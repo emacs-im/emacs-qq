@@ -1638,46 +1638,49 @@ PROPERTIES and PREFIX-STATE control styling for the inserted line."
       (qq-api-delete-message message-id))))
 
 (defun qq-chat--insert-message-actions (message prefix-state properties)
-  "Insert per-message action buttons for MESSAGE using PREFIX-STATE."
-  (let* ((server-id (alist-get 'server-id message))
-         (has-resource (qq-chat--message-openable-p message))
-         (action-start (point))
-         (inserted nil))
-    (when server-id
-      (setq inserted t)
-      (qq-chat--insert-message-action-button
-       "[Reply]"
-       (lambda ()
-         (qq-chat--set-pending-reply message))
-       (format "Reply to %s" server-id)))
-    (when has-resource
-      (when inserted (insert " "))
-      (setq inserted t)
-      (qq-chat--insert-message-action-button
-       "[Open]"
-       (lambda ()
-         (qq-media-open-message-resource message))
-       "Open primary media resource"))
-    (when (alist-get 'sender-id message)
-      (when inserted (insert " "))
-      (setq inserted t)
-      (qq-chat--insert-message-action-button
-       "[Avatar]"
-       (lambda ()
-         (qq-media-open-message-avatar message))
-       "Open sender avatar"))
-    (when (and server-id (alist-get 'self-p message))
-      (when inserted (insert " "))
-      (setq inserted t)
-      (qq-chat--insert-message-action-button
-       "[Recall]"
-       (lambda ()
-         (qq-chat--delete-message-internal message))
-       (format "Recall %s" server-id)))
-    (when inserted
-      (insert "\n")
-      (qq-ui-apply-line-prefix action-start (point) prefix-state)
-      (add-text-properties action-start (point) (append properties (list 'face 'shadow))))))
+  "Insert per-message action buttons for MESSAGE using PREFIX-STATE.
+
+Recalled messages get no actions (no reply/recall/open shell)."
+  (when (not (qq-state-message-recalled-p message))
+    (let* ((server-id (alist-get 'server-id message))
+           (has-resource (qq-chat--message-openable-p message))
+           (action-start (point))
+           (inserted nil))
+      (when server-id
+        (setq inserted t)
+        (qq-chat--insert-message-action-button
+         "[Reply]"
+         (lambda ()
+           (qq-chat--set-pending-reply message))
+         (format "Reply to %s" server-id)))
+      (when has-resource
+        (when inserted (insert " "))
+        (setq inserted t)
+        (qq-chat--insert-message-action-button
+         "[Open]"
+         (lambda ()
+           (qq-media-open-message-resource message))
+         "Open primary media resource"))
+      (when (alist-get 'sender-id message)
+        (when inserted (insert " "))
+        (setq inserted t)
+        (qq-chat--insert-message-action-button
+         "[Avatar]"
+         (lambda ()
+           (qq-media-open-message-avatar message))
+         "Open sender avatar"))
+      (when (and server-id (alist-get 'self-p message))
+        (when inserted (insert " "))
+        (setq inserted t)
+        (qq-chat--insert-message-action-button
+         "[Recall]"
+         (lambda ()
+           (qq-chat--delete-message-internal message))
+         (format "Recall %s" server-id)))
+      (when inserted
+        (insert "\n")
+        (qq-ui-apply-line-prefix action-start (point) prefix-state)
+        (add-text-properties action-start (point) (append properties (list 'face 'shadow)))))))
 
 (defun qq-chat--render-message (message &optional previous-message)
   "Insert one formatted MESSAGE block.
@@ -1703,50 +1706,66 @@ fall back to computing compact grouping directly."
          (short-time (qq-chat--format-time-short (alist-get 'time message))))
     (when (and (stringp insert-date) (not (string-empty-p insert-date)))
       (qq-chat--insert-date-separator-row (qq-chat--message-day-label insert-date)))
-    (if compact
-        (progn
-          (when reply-id
-            (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
-          (let* ((lines (split-string (if (string-empty-p body-text) "(empty message)" body-text) "\n" nil))
-                 (first-line (or (car lines) "(empty message)"))
-                 (rest-lines (cdr lines))
-                 (content-start (point)))
-            (insert first-line)
-            (unless (string-empty-p short-time)
-              (insert "  ")
-              (let ((time-start (point)))
-                (insert short-time)
-                (add-text-properties time-start (point) (list 'face 'shadow))))
-            (insert "\n")
-            (qq-ui-apply-line-prefix content-start (point) body-prefix-state)
-            (add-text-properties content-start (point) properties)
-            (when rest-lines
-              (let ((rest-start (point)))
-                (qq-ui-insert-prefixed-lines body-prefix-state (string-join rest-lines "\n") :properties properties)
-                (add-text-properties rest-start (point) properties))))
-          (qq-chat--insert-message-actions message body-prefix-state properties))
-      (let ((header-start (point)))
-        (when-let* ((sender-id (alist-get 'sender-id message)))
-          (let ((avatar-start (point)))
-            (insert (qq-media-avatar-display-string sender-id) " ")
-            (add-text-properties
-             avatar-start
-             (point)
-             '(mouse-face highlight
-               help-echo "Open sender avatar"))))
-        (qq-chat--insert-message-sender message author-face)
-        (insert status-suffix)
-        (insert "  ")
-        (let ((time-start (point)))
-          (insert (qq-chat--format-time (alist-get 'time message)))
-          (add-text-properties time-start (point) (list 'face 'shadow)))
-        (insert "\n")
-        (qq-ui-apply-line-prefix header-start (point) header-prefix-state)
-        (add-text-properties header-start (point) properties))
-      (when reply-id
-        (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
-      (qq-chat--insert-message-body message body-prefix-state properties)
-      (qq-chat--insert-message-actions message body-prefix-state properties))
+    (if (qq-state-message-recalled-p message)
+        ;; Dedicated path: no empty body shell, no action row.
+        (let ((header-start (point)))
+          (qq-chat--insert-message-sender message author-face)
+          (insert status-suffix)
+          (insert "  ")
+          (let ((time-start (point)))
+            (insert (qq-chat--format-time (alist-get 'time message)))
+            (add-text-properties time-start (point) (list 'face 'shadow)))
+          (insert "\n")
+          (qq-ui-apply-line-prefix header-start (point) header-prefix-state)
+          (add-text-properties header-start (point) properties)
+          (qq-ui-insert-prefixed-lines
+           body-prefix-state
+           (qq-chat--message-body message)
+           :properties (append properties (list 'face 'shadow))))
+      (if compact
+          (progn
+            (when reply-id
+              (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
+            (let* ((lines (split-string (if (string-empty-p body-text) "(empty message)" body-text) "\n" nil))
+                   (first-line (or (car lines) "(empty message)"))
+                   (rest-lines (cdr lines))
+                   (content-start (point)))
+              (insert first-line)
+              (unless (string-empty-p short-time)
+                (insert "  ")
+                (let ((time-start (point)))
+                  (insert short-time)
+                  (add-text-properties time-start (point) (list 'face 'shadow))))
+              (insert "\n")
+              (qq-ui-apply-line-prefix content-start (point) body-prefix-state)
+              (add-text-properties content-start (point) properties)
+              (when rest-lines
+                (let ((rest-start (point)))
+                  (qq-ui-insert-prefixed-lines body-prefix-state (string-join rest-lines "\n") :properties properties)
+                  (add-text-properties rest-start (point) properties))))
+            (qq-chat--insert-message-actions message body-prefix-state properties))
+        (let ((header-start (point)))
+          (when-let* ((sender-id (alist-get 'sender-id message)))
+            (let ((avatar-start (point)))
+              (insert (qq-media-avatar-display-string sender-id) " ")
+              (add-text-properties
+               avatar-start
+               (point)
+               '(mouse-face highlight
+                 help-echo "Open sender avatar"))))
+          (qq-chat--insert-message-sender message author-face)
+          (insert status-suffix)
+          (insert "  ")
+          (let ((time-start (point)))
+            (insert (qq-chat--format-time (alist-get 'time message)))
+            (add-text-properties time-start (point) (list 'face 'shadow)))
+          (insert "\n")
+          (qq-ui-apply-line-prefix header-start (point) header-prefix-state)
+          (add-text-properties header-start (point) properties))
+        (when reply-id
+          (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
+        (qq-chat--insert-message-body message body-prefix-state properties)
+        (qq-chat--insert-message-actions message body-prefix-state properties)))
     (insert "\n")
     (add-text-properties start (point) properties)))
 

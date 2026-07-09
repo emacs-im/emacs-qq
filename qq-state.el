@@ -275,6 +275,33 @@ Values from NEW replace values in OLD."
       (setf (alist-get (car pair) merged nil nil #'eq) (cdr pair)))
     merged))
 
+(defun qq-state-message-recalled-p (message)
+  "Return non-nil when MESSAGE is marked recalled."
+  (eq (alist-get 'status message) 'recalled))
+
+(defun qq-state--raw-message-recalled-p (message)
+  "Return non-nil when raw OneBot MESSAGE is a recalled stub.
+
+NapCat fork may set `recalled' or non-zero `recall_time' (NT recallTime)."
+  (let ((recalled (alist-get 'recalled message))
+        (recall-time (alist-get 'recall_time message)))
+    (or (eq recalled t)
+        (eq recalled 'true)
+        (and (numberp recalled) (not (zerop recalled)))
+        (and (stringp recalled)
+             (member (downcase recalled) '("true" "1" "yes")))
+        (and recall-time
+             (not (member (format "%s" recall-time) '("" "0" "nil")))))))
+
+(defun qq-state--as-recalled-message (message)
+  "Return MESSAGE with recalled display fields forced."
+  (qq-state--merge-alists
+   message
+   '((status . recalled)
+     (segments . nil)
+     (raw-message . "[message recalled]")
+     (preview . "[message recalled]"))))
+
 (defun qq-state-session (session-key)
   "Return session object for SESSION-KEY."
   (copy-tree (gethash session-key qq-state--sessions)))
@@ -414,17 +441,25 @@ When EMIT is non-nil, fire one session mutation event (`:mutation' `session')."
                         nil
                       sender-id))
          (sender-fields (qq-state--sender-display-fields session-key sender sender-id))
-         (segments (or (alist-get 'message message) '()))
-         (raw-message (or (alist-get 'raw_message message)
-                          (qq-state-message-preview-from-segments segments)
-                          ""))
+         (recalled-p (qq-state--raw-message-recalled-p message))
+         (segments (if recalled-p
+                       '()
+                     (or (alist-get 'message message) '())))
+         (raw-message (if recalled-p
+                          "[message recalled]"
+                        (or (alist-get 'raw_message message)
+                            (qq-state-message-preview-from-segments segments)
+                            "")))
          ;; NapCat hard-cut: message_id is the NT snowflake string (never coerce
          ;; with string-to-number — snowflakes exceed fixnum precision).
          (server-id (qq-state--normalize-id
                      (or (alist-get 'message_id message)
                          (alist-get 'id message))))
          (self-p (qq-state--message-self-p message))
-         (status (if self-p 'sent 'received))
+         (status (cond
+                  (recalled-p 'recalled)
+                  (self-p 'sent)
+                  (t 'received)))
          (time (qq-state--normalize-time (alist-get 'time message)))
          (target-id (or (and (qq-state--dataline-chat-type-p chat-type) peer-uid)
                         (qq-state--normalize-id (alist-get 'target_id message)))))
@@ -442,7 +477,9 @@ When EMIT is non-nil, fire one session mutation event (`:mutation' `session')."
       (status . ,status)
       (segments . ,segments)
       (raw-message . ,raw-message)
-      (preview . ,(qq-state-message-preview-from-segments segments))
+      (preview . ,(if recalled-p
+                     "[message recalled]"
+                   (qq-state-message-preview-from-segments segments)))
       (message-type . ,(alist-get 'message_type message))
       (chat-type . ,chat-type)
       (peer-uid . ,peer-uid)
@@ -651,6 +688,13 @@ Return three values via `cl-values':
          (mutation (if existing 'update 'create)))
     (when old-order
       (setf (alist-get 'order merged nil nil #'eq) old-order))
+    ;; History/live re-merge often rewrites recalled rows as empty sent/received
+    ;; stubs (OneBot drops NT recallTime). Keep recalled once known, unless the
+    ;; incoming payload itself asserts recalled.
+    (when (and existing
+               (qq-state-message-recalled-p existing)
+               (not (qq-state-message-recalled-p message)))
+      (setq merged (qq-state--as-recalled-message merged)))
     (if existing
         (setq messages (qq-state--replace-message messages existing merged))
       (push merged messages))
@@ -778,11 +822,7 @@ hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor."
                          (lambda (it)
                            (equal (alist-get 'server-id it) normalized-id))))))
     (when (and session-key existing)
-      (let ((updated (qq-state--merge-alists
-                      existing
-                      '((status . recalled)
-                        (raw-message . "[message recalled]")
-                        (preview . "[message recalled]")))))
+      (let ((updated (qq-state--as-recalled-message existing)))
         (setq messages (qq-state--replace-message messages existing updated))
         (puthash session-key messages qq-state--messages-by-session)
         (qq-state--sync-session-summary session-key)

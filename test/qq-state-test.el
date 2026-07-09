@@ -134,7 +134,64 @@
    (qq-state-apply-recall "9007199254741004123")
    (let ((message (car (qq-state-session-messages "private:10001"))))
      (should (eq (alist-get 'status message) 'recalled))
-     (should (equal (alist-get 'raw-message message) "[message recalled]")))))
+     (should (equal (alist-get 'raw-message message) "[message recalled]"))
+     (should-not (alist-get 'segments message)))))
+
+(ert-deftest qq-state-history-merge-preserves-recalled-status ()
+  "Reopen/history must not turn recalled rows into empty shells."
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . 90001)
+                             (nickname . "Me")))
+   (qq-state-merge-live-message
+    '((post_type . "message_sent")
+      (message_type . "private")
+      (message_id . "9007199254741005555")
+      (user_id . 90001)
+      (target_id . 10001)
+      (time . 1710000001)
+      (sender . ((user_id . 90001)
+                 (nickname . "Me")))
+      (raw_message . "will recall")
+      (message . (((type . "text")
+                   (data . ((text . "will recall"))))))))
+   (qq-state-apply-recall "9007199254741005555")
+   ;; History stub as NapCat often returns after recall: empty body, no flag.
+   (qq-state-merge-history
+    "private:10001"
+    (list
+     '((post_type . "message_sent")
+       (message_type . "private")
+       (message_id . "9007199254741005555")
+       (user_id . 90001)
+       (target_id . 10001)
+       (time . 1710000001)
+       (sender . ((user_id . 90001)
+                  (nickname . "Me")))
+       (raw_message . "")
+       (message . ()))))
+   (let ((message (car (qq-state-session-messages "private:10001"))))
+     (should (eq (alist-get 'status message) 'recalled))
+     (should (equal (alist-get 'raw-message message) "[message recalled]"))
+     (should-not (alist-get 'segments message)))))
+
+(ert-deftest qq-state-normalize-respects-napcat-recalled-flag ()
+  (qq-test-with-reset
+   (qq-state-merge-live-message
+    '((post_type . "message")
+      (message_type . "private")
+      (message_id . "9007199254741006666")
+      (user_id . 10001)
+      (time . 1710000001)
+      (recalled . t)
+      (recall_time . "1710000099")
+      (sender . ((user_id . 10001)
+                 (nickname . "Alice")))
+      (raw_message . "")
+      (message . ())))
+   (let ((message (car (qq-state-session-messages "private:10001"))))
+     (should (eq (alist-get 'status message) 'recalled))
+     (should (equal (alist-get 'preview message) "[message recalled]"))
+     (should (qq-state-message-recalled-p message)))))
 
 (ert-deftest qq-state-live-dataline-message-routes-by-peer-uid ()
   (qq-test-with-reset
