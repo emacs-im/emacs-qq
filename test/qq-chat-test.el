@@ -407,22 +407,23 @@
          (should (equal '((header-line header)) updates))
          (should-not render-called))))))
 
-(ert-deftest qq-chat-handle-state-change-read-mutation-updates-header-line-only ()
+(ert-deftest qq-chat-handle-state-change-read-mutation-applies-partial-read ()
   (qq-chat-test-with-reset
    (with-temp-buffer
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
-     (let (updates render-called)
-       (cl-letf (((symbol-function 'qq-chat--chat-update)
-                  (lambda (&rest parts)
-                    (push parts updates)))
+     (let (partial-called render-called)
+       (cl-letf (((symbol-function 'qq-chat--apply-read-state-change-partially)
+                  (lambda ()
+                    (setq partial-called t)
+                    t))
                  ((symbol-function 'qq-chat-render)
                   (lambda ()
                     (setq render-called t))))
          (qq-chat--handle-state-change '(:type session
                                          :session-key "private:10001"
                                          :mutation read))
-         (should (equal '((header-line)) updates))
+         (should partial-called)
          (should-not render-called))))))
 
 (ert-deftest qq-chat-handle-state-change-prefers-event-message-anchor ()
@@ -738,6 +739,66 @@
                           redisplayed))))
          (qq-chat--request-node-redisplay '("m1" "m2"))
          (should (equal '("m1" "m2") (nreverse redisplayed))))))))
+
+(ert-deftest qq-chat-first-unread-anchor-uses-session-unread-count ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice")
+      (target-id . "10001")
+      (unread-count . 2))
+    nil)
+   (let ((messages
+          '(((server-id . "m1") (self-p . nil) (time . 1))
+            ((server-id . "m2") (self-p . nil) (time . 2))
+            ((server-id . "m3") (self-p . nil) (time . 3))
+            ((server-id . "m-self") (self-p . t) (time . 4)))))
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "private:10001")
+       (let ((qq-chat-show-unread-divider t))
+         (should (equal "m2" (qq-chat--first-unread-anchor messages)))
+         (qq-state-clear-session-unread "private:10001")
+         (should-not (qq-chat--first-unread-anchor messages)))))))
+
+(ert-deftest qq-chat-render-inserts-unread-divider ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice")
+      (target-id . "10001")
+      (unread-count . 1))
+    nil)
+   (puthash
+    "private:10001"
+    '(((server-id . "m1")
+       (sender-id . "10001")
+       (sender-name . "Alice")
+       (time . 100)
+       (self-p . nil)
+       (raw-message . "older"))
+      ((server-id . "m2")
+       (sender-id . "10001")
+       (sender-name . "Alice")
+       (time . 200)
+       (self-p . nil)
+       (raw-message . "newest")))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (let ((qq-chat-show-unread-divider t))
+       (qq-chat-render)
+       (goto-char (point-min))
+       (should (search-forward "Unread Messages" nil t))
+       (let ((ctx (gethash "m2" qq-chat--render-context-by-anchor)))
+         (should (plist-get ctx :insert-unread)))
+       (qq-state-clear-session-unread "private:10001")
+       (qq-chat--apply-read-state-change-partially)
+       (should-not (plist-get (gethash "m2" qq-chat--render-context-by-anchor)
+                              :insert-unread))
+       (goto-char (point-min))
+       (should-not (search-forward "Unread Messages" nil t))))))
 
 (ert-deftest qq-chat-attach-file-inserts-structured-object-and-sends-segments ()
   (qq-chat-test-with-reset

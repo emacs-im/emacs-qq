@@ -134,13 +134,30 @@ ERRBACK falls back to `qq-api--default-error'."
          (qq-state-merge-history session-key messages))))))
 
 (defun qq-api-mark-session-read (session-key)
-  "Mark SESSION-KEY as read both locally and in NapCat."
+  "Mark SESSION-KEY as read both locally and in NapCat.
+
+Clear unread optimistically before the network roundtrip (telega/disco
+style).  On API failure, restore the previous unread count when the
+session is still at zero."
   (interactive)
-  (qq-api-call
-   "mark_msg_as_read"
-   (qq-api--session-request-params session-key)
-   (lambda (_response)
-     (qq-state-clear-session-unread session-key))))
+  (let* ((session (qq-state-session session-key))
+         (previous-unread (or (and session (alist-get 'unread-count session)) 0)))
+    (when (> previous-unread 0)
+      (qq-state-clear-session-unread session-key))
+    (qq-api-call
+     "mark_msg_as_read"
+     (qq-api--session-request-params session-key)
+     (lambda (_response)
+       ;; Idempotent: success after optimistic clear is a no-op for state.
+       (qq-state-clear-session-unread session-key))
+     (lambda (response reason)
+       (let* ((current (qq-state-session session-key))
+              (current-unread (or (and current (alist-get 'unread-count current)) 0)))
+         (when (and (> previous-unread 0)
+                    current
+                    (= current-unread 0))
+           (qq-state-set-session-unread session-key previous-unread)))
+       (qq-api--default-error response reason)))))
 
 (defun qq-api--send-text-segments (text &optional reply-to-message-id)
   "Return send_msg segment list for TEXT and optional REPLY-TO-MESSAGE-ID."

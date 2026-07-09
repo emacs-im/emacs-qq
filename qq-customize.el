@@ -60,6 +60,15 @@ Requires NapCat fork to mark messages with `recalled' / `recall_time'."
   :type 'boolean
   :group 'qq)
 
+(defcustom qq-chat-show-unread-divider t
+  "When non-nil, render an unread divider before the first unread message.
+
+QQ only exposes `unread-count' (no last-read snowflake).  The first unread
+row is approximated as the oldest among the last N non-self timeline
+messages, where N is the session unread count."
+  :type 'boolean
+  :group 'qq)
+
 (defcustom qq-media-avatar-image-height 20
   "Pixel height used for inline avatar images in chat buffers."
   :type 'integer

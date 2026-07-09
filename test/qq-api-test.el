@@ -72,6 +72,40 @@
       (should (equal (alist-get 'peer_uid captured-params) "device-1"))
       (should-not (alist-get 'user_id captured-params)))))
 
+(ert-deftest qq-api-mark-session-read-clears-unread-optimistically ()
+  (let ((qq-state-change-hook nil)
+        cleared-before-call
+        errback-fn
+        success-fn)
+    (qq-state-reset)
+    (qq-state-upsert-session
+     "private:10001"
+     '((title . "Alice")
+       (target-id . "10001")
+       (unread-count . 3))
+     nil)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional errback)
+                 (setq cleared-before-call
+                       (= 0 (alist-get 'unread-count
+                                       (qq-state-session "private:10001"))))
+                 (setq success-fn callback)
+                 (setq errback-fn errback)
+                 'sent)))
+      (qq-api-mark-session-read "private:10001")
+      (should cleared-before-call)
+      (should (= 0 (alist-get 'unread-count
+                              (qq-state-session "private:10001"))))
+      ;; Failure restores previous unread.
+      (funcall errback-fn nil "network down")
+      (should (= 3 (alist-get 'unread-count
+                              (qq-state-session "private:10001"))))
+      ;; Success path after another optimistic clear stays at 0.
+      (qq-api-mark-session-read "private:10001")
+      (funcall success-fn '((status . ok)))
+      (should (= 0 (alist-get 'unread-count
+                              (qq-state-session "private:10001")))))))
+
 (ert-deftest qq-api-send-text-builds-reply-segments ()
   (let (sent-session sent-segments sent-raw)
     (cl-letf (((symbol-function 'qq-api-send-message)

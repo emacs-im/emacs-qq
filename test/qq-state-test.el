@@ -403,7 +403,13 @@
        (qq-state-clear-session-unread "private:10001")
        (let ((read-event (car events)))
          (should (eq (plist-get read-event :type) 'session))
-         (should (eq (plist-get read-event :mutation) 'read)))))))
+         (should (eq (plist-get read-event :mutation) 'read)))
+       (setq events nil)
+       (qq-state-set-session-unread "private:10001" 4)
+       (let ((restore-event (car events)))
+         (should (eq (plist-get restore-event :mutation) 'read))
+         (should (= 4 (alist-get 'unread-count
+                                 (qq-state-session "private:10001")))))))))
 
 (provide 'qq-state-test)
 

@@ -599,8 +599,31 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
          qq-chat--render-context-by-anchor
          (gethash anchor qq-chat--render-context-by-anchor))))
 
-(defun qq-chat--compute-message-render-context (previous-message message)
-  "Return render context for MESSAGE given PREVIOUS-MESSAGE."
+(defun qq-chat--first-unread-anchor (messages)
+  "Return anchor of the first unread message in MESSAGES, or nil.
+
+QQ exposes only `unread-count', not a last-read snowflake.  Approximate
+first unread as the oldest among the last N non-self timeline rows, where
+N is the current session unread count.  When N exceeds available rows, use
+the oldest incoming message."
+  (when qq-chat-show-unread-divider
+    (let* ((session (qq-chat--session))
+           (n (or (and session (alist-get 'unread-count session)) 0)))
+      (when (and (integerp n) (> n 0) messages)
+        (let* ((incoming (cl-remove-if (lambda (message)
+                                         (alist-get 'self-p message))
+                                       messages))
+               (len (length incoming)))
+          (when (> len 0)
+            (qq-chat--message-anchor
+             (nth (max 0 (- len n)) incoming))))))))
+
+(defun qq-chat--compute-message-render-context (previous-message message
+                                                                &optional first-unread-anchor)
+  "Return render context for MESSAGE given PREVIOUS-MESSAGE.
+
+When FIRST-UNREAD-ANCHOR is non-nil and matches MESSAGE, set
+`:insert-unread'."
   (let* ((day-key (qq-chat--message-day-key message))
          (previous-day-key (and previous-message
                                 (qq-chat--message-day-key previous-message)))
@@ -608,21 +631,29 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
                            (not (equal day-key previous-day-key))
                            day-key))
          (compact (and previous-message
-                       (qq-chat--messages-compact-group-p previous-message message))))
+                       (qq-chat--messages-compact-group-p previous-message message)))
+         (anchor (qq-chat--message-anchor message))
+         (insert-unread (and qq-chat-show-unread-divider
+                             first-unread-anchor
+                             anchor
+                             (equal anchor first-unread-anchor))))
     (list :compact (and compact t)
-          :insert-date insert-date)))
+          :insert-date insert-date
+          :insert-unread (and insert-unread t))))
 
 (defun qq-chat--rebuild-render-contexts (messages)
   "Recompute full render contexts for MESSAGES in display order."
   (unless (hash-table-p qq-chat--render-context-by-anchor)
     (setq qq-chat--render-context-by-anchor (make-hash-table :test #'equal)))
   (clrhash qq-chat--render-context-by-anchor)
-  (let ((previous-message nil))
+  (let ((first-unread (qq-chat--first-unread-anchor messages))
+        (previous-message nil))
     (dolist (message messages)
       (let ((anchor (qq-chat--message-anchor message)))
         (when anchor
           (puthash anchor
-                   (qq-chat--compute-message-render-context previous-message message)
+                   (qq-chat--compute-message-render-context
+                    previous-message message first-unread)
                    qq-chat--render-context-by-anchor)))
       (setq previous-message message))))
 
@@ -706,13 +737,33 @@ Recalled messages are hidden unless `qq-chat-show-recalled-messages' is set
    (append (qq-chat--neighbor-anchors-in-sequence current-anchors anchor)
            (qq-chat--neighbor-anchors-in-sequence target-anchors anchor))))
 
+(defun qq-chat--current-first-unread-context-anchor ()
+  "Return the anchor currently marked `:insert-unread' in render contexts."
+  (when (hash-table-p qq-chat--render-context-by-anchor)
+    (catch 'found
+      (maphash
+       (lambda (anchor context)
+         (when (plist-get context :insert-unread)
+           (throw 'found anchor)))
+       qq-chat--render-context-by-anchor)
+      nil)))
+
 (defun qq-chat--recompute-render-contexts-for-anchors (messages anchors)
-  "Recompute render contexts in MESSAGES only for ANCHORS."
+  "Recompute render contexts in MESSAGES only for ANCHORS.
+
+Also refreshes previous/new first-unread anchors so the divider can move
+without a full timeline rebuild."
   (unless (hash-table-p qq-chat--render-context-by-anchor)
     (setq qq-chat--render-context-by-anchor (make-hash-table :test #'equal)))
-  (let ((target-set (make-hash-table :test #'equal))
-        (previous-message nil)
-        seen)
+  (let* ((first-unread (qq-chat--first-unread-anchor messages))
+         (previous-first (qq-chat--current-first-unread-context-anchor))
+         (anchors (delete-dups
+                   (delq nil
+                         (append (copy-sequence (or anchors '()))
+                                 (list previous-first first-unread)))))
+         (target-set (make-hash-table :test #'equal))
+         (previous-message nil)
+         seen)
     (dolist (anchor anchors)
       (when anchor
         (puthash anchor t target-set)))
@@ -720,7 +771,8 @@ Recalled messages are hidden unless `qq-chat-show-recalled-messages' is set
       (let ((anchor (qq-chat--message-anchor message)))
         (when (and anchor (gethash anchor target-set))
           (puthash anchor
-                   (qq-chat--compute-message-render-context previous-message message)
+                   (qq-chat--compute-message-render-context
+                    previous-message message first-unread)
                    qq-chat--render-context-by-anchor)
           (push anchor seen))
         (setq previous-message message)))
@@ -966,8 +1018,15 @@ Return non-nil when the persistent EWOC was patched successfully."
          (target-anchors (qq-chat--message-anchor-list messages))
          (present-before (member anchor current-anchors))
          (present-after (member anchor target-anchors))
-         (affected-anchors (qq-chat--message-neighborhood-anchors
-                            current-anchors target-anchors anchor))
+         (affected-anchors
+          (delete-dups
+           (delq nil
+                 (append (qq-chat--message-neighborhood-anchors
+                          current-anchors target-anchors anchor)
+                         ;; Unread divider may leave the neighborhood when
+                         ;; unread-count changes as a side effect of this message.
+                         (list (qq-chat--current-first-unread-context-anchor)
+                               (qq-chat--first-unread-anchor messages))))))
          (target-message (or message-for-rekey
                              (seq-find (lambda (message)
                                          (equal (qq-chat--message-anchor message)
@@ -1009,7 +1068,8 @@ Return non-nil when the persistent EWOC was patched successfully."
                    (append
                     (and present-after (list anchor))
                     (qq-chat--changed-render-context-anchors
-                     affected-anchors context-snapshot))))
+                     affected-anchors context-snapshot)
+                    (list (qq-chat--current-first-unread-context-anchor)))))
            (when-let* ((node (gethash affected-anchor qq-chat--message-node-table)))
              (qq-chat--redisplay-node node)))))
       t)))
@@ -1360,6 +1420,10 @@ When SEGMENT-TYPE is nil, infer the most useful QQ segment type from PATH."
   "Insert a date separator row for DAY-LABEL."
   (qq-view-insert-note-line (format "-- %s --" day-label) :face 'font-lock-doc-face))
 
+(defun qq-chat--insert-unread-divider-row ()
+  "Insert the unread separator row above the first unread message."
+  (qq-view-insert-note-line "-- Unread Messages --" :face 'warning))
+
 (defun qq-chat--insert-reply-preview-line (reply-id properties prefix-state)
   "Insert one inline reply preview line for REPLY-ID.
 
@@ -1708,6 +1772,7 @@ fall back to computing compact grouping directly."
          (context (or (qq-chat--message-render-context message)
                       (qq-chat--compute-message-render-context previous-message message)))
          (insert-date (plist-get context :insert-date))
+         (insert-unread (plist-get context :insert-unread))
          (self-p (alist-get 'self-p message))
          (author-face (if self-p 'font-lock-keyword-face 'default))
          (header-prefix (if self-p ">> " "-- "))
@@ -1722,6 +1787,8 @@ fall back to computing compact grouping directly."
          (short-time (qq-chat--format-time-short (alist-get 'time message))))
     (when (and (stringp insert-date) (not (string-empty-p insert-date)))
       (qq-chat--insert-date-separator-row (qq-chat--message-day-label insert-date)))
+    (when insert-unread
+      (qq-chat--insert-unread-divider-row))
     (if (qq-state-message-recalled-p message)
         ;; Stub path for `qq-chat-show-recalled-messages' (telega deleted style).
         (let ((header-start (point)))
@@ -1978,6 +2045,21 @@ Return non-nil on success."
    (t
     (message "qq: nothing to cancel"))))
 
+(defun qq-chat--apply-read-state-change-partially ()
+  "Apply unread/read-state change without full timeline rebuild.
+
+Updates header-line and redisplays only nodes whose render context changed
+(typically the previous first-unread row losing its divider)."
+  (let* ((messages (qq-chat--timeline-messages))
+         (anchors (or qq-chat--displayed-message-anchors '()))
+         (snapshot (qq-chat--copy-render-contexts-for-anchors anchors)))
+    (qq-chat--rebuild-render-contexts messages)
+    (qq-chat--header-line-update)
+    (let ((changed (qq-chat--changed-render-context-anchors anchors snapshot)))
+      (when changed
+        (qq-chat--redisplay-message-anchors-preserving-point changed)))
+    t))
+
 (defun qq-chat-read-all ()
   "Mark the current chat as read."
   (interactive)
@@ -2096,7 +2178,8 @@ Prefer `qq-state' `:mutation' metadata when present:
 
 - message create/update → single-node partial patch (full render fallback)
 - history / reset → full render (batch timeline rebuild still coarse)
-- session read → header-line only (unread); other session → header-line+header
+- session read → header-line + local unread-divider patch
+- other session → header-line+header
 - friends/groups refresh → header + timeline (sender titles may change)"
   (let ((event-session-key (plist-get event :session-key))
         (event-type (plist-get event :type))
@@ -2131,8 +2214,7 @@ Prefer `qq-state' `:mutation' metadata when present:
              ((eq event-type 'session)
               (when (equal event-session-key qq-chat--session-key)
                 (if (eq event-mutation 'read)
-                    ;; Unread clear: header-line (and later optimistic divider).
-                    (qq-chat--chat-update 'header-line)
+                    (qq-chat--apply-read-state-change-partially)
                   (qq-chat--chat-update 'header-line 'header))))
              ((eq event-type 'sessions-refreshed)
               (qq-chat--chat-update 'header-line 'header))

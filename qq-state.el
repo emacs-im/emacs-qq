@@ -805,14 +805,23 @@ hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor."
                         :source 'response)
         updated))))
 
+(defun qq-state-set-session-unread (session-key count)
+  "Set SESSION-KEY unread-count to COUNT and emit `:mutation' `read'.
+
+COUNT is clamped to a non-negative integer.  Views treat this mutation as a
+read-state change (header-line + optional unread divider), not a full
+timeline rebuild."
+  (let ((n (max 0 (if (integerp count) count (truncate (or count 0))))))
+    (qq-state-upsert-session session-key `((unread-count . ,n)) nil)
+    (qq-state--emit 'session
+                    :session-key session-key
+                    :session (qq-state-session session-key)
+                    :mutation 'read)
+    n))
+
 (defun qq-state-clear-session-unread (session-key)
   "Reset unread count for SESSION-KEY."
-  (qq-state-upsert-session session-key '((unread-count . 0)) nil)
-  (qq-state--emit 'session
-                  :session-key session-key
-                  :session (qq-state-session session-key)
-                  :mutation 'read)
-  0)
+  (qq-state-set-session-unread session-key 0))
 
 (defun qq-state-apply-recall (message-id)
   "Mark MESSAGE-ID as recalled in local state when present.
