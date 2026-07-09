@@ -1521,10 +1521,10 @@ image/video inference."
   (format "%s %s\n" label message-id))
 
 (defun qq-chat--cancel-reply-button-string ()
-  "Return telega-style `[×]' button that cancels reply aux."
+  "Return a quiet cancel control for reply aux (telega-like close)."
   (propertize
-   "[×]"
-   'face 'link
+   "×"
+   'face 'shadow
    'mouse-face 'highlight
    'help-echo "Cancel reply (C-c C-k)"
    'follow-link t
@@ -1537,18 +1537,14 @@ image/video inference."
                (lambda ()
                  (interactive)
                  (qq-chat-cancel-dwim)))
-             (define-key map (kbd "q")
-               (lambda ()
-                 (interactive)
-                 (qq-chat-cancel-dwim)))
              map)
    'qq-chat-cancel-reply t))
 
 (defun qq-chat--reply-context-text ()
   "Return extra context lines shown above the chat composer.
 
-Mirrors telega aux prompt: leading `[×]' cancel button + reply summary +
-key hint (`C-c C-k')."
+Quiet telega-like aux: leading × + short summary.  No keybinding slogans;
+cancel with `C-c C-k' or click × (help-echo)."
   (let ((message (qq-chat--reply-message)))
     (if-let* ((reply-id (alist-get 'server-id message))
               (name (or (car (qq-chat--message-sender-display-parts message))
@@ -1556,7 +1552,7 @@ key hint (`C-c C-k')."
               (preview (string-trim (or (qq-state-message-preview message) "")))
               (body
                (concat
-                (format "Replying to %s  (C-c C-k)\n" name)
+                (format "Reply to %s\n" name)
                 (format "  %s\n"
                         (if (string-empty-p preview)
                             (format "id %s" reply-id)
@@ -1564,25 +1560,24 @@ key hint (`C-c C-k')."
         (concat
          (qq-chat--cancel-reply-button-string)
          " "
-         (propertize body 'face 'font-lock-doc-face))
+         (propertize body 'face 'shadow))
       "")))
 
 (defun qq-chat--header-help-text ()
   "Return header help text for chat actions."
   (concat
-   "M-<: older   r/d/o/a: reply/recall/open/avatar   m: message menu   ?: chat menu"
-   "   C-c C-k: cancel reply   C-c C-v: clipboard   RET/C-c C-c: send   q: quit"))
+   "M-<: older   r/d/o/a · m/? menus   C-c C-k cancel   C-c C-v clipboard   C-c C-c send"))
 
 (defun qq-chat--insert-date-separator-row (day-label)
   "Insert a date separator row for DAY-LABEL."
   (qq-view-insert-note-line
-   (format "──── %s ────" day-label)
+   (format "-- %s --" day-label)
    :face 'qq-msg-date-separator))
 
 (defun qq-chat--insert-unread-divider-row ()
   "Insert the unread separator row above the first unread message."
   (qq-view-insert-note-line
-   "──── Unread Messages ────"
+   "-- Unread --"
    :face 'qq-msg-unread-divider))
 
 (defun qq-chat--message-by-server-id (server-id)
@@ -2186,8 +2181,7 @@ Return non-nil on success."
 (defun qq-chat-cancel-dwim ()
   "Cancel reply context, or clear draft when no reply is pending.
 
-Same role as telega's `telega-chatbuf-cancel-dwim' / aux `[×]' button.
-Bound to `C-c C-k' (and ESC ESC).  Click the footer `[×]' to cancel reply."
+Bound to `C-c C-k' (also ESC ESC / C-M-c).  Reply footer × is clickable."
   (interactive)
   (cond
    ((qq-chat--reply-message)

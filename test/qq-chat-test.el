@@ -120,19 +120,18 @@
                                    (raw-message . "hello from footer")))
      (qq-chat--update-frame-preserving-point)
      (goto-char (point-min))
-     (search-forward "Replying to Alice")
+     (search-forward "Reply to Alice")
      (beginning-of-line)
      (let ((before (point)))
        (qq-chat-render)
        (should (= before (point)))
        (should-not (qq-chat--point-in-input-p)))
-     ;; Cancel reply (telega C-c C-k / [×]).
+     ;; Cancel reply (C-c C-k / footer ×).
      (should (qq-chat--reply-message))
      (qq-chat-cancel-dwim)
      (should-not (qq-chat--reply-message))
      (goto-char (point-min))
-     (should-not (search-forward "Replying to Alice" nil t))
-     (should-not (search-forward "[×]" nil t)))))
+     (should-not (search-forward "Reply to Alice" nil t)))))
 
 (ert-deftest qq-chat-render-falls-back-to-sender-id-when-sender-name-empty ()
   (qq-chat-test-with-reset
@@ -806,7 +805,7 @@
      (let ((qq-chat-show-unread-divider t))
        (qq-chat-render)
        (goto-char (point-min))
-       (should (search-forward "Unread Messages" nil t))
+       (should (search-forward "Unread" nil t))
        (let ((ctx (gethash "m2" qq-chat--render-context-by-anchor)))
          (should (plist-get ctx :insert-unread)))
        (qq-state-clear-session-unread "private:10001")
@@ -814,7 +813,7 @@
        (should-not (plist-get (gethash "m2" qq-chat--render-context-by-anchor)
                               :insert-unread))
        (goto-char (point-min))
-       (should-not (search-forward "Unread Messages" nil t))))))
+       (should-not (search-forward "Unread" nil t))))))
 
 (defconst qq-chat-test--1x1-png
   (base64-decode-string

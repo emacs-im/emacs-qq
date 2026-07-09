@@ -142,7 +142,7 @@ Prefer this over inline button rows (telega/disco style)."
    ["Composer"
     ("c" "Send" qq-chat-send-message)
     ("a" "Attach…" qq-chat-attach-transient)
-    ("k" "Cancel reply/draft (C-c C-k / [×])" qq-chat-cancel-dwim
+    ("k" "Cancel reply/draft" qq-chat-cancel-dwim
      :inapt-if qq-transient--cancel-inapt-p)
     ("e" "Focus draft" qq-chat-edit-draft)
     ("r" "Reply at point" qq-chat-reply-to-message

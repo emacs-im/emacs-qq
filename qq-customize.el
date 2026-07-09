@@ -79,42 +79,42 @@ available via `C-c ?' / `describe-mode'."
 
 (defface qq-msg-heading
   '((((class color) (background light))
-     :background "gray92" :extend t)
+     :background "gray95" :extend t)
     (((class color) (background dark))
-     :background "gray20" :extend t)
-    (t :inherit widget-single-line-field :extend t))
+     :background "gray18" :extend t)
+    (t :extend t))
   "Face for message heading rows (avatar + sender + time).
 
-Mirrors `telega-msg-heading'; intended for future appkit chatbuf reuse."
+Kept subtle; intended for future appkit chatbuf reuse."
   :group 'qq)
 
 (defface qq-msg-self-title
-  '((t :weight bold :inherit font-lock-keyword-face))
+  '((t :inherit font-lock-keyword-face))
   "Face for the current account's sender title in chat buffers."
   :group 'qq)
 
 (defface qq-msg-user-title
-  '((t :weight bold))
+  '((t :inherit default))
   "Face for other users' sender titles in chat buffers."
   :group 'qq)
 
 (defface qq-msg-inline-reply
-  '((t :inherit (qq-msg-heading shadow)))
+  '((t :inherit shadow))
   "Face for inline reply preview rows."
   :group 'qq)
 
 (defface qq-msg-deleted
-  '((t :inherit shadow :extend t :slant italic))
+  '((t :inherit shadow :slant italic))
   "Face used for recalled message stubs."
   :group 'qq)
 
 (defface qq-msg-date-separator
-  '((t :inherit font-lock-doc-face :weight bold :extend t))
+  '((t :inherit shadow))
   "Face for day separator rows in the chat timeline."
   :group 'qq)
 
 (defface qq-msg-unread-divider
-  '((t :inherit warning :weight bold :extend t))
+  '((t :inherit shadow))
   "Face for the unread messages bar."
   :group 'qq)
 
