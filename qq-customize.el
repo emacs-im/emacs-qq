@@ -69,6 +69,60 @@ messages, where N is the session unread count."
   :type 'boolean
   :group 'qq)
 
+(defcustom qq-chat-show-header-help nil
+  "When non-nil, show the long keybinding help line in the chat EWOC header.
+
+Default nil keeps the buffer header as title-only (telega-like).  Help remains
+available via `C-c ?' / `describe-mode'."
+  :type 'boolean
+  :group 'qq)
+
+(defface qq-msg-heading
+  '((((class color) (background light))
+     :background "gray92" :extend t)
+    (((class color) (background dark))
+     :background "gray20" :extend t)
+    (t :inherit widget-single-line-field :extend t))
+  "Face for message heading rows (avatar + sender + time).
+
+Mirrors `telega-msg-heading'; intended for future appkit chatbuf reuse."
+  :group 'qq)
+
+(defface qq-msg-self-title
+  '((t :weight bold :inherit font-lock-keyword-face))
+  "Face for the current account's sender title in chat buffers."
+  :group 'qq)
+
+(defface qq-msg-user-title
+  '((t :weight bold))
+  "Face for other users' sender titles in chat buffers."
+  :group 'qq)
+
+(defface qq-msg-inline-reply
+  '((t :inherit (qq-msg-heading shadow)))
+  "Face for inline reply preview rows."
+  :group 'qq)
+
+(defface qq-msg-deleted
+  '((t :inherit shadow :extend t :slant italic))
+  "Face used for recalled message stubs."
+  :group 'qq)
+
+(defface qq-msg-date-separator
+  '((t :inherit font-lock-doc-face :weight bold :extend t))
+  "Face for day separator rows in the chat timeline."
+  :group 'qq)
+
+(defface qq-msg-unread-divider
+  '((t :inherit warning :weight bold :extend t))
+  "Face for the unread messages bar."
+  :group 'qq)
+
+(defface qq-msg-status
+  '((t :inherit shadow))
+  "Face for pending/failed/recalled status suffixes and timestamps."
+  :group 'qq)
+
 (defcustom qq-media-avatar-image-height 20
   "Pixel height used for inline avatar images in chat buffers."
   :type 'integer

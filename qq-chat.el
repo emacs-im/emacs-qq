@@ -85,8 +85,17 @@
 (defvar qq-chat-timeline-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "q") #'quit-window)
+    ;; Message actions at point (telega-style single keys; never steal input).
+    (define-key map (kbd "r") #'qq-chat-reply-to-message)
+    (define-key map (kbd "d") #'qq-chat-delete-message)
+    (define-key map (kbd "o") #'qq-chat-open-resource-at-point)
+    (define-key map (kbd "a") #'qq-chat-open-avatar-at-point)
     map)
-  "Timeline-only keymap active when point is outside the draft region.")
+  "Timeline-only keymap active when point is outside the draft region.
+
+Single-key message actions (`r' reply, `d' recall, `o' open media, `a' avatar)
+apply to the message at point.  They are inactive in the composer so typing is
+never stolen.")
 
 (defvar qq-chat-message-prefix-map
   (let ((map (make-sparse-keymap)))
@@ -95,7 +104,10 @@
     (define-key map (kbd "o") #'qq-chat-open-resource-at-point)
     (define-key map (kbd "a") #'qq-chat-open-avatar-at-point)
     map)
-  "Prefix map for message actions at point in `qq-chat-mode'.")
+  "Prefix map for message actions at point (`C-c m') in `qq-chat-mode'.
+
+Prefer timeline single keys when point is on a message; this map remains as a
+fallback that also works while the cursor is in the input region.")
 
 (define-minor-mode qq-chat-timeline-mode
   "Buffer-local navigation bindings active outside the draft region."
@@ -124,19 +136,21 @@
   (max 72 (window-body-width (get-buffer-window (current-buffer) t))))
 
 (defun qq-chat--header-line ()
-  "Return dynamic header line for the active chat buffer."
+  "Return dynamic header line for the active chat buffer.
+
+Telega-like: title first, connection only when not connected, unread as a
+compact badge.  Debug fields (target id) stay out of the default chrome."
   (let* ((session (qq-chat--session))
          (title (or (alist-get 'title session) qq-chat--session-key))
-         (target-id (alist-get 'target-id session))
          (status (qq-state-connection-status))
-         (unread (or (alist-get 'unread-count session) 0)))
-    (format " %s  [%s]  target:%s%s"
-            title
-            status
-            target-id
-            (if (> unread 0)
-                (format "  unread:%d" unread)
-              ""))))
+         (unread (or (alist-get 'unread-count session) 0))
+         (status-part (if (eq status 'connected)
+                          ""
+                        (format "  [%s]" status)))
+         (unread-part (if (> unread 0)
+                          (format "  · %d unread" unread)
+                        "")))
+    (format " %s%s%s" title status-part unread-part)))
 
 (defun qq-chat--insert-read-only (text &optional face properties)
   "Insert read-only TEXT with optional FACE and PROPERTIES."
@@ -312,9 +326,15 @@ available."
 (defun qq-chat--status-suffix (message)
   "Return display suffix representing MESSAGE state."
   (pcase (alist-get 'status message)
-    ('pending " [pending]")
-    ('failed (format " [failed: %s]" (or (alist-get 'error message) "send failed")))
-    ('recalled " [recalled]")
+    ('pending
+     (propertize "  …" 'face 'qq-msg-status 'help-echo "pending"))
+    ('failed
+     (propertize (format "  !%s"
+                         (or (alist-get 'error message) "failed"))
+                 'face 'error
+                 'help-echo (or (alist-get 'error message) "send failed")))
+    ('recalled
+     (propertize "  ↩" 'face 'qq-msg-status 'help-echo "recalled"))
     (_ "")))
 
 (defun qq-chat--message-body (message)
@@ -555,13 +575,17 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
       (qq-chat--apply-input-text-properties))))
 
 (defun qq-chat--header-text ()
-  "Build EWOC header text for the current chat state."
+  "Build EWOC header text for the current chat state.
+
+Default is title-only.  Long help lines are optional via
+`qq-chat-show-header-help' (see also `C-c ?')."
   (let* ((session (qq-chat--session))
          (title (or (alist-get 'title session) qq-chat--session-key))
          (text
           (with-temp-buffer
             (qq-view-insert-heading-line title)
-            (qq-view-insert-note-line (qq-chat--header-help-text))
+            (when qq-chat-show-header-help
+              (qq-view-insert-note-line (qq-chat--header-help-text)))
             (insert "\n")
             (buffer-string))))
     (add-text-properties
@@ -1399,38 +1423,64 @@ When SEGMENT-TYPE is nil, infer the most useful QQ segment type from PATH."
   "Return extra context lines shown above the chat composer."
   (let ((message (qq-chat--reply-message)))
     (if-let* ((reply-id (alist-get 'server-id message))
+              (name (or (car (qq-chat--message-sender-display-parts message))
+                        "message"))
               (preview (string-trim (or (qq-state-message-preview message) ""))))
         (concat
-         (qq-chat--composer-context-text "Replying to" reply-id)
+         (format "Replying to %s\n" name)
          (format "  %s\n"
                  (if (string-empty-p preview)
-                     "(no preview)"
-                   preview)))
+                     (format "id %s" reply-id)
+                   (truncate-string-to-width preview 72 nil nil t))))
       "")))
 
 (defun qq-chat--header-help-text ()
   "Return header help text for chat actions."
   (concat
-   "M-<: older/more   M-g n/p: message nav   C-c g: refresh   C-c /: search"
-   "   C-c C-n/C-p: next/prev hit   C-c r: read all   C-c m r/d/o/a: message actions"
-   "   C-c C-f: attach   RET/C-c C-c: send   type at >>>   M-p/M-n: history"
-   "   timeline q: quit   C-c ?: help"))
+   "M-<: older   M-g n/p: messages   C-c r: read   r/d/o/a: reply/recall/open/avatar at point"
+   "   C-c C-f: attach   RET/C-c C-c: send   M-p/n: draft history   q: quit   C-c ?: help"))
 
 (defun qq-chat--insert-date-separator-row (day-label)
   "Insert a date separator row for DAY-LABEL."
-  (qq-view-insert-note-line (format "-- %s --" day-label) :face 'font-lock-doc-face))
+  (qq-view-insert-note-line
+   (format "──── %s ────" day-label)
+   :face 'qq-msg-date-separator))
 
 (defun qq-chat--insert-unread-divider-row ()
   "Insert the unread separator row above the first unread message."
-  (qq-view-insert-note-line "-- Unread Messages --" :face 'warning))
+  (qq-view-insert-note-line
+   "──── Unread Messages ────"
+   :face 'qq-msg-unread-divider))
+
+(defun qq-chat--message-by-server-id (server-id)
+  "Return cached message with SERVER-ID in the current session, or nil."
+  (when (and server-id qq-chat--session-key)
+    (seq-find
+     (lambda (message)
+       (equal (format "%s" (or (alist-get 'server-id message) ""))
+              (format "%s" server-id)))
+     (qq-state-session-messages qq-chat--session-key))))
 
 (defun qq-chat--insert-reply-preview-line (reply-id properties prefix-state)
   "Insert one inline reply preview line for REPLY-ID.
 
-PROPERTIES and PREFIX-STATE control styling for the inserted line."
-  (let ((reply-start (point)))
-    (insert (format "Reply to %s\n" reply-id))
-    (add-text-properties reply-start (point) (append properties (list 'face 'shadow)))
+PROPERTIES and PREFIX-STATE control styling for the inserted line.
+Prefer source-message preview text over the raw id (telega-like)."
+  (let* ((source (qq-chat--message-by-server-id reply-id))
+         (sender (and source (car (qq-chat--message-sender-display-parts source))))
+         (preview (and source (string-trim (or (qq-state-message-preview source) ""))))
+         (body (cond
+                ((and sender preview (not (string-empty-p preview)))
+                 (format "%s: %s" sender
+                         (truncate-string-to-width preview 56 nil nil t)))
+                ((and preview (not (string-empty-p preview)))
+                 (truncate-string-to-width preview 64 nil nil t))
+                (t (format "id %s" reply-id))))
+         (reply-start (point)))
+    (insert (format "↪ %s\n" body))
+    (add-text-properties
+     reply-start (point)
+     (append properties (list 'face 'qq-msg-inline-reply)))
     (qq-ui-apply-line-prefix reply-start (point) prefix-state)))
 
 (defun qq-chat--segment-inline-string (segment)
@@ -1717,71 +1767,43 @@ PROPERTIES and PREFIX-STATE control styling for the inserted line."
     (when (y-or-n-p (format "Recall message %s? " message-id))
       (qq-api-delete-message message-id))))
 
-(defun qq-chat--insert-message-actions (message prefix-state properties)
-  "Insert per-message action buttons for MESSAGE using PREFIX-STATE.
+(defun qq-chat--message-title-face (message)
+  "Return sender title face for MESSAGE."
+  (if (alist-get 'self-p message)
+      'qq-msg-self-title
+    'qq-msg-user-title))
 
-Recalled stubs never get action buttons."
-  (unless (qq-state-message-recalled-p message)
-    (let* ((server-id (alist-get 'server-id message))
-           (has-resource (qq-chat--message-openable-p message))
-           (action-start (point))
-           (inserted nil))
-      (when server-id
-        (setq inserted t)
-        (qq-chat--insert-message-action-button
-         "[Reply]"
-         (lambda ()
-           (qq-chat--set-pending-reply message))
-         (format "Reply to %s" server-id)))
-      (when has-resource
-        (when inserted (insert " "))
-        (setq inserted t)
-        (qq-chat--insert-message-action-button
-         "[Open]"
-         (lambda ()
-           (qq-media-open-message-resource message))
-         "Open primary media resource"))
-      (when (alist-get 'sender-id message)
-        (when inserted (insert " "))
-        (setq inserted t)
-        (qq-chat--insert-message-action-button
-         "[Avatar]"
-         (lambda ()
-           (qq-media-open-message-avatar message))
-         "Open sender avatar"))
-      (when (and server-id (alist-get 'self-p message))
-        (when inserted (insert " "))
-        (setq inserted t)
-        (qq-chat--insert-message-action-button
-         "[Recall]"
-         (lambda ()
-           (qq-chat--delete-message-internal message))
-         (format "Recall %s" server-id)))
-      (when inserted
-        (insert "\n")
-        (qq-ui-apply-line-prefix action-start (point) prefix-state)
-        (add-text-properties action-start (point) (append properties (list 'face 'shadow)))))))
+(defun qq-chat--message-body-prefix (_message &optional compact)
+  "Return body line-prefix string for MESSAGE.
+
+Telega uses avatar-width spaces, not ASCII gutters.  We use a fixed two-space
+indent for body rows; compact continuations use the same indent."
+  (if compact "  " "  "))
 
 (defun qq-chat--render-message (message &optional previous-message)
   "Insert one formatted MESSAGE block.
 
 When PREVIOUS-MESSAGE is non-nil and no stored render context is available,
-fall back to computing compact grouping directly."
+fall back to computing compact grouping directly.
+
+Visual model (telega-inspired; later appkit):
+- optional date / unread bars above the node
+- heading row: avatar + sender + status + time (`qq-msg-heading')
+- optional reply preview (`qq-msg-inline-reply')
+- body with light indent (no `>>'/`|' gutters)
+- no per-message action button row (use `C-c m r/d/o/a' at point)"
   (let* ((anchor (qq-chat--message-anchor message))
          (start (point))
          (context (or (qq-chat--message-render-context message)
                       (qq-chat--compute-message-render-context previous-message message)))
          (insert-date (plist-get context :insert-date))
          (insert-unread (plist-get context :insert-unread))
-         (self-p (alist-get 'self-p message))
-         (author-face (if self-p 'font-lock-keyword-face 'default))
-         (header-prefix (if self-p ">> " "-- "))
-         (body-prefix (if self-p "   " "|  "))
+         (title-face (qq-chat--message-title-face message))
+         (body-prefix (qq-chat--message-body-prefix message))
          (reply-id (qq-chat--message-reply-id message))
          (properties (qq-chat--message-line-properties message anchor))
          (status-suffix (qq-chat--status-suffix message))
          (compact (plist-get context :compact))
-         (header-prefix-state (qq-ui-make-prefix-state header-prefix body-prefix))
          (body-prefix-state (qq-ui-make-prefix-state body-prefix body-prefix))
          (body-text (qq-chat--message-body message))
          (short-time (qq-chat--format-time-short (alist-get 'time message))))
@@ -1792,19 +1814,20 @@ fall back to computing compact grouping directly."
     (if (qq-state-message-recalled-p message)
         ;; Stub path for `qq-chat-show-recalled-messages' (telega deleted style).
         (let ((header-start (point)))
-          (qq-chat--insert-message-sender message author-face)
+          (qq-chat--insert-message-sender message title-face)
           (insert status-suffix)
           (insert "  ")
           (let ((time-start (point)))
             (insert (qq-chat--format-time (alist-get 'time message)))
-            (add-text-properties time-start (point) (list 'face 'shadow)))
+            (add-text-properties time-start (point) (list 'face 'qq-msg-status)))
           (insert "\n")
-          (qq-ui-apply-line-prefix header-start (point) header-prefix-state)
-          (add-text-properties header-start (point) properties)
+          (add-text-properties
+           header-start (point)
+           (append properties (list 'face 'qq-msg-deleted)))
           (qq-ui-insert-prefixed-lines
            body-prefix-state
            (qq-chat--message-body message)
-           :properties (append properties (list 'face 'shadow))))
+           :properties (append properties (list 'face 'qq-msg-deleted))))
       (if compact
           (progn
             (when reply-id
@@ -1818,15 +1841,14 @@ fall back to computing compact grouping directly."
                 (insert "  ")
                 (let ((time-start (point)))
                   (insert short-time)
-                  (add-text-properties time-start (point) (list 'face 'shadow))))
+                  (add-text-properties time-start (point) (list 'face 'qq-msg-status))))
               (insert "\n")
               (qq-ui-apply-line-prefix content-start (point) body-prefix-state)
               (add-text-properties content-start (point) properties)
               (when rest-lines
                 (let ((rest-start (point)))
                   (qq-ui-insert-prefixed-lines body-prefix-state (string-join rest-lines "\n") :properties properties)
-                  (add-text-properties rest-start (point) properties))))
-            (qq-chat--insert-message-actions message body-prefix-state properties))
+                  (add-text-properties rest-start (point) properties)))))
         (let ((header-start (point)))
           (when-let* ((sender-id (alist-get 'sender-id message)))
             (let ((avatar-start (point)))
@@ -1836,19 +1858,18 @@ fall back to computing compact grouping directly."
                (point)
                '(mouse-face highlight
                  help-echo "Open sender avatar"))))
-          (qq-chat--insert-message-sender message author-face)
+          (qq-chat--insert-message-sender message title-face)
           (insert status-suffix)
           (insert "  ")
           (let ((time-start (point)))
             (insert (qq-chat--format-time (alist-get 'time message)))
-            (add-text-properties time-start (point) (list 'face 'shadow)))
+            (add-text-properties time-start (point) (list 'face 'qq-msg-status)))
           (insert "\n")
-          (qq-ui-apply-line-prefix header-start (point) header-prefix-state)
+          (qq-ui-append-face header-start (point) 'qq-msg-heading)
           (add-text-properties header-start (point) properties))
         (when reply-id
           (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
-        (qq-chat--insert-message-body message body-prefix-state properties)
-        (qq-chat--insert-message-actions message body-prefix-state properties)))
+        (qq-chat--insert-message-body message body-prefix-state properties)))
     (insert "\n")
     (add-text-properties start (point) properties)))
 
