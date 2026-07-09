@@ -275,92 +275,21 @@ Values from NEW replace values in OLD."
       (setf (alist-get (car pair) merged nil nil #'eq) (cdr pair)))
     merged))
 
-(defun qq-state-message-recalled-p (message)
-  "Return non-nil when MESSAGE is marked recalled."
-  (eq (alist-get 'status message) 'recalled))
-
-(defun qq-state-message-empty-shell-p (message)
-  "Return non-nil when MESSAGE has no displayable body.
-
-NapCat history often keeps recalled rows as empty `message`/`raw_message`
-without a recalled flag (until fork exposes `recall_time').  Those shells
-must not render as blank header + action buttons."
-  (let ((segments (alist-get 'segments message))
-        (raw (alist-get 'raw-message message))
-        (preview (alist-get 'preview message)))
-    (and (or (null segments) (equal segments '()))
-         (or (null raw) (and (stringp raw) (string-empty-p raw)))
-         (or (null preview)
-             (and (stringp preview)
-                  (or (string-empty-p preview)
-                      (equal preview "[message recalled]")))))))
-
 (defun qq-state--raw-message-recalled-p (message)
-  "Return non-nil when raw OneBot MESSAGE is a recalled stub.
+  "Return non-nil when raw OneBot MESSAGE is explicitly recalled.
 
-NapCat fork may set `recalled' or non-zero `recall_time' (NT recallTime).
-Also treat fully empty body arrays as recalled stubs (common after revoke)."
+Only protocol fields from the NapCat fork (`recalled', `recall_time').
+Empty bodies alone are not treated as recalled — history must omit them
+or mark them at the NapCat layer."
   (let ((recalled (alist-get 'recalled message))
-        (recall-time (alist-get 'recall_time message))
-        (segments (alist-get 'message message))
-        (raw (alist-get 'raw_message message)))
+        (recall-time (alist-get 'recall_time message)))
     (or (eq recalled t)
         (eq recalled 'true)
         (and (numberp recalled) (not (zerop recalled)))
         (and (stringp recalled)
              (member (downcase recalled) '("true" "1" "yes")))
         (and recall-time
-             (not (member (format "%s" recall-time) '("" "0" "nil"))))
-        ;; History/event payload with no segments and no raw text.
-        (and (or (null segments) (equal segments '()))
-             (or (null raw) (and (stringp raw) (string-empty-p raw)))))))
-
-(defun qq-state--as-recalled-message (message)
-  "Return MESSAGE with recalled display fields forced."
-  (qq-state--merge-alists
-   message
-   '((status . recalled)
-     (segments . nil)
-     (raw-message . "[message recalled]")
-     (preview . "[message recalled]"))))
-
-(defun qq-state-scrub-empty-shells (&optional session-key)
-  "Mark empty-body shells as recalled in SESSION-KEY or all sessions.
-
-Return number of messages updated.  Used to repair live state after history
-imported empty stubs without a recalled flag."
-  (let ((keys (if session-key
-                  (list session-key)
-                (let (all)
-                  (maphash (lambda (k _v) (push k all))
-                           qq-state--messages-by-session)
-                  all)))
-        (count 0))
-    (dolist (key keys)
-      (let* ((messages (copy-tree
-                        (or (gethash key qq-state--messages-by-session) '())))
-             (changed nil)
-             (new-messages
-              (mapcar
-               (lambda (msg)
-                 (if (and (not (qq-state-message-recalled-p msg))
-                          (qq-state-message-empty-shell-p msg))
-                     (progn
-                       (setq changed t)
-                       (cl-incf count)
-                       (qq-state--as-recalled-message msg))
-                   msg))
-               messages)))
-        (when changed
-          (puthash key new-messages qq-state--messages-by-session)
-          (qq-state--reindex-session-messages key new-messages)
-          (qq-state--sync-session-summary key)
-          (qq-state--emit 'history
-                          :session-key key
-                          :message-count (length new-messages)
-                          :mutation 'history
-                          :source 'scrub))))
-    count))
+             (not (member (format "%s" recall-time) '("" "0" "nil")))))))
 
 (defun qq-state-session (session-key)
   "Return session object for SESSION-KEY."
@@ -501,25 +430,17 @@ When EMIT is non-nil, fire one session mutation event (`:mutation' `session')."
                         nil
                       sender-id))
          (sender-fields (qq-state--sender-display-fields session-key sender sender-id))
-         (recalled-p (qq-state--raw-message-recalled-p message))
-         (segments (if recalled-p
-                       '()
-                     (or (alist-get 'message message) '())))
-         (raw-message (if recalled-p
-                          "[message recalled]"
-                        (or (alist-get 'raw_message message)
-                            (qq-state-message-preview-from-segments segments)
-                            "")))
+         (segments (or (alist-get 'message message) '()))
+         (raw-message (or (alist-get 'raw_message message)
+                          (qq-state-message-preview-from-segments segments)
+                          ""))
          ;; NapCat hard-cut: message_id is the NT snowflake string (never coerce
          ;; with string-to-number — snowflakes exceed fixnum precision).
          (server-id (qq-state--normalize-id
                      (or (alist-get 'message_id message)
                          (alist-get 'id message))))
          (self-p (qq-state--message-self-p message))
-         (status (cond
-                  (recalled-p 'recalled)
-                  (self-p 'sent)
-                  (t 'received)))
+         (status (if self-p 'sent 'received))
          (time (qq-state--normalize-time (alist-get 'time message)))
          (target-id (or (and (qq-state--dataline-chat-type-p chat-type) peer-uid)
                         (qq-state--normalize-id (alist-get 'target_id message)))))
@@ -537,9 +458,7 @@ When EMIT is non-nil, fire one session mutation event (`:mutation' `session')."
       (status . ,status)
       (segments . ,segments)
       (raw-message . ,raw-message)
-      (preview . ,(if recalled-p
-                     "[message recalled]"
-                   (qq-state-message-preview-from-segments segments)))
+      (preview . ,(qq-state-message-preview-from-segments segments))
       (message-type . ,(alist-get 'message_type message))
       (chat-type . ,chat-type)
       (peer-uid . ,peer-uid)
@@ -748,18 +667,6 @@ Return three values via `cl-values':
          (mutation (if existing 'update 'create)))
     (when old-order
       (setf (alist-get 'order merged nil nil #'eq) old-order))
-    ;; History/live re-merge often rewrites recalled rows as empty sent/received
-    ;; stubs (OneBot drops NT recallTime). Keep recalled once known, unless the
-    ;; incoming payload itself asserts recalled.
-    (when (and existing
-               (qq-state-message-recalled-p existing)
-               (not (qq-state-message-recalled-p message)))
-      (setq merged (qq-state--as-recalled-message merged)))
-    ;; Incoming empty shell (no segments/raw) → force recalled even if status
-    ;; was still sent/received (history after revoke).
-    (when (and (not (qq-state-message-recalled-p merged))
-               (qq-state-message-empty-shell-p merged))
-      (setq merged (qq-state--as-recalled-message merged)))
     (if existing
         (setq messages (qq-state--replace-message messages existing merged))
       (push merged messages))
@@ -776,39 +683,56 @@ Return three values via `cl-values':
     (cl-values merged mutation previous-anchor)))
 
 (defun qq-state-merge-live-message (message)
-  "Merge live websocket MESSAGE into local state and return its session key."
-  (let* ((normalized (qq-state--normalize-raw-message message))
-         (session-key (alist-get 'session-key normalized)))
-    (when session-key
-      (cl-multiple-value-bind (merged mutation previous-anchor)
-          (qq-state--merge-normalized-message
-           session-key
-           normalized
-           (not (alist-get 'self-p normalized)))
-        (when merged
-          (apply #'qq-state--emit
-                 'message
-                 :session-key session-key
-                 :message (copy-tree merged)
-                 :message-anchor (qq-state-message-anchor merged)
-                 :mutation mutation
-                 :source 'event
-                 (when previous-anchor
-                   (list :previous-anchor previous-anchor))))))
-    session-key))
+  "Merge live websocket MESSAGE into local state and return its session key.
+
+Explicit NapCat `recalled' payloads remove any local row (same as notice)."
+  (if (qq-state--raw-message-recalled-p message)
+      (progn
+        (qq-state-apply-recall
+         (or (alist-get 'message_id message)
+             (alist-get 'id message)))
+        (qq-state--raw-message-session-key message))
+    (let* ((normalized (qq-state--normalize-raw-message message))
+           (session-key (alist-get 'session-key normalized)))
+      (when session-key
+        (cl-multiple-value-bind (merged mutation previous-anchor)
+            (qq-state--merge-normalized-message
+             session-key
+             normalized
+             (not (alist-get 'self-p normalized)))
+          (when merged
+            (apply #'qq-state--emit
+                   'message
+                   :session-key session-key
+                   :message (copy-tree merged)
+                   :message-anchor (qq-state-message-anchor merged)
+                   :mutation mutation
+                   :source 'event
+                   (when previous-anchor
+                     (list :previous-anchor previous-anchor))))))
+      session-key)))
 
 (defun qq-state-merge-history (session-key raw-messages)
-  "Merge RAW-MESSAGES history batch into SESSION-KEY."
+  "Merge RAW-MESSAGES history batch into SESSION-KEY.
+
+Rows marked recalled by NapCat are dropped (fork history should already omit
+them; this only honors the protocol flag, no empty-body guessing)."
   (qq-state-upsert-session session-key nil nil)
-  (dolist (raw-message (or raw-messages '()))
-    (qq-state--merge-normalized-message
-     session-key
-     (qq-state--normalize-raw-message raw-message session-key)
-     nil))
-  (qq-state--emit 'history
-                  :session-key session-key
-                  :message-count (length raw-messages)
-                  :mutation 'history)
+  (let ((merged-count 0))
+    (dolist (raw-message (or raw-messages '()))
+      (if (qq-state--raw-message-recalled-p raw-message)
+          (qq-state-apply-recall
+           (or (alist-get 'message_id raw-message)
+               (alist-get 'id raw-message)))
+        (qq-state--merge-normalized-message
+         session-key
+         (qq-state--normalize-raw-message raw-message session-key)
+         nil)
+        (cl-incf merged-count)))
+    (qq-state--emit 'history
+                    :session-key session-key
+                    :message-count merged-count
+                    :mutation 'history))
   session-key)
 
 (defun qq-state-mark-pending-message-sent (session-key local-id message-id)
@@ -876,9 +800,13 @@ hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor."
   0)
 
 (defun qq-state-apply-recall (message-id)
-  "Mark MESSAGE-ID as recalled when it exists locally."
+  "Remove MESSAGE-ID from local state when present (telega-like hide).
+
+NapCat is responsible for not reintroducing revoked rows via history.
+Return non-nil when a local message was removed."
   (let* ((normalized-id (qq-state--normalize-id message-id))
-         (session-key (gethash normalized-id qq-state--message-session-index))
+         (session-key (and normalized-id
+                           (gethash normalized-id qq-state--message-session-index)))
          (messages (and session-key
                         (copy-tree (or (gethash session-key qq-state--messages-by-session) '()))))
          (existing (and messages
@@ -887,17 +815,20 @@ hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor."
                          (lambda (it)
                            (equal (alist-get 'server-id it) normalized-id))))))
     (when (and session-key existing)
-      (let ((updated (qq-state--as-recalled-message existing)))
-        (setq messages (qq-state--replace-message messages existing updated))
-        (puthash session-key messages qq-state--messages-by-session)
-        (qq-state--sync-session-summary session-key)
-        (qq-state--emit 'message
-                        :session-key session-key
-                        :message (copy-tree updated)
-                        :message-anchor (qq-state-message-anchor updated)
-                        :mutation 'update
-                        :source 'notice)
-        updated))))
+      (setq messages
+            (cl-remove-if (lambda (it)
+                            (equal (alist-get 'server-id it) normalized-id))
+                          messages))
+      (puthash session-key messages qq-state--messages-by-session)
+      (remhash normalized-id qq-state--message-session-index)
+      (qq-state--reindex-session-messages session-key messages)
+      (qq-state--sync-session-summary session-key)
+      (qq-state--emit 'message
+                      :session-key session-key
+                      :message-anchor normalized-id
+                      :mutation 'delete
+                      :source 'notice)
+      t)))
 
 (defun qq-state--recent-contact-title (contact session-key)
   "Return display title for recent CONTACT in SESSION-KEY."
