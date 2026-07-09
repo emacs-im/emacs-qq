@@ -346,12 +346,80 @@ alist returned by NapCat."
   "Return candidate file keys from SEGMENT, in preference order."
   (let* ((data (alist-get 'data segment))
          (keys (list (alist-get 'file_id data)
-                     (alist-get 'file data))))
+                     (alist-get 'file data)
+                     (alist-get 'path data))))
     (delete-dups (delq nil keys))))
 
 (defun qq-media--segment-file-key (segment)
   "Return best file key from SEGMENT."
   (car (qq-media--segment-file-keys segment)))
+
+(defun qq-media--segment-existing-path (segment)
+  "Return an existing local filesystem path from SEGMENT, or nil.
+
+Outbound attach/pending segments carry absolute paths in `file' or `path'.
+Those must never be sent to NapCat `get_image'/`get_file' (Telega-style
+local-first rendering)."
+  (let* ((data (alist-get 'data segment))
+         (candidates (list (alist-get 'path data)
+                           (alist-get 'file data))))
+    (catch 'found
+      (dolist (candidate candidates)
+        (when (qq-media-file-present-p candidate)
+          (throw 'found candidate)))
+      nil)))
+
+(defun qq-media--segment-remote-file-keys (segment)
+  "Return SEGMENT file keys that are not existing local paths.
+
+Only these keys are safe to pass to NapCat `get_image'/`get_file'."
+  (let (remote)
+    (dolist (key (qq-media--segment-file-keys segment))
+      (unless (qq-media-file-present-p key)
+        (push key remote)))
+    (nreverse remote)))
+
+(defun qq-media--resource-from-local+url (local url)
+  "Build a resource alist from LOCAL path and optional URL."
+  (append
+   (when (qq-media-file-present-p local)
+     `((file . ,local)))
+   (when (qq-media-url-present-p url)
+     `((url . ,url)))))
+
+(defun qq-media--resolve-fileish-segment (segment action callback errback &optional final-error)
+  "Resolve file-like SEGMENT with Telega-style priority.
+
+Order:
+1. Existing local path on the segment (outbound attach / pending)
+2. NapCat ACTION (`get_image'/`get_file') with remote file keys only
+3. Direct `url' from the segment
+4. ERRBACK
+
+NapCat/NT still owns remote materialization and QQ disk cache; the client
+never treats a local absolute path as a NapCat file id."
+  (let* ((url (qq-media--segment-url segment))
+         (local (qq-media--segment-existing-path segment))
+         (remote-keys (qq-media--segment-remote-file-keys segment))
+         (error-fn (or errback #'qq-api--default-error))
+         (fail-msg (or final-error
+                       "media segment has neither local file, file id, nor URL")))
+    (cond
+     (local
+      (funcall callback (qq-media--resource-from-local+url local url)))
+     (remote-keys
+      (qq-media--call-fileish-action
+       action remote-keys
+       callback
+       (lambda (response reason)
+         (if (qq-media-url-present-p url)
+             (funcall callback `((url . ,url)))
+           (funcall error-fn response (or reason fail-msg))))
+       fail-msg))
+     ((qq-media-url-present-p url)
+      (funcall callback `((url . ,url))))
+     (t
+      (funcall error-fn nil fail-msg)))))
 
 (defun qq-media--image-file-name-p (filename)
   "Return non-nil when FILENAME looks like an image file."
@@ -415,39 +483,38 @@ ERRBACK with FINAL-ERROR or the last backend reason."
       (_ nil))))
 
 (defun qq-media--fetch-segment-resource (segment callback &optional errback)
-  "Fetch media resource for SEGMENT and pass it to CALLBACK."
+  "Fetch media resource for SEGMENT and pass it to CALLBACK.
+
+Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment')."
   (let* ((type (alist-get 'type segment))
          (data (alist-get 'data segment))
-         (file-keys (qq-media--segment-file-keys segment))
-         (url (alist-get 'url data))
          (emoji-id (alist-get 'id data))
          (error-fn (or errback #'qq-api--default-error)))
     (pcase type
       ("image"
-       (if file-keys
-           (qq-media--call-fileish-action
-            "get_image" file-keys callback error-fn
-            "image segment has neither usable file id nor URL")
-         (if (qq-media-url-present-p url)
-             (funcall callback `((url . ,url)))
-           (funcall error-fn nil "image segment has neither file id nor URL"))))
+       (qq-media--resolve-fileish-segment
+        segment "get_image" callback error-fn
+        "image segment has neither local file, file id, nor URL"))
       ((or "file" "video")
-       (if file-keys
-           (qq-media--call-fileish-action
-            (if (qq-media-imageish-file-segment-p segment)
-                "get_image"
-              "get_file")
-            file-keys callback error-fn
-            (format "%s segment has neither usable file id nor URL" type))
-         (if (qq-media-url-present-p url)
-             (funcall callback `((url . ,url)))
-           (funcall error-fn nil (format "%s segment has neither file id nor URL" type)))))
+       (qq-media--resolve-fileish-segment
+        segment
+        (if (qq-media-imageish-file-segment-p segment)
+            "get_image"
+          "get_file")
+        callback error-fn
+        (format "%s segment has neither local file, file id, nor URL" type)))
       ("record"
-       (if file-keys
+       (let ((remote-keys (qq-media--segment-remote-file-keys segment))
+             (local (qq-media--segment-existing-path segment)))
+         (cond
+          (local
+           (funcall callback `((file . ,local))))
+          (remote-keys
            (letrec ((try-next
                      (lambda (keys last-reason last-response)
                        (if (null keys)
-                           (funcall error-fn last-response (or last-reason "record segment has no usable file id"))
+                           (funcall error-fn last-response
+                                    (or last-reason "record segment has no usable file id"))
                          (qq-api-call
                           "get_record"
                           `((file . ,(car keys))
@@ -456,32 +523,35 @@ ERRBACK with FINAL-ERROR or the last backend reason."
                             (funcall callback (qq-api--response-data response)))
                           (lambda (response reason)
                             (funcall try-next (cdr keys) reason response)))))))
-             (funcall try-next file-keys nil nil))
-         (funcall error-fn nil "record segment has no file id")))
+             (funcall try-next remote-keys nil nil)))
+          (t
+           (funcall error-fn nil "record segment has no file id")))))
       ("face"
        (if emoji-id
            (qq-api-get-base-emoji emoji-id callback error-fn)
          (funcall error-fn nil "face segment has no id")))
       ("mface"
-       (cond
-        (file-keys
-         (qq-media--call-fileish-action
-          "get_image" file-keys callback error-fn
-          "mface segment has neither usable file id nor URL"))
-        ((qq-media-url-present-p url)
-         (funcall callback `((url . ,url))))
-        (t
-         (funcall error-fn nil "mface segment has neither file id nor URL"))))
+       (qq-media--resolve-fileish-segment
+        segment "get_image" callback error-fn
+        "mface segment has neither local file, file id, nor URL"))
       (_
        (funcall error-fn nil (format "unsupported segment type for resource fetch: %s" type))))))
 
 (defun qq-media-resolve-segment-resource (segment callback &optional errback)
   "Resolve media resource for SEGMENT and pass it to CALLBACK."
   (let ((cache-key (qq-media--segment-resource-key segment))
-        (url (qq-media--segment-url segment)))
+        (url (qq-media--segment-url segment))
+        (local (qq-media--segment-existing-path segment)))
     (cond
      ((and cache-key (qq-media--cached-resource cache-key))
       (funcall callback (qq-media--cached-resource cache-key)))
+     ;; Local-first even when no logical cache key is available.
+     (local
+      (let ((resource (qq-media--resource-from-local+url local url)))
+        (when cache-key
+          (qq-media--cache-resource cache-key resource)
+          (qq-media--note-cache-updated cache-key))
+        (funcall callback resource)))
      (cache-key
       (qq-media--fetch-segment-resource
        segment
@@ -493,7 +563,7 @@ ERRBACK with FINAL-ERROR or the last backend reason."
      ((qq-media-url-present-p url)
       (funcall callback `((url . ,url))))
      (errback
-      (funcall errback nil "resource has neither cache key nor URL"))
+      (funcall errback nil "resource has neither local file, cache key, nor URL"))
      (t
       (user-error "qq: segment has neither local file nor URL")))))
 
@@ -831,13 +901,19 @@ When image data is not ready yet, return a textual fallback."
 
 (defun qq-media-segment-preview-key (segment)
   "Return preview cache key for SEGMENT, or nil when unsupported."
-  (let* ((type (alist-get 'type segment))
-         (preview-type (if (qq-media-imageish-file-segment-p segment)
-                           "file-image"
-                         type))
-         (file-key (qq-media--segment-file-key segment)))
-    (when (and (qq-media-segment-preview-capable-p segment) file-key)
-      (format "preview:%s:%s" preview-type file-key))))
+  (when (qq-media-segment-preview-capable-p segment)
+    (let* ((type (alist-get 'type segment))
+           (preview-type (if (qq-media-imageish-file-segment-p segment)
+                             "file-image"
+                           type))
+           (file-key (qq-media--segment-file-key segment))
+           (url (qq-media--segment-url segment)))
+      (cond
+       (file-key
+        (format "preview:%s:%s" preview-type file-key))
+       ((qq-media-url-present-p url)
+        (format "preview:%s-url:%s" preview-type url))
+       (t nil)))))
 
 (defun qq-media-segment-cache-keys (segment)
   "Return logical media cache keys that can affect SEGMENT rendering."
@@ -856,16 +932,33 @@ When image data is not ready yet, return a textual fallback."
     (delete-dups (delq nil keys))))
 
 (defun qq-media-segment-preview-image (segment)
-  "Return inline preview image for SEGMENT, triggering fetch when needed."
-  (let* ((file-keys (qq-media--segment-file-keys segment))
-         (key (qq-media-segment-preview-key segment)))
+  "Return inline preview image for SEGMENT, triggering fetch when needed.
+
+Resolution order matches `qq-media--resolve-fileish-segment': local path,
+then NapCat get_image for remote keys, then segment URL.  Preview failures
+are soft (no NapCat error spam).
+
+When SEGMENT already has an existing local path (outbound attach), seed the
+resource cache so the image can be built synchronously without touching NapCat."
+  (let ((key (qq-media-segment-preview-key segment))
+        (local (qq-media--segment-existing-path segment)))
     (when key
+      (when local
+        (qq-media--cache-resource
+         key
+         (qq-media--resource-from-local+url
+          local (qq-media--segment-url segment))))
       (qq-media--ensure-resource-image
        key
        (lambda (done error)
-         (if (and (qq-media-segment-preview-capable-p segment) file-keys)
-             (qq-media--call-fileish-action
-              "get_image" file-keys done error
+         (if (qq-media-segment-preview-capable-p segment)
+             (qq-media--resolve-fileish-segment
+              segment
+              "get_image"
+              done
+              ;; Soft-fail: clear fetching without user-error / NapCat spam.
+              (lambda (_response _reason)
+                (funcall error nil "preview image not found"))
               "preview image not found")
            (funcall done nil)))
        nil

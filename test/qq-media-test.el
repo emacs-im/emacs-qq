@@ -155,6 +155,110 @@
        (should errback-called)
        (should-not (qq-media--resource-fetching-p "avatar:10001"))))))
 
+(ert-deftest qq-media-resolve-fileish-prefers-existing-local-path ()
+  "Outbound attach paths must not hit NapCat get_image."
+  (qq-media-test-with-reset
+   (let* ((local-file (make-temp-file "qq-attach" nil ".png"))
+          (segment `((type . "image")
+                     (data . ((file . ,local-file)
+                              (name . "attach.png")
+                              (url . "https://example.com/ignored.png")))))
+          (api-called nil)
+          result)
+     (unwind-protect
+         (progn
+           (with-temp-file local-file
+             (insert "png-bytes"))
+           (cl-letf (((symbol-function 'qq-api-call)
+                      (lambda (&rest _args)
+                        (setq api-called t)
+                        (ert-fail "get_image must not run for local path"))))
+             (qq-media--resolve-fileish-segment
+              segment "get_image"
+              (lambda (resource) (setq result resource))
+              (lambda (&rest _args)
+                (ert-fail "errback must not run for local path"))))
+           (should-not api-called)
+           (should (equal (alist-get 'file result) local-file))
+           (should (equal (alist-get 'url result)
+                          "https://example.com/ignored.png")))
+       (when (file-exists-p local-file)
+         (delete-file local-file))))))
+
+(ert-deftest qq-media-resolve-fileish-falls-back-to-url-after-get-image-fails ()
+  (qq-media-test-with-reset
+   (let* ((segment '((type . "image")
+                     (data . ((file . "not-registered.jpg")
+                              (url . "https://example.com/pic.jpg")))))
+          (api-actions nil)
+          result)
+     (cl-letf (((symbol-function 'qq-api-call)
+                (lambda (action _params success error)
+                  (push action api-actions)
+                  (funcall error nil "file not found"))))
+       (qq-media--resolve-fileish-segment
+        segment "get_image"
+        (lambda (resource) (setq result resource))
+        (lambda (&rest _args)
+          (ert-fail "should fall back to url instead of errback"))))
+     (should (equal api-actions '("get_image")))
+     (should (equal (alist-get 'url result) "https://example.com/pic.jpg"))
+     (should-not (alist-get 'file result)))))
+
+(ert-deftest qq-media-resolve-fileish-skips-local-path-in-remote-keys ()
+  (qq-media-test-with-reset
+   (let* ((local-file (make-temp-file "qq-attach" nil ".png"))
+          (segment `((type . "image")
+                     (data . ((file_id . "remote-name.jpg")
+                              (file . ,local-file)))))
+          (api-files nil)
+          result)
+     (unwind-protect
+         (progn
+           (with-temp-file local-file
+             (insert "png-bytes"))
+           ;; Local path wins entirely; remote key is not consulted.
+           (cl-letf (((symbol-function 'qq-api-call)
+                      (lambda (_action params _success _error)
+                        (push (alist-get 'file params) api-files))))
+             (qq-media--resolve-fileish-segment
+              segment "get_image"
+              (lambda (resource) (setq result resource))
+              #'ignore))
+           (should-not api-files)
+           (should (equal (alist-get 'file result) local-file))
+           (should (equal (qq-media--segment-remote-file-keys segment)
+                          '("remote-name.jpg"))))
+       (when (file-exists-p local-file)
+         (delete-file local-file))))))
+
+(ert-deftest qq-media-segment-preview-image-uses-local-file-without-api ()
+  (qq-media-test-with-reset
+   (let* ((local-file (make-temp-file "qq-preview" nil ".png"))
+          (segment `((type . "image")
+                     (data . ((file . ,local-file)))))
+          (api-called nil)
+          image)
+     (unwind-protect
+         (progn
+           (with-temp-file local-file
+             (insert "png-bytes"))
+           (cl-letf (((symbol-function 'qq-api-call)
+                      (lambda (&rest _args)
+                        (setq api-called t)
+                        nil))
+                     ((symbol-function 'qq-media--preview-image-from-file)
+                      (lambda (file _spec)
+                        (list 'preview file))))
+             (setq image (qq-media-segment-preview-image segment))
+             (should (equal image (list 'preview local-file)))
+             (should-not api-called)
+             ;; Second call hits image cache.
+             (should (equal (qq-media-segment-preview-image segment)
+                            (list 'preview local-file)))))
+       (when (file-exists-p local-file)
+         (delete-file local-file))))))
+
 (provide 'qq-media-test)
 
 ;;; qq-media-test.el ends here
