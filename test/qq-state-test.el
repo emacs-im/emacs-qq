@@ -454,7 +454,8 @@
        (let ((history-event (car events)))
          (should (eq (plist-get history-event :type) 'history))
          (should (eq (plist-get history-event :mutation) 'history))
-         (should (= (plist-get history-event :message-count) 1)))
+         (should (= (plist-get history-event :message-count) 1))
+         (should (= (plist-get history-event :added-count) 1)))
        (setq events nil)
        (qq-state-clear-session-unread "private:10001")
        (let ((read-event (car events)))
@@ -466,6 +467,44 @@
          (should (eq (plist-get restore-event :mutation) 'read))
          (should (= 4 (alist-get 'unread-count
                                  (qq-state-session "private:10001")))))))))
+
+(ert-deftest qq-state-merge-history-added-count-skips-duplicates ()
+  (let ((qq-state-change-hook nil)
+        meta)
+    (qq-state-reset)
+    (qq-state-upsert-session "private:10001" '((target-id . "10001")) nil)
+    (qq-state-merge-history
+     "private:10001"
+     (list
+      '((message_id . "100")
+        (message_type . "private")
+        (user_id . 10001)
+        (time . 1710000001)
+        (sender . ((user_id . 10001) (nickname . "A")))
+        (raw_message . "a")
+        (message . (((type . "text") (data . ((text . "a")))))))))
+    (setq meta
+          (qq-state-merge-history
+           "private:10001"
+           (list
+            '((message_id . "100")
+              (message_type . "private")
+              (user_id . 10001)
+              (time . 1710000001)
+              (sender . ((user_id . 10001) (nickname . "A")))
+              (raw_message . "a")
+              (message . (((type . "text") (data . ((text . "a")))))))
+            '((message_id . "90")
+              (message_type . "private")
+              (user_id . 10001)
+              (time . 1710000000)
+              (sender . ((user_id . 10001) (nickname . "A")))
+              (raw_message . "older")
+              (message . (((type . "text") (data . ((text . "older"))))))))))
+    (should (= (plist-get meta :message-count) 2))
+    (should (= (plist-get meta :added-count) 1))
+    (should (equal (plist-get meta :oldest-message-id) "90"))
+    (should (= (length (qq-state-session-messages "private:10001")) 2))))
 
 (provide 'qq-state-test)
 

@@ -886,18 +886,39 @@ Return three values via `cl-values':
   "Merge RAW-MESSAGES history batch into SESSION-KEY.
 
 Recalled rows from NapCat (`recalled'/`recall_time') are stored as stubs so
-`qq-chat-show-recalled-messages' can optionally show them."
+`qq-chat-show-recalled-messages' can optionally show them.
+
+Return a plist:
+  :session-key, :message-count (batch size), :added-count (new server ids),
+  :oldest-message-id (after merge).  Chat uses `:added-count' to detect
+  beginning-of-history when NapCat returns only already-cached rows."
   (qq-state-upsert-session session-key nil nil)
-  (dolist (raw-message (or raw-messages '()))
-    (qq-state--merge-normalized-message
-     session-key
-     (qq-state--normalize-raw-message raw-message session-key)
-     nil))
-  (qq-state--emit 'history
-                  :session-key session-key
-                  :message-count (length raw-messages)
-                  :mutation 'history)
-  session-key)
+  (let ((known-ids (make-hash-table :test #'equal))
+        (added 0)
+        (batch (or raw-messages '())))
+    (dolist (message (or (gethash session-key qq-state--messages-by-session) '()))
+      (when-let* ((server-id (alist-get 'server-id message)))
+        (puthash server-id t known-ids)))
+    (dolist (raw-message batch)
+      (let* ((normalized (qq-state--normalize-raw-message raw-message session-key))
+             (server-id (alist-get 'server-id normalized))
+             (already (and server-id (gethash server-id known-ids))))
+        (qq-state--merge-normalized-message session-key normalized nil)
+        (when (and server-id (not already))
+          (cl-incf added)
+          (puthash server-id t known-ids))))
+    (let ((oldest (qq-state-session-oldest-message-id session-key))
+          (count (length batch)))
+      (qq-state--emit 'history
+                      :session-key session-key
+                      :message-count count
+                      :added-count added
+                      :oldest-message-id oldest
+                      :mutation 'history)
+      (list :session-key session-key
+            :message-count count
+            :added-count added
+            :oldest-message-id oldest))))
 
 (defun qq-state-mark-pending-message-sent (session-key local-id message-id)
   "Mark local pending message LOCAL-ID as sent with MESSAGE-ID in SESSION-KEY.

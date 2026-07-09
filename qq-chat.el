@@ -82,6 +82,12 @@
 (defvar-local qq-chat--media-anchors-by-key nil
   "Hash table mapping media cache keys to affected message anchors.")
 
+(defvar-local qq-chat--history-loading nil
+  "Non-nil while an older-history request is in flight for this chat.")
+
+(defvar-local qq-chat--history-exhausted nil
+  "Non-nil when older history is known to be exhausted for this chat.")
+
 (defvar qq-chat-timeline-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "q") #'quit-window)
@@ -568,7 +574,8 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
   "Build EWOC header text for the current chat state.
 
 Default is title-only.  Long help lines are optional via
-`qq-chat-show-header-help' (see also `C-c ?')."
+`qq-chat-show-header-help' (see also `C-c ?').  Older-history load state is
+shown when loading or exhausted (disco-style)."
   (let* ((session (qq-chat--session))
          (title (or (alist-get 'title session) qq-chat--session-key))
          (text
@@ -576,6 +583,11 @@ Default is title-only.  Long help lines are optional via
             (qq-view-insert-heading-line title)
             (when qq-chat-show-header-help
               (qq-view-insert-note-line (qq-chat--header-help-text)))
+            (cond
+             (qq-chat--history-loading
+              (qq-view-insert-note-line "(loading older messages…)"))
+             (qq-chat--history-exhausted
+              (qq-view-insert-note-line "(older history exhausted)")))
             (insert "\n")
             (buffer-string))))
     (add-text-properties
@@ -2272,16 +2284,64 @@ Return non-nil on success."
   (interactive)
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
+  (setq qq-chat--history-exhausted nil)
+  (setq qq-chat--history-loading nil)
   (qq-chat-render)
   (qq-api-fetch-history qq-chat--session-key))
 
 (defun qq-chat-load-older-messages ()
-  "Load older history page for the current chat."
+  "Load one older history page for the current chat (telega/disco `M-<').
+
+Uses the oldest cached snowflake `server-id' as NapCat `message_seq'.  Guards
+against concurrent requests and marks history exhausted when NapCat returns no
+new rows or reports the cursor missing."
   (interactive)
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
-  (qq-api-fetch-history qq-chat--session-key
-                        (qq-state-session-oldest-message-id qq-chat--session-key)))
+  (cond
+   (qq-chat--history-exhausted
+    (message "qq: no older messages available"))
+   (qq-chat--history-loading
+    (message "qq: older history load already in progress"))
+   (t
+    (let* ((session-key qq-chat--session-key)
+           (before (qq-state-session-oldest-message-id session-key))
+           (buffer (current-buffer)))
+      (unless before
+        (user-error "qq: no oldest message cursor; refresh first (C-c g)"))
+      (setq qq-chat--history-loading t)
+      (qq-api-fetch-history
+       session-key
+       before
+       (lambda (meta)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (when (equal qq-chat--session-key session-key)
+               (setq qq-chat--history-loading nil)
+               (let ((added (or (plist-get meta :added-count) 0)))
+                 (if (<= added 0)
+                     (progn
+                       (setq qq-chat--history-exhausted t)
+                       (qq-chat--chat-update 'header-line 'header)
+                       (message "qq: reached beginning of history"))
+                   ;; Timeline already reconciled via history hook; only
+                   ;; clear the loading note in the header.
+                   (qq-chat--chat-update 'header-line 'header)
+                   (message "qq: loaded %d older message%s"
+                            added
+                            (if (= added 1) "" "s"))))))))
+       (lambda (response reason)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (when (equal qq-chat--session-key session-key)
+               (setq qq-chat--history-loading nil)
+               (if (qq-api--history-exhausted-error-p response reason)
+                   (progn
+                     (setq qq-chat--history-exhausted t)
+                     (qq-chat--chat-update 'header-line 'header)
+                     (message "qq: reached beginning of history"))
+                 (qq-chat--chat-update 'header-line 'header)
+                 (qq-api--default-error response reason)))))))))))
 
 (defun qq-chat-send-message ()
   "Send current chat draft."
@@ -2480,6 +2540,8 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (setq-local qq-chat--render-context-by-anchor (make-hash-table :test #'equal))
   (setq-local qq-chat--media-anchors-by-key (make-hash-table :test #'equal))
   (setq-local qq-chat--deferred-node-anchors nil)
+  (setq-local qq-chat--history-loading nil)
+  (setq-local qq-chat--history-exhausted nil)
   ;; telega-style: M-x yank-media also drops images into the composer.
   (when (fboundp 'yank-media-handler)
     (funcall #'yank-media-handler
@@ -2501,6 +2563,8 @@ Attach from clipboard with `C-c C-v' (telega-style)."
       (unless (derived-mode-p 'qq-chat-mode)
         (qq-chat-mode))
       (setq qq-chat--session-key session-key)
+      (setq qq-chat--history-exhausted nil)
+      (setq qq-chat--history-loading nil)
       (qq-chat-render)
       (goto-char (or (qq-chat--input-logical-end-position) (point-max)))
       (qq-api-fetch-history session-key)
@@ -2581,7 +2645,9 @@ Prefer `qq-state' `:mutation' metadata when present:
                   (qq-chat-read-all))))
              ((eq event-type 'history)
               (when (equal event-session-key qq-chat--session-key)
-                (qq-chat-render)))
+                ;; Reconcile can prepend older anchors when order is compatible;
+                ;; still goes through partitioned timeline update (preserve point).
+                (qq-chat--chat-update 'header-line 'header 'timeline)))
              ((eq event-type 'reset)
               (qq-chat-render))
              ((eq event-type 'session)

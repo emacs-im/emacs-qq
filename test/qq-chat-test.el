@@ -1075,6 +1075,69 @@
                             (alist-get 'name (alist-get 'data (nth 1 sent-segments))))))
          (ignore-errors (delete-file path)))))))
 
+(ert-deftest qq-chat-load-older-messages-uses-oldest-cursor-and-guards ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice")
+      (target-id . "10001")
+      (oldest-message-id . "200"))
+    nil)
+   ;; Seed one message so oldest cursor is real after merge.
+   (qq-state-merge-history
+    "private:10001"
+    (list
+     '((message_id . "200")
+       (message_type . "private")
+       (user_id . 10001)
+       (time . 1710000200)
+       (sender . ((user_id . 10001) (nickname . "Alice")))
+       (raw_message . "latest")
+       (message . (((type . "text") (data . ((text . "latest")))))))))
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (should (equal (qq-state-session-oldest-message-id "private:10001") "200"))
+     (let (captured-before)
+       (cl-letf (((symbol-function 'qq-api-fetch-history)
+                  (lambda (session-key &optional before callback _errback)
+                    (setq captured-before before)
+                    (should (equal session-key "private:10001"))
+                    (when callback
+                      (funcall callback
+                               (list :session-key session-key
+                                     :message-count 1
+                                     :added-count 1
+                                     :oldest-message-id "100"))))))
+         (qq-chat-load-older-messages)
+         (should (equal captured-before "200"))
+         (should-not qq-chat--history-loading)
+         (should-not qq-chat--history-exhausted)))
+     ;; Exhausted path: zero added.
+     (setq qq-chat--history-loading nil)
+     (setq qq-chat--history-exhausted nil)
+     (cl-letf (((symbol-function 'qq-api-fetch-history)
+                (lambda (_session-key &optional _before callback _errback)
+                  (when callback
+                    (funcall callback
+                             (list :added-count 0 :message-count 1))))))
+       (qq-chat-load-older-messages)
+       (should qq-chat--history-exhausted)
+       (should-not qq-chat--history-loading))
+     ;; Guard when exhausted.
+     (cl-letf (((symbol-function 'qq-api-fetch-history)
+                (lambda (&rest _) (error "should not fetch when exhausted"))))
+       (qq-chat-load-older-messages)
+       (should qq-chat--history-exhausted)))))
+
+(ert-deftest qq-api-history-exhausted-error-p ()
+  (require 'qq-api)
+  (should (qq-api--history-exhausted-error-p nil "消息200不存在"))
+  (should (qq-api--history-exhausted-error-p
+           '((message . "消息 not exist")) "fail"))
+  (should-not (qq-api--history-exhausted-error-p nil "timeout")))
+
 (provide 'qq-chat-test)
 
 ;;; qq-chat-test.el ends here

@@ -110,8 +110,29 @@ ERRBACK falls back to `qq-api--default-error'."
        `((user_id . ,(or (alist-get 'peer-uin session)
                          target-id)))))))
 
-(defun qq-api-fetch-history (session-key &optional before-message-id)
-  "Fetch history for SESSION-KEY before BEFORE-MESSAGE-ID when provided."
+(defun qq-api--history-exhausted-error-p (response reason)
+  "Return non-nil when RESPONSE/REASON means no older history page.
+
+NapCat throws when `message_seq' is unknown or the page is empty
+(\"消息…不存在\").  For load-older that is end-of-history, not a hard failure."
+  (let ((text (format "%s%s"
+                      (or reason "")
+                      (or (and (listp response) (alist-get 'message response))
+                          (and (listp response) (alist-get 'wording response))
+                          ""))))
+    (or (string-match-p "不存在" text)
+        (string-match-p "not exist" text)
+        (string-match-p "no message" text))))
+
+(defun qq-api-fetch-history (session-key &optional before-message-id callback errback)
+  "Fetch history for SESSION-KEY before BEFORE-MESSAGE-ID when provided.
+
+BEFORE-MESSAGE-ID is the NapCat hard-cut snowflake `message_id' of the oldest
+already-loaded row (legacy param name `message_seq' on the wire).
+
+CALLBACK is called with the merge-history plist
+\(`:added-count', `:message-count', `:oldest-message-id', …) after a successful
+merge.  ERRBACK receives (RESPONSE REASON) like other `qq-api-call' errors."
   (interactive)
   (let* ((session (qq-state-session session-key))
          (type (or (alist-get 'type session)
@@ -130,8 +151,11 @@ ERRBACK falls back to `qq-api--default-error'."
      params
      (lambda (response)
        (let* ((data (qq-api--response-data response))
-              (messages (alist-get 'messages data nil nil #'eq)))
-         (qq-state-merge-history session-key messages))))))
+              (messages (alist-get 'messages data nil nil #'eq))
+              (meta (qq-state-merge-history session-key messages)))
+         (when callback
+           (funcall callback meta))))
+     errback)))
 
 (defun qq-api-mark-session-read (session-key)
   "Mark SESSION-KEY as read both locally and in NapCat.
