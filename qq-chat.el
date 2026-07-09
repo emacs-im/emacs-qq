@@ -655,9 +655,26 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
              (hash-table-p qq-chat--media-anchors-by-key))
     (delete-dups (copy-sequence (gethash media-key qq-chat--media-anchors-by-key)))))
 
+(defun qq-chat--message-visible-in-timeline-p (message)
+  "Return non-nil when MESSAGE should appear in the chat timeline.
+
+Recalled messages are hidden by default (telega-like).  Set
+`qq-chat-show-recalled-messages' non-nil to keep stubs."
+  (or qq-chat-show-recalled-messages
+      (not (qq-state-message-recalled-p message))))
+
+(defun qq-chat--timeline-messages (&optional messages)
+  "Return MESSAGES (or current session messages) filtered for timeline display."
+  (seq-filter #'qq-chat--message-visible-in-timeline-p
+              (or messages
+                  (and qq-chat--session-key
+                       (qq-state-session-messages qq-chat--session-key))
+                  '())))
+
 (defun qq-chat--message-anchor-list (messages)
   "Return message anchors in display order, skipping missing anchors."
-  (delq nil (mapcar #'qq-chat--message-anchor (or messages '()))))
+  (delq nil (mapcar #'qq-chat--message-anchor
+                    (qq-chat--timeline-messages messages))))
 
 (defun qq-chat--timeline-order-compatible-p (current-anchors target-anchors)
   "Return non-nil when CURRENT-ANCHORS can reconcile into TARGET-ANCHORS."
@@ -1173,8 +1190,7 @@ update similar in spirit to `telega-chatbuf--chat-update'."
          (footer-p (or full-p initial-frame-p (memq 'footer parts)))
          (prompt-p (or full-p initial-frame-p (memq 'prompt parts)))
          (timeline-p (or full-p initial-frame-p (memq 'timeline parts)))
-         (messages (and timeline-p
-                        (qq-state-session-messages qq-chat--session-key))))
+         (messages (and timeline-p (qq-chat--timeline-messages))))
     (when header-line-p
       (qq-chat--header-line-update))
     (when (or header-p footer-p prompt-p timeline-p)
@@ -2095,10 +2111,12 @@ Prefer `qq-state' `:mutation' metadata when present:
              ((eq event-type 'message)
               (when (equal event-session-key qq-chat--session-key)
                 (qq-chat--header-line-update)
-                (let* ((messages (qq-state-session-messages qq-chat--session-key))
+                (let* ((messages (qq-chat--timeline-messages))
                        (anchor (or (plist-get event :message-anchor)
                                    (qq-chat--message-anchor event-message)
                                    (plist-get event :previous-anchor))))
+                  ;; Recall with default hide: filter drops the row; partial
+                  ;; path deletes the EWOC node (telega-like).
                   (unless (qq-chat--apply-single-message-change-partially
                            anchor messages)
                     (qq-chat-render)))
