@@ -1870,10 +1870,8 @@ Does not iterative load-older; seek already tried once."
             target
             (or reason "get_msg failed"))))))))
 
-(defun qq-chat--seek-history-for-jump (session-key target buffer)
-  "Seek one history page at TARGET snowflake (NapCat message_seq = msgId).
-
-This is the correct around-substitute: not load-older from buffer oldest."
+(defun qq-chat--seek-history-one-side (session-key target buffer)
+  "Fallback seek: one-sided `get_*_msg_history' with message_seq = TARGET."
   (qq-api-fetch-history
    session-key
    target
@@ -1883,16 +1881,35 @@ This is the correct around-substitute: not load-older from buffer oldest."
          (when (equal qq-chat--session-key session-key)
            (if (qq-chat--finish-jump-if-loaded target)
                nil
-             ;; Page may omit the cursor row in edge cases; try single get_msg.
              (qq-chat--jump-via-get-msg session-key target buffer))))))
-   (lambda (response reason)
+   (lambda (_response _reason)
      (when (buffer-live-p buffer)
        (with-current-buffer buffer
          (when (equal qq-chat--session-key session-key)
-           (if (qq-api--history-exhausted-error-p response reason)
-               ;; Unknown cursor: still try get_msg (mapping may exist).
-               (qq-chat--jump-via-get-msg session-key target buffer)
-             (qq-chat--jump-via-get-msg session-key target buffer))))))
+           (qq-chat--jump-via-get-msg session-key target buffer)))))
+   (qq-chat--jump-history-count)))
+
+(defun qq-chat--seek-history-for-jump (session-key target buffer)
+  "Load history for jump to TARGET (telega around, NapCat fork).
+
+Primary: fork `get_msg_history_around' (older+newer window around snowflake).
+Fallback: one-sided seek at TARGET, then `get_msg'."
+  (qq-api-fetch-history-around
+   session-key
+   target
+   (lambda (_meta)
+     (when (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (when (equal qq-chat--session-key session-key)
+           (if (qq-chat--finish-jump-if-loaded target)
+               nil
+             (qq-chat--seek-history-one-side session-key target buffer))))))
+   (lambda (_response _reason)
+     (when (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (when (equal qq-chat--session-key session-key)
+           ;; Unknown action or peer miss → one-sided seek / get_msg.
+           (qq-chat--seek-history-one-side session-key target buffer)))))
    (qq-chat--jump-history-count)))
 
 (defun qq-chat-goto-message (message-id &optional no-pop)
@@ -1900,8 +1917,9 @@ This is the correct around-substitute: not load-older from buffer oldest."
 
 1. Push message at point onto the pop ring (unless NO-POP)
 2. If already loaded, jump and pulse-highlight
-3. Else seek one history page with `message_seq' = MESSAGE-ID (target cursor)
-4. Else `get_msg' single-message fallback
+3. Else NapCat fork `get_msg_history_around' (window around TARGET)
+4. Else one-sided history seek (`message_seq' = TARGET)
+5. Else `get_msg' single-message fallback
 
 Does not walk load-older from the buffer's oldest id."
   (interactive

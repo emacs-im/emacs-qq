@@ -175,6 +175,51 @@ Used by chatbuf jump (telega `telega-msg-get') as a fallback after seek."
        (funcall callback (qq-api--response-data response))))
    errback))
 
+(defun qq-api--history-around-params (session-key message-id count)
+  "Build `get_msg_history_around' params for SESSION-KEY centered on MESSAGE-ID."
+  (let* ((session (qq-state-session session-key))
+         (type (or (alist-get 'type session)
+                   (qq-state-session-key-type session-key)))
+         (target-id (or (alist-get 'target-id session)
+                        (qq-state-session-key-target-id session-key)))
+         (params `((message_id . ,(format "%s" message-id))
+                   (count . ,(max 1 count)))))
+    (pcase type
+      ('group
+       (append params `((group_id . ,(format "%s" target-id)))))
+      ('dataline
+       (append params
+               `((chat_type . ,(or (alist-get 'chat-type session) 8))
+                 (peer_uid . ,(or (alist-get 'peer-uid session)
+                                  target-id)))))
+      (_
+       (append params
+               `((user_id . ,(format "%s"
+                                     (or (alist-get 'peer-uin session)
+                                         target-id)))))))))
+
+(defun qq-api-fetch-history-around (session-key message-id callback &optional errback count)
+  "Fetch a history window around MESSAGE-ID (NapCat `get_msg_history_around').
+
+Fork action: older+newer pages around the NT snowflake center (telega around).
+CALLBACK receives the merge-history plist.  On action-missing/network error,
+ERRBACK is called so the client can fall back to single-side seek."
+  (let ((n (max 1 (or count
+                      (and (boundp 'qq-chat-jump-history-count)
+                           qq-chat-jump-history-count)
+                      qq-history-fetch-count))))
+    (qq-api-call
+     "get_msg_history_around"
+     (qq-api--history-around-params session-key message-id n)
+     (lambda (response)
+       (let* ((data (qq-api--response-data response))
+              (messages (or (alist-get 'messages data nil nil #'eq)
+                            (and (listp data) data)))
+              (meta (qq-state-merge-history session-key messages)))
+         (when callback
+           (funcall callback meta))))
+     errback)))
+
 (defun qq-api-mark-session-read (session-key)
   "Mark SESSION-KEY as read both locally and in NapCat.
 

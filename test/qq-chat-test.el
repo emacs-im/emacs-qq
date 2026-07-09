@@ -1212,8 +1212,8 @@
                             (cons (quote data)
                                   (list (cons (quote text) "hi"))))))))))
 
-(ert-deftest qq-chat-goto-message-seeks-at-target-not-oldest ()
-  "Jump fetch uses message_seq = target id (seek), not buffer oldest."
+(ert-deftest qq-chat-goto-message-uses-history-around ()
+  "Jump prefers fork get_msg_history_around, not load-older from oldest."
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "private:10001"
@@ -1240,13 +1240,11 @@
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
-     (let (captured-before captured-count load-older-called)
-       (cl-letf (((symbol-function 'qq-api-fetch-history)
-                  (lambda (session-key &optional before callback _errback count)
-                    (setq captured-before before)
-                    (setq captured-count count)
+     (let (around-called load-older-called oneside-called)
+       (cl-letf (((symbol-function 'qq-api-fetch-history-around)
+                  (lambda (session-key message-id callback &optional _errback _count)
+                    (setq around-called message-id)
                     (should (equal session-key "private:10001"))
-                    ;; Simulate seek page + history hook re-render.
                     (qq-state-merge-history
                      "private:10001"
                      (list
@@ -1267,16 +1265,21 @@
                     (when callback
                       (funcall callback
                                (list :added-count 1 :message-count 1)))))
+                 ((symbol-function 'qq-api-fetch-history)
+                  (lambda (&rest _)
+                    (setq oneside-called t)
+                    (error "around succeeded; one-side seek should not run")))
                  ((symbol-function 'qq-chat-load-older-messages)
                   (lambda ()
                     (setq load-older-called t)
                     (error "jump must not call load-older")))
                  ((symbol-function 'qq-api-get-msg)
                   (lambda (&rest _)
-                    (error "seek succeeded; get_msg should not run"))))
+                    (error "around succeeded; get_msg should not run"))))
          (qq-chat-goto-message "100" 'no-pop)
-         (should (equal captured-before "100"))
+         (should (equal around-called "100"))
          (should-not load-older-called)
+         (should-not oneside-called)
          (should (equal "100"
                         (get-text-property (point) 'qq-chat-message-anchor)))
          (should-not qq-chat--pending-jump-id))))))
