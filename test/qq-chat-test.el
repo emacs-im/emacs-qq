@@ -125,7 +125,14 @@
      (let ((before (point)))
        (qq-chat-render)
        (should (= before (point)))
-       (should-not (qq-chat--point-in-input-p))))))
+       (should-not (qq-chat--point-in-input-p)))
+     ;; Cancel reply (telega C-c C-k / [×]).
+     (should (qq-chat--reply-message))
+     (qq-chat-cancel-dwim)
+     (should-not (qq-chat--reply-message))
+     (goto-char (point-min))
+     (should-not (search-forward "Replying to Alice" nil t))
+     (should-not (search-forward "[×]" nil t)))))
 
 (ert-deftest qq-chat-render-falls-back-to-sender-id-when-sender-name-empty ()
   (qq-chat-test-with-reset

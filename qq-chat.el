@@ -587,13 +587,16 @@ Default is title-only.  Long help lines are optional via
     text))
 
 (defun qq-chat--input-footer-context-text ()
-  "Return dynamic footer text shown above the composer prompt."
+  "Return dynamic footer text shown above the composer prompt.
+
+Reply aux already carries its own faces/button; do not blanket-propertize
+it or the cancel `[×]' loses its link face."
   (let ((reply-context (qq-chat--reply-context-text)))
     (concat
      "\n"
      (if (string-empty-p reply-context)
          ""
-       (propertize reply-context 'face 'font-lock-doc-face)))))
+       reply-context))))
 
 (defun qq-chat--footer-text (&optional _draft)
   "Build read-only EWOC footer text for the current chat state."
@@ -1517,26 +1520,58 @@ image/video inference."
   "Return one composer context line for LABEL and MESSAGE-ID."
   (format "%s %s\n" label message-id))
 
+(defun qq-chat--cancel-reply-button-string ()
+  "Return telega-style `[×]' button that cancels reply aux."
+  (propertize
+   "[×]"
+   'face 'link
+   'mouse-face 'highlight
+   'help-echo "Cancel reply (C-c C-k)"
+   'follow-link t
+   'keymap (let ((map (make-sparse-keymap)))
+             (define-key map [mouse-1]
+               (lambda ()
+                 (interactive)
+                 (qq-chat-cancel-dwim)))
+             (define-key map (kbd "RET")
+               (lambda ()
+                 (interactive)
+                 (qq-chat-cancel-dwim)))
+             (define-key map (kbd "q")
+               (lambda ()
+                 (interactive)
+                 (qq-chat-cancel-dwim)))
+             map)
+   'qq-chat-cancel-reply t))
+
 (defun qq-chat--reply-context-text ()
-  "Return extra context lines shown above the chat composer."
+  "Return extra context lines shown above the chat composer.
+
+Mirrors telega aux prompt: leading `[×]' cancel button + reply summary +
+key hint (`C-c C-k')."
   (let ((message (qq-chat--reply-message)))
     (if-let* ((reply-id (alist-get 'server-id message))
               (name (or (car (qq-chat--message-sender-display-parts message))
                         "message"))
-              (preview (string-trim (or (qq-state-message-preview message) ""))))
+              (preview (string-trim (or (qq-state-message-preview message) "")))
+              (body
+               (concat
+                (format "Replying to %s  (C-c C-k)\n" name)
+                (format "  %s\n"
+                        (if (string-empty-p preview)
+                            (format "id %s" reply-id)
+                          (truncate-string-to-width preview 72 nil nil t))))))
         (concat
-         (format "Replying to %s\n" name)
-         (format "  %s\n"
-                 (if (string-empty-p preview)
-                     (format "id %s" reply-id)
-                   (truncate-string-to-width preview 72 nil nil t))))
+         (qq-chat--cancel-reply-button-string)
+         " "
+         (propertize body 'face 'font-lock-doc-face))
       "")))
 
 (defun qq-chat--header-help-text ()
   "Return header help text for chat actions."
   (concat
    "M-<: older   r/d/o/a: reply/recall/open/avatar   m: message menu   ?: chat menu"
-   "   C-c C-v: clipboard   C-c C-a: attach   RET/C-c C-c: send   q: quit"))
+   "   C-c C-k: cancel reply   C-c C-v: clipboard   RET/C-c C-c: send   q: quit"))
 
 (defun qq-chat--insert-date-separator-row (day-label)
   "Insert a date separator row for DAY-LABEL."
@@ -2149,7 +2184,10 @@ Return non-nil on success."
        (user-error "qq: no message at point"))))
 
 (defun qq-chat-cancel-dwim ()
-  "Cancel reply context, or clear draft when no reply is pending."
+  "Cancel reply context, or clear draft when no reply is pending.
+
+Same role as telega's `telega-chatbuf-cancel-dwim' / aux `[×]' button.
+Bound to `C-c C-k' (and ESC ESC).  Click the footer `[×]' to cancel reply."
   (interactive)
   (cond
    ((qq-chat--reply-message)
@@ -2212,6 +2250,9 @@ Updates header-line and redisplays only nodes whose render context changed
     (define-key map (kbd "M-g p") #'qq-chat-previous-message)
     (define-key map (kbd "C-c C-c") #'qq-chat-send-message)
     (define-key map (kbd "C-c C-k") #'qq-chat-cancel-dwim)
+    ;; telega: ESC ESC / C-M-c also cancel reply-or-edit aux.
+    (define-key map (kbd "\e\e") #'qq-chat-cancel-dwim)
+    (define-key map (kbd "C-M-c") #'qq-chat-cancel-dwim)
     (define-key map (kbd "C-c ?") #'qq-chat-transient)
     map)
   "Keymap for `qq-chat-mode'.")

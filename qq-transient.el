@@ -68,6 +68,12 @@
   "Return non-nil when composer has no pending reply."
   (null (qq-chat--reply-message)))
 
+(defun qq-transient--cancel-inapt-p ()
+  "Return non-nil when cancel-dwim has nothing to clear."
+  (and (qq-transient--no-reply-context-p)
+       (let ((draft (ignore-errors (qq-chat--current-draft-string))))
+         (or (null draft) (string-empty-p (string-trim draft))))))
+
 (defun qq-transient--no-session-at-point-p ()
   "Return non-nil when root point is not on a session row."
   (null (ignore-errors (qq-root--session-key-at-point))))
@@ -136,7 +142,8 @@ Prefer this over inline button rows (telega/disco style)."
    ["Composer"
     ("c" "Send" qq-chat-send-message)
     ("a" "Attach…" qq-chat-attach-transient)
-    ("k" "Cancel reply/draft" qq-chat-cancel-dwim)
+    ("k" "Cancel reply/draft (C-c C-k / [×])" qq-chat-cancel-dwim
+     :inapt-if qq-transient--cancel-inapt-p)
     ("e" "Focus draft" qq-chat-edit-draft)
     ("r" "Reply at point" qq-chat-reply-to-message
      :inapt-if qq-transient--reply-inapt-p)
