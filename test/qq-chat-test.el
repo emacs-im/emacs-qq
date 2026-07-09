@@ -1284,6 +1284,43 @@
                         (get-text-property (point) 'qq-chat-message-anchor)))
          (should-not qq-chat--pending-jump-id))))))
 
+
+(ert-deftest qq-chat-input-segments-keep-cjk-text-after-image-object ()
+  "Image object must not swallow following Chinese when sending.
+
+Regression: object text-properties were rear-sticky, so CJK typed after an
+attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    (list (cons (quote title) "Alice")
+          (cons (quote target-id) "10001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (qq-chat-edit-draft)
+     (let* ((path (make-temp-file "qq-img" nil ".png"))
+            (segments nil))
+       (unwind-protect
+           (progn
+             (with-temp-file path (insert "x"))
+             (qq-chat-attach-file path "image")
+             ;; Type CJK after the attachment object (normal user flow).
+             (goto-char (or (qq-chat--input-logical-end-position) (point-max)))
+             (insert "你好世界")
+             (qq-chat--sync-draft-from-buffer)
+             (setq segments (qq-chat--current-input-segments))
+             (should (equal '("image" "text")
+                            (mapcar (lambda (s) (alist-get (quote type) s))
+                                    segments)))
+             (should (equal "你好世界"
+                            (alist-get (quote text)
+                                       (alist-get (quote data)
+                                                  (nth 1 segments))))))
+         (ignore-errors (delete-file path)))))))
+
 (provide (quote qq-chat-test))
 
 ;;; qq-chat-test.el ends here

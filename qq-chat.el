@@ -1646,26 +1646,69 @@ image/video inference."
           (unless attached
             (user-error "qq: no file or image in clipboard")))))))))
 
+(defun qq-chat--input-object-span-end (input start limit object-prop)
+  "Return exclusive end of the structured object starting at START in INPUT.
+
+Only characters up through the object-end marker are included.  Text that
+inherited the object property via rear-stickiness is excluded."
+  (let* ((object (get-text-property start object-prop input))
+         (pos start)
+         end-at)
+    (while (and (< pos limit)
+                (eq (get-text-property pos object-prop input) object))
+      (when (get-text-property pos disco-chatbuf-input-object-end-property input)
+        (setq end-at (1+ pos))
+        (setq pos limit))
+      (unless end-at
+        (setq pos (1+ pos))))
+    (or end-at
+        ;; Malformed object without end marker: single property run.
+        (next-single-property-change start object-prop input limit)
+        limit)))
+
 (defun qq-chat--current-input-segments ()
-  "Parse current input region into outbound QQ message segments."
+  "Parse current input region into outbound QQ message segments.
+
+Plain text (including CJK) between/after attachment objects becomes `text'
+segments.  A real attachment starts only at
+`disco-chatbuf-input-object-start-property'; characters that merely inherited
+`disco-chatbuf-input-object' (rear-sticky bug) are emitted as text so Chinese
+after an image is not dropped."
   (let* ((input (or (disco-chatbuf-input-string) ""))
          (object-prop disco-chatbuf-input-object-property)
          (limit (length input))
          (pos 0)
          segments)
     (while (< pos limit)
-      (let ((object (get-text-property pos object-prop input)))
-        (if object
-            (let* ((next (or (next-single-property-change
-                              pos object-prop input limit)
-                             limit))
+      (let* ((object (get-text-property pos object-prop input))
+             (real-object-p
+              (and object
+                   (get-text-property
+                    pos disco-chatbuf-input-object-start-property input))))
+        (if real-object-p
+            (let* ((next (qq-chat--input-object-span-end
+                          input pos limit object-prop))
                    (segment (qq-chat--input-object-segment object)))
               (when segment
                 (push segment segments))
               (setq pos next))
-          (let* ((next (or (next-single-property-change
-                            pos object-prop input limit)
-                           limit))
+          (let* ((next
+                  (if object
+                      ;; Sticky residue: walk until a real object start or
+                      ;; property change away from this object value.
+                      (let ((p (1+ pos)))
+                        (while (and (< p limit)
+                                    (eq (get-text-property p object-prop input)
+                                        object)
+                                    (not (get-text-property
+                                          p
+                                          disco-chatbuf-input-object-start-property
+                                          input)))
+                          (setq p (1+ p)))
+                        p)
+                    (or (next-single-property-change
+                         pos object-prop input limit)
+                        limit)))
                  (text (substring-no-properties input pos next)))
             (unless (string-empty-p text)
               (push `((type . "text")
