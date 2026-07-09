@@ -54,7 +54,8 @@
              (should (eq (key-binding (kbd "C-c /") t) 'qq-chat-search))
              (should (eq (key-binding (kbd "C-c m") t) 'qq-chat-message-transient))
              (should (eq (key-binding (kbd "C-c ?") t) 'qq-chat-transient))
-             (should (eq (key-binding (kbd "C-c C-a") t) 'qq-chat-attach-transient)))
+             (should (eq (key-binding (kbd "C-c C-a") t) 'qq-chat-attach-transient))
+             (should (eq (key-binding (kbd "C-c C-v") t) 'qq-chat-attach-clipboard)))
          (when (buffer-live-p buffer)
            (kill-buffer buffer)))))))
 
@@ -807,6 +808,88 @@
                               :insert-unread))
        (goto-char (point-min))
        (should-not (search-forward "Unread Messages" nil t))))))
+
+(defconst qq-chat-test--1x1-png
+  (base64-decode-string
+   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+  "Minimal 1x1 PNG bytes for clipboard attach tests.")
+
+(ert-deftest qq-chat-attach-clipboard-from-image-png ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice")
+      (target-id . "10001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (cl-letf (((symbol-function 'gui-get-selection)
+                (lambda (_selection &optional type)
+                  (pcase type
+                    ('TARGETS ["TARGETS" "image/png" "TIMESTAMP"])
+                    ('image/png qq-chat-test--1x1-png)
+                    (_ nil)))))
+       (qq-chat-attach-clipboard)
+       (should (disco-chatbuf-input-has-objects-p))
+       (let ((segments (qq-chat--current-input-segments)))
+         (should (= 1 (length segments)))
+         (should (equal "image" (alist-get 'type (car segments))))
+         (should (file-readable-p
+                  (alist-get 'file (alist-get 'data (car segments))))))))))
+
+(ert-deftest qq-chat-attach-clipboard-uri-list-local-file ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice")
+      (target-id . "10001"))
+    nil)
+   (let ((path (make-temp-file "qq-clip-uri" nil ".txt")))
+     (unwind-protect
+         (progn
+           (with-temp-file path (insert "hello clip"))
+           (with-temp-buffer
+             (qq-chat-mode)
+             (setq qq-chat--session-key "private:10001")
+             (qq-chat-render)
+             (cl-letf (((symbol-function 'gui-get-selection)
+                        (lambda (_selection &optional type)
+                          (pcase type
+                            ('TARGETS ["TARGETS" "text/uri-list" "text/plain"])
+                            ('text/uri-list (concat "file://" path "\n"))
+                            (_ nil)))))
+               (qq-chat-attach-clipboard)
+               (let ((segments (qq-chat--current-input-segments)))
+                 (should (= 1 (length segments)))
+                 (should (equal "file" (alist-get 'type (car segments))))
+                 (should (equal path
+                                (alist-get 'file
+                                           (alist-get 'data (car segments)))))))))
+       (ignore-errors (delete-file path))))))
+
+(ert-deftest qq-chat-attach-clipboard-as-file-prefix ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice")
+      (target-id . "10001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (cl-letf (((symbol-function 'gui-get-selection)
+                (lambda (_selection &optional type)
+                  (pcase type
+                    ('TARGETS ["TARGETS" "image/png"])
+                    ('image/png qq-chat-test--1x1-png)
+                    (_ nil)))))
+       (qq-chat-attach-clipboard t)
+       (should (equal "file"
+                      (alist-get 'type
+                                 (car (qq-chat--current-input-segments)))))))))
 
 (ert-deftest qq-chat-attach-file-inserts-structured-object-and-sends-segments ()
   (qq-chat-test-with-reset

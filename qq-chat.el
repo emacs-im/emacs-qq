@@ -1377,6 +1377,114 @@ When SEGMENT-TYPE is nil, infer the most useful QQ segment type from PATH."
              (file-name-nondirectory path)
              type)))
 
+(defun qq-chat--clipboard-temp-file (extension)
+  "Return a unique temp file path with EXTENSION (including the leading dot)."
+  (let ((dir (expand-file-name "clipboard" qq-media-cache-directory)))
+    (make-directory dir t)
+    (make-temp-file (expand-file-name "qq-clip-" dir) nil extension)))
+
+(defun qq-chat--write-binary-temp-file (data extension)
+  "Write binary DATA to a clipboard temp file with EXTENSION and return path."
+  (let ((path (qq-chat--clipboard-temp-file extension))
+        (coding-system-for-write 'binary))
+    (with-temp-file path
+      (set-buffer-multibyte nil)
+      (insert data))
+    path))
+
+(defun qq-chat--uri-list-local-paths (uri-list)
+  "Parse URI-LIST (text/uri-list) into absolute local file paths."
+  (let (paths)
+    (dolist (uri (split-string (or uri-list "") "[\r\n\0]" t))
+      (setq uri (string-trim uri))
+      (when (and (not (string-empty-p uri))
+                 (not (string-prefix-p "#" uri)))
+        (cond
+         ((string-match-p "\\`file:" uri)
+          (require 'url-parse)
+          (let* ((parsed (url-generic-parse-url uri))
+                 (raw (url-filename parsed))
+                 (path (and raw (url-unhex-string raw))))
+            ;; url-filename keeps leading "/" on file:///path.
+            (when (and (stringp path)
+                       (file-exists-p path))
+              (push (expand-file-name path) paths))))
+         ((and (file-name-absolute-p uri) (file-exists-p uri))
+          (push (expand-file-name uri) paths)))))
+    (nreverse paths)))
+
+(defun qq-chat--clipboard-selection (type)
+  "Return CLIPBOARD selection for TYPE, or nil."
+  (condition-case nil
+      (let ((selection-coding-system
+             (if (memq type '(image/png image/jpeg image/bmp))
+                 'no-conversion
+               selection-coding-system)))
+        (gui-get-selection 'CLIPBOARD type))
+    (error nil)))
+
+(defun qq-chat--yank-media (mime-type data &optional as-file-p)
+  "Attach clipboard/yank media DATA of MIME-TYPE into the chat input.
+
+When AS-FILE-P is non-nil, force segment type `file' (telega C-u clipboard)."
+  (unless (and (stringp data) (> (length data) 0))
+    (user-error "qq: empty clipboard media"))
+  (let* ((ext (pcase mime-type
+                ((or 'image/png "image/png") ".png")
+                ((or 'image/jpeg "image/jpeg") ".jpg")
+                ((or 'image/bmp "image/bmp") ".bmp")
+                (_ ".bin")))
+         (path (qq-chat--write-binary-temp-file data ext))
+         (type (if as-file-p "file" (qq-chat--guess-file-segment-type path))))
+    (qq-chat-attach-file path type)
+    path))
+
+(defun qq-chat-attach-clipboard (&optional as-file-p)
+  "Attach clipboard content to the chat composer (telega `C-c C-v').
+
+Prefer order:
+1. `text/uri-list' local files from the clipboard
+2. image bytes (`image/png', `image/jpeg')
+3. on Darwin, `pngpaste' if available
+
+With `\\[universal-argument]' (AS-FILE-P), force segment type `file' instead of
+image/video inference."
+  (interactive "P")
+  (cond
+   ;; macOS: pngpaste is the reliable image path (same as telega).
+   ((and (eq system-type 'darwin)
+         (executable-find "pngpaste"))
+    (let ((tmp (qq-chat--clipboard-temp-file ".png")))
+      (unless (= 0 (call-process "pngpaste" nil nil nil tmp))
+        (ignore-errors (delete-file tmp))
+        (user-error "qq: no image in clipboard (pngpaste failed)"))
+      (qq-chat-attach-file tmp (if as-file-p "file" "image"))))
+   (t
+    (let* ((targets (qq-chat--clipboard-selection 'TARGETS))
+           (target-list (cond
+                         ((stringp targets) (split-string targets))
+                         ((listp targets) targets)
+                         ((vectorp targets) (append targets nil))
+                         (t nil)))
+           (has-uri (cl-find "text/uri-list" target-list :test #'string-equal))
+           (uris (and has-uri (qq-chat--clipboard-selection 'text/uri-list)))
+           (paths (and uris (qq-chat--uri-list-local-paths uris))))
+      (cond
+       (paths
+        (dolist (path paths)
+          (qq-chat-attach-file
+           path
+           (when as-file-p "file"))))
+       (t
+        (let ((attached nil))
+          (dolist (mime '(image/png image/jpeg image/bmp))
+            (unless attached
+              (when-let* ((data (qq-chat--clipboard-selection mime)))
+                (qq-chat--yank-media mime data as-file-p)
+                (setq attached t))))
+          (unless attached
+            (user-error "qq: no file or image in clipboard")))))))))
+
 (defun qq-chat--current-input-segments ()
   "Parse current input region into outbound QQ message segments."
   (let* ((input (or (disco-chatbuf-input-string) ""))
@@ -1428,7 +1536,7 @@ When SEGMENT-TYPE is nil, infer the most useful QQ segment type from PATH."
   "Return header help text for chat actions."
   (concat
    "M-<: older   r/d/o/a: reply/recall/open/avatar   m: message menu   ?: chat menu"
-   "   C-c C-a: attach   RET/C-c C-c: send   C-c ?: chat transient   q: quit"))
+   "   C-c C-v: clipboard   C-c C-a: attach   RET/C-c C-c: send   q: quit"))
 
 (defun qq-chat--insert-date-separator-row (day-label)
   "Insert a date separator row for DAY-LABEL."
@@ -2098,6 +2206,7 @@ Updates header-line and redisplays only nodes whose render context changed
     (define-key map (kbd "M-p") #'qq-chat-draft-prev)
     (define-key map (kbd "M-n") #'qq-chat-draft-next)
     (define-key map (kbd "C-c C-f") #'qq-chat-attach-file)
+    (define-key map (kbd "C-c C-v") #'qq-chat-attach-clipboard)
     (define-key map (kbd "C-c C-a") #'qq-chat-attach-transient)
     (define-key map (kbd "M-g n") #'qq-chat-next-message)
     (define-key map (kbd "M-g p") #'qq-chat-previous-message)
@@ -2112,7 +2221,8 @@ Updates header-line and redisplays only nodes whose render context changed
 
 Message actions use point + keys (`r'/`d'/`o'/`a' on the timeline) or
 `qq-chat-message-transient' (`C-c m' / timeline `m').  Chat-wide commands
-are in `qq-chat-transient' (`C-c ?' / timeline `?')."
+are in `qq-chat-transient' (`C-c ?' / timeline `?').
+Attach from clipboard with `C-c C-v' (telega-style)."
   (disco-chatbuf-mode-setup)
   (setq-local qq-chat--draft-input "")
   (setq-local qq-chat--draft-input-rich "")
@@ -2129,6 +2239,12 @@ are in `qq-chat-transient' (`C-c ?' / timeline `?')."
   (setq-local qq-chat--render-context-by-anchor (make-hash-table :test #'equal))
   (setq-local qq-chat--media-anchors-by-key (make-hash-table :test #'equal))
   (setq-local qq-chat--deferred-node-anchors nil)
+  ;; telega-style: M-x yank-media also drops images into the composer.
+  (when (fboundp 'yank-media-handler)
+    (funcall #'yank-media-handler
+             '(image/png image/jpeg image/bmp)
+             (lambda (mime-type data)
+               (qq-chat--yank-media mime-type data nil))))
   (add-hook 'after-change-functions #'qq-chat--after-change nil t)
   (add-hook 'post-command-hook #'qq-chat--post-command nil t)
   (qq-chat--update-context-mode))

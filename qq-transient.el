@@ -112,7 +112,8 @@ Prefer this over inline button rows (telega/disco style)."
   [["Attach"
     ("f" "File (auto type)" qq-chat-attach-file)
     ("i" "As image" qq-chat-attach-as-image)
-    ("F" "As file" qq-chat-attach-as-file)]])
+    ("F" "As file" qq-chat-attach-as-file)
+    ("v" "Clipboard (C-c C-v)" qq-chat-attach-clipboard)]])
 
 ;;;###autoload
 (transient-define-prefix qq-chat-transient ()
