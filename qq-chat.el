@@ -1545,24 +1545,30 @@ Matches `telega-symbol-button-close' + `telega-link' face."
 (defun qq-chat--reply-context-text ()
   "Return extra context lines shown above the chat composer.
 
-Telega aux shape: `[×]' then reply summary in shadow.  No keybinding
-slogans in the line — cancel via button or `C-c C-k'."
+Telega-like aux bar:
+  [×] Reply to Name
+      short human preview
+
+Never dump OneBot CQ / raw_message here — previews come from
+`qq-state-message-preview' (segment-first)."
   (let ((message (qq-chat--reply-message)))
     (if-let* ((reply-id (alist-get 'server-id message))
               (name (or (car (qq-chat--message-sender-display-parts message))
                         "message"))
               (preview (string-trim (or (qq-state-message-preview message) "")))
-              (body
-               (concat
-                (format "Reply to %s\n" name)
-                (format "  %s\n"
-                        (if (string-empty-p preview)
-                            ""
-                          (truncate-string-to-width preview 72 nil nil t))))))
+              (preview (if (string-empty-p preview) "…" preview))
+              (preview (truncate-string-to-width preview 64 nil nil t))
+              (title (propertize (format "Reply to %s" name)
+                                 'face 'qq-msg-title))
+              (body (propertize (format "  %s" preview)
+                                'face 'qq-msg-inline-reply)))
         (concat
          (qq-chat--cancel-reply-button-string)
          " "
-         (propertize body 'face 'shadow))
+         title
+         "\n"
+         body
+         "\n")
       "")))
 
 (defun qq-chat--header-help-text ()
@@ -1645,15 +1651,22 @@ Prefer source-message preview text over the raw id (telega-like)."
       (_ "Media"))))
 
 (defun qq-chat--segment-media-summary (segment)
-  "Return one-line summary for media SEGMENT."
+  "Return one-line human summary for media SEGMENT.
+
+Prefer a short name; never dump full URLs or CQ blobs into the timeline."
   (let* ((data (alist-get 'data segment))
+         (type (alist-get 'type segment))
+         (fallback (pcase type
+                     ("image" "image")
+                     ("mface" "sticker")
+                     ("record" "voice")
+                     ("video" "video")
+                     ("file" "file")
+                     (_ "media")))
          (summary (or (alist-get 'summary data)
                       (alist-get 'name data)
-                      (alist-get 'file data)
-                      (alist-get 'url data))))
-    (if (and (stringp summary) (not (string-empty-p summary)))
-        summary
-      "(no label)")))
+                      (alist-get 'file data))))
+    (qq-state--short-media-label summary fallback)))
 
 (defun qq-chat--format-byte-size (value)
   "Return human-readable string for byte VALUE, or nil."
@@ -1672,27 +1685,13 @@ Prefer source-message preview text over the raw id (telega-like)."
        (t (format "%d B" bytes))))))
 
 (defun qq-chat--segment-media-meta-line (segment)
-  "Return one meta line for media SEGMENT."
-  (let* ((type (alist-get 'type segment))
-         (data (alist-get 'data segment))
-         (pieces (delq nil
-                       (list
-                        (qq-chat--format-byte-size (or (alist-get 'file_size data)
-                                                       (alist-get 'file-size data)))
-                        (and (or (equal type "image")
-                                 (qq-media-imageish-file-segment-p segment))
-                             (alist-get 'sub_type data)
-                             (format "sub=%s" (alist-get 'sub_type data)))
-                        (and (equal type "mface")
-                             (alist-get 'emoji_package_id data)
-                             (format "pkg=%s" (alist-get 'emoji_package_id data)))
-                        (and (or (equal type "mface")
-                                 (equal type "image"))
-                             (alist-get 'emoji_id data)
-                             (format "emoji=%s" (alist-get 'emoji_id data)))))))
-    (if pieces
-        (string-join pieces "  ")
-      "QQ media resource")))
+  "Return one quiet meta line for media SEGMENT.
+
+Keep this short — size is useful; internal sub_type / emoji ids are not."
+  (let* ((data (alist-get 'data segment))
+         (size (qq-chat--format-byte-size (or (alist-get 'file_size data)
+                                              (alist-get 'file-size data)))))
+    (or size "")))
 
 (defun qq-chat--insert-prefixed-plain-line (prefix-state text properties &optional face)
   "Insert TEXT as one prefixed plain line using PREFIX-STATE and PROPERTIES."
@@ -1795,10 +1794,11 @@ Prefer source-message preview text over the raw id (telega-like)."
       (insert (format "%s: %s\n" kind summary))
       (qq-ui-apply-line-prefix title-start (point) prefix-state)
       (add-text-properties title-start (point) (append properties (list 'face 'bold))))
-    (let ((meta-start (point)))
-      (insert meta "\n")
-      (qq-ui-apply-line-prefix meta-start (point) prefix-state)
-      (add-text-properties meta-start (point) (append properties (list 'face 'shadow))))
+    (when (and (stringp meta) (not (string-empty-p meta)))
+      (let ((meta-start (point)))
+        (insert meta "\n")
+        (qq-ui-apply-line-prefix meta-start (point) prefix-state)
+        (add-text-properties meta-start (point) (append properties (list 'face 'shadow)))))
     (let ((action-start (point))
           (inserted nil))
       (when (qq-media-segment-playable-p segment)

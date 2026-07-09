@@ -350,8 +350,32 @@ When EMIT is non-nil, fire one session mutation event (`:mutation' `session')."
                 (string-lessp (or (alist-get 'title left) "")
                               (or (alist-get 'title right) ""))))))))
 
+(defun qq-state--short-media-label (value &optional fallback)
+  "Return a short label for media VALUE, never a full URL or CQ blob.
+
+Prefer basename of local paths; drop http(s) URLs entirely."
+  (let ((fallback (or fallback "media")))
+    (cond
+     ((not (stringp value)) fallback)
+     ((string-empty-p (string-trim value)) fallback)
+     ((string-match-p "\\`https?://" value) fallback)
+     ((string-match-p "\\`\\[CQ:" value) fallback)
+     ((or (file-name-absolute-p value)
+          (string-match-p "/" value)
+          (string-match-p "\\\\" value))
+      (let ((base (file-name-nondirectory value)))
+        (if (or (string-empty-p base)
+                (string-match-p "\\`https?:" base))
+            fallback
+          (truncate-string-to-width base 28 nil nil t))))
+     (t (truncate-string-to-width (string-trim value) 28 nil nil t)))))
+
 (defun qq-state-message-preview-from-segments (segments)
-  "Return a plain text preview string for message SEGMENTS."
+  "Return a human-readable plain-text preview for message SEGMENTS.
+
+Never emit OneBot CQ strings.  Reply segments are omitted (shown via
+reply chrome elsewhere).  Media becomes short placeholders like
+`[image]' / `[face:178]'."
   (string-trim
    (mapconcat
     (lambda (segment)
@@ -362,24 +386,141 @@ When EMIT is non-nil, fire one session mutation event (`:mutation' `session')."
           ("at" (concat "@" (or (alist-get 'name data)
                                 (alist-get 'qq data)
                                 "mention")))
-          ("reply" "[reply]")
+          ;; Reply chrome is rendered separately in chatbuf / composer.
+          ("reply" "")
+          ("face"
+           (let ((text (alist-get 'faceText data))
+                 (id (or (alist-get 'id data)
+                         (alist-get 'faceIndex data))))
+             (cond
+              ((and (stringp text) (not (string-empty-p text))) text)
+              (id (format "[face:%s]" id))
+              (t "[face]"))))
+          ;; Compact previews stay telega-short; chat body uses media cards.
           ("image" "[image]")
-          ("file" (format "[file:%s]" (or (alist-get 'name data)
-                                          (alist-get 'file data)
-                                          "file")))
+          ("mface" "[sticker]")
+          ("file"
+           (format "[file:%s]"
+                   (qq-state--short-media-label
+                    (or (alist-get 'name data)
+                        (alist-get 'file data))
+                    "file")))
           ("record" "[voice]")
           ("video" "[video]")
+          ("json" "[card]")
+          ("xml" "[xml]")
+          ("poke" "[poke]")
+          ("dice" "[dice]")
+          ("rps" "[rps]")
+          ("share" "[share]")
+          ("location" "[location]")
+          ("music" "[music]")
+          ("forward" "[forward]")
+          ("node" "[forward]")
+          ("markdown" (or (alist-get 'content data)
+                          (alist-get 'text data)
+                          "[markdown]"))
           (_ (format "[%s]" (or type "message"))))))
     (or segments '())
     "")))
 
+(defun qq-state--cq-looks-p (string)
+  "Return non-nil when STRING looks like OneBot CQ `raw_message'."
+  (and (stringp string)
+       (string-match-p "\\[CQ:" string)))
+
+(defun qq-state--decode-cq-entities (string)
+  "Decode common CQ / HTML entities in STRING."
+  (let ((s (or string "")))
+    (dolist (pair '(("&amp;" . "&")
+                    ("&#44;" . ",")
+                    ("&#91;" . "[")
+                    ("&#93;" . "]")
+                    ("&lt;" . "<")
+                    ("&gt;" . ">")
+                    ("&quot;" . "\"")))
+      (setq s (replace-regexp-in-string (regexp-quote (car pair))
+                                        (cdr pair) s t t)))
+    s))
+
+(defun qq-state-message-preview-from-cq (raw)
+  "Convert OneBot CQ RAW string into a short human-readable preview.
+
+Used only as a fallback when structured `message' segments are missing.
+Strips reply tags and collapses media/face codes."
+  (let* ((s (qq-state--decode-cq-entities (or raw "")))
+         (parts nil)
+         (pos 0)
+         (len (length s)))
+    (while (< pos len)
+      (if (string-match "\\[CQ:\\([a-zA-Z0-9_-]+\\)\\(\\,[^]]*\\)?\\]" s pos)
+          (let* ((start (match-beginning 0))
+                 (end (match-end 0))
+                 (type (match-string 1 s))
+                 (params (or (match-string 2 s) ""))
+                 (plain (substring s pos start)))
+            (when (and plain (not (string-empty-p plain)))
+              (push plain parts))
+            (pcase type
+              ("reply" nil)
+              ("text"
+               (when (string-match "text=\\([^,]+\\)" params)
+                 (push (match-string 1 params) parts)))
+              ("at"
+               (push (concat "@"
+                             (or (and (string-match "name=\\([^,]+\\)" params)
+                                      (match-string 1 params))
+                                 (and (string-match "qq=\\([^,]+\\)" params)
+                                      (match-string 1 params))
+                                 "mention"))
+                     parts))
+              ("face"
+               (push (if (string-match "id=\\([^,]+\\)" params)
+                         (format "[face:%s]" (match-string 1 params))
+                       "[face]")
+                     parts))
+              ("image" (push "[image]" parts))
+              ("mface" (push "[sticker]" parts))
+              ("record" (push "[voice]" parts))
+              ("video" (push "[video]" parts))
+              ("file"
+               (push (if (string-match "name=\\([^,]+\\)" params)
+                         (format "[file:%s]"
+                                 (qq-state--short-media-label
+                                  (match-string 1 params) "file"))
+                       "[file]")
+                     parts))
+              ("json" (push "[card]" parts))
+              (_ (push (format "[%s]" type) parts)))
+            (setq pos end))
+        (push (substring s pos) parts)
+        (setq pos len)))
+    (string-trim (mapconcat #'identity (nreverse parts) ""))))
+
 (defun qq-state-message-preview (message)
-  "Return preview text for normalized MESSAGE object."
-  (or (let ((raw (alist-get 'raw-message message)))
-        (and (stringp raw)
-             (not (string-empty-p raw))
-             raw))
-      (qq-state-message-preview-from-segments (alist-get 'segments message))
+  "Return human-readable preview text for normalized MESSAGE.
+
+Prefer structured segment previews.  Never surface OneBot CQ `raw_message'
+in the UI — that is wire format, not display text."
+  (or (let ((stored (alist-get 'preview message)))
+        (and (stringp stored)
+             (not (string-empty-p (string-trim stored)))
+             (not (qq-state--cq-looks-p stored))
+             stored))
+      (let ((from-segments
+             (qq-state-message-preview-from-segments
+              (alist-get 'segments message))))
+        (and (stringp from-segments)
+             (not (string-empty-p from-segments))
+             from-segments))
+      (let ((raw (alist-get 'raw-message message)))
+        (cond
+         ((not (stringp raw)) nil)
+         ((string-empty-p (string-trim raw)) nil)
+         ((qq-state--cq-looks-p raw)
+          (let ((converted (qq-state-message-preview-from-cq raw)))
+            (and (not (string-empty-p converted)) converted)))
+         (t raw)))
       ""))
 
 (defun qq-state--message-chat-type (message)
@@ -878,14 +1019,24 @@ Keeps the row so the chat view can hide it (default) or show a stub when
            (msg-time (qq-state--normalize-time (alist-get 'msgTime contact)))
            (msg-id (qq-state--normalize-id (alist-get 'msgId contact)))
            (last-message (alist-get 'lastestMsg contact))
-           (preview (cond
-                     ((and (listp last-message)
-                           (stringp (alist-get 'raw_message last-message))
-                           (not (string-empty-p (alist-get 'raw_message last-message))))
-                      (alist-get 'raw_message last-message))
-                     ((listp last-message)
-                      (qq-state-message-preview-from-segments (alist-get 'message last-message)))
-                     (t ""))))
+           (preview
+            (cond
+             ((not (listp last-message)) "")
+             (t
+              ;; Prefer structured segments; CQ raw_message is wire format only.
+              (let* ((from-segments
+                      (qq-state-message-preview-from-segments
+                       (alist-get 'message last-message)))
+                     (raw (alist-get 'raw_message last-message)))
+                (cond
+                 ((and (stringp from-segments)
+                       (not (string-empty-p from-segments)))
+                  from-segments)
+                 ((and (stringp raw) (qq-state--cq-looks-p raw))
+                  (qq-state-message-preview-from-cq raw))
+                 ((and (stringp raw) (not (string-empty-p raw)))
+                  raw)
+                 (t "")))))))
       (qq-state-upsert-session
        session-key
        `((title . ,title)

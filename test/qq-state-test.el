@@ -314,12 +314,60 @@
                       (data . ((text . "hello")))))
                    "hello")))
      (should (equal (alist-get 'raw-message message) "hello"))
-     (should (equal (alist-get 'preview message) "[reply]hello"))
+     ;; Reply segment is chrome, not body — preview is just the text.
+     (should (equal (alist-get 'preview message) "hello"))
      (should (equal (alist-get 'segments message)
                     '(((type . "reply")
                        (data . ((id . "42"))))
                       ((type . "text")
                        (data . ((text . "hello"))))))))))
+
+(ert-deftest qq-state-message-preview-prefers-segments-over-cq-raw ()
+  (qq-test-with-reset
+   (let ((message
+          '((raw-message . "[CQ:image,file=foo.png,url=https://example.com/x]")
+            (preview . "[image]")
+            (segments . (((type . "image")
+                          (data . ((file . "foo.png")
+                                   (url . "https://example.com/x")))))))))
+     (should (equal (qq-state-message-preview message) "[image]")))))
+
+(ert-deftest qq-state-message-preview-from-cq-strips-reply-and-face ()
+  (should (equal
+           (qq-state-message-preview-from-cq
+            "[CQ:reply,id=9007199254746000940][CQ:face,id=178,raw={\"faceIndex\":178&#44;\"faceText\":null}]hi")
+           "[face:178]hi"))
+  (should (equal
+           (qq-state-message-preview-from-cq
+            "[CQ:image,file=43DFE.png,url=http://example.com/a.png]")
+           "[image]")))
+
+(ert-deftest qq-state-message-preview-falls-back-to-cq-when-no-segments ()
+  (qq-test-with-reset
+   (let ((message
+          '((raw-message . "[CQ:face,id=178]ok")
+            (segments . nil)
+            (preview . ""))))
+     (should (equal (qq-state-message-preview message) "[face:178]ok")))))
+
+(ert-deftest qq-state-apply-recent-contacts-does-not-surface-cq ()
+  (qq-test-with-reset
+   (qq-state-apply-recent-contacts
+    '(((chatType . 1)
+       (peerUin . "10002")
+       (remark . "Bob")
+       (msgTime . "1710000001")
+       (msgId . "99")
+       (lastestMsg
+        (time . 1710000001)
+        (message_type . "private")
+        (user_id . 10002)
+        (raw_message . "[CQ:image,file=x.png,url=http://e/x]")
+        (message . (((type . "image")
+                     (data . ((file . "x.png")
+                              (url . "http://e/x"))))))))))
+   (let ((session (qq-state-session "private:10002")))
+     (should (equal (alist-get 'last-message-preview session) "[image]")))))
 
 (ert-deftest qq-state-set-status-deduplicates-identical-events ()
   (qq-test-with-reset
