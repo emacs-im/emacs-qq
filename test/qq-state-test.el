@@ -333,10 +333,14 @@
      (should (equal (qq-state-message-preview message) "[image]")))))
 
 (ert-deftest qq-state-message-preview-from-cq-strips-reply-and-face ()
+  ;; Prefer human face name when qq-media face table is available.
   (should (equal
            (qq-state-message-preview-from-cq
             "[CQ:reply,id=9007199254746000940][CQ:face,id=178,raw={\"faceIndex\":178&#44;\"faceText\":null}]hi")
-           "[face:178]hi"))
+           (concat (if (fboundp 'qq-media-face-text-fallback)
+                       (qq-media-face-text-fallback "178")
+                     "[face:178]")
+                   "hi")))
   (should (equal
            (qq-state-message-preview-from-cq
             "[CQ:image,file=43DFE.png,url=http://example.com/a.png]")
@@ -348,7 +352,11 @@
           '((raw-message . "[CQ:face,id=178]ok")
             (segments . nil)
             (preview . ""))))
-     (should (equal (qq-state-message-preview message) "[face:178]ok")))))
+     (should (equal (qq-state-message-preview message)
+                    (concat (if (fboundp 'qq-media-face-text-fallback)
+                                (qq-media-face-text-fallback "178")
+                              "[face:178]")
+                            "ok"))))))
 
 (ert-deftest qq-state-apply-recent-contacts-does-not-surface-cq ()
   (qq-test-with-reset

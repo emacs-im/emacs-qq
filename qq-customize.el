@@ -144,6 +144,29 @@ Same defaults as `telega-msg-deleted'."
   :type 'integer
   :group 'qq)
 
+(defcustom qq-media-default-emoji-directory
+  "/opt/QQ/resources/app/resource/default-emojis"
+  "Directory of LinuxQQ built-in base face PNGs (`<id>.png').
+
+Used as the primary source for inline QQ faces so chat rendering does not
+depend on NapCat `get_base_emoji' succeeding.  Falls back to the API when
+a file is missing (newer / animated faces)."
+  :type 'directory
+  :group 'qq)
+
+(defcustom qq-media-face-names-file
+  (let* ((here (file-name-directory
+                (or load-file-name buffer-file-name
+                    (locate-library "qq-customize")
+                    default-directory))))
+    (expand-file-name "qq-face-names.json" here))
+  "JSON map of QQ face id → display name (e.g. \"178\" → \"/斜眼笑\").
+
+Bundled with emacs-qq from NapCat `face_config.json'.  Used for plain-text
+fallbacks and previews when the face image is not yet available."
+  :type 'file
+  :group 'qq)
+
 (defcustom qq-media-preview-image-height 160
   "Maximum pixel height used for inline media previews in chat buffers."
   :type 'integer

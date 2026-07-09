@@ -389,11 +389,16 @@ reply chrome elsewhere).  Media becomes short placeholders like
           ;; Reply chrome is rendered separately in chatbuf / composer.
           ("reply" "")
           ("face"
-           (let ((text (alist-get 'faceText data))
-                 (id (or (alist-get 'id data)
-                         (alist-get 'faceIndex data))))
+           (let* ((text (or (alist-get 'faceText data)
+                            (alist-get 'face_text data)))
+                  (id (or (alist-get 'id data)
+                          (alist-get 'faceIndex data)))
+                  (named (and id
+                              (fboundp 'qq-media-face-text-fallback)
+                              (qq-media-face-text-fallback id))))
              (cond
               ((and (stringp text) (not (string-empty-p text))) text)
+              ((and (stringp named) (not (string-empty-p named))) named)
               (id (format "[face:%s]" id))
               (t "[face]"))))
           ;; Compact previews stay telega-short; chat body uses media cards.
@@ -476,7 +481,10 @@ Strips reply tags and collapses media/face codes."
                      parts))
               ("face"
                (push (if (string-match "id=\\([^,]+\\)" params)
-                         (format "[face:%s]" (match-string 1 params))
+                         (let ((id (match-string 1 params)))
+                           (if (fboundp 'qq-media-face-text-fallback)
+                               (qq-media-face-text-fallback id)
+                             (format "[face:%s]" id)))
                        "[face]")
                      parts))
               ("image" (push "[image]" parts))

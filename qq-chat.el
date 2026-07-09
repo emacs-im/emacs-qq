@@ -1621,8 +1621,19 @@ Prefer source-message preview text over the raw id (telega-like)."
      (append properties (list 'face 'qq-msg-inline-reply)))
     (qq-ui-apply-line-prefix reply-start (point) prefix-state)))
 
+(defun qq-chat--face-segment-id (segment)
+  "Return QQ base face id from face SEGMENT, or nil."
+  (let* ((data (alist-get 'data segment))
+         (raw (alist-get 'raw data)))
+    (or (alist-get 'id data)
+        (alist-get 'faceIndex data)
+        (and (listp raw) (alist-get 'faceIndex raw)))))
+
 (defun qq-chat--segment-inline-string (segment)
-  "Return inline display string for SEGMENT, or nil for block-like segments."
+  "Return inline display string for SEGMENT, or nil for block-like segments.
+
+Face segments render as inline images (LinuxQQ default-emojis / NapCat
+base emoji), never as OneBot CQ text."
   (let ((type (alist-get 'type segment))
         (data (alist-get 'data segment)))
     (pcase type
@@ -1630,7 +1641,9 @@ Prefer source-message preview text over the raw id (telega-like)."
       ("at" (concat "@" (or (alist-get 'name data)
                             (alist-get 'qq data)
                             "mention")))
-      ("face" (qq-media-face-display-string (or (alist-get 'id data) "?")))
+      ("face"
+       (qq-media-face-display-string
+        (or (qq-chat--face-segment-id segment) "?")))
       (_ nil))))
 
 (defun qq-chat--media-segment-p (segment)

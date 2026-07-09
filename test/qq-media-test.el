@@ -155,6 +155,45 @@
        (should errback-called)
        (should-not (qq-media--resource-fetching-p "avatar:10001"))))))
 
+(ert-deftest qq-media-face-uses-local-default-emoji-png ()
+  "Base faces should render from LinuxQQ default-emojis without API."
+  (qq-media-test-with-reset
+   (let* ((dir (make-temp-file "qq-default-emojis" t))
+          (png (expand-file-name "178.png" dir))
+          (qq-media-default-emoji-directory dir)
+          (qq-media--face-names-table (make-hash-table :test #'equal))
+          (api-called nil))
+     (unwind-protect
+         (progn
+           (puthash "178" "/斜眼笑" qq-media--face-names-table)
+           ;; Minimal valid 1x1 PNG.
+           (with-temp-file png
+             (set-buffer-multibyte nil)
+             (insert (unibyte-string
+                      #x89 #x50 #x4e #x47 #x0d #x0a #x1a #x0a
+                      #x00 #x00 #x00 #x0d #x49 #x48 #x44 #x52
+                      #x00 #x00 #x00 #x01 #x00 #x00 #x00 #x01
+                      #x08 #x02 #x00 #x00 #x00 #x90 #x77 #x53
+                      #xde #x00 #x00 #x00 #x0c #x49 #x44 #x41
+                      #x54 #x08 #xd7 #x63 #xf8 #xcf #xc0 #x00
+                      #x00 #x00 #x03 #x00 #x01 #x00 #x05 #xfe
+                      #xd4 #xef #x00 #x00 #x00 #x00 #x49 #x45
+                      #x4e #x44 #xae #x42 #x60 #x82)))
+           (cl-letf (((symbol-function 'qq-api-get-base-emoji)
+                      (lambda (&rest _args)
+                        (setq api-called t)
+                        (ert-fail "get_base_emoji must not run when local PNG exists"))))
+             (should (equal (qq-media--local-base-emoji-file "178") png))
+             (should (equal (qq-media-face-text-fallback "178") "/斜眼笑"))
+             (let ((image (qq-media-face-image "178")))
+               (should image)
+               (should (eq (car image) 'image)))
+             (let ((display (qq-media-face-display-string "178")))
+               (should (get-text-property 0 'display display)))
+             (should-not api-called)))
+       (when (file-directory-p dir)
+         (delete-directory dir t))))))
+
 (ert-deftest qq-media-resolve-fileish-prefers-existing-local-path ()
   "Outbound attach paths must not hit NapCat get_image."
   (qq-media-test-with-reset

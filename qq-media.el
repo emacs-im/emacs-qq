@@ -10,6 +10,8 @@
 ;;; Code:
 
 (require 'browse-url)
+(require 'json)
+(require 'seq)
 (require 'subr-x)
 (require 'url-handlers)
 (require 'disco-media)
@@ -527,9 +529,13 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
           (t
            (funcall error-fn nil "record segment has no file id")))))
       ("face"
-       (if emoji-id
-           (qq-api-get-base-emoji emoji-id callback error-fn)
-         (funcall error-fn nil "face segment has no id")))
+       (cond
+        ((not emoji-id)
+         (funcall error-fn nil "face segment has no id"))
+        ((qq-media--face-resource-from-local emoji-id)
+         (funcall callback (qq-media--face-resource-from-local emoji-id)))
+        (t
+         (qq-api-get-base-emoji emoji-id callback error-fn))))
       ("mface"
        (qq-media--resolve-fileish-segment
         segment "get_image" callback error-fn
@@ -883,21 +889,105 @@ When image data is not ready yet, return a textual fallback."
       ('dataline "📱")
       (_ (qq-media-avatar-display-string target-id)))))
 
+(defvar qq-media--face-names-table nil
+  "Lazy hash table: face id string → QDes name (e.g. \"/斜眼笑\").")
+
+(defun qq-media--load-face-names-table ()
+  "Load `qq-media-face-names-file' into `qq-media--face-names-table'."
+  (or qq-media--face-names-table
+      (let ((table (make-hash-table :test #'equal))
+            (file qq-media-face-names-file))
+        (when (and (stringp file) (file-readable-p file))
+          (condition-case err
+              (let* ((json-object-type 'alist)
+                     (json-array-type 'list)
+                     (json-key-type 'string)
+                     (json-false nil)
+                     (data (json-read-file file)))
+                (dolist (pair data)
+                  (when (and (consp pair)
+                             (stringp (car pair))
+                             (stringp (cdr pair)))
+                    (puthash (car pair) (cdr pair) table))))
+            (error
+             (message "qq: failed to load face names from %s: %s"
+                      file (error-message-string err)))))
+        (setq qq-media--face-names-table table)
+        table)))
+
+(defun qq-media-face-name (emoji-id)
+  "Return human-readable QQ face name for EMOJI-ID, or nil."
+  (let* ((id (format "%s" emoji-id))
+         (table (qq-media--load-face-names-table)))
+    (or (gethash id table)
+        ;; Also accept numeric keys that json may have stored differently.
+        (and (string-match-p "\\`[0-9]+\\'" id)
+             (gethash id table)))))
+
+(defun qq-media-face-text-fallback (emoji-id)
+  "Return plain-text fallback for face EMOJI-ID (never a CQ blob)."
+  (or (qq-media-face-name emoji-id)
+      (format "[face:%s]" emoji-id)))
+
+(defun qq-media--local-base-emoji-file (emoji-id)
+  "Return path to LinuxQQ default face image for EMOJI-ID, or nil."
+  (let* ((id (format "%s" emoji-id))
+         (dir qq-media-default-emoji-directory))
+    (when (and (stringp dir)
+               (not (string-empty-p id))
+               (file-directory-p dir))
+      (seq-find
+       #'file-exists-p
+       (mapcar (lambda (ext)
+                 (expand-file-name (concat id "." ext) dir))
+               '("png" "gif" "webp" "jpg" "jpeg"))))))
+
+(defun qq-media--face-resource-from-local (emoji-id)
+  "Return resource alist for local face EMOJI-ID, or nil."
+  (when-let* ((file (qq-media--local-base-emoji-file emoji-id)))
+    `((file . ,file)
+      (emoji_id . ,(format "%s" emoji-id))
+      (description . ,(qq-media-face-name emoji-id)))))
+
 (defun qq-media-face-image (emoji-id)
-  "Return inline QQ base face image for EMOJI-ID, triggering fetch when needed."
-  (qq-media--ensure-resource-image
-   (format "face:%s" emoji-id)
-   (lambda (done error)
-     (qq-api-get-base-emoji emoji-id done error))
-   qq-media-face-image-height))
+  "Return inline QQ base face image for EMOJI-ID.
+
+Resolution order:
+1. LinuxQQ `default-emojis/<id>.png' (sync, offline)
+2. NapCat `get_base_emoji' (download/path lookup)"
+  (let* ((id (format "%s" emoji-id))
+         (key (format "face:%s" id))
+         (local (qq-media--face-resource-from-local id)))
+    ;; Seed resource cache so ensure-resource-image can build the image
+    ;; synchronously without waiting on NapCat.
+    (when local
+      (qq-media--cache-resource key local))
+    (qq-media--ensure-resource-image
+     key
+     (lambda (done error)
+       (if-let* ((resource (qq-media--face-resource-from-local id)))
+           (funcall done resource)
+         (qq-api-get-base-emoji
+          id
+          (lambda (resource)
+            ;; Merge description from local name table when API omits it.
+            (let* ((resource (copy-tree (or resource '())))
+                   (desc (or (alist-get 'description resource)
+                             (qq-media-face-name id))))
+              (when desc
+                (setf (alist-get 'description resource) desc))
+              (funcall done resource)))
+          error)))
+     qq-media-face-image-height)))
 
 (defun qq-media-face-display-string (emoji-id)
   "Return inline display string for QQ face EMOJI-ID.
 
-When image data is not ready yet, return a textual fallback."
+Prefer the face image (local default-emojis first).  When the image is
+not ready yet, show the human face name (`/斜眼笑') rather than CQ."
   (qq-media--image-display-string
    (qq-media-face-image emoji-id)
-   (format "[face:%s]" emoji-id)))
+   (qq-media-face-text-fallback emoji-id)))
 
 (defun qq-media-segment-preview-key (segment)
   "Return preview cache key for SEGMENT, or nil when unsupported."
