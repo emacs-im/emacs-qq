@@ -155,6 +155,37 @@
        (should errback-called)
        (should-not (qq-media--resource-fetching-p "avatar:10001"))))))
 
+(ert-deftest qq-media-normalize-custom-face-list-keeps-multiple-faces ()
+  "A list of face alists must not collapse into one bogus entry."
+  (let* ((faces '(((url . "https://a")
+                   (md5 . "AAAAAAAA")
+                   (desc . "")
+                   (file . "/tmp/a.jpg"))
+                  ((url . "https://b")
+                   (md5 . "BBBBBBBB")
+                   (desc . "")
+                   (file . "/tmp/b.jpg"))
+                  ((url . "https://c")
+                   (md5 . "CCCCCCCC")
+                   (desc . "named")
+                   (file . "/tmp/c.jpg"))))
+         (normalized (qq-media--normalize-custom-face-list faces))
+         (pairs (qq-media-custom-face-completion-candidates normalized)))
+    (should (= 3 (length normalized)))
+    (should (= 3 (length pairs)))
+    (should (string-match-p "AAAAAAAA" (car (nth 0 pairs))))
+    (should (string-match-p "BBBBBBBB" (car (nth 1 pairs))))
+    (should (string-match-p "named" (car (nth 2 pairs))))))
+
+(ert-deftest qq-media-normalize-custom-face-list-vector-and-single ()
+  (should (= 2 (length (qq-media--normalize-custom-face-list
+                        [((md5 . "A1A1A1A1") (url . "u1"))
+                         ((md5 . "B2B2B2B2") (url . "u2"))]))))
+  (let ((one (qq-media--normalize-custom-face-list
+              '((md5 . "C3C3C3C3") (url . "u3")))))
+    (should (= 1 (length one)))
+    (should (equal "C3C3C3C3" (alist-get 'md5 (car one))))))
+
 (ert-deftest qq-media-custom-face-to-segment-personal-sticker ()
   "Personal favorites become image segments with sub_type 1."
   (let* ((file (make-temp-file "qq-fav" nil ".jpg"))
@@ -331,6 +362,72 @@
                             (list 'preview local-file)))))
        (when (file-exists-p local-file)
          (delete-file local-file))))))
+
+(ert-deftest qq-media-face-completion-sorted-by-numeric-id ()
+  "Base face picker must list faces in QQ id order, not hash/string order."
+  (let ((qq-media--face-names-table (make-hash-table :test #'equal)))
+    (puthash "10" "/尴尬" qq-media--face-names-table)
+    (puthash "2" "/色" qq-media--face-names-table)
+    (puthash "0" "/惊讶" qq-media--face-names-table)
+    (puthash "178" "/斜眼笑" qq-media--face-names-table)
+    (let ((cands (qq-media-face-completion-candidates)))
+      (should (equal cands
+                     '("/惊讶  (0)"
+                       "/色  (2)"
+                       "/尴尬  (10)"
+                       "/斜眼笑  (178)")))
+      (should (equal (qq-media-face-id-from-completion (car cands)) "0"))
+      (should (equal (qq-media-face-id-from-completion "/斜眼笑  (178)")
+                     "178")))))
+
+(ert-deftest qq-media-face-completion-table-metadata ()
+  "Completion table must pin sort order and declare affixation."
+  (let ((qq-media--face-names-table (make-hash-table :test #'equal)))
+    (puthash "0" "/惊讶" qq-media--face-names-table)
+    (puthash "1" "/撇嘴" qq-media--face-names-table)
+    (let* ((table (qq-media-face-completion-table))
+           (meta (funcall table "" nil 'metadata)))
+      (should (eq (car meta) 'metadata))
+      (should (eq (completion-metadata-get meta 'display-sort-function)
+                  #'identity))
+      (should (eq (completion-metadata-get meta 'cycle-sort-function)
+                  #'identity))
+      (should (eq (completion-metadata-get meta 'affixation-function)
+                  #'qq-media-face-affixation-function))
+      (should (equal (all-completions "" table)
+                     '("/惊讶  (0)" "/撇嘴  (1)"))))))
+
+(ert-deftest qq-media-face-affixation-uses-local-png ()
+  "Picker affix should show the local default-emoji PNG when present."
+  (let* ((dir (make-temp-file "qq-emoji-affix" t))
+         (qq-media-default-emoji-directory dir)
+         (qq-media-face-image-height 18)
+         (png (expand-file-name "0.png" dir)))
+    (unwind-protect
+        (progn
+          ;; Minimal valid 1x1 PNG.
+          (with-temp-file png
+            (set-buffer-multibyte nil)
+            (insert (unibyte-string
+                     #x89 #x50 #x4e #x47 #x0d #x0a #x1a #x0a
+                     #x00 #x00 #x00 #x0d #x49 #x48 #x44 #x52
+                     #x00 #x00 #x00 #x01 #x00 #x00 #x00 #x01
+                     #x08 #x02 #x00 #x00 #x00 #x90 #x77 #x53
+                     #xde #x00 #x00 #x00 #x0c #x49 #x44 #x41
+                     #x54 #x08 #xd7 #x63 #xf8 #xcf #xc0 #x00
+                     #x00 #x00 #x03 #x00 #x01 #x00 #x05 #xfe
+                     #xd4 #xef #x00 #x00 #x00 #x00 #x49 #x45
+                     #x4e #x44 #xae #x42 #x60 #x82)))
+          (let* ((affixed (qq-media-face-affixation-function
+                           '("/惊讶  (0)" "/missing  (999)")))
+                 (prefix0 (nth 1 (nth 0 affixed)))
+                 (prefix1 (nth 1 (nth 1 affixed))))
+            (should (get-text-property 0 'display prefix0))
+            (should (eq (car (get-text-property 0 'display prefix0)) 'image))
+            ;; Missing id keeps a plain spacer (no image property).
+            (should-not (get-text-property 0 'display prefix1))))
+      (when (file-directory-p dir)
+        (delete-directory dir t)))))
 
 (provide 'qq-media-test)
 

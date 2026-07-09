@@ -1428,18 +1428,22 @@ When SEGMENT-TYPE is nil, infer the most useful QQ segment type from PATH."
   "Insert a QQ base face (system emoji) into the chat composer.
 
 With FACE-ID (string or number), insert that face directly.  Interactively,
-prompt with completing-read over face names (`/斜眼笑') and ids.
+prompt with completing-read over face names (`/斜眼笑') and ids, each
+prefixed with the local face PNG when available.
+
+Candidates stay in QQ face-id order (0, 1, 2, …) via completion
+metadata (`display-sort-function' = identity), so Vertico/Icomplete
+match QQ's base emoji panel order instead of history/length sort.
 
 Sends as a structured OneBot `face' segment (not Unicode, not CQ text).
 Bound via `qq-chat-attach-emoji' (`C-c C-e'); attach transient `e'."
   (interactive
    (list
-    (let* ((candidates (qq-media-face-completion-candidates))
-           (choice
-            (completing-read
-             "QQ face: "
-             candidates
-             nil t nil 'qq-chat--face-history)))
+    (let ((choice
+           (completing-read
+            "QQ face: "
+            (qq-media-face-completion-table)
+            nil t nil 'qq-chat--face-history)))
       (or (qq-media-face-id-from-completion choice)
           (user-error "qq: not a face candidate: %s" choice)))))
   (let* ((id (format "%s" (or face-id

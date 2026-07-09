@@ -938,39 +938,94 @@ When image data is not ready yet, return a textual fallback."
         (and (string-match-p "\\`[0-9]+\\'" id)
              (gethash id table)))))
 
+(defun qq-media--face-id-number (id)
+  "Return numeric value of face ID string, or nil."
+  (and (stringp id)
+       (string-match-p "\\`[0-9]+\\'" id)
+       (string-to-number id)))
+
 (defun qq-media-face-completion-candidates ()
-  "Return completion table mapping display strings to face id strings.
+  "Return base face candidates sorted by numeric id.
 
 Each candidate looks like \"/斜眼笑  (178)\" so users can search by name
-or numeric id.  Use `qq-media-face-id-from-completion'."
+or numeric id.  Use `qq-media-face-id-from-completion'.
+
+Order is by face id (0, 1, 2, …) — the same order as QQ's default
+emoji panel.  Pair with `qq-media-face-completion-table' so Vertico
+does not re-sort by string length/history."
   (let ((table (qq-media--load-face-names-table))
         (candidates nil))
     (maphash
      (lambda (id name)
-       (push (format "%s  (%s)" (or name (format "[face:%s]" id)) id)
+       (push (cons id (format "%s  (%s)"
+                              (or name (format "[face:%s]" id))
+                              id))
              candidates))
      table)
-    ;; Prefer stable order: by numeric id when possible.
-    (sort candidates
-          (lambda (a b)
-            (let ((ida (and (string-match "(\\([0-9]+\\))\\'" a)
-                            (string-to-number (match-string 1 a))))
-                  (idb (and (string-match "(\\([0-9]+\\))\\'" b)
-                            (string-to-number (match-string 1 b)))))
-              (if (and ida idb)
-                  (< ida idb)
-                (string-lessp a b)))))))
+    (mapcar
+     #'cdr
+     (sort candidates
+           (lambda (a b)
+             (let ((ida (qq-media--face-id-number (car a)))
+                   (idb (qq-media--face-id-number (car b))))
+               (cond
+                ((and ida idb) (< ida idb))
+                (ida t)
+                (idb nil)
+                (t (string-lessp (car a) (car b))))))))))
 
 (defun qq-media-face-id-from-completion (candidate)
   "Extract face id string from a `qq-media-face-completion-candidates' CANDIDATE."
-  (cond
-   ((and (stringp candidate)
-         (string-match "(\\([0-9]+\\))\\'" candidate))
-    (match-string 1 candidate))
-   ((and (stringp candidate)
-         (string-match-p "\\`[0-9]+\\'" candidate))
-    candidate)
-   (t nil)))
+  (let ((text (and (stringp candidate)
+                   (substring-no-properties candidate))))
+    (cond
+     ((and text
+           (string-match "(\\([0-9]+\\))\\'" text))
+      (match-string 1 text))
+     ((and text
+           (string-match-p "\\`[0-9]+\\'" text))
+      text)
+     (t nil))))
+
+(defun qq-media--face-completion-prefix (id)
+  "Return minibuffer prefix string with the face image for ID, or spaces."
+  (let* ((file (qq-media--local-base-emoji-file id))
+         (image (and file
+                     (qq-media--image-from-file
+                      file
+                      (max 1 qq-media-face-image-height)))))
+    (if image
+        (concat (propertize " " 'display image) " ")
+      "  ")))
+
+(defun qq-media-face-affixation-function (candidates)
+  "Affixation function: show local face PNG before each CANDIDATE.
+
+Uses LinuxQQ `default-emojis/<id>.png' only (sync).  Missing files get
+a blank spacer so columns stay aligned."
+  (mapcar
+   (lambda (cand)
+     (let ((id (qq-media-face-id-from-completion cand)))
+       (list cand
+             (if id (qq-media--face-completion-prefix id) "  ")
+             "")))
+   candidates))
+
+(defun qq-media-face-completion-table ()
+  "Completion table for base QQ faces with images and stable id order.
+
+Metadata:
+- `display-sort-function'/`cycle-sort-function' = identity (keep id order)
+- `affixation-function' = face PNG prefix for Vertico/Icomplete"
+  (let ((candidates (qq-media-face-completion-candidates)))
+    (lambda (string pred action)
+      (if (eq action 'metadata)
+          '(metadata
+            (category . qq-face)
+            (display-sort-function . identity)
+            (cycle-sort-function . identity)
+            (affixation-function . qq-media-face-affixation-function))
+        (complete-with-action action candidates string pred)))))
 
 
 ;;; Favorite / custom faces (收藏表情)
@@ -990,16 +1045,33 @@ or numeric id.  Use `qq-media-face-id-from-completion'."
        (not (equal value "false"))
        (not (equal value "0"))))
 
+(defun qq-media--face-alist-p (value)
+  "Return non-nil when VALUE looks like one face resource alist."
+  (and (consp value)
+       (listp value)
+       (consp (car value))
+       ;; first element is (KEY . VAL), not another nested face list
+       (symbolp (car (car value)))))
+
 (defun qq-media--normalize-custom-face-list (data)
-  "Normalize DATA from fetch_custom_face_info into a list of alists."
+  "Normalize DATA from fetch_custom_face_info into a list of face alists.
+
+NapCat returns a JSON array → vector or list of alists.  A single face
+alist must not be confused with a list of faces: for a list of faces the
+first element is itself an alist; for one face the first element is a
+pair `(url . …)'."
   (cond
    ((null data) nil)
-   ((vectorp data) (append data nil))
-   ((listp data)
-    ;; Either a list of faces, or a single face alist.
-    (if (and data (consp (car data)) (symbolp (car (car data))))
-        data
-      (list data)))
+   ((vectorp data)
+    (qq-media--normalize-custom-face-list (append data nil)))
+   ((not (listp data)) nil)
+   ;; List of face alists: car is an alist (caar is a pair).
+   ((and (consp (car data))
+         (qq-media--face-alist-p (car data)))
+    data)
+   ;; Single face alist: car is (symbol . value).
+   ((qq-media--face-alist-p data)
+    (list data))
    (t nil)))
 
 (defun qq-media-custom-faces (&optional force)
@@ -1034,8 +1106,11 @@ CALLBACK is called with the face list on success."
         (and emo (format "emo:%s" emo)))
       (format "fav:%s" (sxhash-equal face))))
 
-(defun qq-media-custom-face-label (face)
-  "Return a human completion label for favorite FACE."
+(defun qq-media-custom-face-label (face &optional index)
+  "Return a human completion label for favorite FACE.
+
+INDEX, when non-nil, is included so completing-read candidates stay unique
+even when several favorites share an empty `desc'."
   (let* ((desc (alist-get 'desc face))
          (md5 (alist-get 'md5 face))
          (emo (alist-get 'emo_id face))
@@ -1045,10 +1120,14 @@ CALLBACK is called with the face list on success."
                   (string-trim desc))
                  ((and (stringp md5) (>= (length md5) 8))
                   (concat (substring md5 0 8) "…"))
-                 (emo (format "#%s" emo))
+                 ((and emo (not (equal emo 0)) (not (equal emo "0")))
+                  (format "#%s" emo))
                  (t "favorite")))
-         (kind (if mark "mface" "fav")))
-    (format "[%s] %s" kind short)))
+         (kind (if mark "mface" "fav"))
+         (base (format "[%s] %s" kind short)))
+    (if index
+        (format "%s  (%d)" base (1+ index))
+      base)))
 
 (defun qq-media-custom-face-file (face)
   "Return best local image path for FACE, or nil."
@@ -1079,12 +1158,14 @@ CALLBACK is called with the face list on success."
 (defun qq-media-custom-face-completion-candidates (&optional faces)
   "Return completion candidates for favorite FACES (default: cache).
 
-Each candidate is a string; use `qq-media-custom-face-from-completion'."
+Each entry is `(LABEL . FACE)'.  Labels are unique (md5 + index)."
   (let ((faces (or faces qq-media--custom-faces))
-        (candidates nil))
+        (candidates nil)
+        (i 0))
     (dolist (face faces)
-      (when (listp face)
-        (push (cons (qq-media-custom-face-label face) face) candidates)))
+      (when (qq-media--face-alist-p face)
+        (push (cons (qq-media-custom-face-label face i) face) candidates)
+        (setq i (1+ i))))
     (nreverse candidates)))
 
 (defun qq-media-custom-face-from-completion (candidate &optional pairs)

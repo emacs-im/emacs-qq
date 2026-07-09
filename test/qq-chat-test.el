@@ -968,7 +968,7 @@
              (qq-chat-render)
              (cl-letf (((symbol-function 'completing-read)
                         (lambda (&rest _)
-                          (qq-media-custom-face-label face))))
+                          (qq-media-custom-face-label face 0))))
                (qq-chat-attach-custom-face)
                (let ((segments (qq-chat--current-input-segments)))
                  (should (= 1 (length segments)))
