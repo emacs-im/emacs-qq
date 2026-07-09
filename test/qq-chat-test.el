@@ -1138,6 +1138,80 @@
            '((message . "消息 not exist")) "fail"))
   (should-not (qq-api--history-exhausted-error-p nil "timeout")))
 
-(provide 'qq-chat-test)
+(ert-deftest qq-chat-goto-reply-jumps-to-loaded-target ()
+  "telega-style: goto reply target when both messages are in the timeline."
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    (list (cons (quote title) "Alice")
+          (cons (quote target-id) "10001"))
+    nil)
+   (qq-state-merge-history
+    "private:10001"
+    (list
+     (list (cons (quote message_id) "100")
+           (cons (quote message_type) "private")
+           (cons (quote user_id) 10001)
+           (cons (quote time) 1710000100)
+           (cons (quote sender)
+                 (list (cons (quote user_id) 10001)
+                       (cons (quote nickname) "Alice")))
+           (cons (quote raw_message) "source")
+           (cons (quote message)
+                 (list (list (cons (quote type) "text")
+                             (cons (quote data)
+                                   (list (cons (quote text) "source")))))))
+     (list (cons (quote message_id) "200")
+           (cons (quote message_type) "private")
+           (cons (quote user_id) 10001)
+           (cons (quote time) 1710000200)
+           (cons (quote sender)
+                 (list (cons (quote user_id) 10001)
+                       (cons (quote nickname) "Alice")))
+           (cons (quote raw_message) "reply body")
+           (cons (quote message)
+                 (list (list (cons (quote type) "reply")
+                             (cons (quote data)
+                                   (list (cons (quote id) "100"))))
+                       (list (cons (quote type) "text")
+                             (cons (quote data)
+                                   (list (cons (quote text) "reply body")))))))))
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (let ((reply-pos (qq-chat--message-position "200")))
+       (should reply-pos)
+       (goto-char reply-pos)
+       (should (equal "100"
+                      (qq-chat--message-reply-id (qq-chat--message-at-point))))
+       (qq-chat-goto-reply)
+       (should (equal "100"
+                      (get-text-property (point) (quote qq-chat-message-anchor))))
+       (should (not (ring-empty-p qq-chat--messages-pop-ring)))
+       (should (equal "200" (ring-ref qq-chat--messages-pop-ring 0)))
+       (qq-chat-goto-pop-message)
+       (should (equal "200"
+                      (get-text-property (point) (quote qq-chat-message-anchor))))))))
+
+(ert-deftest qq-chat-message-reply-id-from-segments ()
+  (should
+   (equal "42"
+          (qq-chat--message-reply-id
+           (list (cons (quote segments)
+                       (list (list (cons (quote type) "reply")
+                                   (cons (quote data)
+                                         (list (cons (quote id) "42"))))
+                             (list (cons (quote type) "text")
+                                   (cons (quote data)
+                                         (list (cons (quote text) "hi"))))))))))
+  (should-not
+   (qq-chat--message-reply-id
+    (list (cons (quote segments)
+                (list (list (cons (quote type) "text")
+                            (cons (quote data)
+                                  (list (cons (quote text) "hi"))))))))))
+
+(provide (quote qq-chat-test))
 
 ;;; qq-chat-test.el ends here

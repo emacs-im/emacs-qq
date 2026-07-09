@@ -11,6 +11,7 @@
 
 (require 'cl-lib)
 (require 'ring)
+(require 'button)
 (require 'subr-x)
 (require 'ewoc)
 (require 'disco-chatbuf)
@@ -88,6 +89,15 @@
 (defvar-local qq-chat--history-exhausted nil
   "Non-nil when older history is known to be exhausted for this chat.")
 
+(defvar-local qq-chat--pending-jump-id nil
+  "Server message id to jump to after history loads, or nil.
+
+Mirrors telega's async `telega-chatbuf--goto-msg' when the target is not yet
+loaded in the chatbuf.")
+
+(defvar-local qq-chat--messages-pop-ring nil
+  "Ring of message anchors for jump-back (telega `telega-chatbuf--messages-pop-ring').")
+
 (defvar qq-chat-timeline-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "q") #'quit-window)
@@ -96,14 +106,16 @@
     (define-key map (kbd "d") #'qq-chat-delete-message)
     (define-key map (kbd "o") #'qq-chat-open-resource-at-point)
     (define-key map (kbd "a") #'qq-chat-open-avatar-at-point)
+    (define-key map (kbd "g") #'qq-chat-goto-reply)
+    (define-key map (kbd "x") #'qq-chat-goto-pop-message)
     (define-key map (kbd "m") #'qq-chat-message-transient)
     (define-key map (kbd "?") #'qq-chat-transient)
     map)
   "Timeline-only keymap active when point is outside the draft region.
 
-Single-key message actions (`r' reply, `d' recall, `o' open media, `a' avatar)
-and menus (`m' message transient, `?' chat transient) apply when point is on the
-timeline.  They are inactive in the composer so typing is never stolen.")
+Single-key message actions (`r' reply, `d' recall, `o' open media, `a' avatar,
+`g' goto replied-to, `x' pop jump) and menus (`m'/`?') apply on the timeline.
+They are inactive in the composer so typing is never stolen.")
 
 (define-minor-mode qq-chat-timeline-mode
   "Buffer-local navigation bindings active outside the draft region."
@@ -1720,7 +1732,7 @@ Never dump OneBot CQ / raw_message here — previews come from
 (defun qq-chat--header-help-text ()
   "Return header help text for chat actions."
   (concat
-   "M-<: older   r/d/o/a · m/?   C-c C-e face · C-u fav   C-c C-v clip   C-c C-c send"))
+   "M-<: older   r/d/o/a · g reply-jump · x pop · m/?   C-c C-e face · C-c C-v · C-c C-c"))
 
 (defun qq-chat--insert-date-separator-row (day-label)
   "Insert a date separator row for DAY-LABEL."
@@ -1745,11 +1757,183 @@ Label matches telega's unread bar wording (\"Unread Messages\")."
               (format "%s" server-id)))
      (qq-state-session-messages qq-chat--session-key))))
 
+(defun qq-chat--message-position (server-id)
+  "Return buffer position of SERVER-ID's rendered message, or nil.
+
+Like locating a telega message button by id.
+Note: `text-property-any' uses `eq'; snowflake string ids need `equal'."
+  (when server-id
+    (let ((want (format "%s" server-id))
+          (pos (point-min))
+          found)
+      (while (and (not found) (< pos (point-max)))
+        (let ((here (get-text-property pos 'qq-chat-message-anchor)))
+          (if (and here (equal (format "%s" here) want))
+              (setq found pos)
+            (setq pos (or (next-single-property-change
+                           pos 'qq-chat-message-anchor nil (point-max))
+                          (point-max))))))
+      found)))
+
+(defun qq-chat--message-end-position (start)
+  "Return end position of the message block starting at START."
+  (or (and start
+           (next-single-property-change
+            start 'qq-chat-message-anchor nil (point-max)))
+      start))
+
+(defun qq-chat--highlight-region (start end)
+  "Pulse region START..END (telega uses `pulse-momentary-highlight-region')."
+  (when (and (number-or-marker-p start)
+             (number-or-marker-p end)
+             (< start end)
+             (fboundp 'pulse-momentary-highlight-region))
+    (with-no-warnings
+      (pulse-momentary-highlight-region start end))))
+
+(defun qq-chat--messages-pop-ring-last-p (message-id)
+  "Return non-nil when MESSAGE-ID is already the top of the pop ring."
+  (and (ring-p qq-chat--messages-pop-ring)
+       (not (ring-empty-p qq-chat--messages-pop-ring))
+       (equal (format "%s" (ring-ref qq-chat--messages-pop-ring 0))
+              (format "%s" message-id))))
+
+(defun qq-chat--messages-pop-ring-push (message-id)
+  "Push MESSAGE-ID onto the jump-back ring (telega chatbuf pop ring)."
+  (when (and message-id (ring-p qq-chat--messages-pop-ring))
+    (let ((id (format "%s" message-id)))
+      (unless (qq-chat--messages-pop-ring-last-p id)
+        (ring-insert qq-chat--messages-pop-ring id)
+        (message "qq: %s to jump back"
+                 (or (key-description
+                      (where-is-internal #'qq-chat-goto-pop-message
+                                         qq-chat-timeline-mode-map t))
+                     "x"))))))
+
+(defun qq-chat--goto-loaded-message (server-id &optional highlight)
+  "Goto SERVER-ID only if already displayed (telega `--goto-loaded-msg').
+
+Return non-nil on success.  When HIGHLIGHT is non-nil, pulse the block."
+  (when-let* ((id (and server-id (format "%s" server-id)))
+              (pos (qq-chat--message-position id)))
+    (goto-char pos)
+    (when-let* ((win (get-buffer-window (current-buffer) t)))
+      (set-window-point win pos)
+      (with-selected-window win
+        (goto-char pos)
+        ;; telega-button--make-observable equivalent: keep target in view.
+        (recenter)))
+    (when highlight
+      (qq-chat--highlight-region pos (qq-chat--message-end-position pos)))
+    t))
+
+(defun qq-chat--resolve-pending-jump ()
+  "Finish async jump for `qq-chat--pending-jump-id'.
+
+Order (telega `telega-chatbuf--goto-msg' adapted to NapCat paging):
+1. if loaded → jump + highlight
+2. else if history available → load older page
+3. else → not found"
+  (when (and (stringp qq-chat--pending-jump-id)
+             (not (string-empty-p qq-chat--pending-jump-id)))
+    (let ((target qq-chat--pending-jump-id))
+      (cond
+       ((qq-chat--goto-loaded-message target t)
+        (setq qq-chat--pending-jump-id nil))
+       (qq-chat--history-loading
+        nil)
+       (qq-chat--history-exhausted
+        (setq qq-chat--pending-jump-id nil)
+        (message "qq: message not found"))
+       ((null (qq-state-session-oldest-message-id qq-chat--session-key))
+        (setq qq-chat--pending-jump-id nil)
+        (message "qq: message not found"))
+       (t
+        (message "qq: loading…")
+        (qq-chat-load-older-messages))))))
+
+(defun qq-chat-goto-message (message-id &optional no-pop)
+  "Goto MESSAGE-ID in the current chatbuf (telega `telega-chatbuf--goto-msg').
+
+1. Push message at point onto the pop ring (unless NO-POP)
+2. If already loaded, jump and pulse-highlight
+3. Else fetch via `get_msg' when possible, then page older history until
+   found or exhausted
+
+Async; may load several older pages."
+  (interactive
+   (list (or (get-text-property (point) 'qq-chat-reply-id)
+             (qq-chat--message-reply-id (qq-chat--message-at-point))
+             (read-string "Message id: "))))
+  (unless qq-chat--session-key
+    (user-error "qq: this buffer is not bound to a session"))
+  (let ((id (and message-id (format "%s" message-id)))
+        (session-key qq-chat--session-key)
+        (buffer (current-buffer)))
+    (unless (and id (not (string-empty-p id)))
+      (user-error "qq: no message id to jump to"))
+    ;; telega: put message at point into messages-pop-ring.
+    (unless no-pop
+      (when-let* ((at-point (qq-chat--message-at-point))
+                  (cur-id (qq-chat--message-anchor at-point)))
+        (unless (equal (format "%s" cur-id) id)
+          (qq-chat--messages-pop-ring-push cur-id))))
+    (if (qq-chat--goto-loaded-message id t)
+        (setq qq-chat--pending-jump-id nil)
+      (setq qq-chat--pending-jump-id id)
+      (message "qq: loading…")
+      ;; telega-msg-get: try single-message fetch first.
+      (qq-api-get-msg
+       id
+       (lambda (raw)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (when (equal qq-chat--session-key session-key)
+               (when (and raw (listp raw))
+                 (qq-state-merge-history session-key (list raw)))
+               (if (qq-chat--goto-loaded-message id t)
+                   (setq qq-chat--pending-jump-id nil)
+                 (qq-chat--resolve-pending-jump))))))
+       (lambda (_response _reason)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (when (equal qq-chat--session-key session-key)
+               (qq-chat--resolve-pending-jump)))))))))
+
+(defun qq-chat-goto-reply (&optional message)
+  "Goto the message that MESSAGE replies to (telega `telega-msg-goto-reply-to-message').
+
+MESSAGE defaults to the message at point.  Bound to timeline `g'.  The ↪
+reply preview line is also a button that calls this path."
+  (interactive)
+  (let* ((msg (or message
+                  (qq-chat--message-at-point)
+                  (user-error "qq: no message at point")))
+         (reply-id (or (qq-chat--message-reply-id msg)
+                       (user-error "qq: message is not a reply"))))
+    (qq-chat-goto-message reply-id)))
+
+(defun qq-chat-goto-pop-message ()
+  "Pop a message from the jump ring and goto it (telega `telega-chatbuf-goto-pop-message').
+
+Bound to timeline `x'."
+  (interactive)
+  (unless (and (ring-p qq-chat--messages-pop-ring)
+               (not (ring-empty-p qq-chat--messages-pop-ring)))
+    (user-error "qq: no messages to pop to"))
+  (let ((id (ring-remove qq-chat--messages-pop-ring 0)))
+    (message "qq: %d messages left in ring"
+             (ring-length qq-chat--messages-pop-ring))
+    ;; Avoid re-pushing current while popping (telega binds ring to nil).
+    (let ((qq-chat--messages-pop-ring nil))
+      (qq-chat-goto-message id 'no-pop))))
+
 (defun qq-chat--insert-reply-preview-line (reply-id properties prefix-state)
   "Insert one inline reply preview line for REPLY-ID.
 
-PROPERTIES and PREFIX-STATE control styling for the inserted line.
-Prefer source-message preview text over the raw id (telega-like)."
+Telega uses `telega-ins--with-props' + `:action telega-msg-goto-reply-to-message'
+on the reply header.  Here the line is a button (RET / mouse-1) that jumps to
+REPLY-ID via `qq-chat-goto-message'."
   (let* ((source (qq-chat--message-by-server-id reply-id))
          (sender (and source (car (qq-chat--message-sender-display-parts source))))
          (preview (and source (string-trim (or (qq-state-message-preview source) ""))))
@@ -1760,11 +1944,34 @@ Prefer source-message preview text over the raw id (telega-like)."
                 ((and preview (not (string-empty-p preview)))
                  (truncate-string-to-width preview 64 nil nil t))
                 (t (format "id %s" reply-id))))
-         (reply-start (point)))
+         (reply-start (point))
+         (target (format "%s" reply-id))
+         (map (let ((map (make-sparse-keymap)))
+                (set-keymap-parent map button-map)
+                (define-key map [mouse-1]
+                  (lambda ()
+                    (interactive)
+                    (qq-chat-goto-message target)))
+                (define-key map (kbd "RET")
+                  (lambda ()
+                    (interactive)
+                    (qq-chat-goto-message target)))
+                map)))
     (insert (format "↪ %s\n" body))
     (add-text-properties
      reply-start (point)
-     (append properties (list 'face 'qq-msg-inline-reply)))
+     (append properties
+             (list 'face 'qq-msg-inline-reply
+                   'mouse-face 'highlight
+                   'help-echo "Jump to replied message (telega-style; g / RET)"
+                   'follow-link t
+                   'keymap map
+                   'button t
+                   'category 'default-button
+                   'action (lambda (_button)
+                             (qq-chat-goto-message target))
+                   'qq-chat-reply-id target
+                   'qq-chat-reply-button t)))
     (qq-ui-apply-line-prefix reply-start (point) prefix-state)))
 
 (defun qq-chat--face-segment-id (segment)
@@ -2318,18 +2525,23 @@ new rows or reports the cursor missing."
            (with-current-buffer buffer
              (when (equal qq-chat--session-key session-key)
                (setq qq-chat--history-loading nil)
-               (let ((added (or (plist-get meta :added-count) 0)))
-                 (if (<= added 0)
-                     (progn
-                       (setq qq-chat--history-exhausted t)
-                       (qq-chat--chat-update 'header-line 'header)
-                       (message "qq: reached beginning of history"))
-                   ;; Timeline already reconciled via history hook; only
-                   ;; clear the loading note in the header.
+               (let ((added (or (plist-get meta :added-count) 0))
+                     (jumping qq-chat--pending-jump-id))
+                 (cond
+                  ((<= added 0)
+                   (setq qq-chat--history-exhausted t)
                    (qq-chat--chat-update 'header-line 'header)
-                   (message "qq: loaded %d older message%s"
-                            added
-                            (if (= added 1) "" "s"))))))))
+                   (if jumping
+                       (qq-chat--resolve-pending-jump)
+                     (message "qq: reached beginning of history")))
+                  (t
+                   ;; Timeline already reconciled via history hook.
+                   (qq-chat--chat-update 'header-line 'header)
+                   (if jumping
+                       (qq-chat--resolve-pending-jump)
+                     (message "qq: loaded %d older message%s"
+                              added
+                              (if (= added 1) "" "s"))))))))))
        (lambda (response reason)
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
@@ -2339,8 +2551,12 @@ new rows or reports the cursor missing."
                    (progn
                      (setq qq-chat--history-exhausted t)
                      (qq-chat--chat-update 'header-line 'header)
-                     (message "qq: reached beginning of history"))
+                     (if qq-chat--pending-jump-id
+                         (qq-chat--resolve-pending-jump)
+                       (message "qq: reached beginning of history")))
                  (qq-chat--chat-update 'header-line 'header)
+                 (when qq-chat--pending-jump-id
+                   (setq qq-chat--pending-jump-id nil))
                  (qq-api--default-error response reason)))))))))))
 
 (defun qq-chat-send-message ()
@@ -2542,6 +2758,9 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (setq-local qq-chat--deferred-node-anchors nil)
   (setq-local qq-chat--history-loading nil)
   (setq-local qq-chat--history-exhausted nil)
+  (setq-local qq-chat--pending-jump-id nil)
+  (setq-local qq-chat--messages-pop-ring
+              (make-ring (max 1 qq-chat-messages-pop-ring-size)))
   ;; telega-style: M-x yank-media also drops images into the composer.
   (when (fboundp 'yank-media-handler)
     (funcall #'yank-media-handler

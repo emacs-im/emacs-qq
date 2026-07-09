@@ -44,6 +44,14 @@ When nil, emacs-qq falls back to `qq-onebot-token-env-var'."
   :type 'integer
   :group 'qq)
 
+(defcustom qq-chat-messages-pop-ring-size 50
+  "Size of the chatbuf messages pop ring (telega `telega-chat-messages-pop-ring-size').
+
+When jumping to a reply target (or any message), the previous message at
+point is pushed so `qq-chat-goto-pop-message' (`x') can jump back."
+  :type 'integer
+  :group 'qq)
+
 (defcustom qq-auto-mark-read t
   "When non-nil, mark a chat as read when its buffer is visible."
   :type 'boolean

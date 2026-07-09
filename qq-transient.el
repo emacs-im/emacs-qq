@@ -44,6 +44,19 @@
         (null (alist-get 'server-id message))
         (qq-state-message-recalled-p message))))
 
+(defun qq-transient--goto-reply-inapt-p ()
+  "Return non-nil when the message at point has no reply target to jump to."
+  (let ((message (qq-transient--message-at-point)))
+    (or (null message)
+        (null (qq-chat--message-reply-id message)))))
+
+(defun qq-transient--pop-ring-empty-p ()
+  "Return non-nil when the messages pop ring is empty."
+  (or (not (boundp 'qq-chat--messages-pop-ring))
+      (null qq-chat--messages-pop-ring)
+      (not (ring-p qq-chat--messages-pop-ring))
+      (ring-empty-p qq-chat--messages-pop-ring)))
+
 (defun qq-transient--recall-inapt-p ()
   "Return non-nil when recall is unavailable for the message at point."
   (let ((message (qq-transient--message-at-point)))
@@ -113,10 +126,14 @@ Prefer this over inline button rows (telega/disco style)."
     ("o" "Open resource" qq-chat-open-resource-at-point
      :inapt-if qq-transient--resource-inapt-p)
     ("a" "Open avatar" qq-chat-open-avatar-at-point
-     :inapt-if qq-transient--avatar-inapt-p)]
+     :inapt-if qq-transient--avatar-inapt-p)
+    ("g" "Goto reply target" qq-chat-goto-reply
+     :inapt-if qq-transient--goto-reply-inapt-p)]
    ["Navigate"
     ("n" "Next message" qq-chat-next-message)
-    ("p" "Previous message" qq-chat-previous-message)]])
+    ("p" "Previous message" qq-chat-previous-message)
+    ("x" "Pop jump" qq-chat-goto-pop-message
+     :inapt-if qq-transient--pop-ring-empty-p)]])
 
 ;;;###autoload(autoload 'qq-chat-attach-transient "qq-transient" nil t)
 (transient-define-prefix qq-chat-attach-transient ()

@@ -157,6 +157,19 @@ merge.  ERRBACK receives (RESPONSE REASON) like other `qq-api-call' errors."
            (funcall callback meta))))
      errback)))
 
+(defun qq-api-get-msg (message-id callback &optional errback)
+  "Fetch a single message by MESSAGE-ID (NapCat hard-cut snowflake string).
+
+CALLBACK receives the raw OneBot message alist (response `data').  Used by
+chatbuf jump (telega `telega-msg-get') before paging older history."
+  (qq-api-call
+   "get_msg"
+   `((message_id . ,(format "%s" message-id)))
+   (lambda (response)
+     (when callback
+       (funcall callback (qq-api--response-data response))))
+   errback))
+
 (defun qq-api-mark-session-read (session-key)
   "Mark SESSION-KEY as read both locally and in NapCat.
 
