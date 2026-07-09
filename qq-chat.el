@@ -1521,10 +1521,12 @@ image/video inference."
   (format "%s %s\n" label message-id))
 
 (defun qq-chat--cancel-reply-button-string ()
-  "Return a quiet cancel control for reply aux (telega-like close)."
+  "Return telega-style close button for reply aux (`[×]').
+
+Matches `telega-symbol-button-close' + `telega-link' face."
   (propertize
-   "×"
-   'face 'shadow
+   "[×]"
+   'face 'link
    'mouse-face 'highlight
    'help-echo "Cancel reply (C-c C-k)"
    'follow-link t
@@ -1543,8 +1545,8 @@ image/video inference."
 (defun qq-chat--reply-context-text ()
   "Return extra context lines shown above the chat composer.
 
-Quiet telega-like aux: leading × + short summary.  No keybinding slogans;
-cancel with `C-c C-k' or click × (help-echo)."
+Telega aux shape: `[×]' then reply summary in shadow.  No keybinding
+slogans in the line — cancel via button or `C-c C-k'."
   (let ((message (qq-chat--reply-message)))
     (if-let* ((reply-id (alist-get 'server-id message))
               (name (or (car (qq-chat--message-sender-display-parts message))
@@ -1555,7 +1557,7 @@ cancel with `C-c C-k' or click × (help-echo)."
                 (format "Reply to %s\n" name)
                 (format "  %s\n"
                         (if (string-empty-p preview)
-                            (format "id %s" reply-id)
+                            ""
                           (truncate-string-to-width preview 72 nil nil t))))))
         (concat
          (qq-chat--cancel-reply-button-string)
@@ -1566,7 +1568,7 @@ cancel with `C-c C-k' or click × (help-echo)."
 (defun qq-chat--header-help-text ()
   "Return header help text for chat actions."
   (concat
-   "M-<: older   r/d/o/a · m/? menus   C-c C-k cancel   C-c C-v clipboard   C-c C-c send"))
+   "M-<: older   r/d/o/a · m/?   C-c C-k cancel   C-c C-v clipboard   C-c C-c send"))
 
 (defun qq-chat--insert-date-separator-row (day-label)
   "Insert a date separator row for DAY-LABEL."
@@ -1575,9 +1577,11 @@ cancel with `C-c C-k' or click × (help-echo)."
    :face 'qq-msg-date-separator))
 
 (defun qq-chat--insert-unread-divider-row ()
-  "Insert the unread separator row above the first unread message."
+  "Insert the unread separator row above the first unread message.
+
+Label matches telega's unread bar wording (\"Unread Messages\")."
   (qq-view-insert-note-line
-   "-- Unread --"
+   "Unread Messages"
    :face 'qq-msg-unread-divider))
 
 (defun qq-chat--message-by-server-id (server-id)

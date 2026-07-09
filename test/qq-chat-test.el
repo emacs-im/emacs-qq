@@ -805,7 +805,7 @@
      (let ((qq-chat-show-unread-divider t))
        (qq-chat-render)
        (goto-char (point-min))
-       (should (search-forward "Unread" nil t))
+       (should (search-forward "Unread Messages" nil t))
        (let ((ctx (gethash "m2" qq-chat--render-context-by-anchor)))
          (should (plist-get ctx :insert-unread)))
        (qq-state-clear-session-unread "private:10001")
@@ -813,7 +813,7 @@
        (should-not (plist-get (gethash "m2" qq-chat--render-context-by-anchor)
                               :insert-unread))
        (goto-char (point-min))
-       (should-not (search-forward "Unread" nil t))))))
+       (should-not (search-forward "Unread Messages" nil t))))))
 
 (defconst qq-chat-test--1x1-png
   (base64-decode-string

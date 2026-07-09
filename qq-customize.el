@@ -77,35 +77,46 @@ available via `C-c ?' / `describe-mode'."
   :type 'boolean
   :group 'qq)
 
+;; Faces mirror telega-msg-* defaults (not a visual clone of every palette
+;; trick).  Keep them ordinary so theming stays familiar.
+
 (defface qq-msg-heading
   '((((class color) (background light))
-     :background "gray95" :extend t)
+     :background "gray90" :extend t)
     (((class color) (background dark))
-     :background "gray18" :extend t)
-    (t :extend t))
+     :background "gray20" :extend t)
+    (t :inherit widget-single-line-field :extend t))
   "Face for message heading rows (avatar + sender + time).
 
-Kept subtle; intended for future appkit chatbuf reuse."
+Same defaults as `telega-msg-heading'."
   :group 'qq)
 
 (defface qq-msg-self-title
-  '((t :inherit font-lock-keyword-face))
-  "Face for the current account's sender title in chat buffers."
+  '((t :bold t))
+  "Face for the current account's sender title.
+
+Same defaults as `telega-msg-self-title'."
   :group 'qq)
 
 (defface qq-msg-user-title
-  '((t :inherit default))
-  "Face for other users' sender titles in chat buffers."
+  '((t nil))
+  "Face for other users' sender titles.
+
+Same defaults as `telega-msg-user-title'."
   :group 'qq)
 
 (defface qq-msg-inline-reply
-  '((t :inherit shadow))
-  "Face for inline reply preview rows."
+  '((t :inherit (qq-msg-heading shadow)))
+  "Face for inline reply preview rows.
+
+Same idea as `telega-msg-inline-reply'."
   :group 'qq)
 
 (defface qq-msg-deleted
-  '((t :inherit shadow :slant italic))
-  "Face used for recalled message stubs."
+  '((t :inherit custom-invalid :extend t))
+  "Face used for recalled message stubs.
+
+Same defaults as `telega-msg-deleted'."
   :group 'qq)
 
 (defface qq-msg-date-separator
@@ -115,7 +126,7 @@ Kept subtle; intended for future appkit chatbuf reuse."
 
 (defface qq-msg-unread-divider
   '((t :inherit shadow))
-  "Face for the unread messages bar."
+  "Face for the unread messages bar (telega unread bar)."
   :group 'qq)
 
 (defface qq-msg-status
