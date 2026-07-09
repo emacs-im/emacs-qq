@@ -90,24 +90,14 @@
     (define-key map (kbd "d") #'qq-chat-delete-message)
     (define-key map (kbd "o") #'qq-chat-open-resource-at-point)
     (define-key map (kbd "a") #'qq-chat-open-avatar-at-point)
+    (define-key map (kbd "m") #'qq-chat-message-transient)
+    (define-key map (kbd "?") #'qq-chat-transient)
     map)
   "Timeline-only keymap active when point is outside the draft region.
 
 Single-key message actions (`r' reply, `d' recall, `o' open media, `a' avatar)
-apply to the message at point.  They are inactive in the composer so typing is
-never stolen.")
-
-(defvar qq-chat-message-prefix-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "r") #'qq-chat-reply-to-message)
-    (define-key map (kbd "d") #'qq-chat-delete-message)
-    (define-key map (kbd "o") #'qq-chat-open-resource-at-point)
-    (define-key map (kbd "a") #'qq-chat-open-avatar-at-point)
-    map)
-  "Prefix map for message actions at point (`C-c m') in `qq-chat-mode'.
-
-Prefer timeline single keys when point is on a message; this map remains as a
-fallback that also works while the cursor is in the input region.")
+and menus (`m' message transient, `?' chat transient) apply when point is on the
+timeline.  They are inactive in the composer so typing is never stolen.")
 
 (define-minor-mode qq-chat-timeline-mode
   "Buffer-local navigation bindings active outside the draft region."
@@ -1437,8 +1427,8 @@ When SEGMENT-TYPE is nil, infer the most useful QQ segment type from PATH."
 (defun qq-chat--header-help-text ()
   "Return header help text for chat actions."
   (concat
-   "M-<: older   M-g n/p: messages   C-c r: read   r/d/o/a: reply/recall/open/avatar at point"
-   "   C-c C-f: attach   RET/C-c C-c: send   M-p/n: draft history   q: quit   C-c ?: help"))
+   "M-<: older   r/d/o/a: reply/recall/open/avatar   m: message menu   ?: chat menu"
+   "   C-c C-a: attach   RET/C-c C-c: send   C-c ?: chat transient   q: quit"))
 
 (defun qq-chat--insert-date-separator-row (day-label)
   "Insert a date separator row for DAY-LABEL."
@@ -2100,7 +2090,7 @@ Updates header-line and redisplays only nodes whose render context changed
     (define-key map (kbd "C-c C-n") #'qq-chat-search-next)
     (define-key map (kbd "C-c C-p") #'qq-chat-search-prev)
     (define-key map (kbd "C-c r") #'qq-chat-read-all)
-    (define-key map (kbd "C-c m") qq-chat-message-prefix-map)
+    (define-key map (kbd "C-c m") #'qq-chat-message-transient)
     (define-key map (kbd "M-<") #'qq-chat-load-older-messages)
     (define-key map (kbd "RET") #'qq-chat-return-dwim)
     (define-key map (kbd "TAB") #'qq-chat-edit-draft)
@@ -2108,16 +2098,21 @@ Updates header-line and redisplays only nodes whose render context changed
     (define-key map (kbd "M-p") #'qq-chat-draft-prev)
     (define-key map (kbd "M-n") #'qq-chat-draft-next)
     (define-key map (kbd "C-c C-f") #'qq-chat-attach-file)
+    (define-key map (kbd "C-c C-a") #'qq-chat-attach-transient)
     (define-key map (kbd "M-g n") #'qq-chat-next-message)
     (define-key map (kbd "M-g p") #'qq-chat-previous-message)
     (define-key map (kbd "C-c C-c") #'qq-chat-send-message)
     (define-key map (kbd "C-c C-k") #'qq-chat-cancel-dwim)
-    (define-key map (kbd "C-c ?") #'describe-mode)
+    (define-key map (kbd "C-c ?") #'qq-chat-transient)
     map)
   "Keymap for `qq-chat-mode'.")
 
 (define-derived-mode qq-chat-mode nil "QQ-Chat"
-  "Major mode for emacs-qq chat buffers."
+  "Major mode for emacs-qq chat buffers.
+
+Message actions use point + keys (`r'/`d'/`o'/`a' on the timeline) or
+`qq-chat-message-transient' (`C-c m' / timeline `m').  Chat-wide commands
+are in `qq-chat-transient' (`C-c ?' / timeline `?')."
   (disco-chatbuf-mode-setup)
   (setq-local qq-chat--draft-input "")
   (setq-local qq-chat--draft-input-rich "")

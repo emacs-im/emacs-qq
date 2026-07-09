@@ -292,7 +292,7 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
        (qq-view-insert-note-line (qq-root--filters-line) :face 'font-lock-doc-face)
        (qq-view-insert-note-line (qq-root--mode-divider-line) :face 'shadow)
        (qq-view-insert-note-line
-        "g refresh  RET open  a avatar  TAB/n/p move  u next unread  s// search  q quit")
+        "g refresh  RET open  a avatar  TAB/n/p move  u next unread  s// search  ?: menu  q quit")
        (insert "\n")
        (if sessions
            (dolist (session sessions)
@@ -319,13 +319,15 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
     (define-key map (kbd "TAB") #'qq-root-tab-dwim)
     (define-key map (kbd "<backtab>") #'qq-root-button-backward)
     (define-key map (kbd "u") #'qq-root-next-unread)
-    (define-key map (kbd "?") #'describe-mode)
+    (define-key map (kbd "?") #'qq-root-transient)
     (define-key map (kbd "q") #'quit-window)
     map)
   "Keymap for `qq-root-mode'.")
 
 (define-derived-mode qq-root-mode special-mode "QQ-Root"
-  "Major mode for the emacs-qq root buffer."
+  "Major mode for the emacs-qq root buffer.
+
+`?' opens `qq-root-transient' (discoverable command menu)."
   (setq buffer-read-only t)
   (setq truncate-lines t)
   (setq-local switch-to-buffer-preserve-window-point nil))

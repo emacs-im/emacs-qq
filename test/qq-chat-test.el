@@ -5,6 +5,7 @@
 (require 'ert)
 (require 'qq-chat)
 (require 'qq-state)
+(require 'qq-transient)
 
 (defmacro qq-chat-test-with-reset (&rest body)
   "Run BODY with clean qq state and disabled live-update hooks."
@@ -48,8 +49,12 @@
              (should (eq (key-binding (kbd "q") t) 'quit-window))
              (should (eq (key-binding (kbd "r") t) 'qq-chat-reply-to-message))
              (should (eq (key-binding (kbd "d") t) 'qq-chat-delete-message))
+             (should (eq (key-binding (kbd "m") t) 'qq-chat-message-transient))
+             (should (eq (key-binding (kbd "?") t) 'qq-chat-transient))
              (should (eq (key-binding (kbd "C-c /") t) 'qq-chat-search))
-             (should (eq (key-binding (kbd "C-c m r") t) 'qq-chat-reply-to-message)))
+             (should (eq (key-binding (kbd "C-c m") t) 'qq-chat-message-transient))
+             (should (eq (key-binding (kbd "C-c ?") t) 'qq-chat-transient))
+             (should (eq (key-binding (kbd "C-c C-a") t) 'qq-chat-attach-transient)))
          (when (buffer-live-p buffer)
            (kill-buffer buffer)))))))
 

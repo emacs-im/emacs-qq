@@ -3,7 +3,7 @@
 ;; Author: emacs-qq contributors
 ;; Keywords: comm
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1") (websocket "1.16") (disco "0"))
+;; Package-Requires: ((emacs "27.1") (websocket "1.16") (transient "0.3") (disco "0"))
 
 ;;; Commentary:
 
@@ -14,6 +14,7 @@
 ;; - browse recent sessions in a disco-style root buffer
 ;; - open one chat buffer, fetch history, send text messages
 ;; - keep state updated from websocket events
+;; - transient menus for root / chat / message / attach (telega/disco style)
 
 ;;; Code:
 
@@ -23,6 +24,7 @@
 (require 'qq-api)
 (require 'qq-chat)
 (require 'qq-root)
+(require 'qq-transient)
 
 ;;;###autoload
 (defun qq ()
