@@ -155,11 +155,14 @@ a file is missing (newer / animated faces)."
   :group 'qq)
 
 (defcustom qq-media-face-names-file
-  (let* ((here (file-name-directory
-                (or load-file-name buffer-file-name
-                    (locate-library "qq-customize")
-                    default-directory))))
-    (expand-file-name "qq-face-names.json" here))
+  (let* ((lib (or (locate-library "qq-customize.el")
+                  (locate-library "qq-media.el")
+                  load-file-name
+                  buffer-file-name))
+         ;; straight build often symlinks *.el into build/; resolve to the
+         ;; real package dir so non-el data files (json) are found.
+         (here (and lib (file-name-directory (file-truename lib)))))
+    (expand-file-name "qq-face-names.json" (or here default-directory)))
   "JSON map of QQ face id → display name (e.g. \"178\" → \"/斜眼笑\").
 
 Bundled with emacs-qq from NapCat `face_config.json'.  Used for plain-text

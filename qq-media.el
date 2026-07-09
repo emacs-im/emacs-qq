@@ -892,11 +892,25 @@ When image data is not ready yet, return a textual fallback."
 (defvar qq-media--face-names-table nil
   "Lazy hash table: face id string → QDes name (e.g. \"/斜眼笑\").")
 
+(defun qq-media--face-names-file ()
+  "Return resolved path to the face-names JSON, preferring a readable file."
+  (let* ((configured qq-media-face-names-file)
+         (lib (or (locate-library "qq-media.el")
+                  (locate-library "qq-customize.el")))
+         (beside (and lib
+                      (expand-file-name
+                       "qq-face-names.json"
+                       (file-name-directory (file-truename lib))))))
+    (cond
+     ((and (stringp configured) (file-readable-p configured)) configured)
+     ((and (stringp beside) (file-readable-p beside)) beside)
+     (t configured))))
+
 (defun qq-media--load-face-names-table ()
-  "Load `qq-media-face-names-file' into `qq-media--face-names-table'."
+  "Load face-names JSON into `qq-media--face-names-table'."
   (or qq-media--face-names-table
       (let ((table (make-hash-table :test #'equal))
-            (file qq-media-face-names-file))
+            (file (qq-media--face-names-file)))
         (when (and (stringp file) (file-readable-p file))
           (condition-case err
               (let* ((json-object-type 'alist)

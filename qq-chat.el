@@ -1890,6 +1890,73 @@ Keep this short — size is useful; internal sub_type / emoji ids are not."
                 (push (format "[%s]" (or type "segment")) inline-parts))))))
         (flush-inline)))))
 
+(defun qq-chat--insert-compact-message-body (message prefix-state properties short-time)
+  "Insert a same-sender continuation body for MESSAGE.
+
+Uses structured segments (so faces render as images).  SHORT-TIME is appended
+on the first inline line when the body is pure inline content."
+  (let ((segments (alist-get 'segments message))
+        (inline-parts nil)
+        (saw-block nil))
+    (cl-labels
+        ((flush-inline (&optional with-time)
+           (when inline-parts
+             (let* ((text (mapconcat #'identity (nreverse inline-parts) ""))
+                    (start (point)))
+               (insert (if (string-empty-p text) "(empty message)" text))
+               (when (and with-time
+                          (stringp short-time)
+                          (not (string-empty-p short-time)))
+                 (insert "  ")
+                 (let ((time-start (point)))
+                   (insert short-time)
+                   (add-text-properties time-start (point)
+                                        (list 'face 'qq-msg-status))))
+               (insert "\n")
+               (qq-ui-apply-line-prefix start (point) prefix-state)
+               (add-text-properties start (point) properties)
+               (setq inline-parts nil)))))
+      (cond
+       ((or (qq-state-message-recalled-p message) (null segments))
+        (let* ((text (qq-chat--message-body message))
+               (start (point)))
+          (insert (if (string-empty-p text) "(empty message)" text))
+          (when (and (stringp short-time) (not (string-empty-p short-time)))
+            (insert "  ")
+            (let ((time-start (point)))
+              (insert short-time)
+              (add-text-properties time-start (point)
+                                   (list 'face 'qq-msg-status))))
+          (insert "\n")
+          (qq-ui-apply-line-prefix start (point) prefix-state)
+          (add-text-properties start (point) properties)))
+       (t
+        (dolist (segment segments)
+          (let ((type (alist-get 'type segment)))
+            (unless (equal type "reply")
+              (cond
+               ((qq-chat--media-segment-p segment)
+                (flush-inline nil)
+                (setq saw-block t)
+                (qq-chat--insert-segment-media-line
+                 segment prefix-state properties))
+               ((qq-chat--segment-inline-string segment)
+                (push (qq-chat--segment-inline-string segment) inline-parts))
+               (t
+                (push (format "[%s]" (or type "segment")) inline-parts))))))
+        ;; Time rides on the first (only) inline flush when there is no media card.
+        (flush-inline (not saw-block))
+        (when (and saw-block
+                   (stringp short-time)
+                   (not (string-empty-p short-time))
+                   (null inline-parts))
+          (let ((start (point)))
+            (insert short-time "\n")
+            (qq-ui-apply-line-prefix start (point) prefix-state)
+            (add-text-properties
+             start (point)
+             (append properties (list 'face 'qq-msg-status))))))))))
+
 (defun qq-chat--message-openable-p (message)
   "Return non-nil when MESSAGE has an openable QQ media resource."
   (qq-media-message-has-openable-resource-p message))
@@ -1950,7 +2017,6 @@ Visual model (telega-inspired; later appkit):
          (status-suffix (qq-chat--status-suffix message))
          (compact (plist-get context :compact))
          (body-prefix-state (qq-ui-make-prefix-state body-prefix body-prefix))
-         (body-text (qq-chat--message-body message))
          (short-time (qq-chat--format-time-short (alist-get 'time message))))
     (when (and (stringp insert-date) (not (string-empty-p insert-date)))
       (qq-chat--insert-date-separator-row (qq-chat--message-day-label insert-date)))
@@ -1974,26 +2040,14 @@ Visual model (telega-inspired; later appkit):
            (qq-chat--message-body message)
            :properties (append properties (list 'face 'qq-msg-deleted))))
       (if compact
+          ;; Same-sender continuations still need segment-rich bodies (faces,
+          ;; images, …).  Never dump plain `preview'/CQ text here — that is what
+          ;; produced visible "[face:178]" while the image path already worked.
           (progn
             (when reply-id
               (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
-            (let* ((lines (split-string (if (string-empty-p body-text) "(empty message)" body-text) "\n" nil))
-                   (first-line (or (car lines) "(empty message)"))
-                   (rest-lines (cdr lines))
-                   (content-start (point)))
-              (insert first-line)
-              (unless (string-empty-p short-time)
-                (insert "  ")
-                (let ((time-start (point)))
-                  (insert short-time)
-                  (add-text-properties time-start (point) (list 'face 'qq-msg-status))))
-              (insert "\n")
-              (qq-ui-apply-line-prefix content-start (point) body-prefix-state)
-              (add-text-properties content-start (point) properties)
-              (when rest-lines
-                (let ((rest-start (point)))
-                  (qq-ui-insert-prefixed-lines body-prefix-state (string-join rest-lines "\n") :properties properties)
-                  (add-text-properties rest-start (point) properties)))))
+            (qq-chat--insert-compact-message-body
+             message body-prefix-state properties short-time))
         (let ((header-start (point)))
           (when-let* ((sender-id (alist-get 'sender-id message)))
             (let ((avatar-start (point)))
