@@ -1827,40 +1827,83 @@ Return non-nil on success.  When HIGHLIGHT is non-nil, pulse the block."
       (qq-chat--highlight-region pos (qq-chat--message-end-position pos)))
     t))
 
-(defun qq-chat--resolve-pending-jump ()
-  "Finish async jump for `qq-chat--pending-jump-id'.
+(defun qq-chat--jump-history-count ()
+  "Return history page size used when seeking a jump target."
+  (max 1 (or qq-chat-jump-history-count qq-history-fetch-count)))
 
-Order (telega `telega-chatbuf--goto-msg' adapted to NapCat paging):
-1. if loaded → jump + highlight
-2. else if history available → load older page
-3. else → not found"
-  (when (and (stringp qq-chat--pending-jump-id)
-             (not (string-empty-p qq-chat--pending-jump-id)))
-    (let ((target qq-chat--pending-jump-id))
-      (cond
-       ((qq-chat--goto-loaded-message target t)
-        (setq qq-chat--pending-jump-id nil))
-       (qq-chat--history-loading
-        nil)
-       (qq-chat--history-exhausted
-        (setq qq-chat--pending-jump-id nil)
-        (message "qq: message not found"))
-       ((null (qq-state-session-oldest-message-id qq-chat--session-key))
-        (setq qq-chat--pending-jump-id nil)
-        (message "qq: message not found"))
-       (t
-        (message "qq: loading…")
-        (qq-chat-load-older-messages))))))
+(defun qq-chat--finish-jump-if-loaded (target)
+  "If TARGET is rendered, jump+highlight and clear pending jump.
+
+Return non-nil on success."
+  (when (and target (qq-chat--goto-loaded-message target t))
+    (setq qq-chat--pending-jump-id nil)
+    t))
+
+(defun qq-chat--jump-fail (target &optional reason)
+  "Clear pending jump for TARGET and report not found."
+  (when (equal qq-chat--pending-jump-id target)
+    (setq qq-chat--pending-jump-id nil))
+  (message "qq: message not found%s"
+           (if (and reason (not (string-empty-p reason)))
+               (format " (%s)" reason)
+             "")))
+
+(defun qq-chat--jump-via-get-msg (session-key target buffer)
+  "Fallback: `get_msg' TARGET then jump (telega `telega-msg-get').
+
+Does not iterative load-older; seek already tried once."
+  (qq-api-get-msg
+   target
+   (lambda (raw)
+     (when (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (when (equal qq-chat--session-key session-key)
+           (when (and raw (listp raw))
+             (qq-state-merge-history session-key (list raw)))
+           (unless (qq-chat--finish-jump-if-loaded target)
+             (qq-chat--jump-fail target "get_msg ok but not in timeline"))))))
+   (lambda (_response reason)
+     (when (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (when (equal qq-chat--session-key session-key)
+           (qq-chat--jump-fail
+            target
+            (or reason "get_msg failed"))))))))
+
+(defun qq-chat--seek-history-for-jump (session-key target buffer)
+  "Seek one history page at TARGET snowflake (NapCat message_seq = msgId).
+
+This is the correct around-substitute: not load-older from buffer oldest."
+  (qq-api-fetch-history
+   session-key
+   target
+   (lambda (_meta)
+     (when (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (when (equal qq-chat--session-key session-key)
+           (if (qq-chat--finish-jump-if-loaded target)
+               nil
+             ;; Page may omit the cursor row in edge cases; try single get_msg.
+             (qq-chat--jump-via-get-msg session-key target buffer))))))
+   (lambda (response reason)
+     (when (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (when (equal qq-chat--session-key session-key)
+           (if (qq-api--history-exhausted-error-p response reason)
+               ;; Unknown cursor: still try get_msg (mapping may exist).
+               (qq-chat--jump-via-get-msg session-key target buffer)
+             (qq-chat--jump-via-get-msg session-key target buffer))))))
+   (qq-chat--jump-history-count)))
 
 (defun qq-chat-goto-message (message-id &optional no-pop)
   "Goto MESSAGE-ID in the current chatbuf (telega `telega-chatbuf--goto-msg').
 
 1. Push message at point onto the pop ring (unless NO-POP)
 2. If already loaded, jump and pulse-highlight
-3. Else fetch via `get_msg' when possible, then page older history until
-   found or exhausted
+3. Else seek one history page with `message_seq' = MESSAGE-ID (target cursor)
+4. Else `get_msg' single-message fallback
 
-Async; may load several older pages."
+Does not walk load-older from the buffer's oldest id."
   (interactive
    (list (or (get-text-property (point) 'qq-chat-reply-id)
              (qq-chat--message-reply-id (qq-chat--message-at-point))
@@ -1882,23 +1925,7 @@ Async; may load several older pages."
         (setq qq-chat--pending-jump-id nil)
       (setq qq-chat--pending-jump-id id)
       (message "qq: loading…")
-      ;; telega-msg-get: try single-message fetch first.
-      (qq-api-get-msg
-       id
-       (lambda (raw)
-         (when (buffer-live-p buffer)
-           (with-current-buffer buffer
-             (when (equal qq-chat--session-key session-key)
-               (when (and raw (listp raw))
-                 (qq-state-merge-history session-key (list raw)))
-               (if (qq-chat--goto-loaded-message id t)
-                   (setq qq-chat--pending-jump-id nil)
-                 (qq-chat--resolve-pending-jump))))))
-       (lambda (_response _reason)
-         (when (buffer-live-p buffer)
-           (with-current-buffer buffer
-             (when (equal qq-chat--session-key session-key)
-               (qq-chat--resolve-pending-jump)))))))))
+      (qq-chat--seek-history-for-jump session-key id buffer))))
 
 (defun qq-chat-goto-reply (&optional message)
   "Goto the message that MESSAGE replies to (telega `telega-msg-goto-reply-to-message').
@@ -2525,20 +2552,22 @@ new rows or reports the cursor missing."
            (with-current-buffer buffer
              (when (equal qq-chat--session-key session-key)
                (setq qq-chat--history-loading nil)
-               (let ((added (or (plist-get meta :added-count) 0))
-                     (jumping qq-chat--pending-jump-id))
+               (let ((added (or (plist-get meta :added-count) 0)))
                  (cond
                   ((<= added 0)
                    (setq qq-chat--history-exhausted t)
                    (qq-chat--chat-update 'header-line 'header)
-                   (if jumping
-                       (qq-chat--resolve-pending-jump)
+                   ;; Jump uses seek-at-target, not load-older chains.
+                   (when qq-chat--pending-jump-id
+                     (qq-chat--finish-jump-if-loaded qq-chat--pending-jump-id))
+                   (unless qq-chat--pending-jump-id
                      (message "qq: reached beginning of history")))
                   (t
                    ;; Timeline already reconciled via history hook.
                    (qq-chat--chat-update 'header-line 'header)
-                   (if jumping
-                       (qq-chat--resolve-pending-jump)
+                   (when qq-chat--pending-jump-id
+                     (qq-chat--finish-jump-if-loaded qq-chat--pending-jump-id))
+                   (unless qq-chat--pending-jump-id
                      (message "qq: loaded %d older message%s"
                               added
                               (if (= added 1) "" "s"))))))))))
@@ -2551,12 +2580,11 @@ new rows or reports the cursor missing."
                    (progn
                      (setq qq-chat--history-exhausted t)
                      (qq-chat--chat-update 'header-line 'header)
-                     (if qq-chat--pending-jump-id
-                         (qq-chat--resolve-pending-jump)
+                     (when qq-chat--pending-jump-id
+                       (qq-chat--finish-jump-if-loaded qq-chat--pending-jump-id))
+                     (unless qq-chat--pending-jump-id
                        (message "qq: reached beginning of history")))
                  (qq-chat--chat-update 'header-line 'header)
-                 (when qq-chat--pending-jump-id
-                   (setq qq-chat--pending-jump-id nil))
                  (qq-api--default-error response reason)))))))))))
 
 (defun qq-chat-send-message ()

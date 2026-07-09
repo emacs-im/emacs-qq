@@ -1212,6 +1212,75 @@
                             (cons (quote data)
                                   (list (cons (quote text) "hi"))))))))))
 
+(ert-deftest qq-chat-goto-message-seeks-at-target-not-oldest ()
+  "Jump fetch uses message_seq = target id (seek), not buffer oldest."
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    (list (cons (quote title) "Alice")
+          (cons (quote target-id) "10001")
+          (cons (quote oldest-message-id) "900"))
+    nil)
+   (qq-state-merge-history
+    "private:10001"
+    (list
+     (list (cons (quote message_id) "900")
+           (cons (quote message_type) "private")
+           (cons (quote user_id) 10001)
+           (cons (quote time) 1710000900)
+           (cons (quote sender)
+                 (list (cons (quote user_id) 10001)
+                       (cons (quote nickname) "Alice")))
+           (cons (quote raw_message) "newest")
+           (cons (quote message)
+                 (list (list (cons (quote type) "text")
+                             (cons (quote data)
+                                   (list (cons (quote text) "newest")))))))))
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (let (captured-before captured-count load-older-called)
+       (cl-letf (((symbol-function 'qq-api-fetch-history)
+                  (lambda (session-key &optional before callback _errback count)
+                    (setq captured-before before)
+                    (setq captured-count count)
+                    (should (equal session-key "private:10001"))
+                    ;; Simulate seek page + history hook re-render.
+                    (qq-state-merge-history
+                     "private:10001"
+                     (list
+                      (list (cons (quote message_id) "100")
+                            (cons (quote message_type) "private")
+                            (cons (quote user_id) 10001)
+                            (cons (quote time) 1710000100)
+                            (cons (quote sender)
+                                  (list (cons (quote user_id) 10001)
+                                        (cons (quote nickname) "Alice")))
+                            (cons (quote raw_message) "old target")
+                            (cons (quote message)
+                                  (list (list (cons (quote type) "text")
+                                              (cons (quote data)
+                                                    (list (cons (quote text)
+                                                                "old target")))))))))
+                    (qq-chat-render)
+                    (when callback
+                      (funcall callback
+                               (list :added-count 1 :message-count 1)))))
+                 ((symbol-function 'qq-chat-load-older-messages)
+                  (lambda ()
+                    (setq load-older-called t)
+                    (error "jump must not call load-older")))
+                 ((symbol-function 'qq-api-get-msg)
+                  (lambda (&rest _)
+                    (error "seek succeeded; get_msg should not run"))))
+         (qq-chat-goto-message "100" 'no-pop)
+         (should (equal captured-before "100"))
+         (should-not load-older-called)
+         (should (equal "100"
+                        (get-text-property (point) 'qq-chat-message-anchor)))
+         (should-not qq-chat--pending-jump-id))))))
+
 (provide (quote qq-chat-test))
 
 ;;; qq-chat-test.el ends here

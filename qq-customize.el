@@ -52,6 +52,16 @@ point is pushed so `qq-chat-goto-pop-message' (`x') can jump back."
   :type 'integer
   :group 'qq)
 
+(defcustom qq-chat-jump-history-count nil
+  "History page size when seeking a jump target (reply goto).
+
+Nil means use `qq-history-fetch-count'.  NapCat `get_*_msg_history' with
+`message_seq' set to the target snowflake loads one page from that cursor
+(not iterative load-older from the buffer's oldest id)."
+  :type '(choice (const :tag "Same as qq-history-fetch-count" nil)
+                 (integer :tag "Count"))
+  :group 'qq)
+
 (defcustom qq-auto-mark-read t
   "When non-nil, mark a chat as read when its buffer is visible."
   :type 'boolean

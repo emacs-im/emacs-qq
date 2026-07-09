@@ -124,15 +124,19 @@ NapCat throws when `message_seq' is unknown or the page is empty
         (string-match-p "not exist" text)
         (string-match-p "no message" text))))
 
-(defun qq-api-fetch-history (session-key &optional before-message-id callback errback)
-  "Fetch history for SESSION-KEY before BEFORE-MESSAGE-ID when provided.
+(defun qq-api-fetch-history (session-key &optional before-message-id callback errback count)
+  "Fetch history for SESSION-KEY.
 
-BEFORE-MESSAGE-ID is the NapCat hard-cut snowflake `message_id' of the oldest
-already-loaded row (legacy param name `message_seq' on the wire).
+When BEFORE-MESSAGE-ID is nil, pull the latest page (`getAioFirstViewLatestMsgs').
+When non-nil, pass it as wire `message_seq' — NapCat hard-cut treats this as the
+NT snowflake msgId cursor for `getMsgsIncludeSelf' (seek from that message,
+not only \"older than buffer oldest\").
 
-CALLBACK is called with the merge-history plist
-\(`:added-count', `:message-count', `:oldest-message-id', …) after a successful
-merge.  ERRBACK receives (RESPONSE REASON) like other `qq-api-call' errors."
+COUNT overrides `qq-history-fetch-count' when non-nil (used by jump seek).
+
+CALLBACK receives the merge-history plist
+\(`:added-count', `:message-count', `:oldest-message-id', …).
+ERRBACK receives (RESPONSE REASON)."
   (interactive)
   (let* ((session (qq-state-session session-key))
          (type (or (alist-get 'type session)
@@ -141,9 +145,10 @@ merge.  ERRBACK receives (RESPONSE REASON) like other `qq-api-call' errors."
                    ('group "get_group_msg_history")
                    ('dataline "get_peer_msg_history")
                    (_ "get_friend_msg_history")))
+         (n (max 1 (or count qq-history-fetch-count)))
          (params (append
                   (qq-api--session-request-params session-key)
-                  `((count . ,(max 1 qq-history-fetch-count)))
+                  `((count . ,n))
                   (when before-message-id
                     `((message_seq . ,(format "%s" before-message-id)))))))
     (qq-api-call
@@ -160,8 +165,8 @@ merge.  ERRBACK receives (RESPONSE REASON) like other `qq-api-call' errors."
 (defun qq-api-get-msg (message-id callback &optional errback)
   "Fetch a single message by MESSAGE-ID (NapCat hard-cut snowflake string).
 
-CALLBACK receives the raw OneBot message alist (response `data').  Used by
-chatbuf jump (telega `telega-msg-get') before paging older history."
+CALLBACK receives the raw OneBot message alist (response `data').
+Used by chatbuf jump (telega `telega-msg-get') as a fallback after seek."
   (qq-api-call
    "get_msg"
    `((message_id . ,(format "%s" message-id)))
