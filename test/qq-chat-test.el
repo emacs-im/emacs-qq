@@ -402,9 +402,48 @@
                   (lambda ()
                     (setq render-called t))))
          (qq-chat--handle-state-change '(:type session
-                                         :session-key "private:10001"))
+                                         :session-key "private:10001"
+                                         :mutation session))
          (should (equal '((header-line header)) updates))
          (should-not render-called))))))
+
+(ert-deftest qq-chat-handle-state-change-read-mutation-updates-header-line-only ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (let (updates render-called)
+       (cl-letf (((symbol-function 'qq-chat--chat-update)
+                  (lambda (&rest parts)
+                    (push parts updates)))
+                 ((symbol-function 'qq-chat-render)
+                  (lambda ()
+                    (setq render-called t))))
+         (qq-chat--handle-state-change '(:type session
+                                         :session-key "private:10001"
+                                         :mutation read))
+         (should (equal '((header-line)) updates))
+         (should-not render-called))))))
+
+(ert-deftest qq-chat-handle-state-change-prefers-event-message-anchor ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (let (partial-calls)
+       (cl-letf (((symbol-function 'qq-chat--apply-single-message-change-partially)
+                  (lambda (anchor _messages)
+                    (push anchor partial-calls)
+                    t))
+                 ((symbol-function 'qq-chat-render)
+                  (lambda () nil)))
+         (qq-chat--handle-state-change
+          '(:type message
+            :session-key "private:10001"
+            :mutation create
+            :message-anchor "9007199254741004645"
+            :message ((server-id . "other"))))
+         (should (equal '("9007199254741004645") partial-calls)))))))
 
 (ert-deftest qq-chat-handle-state-change-friends-refreshes-timeline-for-name-updates ()
   (qq-chat-test-with-reset

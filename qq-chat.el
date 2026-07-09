@@ -2055,10 +2055,18 @@ changed cache entry."
 
 Follow telega/disco-like update rules: patch single message changes in the
 persistent EWOC when possible, fall back to full render for broader timeline
-changes, and only update the composer frame for metadata changes."
+changes, and only update the composer frame for metadata changes.
+
+Prefer `qq-state' `:mutation' metadata when present:
+
+- message create/update → single-node partial patch (full render fallback)
+- history / reset → full render (batch timeline rebuild still coarse)
+- session read → header-line only (unread); other session → header-line+header
+- friends/groups refresh → header + timeline (sender titles may change)"
   (let ((event-session-key (plist-get event :session-key))
         (event-type (plist-get event :type))
-        (event-message (plist-get event :message)))
+        (event-message (plist-get event :message))
+        (event-mutation (plist-get event :mutation)))
     (when (memq event-type '(message history reset session
                              sessions-refreshed friends-refreshed groups-refreshed))
       (dolist (buffer (buffer-list))
@@ -2069,7 +2077,8 @@ changes, and only update the composer frame for metadata changes."
               (when (equal event-session-key qq-chat--session-key)
                 (qq-chat--header-line-update)
                 (let* ((messages (qq-state-session-messages qq-chat--session-key))
-                       (anchor (or (qq-chat--message-anchor event-message)
+                       (anchor (or (plist-get event :message-anchor)
+                                   (qq-chat--message-anchor event-message)
                                    (plist-get event :previous-anchor))))
                   (unless (qq-chat--apply-single-message-change-partially
                            anchor messages)
@@ -2084,7 +2093,10 @@ changes, and only update the composer frame for metadata changes."
               (qq-chat-render))
              ((eq event-type 'session)
               (when (equal event-session-key qq-chat--session-key)
-                (qq-chat--chat-update 'header-line 'header)))
+                (if (eq event-mutation 'read)
+                    ;; Unread clear: header-line (and later optimistic divider).
+                    (qq-chat--chat-update 'header-line)
+                  (qq-chat--chat-update 'header-line 'header))))
              ((eq event-type 'sessions-refreshed)
               (qq-chat--chat-update 'header-line 'header))
              ((memq event-type '(friends-refreshed groups-refreshed))

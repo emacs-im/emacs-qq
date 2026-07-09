@@ -14,7 +14,20 @@
 (require 'qq-customize)
 
 (defvar qq-state-change-hook nil
-  "Hook called with one event plist argument after state mutations.")
+  "Hook called with one event plist argument after state mutations.
+
+Event plists always include `:type'.  Message-related emitters should also
+include:
+
+- `:session-key' — affected QQ session key
+- `:mutation' — one of `create', `update', `delete', `read', `history',
+  `session' (coarse kind; see `qq-state--emit')
+- `:source' — `local', `event', `response', `notice', when known
+- `:message' / `:message-anchor' / `:previous-anchor' — when a single
+  message is the subject (anchor prefers NT snowflake `server-id')
+
+Chat views should prefer `:mutation' + anchors for incremental EWOC patches
+and fall back to full render only for `history'/`reset' or failed patches.")
 
 (defvar qq-state--connection-status 'disconnected)
 (defvar qq-state--last-heartbeat nil)
@@ -31,8 +44,28 @@
 (defvar qq-state--local-message-counter 0)
 
 (defun qq-state--emit (type &rest plist)
-  "Emit state TYPE event with extra PLIST fields."
+  "Emit state TYPE event with extra PLIST fields.
+
+Preferred keys (callers should populate when applicable):
+
+`:type' (always)  event class: `message', `history', `session', `reset', …
+`:mutation'       coarse change kind for views:
+                  `create' | `update' | `delete' | `read' | `history' | `session'
+`:session-key'    QQ session key string
+`:source'         provenance: `local' | `event' | `response' | `notice'
+`:message'        normalized message alist (copy)
+`:message-anchor' stable timeline key (server-id or local-id)
+`:previous-anchor' prior key when rekeying (pending local-id → snowflake)"
   (run-hook-with-args 'qq-state-change-hook (append (list :type type) plist)))
+
+(defun qq-state-message-anchor (message)
+  "Return stable timeline anchor for MESSAGE.
+
+Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
+  (and message
+       (or (alist-get 'server-id message)
+           (alist-get 'local-id message)
+           (alist-get 'id message))))
 
 (defun qq-state--normalize-id (value)
   "Return VALUE normalized as a string ID, or nil."
@@ -261,14 +294,17 @@ Values from NEW replace values in OLD."
 (defun qq-state-upsert-session (session-key fields &optional emit)
   "Insert or update SESSION-KEY with FIELDS.
 
-When EMIT is non-nil, fire one session mutation event."
+When EMIT is non-nil, fire one session mutation event (`:mutation' `session')."
   (let* ((existing (or (copy-tree (gethash session-key qq-state--sessions))
                        (qq-state--session-template session-key)))
          (session (qq-state--merge-alists existing fields)))
     (setq session (qq-state--hydrate-session session))
     (puthash session-key session qq-state--sessions)
     (when emit
-      (qq-state--emit 'session :session-key session-key :session (copy-tree session)))
+      (qq-state--emit 'session
+                      :session-key session-key
+                      :session (copy-tree session)
+                      :mutation 'session))
     session))
 
 (defun qq-state-sessions ()
@@ -559,7 +595,12 @@ local message object."
     (qq-state-upsert-session session-key nil nil)
     (qq-state--index-message message)
     (qq-state--sync-session-summary session-key)
-    (qq-state--emit 'message :session-key session-key :message (copy-tree message) :source 'local)
+    (qq-state--emit 'message
+                    :session-key session-key
+                    :message (copy-tree message)
+                    :message-anchor (qq-state-message-anchor message)
+                    :mutation 'create
+                    :source 'local)
     message))
 
 (defun qq-state-insert-pending-text-message (session-key text &optional reply-to-message-id)
@@ -585,14 +626,29 @@ Return the local message object."
   "Merge normalized MESSAGE into SESSION-KEY.
 
 When COUNT-UNREAD is non-nil and MESSAGE is not self-sent, increment unread.
-Return the merged local message object."
+
+Return three values via `cl-values':
+1. merged local message object
+2. mutation symbol `create' or `update'
+3. previous timeline anchor when a pending local-id is promoted to server-id,
+   else nil"
   (let* ((messages (copy-tree (or (gethash session-key qq-state--messages-by-session) '())))
          (existing (or (qq-state--direct-message-match messages message)
                        (qq-state--weak-pending-match messages message)))
          (merged (if existing
                      (qq-state--merge-alists existing message)
                    message))
-         (old-order (and existing (alist-get 'order existing))))
+         (old-order (and existing (alist-get 'order existing)))
+         (previous-anchor
+          (and existing
+               (let ((old-local (alist-get 'local-id existing))
+                     (new-server (alist-get 'server-id merged)))
+                 (and old-local
+                      new-server
+                      (not (equal old-local new-server))
+                      (not (alist-get 'server-id existing))
+                      old-local))))
+         (mutation (if existing 'update 'create)))
     (when old-order
       (setf (alist-get 'order merged nil nil #'eq) old-order))
     (if existing
@@ -608,19 +664,28 @@ Return the merged local message object."
                           (qq-state--session-template session-key)))
              (current (or (alist-get 'unread-count session) 0)))
         (qq-state-upsert-session session-key `((unread-count . ,(1+ current))) nil)))
-    merged))
+    (cl-values merged mutation previous-anchor)))
 
 (defun qq-state-merge-live-message (message)
   "Merge live websocket MESSAGE into local state and return its session key."
   (let* ((normalized (qq-state--normalize-raw-message message))
-         (session-key (alist-get 'session-key normalized))
-         (merged (and session-key
-                      (qq-state--merge-normalized-message
-                       session-key
-                       normalized
-                       (not (alist-get 'self-p normalized))))))
-    (when merged
-      (qq-state--emit 'message :session-key session-key :message (copy-tree merged) :source 'event))
+         (session-key (alist-get 'session-key normalized)))
+    (when session-key
+      (cl-multiple-value-bind (merged mutation previous-anchor)
+          (qq-state--merge-normalized-message
+           session-key
+           normalized
+           (not (alist-get 'self-p normalized)))
+        (when merged
+          (apply #'qq-state--emit
+                 'message
+                 :session-key session-key
+                 :message (copy-tree merged)
+                 :message-anchor (qq-state-message-anchor merged)
+                 :mutation mutation
+                 :source 'event
+                 (when previous-anchor
+                   (list :previous-anchor previous-anchor))))))
     session-key))
 
 (defun qq-state-merge-history (session-key raw-messages)
@@ -631,7 +696,10 @@ Return the merged local message object."
      session-key
      (qq-state--normalize-raw-message raw-message session-key)
      nil))
-  (qq-state--emit 'history :session-key session-key :message-count (length raw-messages))
+  (qq-state--emit 'history
+                  :session-key session-key
+                  :message-count (length raw-messages)
+                  :mutation 'history)
   session-key)
 
 (defun qq-state-mark-pending-message-sent (session-key local-id message-id)
@@ -660,7 +728,9 @@ hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor."
         (qq-state--emit 'message
                         :session-key session-key
                         :message (copy-tree updated)
+                        :message-anchor (qq-state-message-anchor updated)
                         :previous-anchor local-id
+                        :mutation 'update
                         :source 'response)
         updated))))
 
@@ -679,13 +749,21 @@ hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor."
         (setq messages (qq-state--replace-message messages existing updated))
         (puthash session-key messages qq-state--messages-by-session)
         (qq-state--sync-session-summary session-key)
-        (qq-state--emit 'message :session-key session-key :message (copy-tree updated) :source 'response)
+        (qq-state--emit 'message
+                        :session-key session-key
+                        :message (copy-tree updated)
+                        :message-anchor (qq-state-message-anchor updated)
+                        :mutation 'update
+                        :source 'response)
         updated))))
 
 (defun qq-state-clear-session-unread (session-key)
   "Reset unread count for SESSION-KEY."
   (qq-state-upsert-session session-key '((unread-count . 0)) nil)
-  (qq-state--emit 'session :session-key session-key :session (qq-state-session session-key))
+  (qq-state--emit 'session
+                  :session-key session-key
+                  :session (qq-state-session session-key)
+                  :mutation 'read)
   0)
 
 (defun qq-state-apply-recall (message-id)
@@ -708,7 +786,12 @@ hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor."
         (setq messages (qq-state--replace-message messages existing updated))
         (puthash session-key messages qq-state--messages-by-session)
         (qq-state--sync-session-summary session-key)
-        (qq-state--emit 'message :session-key session-key :message (copy-tree updated) :source 'notice)
+        (qq-state--emit 'message
+                        :session-key session-key
+                        :message (copy-tree updated)
+                        :message-anchor (qq-state-message-anchor updated)
+                        :mutation 'update
+                        :source 'notice)
         updated))))
 
 (defun qq-state--recent-contact-title (contact session-key)
