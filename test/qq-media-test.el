@@ -175,7 +175,66 @@
     (should (= 3 (length pairs)))
     (should (string-match-p "AAAAAAAA" (car (nth 0 pairs))))
     (should (string-match-p "BBBBBBBB" (car (nth 1 pairs))))
-    (should (string-match-p "named" (car (nth 2 pairs))))))
+    (should (string-match-p "named" (car (nth 2 pairs))))
+    ;; Labels carry the face for affixation / lookup.
+    (should (equal "AAAAAAAA"
+                   (alist-get 'md5 (get-text-property 0 'qq-custom-face
+                                                      (car (nth 0 pairs))))))))
+
+(ert-deftest qq-media-custom-face-completion-table-metadata ()
+  "Favorite picker must keep NapCat order and declare affixation."
+  (let* ((faces '(((md5 . "AAAAAAAA") (desc . "") (url . "https://a"))
+                  ((md5 . "BBBBBBBB") (desc . "meme") (url . "https://b"))))
+         (table (qq-media-custom-face-completion-table faces))
+         (meta (funcall table "" nil 'metadata))
+         (labels (all-completions "" table)))
+    (should (eq (completion-metadata-get meta 'display-sort-function)
+                #'identity))
+    (should (eq (completion-metadata-get meta 'affixation-function)
+                #'qq-media-custom-face-affixation-function))
+    (should (= 2 (length labels)))
+    (should (string-match-p "AAAAAAAA" (nth 0 labels)))
+    (should (string-match-p "meme" (nth 1 labels)))
+    ;; Plain-string choice still resolves (completing-read may strip props).
+    (should (equal "AAAAAAAA"
+                   (alist-get 'md5
+                              (qq-media-custom-face-from-completion
+                               (substring-no-properties (nth 0 labels))))))))
+
+(ert-deftest qq-media-custom-face-affixation-uses-local-thumb ()
+  "Favorite affix should show local thumb/file when present."
+  (let* ((file (make-temp-file "qq-fav-affix" nil ".png"))
+         (face `((md5 . "DEADBEEFDEADBEEF")
+                 (desc . "")
+                 (thumb_file . ,file)
+                 (file . ,file)
+                 (url . "https://example.com/x")))
+         (qq-media-face-image-height 18))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (set-buffer-multibyte nil)
+            (insert (unibyte-string
+                     #x89 #x50 #x4e #x47 #x0d #x0a #x1a #x0a
+                     #x00 #x00 #x00 #x0d #x49 #x48 #x44 #x52
+                     #x00 #x00 #x00 #x01 #x00 #x00 #x00 #x01
+                     #x08 #x02 #x00 #x00 #x00 #x90 #x77 #x53
+                     #xde #x00 #x00 #x00 #x0c #x49 #x44 #x41
+                     #x54 #x08 #xd7 #x63 #xf8 #xcf #xc0 #x00
+                     #x00 #x00 #x03 #x00 #x01 #x00 #x05 #xfe
+                     #xd4 #xef #x00 #x00 #x00 #x00 #x49 #x45
+                     #x4e #x44 #xae #x42 #x60 #x82)))
+          (qq-media-custom-face-completion-table (list face))
+          (let* ((label (car (car qq-media--custom-face-completion-pairs)))
+                 (affixed (qq-media-custom-face-affixation-function
+                           (list label
+                                 "[fav] missing  (9)")))
+                 (prefix0 (nth 1 (nth 0 affixed)))
+                 (prefix1 (nth 1 (nth 1 affixed))))
+            (should (eq (car (get-text-property 0 'display prefix0)) 'image))
+            (should-not (get-text-property 0 'display prefix1))))
+      (when (file-exists-p file)
+        (delete-file file)))))
 
 (ert-deftest qq-media-normalize-custom-face-list-vector-and-single ()
   (should (= 2 (length (qq-media--normalize-custom-face-list

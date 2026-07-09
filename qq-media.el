@@ -1155,25 +1155,84 @@ even when several favorites share an empty `desc'."
          (fallback (qq-media-custom-face-label face)))
     (qq-media--image-display-string image fallback)))
 
+(defvar qq-media--custom-face-completion-pairs nil
+  "Active `(LABEL . FACE)' pairs for the favorite-face completing-read.")
+
 (defun qq-media-custom-face-completion-candidates (&optional faces)
   "Return completion candidates for favorite FACES (default: cache).
 
-Each entry is `(LABEL . FACE)'.  Labels are unique (md5 + index)."
+Each entry is `(LABEL . FACE)'.  Labels are unique (md5 + index).
+Order follows the NapCat favorites list (not re-sorted by string)."
   (let ((faces (or faces qq-media--custom-faces))
         (candidates nil)
         (i 0))
     (dolist (face faces)
       (when (qq-media--face-alist-p face)
-        (push (cons (qq-media-custom-face-label face i) face) candidates)
-        (setq i (1+ i))))
+        (let* ((label (qq-media-custom-face-label face i))
+               ;; Attach FACE so affixation / lookup work even if the
+               ;; completion UI strips the pairs list context.
+               (labeled (propertize label 'qq-custom-face face)))
+          (push (cons labeled face) candidates)
+          (setq i (1+ i)))))
     (nreverse candidates)))
 
 (defun qq-media-custom-face-from-completion (candidate &optional pairs)
   "Return face alist matching completion CANDIDATE in PAIRS.
 
-PAIRS defaults to `qq-media-custom-face-completion-candidates'."
-  (let ((pairs (or pairs (qq-media-custom-face-completion-candidates))))
-    (cdr (assoc candidate pairs))))
+PAIRS defaults to the active completion pairs, then the cache."
+  (or (and (stringp candidate)
+           (get-text-property 0 'qq-custom-face candidate))
+      (let* ((key (and (stringp candidate)
+                       (substring-no-properties candidate)))
+             (pairs (or pairs
+                        qq-media--custom-face-completion-pairs
+                        (qq-media-custom-face-completion-candidates))))
+        (when key
+          (or (cdr (assoc key pairs))
+              ;; assoc with text-propertized cars: match by plain string.
+              (cdr (seq-find (lambda (p)
+                               (equal key (substring-no-properties (car p))))
+                             pairs)))))))
+
+(defun qq-media--custom-face-completion-prefix (face)
+  "Return minibuffer prefix with thumb image for FACE, or spaces."
+  (let* ((thumb (qq-media-custom-face-thumb face))
+         (image (and thumb
+                     (qq-media--image-from-file
+                      thumb
+                      (max qq-media-face-image-height 32)))))
+    (if image
+        (concat (propertize " " 'display image) " ")
+      "  ")))
+
+(defun qq-media-custom-face-affixation-function (candidates)
+  "Affixation function: show favorite thumb before each CANDIDATE."
+  (mapcar
+   (lambda (cand)
+     (let ((face (qq-media-custom-face-from-completion cand)))
+       (list cand
+             (if face
+                 (qq-media--custom-face-completion-prefix face)
+               "  ")
+             "")))
+   candidates))
+
+(defun qq-media-custom-face-completion-table (&optional faces)
+  "Completion table for favorite custom faces with images and stable order.
+
+Keeps NapCat favorites order (identity display/cycle sort) and prefixes
+each candidate with its local thumb when available."
+  (let* ((pairs (qq-media-custom-face-completion-candidates faces))
+         (labels (mapcar #'car pairs)))
+    (setq qq-media--custom-face-completion-pairs pairs)
+    (lambda (string pred action)
+      (if (eq action 'metadata)
+          '(metadata
+            (category . qq-custom-face)
+            (display-sort-function . identity)
+            (cycle-sort-function . identity)
+            (affixation-function . qq-media-custom-face-affixation-function))
+        (complete-with-action action labels string pred)))))
 
 (defun qq-media-custom-face-to-segment (face)
   "Convert favorite FACE alist into an outbound OneBot segment.

@@ -1467,19 +1467,20 @@ Bound via `qq-chat-attach-emoji' (`C-c C-e'); attach transient `e'."
     (message "qq: favorite %s" (qq-media-custom-face-label face))))
 
 (defun qq-chat--pick-custom-face (faces)
-  "Completing-read among FACES and insert the chosen favorite."
+  "Completing-read among FACES and insert the chosen favorite.
+
+Uses `qq-media-custom-face-completion-table' so candidates keep favorites
+order and show local thumb previews (same treatment as base faces)."
   (unless faces
     (user-error "qq: no favorite custom faces (收藏表情为空)"))
-  (let* ((pairs (qq-media-custom-face-completion-candidates faces))
-         (choice (completing-read
+  (let* ((choice (completing-read
                   "Favorite face: "
-                  (mapcar #'car pairs)
+                  (qq-media-custom-face-completion-table faces)
                   nil t nil 'qq-chat--custom-face-history))
-         (face (qq-media-custom-face-from-completion choice pairs)))
+         (face (qq-media-custom-face-from-completion choice)))
     (unless face
       (user-error "qq: unknown favorite: %s" choice))
     (qq-chat--insert-custom-face face)))
-
 (defun qq-chat-attach-custom-face (&optional force-refresh)
   "Insert a favorite custom face (收藏表情) into the chat composer.
 
