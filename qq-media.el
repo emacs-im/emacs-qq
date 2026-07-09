@@ -938,6 +938,40 @@ When image data is not ready yet, return a textual fallback."
         (and (string-match-p "\\`[0-9]+\\'" id)
              (gethash id table)))))
 
+(defun qq-media-face-completion-candidates ()
+  "Return completion table mapping display strings to face id strings.
+
+Each candidate looks like \"/斜眼笑  (178)\" so users can search by name
+or numeric id.  Use `qq-media-face-id-from-completion'."
+  (let ((table (qq-media--load-face-names-table))
+        (candidates nil))
+    (maphash
+     (lambda (id name)
+       (push (format "%s  (%s)" (or name (format "[face:%s]" id)) id)
+             candidates))
+     table)
+    ;; Prefer stable order: by numeric id when possible.
+    (sort candidates
+          (lambda (a b)
+            (let ((ida (and (string-match "(\\([0-9]+\\))\\'" a)
+                            (string-to-number (match-string 1 a))))
+                  (idb (and (string-match "(\\([0-9]+\\))\\'" b)
+                            (string-to-number (match-string 1 b)))))
+              (if (and ida idb)
+                  (< ida idb)
+                (string-lessp a b)))))))
+
+(defun qq-media-face-id-from-completion (candidate)
+  "Extract face id string from a `qq-media-face-completion-candidates' CANDIDATE."
+  (cond
+   ((and (stringp candidate)
+         (string-match "(\\([0-9]+\\))\\'" candidate))
+    (match-string 1 candidate))
+   ((and (stringp candidate)
+         (string-match-p "\\`[0-9]+\\'" candidate))
+    candidate)
+   (t nil)))
+
 (defun qq-media-face-text-fallback (emoji-id)
   "Return plain-text fallback for face EMOJI-ID (never a CQ blob)."
   (or (qq-media-face-name emoji-id)

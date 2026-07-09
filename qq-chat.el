@@ -1326,15 +1326,22 @@ update similar in spirit to `telega-chatbuf--chat-update'."
      (t "file"))))
 
 (defun qq-chat--segment-object-label (segment)
-  "Return visible input label for structured SEGMENT."
+  "Return visible input label for structured SEGMENT.
+
+Face segments use the same inline image (or `/名称') as the timeline."
   (let* ((type (or (alist-get 'type segment) "segment"))
-         (data (alist-get 'data segment))
-         (path (or (alist-get 'path data)
-                   (alist-get 'file data)
-                   (alist-get 'name data)
-                   "item"))
-         (name (file-name-nondirectory path)))
-    (format "[%s:%s]" type name)))
+         (data (alist-get 'data segment)))
+    (pcase type
+      ("face"
+       (let ((id (or (alist-get 'id data) "?")))
+         (qq-media-face-display-string id)))
+      (_
+       (let* ((path (or (alist-get 'path data)
+                        (alist-get 'file data)
+                        (alist-get 'name data)
+                        "item"))
+              (name (file-name-nondirectory (format "%s" path))))
+         (format "[%s:%s]" type name))))))
 
 (defun qq-chat--segment-input-object (segment)
   "Return chatbuf input object plist for outbound SEGMENT."
@@ -1379,6 +1386,37 @@ When SEGMENT-TYPE is nil, infer the most useful QQ segment type from PATH."
     (message "qq: attached %s as %s"
              (file-name-nondirectory path)
              type)))
+
+(defvar qq-chat--face-history nil
+  "Minibuffer history for `qq-chat-attach-face'.")
+
+(defun qq-chat-attach-face (&optional face-id)
+  "Insert a QQ base face (system emoji) into the chat composer.
+
+With FACE-ID (string or number), insert that face directly.  Interactively,
+prompt with completing-read over face names (`/斜眼笑') and ids.
+
+Sends as a structured OneBot `face' segment (not Unicode, not CQ text).
+Bound to `C-c C-e'; also on the attach transient as `e'."
+  (interactive
+   (list
+    (let* ((candidates (qq-media-face-completion-candidates))
+           (choice
+            (completing-read
+             "QQ face: "
+             candidates
+             nil t nil 'qq-chat--face-history)))
+      (or (qq-media-face-id-from-completion choice)
+          (user-error "qq: not a face candidate: %s" choice)))))
+  (let* ((id (format "%s" (or face-id
+                              (user-error "qq: face id required"))))
+         (segment `((type . "face")
+                    (data . ((id . ,id))))))
+    (qq-chat--insert-input-segment-object segment)
+    (qq-chat--sync-draft-from-buffer)
+    (message "qq: face %s (%s)"
+             (or (qq-media-face-name id) id)
+             id)))
 
 (defun qq-chat--clipboard-temp-file (extension)
   "Return a unique temp file path with EXTENSION (including the leading dot)."
@@ -1574,7 +1612,7 @@ Never dump OneBot CQ / raw_message here — previews come from
 (defun qq-chat--header-help-text ()
   "Return header help text for chat actions."
   (concat
-   "M-<: older   r/d/o/a · m/?   C-c C-k cancel   C-c C-v clipboard   C-c C-c send"))
+   "M-<: older   r/d/o/a · m/?   C-c C-e face   C-c C-v clip   C-c C-c send"))
 
 (defun qq-chat--insert-date-separator-row (day-label)
   "Insert a date separator row for DAY-LABEL."
@@ -2310,6 +2348,7 @@ Updates header-line and redisplays only nodes whose render context changed
     (define-key map (kbd "M-n") #'qq-chat-draft-next)
     (define-key map (kbd "C-c C-f") #'qq-chat-attach-file)
     (define-key map (kbd "C-c C-v") #'qq-chat-attach-clipboard)
+    (define-key map (kbd "C-c C-e") #'qq-chat-attach-face)
     (define-key map (kbd "C-c C-a") #'qq-chat-attach-transient)
     (define-key map (kbd "M-g n") #'qq-chat-next-message)
     (define-key map (kbd "M-g p") #'qq-chat-previous-message)

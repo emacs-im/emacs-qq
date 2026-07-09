@@ -921,6 +921,27 @@
          (should (file-readable-p
                   (alist-get 'file (alist-get 'data (car segments))))))))))
 
+(ert-deftest qq-chat-attach-face-inserts-face-segment ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice")
+      (target-id . "10001"))
+    nil)
+   (let ((qq-media--face-names-table (make-hash-table :test #'equal)))
+     (puthash "178" "/斜眼笑" qq-media--face-names-table)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "private:10001")
+       (qq-chat-render)
+       (qq-chat-attach-face "178")
+       (should (disco-chatbuf-input-has-objects-p))
+       (let ((segments (qq-chat--current-input-segments)))
+         (should (= 1 (length segments)))
+         (should (equal "face" (alist-get 'type (car segments))))
+         (should (equal "178"
+                        (alist-get 'id (alist-get 'data (car segments))))))))))
+
 (ert-deftest qq-chat-attach-clipboard-uri-list-local-file ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
