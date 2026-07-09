@@ -1646,76 +1646,53 @@ image/video inference."
           (unless attached
             (user-error "qq: no file or image in clipboard")))))))))
 
-(defun qq-chat--input-object-span-end (input start limit object-prop)
-  "Return exclusive end of the structured object starting at START in INPUT.
-
-Only characters up through the object-end marker are included.  Text that
-inherited the object property via rear-stickiness is excluded."
-  (let* ((object (get-text-property start object-prop input))
-         (pos start)
-         end-at)
-    (while (and (< pos limit)
-                (eq (get-text-property pos object-prop input) object))
-      (when (get-text-property pos disco-chatbuf-input-object-end-property input)
-        (setq end-at (1+ pos))
-        (setq pos limit))
-      (unless end-at
-        (setq pos (1+ pos))))
-    (or end-at
-        ;; Malformed object without end marker: single property run.
-        (next-single-property-change start object-prop input limit)
-        limit)))
-
 (defun qq-chat--current-input-segments ()
   "Parse current input region into outbound QQ message segments.
 
-Plain text (including CJK) between/after attachment objects becomes `text'
-segments.  A real attachment starts only at
-`disco-chatbuf-input-object-start-property'; characters that merely inherited
-`disco-chatbuf-input-object' (rear-sticky bug) are emitted as text so Chinese
-after an image is not dropped."
+Follow telega's `telega-chatbuf--input-imcs' shape:
+
+1. Split the input string by `disco-chatbuf-input-object-property'
+   (telega splits on `telega-attach' via `telega--split-by-text-prop').
+2. Chunks with no object property → plain `text' segments (CJK included).
+3. Chunks with an object → the structured segment (image/face/file/…).
+
+With telega-style insert (object body + trailing spacer with
+`rear-nonsticky t'), typed text after an attachment is a separate chunk and
+is not swallowed into the image segment."
   (let* ((input (or (disco-chatbuf-input-string) ""))
          (object-prop disco-chatbuf-input-object-property)
-         (limit (length input))
-         (pos 0)
+         (chunks (if (fboundp 'disco-chatbuf--split-by-text-prop)
+                     (disco-chatbuf--split-by-text-prop input object-prop)
+                   (list input)))
          segments)
-    (while (< pos limit)
-      (let* ((object (get-text-property pos object-prop input))
-             (real-object-p
-              (and object
-                   (get-text-property
-                    pos disco-chatbuf-input-object-start-property input))))
-        (if real-object-p
-            (let* ((next (qq-chat--input-object-span-end
-                          input pos limit object-prop))
-                   (segment (qq-chat--input-object-segment object)))
-              (when segment
-                (push segment segments))
-              (setq pos next))
-          (let* ((next
-                  (if object
-                      ;; Sticky residue: walk until a real object start or
-                      ;; property change away from this object value.
-                      (let ((p (1+ pos)))
-                        (while (and (< p limit)
-                                    (eq (get-text-property p object-prop input)
-                                        object)
-                                    (not (get-text-property
-                                          p
-                                          disco-chatbuf-input-object-start-property
-                                          input)))
-                          (setq p (1+ p)))
-                        p)
-                    (or (next-single-property-change
-                         pos object-prop input limit)
-                        limit)))
-                 (text (substring-no-properties input pos next)))
+    (dolist (chunk chunks)
+      (let ((object (and (not (string-empty-p chunk))
+                         (get-text-property 0 object-prop chunk))))
+        (if object
+            (when-let* ((segment (qq-chat--input-object-segment object)))
+              (push segment segments))
+          (let ((text (substring-no-properties chunk)))
+            ;; telega skips blank text chunks; keep pure whitespace only if
+            ;; it is the sole content (otherwise trim attachment spacers).
             (unless (string-empty-p text)
               (push `((type . "text")
                       (data . ((text . ,text))))
-                    segments))
-            (setq pos next)))))
-    (nreverse segments)))
+                    segments))))))
+    ;; Drop whitespace-only text segments that are only the telega-style
+    ;; attachment spacer leftovers when mixed with real content.
+    (setq segments (nreverse segments))
+    (if (seq-find (lambda (s)
+                    (or (not (equal (alist-get 'type s) "text"))
+                        (not (string-blank-p
+                              (or (alist-get 'text (alist-get 'data s)) "")))))
+                  segments)
+        (seq-filter
+         (lambda (s)
+           (or (not (equal (alist-get 'type s) "text"))
+               (not (string-blank-p
+                     (or (alist-get 'text (alist-get 'data s)) "")))))
+         segments)
+      segments)))
 
 (defun qq-chat--composer-context-text (label message-id)
   "Return one composer context line for LABEL and MESSAGE-ID."
