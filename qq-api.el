@@ -189,7 +189,7 @@ When REPLY-TO-MESSAGE-ID is non-nil, send the text as a reply."
    text))
 
 (defun qq-api-delete-message (message-id)
-  "Recall MESSAGE-ID (NT snowflake string) via NapCat and drop it locally."
+  "Recall MESSAGE-ID (NT snowflake string) via NapCat and mark it recalled."
   (interactive)
   (qq-api-call
    "delete_msg"

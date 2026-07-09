@@ -49,6 +49,17 @@ When nil, emacs-qq falls back to `qq-onebot-token-env-var'."
   :type 'boolean
   :group 'qq)
 
+(defcustom qq-chat-show-recalled-messages nil
+  "When non-nil, show recalled messages as stubs in the chat timeline.
+
+Default nil matches telega (`telega-chat-show-deleted-messages-for' defaults
+to nil): recalled rows stay in `qq-state' but are omitted from the EWOC.
+When non-nil, render a \"[message recalled]\" placeholder (no action buttons).
+
+Requires NapCat fork to mark messages with `recalled' / `recall_time'."
+  :type 'boolean
+  :group 'qq)
+
 (defcustom qq-media-avatar-image-height 20
   "Pixel height used for inline avatar images in chat buffers."
   :type 'integer

@@ -131,10 +131,12 @@
                    (data . ((text . "hello"))))))))
    (let ((session (qq-state-session "private:10001")))
      (should (= (alist-get 'unread-count session) 1)))
-   (should (qq-state-apply-recall "9007199254741004123"))
-   (should-not (qq-state-session-messages "private:10001"))))
+   (qq-state-apply-recall "9007199254741004123")
+   (let ((message (car (qq-state-session-messages "private:10001"))))
+     (should (qq-state-message-recalled-p message))
+     (should (equal (alist-get 'preview message) "[message recalled]")))))
 
-(ert-deftest qq-state-apply-recall-removes-message-from-store ()
+(ert-deftest qq-state-apply-recall-keeps-stub-in-store ()
   (qq-test-with-reset
    (qq-state-set-self-info '((user_id . 90001)
                              (nickname . "Me")))
@@ -150,28 +152,14 @@
       (raw_message . "will recall")
       (message . (((type . "text")
                    (data . ((text . "will recall"))))))))
-   (should (qq-state-apply-recall "9007199254741005555"))
-   (should-not (qq-state-session-messages "private:10001"))
-   (should-not (gethash "9007199254741005555"
-                        qq-state--message-session-index))))
+   (qq-state-apply-recall "9007199254741005555")
+   (let ((message (car (qq-state-session-messages "private:10001"))))
+     (should (qq-state-message-recalled-p message))
+     (should (equal (alist-get 'server-id message) "9007199254741005555")))))
 
-(ert-deftest qq-state-napcat-recalled-flag-drops-message ()
-  "Protocol `recalled' must remove local row (NapCat is source of truth)."
+(ert-deftest qq-state-napcat-recalled-flag-stores-stub ()
+  "Protocol `recalled' stores a stub (display policy is chat's job)."
   (qq-test-with-reset
-   (qq-state-set-self-info '((user_id . 90001)
-                             (nickname . "Me")))
-   (qq-state-merge-live-message
-    '((post_type . "message")
-      (message_type . "private")
-      (message_id . "9007199254741006666")
-      (user_id . 10001)
-      (time . 1710000001)
-      (sender . ((user_id . 10001)
-                 (nickname . "Alice")))
-      (raw_message . "hi")
-      (message . (((type . "text")
-                   (data . ((text . "hi"))))))))
-   (should (= 1 (length (qq-state-session-messages "private:10001"))))
    (qq-state-merge-live-message
     '((post_type . "message")
       (message_type . "private")
@@ -184,7 +172,38 @@
                  (nickname . "Alice")))
       (raw_message . "")
       (message . ())))
-   (should-not (qq-state-session-messages "private:10001"))))
+   (let ((message (car (qq-state-session-messages "private:10001"))))
+     (should (qq-state-message-recalled-p message))
+     (should (equal (alist-get 'preview message) "[message recalled]")))))
+
+(ert-deftest qq-state-history-merge-preserves-recalled-status ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . 90001) (nickname . "Me")))
+   (qq-state-merge-live-message
+    '((post_type . "message_sent")
+      (message_type . "private")
+      (message_id . "9007199254741005555")
+      (user_id . 90001)
+      (target_id . 10001)
+      (time . 1710000001)
+      (sender . ((user_id . 90001) (nickname . "Me")))
+      (raw_message . "x")
+      (message . (((type . "text") (data . ((text . "x"))))))))
+   (qq-state-apply-recall "9007199254741005555")
+   (qq-state-merge-history
+    "private:10001"
+    (list
+     '((post_type . "message_sent")
+       (message_type . "private")
+       (message_id . "9007199254741005555")
+       (user_id . 90001)
+       (target_id . 10001)
+       (time . 1710000001)
+       (sender . ((user_id . 90001) (nickname . "Me")))
+       (raw_message . "")
+       (message . ()))))
+   (should (qq-state-message-recalled-p
+            (car (qq-state-session-messages "private:10001"))))))
 
 (ert-deftest qq-state-live-dataline-message-routes-by-peer-uid ()
   (qq-test-with-reset
@@ -359,7 +378,7 @@
        (setq events nil)
        (qq-state-apply-recall "9007199254741004999")
        (let ((recall-event (car events)))
-         (should (eq (plist-get recall-event :mutation) 'delete))
+         (should (eq (plist-get recall-event :mutation) 'update))
          (should (eq (plist-get recall-event :source) 'notice))
          (should (equal (plist-get recall-event :message-anchor)
                         "9007199254741004999")))

@@ -445,43 +445,84 @@
             :message ((server-id . "other"))))
          (should (equal '("9007199254741004645") partial-calls)))))))
 
-(ert-deftest qq-chat-recall-removes-node-from-timeline ()
-  "apply-recall deletes from state; chat drops the EWOC node."
+(ert-deftest qq-chat-recall-hides-node-by-default ()
+  "Default: recalled stays in state but leaves the timeline."
   (qq-chat-test-with-reset
-   (qq-state-set-self-info '((user_id . 90001)
-                             (nickname . "Me")))
-   (qq-state-upsert-session
-    "private:10001"
-    '((title . "Alice")
-      (target-id . "10001"))
-    nil)
-   (qq-state-merge-live-message
-    '((post_type . "message_sent")
-      (message_type . "private")
-      (message_id . "9007199254741007777")
-      (user_id . 90001)
-      (target_id . 10001)
-      (time . 1710000001)
-      (sender . ((user_id . 90001)
-                 (nickname . "Me")))
-      (raw_message . "bye")
-      (message . (((type . "text")
-                   (data . ((text . "bye"))))))))
-   (with-temp-buffer
-     (qq-chat-mode)
-     (setq qq-chat--session-key "private:10001")
-     (qq-chat-render)
-     (should (equal '("9007199254741007777")
-                    qq-chat--displayed-message-anchors))
-     (qq-state-apply-recall "9007199254741007777")
-     (qq-chat--handle-state-change
-      '(:type message
-        :session-key "private:10001"
-        :mutation delete
-        :message-anchor "9007199254741007777"))
-     (should-not qq-chat--displayed-message-anchors)
-     (should-not (gethash "9007199254741007777"
-                          qq-chat--message-node-table)))))
+   (let ((qq-chat-show-recalled-messages nil))
+     (qq-state-set-self-info '((user_id . 90001)
+                               (nickname . "Me")))
+     (qq-state-upsert-session
+      "private:10001"
+      '((title . "Alice")
+        (target-id . "10001"))
+      nil)
+     (qq-state-merge-live-message
+      '((post_type . "message_sent")
+        (message_type . "private")
+        (message_id . "9007199254741007777")
+        (user_id . 90001)
+        (target_id . 10001)
+        (time . 1710000001)
+        (sender . ((user_id . 90001)
+                   (nickname . "Me")))
+        (raw_message . "bye")
+        (message . (((type . "text")
+                     (data . ((text . "bye"))))))))
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "private:10001")
+       (qq-chat-render)
+       (should (equal '("9007199254741007777")
+                      qq-chat--displayed-message-anchors))
+       (qq-state-apply-recall "9007199254741007777")
+       (qq-chat--handle-state-change
+        (list :type 'message
+              :session-key "private:10001"
+              :mutation 'update
+              :message-anchor "9007199254741007777"
+              :message (car (qq-state-session-messages "private:10001"))))
+       (should-not qq-chat--displayed-message-anchors)
+       (should (qq-state-message-recalled-p
+                (car (qq-state-session-messages "private:10001"))))))))
+
+(ert-deftest qq-chat-show-recalled-messages-keeps-stub ()
+  (qq-chat-test-with-reset
+   (let ((qq-chat-show-recalled-messages t))
+     (qq-state-set-self-info '((user_id . 90001)
+                               (nickname . "Me")))
+     (qq-state-upsert-session
+      "private:10001"
+      '((title . "Alice")
+        (target-id . "10001"))
+      nil)
+     (qq-state-merge-live-message
+      '((post_type . "message_sent")
+        (message_type . "private")
+        (message_id . "9007199254741008888")
+        (user_id . 90001)
+        (target_id . 10001)
+        (time . 1710000001)
+        (sender . ((user_id . 90001)
+                   (nickname . "Me")))
+        (raw_message . "bye")
+        (message . (((type . "text")
+                     (data . ((text . "bye"))))))))
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "private:10001")
+       (qq-chat-render)
+       (qq-state-apply-recall "9007199254741008888")
+       (qq-chat--handle-state-change
+        (list :type 'message
+              :session-key "private:10001"
+              :mutation 'update
+              :message-anchor "9007199254741008888"
+              :message (car (qq-state-session-messages "private:10001"))))
+       (should (equal '("9007199254741008888")
+                      qq-chat--displayed-message-anchors))
+       (should (string-match-p
+                "recalled"
+                (buffer-substring-no-properties (point-min) (point-max))))))))
 
 (ert-deftest qq-chat-handle-state-change-friends-refreshes-timeline-for-name-updates ()
   (qq-chat-test-with-reset
