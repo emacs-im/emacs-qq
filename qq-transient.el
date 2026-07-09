@@ -87,8 +87,14 @@
 
 
 ;;; Chat / message transients
+;;
+;; Magit-style autoloads: do NOT put bare `;;;###autoload' above
+;; `transient-define-prefix'.  loaddefs would copy the whole form into
+;; *-autoloads.el, where `transient-define-prefix' is still undefined.
+;; Use an explicit (autoload SYMBOL FILE nil t) cookie instead; the real
+;; definition runs only after this file loads and (require 'transient).
 
-;;;###autoload
+;;;###autoload(autoload 'qq-chat-message-transient "qq-transient" nil t)
 (transient-define-prefix qq-chat-message-transient ()
   "Message actions for the QQ chat message at point.
 
@@ -106,7 +112,7 @@ Prefer this over inline button rows (telega/disco style)."
     ("n" "Next message" qq-chat-next-message)
     ("p" "Previous message" qq-chat-previous-message)]])
 
-;;;###autoload
+;;;###autoload(autoload 'qq-chat-attach-transient "qq-transient" nil t)
 (transient-define-prefix qq-chat-attach-transient ()
   "Attach local media into the QQ chat composer."
   [["Attach"
@@ -115,7 +121,7 @@ Prefer this over inline button rows (telega/disco style)."
     ("F" "As file" qq-chat-attach-as-file)
     ("v" "Clipboard (C-c C-v)" qq-chat-attach-clipboard)]])
 
-;;;###autoload
+;;;###autoload(autoload 'qq-chat-transient "qq-transient" nil t)
 (transient-define-prefix qq-chat-transient ()
   "Chat command menu for emacs-qq."
   [["Timeline"
@@ -143,7 +149,7 @@ Prefer this over inline button rows (telega/disco style)."
 
 ;;; Root transient
 
-;;;###autoload
+;;;###autoload(autoload 'qq-root-transient "qq-transient" nil t)
 (transient-define-prefix qq-root-transient ()
   "Root command menu for emacs-qq."
   [["Sessions"
