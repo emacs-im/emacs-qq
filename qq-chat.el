@@ -658,10 +658,17 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
 (defun qq-chat--message-visible-in-timeline-p (message)
   "Return non-nil when MESSAGE should appear in the chat timeline.
 
-Recalled messages are hidden by default (telega-like).  Set
+Recalled messages and empty-body shells (history after revoke without a
+recalled flag) are hidden by default (telega-like).  Set
 `qq-chat-show-recalled-messages' non-nil to keep stubs."
-  (or qq-chat-show-recalled-messages
-      (not (qq-state-message-recalled-p message))))
+  (cond
+   (qq-chat-show-recalled-messages
+    t)
+   ((qq-state-message-recalled-p message)
+    nil)
+   ((qq-state-message-empty-shell-p message)
+    nil)
+   (t t)))
 
 (defun qq-chat--timeline-messages (&optional messages)
   "Return MESSAGES (or current session messages) filtered for timeline display."

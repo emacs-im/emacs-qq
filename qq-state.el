@@ -279,19 +279,41 @@ Values from NEW replace values in OLD."
   "Return non-nil when MESSAGE is marked recalled."
   (eq (alist-get 'status message) 'recalled))
 
+(defun qq-state-message-empty-shell-p (message)
+  "Return non-nil when MESSAGE has no displayable body.
+
+NapCat history often keeps recalled rows as empty `message`/`raw_message`
+without a recalled flag (until fork exposes `recall_time').  Those shells
+must not render as blank header + action buttons."
+  (let ((segments (alist-get 'segments message))
+        (raw (alist-get 'raw-message message))
+        (preview (alist-get 'preview message)))
+    (and (or (null segments) (equal segments '()))
+         (or (null raw) (and (stringp raw) (string-empty-p raw)))
+         (or (null preview)
+             (and (stringp preview)
+                  (or (string-empty-p preview)
+                      (equal preview "[message recalled]")))))))
+
 (defun qq-state--raw-message-recalled-p (message)
   "Return non-nil when raw OneBot MESSAGE is a recalled stub.
 
-NapCat fork may set `recalled' or non-zero `recall_time' (NT recallTime)."
+NapCat fork may set `recalled' or non-zero `recall_time' (NT recallTime).
+Also treat fully empty body arrays as recalled stubs (common after revoke)."
   (let ((recalled (alist-get 'recalled message))
-        (recall-time (alist-get 'recall_time message)))
+        (recall-time (alist-get 'recall_time message))
+        (segments (alist-get 'message message))
+        (raw (alist-get 'raw_message message)))
     (or (eq recalled t)
         (eq recalled 'true)
         (and (numberp recalled) (not (zerop recalled)))
         (and (stringp recalled)
              (member (downcase recalled) '("true" "1" "yes")))
         (and recall-time
-             (not (member (format "%s" recall-time) '("" "0" "nil")))))))
+             (not (member (format "%s" recall-time) '("" "0" "nil"))))
+        ;; History/event payload with no segments and no raw text.
+        (and (or (null segments) (equal segments '()))
+             (or (null raw) (and (stringp raw) (string-empty-p raw)))))))
 
 (defun qq-state--as-recalled-message (message)
   "Return MESSAGE with recalled display fields forced."
@@ -301,6 +323,44 @@ NapCat fork may set `recalled' or non-zero `recall_time' (NT recallTime)."
      (segments . nil)
      (raw-message . "[message recalled]")
      (preview . "[message recalled]"))))
+
+(defun qq-state-scrub-empty-shells (&optional session-key)
+  "Mark empty-body shells as recalled in SESSION-KEY or all sessions.
+
+Return number of messages updated.  Used to repair live state after history
+imported empty stubs without a recalled flag."
+  (let ((keys (if session-key
+                  (list session-key)
+                (let (all)
+                  (maphash (lambda (k _v) (push k all))
+                           qq-state--messages-by-session)
+                  all)))
+        (count 0))
+    (dolist (key keys)
+      (let* ((messages (copy-tree
+                        (or (gethash key qq-state--messages-by-session) '())))
+             (changed nil)
+             (new-messages
+              (mapcar
+               (lambda (msg)
+                 (if (and (not (qq-state-message-recalled-p msg))
+                          (qq-state-message-empty-shell-p msg))
+                     (progn
+                       (setq changed t)
+                       (cl-incf count)
+                       (qq-state--as-recalled-message msg))
+                   msg))
+               messages)))
+        (when changed
+          (puthash key new-messages qq-state--messages-by-session)
+          (qq-state--reindex-session-messages key new-messages)
+          (qq-state--sync-session-summary key)
+          (qq-state--emit 'history
+                          :session-key key
+                          :message-count (length new-messages)
+                          :mutation 'history
+                          :source 'scrub))))
+    count))
 
 (defun qq-state-session (session-key)
   "Return session object for SESSION-KEY."
@@ -694,6 +754,11 @@ Return three values via `cl-values':
     (when (and existing
                (qq-state-message-recalled-p existing)
                (not (qq-state-message-recalled-p message)))
+      (setq merged (qq-state--as-recalled-message merged)))
+    ;; Incoming empty shell (no segments/raw) → force recalled even if status
+    ;; was still sent/received (history after revoke).
+    (when (and (not (qq-state-message-recalled-p merged))
+               (qq-state-message-empty-shell-p merged))
       (setq merged (qq-state--as-recalled-message merged)))
     (if existing
         (setq messages (qq-state--replace-message messages existing merged))

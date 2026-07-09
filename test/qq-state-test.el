@@ -193,6 +193,55 @@
      (should (equal (alist-get 'preview message) "[message recalled]"))
      (should (qq-state-message-recalled-p message)))))
 
+(ert-deftest qq-state-empty-body-history-stub-treated-as-recalled ()
+  "History empty shells (no recalled flag) become recalled."
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . 90001)
+                             (nickname . "Me")))
+   (qq-state-merge-history
+    "private:10001"
+    (list
+     '((post_type . "message_sent")
+       (message_type . "private")
+       (message_id . "9007199254741008888")
+       (user_id . 90001)
+       (target_id . 10001)
+       (time . 1710000001)
+       (sender . ((user_id . 90001)
+                  (nickname . "Me")))
+       (raw_message . "")
+       (message . ()))))
+   (let ((message (car (qq-state-session-messages "private:10001"))))
+     (should (eq (alist-get 'status message) 'recalled))
+     (should (qq-state-message-empty-shell-p
+              ;; Before scrub helpers: raw empty shell shape
+              '((status . sent) (segments) (raw-message . "") (preview . ""))))
+     (should (qq-state-message-recalled-p message)))))
+
+(ert-deftest qq-state-scrub-empty-shells-repairs-live-state ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . 90001) (nickname . "Me")))
+   ;; Simulate pre-fix empty shell still marked sent.
+   (puthash "private:10001"
+            (list
+             '((id . "9007199254741009999")
+               (server-id . "9007199254741009999")
+               (session-key . "private:10001")
+               (time . 1710000001)
+               (sender-id . "90001")
+               (self-p . t)
+               (status . sent)
+               (segments)
+               (raw-message . "")
+               (preview . "")
+               (order . 1)))
+            qq-state--messages-by-session)
+   (qq-state--index-message
+    (car (gethash "private:10001" qq-state--messages-by-session)))
+   (should (= 1 (qq-state-scrub-empty-shells "private:10001")))
+   (let ((message (car (qq-state-session-messages "private:10001"))))
+     (should (eq (alist-get 'status message) 'recalled)))))
+
 (ert-deftest qq-state-live-dataline-message-routes-by-peer-uid ()
   (qq-test-with-reset
    (qq-state-set-self-info '((user_id . 90001)
