@@ -1085,16 +1085,35 @@ With FORCE non-nil, ignore the cache (caller should still refresh via
 (defun qq-media-refresh-custom-faces (&optional callback errback count)
   "Fetch favorite custom faces from NapCat and cache them.
 
-CALLBACK is called with the face list on success."
-  (qq-api-fetch-custom-face-info
-   (lambda (data)
-     (let ((faces (qq-media--normalize-custom-face-list data)))
-       (setq qq-media--custom-faces faces
-             qq-media--custom-faces-fetched-at (float-time))
-       (when callback
-         (funcall callback faces))))
-   errback
-   (or count qq-media-custom-face-count)))
+CALLBACK is called with the face list on success.
+
+`fetch_custom_face_info' is capped by its `count' argument (see
+`qq-media-custom-face-count').  When the response is full — length
+equals the requested count — this function retries with a larger
+count (doubling, capped by `qq-media-custom-face-count-max') so large
+favorites libraries are not silently truncated at 96/page-size."
+  (let ((req (max 1 (or count qq-media-custom-face-count))))
+    (qq-api-fetch-custom-face-info
+     (lambda (data)
+       (let* ((faces (qq-media--normalize-custom-face-list data))
+              (n (length faces))
+              (max-count (max req qq-media-custom-face-count-max)))
+         (if (and (>= n req)
+                  (< req max-count))
+             ;; Likely truncated: ask for more.
+             (qq-media-refresh-custom-faces
+              callback errback
+              (min max-count (max (* req 2) (1+ req))))
+           (setq qq-media--custom-faces faces
+                 qq-media--custom-faces-fetched-at (float-time))
+           (when (and (>= n req) (>= req max-count))
+             (message
+              "qq: favorite faces may be truncated (%d returned, count max %d)"
+              n max-count))
+           (when callback
+             (funcall callback faces)))))
+     errback
+     req)))
 
 (defun qq-media-custom-face-id (face)
   "Return a stable string id for favorite FACE alist."

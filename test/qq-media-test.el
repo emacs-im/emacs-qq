@@ -245,6 +245,32 @@
     (should (= 1 (length one)))
     (should (equal "C3C3C3C3" (alist-get 'md5 (car one))))))
 
+(ert-deftest qq-media-refresh-custom-faces-expands-when-full-page ()
+  "When NapCat returns exactly COUNT faces, retry with a larger count."
+  (let* ((qq-media-custom-face-count 2)
+         (qq-media-custom-face-count-max 8)
+         (qq-media--custom-faces nil)
+         (calls nil)
+         (final nil))
+    (cl-letf (((symbol-function 'qq-api-fetch-custom-face-info)
+               (lambda (callback &optional _errback count)
+                 (push count calls)
+                 (let* ((n (or count 2))
+                        ;; First full pages, then a short one.
+                        (take (if (>= n 8) 5 n))
+                        (data
+                         (cl-loop for i from 1 to take
+                                  collect
+                                  `((md5 . ,(format "MD5%06dXXXXXXXX" i))
+                                    (url . ,(format "https://e/%d" i))
+                                    (desc . "")))))
+                   (funcall callback data)))))
+      (qq-media-refresh-custom-faces
+       (lambda (faces) (setq final faces)))
+      (should (equal (nreverse calls) '(2 4 8)))
+      (should (= 5 (length final)))
+      (should (= 5 (length qq-media--custom-faces))))))
+
 (ert-deftest qq-media-custom-face-to-segment-personal-sticker ()
   "Personal favorites become image segments with sub_type 1."
   (let* ((file (make-temp-file "qq-fav" nil ".jpg"))

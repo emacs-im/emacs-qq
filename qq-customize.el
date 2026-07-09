@@ -154,8 +154,23 @@ a file is missing (newer / animated faces)."
   :type 'directory
   :group 'qq)
 
-(defcustom qq-media-custom-face-count 96
-  "How many favorite custom faces to fetch from NapCat."
+(defcustom qq-media-custom-face-count 1000
+  "How many favorite custom faces to request from NapCat per fetch.
+
+NapCat/`fetch_custom_face_info' only returns up to this many items
+(`count' parameter).  The previous default of 96 truncated large
+favorites libraries.  When the response is full (length = count),
+`qq-media-refresh-custom-faces' automatically retries with a larger
+count up to `qq-media-custom-face-count-max'."
+  :type 'integer
+  :group 'qq)
+
+(defcustom qq-media-custom-face-count-max 5000
+  "Upper bound when auto-expanding favorite-face fetches.
+
+If a fetch returns exactly as many faces as requested, the client
+retries with a larger `count' until it gets a short page or hits
+this max."
   :type 'integer
   :group 'qq)
 
