@@ -122,7 +122,8 @@ Prefer this over inline button rows (telega/disco style)."
 (transient-define-prefix qq-chat-attach-transient ()
   "Attach local media / QQ faces into the QQ chat composer."
   [["Attach"
-    ("e" "QQ face / emoji (C-c C-e)" qq-chat-attach-face)
+    ("e" "QQ face (C-c C-e)" qq-chat-attach-face)
+    ("E" "Favorite face (C-u C-c C-e)" qq-chat-attach-custom-face)
     ("f" "File (auto type)" qq-chat-attach-file)
     ("i" "As image" qq-chat-attach-as-image)
     ("F" "As file" qq-chat-attach-as-file)
@@ -143,7 +144,8 @@ Prefer this over inline button rows (telega/disco style)."
    ["Composer"
     ("c" "Send" qq-chat-send-message)
     ("a" "Attach…" qq-chat-attach-transient)
-    ("E" "QQ face / emoji" qq-chat-attach-face)
+    ("E" "QQ face" qq-chat-attach-face)
+    ("F" "Favorite face" qq-chat-attach-custom-face)
     ("k" "Cancel reply/draft" qq-chat-cancel-dwim
      :inapt-if qq-transient--cancel-inapt-p)
     ("e" "Focus draft" qq-chat-edit-draft)

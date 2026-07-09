@@ -972,6 +972,166 @@ or numeric id.  Use `qq-media-face-id-from-completion'."
     candidate)
    (t nil)))
 
+
+;;; Favorite / custom faces (收藏表情)
+
+(defvar qq-media--custom-faces nil
+  "Cached list of favorite custom-face alists from NapCat.")
+
+(defvar qq-media--custom-faces-fetched-at nil
+  "Float time when `qq-media--custom-faces' was last fetched.")
+
+(defun qq-media--json-truthy-p (value)
+  "Return non-nil when JSON VALUE is a true-ish flag (not :false/:null)."
+  (and value
+       (not (eq value :false))
+       (not (eq value :null))
+       (not (equal value 0))
+       (not (equal value "false"))
+       (not (equal value "0"))))
+
+(defun qq-media--normalize-custom-face-list (data)
+  "Normalize DATA from fetch_custom_face_info into a list of alists."
+  (cond
+   ((null data) nil)
+   ((vectorp data) (append data nil))
+   ((listp data)
+    ;; Either a list of faces, or a single face alist.
+    (if (and data (consp (car data)) (symbolp (car (car data))))
+        data
+      (list data)))
+   (t nil)))
+
+(defun qq-media-custom-faces (&optional force)
+  "Return cached favorite custom faces, or nil if not loaded.
+
+With FORCE non-nil, ignore the cache (caller should still refresh via
+`qq-media-refresh-custom-faces')."
+  (unless force
+    qq-media--custom-faces))
+
+(defun qq-media-refresh-custom-faces (&optional callback errback count)
+  "Fetch favorite custom faces from NapCat and cache them.
+
+CALLBACK is called with the face list on success."
+  (qq-api-fetch-custom-face-info
+   (lambda (data)
+     (let ((faces (qq-media--normalize-custom-face-list data)))
+       (setq qq-media--custom-faces faces
+             qq-media--custom-faces-fetched-at (float-time))
+       (when callback
+         (funcall callback faces))))
+   errback
+   (or count qq-media-custom-face-count)))
+
+(defun qq-media-custom-face-id (face)
+  "Return a stable string id for favorite FACE alist."
+  (or (let ((md5 (alist-get 'md5 face)))
+        (and (stringp md5) (not (string-empty-p md5)) md5))
+      (let ((res (alist-get 'res_id face)))
+        (and (stringp res) (not (string-empty-p res)) res))
+      (let ((emo (alist-get 'emo_id face)))
+        (and emo (format "emo:%s" emo)))
+      (format "fav:%s" (sxhash-equal face))))
+
+(defun qq-media-custom-face-label (face)
+  "Return a human completion label for favorite FACE."
+  (let* ((desc (alist-get 'desc face))
+         (md5 (alist-get 'md5 face))
+         (emo (alist-get 'emo_id face))
+         (mark (qq-media--json-truthy-p (alist-get 'is_mark_face face)))
+         (short (cond
+                 ((and (stringp desc) (not (string-empty-p (string-trim desc))))
+                  (string-trim desc))
+                 ((and (stringp md5) (>= (length md5) 8))
+                  (concat (substring md5 0 8) "…"))
+                 (emo (format "#%s" emo))
+                 (t "favorite")))
+         (kind (if mark "mface" "fav")))
+    (format "[%s] %s" kind short)))
+
+(defun qq-media-custom-face-file (face)
+  "Return best local image path for FACE, or nil."
+  (seq-find
+   #'qq-media-file-present-p
+   (list (alist-get 'file face)
+         (alist-get 'original_file face)
+         (alist-get 'thumb_file face))))
+
+(defun qq-media-custom-face-thumb (face)
+  "Return best local thumb path for FACE, or nil."
+  (seq-find
+   #'qq-media-file-present-p
+   (list (alist-get 'thumb_file face)
+         (alist-get 'file face)
+         (alist-get 'original_file face))))
+
+(defun qq-media-custom-face-display-string (face)
+  "Return composer/timeline display string for favorite FACE."
+  (let* ((thumb (qq-media-custom-face-thumb face))
+         (image (and thumb
+                     (qq-media--image-from-file
+                      thumb
+                      (max qq-media-face-image-height 32))))
+         (fallback (qq-media-custom-face-label face)))
+    (qq-media--image-display-string image fallback)))
+
+(defun qq-media-custom-face-completion-candidates (&optional faces)
+  "Return completion candidates for favorite FACES (default: cache).
+
+Each candidate is a string; use `qq-media-custom-face-from-completion'."
+  (let ((faces (or faces qq-media--custom-faces))
+        (candidates nil))
+    (dolist (face faces)
+      (when (listp face)
+        (push (cons (qq-media-custom-face-label face) face) candidates)))
+    (nreverse candidates)))
+
+(defun qq-media-custom-face-from-completion (candidate &optional pairs)
+  "Return face alist matching completion CANDIDATE in PAIRS.
+
+PAIRS defaults to `qq-media-custom-face-completion-candidates'."
+  (let ((pairs (or pairs (qq-media-custom-face-completion-candidates))))
+    (cdr (assoc candidate pairs))))
+
+(defun qq-media-custom-face-to-segment (face)
+  "Convert favorite FACE alist into an outbound OneBot segment.
+
+Personal favorites (most common) are sent as image with `sub_type' 1
+(KCUSTOM sticker).  Market favorites (`is_mark_face') become mface when
+e_id is present."
+  (let* ((mark (qq-media--json-truthy-p (alist-get 'is_mark_face face)))
+         (e-id (alist-get 'e_id face))
+         (ep-id (alist-get 'ep_id face))
+         (file (qq-media-custom-face-file face))
+         (url (alist-get 'url face))
+         (desc (alist-get 'desc face))
+         (md5 (alist-get 'md5 face))
+         (summary (if (and (stringp desc) (not (string-empty-p (string-trim desc))))
+                      (string-trim desc)
+                    "[收藏表情]")))
+    (cond
+     ((and mark
+           (stringp e-id)
+           (not (string-empty-p e-id)))
+      `((type . "mface")
+        (data . ((emoji_id . ,e-id)
+                 (emoji_package_id . ,(condition-case _
+                                          (string-to-number (format "%s" (or ep-id 0)))
+                                        (error 0)))
+                 (key . ,(or (alist-get 'key face) ""))
+                 (summary . ,summary)))))
+     ((or file (qq-media-url-present-p url))
+      `((type . "image")
+        (data . (,@(when file `((file . ,file)))
+                 ,@(when (qq-media-url-present-p url) `((url . ,url)))
+                 (name . ,(or md5 "custom-face"))
+                 (summary . ,summary)
+                 ;; PicSubType.KCUSTOM — QQ treats this as a sticker/emoji image.
+                 (sub_type . 1)))))
+     (t
+      (user-error "qq: favorite face has neither local file nor URL")))))
+
 (defun qq-media-face-text-fallback (emoji-id)
   "Return plain-text fallback for face EMOJI-ID (never a CQ blob)."
   (or (qq-media-face-name emoji-id)

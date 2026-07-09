@@ -155,6 +155,40 @@
        (should errback-called)
        (should-not (qq-media--resource-fetching-p "avatar:10001"))))))
 
+(ert-deftest qq-media-custom-face-to-segment-personal-sticker ()
+  "Personal favorites become image segments with sub_type 1."
+  (let* ((file (make-temp-file "qq-fav" nil ".jpg"))
+         (face `((url . "https://example.com/x")
+                 (file . ,file)
+                 (thumb_file . ,file)
+                 (desc . "meme")
+                 (md5 . "ABCDEF12")
+                 (emo_id . 3)
+                 (is_mark_face . :false)
+                 (e_id . "")
+                 (ep_id . "0"))))
+    (unwind-protect
+        (progn
+          (with-temp-file file (insert "x"))
+          (let ((seg (qq-media-custom-face-to-segment face)))
+            (should (equal "image" (alist-get 'type seg)))
+            (should (equal 1 (alist-get 'sub_type (alist-get 'data seg))))
+            (should (equal file (alist-get 'file (alist-get 'data seg))))
+            (should (equal "meme" (alist-get 'summary (alist-get 'data seg))))))
+      (when (file-exists-p file)
+        (delete-file file)))))
+
+(ert-deftest qq-media-custom-face-to-segment-mark-face ()
+  (let* ((face '((is_mark_face . t)
+                 (e_id . "abc123")
+                 (ep_id . "5")
+                 (desc . "pack sticker")
+                 (key . "k1")))
+         (seg (qq-media-custom-face-to-segment face)))
+    (should (equal "mface" (alist-get 'type seg)))
+    (should (equal "abc123" (alist-get 'emoji_id (alist-get 'data seg))))
+    (should (equal 5 (alist-get 'emoji_package_id (alist-get 'data seg))))))
+
 (ert-deftest qq-media-face-uses-local-default-emoji-png ()
   "Base faces should render from LinuxQQ default-emojis without API."
   (qq-media-test-with-reset

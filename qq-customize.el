@@ -154,6 +154,11 @@ a file is missing (newer / animated faces)."
   :type 'directory
   :group 'qq)
 
+(defcustom qq-media-custom-face-count 96
+  "How many favorite custom faces to fetch from NapCat."
+  :type 'integer
+  :group 'qq)
+
 (defcustom qq-media-face-names-file
   (let* ((lib (or (locate-library "qq-customize.el")
                   (locate-library "qq-media.el")

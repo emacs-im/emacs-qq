@@ -942,6 +942,45 @@
          (should (equal "178"
                         (alist-get 'id (alist-get 'data (car segments))))))))))
 
+(ert-deftest qq-chat-attach-custom-face-inserts-image-sticker-segment ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice")
+      (target-id . "10001"))
+    nil)
+   (let* ((file (make-temp-file "qq-fav-chat" nil ".jpg"))
+          (face `((url . "https://example.com/x")
+                  (file . ,file)
+                  (thumb_file . ,file)
+                  (desc . "lol")
+                  (md5 . "DEADBEEF")
+                  (is_mark_face . :false)
+                  (e_id . "")
+                  (ep_id . "0")))
+          (qq-media--custom-faces (list face)))
+     (unwind-protect
+         (progn
+           (with-temp-file file (insert "jpg"))
+           (with-temp-buffer
+             (qq-chat-mode)
+             (setq qq-chat--session-key "private:10001")
+             (qq-chat-render)
+             (cl-letf (((symbol-function 'completing-read)
+                        (lambda (&rest _)
+                          (qq-media-custom-face-label face))))
+               (qq-chat-attach-custom-face)
+               (let ((segments (qq-chat--current-input-segments)))
+                 (should (= 1 (length segments)))
+                 (should (equal "image" (alist-get 'type (car segments))))
+                 (should (equal 1 (alist-get 'sub_type
+                                             (alist-get 'data (car segments)))))
+                 (should (equal file
+                                (alist-get 'file
+                                           (alist-get 'data (car segments)))))))))
+       (when (file-exists-p file)
+         (delete-file file))))))
+
 (ert-deftest qq-chat-attach-clipboard-uri-list-local-file ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session

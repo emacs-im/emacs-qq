@@ -1328,13 +1328,47 @@ update similar in spirit to `telega-chatbuf--chat-update'."
 (defun qq-chat--segment-object-label (segment)
   "Return visible input label for structured SEGMENT.
 
-Face segments use the same inline image (or `/名称') as the timeline."
+Face segments use the same inline image (or `/名称') as the timeline.
+Favorite stickers (`image' with sub_type 1, or mface) try local thumbs."
   (let* ((type (or (alist-get 'type segment) "segment"))
          (data (alist-get 'data segment)))
     (pcase type
       ("face"
        (let ((id (or (alist-get 'id data) "?")))
          (qq-media-face-display-string id)))
+      ("mface"
+       (let* ((summary (or (alist-get 'summary data) "[商城表情]"))
+              (file (or (alist-get 'file data)
+                        (alist-get 'path data)))
+              (image (and file
+                          (qq-media-file-present-p file)
+                          (qq-media--image-from-file
+                           file
+                           (max qq-media-face-image-height 32)))))
+         (qq-media--image-display-string image (format "[mface:%s]" summary))))
+      ("image"
+       (let* ((summary (alist-get 'summary data))
+              (sub (alist-get 'sub_type data))
+              (file (or (alist-get 'file data)
+                        (alist-get 'path data)))
+              (sticker-p (member sub '(1 "1")))
+              (image (and file
+                          (qq-media-file-present-p file)
+                          (qq-media--image-from-file
+                           file
+                           (if sticker-p
+                               (max qq-media-face-image-height 32)
+                             qq-media-face-image-height)))))
+         (if (or sticker-p image)
+             (qq-media--image-display-string
+              image
+              (or summary
+                  (and file (file-name-nondirectory file))
+                  "[image]"))
+           (format "[image:%s]"
+                   (or summary
+                       (and file (file-name-nondirectory file))
+                       "item")))))
       (_
        (let* ((path (or (alist-get 'path data)
                         (alist-get 'file data)
@@ -1397,7 +1431,7 @@ With FACE-ID (string or number), insert that face directly.  Interactively,
 prompt with completing-read over face names (`/斜眼笑') and ids.
 
 Sends as a structured OneBot `face' segment (not Unicode, not CQ text).
-Bound to `C-c C-e'; also on the attach transient as `e'."
+Bound via `qq-chat-attach-emoji' (`C-c C-e'); attach transient `e'."
   (interactive
    (list
     (let* ((candidates (qq-media-face-completion-candidates))
@@ -1417,6 +1451,63 @@ Bound to `C-c C-e'; also on the attach transient as `e'."
     (message "qq: face %s (%s)"
              (or (qq-media-face-name id) id)
              id)))
+
+(defvar qq-chat--custom-face-history nil
+  "Minibuffer history for `qq-chat-attach-custom-face'.")
+
+(defun qq-chat--insert-custom-face (face)
+  "Insert favorite FACE alist into the composer as a sendable segment."
+  (let ((segment (qq-media-custom-face-to-segment face)))
+    (qq-chat--insert-input-segment-object segment)
+    (qq-chat--sync-draft-from-buffer)
+    (message "qq: favorite %s" (qq-media-custom-face-label face))))
+
+(defun qq-chat--pick-custom-face (faces)
+  "Completing-read among FACES and insert the chosen favorite."
+  (unless faces
+    (user-error "qq: no favorite custom faces (收藏表情为空)"))
+  (let* ((pairs (qq-media-custom-face-completion-candidates faces))
+         (choice (completing-read
+                  "Favorite face: "
+                  (mapcar #'car pairs)
+                  nil t nil 'qq-chat--custom-face-history))
+         (face (qq-media-custom-face-from-completion choice pairs)))
+    (unless face
+      (user-error "qq: unknown favorite: %s" choice))
+    (qq-chat--insert-custom-face face)))
+
+(defun qq-chat-attach-custom-face (&optional force-refresh)
+  "Insert a favorite custom face (收藏表情) into the chat composer.
+
+Uses NapCat `fetch_custom_face_info'.  Personal favorites are sent as
+image segments with `sub_type' 1; market favorites as mface when possible.
+
+With prefix FORCE-REFRESH, re-fetch the list from NapCat.
+Bound via `C-u C-c C-e' or attach transient `E'."
+  (interactive "P")
+  (let ((cached (and (not force-refresh) (qq-media-custom-faces))))
+    (if cached
+        (qq-chat--pick-custom-face cached)
+      (message "qq: loading favorite faces…")
+      (qq-media-refresh-custom-faces
+       (lambda (faces)
+         (condition-case err
+             (qq-chat--pick-custom-face faces)
+           (error (message "%s" (error-message-string err)))))
+       (lambda (_response reason)
+         (message "qq: failed to load favorites: %s" reason))))))
+
+(defun qq-chat-attach-emoji (&optional custom-p)
+  "Attach a QQ emoji into the composer.
+
+Without prefix: system base face (`face' id, same as QQ 小黄脸).
+With prefix CUSTOM-P (`C-u'): favorite custom face (收藏表情).
+
+Keys: `C-c C-e' / `C-u C-c C-e'."
+  (interactive "P")
+  (if custom-p
+      (qq-chat-attach-custom-face (equal custom-p '(16)))
+    (call-interactively #'qq-chat-attach-face)))
 
 (defun qq-chat--clipboard-temp-file (extension)
   "Return a unique temp file path with EXTENSION (including the leading dot)."
@@ -1612,7 +1703,7 @@ Never dump OneBot CQ / raw_message here — previews come from
 (defun qq-chat--header-help-text ()
   "Return header help text for chat actions."
   (concat
-   "M-<: older   r/d/o/a · m/?   C-c C-e face   C-c C-v clip   C-c C-c send"))
+   "M-<: older   r/d/o/a · m/?   C-c C-e face · C-u fav   C-c C-v clip   C-c C-c send"))
 
 (defun qq-chat--insert-date-separator-row (day-label)
   "Insert a date separator row for DAY-LABEL."
@@ -2348,7 +2439,7 @@ Updates header-line and redisplays only nodes whose render context changed
     (define-key map (kbd "M-n") #'qq-chat-draft-next)
     (define-key map (kbd "C-c C-f") #'qq-chat-attach-file)
     (define-key map (kbd "C-c C-v") #'qq-chat-attach-clipboard)
-    (define-key map (kbd "C-c C-e") #'qq-chat-attach-face)
+    (define-key map (kbd "C-c C-e") #'qq-chat-attach-emoji)
     (define-key map (kbd "C-c C-a") #'qq-chat-attach-transient)
     (define-key map (kbd "M-g n") #'qq-chat-next-message)
     (define-key map (kbd "M-g p") #'qq-chat-previous-message)
