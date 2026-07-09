@@ -100,12 +100,19 @@
                              (nickname . "Me")))
    (qq-state-upsert-session "private:10001" '((title . "Alice")) nil)
    (let* ((pending (qq-state-insert-pending-text-message "private:10001" "ping"))
-          (local-id (alist-get 'local-id pending)))
-     (qq-state-mark-pending-message-sent "private:10001" local-id 88)
+          (local-id (alist-get 'local-id pending))
+          ;; NapCat hard-cut: message_id is an NT snowflake string.
+          (snowflake "9007199254741004645"))
+     (qq-state-mark-pending-message-sent "private:10001" local-id snowflake)
      (let ((message (car (qq-state-session-messages "private:10001"))))
-       (should (equal (alist-get 'server-id message) "88"))
+       (should (equal (alist-get 'server-id message) snowflake))
+       (should (equal (alist-get 'id message) snowflake))
        (should (eq (alist-get 'status message) 'sent))
-       (should (equal (alist-get 'raw-message message) "ping"))))))
+       (should (equal (alist-get 'raw-message message) "ping"))
+       ;; Anchor prefers server snowflake after send.
+       (should (equal (or (alist-get 'server-id message)
+                          (alist-get 'local-id message))
+                      snowflake))))))
 
 (ert-deftest qq-state-live-message-increments-unread-and-supports-recall ()
   (qq-test-with-reset
@@ -114,7 +121,7 @@
    (qq-state-merge-live-message
     '((post_type . "message")
       (message_type . "private")
-      (message_id . 123)
+      (message_id . "9007199254741004123")
       (user_id . 10001)
       (time . 1710000001)
       (sender . ((user_id . 10001)
@@ -124,7 +131,7 @@
                    (data . ((text . "hello"))))))))
    (let ((session (qq-state-session "private:10001")))
      (should (= (alist-get 'unread-count session) 1)))
-   (qq-state-apply-recall 123)
+   (qq-state-apply-recall "9007199254741004123")
    (let ((message (car (qq-state-session-messages "private:10001"))))
      (should (eq (alist-get 'status message) 'recalled))
      (should (equal (alist-get 'raw-message message) "[message recalled]")))))

@@ -382,6 +382,8 @@ When EMIT is non-nil, fire one session mutation event."
          (raw-message (or (alist-get 'raw_message message)
                           (qq-state-message-preview-from-segments segments)
                           ""))
+         ;; NapCat hard-cut: message_id is the NT snowflake string (never coerce
+         ;; with string-to-number — snowflakes exceed fixnum precision).
          (server-id (qq-state--normalize-id
                      (or (alist-get 'message_id message)
                          (alist-get 'id message))))
@@ -633,17 +635,21 @@ Return the merged local message object."
   session-key)
 
 (defun qq-state-mark-pending-message-sent (session-key local-id message-id)
-  "Mark local pending message LOCAL-ID as sent with MESSAGE-ID in SESSION-KEY."
+  "Mark local pending message LOCAL-ID as sent with MESSAGE-ID in SESSION-KEY.
+
+MESSAGE-ID is the NapCat NT snowflake string (`message_id' in the protocol
+hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor."
   (let* ((messages (copy-tree (or (gethash session-key qq-state--messages-by-session) '())))
          (existing (qq-state--find-message
                     messages
                     (lambda (it)
-                      (equal (alist-get 'local-id it) local-id)))))
-    (when existing
+                      (equal (alist-get 'local-id it) local-id))))
+         (normalized-id (qq-state--normalize-id message-id)))
+    (when (and existing normalized-id)
       (let ((updated (qq-state--merge-alists
                       existing
-                      `((id . ,(qq-state--normalize-id message-id))
-                        (server-id . ,(qq-state--normalize-id message-id))
+                      `((id . ,normalized-id)
+                        (server-id . ,normalized-id)
                         (status . sent)
                         (error . nil)))))
         (setq messages (qq-state--replace-message messages existing updated))
@@ -651,7 +657,11 @@ Return the merged local message object."
         (puthash session-key messages qq-state--messages-by-session)
         (qq-state--index-message updated)
         (qq-state--sync-session-summary session-key)
-        (qq-state--emit 'message :session-key session-key :message (copy-tree updated) :source 'response)
+        (qq-state--emit 'message
+                        :session-key session-key
+                        :message (copy-tree updated)
+                        :previous-anchor local-id
+                        :source 'response)
         updated))))
 
 (defun qq-state-mark-pending-message-failed (session-key local-id reason)

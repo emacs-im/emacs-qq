@@ -156,7 +156,10 @@ ERRBACK falls back to `qq-api--default-error'."
 
 Insert a local pending message immediately and update it after the response.
 RAW-MESSAGE, when non-nil, overrides the optimistic raw-message field used for
-local pending rendering."
+local pending rendering.
+
+The NapCat hard-cut returns `message_id' as the NT snowflake string; that value
+is stored as the message `server-id' and becomes the timeline anchor."
   (let* ((segments (copy-tree (or segments '())))
          (pending (qq-state-insert-pending-message session-key segments raw-message))
          (local-id (alist-get 'local-id pending))
@@ -186,10 +189,11 @@ When REPLY-TO-MESSAGE-ID is non-nil, send the text as a reply."
    text))
 
 (defun qq-api-delete-message (message-id)
-  "Recall MESSAGE-ID using NapCat and mark it recalled locally on success."
+  "Recall MESSAGE-ID (NT snowflake string) via NapCat and mark it recalled."
   (interactive)
   (qq-api-call
    "delete_msg"
+   ;; Always stringify: hard-cut snowflake ids must not be JSON numbers.
    `((message_id . ,(format "%s" message-id)))
    (lambda (_response)
      (qq-state-apply-recall message-id))))

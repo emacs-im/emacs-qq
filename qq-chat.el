@@ -324,9 +324,13 @@ available."
     (or (qq-state-message-preview message) "")))
 
 (defun qq-chat--message-anchor (message)
-  "Return stable anchor value for MESSAGE."
-  (or (alist-get 'local-id message)
-      (alist-get 'server-id message)
+  "Return stable anchor value for MESSAGE.
+
+Prefer the NapCat NT snowflake `server-id' (string) once known.  Pending
+optimistic rows still use `local-id' until send succeeds and the node is
+rekeyed (see `qq-chat--rekey-message-node-if-needed')."
+  (or (alist-get 'server-id message)
+      (alist-get 'local-id message)
       (alist-get 'id message)))
 
 (defun qq-chat--message-reply-id (message)
@@ -886,19 +890,72 @@ Return non-nil when a node is removed."
       (when-let* ((node (gethash anchor qq-chat--message-node-table)))
         (qq-chat--redisplay-node node)))))
 
+(defun qq-chat--rekey-message-node-if-needed (message)
+  "If MESSAGE was shown under local-id, rekey node/tables to server-id.
+
+Return the new anchor when a rekey happened, else nil.  Needed when NapCat
+returns the NT snowflake `message_id' after optimistic pending insert."
+  (let* ((local-id (alist-get 'local-id message))
+         (server-id (alist-get 'server-id message))
+         (node (and local-id
+                    server-id
+                    (not (equal local-id server-id))
+                    qq-chat--message-node-table
+                    (gethash local-id qq-chat--message-node-table))))
+    (when node
+      (remhash local-id qq-chat--message-node-table)
+      (puthash server-id node qq-chat--message-node-table)
+      (setq qq-chat--displayed-message-anchors
+            (mapcar (lambda (anchor)
+                      (if (equal anchor local-id) server-id anchor))
+                    (or qq-chat--displayed-message-anchors '())))
+      (when (and (hash-table-p qq-chat--render-context-by-anchor)
+                 (gethash local-id qq-chat--render-context-by-anchor))
+        (puthash server-id
+                 (gethash local-id qq-chat--render-context-by-anchor)
+                 qq-chat--render-context-by-anchor)
+        (remhash local-id qq-chat--render-context-by-anchor))
+      (when (hash-table-p qq-chat--media-anchors-by-key)
+        (maphash
+         (lambda (key anchors)
+           (puthash key
+                    (mapcar (lambda (anchor)
+                              (if (equal anchor local-id) server-id anchor))
+                            anchors)
+                    qq-chat--media-anchors-by-key))
+         qq-chat--media-anchors-by-key))
+      (setq qq-chat--deferred-node-anchors
+            (mapcar (lambda (anchor)
+                      (if (equal anchor local-id) server-id anchor))
+                    (or qq-chat--deferred-node-anchors '())))
+      server-id)))
+
 (defun qq-chat--apply-single-message-change-partially (anchor messages)
   "Apply one ANCHOR change against MESSAGES incrementally.
 
 Return non-nil when the persistent EWOC was patched successfully."
-  (let* ((current-anchors (or qq-chat--displayed-message-anchors '()))
+  (let* ((message-for-rekey
+          (seq-find (lambda (message)
+                      (or (equal (qq-chat--message-anchor message) anchor)
+                          (equal (alist-get 'local-id message) anchor)
+                          (equal (alist-get 'server-id message) anchor)))
+                    messages))
+         (_rekey (and message-for-rekey
+                      (when-let* ((rekeyed (qq-chat--rekey-message-node-if-needed
+                                            message-for-rekey)))
+                        (setq anchor rekeyed)
+                        rekeyed)))
+         (current-anchors (or qq-chat--displayed-message-anchors '()))
          (target-anchors (qq-chat--message-anchor-list messages))
          (present-before (member anchor current-anchors))
          (present-after (member anchor target-anchors))
          (affected-anchors (qq-chat--message-neighborhood-anchors
                             current-anchors target-anchors anchor))
-         (target-message (seq-find (lambda (message)
-                                     (equal (qq-chat--message-anchor message) anchor))
-                                   messages))
+         (target-message (or message-for-rekey
+                             (seq-find (lambda (message)
+                                         (equal (qq-chat--message-anchor message)
+                                                anchor))
+                                       messages)))
          (context-snapshot (qq-chat--copy-render-contexts-for-anchors
                             affected-anchors)))
     (when (and anchor
@@ -2011,10 +2068,12 @@ changes, and only update the composer frame for metadata changes."
              ((eq event-type 'message)
               (when (equal event-session-key qq-chat--session-key)
                 (qq-chat--header-line-update)
-                (unless (qq-chat--apply-single-message-change-partially
-                         (qq-chat--message-anchor event-message)
-                         (qq-state-session-messages qq-chat--session-key))
-                  (qq-chat-render))
+                (let* ((messages (qq-state-session-messages qq-chat--session-key))
+                       (anchor (or (qq-chat--message-anchor event-message)
+                                   (plist-get event :previous-anchor))))
+                  (unless (qq-chat--apply-single-message-change-partially
+                           anchor messages)
+                    (qq-chat-render)))
                 (when (and qq-auto-mark-read
                            (get-buffer-window buffer t))
                   (qq-chat-read-all))))

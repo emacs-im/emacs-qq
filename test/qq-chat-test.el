@@ -365,10 +365,11 @@
                  ((symbol-function 'qq-chat-render)
                   (lambda ()
                     (setq render-called t))))
-         (qq-chat--handle-state-change '(:type message
-                                         :session-key "private:10001"
-                                         :message ((server-id . "42"))))
-         (should (equal '("42") partial-calls))
+         (qq-chat--handle-state-change
+          '(:type message
+            :session-key "private:10001"
+            :message ((server-id . "9007199254741004645"))))
+         (should (equal '("9007199254741004645") partial-calls))
          (should-not render-called))))))
 
 (ert-deftest qq-chat-handle-state-change-falls-back-to-full-render-when-partial-fails ()
@@ -443,6 +444,50 @@
        (should (search-forward "first" nil t))
        (goto-char (point-min))
        (should-not (search-forward "No messages loaded yet." nil t))))))
+
+(ert-deftest qq-chat-pending-promote-rekeys-anchor-to-snowflake ()
+  "Optimistic local-id row is rekeyed to NT snowflake after send."
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice")
+      (target-id . "10001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (let* ((local-id "local-9")
+            (snowflake "9007199254741004645")
+            (pending `(((local-id . ,local-id)
+                        (self-p . t)
+                        (status . pending)
+                        (sender-id . "90001")
+                        (sender-name . "Me")
+                        (time . 100)
+                        (raw-message . "hi")
+                        (preview . "hi"))))
+            (sent `(((local-id . ,local-id)
+                     (server-id . ,snowflake)
+                     (id . ,snowflake)
+                     (self-p . t)
+                     (status . sent)
+                     (sender-id . "90001")
+                     (sender-name . "Me")
+                     (time . 100)
+                     (raw-message . "hi")
+                     (preview . "hi")))))
+       (puthash "private:10001" pending qq-state--messages-by-session)
+       (should (qq-chat--apply-single-message-change-partially local-id pending))
+       (should (gethash local-id qq-chat--message-node-table))
+       (should (equal qq-chat--displayed-message-anchors (list local-id)))
+       (puthash "private:10001" sent qq-state--messages-by-session)
+       (should (qq-chat--apply-single-message-change-partially snowflake sent))
+       (should-not (gethash local-id qq-chat--message-node-table))
+       (should (gethash snowflake qq-chat--message-node-table))
+       (should (equal qq-chat--displayed-message-anchors (list snowflake)))
+       (goto-char (point-min))
+       (should (search-forward "hi" nil t))))))
 
 (ert-deftest qq-chat-partial-message-delete-restores-empty-timeline-placeholder ()
   (qq-chat-test-with-reset
