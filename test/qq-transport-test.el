@@ -43,6 +43,19 @@
           (qq-transport--request-timeout echo "emacs_get_forward")
           (should (equal failure "emacs_get_forward request timed out")))))))
 
+(ert-deftest qq-transport-cancel-forgets-callback-ownership ()
+  (qq-transport-test-with-state
+    (let ((calls 0))
+      (cl-letf (((symbol-function 'websocket-openp) (lambda (_) t))
+                ((symbol-function 'websocket-send-text) #'ignore))
+        (let ((echo (qq-transport-send
+                     "get_status" nil (lambda (_) (cl-incf calls)))))
+          (should (qq-transport-cancel echo))
+          (qq-transport--dispatch-response
+           `((echo . ,echo) (status . "ok") (retcode . 0)))
+          (should (= calls 0))
+          (should-not (qq-transport-cancel echo)))))))
+
 (ert-deftest qq-transport-fail-pending-isolates-callback-errors ()
   (qq-transport-test-with-state
     (let (second-called)

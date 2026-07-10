@@ -150,6 +150,17 @@ completed, and nil for stale responses or timers."
        (plist-get entry :error) response reason))
     t))
 
+(defun qq-transport-cancel (echo)
+  "Forget pending request ECHO without invoking either callback.
+
+NapCat cannot cancel an action already executing, but removing its callback
+matches telega's request-token cancellation: any later response is stale and
+is ignored."
+  (when-let* ((entry (gethash echo qq-transport--pending)))
+    (remhash echo qq-transport--pending)
+    (qq-transport--cancel-entry-timer entry)
+    t))
+
 (defun qq-transport--request-timeout (echo action)
   "Fail pending ECHO for ACTION after its local timeout."
   (qq-transport--complete

@@ -134,8 +134,11 @@ Non-nil means we currently advertise typing via `set_input_status'.")
 Keys are `:loading' (`older' or `newer'), `:older-loaded', `:newer-loaded',
 `:newer-freezed', and `:gap-after-id'.")
 
-(defvar-local qq-chat--initial-history-generation 0
-  "Generation token for rejecting stale initial-history callbacks.")
+(defvar-local qq-chat--initial-history-owner nil
+  "Opaque owner token for the active initial-history request chain.")
+
+(defvar-local qq-chat--initial-history-request nil
+  "Transport request token currently owned by initial-history loading.")
 
 (defun qq-chat--reset-history-state ()
   "Reset current buffer history paging state."
@@ -3458,51 +3461,65 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (qq-chat--update-context-mode))
 
 (defun qq-chat--initial-history-request-current-p
-    (buffer session-key generation)
-  "Return non-nil when GENERATION still owns BUFFER and SESSION-KEY."
+    (buffer session-key owner)
+  "Return non-nil when OWNER still owns BUFFER and SESSION-KEY."
   (and (buffer-live-p buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-chat-mode)
               (equal qq-chat--session-key session-key)
-              (= qq-chat--initial-history-generation generation)))))
+              (eq qq-chat--initial-history-owner owner)))))
 
 (defun qq-chat--complete-initial-history-load
-    (buffer session-key generation &optional target meta)
+    (buffer session-key owner &optional target meta)
   "Finish initial history load for BUFFER and SESSION-KEY.
 
 When TARGET is non-nil, META describes an around window centered at the exact
 first unread message."
   (when (qq-chat--initial-history-request-current-p
-         buffer session-key generation)
+         buffer session-key owner)
     (with-current-buffer buffer
+      (setq qq-chat--initial-history-owner nil
+            qq-chat--initial-history-request nil)
       (when (and target meta)
         (qq-chat--note-history-window meta)
         (qq-chat--goto-loaded-message target nil))
       (when qq-auto-mark-read
         (qq-api-mark-session-read session-key)))))
 
-(defun qq-chat--load-latest-initial-history (buffer session-key generation)
+(defun qq-chat--load-latest-initial-history (buffer session-key owner)
   "Load latest history for BUFFER, then complete read handling."
-  (qq-api-fetch-history
-   session-key nil
-   (lambda (_meta)
-     (qq-chat--complete-initial-history-load buffer session-key generation))
-   (lambda (response reason)
-     (when (qq-chat--initial-history-request-current-p
-            buffer session-key generation)
-       (qq-chat--complete-initial-history-load buffer session-key generation)
-       (qq-api--default-error response reason)))))
+  (let ((request
+         (qq-api-fetch-history
+          session-key nil
+          (lambda (_meta)
+            (qq-chat--complete-initial-history-load
+             buffer session-key owner))
+          (lambda (response reason)
+            (when (qq-chat--initial-history-request-current-p
+                   buffer session-key owner)
+              (qq-chat--complete-initial-history-load
+               buffer session-key owner)
+              (qq-api--default-error response reason))))))
+    (when (qq-chat--initial-history-request-current-p
+           buffer session-key owner)
+      (with-current-buffer buffer
+        (setq qq-chat--initial-history-request request)))
+    request))
 
 (defun qq-chat--load-initial-history (buffer session-key)
   "Load SESSION-KEY around its official QQ read position when available."
-  (let ((generation
-         (with-current-buffer buffer
-           (cl-incf qq-chat--initial-history-generation))))
-    (qq-api-fetch-session-read-state
-     session-key
-     (lambda (read-state)
-       (when (qq-chat--initial-history-request-current-p
-              buffer session-key generation)
+  (let ((owner (list 'initial-history session-key)))
+    (with-current-buffer buffer
+      (when qq-chat--initial-history-request
+        (qq-api-cancel-request qq-chat--initial-history-request))
+      (setq qq-chat--initial-history-owner owner
+            qq-chat--initial-history-request nil))
+    (let ((request
+           (qq-api-fetch-session-read-state
+            session-key
+            (lambda (read-state)
+              (when (qq-chat--initial-history-request-current-p
+                     buffer session-key owner)
          (let ((unread (or (alist-get 'unread_count read-state) 0))
                (first-id (alist-get 'first_unread_message_id read-state))
                (available
@@ -3513,19 +3530,24 @@ first unread message."
                 session-key first-id
                 (lambda (meta)
                   (qq-chat--complete-initial-history-load
-                   buffer session-key generation first-id meta))
+                   buffer session-key owner first-id meta))
                 (lambda (_response _reason)
                   (qq-chat--load-latest-initial-history
-                   buffer session-key generation))
+                   buffer session-key owner))
                 (max qq-history-fetch-count (* 2 qq-history-fetch-count)))
              (qq-chat--load-latest-initial-history
-              buffer session-key generation)))))
-     (lambda (_response _reason)
-       ;; Backward-compatible path for a stock/older NapCat without read state.
-       (when (qq-chat--initial-history-request-current-p
-              buffer session-key generation)
-         (qq-chat--load-latest-initial-history
-          buffer session-key generation))))))
+              buffer session-key owner)))))
+            (lambda (_response _reason)
+              ;; Backward-compatible path for an older NapCat without read state.
+              (when (qq-chat--initial-history-request-current-p
+                     buffer session-key owner)
+                (qq-chat--load-latest-initial-history
+                 buffer session-key owner))))))
+      (when (qq-chat--initial-history-request-current-p
+             buffer session-key owner)
+        (with-current-buffer buffer
+          (setq qq-chat--initial-history-request request)))
+      request)))
 
 (defun qq-chat-open (session-key)
   "Open chat for SESSION-KEY."

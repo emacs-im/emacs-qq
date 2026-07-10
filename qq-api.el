@@ -40,6 +40,10 @@
 ERRBACK falls back to `qq-api--default-error'."
   (qq-transport-send action params callback (or errback #'qq-api--default-error)))
 
+(defun qq-api-cancel-request (request-token)
+  "Cancel local callback ownership for REQUEST-TOKEN."
+  (and request-token (qq-transport-cancel request-token)))
+
 (defun qq-api-message-id-p (value)
   "Return non-nil when VALUE is a canonical NT message snowflake.
 
