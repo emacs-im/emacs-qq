@@ -15,6 +15,8 @@
 (require 'qq-state)
 (require 'qq-transport)
 
+(declare-function qq-transport-cancel "qq-transport" (echo))
+
 (defvar qq-api--read-operations (make-hash-table :test #'equal)
   "In-flight optimistic read operations keyed by session key.")
 

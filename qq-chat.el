@@ -42,6 +42,7 @@
 (declare-function qq-api-send-forward-bundle
                   "qq-api" (source-session-key target-session-key message-ids
                                                 callback &optional errback))
+(declare-function qq-api-cancel-request "qq-api" (request-token))
 
 (defvar-local qq-chat--session-key nil
   "Session key associated with the current chat buffer.")
