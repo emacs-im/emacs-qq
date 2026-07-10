@@ -20,6 +20,7 @@
 (require 'qq-api)
 (require 'qq-customize)
 (require 'qq-media)
+(require 'qq-protocol)
 (require 'qq-state)
 (require 'qq-ui)
 (require 'qq-view)
@@ -3484,7 +3485,9 @@ first unread message."
    (lambda (read-state)
      (let ((unread (or (alist-get 'unread_count read-state) 0))
            (first-id (alist-get 'first_unread_message_id read-state))
-           (available (alist-get 'position_available read-state)))
+           (available
+            (qq-protocol-json-true-p
+             (alist-get 'position_available read-state))))
        (if (and (> unread 0) available first-id)
            (qq-api-fetch-history-around
             session-key first-id

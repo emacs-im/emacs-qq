@@ -128,7 +128,7 @@
                  (setq sent-segments segments)
                  (setq sent-raw raw-message)
                  'sent)))
-      (qq-api-send-text "private:10001" "hello" 42)
+      (qq-api-send-text "private:10001" "hello" "42")
       (should (equal sent-session "private:10001"))
       (should (equal sent-raw "hello"))
       (should (equal sent-segments
@@ -271,10 +271,11 @@
                  (setq captured-params params)
                  (funcall callback '((status . "ok")))
                  'sent)))
-      (qq-api-delete-message 77)
+      (qq-api-delete-message "77")
       (should (equal captured-action "delete_msg"))
       (should (equal (alist-get 'message_id captured-params) "77"))
-      (should (equal recalled-id 77)))))
+      (should (equal recalled-id "77"))
+      (should-error (qq-api-delete-message 77) :type 'user-error))))
 
 (ert-deftest qq-api-native-get-forward-sends-explicit-source-union ()
   (let* ((messages

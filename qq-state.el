@@ -12,6 +12,7 @@
 (require 'seq)
 (require 'subr-x)
 (require 'qq-customize)
+(require 'qq-protocol)
 
 (defvar qq-state-change-hook nil
   "Hook called with one event plist argument after state mutations.
@@ -672,9 +673,11 @@ in the UI — that is wire format, not display text."
                             "")))
          ;; NapCat hard-cut: message_id is the NT snowflake string (never coerce
          ;; with string-to-number — snowflakes exceed fixnum precision).
-         (server-id (qq-state--normalize-id
-                     (or (alist-get 'message_id message)
-                         (alist-get 'id message))))
+         (server-id
+          (qq-protocol-optional-message-id
+           (or (alist-get 'message_id message)
+               (alist-get 'id message))
+           "message event"))
          (self-p (qq-state--message-self-p message))
          (status (cond
                   (recalled-p 'recalled)
@@ -1023,7 +1026,8 @@ hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor."
                     messages
                     (lambda (it)
                       (equal (alist-get 'local-id it) local-id))))
-         (normalized-id (qq-state--normalize-id message-id)))
+         (normalized-id
+          (qq-protocol-optional-message-id message-id "send_msg response")))
     (when (and existing normalized-id)
       (let ((updated (qq-state--merge-alists
                       existing
@@ -1096,14 +1100,19 @@ coerced to an Emacs number."
          (count (max 0 (if (numberp raw-count)
                            (truncate raw-count)
                          (string-to-number (format "%s" (or raw-count 0))))))
-         (first-id (qq-state--normalize-id
-                    (alist-get 'first_unread_message_id read-state)))
+         (first-id
+          (qq-protocol-optional-message-id
+           (alist-get 'first_unread_message_id read-state)
+           "read state"))
          (first-seq (qq-state--normalize-id
                      (alist-get 'first_unread_message_seq read-state)))
-         (latest-id (qq-state--normalize-id
-                     (alist-get 'latest_message_id read-state)))
+         (latest-id
+          (qq-protocol-optional-message-id
+           (alist-get 'latest_message_id read-state)
+           "read state"))
          (available (and (> count 0)
-                         (alist-get 'position_available read-state)
+                         (qq-protocol-json-true-p
+                          (alist-get 'position_available read-state))
                          first-id)))
     (qq-state-upsert-session
      session-key
@@ -1158,13 +1167,6 @@ Keeps the row so the chat view can hide it (default) or show a stub when
         (and (qq-state--dataline-chat-type-p chat-type) "我的手机")
         (qq-state--default-session-title (qq-state--session-template session-key))
         (qq-state-session-key-target-id session-key))))
-
-(defun qq-state--json-true-p (value)
-  "Return non-nil when JSON VALUE represents true."
-  (or (eq value t)
-      (and (numberp value) (not (zerop value)))
-      (and (stringp value)
-           (member (downcase value) '("true" "1" "yes")))))
 
 (defun qq-state-apply-recent-contacts (contacts)
   "Apply recent CONTACTS snapshot to local session store."
@@ -1222,7 +1224,7 @@ Keeps the row so the chat view can hide it (default) or show a stub when
          ,@(when unread-entry
              `((unread-count . ,unread-count)))
          ,@(when disturb-entry
-             `((muted-p . ,(and (qq-state--json-true-p (cdr disturb-entry)) t))))
+             `((muted-p . ,(and (qq-protocol-json-true-p (cdr disturb-entry)) t))))
          ,@(when notify-mode-entry
              `((message-notify-mode . ,(intern (format "%s" (cdr notify-mode-entry)))))))
        nil)

@@ -11,6 +11,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'qq-customize)
+(require 'qq-protocol)
 (require 'qq-state)
 (require 'qq-transport)
 
@@ -40,8 +41,7 @@ The hard-cut protocol represents `message_id' as an original, non-empty
 decimal string.  In particular, a number is never accepted and reformatted:
 by the time Emacs or JavaScript has represented a snowflake numerically its
 low bits may already have been lost."
-  (and (stringp value)
-       (string-match-p "\\`[0-9]+\\'" value)))
+  (qq-protocol-message-id-p value))
 
 (defun qq-api-non-empty-string-p (value)
   "Return non-nil when VALUE is a non-empty string."
@@ -775,9 +775,11 @@ cursor.  Use `qq-api-fetch-history-page' for newer gap filling."
 
 CALLBACK receives the raw OneBot message alist (response `data').
 Used by chatbuf jump (telega `telega-msg-get') as a fallback after seek."
+  (setq message-id
+        (qq-api-validate-message-id message-id "get_msg"))
   (qq-api-call
    "get_msg"
-   `((message_id . ,(format "%s" message-id)))
+   `((message_id . ,message-id))
    (lambda (response)
      (when callback
        (funcall callback (qq-api--response-data response))))
@@ -959,12 +961,14 @@ Used by chatbuf jump (telega `telega-msg-get') as a fallback after seek."
      callback errback)))
 (defun qq-api--history-around-params (session-key message-id count)
   "Build `get_msg_history_around' params for SESSION-KEY centered on MESSAGE-ID."
+  (setq message-id
+        (qq-api-validate-message-id message-id "get_msg_history_around"))
   (let* ((session (qq-state-session session-key))
          (type (or (alist-get 'type session)
                    (qq-state-session-key-type session-key)))
          (target-id (or (alist-get 'target-id session)
                         (qq-state-session-key-target-id session-key)))
-         (params `((message_id . ,(format "%s" message-id))
+         (params `((message_id . ,message-id)
                    (count . ,(max 1 count)))))
     (pcase type
       ('group
@@ -1037,8 +1041,10 @@ session is still at zero."
   "Return send_msg segment list for TEXT and optional REPLY-TO-MESSAGE-ID."
   (append
    (when reply-to-message-id
+     (setq reply-to-message-id
+           (qq-api-validate-message-id reply-to-message-id "reply segment"))
      `(((type . "reply")
-        (data . ((id . ,(format "%s" reply-to-message-id)))))))
+        (data . ((id . ,reply-to-message-id))))))
    `(((type . "text")
       (data . ((text . ,text)))))))
 
@@ -1082,10 +1088,11 @@ When REPLY-TO-MESSAGE-ID is non-nil, send the text as a reply."
 (defun qq-api-delete-message (message-id)
   "Recall MESSAGE-ID (NT snowflake string) via NapCat and mark it recalled."
   (interactive)
+  (setq message-id
+        (qq-api-validate-message-id message-id "delete_msg"))
   (qq-api-call
    "delete_msg"
-   ;; Always stringify: hard-cut snowflake ids must not be JSON numbers.
-   `((message_id . ,(format "%s" message-id)))
+   `((message_id . ,message-id))
    (lambda (_response)
      (qq-state-apply-recall message-id))))
 

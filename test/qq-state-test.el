@@ -155,6 +155,33 @@
                     (alist-get 'first-unread-message-id session)))
      (should (eq t (alist-get 'read-position-available session))))))
 
+(ert-deftest qq-state-read-position-rejects-decoded-json-false ()
+  (qq-test-with-reset
+   (qq-state-upsert-session "group:20001" nil nil)
+   (qq-state-apply-session-read-state
+    "group:20001"
+    '((unread_count . 5)
+      (first_unread_message_seq . "30001")
+      (first_unread_message_id . "9007199254742007089")
+      (position_available . :false)))
+   (let ((session (qq-state-session "group:20001")))
+     (should-not (alist-get 'first-unread-message-id session))
+     (should-not (alist-get 'first-unread-message-seq session))
+     (should-not (alist-get 'read-position-available session)))))
+
+(ert-deftest qq-state-rejects-numeric-message-id-from-wire ()
+  (qq-test-with-reset
+   (should-error
+    (qq-state-merge-live-message
+     '((post_type . "message")
+       (message_type . "group")
+       (message_id . 9007199254742007089)
+       (group_id . "20001")
+       (user_id . "10001")
+       (time . 1710000001)
+       (sender . ((user_id . "10001") (nickname . "Alice")))
+       (message . (((type . "text") (data . ((text . "hello")))))))))))
+
 (ert-deftest qq-state-apply-recent-contacts-creates-service-session ()
   (qq-test-with-reset
    (qq-state-apply-recent-contacts
@@ -359,7 +386,7 @@
       (peer_uid . "device-1")
       (peer_uin . "0")
       (peer_name . "我的手机")
-      (message_id . 123)
+      (message_id . "123")
       (user_id . 0)
       (time . 1710000001)
       (sender . ((user_id . 0)
@@ -425,7 +452,7 @@
    (qq-state-merge-live-message
     '((post_type . "message")
       (message_type . "group")
-      (message_id . 123)
+      (message_id . "123")
       (group_id . 20001)
       (user_id . 10001)
       (time . 1710000001)
@@ -444,7 +471,7 @@
    (qq-state-merge-live-message
     '((post_type . "message")
       (message_type . "group")
-      (message_id . 123)
+      (message_id . "123")
       (group_id . 20001)
       (user_id . 10001)
       (time . 1710000001)
@@ -469,7 +496,7 @@
    (qq-state-merge-live-message
     '((post_type . "message")
       (message_type . "private")
-      (message_id . 123)
+      (message_id . "123")
       (user_id . 10001)
       (time . 1710000001)
       (sender . ((user_id . 10001)
