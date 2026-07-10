@@ -1545,6 +1545,29 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
           (button-activate (button-at (1- (point))))
           (should (equal opened-url "https://mail.qq.com/example")))))))
 
+(ert-deftest qq-chat-renders-normalized-ark-card-segment ()
+  (let ((segment '((type . "card")
+                   (data . ((kind . "share")
+                            (source . "豆包")
+                            (title . "和豆包的对话")
+                            (content . "点击查看对话内容")
+                            (url . "https://example.com/thread")))))
+        opened-url)
+    (with-temp-buffer
+      (let ((inhibit-read-only t))
+        (cl-letf (((symbol-function 'browse-url)
+                   (lambda (url &optional _new-window)
+                     (setq opened-url url))))
+          (qq-chat--insert-card-segment segment nil nil)
+          (should (string-match-p "Share · 豆包" (buffer-string)))
+          (should (string-match-p "和豆包的对话" (buffer-string)))
+          (should (string-match-p "点击查看对话内容" (buffer-string)))
+          (should-not (string-match-p "com.tencent.tuwen.lua" (buffer-string)))
+          (goto-char (point-min))
+          (search-forward "Open")
+          (button-activate (button-at (1- (point))))
+          (should (equal opened-url "https://example.com/thread")))))))
+
 (provide (quote qq-chat-test))
 
 ;;; qq-chat-test.el ends here

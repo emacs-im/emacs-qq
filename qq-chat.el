@@ -313,7 +313,9 @@ available."
         found)
     (while (and segments (not found))
       (let ((segment (car segments)))
-        (when (qq-chat--media-segment-p segment)
+        (when (or (qq-chat--mail-segment-p segment)
+                  (qq-chat--card-segment-p segment)
+                  (qq-chat--media-segment-p segment))
           (setq found t))
         (setq segments (cdr segments))))
     found))
@@ -2119,6 +2121,10 @@ base emoji), never as OneBot CQ text."
   "Return non-nil when SEGMENT is a structured QQ Mail notification."
   (equal (alist-get 'type segment) "mail"))
 
+(defun qq-chat--card-segment-p (segment)
+  "Return non-nil when SEGMENT is a normalized Ark rich card."
+  (equal (alist-get 'type segment) "card"))
+
 (defun qq-chat--insert-mail-segment (segment prefix-state properties)
   "Insert structured QQ Mail SEGMENT as a compact card."
   (let* ((data (alist-get 'data segment))
@@ -2151,6 +2157,56 @@ base emoji), never as OneBot CQ text."
          (format "[%s]" detail)
          (lambda () (browse-url url t))
          :help-echo "Open this message in QQ Mail")
+        (insert "\n")
+        (qq-ui-apply-line-prefix start (point) card-prefix-state)
+        (add-text-properties start (point) properties)))))
+
+(defun qq-chat--card-kind-label (kind)
+  "Return a short display label for normalized card KIND."
+  (pcase kind
+    ("miniapp" "Mini App")
+    ("share" "Share")
+    ("forward" "Chat History")
+    ("forum" "Channel Post")
+    ("announcement" "Group Announcement")
+    ("contact" "Contact")
+    (_ "Card")))
+
+(defun qq-chat--insert-card-segment (segment prefix-state properties)
+  "Insert normalized Ark rich-card SEGMENT."
+  (let* ((data (alist-get 'data segment))
+         (kind (alist-get 'kind data))
+         (label (qq-chat--card-kind-label kind))
+         (title (qq-chat--present-string (alist-get 'title data)))
+         (content (qq-chat--present-string (alist-get 'content data)))
+         (prompt (qq-chat--present-string (alist-get 'prompt data)))
+         (source (qq-chat--present-string (alist-get 'source data)))
+         (summary (qq-chat--present-string (alist-get 'summary data)))
+         (url (qq-chat--present-string (alist-get 'url data)))
+         (body (or content
+                   (and (not title) prompt)))
+         (qq-ui-card-indent-prefix-state prefix-state)
+         (card-prefix-state (qq-ui-card-prefix-state)))
+    (qq-ui-insert-prefixed-lines
+     card-prefix-state
+     (if source (format "%s · %s" label source) label)
+     :face 'bold
+     :properties properties)
+    (when title
+      (qq-ui-insert-prefixed-lines
+       card-prefix-state title :properties properties))
+    (when body
+      (qq-ui-insert-prefixed-lines
+       card-prefix-state body :face 'shadow :properties properties))
+    (when (and summary (not (equal summary body)))
+      (qq-ui-insert-prefixed-lines
+       card-prefix-state summary :face 'shadow :properties properties))
+    (when url
+      (let ((start (point)))
+        (qq-ui-insert-action-button
+         "[Open]"
+         (lambda () (browse-url url t))
+         :help-echo (format "Open this %s" (downcase label)))
         (insert "\n")
         (qq-ui-apply-line-prefix start (point) card-prefix-state)
         (add-text-properties start (point) properties)))))
@@ -2325,6 +2381,9 @@ Keep this short — size is useful; internal sub_type / emoji ids are not."
                ((qq-chat--mail-segment-p segment)
                 (flush-inline)
                 (qq-chat--insert-mail-segment segment prefix-state properties))
+               ((qq-chat--card-segment-p segment)
+                (flush-inline)
+                (qq-chat--insert-card-segment segment prefix-state properties))
                ((qq-chat--media-segment-p segment)
                 (flush-inline)
                 (qq-chat--insert-segment-media-line segment prefix-state properties))
@@ -2383,6 +2442,11 @@ on the first inline line when the body is pure inline content."
                 (flush-inline nil)
                 (setq saw-block t)
                 (qq-chat--insert-mail-segment
+                 segment prefix-state properties))
+               ((qq-chat--card-segment-p segment)
+                (flush-inline nil)
+                (setq saw-block t)
+                (qq-chat--insert-card-segment
                  segment prefix-state properties))
                ((qq-chat--media-segment-p segment)
                 (flush-inline nil)

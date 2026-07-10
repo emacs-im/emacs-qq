@@ -434,6 +434,11 @@ reply chrome elsewhere).  Media becomes short placeholders like
                                          (alist-get 'subject data))))))
                  (and parts (string-join parts ": ")))
                "[mail]"))
+          ("card"
+           (or (qq-state--present-string (alist-get 'prompt data))
+               (qq-state--present-string (alist-get 'title data))
+               (qq-state--present-string (alist-get 'content data))
+               "[card]"))
           ("json" "[card]")
           ("xml" "[xml]")
           ("poke" "[poke]")

@@ -301,6 +301,16 @@
                  (prompt . "Henrik Lissner: Re: Doom Emacs"))))))
     "Henrik Lissner: Re: Doom Emacs")))
 
+(ert-deftest qq-state-card-segment-preview-prefers-protocol-prompt ()
+  (should
+   (equal
+    (qq-state-message-preview-from-segments
+     '(((type . "card")
+        (data . ((kind . "share")
+                 (title . "Article")
+                 (prompt . "[分享]Article"))))))
+    "[分享]Article")))
+
 (ert-deftest qq-state-live-message-ignores-empty-group-card-when-choosing-sender-name ()
   (qq-test-with-reset
    (qq-state-merge-live-message
