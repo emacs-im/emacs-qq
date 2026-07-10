@@ -26,8 +26,26 @@ Development with Eask:
 
 - `eask install-deps`
 - `eask recompile`
-- `eask test ert test/*-test.el`
+- `eask run script test`
+- `eask run script test-local` — force-refresh the sibling `disco.el`
+  snapshot, then run the tests
 - `eask exec emacs -Q -L . -l qq.el`
+
+`(depends-on "disco" :file "../disco.el")` is a package snapshot: a normal
+`eask install-deps` skips it after the first install.  After changing disco,
+use `eask run script refresh-disco` or `test-local`; both reinstall only disco
+and regenerate its bytecode, avoiding stale source and `.elc` caches.
+
+For live two-repository development, Eask can instead link the source package:
+
+```sh
+eask link add disco ../disco.el
+```
+
+The linked repository's `.elc` files are used by Emacs, so run
+`eask recompile` from `../disco.el` after changing disco.  Use
+`eask link list` to inspect active links and `eask link delete disco-0.1.0` to
+return to snapshot installs.
 
 Architecture notes:
 
