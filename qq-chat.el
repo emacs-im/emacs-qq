@@ -778,6 +778,36 @@ Recalled messages are hidden unless `qq-chat-show-recalled-messages' is set
    (append (qq-chat--neighbor-anchors-in-sequence current-anchors anchor)
            (qq-chat--neighbor-anchors-in-sequence target-anchors anchor))))
 
+(defun qq-chat--reply-dependent-anchors (messages message-id)
+  "Return anchors of MESSAGES whose reply preview depends on MESSAGE-ID.
+
+This mirrors telega's replied-message dependency redisplay and
+`disco-room--reply-dependent-message-ids': changing or loading the source
+message must also redisplay rows that quote it."
+  (when message-id
+    (let ((target (format "%s" message-id))
+          dependent-anchors)
+      (dolist (message messages)
+        (when (equal (qq-chat--message-reply-id message) target)
+          (when-let* ((anchor (qq-chat--message-anchor message)))
+            (push anchor dependent-anchors))))
+      (nreverse dependent-anchors))))
+
+(defun qq-chat--message-affects-composer-context-p (message-id)
+  "Return non-nil when MESSAGE-ID is the active composer reply target."
+  (when-let* ((composer-id (disco-chatbuf-aux-message-id)))
+    (equal (format "%s" message-id) (format "%s" composer-id))))
+
+(defun qq-chat--refresh-composer-context-for-message (message-id)
+  "Refresh active reply composer context after MESSAGE-ID changes.
+
+Like telega's updateMessageEdited aux handling, replace the cached aux message
+with the latest state object before redisplaying the footer."
+  (when (qq-chat--message-affects-composer-context-p message-id)
+    (when-let* ((message (qq-chat--message-by-server-id message-id)))
+      (plist-put disco-chatbuf--aux-plist :aux-msg message))
+    (qq-chat--apply-frame-update)))
+
 (defun qq-chat--current-first-unread-context-anchor ()
   "Return the anchor currently marked `:insert-unread' in render contexts."
   (when (hash-table-p qq-chat--render-context-by-anchor)
@@ -957,7 +987,9 @@ Return non-nil when a node is removed."
                                                (copy-sequence target-anchors))))
          (context-snapshot (qq-chat--copy-render-contexts-for-anchors context-anchors))
          (target-set (make-hash-table :test #'equal))
-         touched-anchors)
+         touched-anchors
+         removed-anchors
+         reply-dependent-anchors)
     (when target-anchors
       (qq-chat--clear-empty-node))
     (dolist (anchor target-anchors)
@@ -967,6 +999,7 @@ Return non-nil when a node is removed."
       (setq current-anchors '()))
     (dolist (anchor current-anchors)
       (unless (gethash anchor target-set)
+        (push anchor removed-anchors)
         (qq-chat--delete-message-node anchor)))
     (cl-loop for message in messages
              for index from 0 do
@@ -986,6 +1019,15 @@ Return non-nil when a node is removed."
                                  when later-node return later-node)))
                    (push anchor touched-anchors)
                    (qq-chat--insert-message-node-before message before-node)))))
+    ;; Telega redisplays a reply row when its asynchronously fetched source
+    ;; becomes available.  History reconcile is the equivalent path here:
+    ;; new/updated/removed source rows invalidate the quoting rows as well.
+    (dolist (source-anchor (delete-dups
+                            (append (copy-sequence touched-anchors)
+                                    (copy-sequence removed-anchors))))
+      (setq reply-dependent-anchors
+            (nconc (qq-chat--reply-dependent-anchors messages source-anchor)
+                   reply-dependent-anchors)))
     (setq qq-chat--displayed-message-anchors target-anchors)
     (qq-chat--rebuild-render-contexts messages)
     (qq-chat--rebuild-media-anchor-index messages)
@@ -995,6 +1037,7 @@ Return non-nil when a node is removed."
     (dolist (anchor
              (delete-dups
               (append touched-anchors
+                      reply-dependent-anchors
                       (qq-chat--changed-render-context-anchors
                        target-anchors context-snapshot))))
       (when-let* ((node (gethash anchor qq-chat--message-node-table)))
@@ -1059,6 +1102,10 @@ Return non-nil when the persistent EWOC was patched successfully."
          (target-anchors (qq-chat--message-anchor-list messages))
          (present-before (member anchor current-anchors))
          (present-after (member anchor target-anchors))
+         (reply-dependent-anchors
+          (qq-chat--reply-dependent-anchors messages anchor))
+         (composer-context-affected-p
+          (qq-chat--message-affects-composer-context-p anchor))
          (affected-anchors
           (delete-dups
            (delq nil
@@ -1101,6 +1148,8 @@ Return non-nil when the persistent EWOC was patched successfully."
          (setq qq-chat--displayed-message-anchors target-anchors)
          (qq-chat--recompute-render-contexts-for-anchors messages affected-anchors)
          (qq-chat--rebuild-media-anchor-index messages)
+         (when composer-context-affected-p
+           (qq-chat--refresh-composer-context-for-message anchor))
          (if target-anchors
              (qq-chat--clear-empty-node)
            (qq-chat--ensure-empty-node))
@@ -1108,6 +1157,7 @@ Return non-nil when the persistent EWOC was patched successfully."
                   (delete-dups
                    (append
                     (and present-after (list anchor))
+                    reply-dependent-anchors
                     (qq-chat--changed-render-context-anchors
                      affected-anchors context-snapshot)
                     (list (qq-chat--current-first-unread-context-anchor)))))

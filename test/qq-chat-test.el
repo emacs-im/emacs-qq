@@ -589,6 +589,141 @@
        (goto-char (point-min))
        (should-not (search-forward "No messages loaded yet." nil t))))))
 
+(ert-deftest qq-chat-source-update-redisplays-reply-dependent-and-composer ()
+  "Updating a source message refreshes its reply rows and active aux."
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice")
+      (target-id . "10001"))
+    nil)
+   (let* ((source-old
+           '((server-id . "m1")
+             (sender-id . "10001")
+             (sender-name . "Alice")
+             (time . 100)
+             (segments . (((type . "text")
+                           (data . ((text . "old body"))))))))
+          (source-new
+           '((server-id . "m1")
+             (sender-id . "10001")
+             (sender-name . "Alice")
+             (time . 100)
+             (segments . (((type . "text")
+                           (data . ((text . "new body"))))))))
+          (reply
+           '((server-id . "m2")
+             (sender-id . "10002")
+             (sender-name . "Bob")
+             (time . 200)
+             (segments . (((type . "reply")
+                           (data . ((id . "m1"))))
+                          ((type . "text")
+                           (data . ((text . "answer"))))))))
+          (initial (list source-old reply))
+          (updated (list source-new reply)))
+     (puthash "private:10001" initial qq-state--messages-by-session)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "private:10001")
+       (qq-chat-render)
+       (qq-chat--set-reply-message source-old)
+       (qq-chat--set-draft "draft stays")
+       (qq-chat--chat-update 'footer)
+       (puthash "private:10001" updated qq-state--messages-by-session)
+       (let ((redisplay-original (symbol-function 'qq-chat--redisplay-node))
+             redisplayed)
+         (cl-letf (((symbol-function 'qq-chat--redisplay-node)
+                    (lambda (node)
+                      (push (qq-chat--message-anchor (ewoc--node-data node))
+                            redisplayed)
+                      (funcall redisplay-original node))))
+           (should (qq-chat--apply-single-message-change-partially
+                    "m1" (qq-chat--timeline-messages updated))))
+         (should (member "m1" redisplayed))
+         (should (member "m2" redisplayed)))
+       (should (equal "new body"
+                      (qq-state-message-preview (qq-chat--reply-message))))
+       (should (equal "draft stays" (qq-chat--current-draft-string)))
+       (goto-char (point-min))
+       (should (search-forward "↪ Alice: new body" nil t))))))
+
+(ert-deftest qq-chat-source-recall-redisplays-reply-dependent ()
+  "Hidden recalled source still refreshes the row that quotes it."
+  (qq-chat-test-with-reset
+   (let ((qq-chat-show-recalled-messages nil)
+         (source
+          '((server-id . "m1")
+            (sender-id . "10001")
+            (sender-name . "Alice")
+            (time . 100)
+            (segments . (((type . "text")
+                          (data . ((text . "old body"))))))))
+         (reply
+          '((server-id . "m2")
+            (sender-id . "10002")
+            (sender-name . "Bob")
+            (time . 200)
+            (segments . (((type . "reply")
+                          (data . ((id . "m1"))))
+                         ((type . "text")
+                          (data . ((text . "answer")))))))))
+     (qq-state-upsert-session
+      "private:10001"
+      '((title . "Alice")
+        (target-id . "10001"))
+      nil)
+     (puthash "private:10001" (list source reply) qq-state--messages-by-session)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "private:10001")
+       (qq-chat-render)
+       (let ((recalled (qq-state--as-recalled-message source)))
+         (puthash "private:10001" (list recalled reply)
+                  qq-state--messages-by-session)
+         (should (qq-chat--apply-single-message-change-partially
+                  "m1" (qq-chat--timeline-messages (list recalled reply)))))
+       (should-not (gethash "m1" qq-chat--message-node-table))
+       (should (gethash "m2" qq-chat--message-node-table))
+       (goto-char (point-min))
+       (should (search-forward "↪ Alice: [message recalled]" nil t))))))
+
+(ert-deftest qq-chat-history-source-arrival-redisplays-reply-dependent ()
+  "History source arrival resolves an already rendered reply preview."
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice")
+      (target-id . "10001"))
+    nil)
+   (let* ((source
+           '((server-id . "m1")
+             (sender-id . "10001")
+             (sender-name . "Alice")
+             (time . 100)
+             (segments . (((type . "text")
+                           (data . ((text . "source arrived"))))))))
+          (reply
+           '((server-id . "m2")
+             (sender-id . "10002")
+             (sender-name . "Bob")
+             (time . 200)
+             (segments . (((type . "reply")
+                           (data . ((id . "m1"))))
+                          ((type . "text")
+                           (data . ((text . "answer")))))))))
+     (puthash "private:10001" (list reply) qq-state--messages-by-session)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "private:10001")
+       (qq-chat-render)
+       (goto-char (point-min))
+       (should (search-forward "↪ id m1" nil t))
+       (puthash "private:10001" (list source reply) qq-state--messages-by-session)
+       (qq-chat--chat-update 'timeline)
+       (goto-char (point-min))
+       (should (search-forward "↪ Alice: source arrived" nil t))))))
+
 (ert-deftest qq-chat-pending-promote-rekeys-anchor-to-snowflake ()
   "Optimistic local-id row is rekeyed to NT snowflake after send."
   (qq-chat-test-with-reset
