@@ -132,9 +132,9 @@ NapCat throws when `message_seq' is unknown or the page is empty
   "Fetch history for SESSION-KEY.
 
 When BEFORE-MESSAGE-ID is nil, pull the latest page (`getAioFirstViewLatestMsgs').
-When non-nil, pass it as wire `message_seq' — NapCat hard-cut treats this as the
-NT snowflake msgId cursor for `getMsgsIncludeSelf' (seek from that message,
-not only \"older than buffer oldest\").
+When non-nil, pass it as wire `message_seq' and set `reverse_order' true.
+On the current Linux QQ kernel that direction walks from the NT snowflake
+cursor toward older messages; false walks toward newer messages.
 
 COUNT overrides `qq-history-fetch-count' when non-nil (used by jump seek).
 
@@ -155,7 +155,8 @@ ERRBACK receives (RESPONSE REASON)."
                   (qq-api--session-request-params session-key)
                   `((count . ,n))
                   (when before-message-id
-                    `((message_seq . ,(format "%s" before-message-id)))))))
+                    `((message_seq . ,(format "%s" before-message-id))
+                      (reverse_order . t))))))
     (qq-api-call
      action
      params

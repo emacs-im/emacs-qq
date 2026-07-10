@@ -194,6 +194,7 @@
       (qq-api-fetch-history "private:10001" "9007199254741004999")
       (should (equal (alist-get 'message_seq captured-params)
                      "9007199254741004999"))
+      (should (eq (alist-get 'reverse_order captured-params) t))
       (should (equal (alist-get 'user_id captured-params) "10001")))))
 
 (ert-deftest qq-api-delete-message-calls-delete-msg-and-applies-recall ()
