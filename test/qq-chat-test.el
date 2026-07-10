@@ -987,6 +987,25 @@
          (qq-state-clear-session-unread "private:10001")
          (should-not (qq-chat--first-unread-anchor messages)))))))
 
+(ert-deftest qq-chat-first-unread-anchor-prefers-kernel-position ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice")
+      (target-id . "10001")
+      (unread-count . 2)
+      (first-unread-message-id . "m3"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (let ((qq-chat-show-unread-divider t))
+       (should (equal "m3"
+                      (qq-chat--first-unread-anchor
+                       '(((server-id . "m1") (self-p . nil) (time . 1))
+                         ((server-id . "m2") (self-p . nil) (time . 2))
+                         ((server-id . "m3") (self-p . nil) (time . 3))))))))))
+
 (ert-deftest qq-chat-render-inserts-unread-divider ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
@@ -1567,6 +1586,74 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
           (search-forward "Open")
           (button-activate (button-at (1- (point))))
           (should (equal opened-url "https://example.com/thread")))))))
+
+(ert-deftest qq-chat-timeline-inserts-explicit-newer-history-gap ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (setq qq-chat--session-key "group:20001")
+    (qq-chat--set-history-gap "m1")
+    (let* ((timeline (qq-chat--timeline-messages
+                      '(((server-id . "m1") (time . 1))
+                        ((server-id . "m2") (time . 2)))))
+           (anchors (mapcar #'qq-chat--message-anchor timeline)))
+      (should (equal anchors '("m1" "history-gap:m1" "m2")))
+      (should (qq-chat--history-gap-message-p (nth 1 timeline))))))
+
+(ert-deftest qq-chat-load-newer-clears-gap-on-short-final-page ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (setq qq-chat--session-key "group:20001")
+    (qq-chat--set-history-gap "m20")
+    (cl-letf (((symbol-function 'qq-api-fetch-history-page)
+               (lambda (session-key cursor direction callback &rest _)
+                 (should (equal session-key "group:20001"))
+                 (should (equal cursor "m20"))
+                 (should (eq direction 'newer))
+                 (funcall callback
+                          '(:added-count 4
+                            :message-count 5
+                            :batch-message-ids ("m20" "m21" "m22" "m23" "m24")
+                            :batch-newest-message-id "m24"))))
+              ((symbol-function 'qq-chat--chat-update) #'ignore))
+      (qq-chat-load-newer-messages t)
+      (should-not (qq-chat--history-get :gap-after-id))
+      (should (qq-chat--history-get :newer-loaded)))))
+
+(ert-deftest qq-chat-post-command-auto-loads-older-near-top ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (setq qq-chat--session-key "group:20001")
+    (let ((inhibit-read-only t))
+      (insert (make-string 3000 ?x)))
+    (goto-char (point-min))
+    (let ((qq-chat-history-auto-load-threshold 2000)
+          called)
+      (cl-letf (((symbol-function 'qq-chat--point-in-input-p) (lambda () nil))
+                ((symbol-function 'qq-chat-load-older-messages)
+                 (lambda (&optional quiet) (setq called quiet))))
+        (qq-chat--maybe-auto-load-older)
+        (should (eq called t))))))
+
+(ert-deftest qq-chat-initial-history-prefers-exact-read-position-window ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (setq qq-chat--session-key "group:20001")
+    (let (around-call completed)
+      (cl-letf (((symbol-function 'qq-api-fetch-session-read-state)
+                 (lambda (_session-key callback &optional _errback)
+                   (funcall callback
+                            '((unread_count . 7)
+                              (first_unread_message_id . "m-first")
+                              (position_available . t)))))
+                ((symbol-function 'qq-api-fetch-history-around)
+                 (lambda (session-key message-id callback &optional _errback count)
+                   (setq around-call (list session-key message-id count))
+                   (funcall callback '(:batch-newest-message-id "m-new"))))
+                ((symbol-function 'qq-chat--complete-initial-history-load)
+                 (lambda (&rest args) (setq completed args))))
+        (qq-chat--load-initial-history (current-buffer) "group:20001")
+        (should (equal around-call '("group:20001" "m-first" 40)))
+        (should (equal (nth 2 completed) "m-first"))))))
 
 (provide (quote qq-chat-test))
 

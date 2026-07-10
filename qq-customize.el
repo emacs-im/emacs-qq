@@ -44,6 +44,14 @@ When nil, emacs-qq falls back to `qq-onebot-token-env-var'."
   :type 'integer
   :group 'qq)
 
+(defcustom qq-chat-history-auto-load-threshold 2000
+  "Character distance from buffer top that triggers an older-history page.
+
+Set to nil to disable telega-style automatic loading near the top."
+  :type '(choice (const :tag "Disabled" nil)
+                 (integer :tag "Characters"))
+  :group 'qq)
+
 (defcustom qq-chat-messages-pop-ring-size 50
   "Size of the chatbuf messages pop ring (telega `telega-chat-messages-pop-ring-size').
 
@@ -81,9 +89,9 @@ Requires NapCat fork to mark messages with `recalled' / `recall_time'."
 (defcustom qq-chat-show-unread-divider t
   "When non-nil, render an unread divider before the first unread message.
 
-QQ only exposes `unread-count' (no last-read snowflake).  The first unread
-row is approximated as the oldest among the last N non-self timeline
-messages, where N is the session unread count."
+NapCat uses Linux QQ's `getABatchOfContactMsgBoxInfo' and resolves its first
+unread msgSeq to an exact NT snowflake.  The unread-count approximation is
+kept only as compatibility fallback for older NapCat builds."
   :type 'boolean
   :group 'qq)
 

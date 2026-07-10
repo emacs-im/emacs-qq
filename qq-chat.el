@@ -63,6 +63,20 @@
 (defconst qq-chat--empty-placeholder :qq-chat-empty-placeholder
   "Sentinel EWOC payload used for the empty timeline note.")
 
+(defconst qq-chat--history-gap-prefix "history-gap:"
+  "Anchor prefix used by synthetic newer-history gap rows.")
+
+(defun qq-chat--history-gap-message-p (message)
+  "Return non-nil when MESSAGE is a synthetic history gap row."
+  (and (listp message) (alist-get 'history-gap message)))
+
+(defun qq-chat--history-gap-message (after-message-id)
+  "Return synthetic gap row following AFTER-MESSAGE-ID."
+  `((id . ,(concat qq-chat--history-gap-prefix (format "%s" after-message-id)))
+    (history-gap . t)
+    (gap-after-id . ,after-message-id)
+    (self-p . t)))
+
 (defvar-local qq-chat--ewoc nil
   "Persistent EWOC backing the current chat timeline.")
 
@@ -89,6 +103,43 @@
 
 (defvar-local qq-chat--history-exhausted nil
   "Non-nil when older history is known to be exhausted for this chat.")
+
+(defvar-local qq-chat--history-state nil
+  "Telega-style history state plist for the current chat.
+
+Keys are `:loading' (`older' or `newer'), `:older-loaded', `:newer-loaded',
+`:newer-freezed', and `:gap-after-id'.")
+
+(defun qq-chat--reset-history-state ()
+  "Reset current buffer history paging state."
+  (setq qq-chat--history-state
+        (list :loading nil
+              :older-loaded nil
+              :newer-loaded t
+              :newer-freezed nil
+              :gap-after-id nil))
+  (setq qq-chat--history-loading nil)
+  (setq qq-chat--history-exhausted nil))
+
+(defun qq-chat--history-get (property)
+  "Return PROPERTY from current `qq-chat--history-state'."
+  (plist-get qq-chat--history-state property))
+
+(defun qq-chat--history-set (property value)
+  "Set PROPERTY to VALUE in current `qq-chat--history-state'."
+  (setq qq-chat--history-state
+        (plist-put qq-chat--history-state property value))
+  (when (eq property :loading)
+    (setq qq-chat--history-loading (and value t)))
+  (when (eq property :older-loaded)
+    (setq qq-chat--history-exhausted (and value t)))
+  value)
+
+(defun qq-chat--set-history-gap (after-message-id)
+  "Place a newer-history gap after AFTER-MESSAGE-ID, or clear it when nil."
+  (qq-chat--history-set :gap-after-id after-message-id)
+  (qq-chat--history-set :newer-freezed (and after-message-id t))
+  (qq-chat--history-set :newer-loaded (not after-message-id)))
 
 (defvar-local qq-chat--pending-jump-id nil
   "Server message id to jump to after history loads, or nil.
@@ -526,12 +577,24 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
                      (setq qq-chat--deferred-node-anchors nil))))
       (qq-chat--invalidate-message-anchors-preserving-point anchors))))
 
+(defun qq-chat--maybe-auto-load-older ()
+  "Load an older page when point approaches the timeline top."
+  (when (and qq-chat-history-auto-load-threshold
+             qq-chat--session-key
+             (not (qq-chat--point-in-input-p))
+             (< (point) (+ (point-min)
+                           (max 0 qq-chat-history-auto-load-threshold)))
+             (not (qq-chat--history-get :loading))
+             (not (qq-chat--history-get :older-loaded)))
+    (qq-chat-load-older-messages t)))
+
 (defun qq-chat--post-command ()
   "Keep point inside the logical draft area when editing input."
   (unless qq-chat--rendering
     (disco-chatbuf-post-command-clamp-point)
     (qq-chat--flush-deferred-node-redisplay)
-    (qq-chat--update-context-mode)))
+    (qq-chat--update-context-mode)
+    (qq-chat--maybe-auto-load-older)))
 
 (defun qq-chat--capture-window-input-offsets ()
   "Return (WINDOW . OFFSET) pairs for windows currently in draft input."
@@ -599,6 +662,8 @@ shown when loading or exhausted (disco-style)."
             (when qq-chat-show-header-help
               (qq-view-insert-note-line (qq-chat--header-help-text)))
             (cond
+             ((eq (qq-chat--history-get :loading) 'newer)
+              (qq-view-insert-note-line "(loading newer messages…)"))
              (qq-chat--history-loading
               (qq-view-insert-note-line "(loading older messages…)"))
              (qq-chat--history-exhausted
@@ -646,21 +711,28 @@ it or the cancel `[×]' loses its link face."
 (defun qq-chat--first-unread-anchor (messages)
   "Return anchor of the first unread message in MESSAGES, or nil.
 
-QQ exposes only `unread-count', not a last-read snowflake.  Approximate
-first unread as the oldest among the last N non-self timeline rows, where
-N is the current session unread count.  When N exceeds available rows, use
-the oldest incoming message."
+Prefer the exact NT snowflake returned by NapCat's Linux QQ read-state action.
+For older NapCat builds, fall back to the oldest among the last N non-self
+timeline rows."
   (when qq-chat-show-unread-divider
     (let* ((session (qq-chat--session))
-           (n (or (and session (alist-get 'unread-count session)) 0)))
+           (n (or (and session (alist-get 'unread-count session)) 0))
+           (exact (and (> n 0)
+                       (alist-get 'first-unread-message-id session))))
       (when (and (integerp n) (> n 0) messages)
-        (let* ((incoming (cl-remove-if (lambda (message)
-                                         (alist-get 'self-p message))
-                                       messages))
-               (len (length incoming)))
-          (when (> len 0)
-            (qq-chat--message-anchor
-             (nth (max 0 (- len n)) incoming))))))))
+        (or (and exact
+                 (seq-find (lambda (message)
+                             (equal exact (qq-chat--message-anchor message)))
+                           messages)
+                 exact)
+            (let* ((incoming (cl-remove-if (lambda (message)
+                                             (or (alist-get 'self-p message)
+                                                 (qq-chat--history-gap-message-p message)))
+                                           messages))
+                   (len (length incoming)))
+              (when (> len 0)
+                (qq-chat--message-anchor
+                 (nth (max 0 (- len n)) incoming)))))))))
 
 (defun qq-chat--compute-message-render-context (previous-message message
                                                                 &optional first-unread-anchor)
@@ -740,16 +812,26 @@ Recalled messages are hidden unless `qq-chat-show-recalled-messages' is set
 
 (defun qq-chat--timeline-messages (&optional messages)
   "Return MESSAGES (or current session messages) filtered for timeline display."
-  (seq-filter #'qq-chat--message-visible-in-timeline-p
-              (or messages
-                  (and qq-chat--session-key
-                       (qq-state-session-messages qq-chat--session-key))
-                  '())))
+  (let* ((visible
+          (seq-filter #'qq-chat--message-visible-in-timeline-p
+                      (or messages
+                          (and qq-chat--session-key
+                               (qq-state-session-messages qq-chat--session-key))
+                          '())))
+         (gap-after (qq-chat--history-get :gap-after-id)))
+    (if (not gap-after)
+        visible
+      (let (result inserted)
+        (dolist (message visible)
+          (push message result)
+          (when (equal gap-after (qq-chat--message-anchor message))
+            (push (qq-chat--history-gap-message gap-after) result)
+            (setq inserted t)))
+        (if inserted (nreverse result) visible)))))
 
 (defun qq-chat--message-anchor-list (messages)
   "Return message anchors in display order, skipping missing anchors."
-  (delq nil (mapcar #'qq-chat--message-anchor
-                    (qq-chat--timeline-messages messages))))
+  (delq nil (mapcar #'qq-chat--message-anchor messages)))
 
 (defun qq-chat--timeline-order-compatible-p (current-anchors target-anchors)
   "Return non-nil when CURRENT-ANCHORS can reconcile into TARGET-ANCHORS."
@@ -1375,11 +1457,41 @@ update similar in spirit to `telega-chatbuf--chat-update'."
        rear-nonsticky (read-only)
        qq-chat-internal empty-placeholder))))
 
+(defun qq-chat--render-history-gap (message)
+  "Render synthetic newer-history gap MESSAGE."
+  (let ((start (point))
+        (anchor (qq-chat--message-anchor message)))
+    (insert "\n  … newer messages are not loaded …  ")
+    (insert-text-button
+     "Load newer"
+     'follow-link t
+     'help-echo "Load the next newer history page"
+     'action (lambda (_button) (qq-chat-load-newer-messages)))
+    (insert "  ")
+    (insert-text-button
+     "Latest"
+     'follow-link t
+     'help-echo "Return to the latest cached messages"
+     'action (lambda (_button) (qq-chat-return-to-latest)))
+    (insert "\n\n")
+    (add-text-properties
+     start (point)
+     (list 'read-only t
+           'front-sticky '(read-only)
+           'rear-nonsticky '(read-only)
+           'qq-chat-message-anchor anchor
+           'qq-chat-internal 'history-gap
+           'face 'shadow))))
+
 (defun qq-chat--ewoc-printer (message)
   "EWOC pretty-printer for one chat MESSAGE."
-  (if (eq message qq-chat--empty-placeholder)
-      (qq-chat--render-empty-placeholder)
-    (qq-chat--render-message message)))
+  (cond
+   ((eq message qq-chat--empty-placeholder)
+    (qq-chat--render-empty-placeholder))
+   ((qq-chat--history-gap-message-p message)
+    (qq-chat--render-history-gap message))
+   (t
+    (qq-chat--render-message message))))
 
 (defun qq-chat--set-draft (text)
   "Set current draft TEXT and refresh only the tail composer region."
@@ -1805,7 +1917,7 @@ Never dump OneBot CQ / raw_message here — previews come from
 (defun qq-chat--header-help-text ()
   "Return header help text for chat actions."
   (concat
-   "M-<: older   r/d/o/a · g reply-jump · x pop · m/?   C-c C-e face · C-c C-v · C-c C-c"))
+   "M-<: older · M->: latest   r/d/o/a · g reply-jump · x pop · m/?   C-c C-e face · C-c C-v · C-c C-c"))
 
 (defun qq-chat--insert-date-separator-row (day-label)
   "Insert a date separator row for DAY-LABEL."
@@ -1948,10 +2060,11 @@ Does not iterative load-older; seek already tried once."
   (qq-api-fetch-history
    session-key
    target
-   (lambda (_meta)
+   (lambda (meta)
      (when (buffer-live-p buffer)
        (with-current-buffer buffer
          (when (equal qq-chat--session-key session-key)
+           (qq-chat--note-history-window meta)
            (if (qq-chat--finish-jump-if-loaded target)
                nil
              (qq-chat--jump-via-get-msg session-key target buffer))))))
@@ -1970,10 +2083,11 @@ Fallback: one-sided seek at TARGET, then `get_msg'."
   (qq-api-fetch-history-around
    session-key
    target
-   (lambda (_meta)
+   (lambda (meta)
      (when (buffer-live-p buffer)
        (with-current-buffer buffer
          (when (equal qq-chat--session-key session-key)
+           (qq-chat--note-history-window meta)
            (if (qq-chat--finish-jump-if-loaded target)
                nil
              (qq-chat--seek-history-one-side session-key target buffer))))))
@@ -2647,12 +2761,100 @@ Return non-nil on success."
   (interactive)
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
-  (setq qq-chat--history-exhausted nil)
-  (setq qq-chat--history-loading nil)
+  (let ((gap-after (qq-chat--history-get :gap-after-id)))
+    (qq-chat--reset-history-state)
+    (when gap-after
+      (qq-chat--set-history-gap gap-after)))
   (qq-chat-render)
   (qq-api-fetch-history qq-chat--session-key))
 
-(defun qq-chat-load-older-messages ()
+(defun qq-chat--note-history-window (meta)
+  "Update newer-gap state after an around-window merge described by META."
+  (let* ((session (qq-chat--session))
+         (latest (or (alist-get 'read-latest-message-id session)
+                     (alist-get 'last-message-id session)))
+         (batch-ids (plist-get meta :batch-message-ids))
+         (newest (plist-get meta :batch-newest-message-id)))
+    (if (and latest newest (not (member latest batch-ids)))
+        (qq-chat--set-history-gap newest)
+      (qq-chat--set-history-gap nil))
+    (qq-chat--chat-update 'header 'timeline)))
+
+(defun qq-chat-load-newer-messages (&optional quiet)
+  "Fill one page on the newer side of the current history gap."
+  (interactive)
+  (unless qq-chat--session-key
+    (user-error "qq: this buffer is not bound to a session"))
+  (let ((cursor (qq-chat--history-get :gap-after-id)))
+    (cond
+     ((not cursor)
+      (unless quiet (message "qq: no newer history gap")))
+     ((qq-chat--history-get :loading)
+      (unless quiet (message "qq: history load already in progress")))
+     (t
+      (let ((session-key qq-chat--session-key)
+            (buffer (current-buffer))
+            (requested (max 1 qq-history-fetch-count))
+            (point-anchor (and (not (qq-chat--point-in-input-p))
+                               (get-text-property (point)
+                                                  'qq-chat-message-anchor)))
+            (point-anchor-offset 0))
+        (when point-anchor
+          (when-let* ((anchor-pos (qq-chat--message-position point-anchor)))
+            (setq point-anchor-offset (- (point) anchor-pos))))
+        (qq-chat--history-set :loading 'newer)
+        (qq-api-fetch-history-page
+         session-key cursor 'newer
+         (lambda (meta)
+           (when (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (when (equal qq-chat--session-key session-key)
+                 (qq-chat--history-set :loading nil)
+                 (let* ((added (or (plist-get meta :added-count) 0))
+                        (count (or (plist-get meta :message-count) 0))
+                        (ids (plist-get meta :batch-message-ids))
+                        (newest (plist-get meta :batch-newest-message-id))
+                        (latest (or (alist-get 'read-latest-message-id
+                                               (qq-chat--session))
+                                    (alist-get 'last-message-id
+                                               (qq-chat--session))))
+                        (finished (or (<= count 1)
+                                      (< count requested)
+                                      (and latest (member latest ids))
+                                      (equal newest cursor))))
+                   (if finished
+                       (qq-chat--set-history-gap nil)
+                     (qq-chat--set-history-gap newest))
+                   (qq-chat--chat-update 'header 'timeline)
+                   (when point-anchor
+                     (when-let* ((anchor-pos (qq-chat--message-position point-anchor)))
+                       (goto-char (+ anchor-pos point-anchor-offset))
+                       (when-let* ((window (get-buffer-window buffer t)))
+                         (set-window-point window (point)))))
+                   (unless quiet
+                     (if finished
+                         (message "qq: newer history caught up")
+                       (message "qq: loaded %d newer message%s"
+                                added (if (= added 1) "" "s")))))))))
+         (lambda (response reason)
+           (when (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (when (equal qq-chat--session-key session-key)
+                 (qq-chat--history-set :loading nil)
+                 (qq-chat--chat-update 'header)
+                 (qq-api--default-error response reason)))))
+         requested))))))
+
+(defun qq-chat-return-to-latest ()
+  "Move point to the newest cached message without hiding a real history gap."
+  (interactive)
+  (let ((latest (or (alist-get 'read-latest-message-id (qq-chat--session))
+                    (alist-get 'last-message-id (qq-chat--session)))))
+    (if (and latest (qq-chat--goto-loaded-message latest nil))
+        (message "qq: latest cached message")
+      (goto-char (or (qq-chat--input-start-position) (point-max))))))
+
+(defun qq-chat-load-older-messages (&optional quiet)
   "Load one older history page for the current chat (telega/disco `M-<').
 
 Uses the oldest cached snowflake `server-id' as NapCat `message_seq'.  Guards
@@ -2662,17 +2864,17 @@ new rows or reports the cursor missing."
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
   (cond
-   (qq-chat--history-exhausted
-    (message "qq: no older messages available"))
-   (qq-chat--history-loading
-    (message "qq: older history load already in progress"))
+   ((or qq-chat--history-exhausted (qq-chat--history-get :older-loaded))
+    (unless quiet (message "qq: no older messages available")))
+   ((qq-chat--history-get :loading)
+    (unless quiet (message "qq: history load already in progress")))
    (t
     (let* ((session-key qq-chat--session-key)
            (before (qq-state-session-oldest-message-id session-key))
            (buffer (current-buffer)))
       (unless before
         (user-error "qq: no oldest message cursor; refresh first (C-c g)"))
-      (setq qq-chat--history-loading t)
+      (qq-chat--history-set :loading 'older)
       (qq-api-fetch-history
        session-key
        before
@@ -2680,23 +2882,23 @@ new rows or reports the cursor missing."
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
              (when (equal qq-chat--session-key session-key)
-               (setq qq-chat--history-loading nil)
+               (qq-chat--history-set :loading nil)
                (let ((added (or (plist-get meta :added-count) 0)))
                  (cond
                   ((<= added 0)
-                   (setq qq-chat--history-exhausted t)
+                   (qq-chat--history-set :older-loaded t)
                    (qq-chat--chat-update 'header-line 'header)
                    ;; Jump uses seek-at-target, not load-older chains.
                    (when qq-chat--pending-jump-id
                      (qq-chat--finish-jump-if-loaded qq-chat--pending-jump-id))
-                   (unless qq-chat--pending-jump-id
+                   (unless (or quiet qq-chat--pending-jump-id)
                      (message "qq: reached beginning of history")))
                   (t
                    ;; Timeline already reconciled via history hook.
                    (qq-chat--chat-update 'header-line 'header)
                    (when qq-chat--pending-jump-id
                      (qq-chat--finish-jump-if-loaded qq-chat--pending-jump-id))
-                   (unless qq-chat--pending-jump-id
+                   (unless (or quiet qq-chat--pending-jump-id)
                      (message "qq: loaded %d older message%s"
                               added
                               (if (= added 1) "" "s"))))))))))
@@ -2704,14 +2906,14 @@ new rows or reports the cursor missing."
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
              (when (equal qq-chat--session-key session-key)
-               (setq qq-chat--history-loading nil)
+               (qq-chat--history-set :loading nil)
                (if (qq-api--history-exhausted-error-p response reason)
                    (progn
-                     (setq qq-chat--history-exhausted t)
+                     (qq-chat--history-set :older-loaded t)
                      (qq-chat--chat-update 'header-line 'header)
                      (when qq-chat--pending-jump-id
                        (qq-chat--finish-jump-if-loaded qq-chat--pending-jump-id))
-                     (unless qq-chat--pending-jump-id
+                     (unless (or quiet qq-chat--pending-jump-id)
                        (message "qq: reached beginning of history")))
                  (qq-chat--chat-update 'header-line 'header)
                  (qq-api--default-error response reason)))))))))))
@@ -2868,6 +3070,7 @@ Updates header-line and redisplays only nodes whose render context changed
     (define-key map (kbd "C-c r") #'qq-chat-read-all)
     (define-key map (kbd "C-c m") #'qq-chat-message-transient)
     (define-key map (kbd "M-<") #'qq-chat-load-older-messages)
+    (define-key map (kbd "M->") #'qq-chat-return-to-latest)
     (define-key map (kbd "RET") #'qq-chat-return-dwim)
     (define-key map (kbd "TAB") #'qq-chat-edit-draft)
     (define-key map (kbd "C-c '") #'qq-chat-edit-draft)
@@ -2913,8 +3116,7 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (setq-local disco-media-card-fallback-context-function
               #'qq-chat--media-card-fallback-context)
   (setq-local qq-chat--deferred-node-anchors nil)
-  (setq-local qq-chat--history-loading nil)
-  (setq-local qq-chat--history-exhausted nil)
+  (qq-chat--reset-history-state)
   (setq-local qq-chat--pending-jump-id nil)
   (setq-local qq-chat--messages-pop-ring
               (make-ring (max 1 qq-chat-messages-pop-ring-size)))
@@ -2928,6 +3130,52 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (add-hook 'post-command-hook #'qq-chat--post-command nil t)
   (qq-chat--update-context-mode))
 
+(defun qq-chat--complete-initial-history-load (buffer session-key &optional target meta)
+  "Finish initial history load for BUFFER and SESSION-KEY.
+
+When TARGET is non-nil, META describes an around window centered at the exact
+first unread message."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (equal qq-chat--session-key session-key)
+        (when (and target meta)
+          (qq-chat--note-history-window meta)
+          (qq-chat--goto-loaded-message target nil))
+        (when qq-auto-mark-read
+          (qq-api-mark-session-read session-key))))))
+
+(defun qq-chat--load-latest-initial-history (buffer session-key)
+  "Load latest history for BUFFER, then complete read handling."
+  (qq-api-fetch-history
+   session-key nil
+   (lambda (_meta)
+     (qq-chat--complete-initial-history-load buffer session-key))
+   (lambda (response reason)
+     (qq-chat--complete-initial-history-load buffer session-key)
+     (qq-api--default-error response reason))))
+
+(defun qq-chat--load-initial-history (buffer session-key)
+  "Load SESSION-KEY around its official QQ read position when available."
+  (qq-api-fetch-session-read-state
+   session-key
+   (lambda (read-state)
+     (let ((unread (or (alist-get 'unread_count read-state) 0))
+           (first-id (alist-get 'first_unread_message_id read-state))
+           (available (alist-get 'position_available read-state)))
+       (if (and (> unread 0) available first-id)
+           (qq-api-fetch-history-around
+            session-key first-id
+            (lambda (meta)
+              (qq-chat--complete-initial-history-load
+               buffer session-key first-id meta))
+            (lambda (_response _reason)
+              (qq-chat--load-latest-initial-history buffer session-key))
+            (max qq-history-fetch-count (* 2 qq-history-fetch-count)))
+         (qq-chat--load-latest-initial-history buffer session-key))))
+   (lambda (_response _reason)
+     ;; Backward-compatible path for a stock/older NapCat without read state.
+     (qq-chat--load-latest-initial-history buffer session-key))))
+
 (defun qq-chat-open (session-key)
   "Open chat for SESSION-KEY."
   (interactive)
@@ -2939,13 +3187,9 @@ Attach from clipboard with `C-c C-v' (telega-style)."
       (unless (derived-mode-p 'qq-chat-mode)
         (qq-chat-mode))
       (setq qq-chat--session-key session-key)
-      (setq qq-chat--history-exhausted nil)
-      (setq qq-chat--history-loading nil)
       (qq-chat-render)
       (goto-char (or (qq-chat--input-logical-end-position) (point-max)))
-      (qq-api-fetch-history session-key)
-      (when qq-auto-mark-read
-        (qq-chat-read-all)))
+      (qq-chat--load-initial-history buffer session-key))
     (pop-to-buffer buffer)))
 
 (defun qq-chat--merge-deferred-node-anchors (anchors)

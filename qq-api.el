@@ -128,20 +128,57 @@ NapCat throws when `message_seq' is unknown or the page is empty
         (string-match-p "not exist" text)
         (string-match-p "no message" text))))
 
-(defun qq-api-fetch-history (session-key &optional before-message-id callback errback count)
-  "Fetch history for SESSION-KEY.
+(defun qq-api--session-peer-params (session-key)
+  "Return raw peer params for SESSION-KEY.
 
-When BEFORE-MESSAGE-ID is nil, pull the latest page (`getAioFirstViewLatestMsgs').
-When non-nil, pass it as wire `message_seq' and set `reverse_order' true.
-On the current Linux QQ kernel that direction walks from the NT snowflake
-cursor toward older messages; false walks toward newer messages.
+Unlike `qq-api--session-request-params', this always returns the hard-cut
+NapCat extension pair `chat_type' + `peer_uid'."
+  (let* ((session (qq-state-session session-key))
+         (type (or (alist-get 'type session)
+                   (qq-state-session-key-type session-key)))
+         (target-id (or (alist-get 'target-id session)
+                        (qq-state-session-key-target-id session-key)))
+         (chat-type (or (alist-get 'chat-type session)
+                        (pcase type
+                          ('group 2)
+                          ('dataline 8)
+                          ('service 103)
+                          (_ 1))))
+         (peer-uid (or (alist-get 'peer-uid session)
+                       (and (memq type '(group dataline service)) target-id))))
+    (unless peer-uid
+      (error "qq: session %s has no kernel peer uid" session-key))
+    `((chat_type . ,chat-type)
+      (peer_uid . ,(format "%s" peer-uid)))))
+
+(defun qq-api-fetch-session-read-state (session-key &optional callback errback)
+  "Fetch the official Linux QQ read position for SESSION-KEY.
+
+NapCat resolves the kernel `firstUnreadMsgInfo.msgSeq' to the hard-cut NT
+snowflake `first_unread_message_id'.  CALLBACK receives the raw read-state
+payload after it has been applied to `qq-state'."
+  (qq-api-call
+   "get_peer_read_state"
+   (qq-api--session-peer-params session-key)
+   (lambda (response)
+     (let ((read-state (qq-api--response-data response)))
+       (qq-state-apply-session-read-state session-key read-state)
+       (when callback
+         (funcall callback read-state))))
+   errback))
+
+(defun qq-api-fetch-history-page (session-key cursor direction
+                                              &optional callback errback count)
+  "Fetch one history page for SESSION-KEY at CURSOR in DIRECTION.
+
+DIRECTION is `older' or `newer'.  A nil CURSOR pulls the latest page.  On the
+current Linux QQ kernel `reverse_order' true walks older and false walks newer.
 
 COUNT overrides `qq-history-fetch-count' when non-nil (used by jump seek).
 
 CALLBACK receives the merge-history plist
 \(`:added-count', `:message-count', `:oldest-message-id', …).
 ERRBACK receives (RESPONSE REASON)."
-  (interactive)
   (let* ((session (qq-state-session session-key))
          (type (or (alist-get 'type session)
                    (qq-state-session-key-type session-key)))
@@ -154,9 +191,9 @@ ERRBACK receives (RESPONSE REASON)."
          (params (append
                   (qq-api--session-request-params session-key)
                   `((count . ,n))
-                  (when before-message-id
-                    `((message_seq . ,(format "%s" before-message-id))
-                      (reverse_order . t))))))
+                  (when cursor
+                    `((message_seq . ,(format "%s" cursor))
+                      (reverse_order . ,(if (eq direction 'older) t :false)))))))
     (qq-api-call
      action
      params
@@ -167,6 +204,15 @@ ERRBACK receives (RESPONSE REASON)."
          (when callback
            (funcall callback meta))))
      errback)))
+
+(defun qq-api-fetch-history (session-key &optional before-message-id callback errback count)
+  "Fetch latest or older history for SESSION-KEY.
+
+This compatibility entry point treats BEFORE-MESSAGE-ID as an older-page
+cursor.  Use `qq-api-fetch-history-page' for newer gap filling."
+  (interactive)
+  (qq-api-fetch-history-page session-key before-message-id 'older
+                             callback errback count))
 
 (defun qq-api-get-msg (message-id callback &optional errback)
   "Fetch a single message by MESSAGE-ID (NapCat hard-cut snowflake string).

@@ -46,6 +46,35 @@
      (should (equal (alist-get 'last-message-preview session)
                     "hello from napcat")))))
 
+(ert-deftest qq-state-apply-recent-contacts-uses-kernel-unread-count ()
+  (qq-test-with-reset
+   (qq-state-apply-recent-contacts
+    '(((chatType . 2)
+       (peerUid . "20001")
+       (peerUin . "20001")
+       (peerName . "Group")
+       (msgTime . "1710000000")
+       (msgId . "9007199254743009336")
+       (unreadCount . 17))))
+   (should (= 17 (alist-get 'unread-count
+                            (qq-state-session "group:20001"))))))
+
+(ert-deftest qq-state-apply-session-read-state-keeps-snowflake-string ()
+  (qq-test-with-reset
+   (qq-state-upsert-session "group:20001" nil nil)
+   (qq-state-apply-session-read-state
+    "group:20001"
+    '((unread_count . 5)
+      (first_unread_message_seq . "30001")
+      (first_unread_message_id . "9007199254742007089")
+      (position_available . t)))
+   (let ((session (qq-state-session "group:20001")))
+     (should (= 5 (alist-get 'unread-count session)))
+     (should (equal "30001" (alist-get 'first-unread-message-seq session)))
+     (should (equal "9007199254742007089"
+                    (alist-get 'first-unread-message-id session)))
+     (should (eq t (alist-get 'read-position-available session))))))
+
 (ert-deftest qq-state-apply-recent-contacts-creates-service-session ()
   (qq-test-with-reset
    (qq-state-apply-recent-contacts
@@ -535,7 +564,13 @@
          (should (eq (plist-get history-event :type) 'history))
          (should (eq (plist-get history-event :mutation) 'history))
          (should (= (plist-get history-event :message-count) 1))
-         (should (= (plist-get history-event :added-count) 1)))
+         (should (= (plist-get history-event :added-count) 1))
+         (should (equal (plist-get history-event :batch-message-ids)
+                        '("9007199254741004001")))
+         (should (equal (plist-get history-event :batch-oldest-message-id)
+                        "9007199254741004001"))
+         (should (equal (plist-get history-event :batch-newest-message-id)
+                        "9007199254741004001")))
        (setq events nil)
        (qq-state-clear-session-unread "private:10001")
        (let ((read-event (car events)))

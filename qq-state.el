@@ -274,6 +274,10 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
     (target-id . ,(qq-state-session-key-target-id session-key))
     (title . ,(qq-state-session-key-target-id session-key))
     (unread-count . 0)
+    (first-unread-message-id . nil)
+    (first-unread-message-seq . nil)
+    (read-position-available . nil)
+    (read-latest-message-id . nil)
     (last-message-time . 0)
     (last-message-preview . "")
     (last-message-id . nil)
@@ -937,6 +941,7 @@ Return a plist:
   (qq-state-upsert-session session-key nil nil)
   (let ((known-ids (make-hash-table :test #'equal))
         (added 0)
+        batch-ids
         (batch (or raw-messages '())))
     (dolist (message (or (gethash session-key qq-state--messages-by-session) '()))
       (when-let* ((server-id (alist-get 'server-id message)))
@@ -945,10 +950,13 @@ Return a plist:
       (let* ((normalized (qq-state--normalize-raw-message raw-message session-key))
              (server-id (alist-get 'server-id normalized))
              (already (and server-id (gethash server-id known-ids))))
+        (when server-id
+          (push server-id batch-ids))
         (qq-state--merge-normalized-message session-key normalized nil)
         (when (and server-id (not already))
           (cl-incf added)
           (puthash server-id t known-ids))))
+    (setq batch-ids (delete-dups (nreverse batch-ids)))
     (let ((oldest (qq-state-session-oldest-message-id session-key))
           (count (length batch)))
       (qq-state--emit 'history
@@ -956,11 +964,17 @@ Return a plist:
                       :message-count count
                       :added-count added
                       :oldest-message-id oldest
+                      :batch-message-ids batch-ids
+                      :batch-oldest-message-id (car batch-ids)
+                      :batch-newest-message-id (car (last batch-ids))
                       :mutation 'history)
       (list :session-key session-key
             :message-count count
             :added-count added
-            :oldest-message-id oldest))))
+            :oldest-message-id oldest
+            :batch-message-ids batch-ids
+            :batch-oldest-message-id (car batch-ids)
+            :batch-newest-message-id (car (last batch-ids))))))
 
 (defun qq-state-mark-pending-message-sent (session-key local-id message-id)
   "Mark local pending message LOCAL-ID as sent with MESSAGE-ID in SESSION-KEY.
@@ -1035,6 +1049,39 @@ timeline rebuild."
   "Reset unread count for SESSION-KEY."
   (qq-state-set-session-unread session-key 0))
 
+(defun qq-state-apply-session-read-state (session-key read-state)
+  "Apply kernel READ-STATE to SESSION-KEY and emit a read mutation.
+
+READ-STATE is the payload from NapCat `get_peer_read_state'.  Message ids and
+sequences remain strings; in particular, the NT snowflake message id is never
+coerced to an Emacs number."
+  (let* ((raw-count (alist-get 'unread_count read-state))
+         (count (max 0 (if (numberp raw-count)
+                           (truncate raw-count)
+                         (string-to-number (format "%s" (or raw-count 0))))))
+         (first-id (qq-state--normalize-id
+                    (alist-get 'first_unread_message_id read-state)))
+         (first-seq (qq-state--normalize-id
+                     (alist-get 'first_unread_message_seq read-state)))
+         (latest-id (qq-state--normalize-id
+                     (alist-get 'latest_message_id read-state)))
+         (available (and (> count 0)
+                         (alist-get 'position_available read-state)
+                         first-id)))
+    (qq-state-upsert-session
+     session-key
+     `((unread-count . ,count)
+       (first-unread-message-id . ,(and available first-id))
+       (first-unread-message-seq . ,(and available first-seq))
+       (read-position-available . ,(and available t))
+       (read-latest-message-id . ,latest-id))
+     nil)
+    (qq-state--emit 'session
+                    :session-key session-key
+                    :session (qq-state-session session-key)
+                    :mutation 'read)
+    (qq-state-session session-key)))
+
 (defun qq-state-apply-recall (message-id)
   "Mark MESSAGE-ID as recalled in local state when present.
 
@@ -1089,6 +1136,12 @@ Keeps the row so the chat view can hide it (default) or show a stub when
            (title (qq-state--recent-contact-title contact session-key))
            (msg-time (qq-state--normalize-time (alist-get 'msgTime contact)))
            (msg-id (qq-state--normalize-id (alist-get 'msgId contact)))
+           (unread-entry (assq 'unreadCount contact))
+           (unread-count
+            (and unread-entry
+                 (max 0 (if (numberp (cdr unread-entry))
+                            (truncate (cdr unread-entry))
+                          (string-to-number (format "%s" (or (cdr unread-entry) 0)))))))
            (last-message (alist-get 'lastestMsg contact))
            (preview
             (cond
@@ -1119,7 +1172,9 @@ Keeps the row so the chat view can hide it (default) or show a stub when
          (remark . ,(alist-get 'remark contact))
          (last-message-time . ,msg-time)
          (last-message-id . ,msg-id)
-         (last-message-preview . ,preview))
+         (last-message-preview . ,preview)
+         ,@(when unread-entry
+             `((unread-count . ,unread-count))))
        nil)
       (when (listp last-message)
         (let ((message-copy (copy-tree last-message)))
