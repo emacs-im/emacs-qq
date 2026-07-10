@@ -1648,17 +1648,39 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
                  (lambda (_session-key callback &optional _errback)
                    (funcall callback
                             '((unread_count . 7)
-                              (first_unread_message_id . "m-first")
+                              (first_unread_message_id . "9007199254742007089")
                               (position_available . t)))))
                 ((symbol-function 'qq-api-fetch-history-around)
                  (lambda (session-key message-id callback &optional _errback count)
                    (setq around-call (list session-key message-id count))
-                   (funcall callback '(:batch-newest-message-id "m-new"))))
+                   (funcall callback
+                            '(:batch-newest-message-id "9007199254742007090"))))
                 ((symbol-function 'qq-chat--complete-initial-history-load)
                  (lambda (&rest args) (setq completed args))))
         (qq-chat--load-initial-history (current-buffer) "group:20001")
-        (should (equal around-call '("group:20001" "m-first" 40)))
-        (should (equal (nth 2 completed) "m-first"))))))
+        (should (equal around-call
+                       '("group:20001" "9007199254742007089" 40)))
+        (should (equal (nth 3 completed) "9007199254742007089"))))))
+
+(ert-deftest qq-chat-initial-history-ignores-stale-read-state-callback ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (setq qq-chat--session-key "group:20001")
+    (let (read-callbacks (history-calls 0))
+      (cl-letf (((symbol-function 'qq-api-fetch-session-read-state)
+                 (lambda (_session-key callback &optional _errback)
+                   (setq read-callbacks
+                         (append read-callbacks (list callback)))))
+                ((symbol-function 'qq-api-fetch-history)
+                 (lambda (&rest _) (cl-incf history-calls))))
+        (qq-chat--load-initial-history (current-buffer) "group:20001")
+        (qq-chat--load-initial-history (current-buffer) "group:20001")
+        (funcall (car read-callbacks)
+                 '((unread_count . 0) (position_available . :false)))
+        (should (= history-calls 0))
+        (funcall (cadr read-callbacks)
+                 '((unread_count . 0) (position_available . :false)))
+        (should (= history-calls 1))))))
 
 (ert-deftest qq-chat-forward-segment-uses-dedicated-block-renderer ()
   (let* ((segment '((type . "forward")
