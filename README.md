@@ -54,10 +54,23 @@ For live two-repository development, Eask can instead link the source package:
 eask link add disco ../disco.el
 ```
 
-The linked repository's `.elc` files are used by Emacs, so run
-`eask recompile` from `../disco.el` after changing disco.  Use
-`eask link list` to inspect active links and `eask link delete disco-0.1.0` to
-return to snapshot installs.
+`eask recompile` only refreshes Eask's own package environment.  A running
+Doom/straight Emacs may use a separate build directory whose `.el` files are
+linked to the repository but whose `.elc` files are independent.  After
+changing disco, evaluate the following in that running Emacs to rebuild and
+reload the bytecode it actually uses:
+
+```elisp
+(let* ((loaded (or (symbol-file 'disco-view--chars-xwidth 'defun)
+                   (locate-library "disco-view")))
+       (dir (file-name-directory loaded)))
+  (byte-compile-file (expand-file-name "disco-view.el" dir))
+  (load (expand-file-name "disco-view.elc" dir) nil nil t)
+  (byte-compile-file (expand-file-name "disco-root-view.el" dir)))
+```
+
+Use `eask link list` to inspect active Eask links and
+`eask link delete disco-0.1.0` to return to snapshot installs.
 
 Architecture notes:
 
