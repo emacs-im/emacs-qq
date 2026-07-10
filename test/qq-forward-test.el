@@ -383,6 +383,108 @@ list are indistinguishable — both mean \"do not claim a count\"."
         (goto-char (1- (point-max)))
         (should (get-text-property (point) 'qq-forward-segment))))))
 
+(ert-deftest qq-forward-media-cache-update-redisplays-only-affected-entry ()
+  "Media ticks redisplay a single entry; other entries and header stay put."
+  (qq-forward-test--with-clean-viewers
+    (let* ((origin '((kind . "group") (group_id . "20001")))
+           (sender-fields '("10001" "Alice" nil nil))
+           (media-key "preview:file-image:media-a.png")
+           (image-segment
+            '((type . "image")
+              (data . ((file . "media-a.png")
+                       (url . "https://example.test/a.png")))))
+           (messages
+            (list
+             (qq-forward--normalized-message
+              nil
+              '(((type . "text") (data . ((text . "first-stable")))))
+              "1" "1" 1710000000 sender-fields "live" origin)
+             (qq-forward--normalized-message
+              nil (list image-segment)
+              "2" "2" 1710000001 sender-fields "live" origin)
+             (qq-forward--normalized-message
+              nil
+              '(((type . "text") (data . ((text . "third-stable")))))
+              "3" "3" 1710000002 sender-fields "live" origin))))
+      (cl-letf (((symbol-function 'qq-media-segment-cache-keys)
+                 (lambda (segment)
+                   (when (equal (alist-get 'type segment) "image")
+                     (list media-key))))
+                ((symbol-function 'qq-media-segment-preview-capable-p)
+                 (lambda (_segment) t))
+                ((symbol-function 'qq-media-segment-preview-image)
+                 (lambda (_segment) nil))
+                ((symbol-function 'qq-media-segment-preview-fetching-p)
+                 (lambda (_segment) t))
+                ((symbol-function 'qq-media-segment-capabilities)
+                 (lambda (_segment)
+                   (list :status "loading" :open nil :download nil
+                         :save nil :copy-url nil)))
+                ((symbol-function 'force-window-update)
+                 (lambda (&rest _) nil)))
+        (with-current-buffer (get-buffer-create "*qq-forward:test-media-partial*")
+          (qq-forward-mode)
+          (setq qq-forward--messages messages
+                qq-forward--loading nil
+                qq-forward--loaded-p t
+                qq-forward--error nil
+                qq-forward--lookup-kind 'resource
+                qq-forward--lookup-id "resource-test")
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            (insert (propertize "Chat History\n" 'face 'bold))
+            (cl-loop for message in qq-forward--messages
+                     for index from 0
+                     do (qq-forward--insert-message message index))
+            (qq-forward--rebuild-media-index))
+          (should (string-match-p "first-stable" (buffer-string)))
+          (should (string-match-p "third-stable" (buffer-string)))
+          (should (string-match-p "loading preview" (buffer-string)))
+          (should (equal (qq-forward--indexes-for-media-key media-key) '(1)))
+          (goto-char (point-min))
+          (search-forward "third-stable")
+          (let ((header-before
+                 (buffer-substring-no-properties
+                  (point-min)
+                  (or (next-single-property-change
+                       (point-min) 'qq-forward-entry-index)
+                      (point-max))))
+                (first-before
+                 (buffer-substring-no-properties
+                  (car (qq-forward--entry-bounds 0))
+                  (cdr (qq-forward--entry-bounds 0))))
+                (third-before
+                 (buffer-substring-no-properties
+                  (car (qq-forward--entry-bounds 2))
+                  (cdr (qq-forward--entry-bounds 2)))))
+            (cl-letf (((symbol-function 'qq-media-segment-preview-fetching-p)
+                       (lambda (_segment) nil)))
+              (qq-forward--handle-media-cache-update media-key)
+              (qq-forward--handle-media-cache-update "preview:other:x")
+              (qq-forward--handle-media-cache-update nil))
+            (should (equal
+                     (buffer-substring-no-properties
+                      (point-min)
+                      (or (next-single-property-change
+                           (point-min) 'qq-forward-entry-index)
+                          (point-max)))
+                     header-before))
+            (should (equal
+                     (buffer-substring-no-properties
+                      (car (qq-forward--entry-bounds 0))
+                      (cdr (qq-forward--entry-bounds 0)))
+                     first-before))
+            (should (equal
+                     (buffer-substring-no-properties
+                      (car (qq-forward--entry-bounds 2))
+                      (cdr (qq-forward--entry-bounds 2)))
+                     third-before))
+            (should (equal (qq-forward--current-entry-index) 2))
+            (should (string-match-p "third-stable"
+                                    (buffer-substring
+                                     (max (point-min) (- (point) 40))
+                                     (min (point-max) (+ (point) 40)))))))))))
+
 (provide 'qq-forward-test)
 
 ;;; qq-forward-test.el ends here

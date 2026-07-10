@@ -81,6 +81,12 @@
 This separate flag distinguishes an explicit empty inline message array from
 a remote reference that must be fetched.")
 
+(defvar-local qq-forward--media-indexes-by-key nil
+  "Hash table mapping media cache keys to lists of entry indexes.
+
+Rebuilt on full `qq-forward--render'.  Media cache ticks use this to redisplay
+only the affected entries (telega-msg-redisplay / qq-chat media-anchor style).")
+
 (defun qq-forward--present-string (value)
   "Return VALUE when it is a non-empty string, else nil."
   (and (stringp value)
@@ -573,22 +579,130 @@ forwarded message is written to or looked up in `qq-state'."
       (and (> (point) (point-min))
            (get-text-property (1- (point)) 'qq-forward-entry-index))))
 
-(defun qq-forward--render ()
-  "Render the current `qq-forward-mode' buffer from buffer-local state.
+(defun qq-forward--capture-view-state ()
+  "Capture entry-relative point and window-starts for local mutations.
 
-Preserve the user's place inside the current entry when possible.  A full
-erase/rebuild that always jumps to the entry header (the old behavior)
-makes C-n/C-p feel like the cursor is hard-snapped back whenever media
-previews finish and re-render the buffer."
+Mirrors the intent of `telega-save-cursor' / qq-chat's preserve helpers:
+restore by semantic entry index + offset, not absolute buffer positions."
   (let* ((old-index (qq-forward--current-entry-index))
          (old-entry-start
           (and (integerp old-index)
                (alist-get old-index (qq-forward--entry-positions))))
          (old-offset (and old-entry-start
-                          (max 0 (- (point) old-entry-start))))
-         (old-window-start
-          (when-let* ((win (get-buffer-window (current-buffer) t)))
-            (window-start win)))
+                          (max 0 (- (point) old-entry-start)))))
+    (list :index old-index
+          :offset old-offset
+          :window-starts
+          (mapcar (lambda (win)
+                    (cons win (window-start win)))
+                  (get-buffer-window-list (current-buffer) nil t)))))
+
+(defun qq-forward--restore-view-state (state)
+  "Restore point and window-starts from STATE.
+
+STATE is produced by `qq-forward--capture-view-state'."
+  (let* ((old-index (plist-get state :index))
+         (old-offset (plist-get state :offset))
+         (positions (qq-forward--entry-positions))
+         (entry-start (and (integerp old-index)
+                           (alist-get old-index positions)))
+         (next-start
+          (and (integerp old-index)
+               (or (alist-get (1+ old-index) positions)
+                   (point-max)))))
+    (cond
+     ((and entry-start (integerp old-offset))
+      (goto-char (min (+ entry-start old-offset)
+                      (max entry-start (1- (or next-start (point-max)))))))
+     ((integerp old-index)
+      (qq-forward--goto-entry old-index)))
+    (dolist (cell (plist-get state :window-starts))
+      (when-let* ((win (car cell))
+                  ((window-live-p win))
+                  (start (cdr cell))
+                  ((and (integerp start)
+                        (>= start (point-min))
+                        (<= start (point-max)))))
+        (set-window-start win start t)))))
+
+(defun qq-forward--rebuild-media-index ()
+  "Rebuild media-key -> entry-index table for the current forward viewer."
+  (unless (hash-table-p qq-forward--media-indexes-by-key)
+    (setq qq-forward--media-indexes-by-key (make-hash-table :test #'equal)))
+  (clrhash qq-forward--media-indexes-by-key)
+  (cl-loop for message in qq-forward--messages
+           for index from 0
+           do (dolist (key (qq-chat--message-media-cache-keys message))
+                (puthash key
+                         (cons index
+                               (gethash key qq-forward--media-indexes-by-key))
+                         qq-forward--media-indexes-by-key))))
+
+(defun qq-forward--indexes-for-media-key (media-key)
+  "Return entry indexes affected by MEDIA-KEY in the current viewer."
+  (when (and (stringp media-key)
+             (hash-table-p qq-forward--media-indexes-by-key))
+    (delete-dups
+     (copy-sequence (gethash media-key qq-forward--media-indexes-by-key)))))
+
+(defun qq-forward--entry-bounds (index)
+  "Return (START . END) buffer bounds for rendered entry INDEX, or nil."
+  (let* ((positions (qq-forward--entry-positions))
+         (start (alist-get index positions)))
+    (when start
+      (let ((end
+             (or (cl-loop for i from (1+ index)
+                          below (1+ (length qq-forward--messages))
+                          for pos = (alist-get i positions)
+                          when pos return pos)
+                 (point-max))))
+        (cons start end)))))
+
+(defun qq-forward--redisplay-entry (index)
+  "Re-insert a single entry INDEX in place.
+
+This is the forward-viewer analogue of `telega-msg-redisplay' /
+`qq-chat--redisplay-node': mutate one message region, never erase the whole
+buffer."
+  (when-let* ((message (nth index qq-forward--messages))
+              (bounds (qq-forward--entry-bounds index)))
+    (let ((inhibit-read-only t)
+          (start (car bounds))
+          (end (cdr bounds)))
+      (goto-char start)
+      (delete-region start end)
+      (qq-forward--insert-message message index)
+      t)))
+
+(defun qq-forward--redisplay-entries (indexes)
+  "Redisplay entry INDEXES without a full buffer erase.
+
+High indexes are processed first so earlier entry bounds remain valid while
+regions are replaced.  Point and window-start are restored via entry-relative
+offsets (telega-save-cursor spirit)."
+  (let* ((indexes (sort (delete-dups (delq nil (copy-sequence indexes))) #'<))
+         (view (qq-forward--capture-view-state))
+         (inhibit-read-only t)
+         changed)
+    (when indexes
+      (save-excursion
+        (dolist (index (reverse indexes))
+          (when (qq-forward--redisplay-entry index)
+            (setq changed t))))
+      (when changed
+        (qq-forward--restore-view-state view)
+        ;; telega: after media image mutation, force window update so the new
+        ;; image/spec is painted without waiting for the next user command.
+        (force-window-update (current-buffer)))
+      changed)))
+
+(defun qq-forward--render ()
+  "Render the current `qq-forward-mode' buffer from buffer-local state.
+
+Full erase is reserved for initial load, refresh, and structural state
+changes.  Media cache ticks must use `qq-forward--redisplay-entries'
+instead — full rebuilds are what made C-n/C-p feel hard-snapped."
+  (let* ((view (qq-forward--capture-view-state))
          (inhibit-read-only t))
     (erase-buffer)
     (insert (propertize "Chat History\n" 'face 'bold))
@@ -614,27 +728,8 @@ previews finish and re-render the buffer."
       (cl-loop for message in qq-forward--messages
                for index from 0
                do (qq-forward--insert-message message index))))
-    (let* ((positions (qq-forward--entry-positions))
-           (entry-start (and (integerp old-index)
-                             (alist-get old-index positions)))
-           (next-start
-            (and (integerp old-index)
-                 (or (alist-get (1+ old-index) positions)
-                     (point-max)))))
-      (cond
-       ((and entry-start old-offset)
-        (goto-char (min (+ entry-start old-offset)
-                        (max entry-start (1- (or next-start (point-max)))))))
-       ((integerp old-index)
-        (qq-forward--goto-entry old-index))
-       (t
-        (goto-char (point-min)))))
-    (when-let* ((win (get-buffer-window (current-buffer) t))
-                (start old-window-start)
-                ((and (integerp start)
-                      (>= start (point-min))
-                      (<= start (point-max)))))
-      (set-window-start win start t))))
+    (qq-forward--rebuild-media-index)
+    (qq-forward--restore-view-state view)))
 
 (defun qq-forward--request-valid-p (buffer source generation)
   "Return non-nil when async result still belongs to BUFFER and GENERATION."
@@ -770,6 +865,7 @@ records issue a fresh `emacs_get_forward' request."
 (define-derived-mode qq-forward-mode special-mode "QQ-Forward"
   "Major mode for one QQ merged-forward message tree."
   (setq-local truncate-lines nil)
+  (setq-local qq-forward--media-indexes-by-key (make-hash-table :test #'equal))
   (setq-local header-line-format
               '(:eval
                 (format " QQ Chat History · %s%s"
@@ -941,41 +1037,23 @@ records issue a fresh `emacs_get_forward' request."
     (add-text-properties start (point) card-properties)
     (point)))
 
-(defvar-local qq-forward--media-rerender-timer nil
-  "Debounce timer for media-driven re-renders of this forward viewer.")
+(defun qq-forward--handle-media-cache-update (&optional media-key)
+  "Refresh affected forward entries after MEDIA-KEY cache updates.
 
-(defun qq-forward--rerender-buffer-now (buffer)
-  "Re-render BUFFER if it is still a live forward viewer."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (setq qq-forward--media-rerender-timer nil)
-      (when (and (derived-mode-p 'qq-forward-mode)
-                 (not qq-forward--loading)
-                 (or qq-forward--messages qq-forward--error))
-        (let ((inhibit-read-only t))
-          (qq-forward--render))))))
+Follow telega/qq-chat: never full-erase on media ticks.  Only redisplay
+entries that depend on MEDIA-KEY.  Unrelated keys and foreign cache events
+are no-ops so open forward viewers stop thrashing while the user navigates."
+  (when (stringp media-key)
+    (dolist (buffer (buffer-list))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (when (and (derived-mode-p 'qq-forward-mode)
+                     (not qq-forward--loading)
+                     qq-forward--messages)
+            (when-let* ((indexes (qq-forward--indexes-for-media-key media-key)))
+              (qq-forward--redisplay-entries indexes))))))))
 
-(defun qq-forward--rerender-open-viewers (&optional _media-key)
-  "Schedule re-render of live `qq-forward-mode' buffers after media updates.
-
-Chat buffers patch single nodes; this viewer still full-redraws.  Debounce
-so a burst of preview completions does not thrash point (C-n/C-p feeling
-\"hard snapped back\" on every image).  Point restore lives in
-`qq-forward--render'."
-  (dolist (buffer (buffer-list))
-    (with-current-buffer buffer
-      (when (and (derived-mode-p 'qq-forward-mode)
-                 (not qq-forward--loading)
-                 (or qq-forward--messages qq-forward--error))
-        (when (timerp qq-forward--media-rerender-timer)
-          (cancel-timer qq-forward--media-rerender-timer))
-        (setq qq-forward--media-rerender-timer
-              (run-at-time
-               0.05 nil
-               #'qq-forward--rerender-buffer-now
-               buffer))))))
-
-(add-hook 'qq-media-cache-update-hook #'qq-forward--rerender-open-viewers)
+(add-hook 'qq-media-cache-update-hook #'qq-forward--handle-media-cache-update)
 
 (provide 'qq-forward)
 
