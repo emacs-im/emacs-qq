@@ -421,6 +421,26 @@
        (when (file-exists-p local-file)
          (delete-file local-file))))))
 
+(ert-deftest qq-media-segment-file-keys-ignore-empty-file-id ()
+  "DataLine FILE images with an empty file_id must not share one cache key."
+  (let* ((first '((type . "file")
+                  (data . ((file_id . "")
+                           (file . "qq-clip-first.png")
+                           (path . "   ")))))
+         (second '((type . "file")
+                   (data . ((file_id . "")
+                            (file . "qq-clip-second.png"))))))
+    (should (equal (qq-media--segment-file-keys first)
+                   '("qq-clip-first.png")))
+    (should (equal (qq-media--segment-remote-file-keys first)
+                   '("qq-clip-first.png")))
+    (should (equal (qq-media-segment-preview-key first)
+                   "preview:file-image:qq-clip-first.png"))
+    (should (equal (qq-media-segment-preview-key second)
+                   "preview:file-image:qq-clip-second.png"))
+    (should-not (equal (qq-media-segment-preview-key first)
+                       (qq-media-segment-preview-key second)))))
+
 (ert-deftest qq-media-segment-preview-image-uses-local-file-without-api ()
   (qq-media-test-with-reset
    (let* ((local-file (make-temp-file "qq-preview" nil ".png"))

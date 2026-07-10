@@ -350,7 +350,13 @@ alist returned by NapCat."
          (keys (list (alist-get 'file_id data)
                      (alist-get 'file data)
                      (alist-get 'path data))))
-    (delete-dups (delq nil keys))))
+    (delete-dups
+     (seq-filter
+      (lambda (key)
+        (and key
+             (or (not (stringp key))
+                 (not (string-empty-p (string-trim key))))))
+      keys))))
 
 (defun qq-media--segment-file-key (segment)
   "Return best file key from SEGMENT."
