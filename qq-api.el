@@ -1187,6 +1187,57 @@ When REPLY-TO-MESSAGE-ID is non-nil, send the text as a reply."
    (qq-api--send-text-segments text reply-to-message-id)
    text))
 
+(defun qq-api-send-poke (session-key &optional target-id callback errback)
+  "Send a poke to SESSION-KEY, optionally targeting TARGET-ID.
+
+Private chats poke the peer.  Group chats require TARGET-ID, normally the
+sender of the message at point.  A successful action is reflected locally as
+a poke notice; a matching websocket notice is deduplicated by its local
+second-level anchor."
+  (let* ((session (qq-state-session session-key))
+         (type (or (and session (alist-get 'type session))
+                   (qq-state-session-key-type session-key)))
+         (peer-id (qq-state-session-key-target-id session-key))
+         (target (if (eq type 'group)
+                     target-id
+                   (or target-id
+                       (and session (alist-get 'target-id session))
+                       peer-id)))
+         (params
+          (pcase type
+            ('group
+             (unless (qq-api-user-id-p target)
+               (user-error "qq: group poke requires a decimal target QQ"))
+             `((group_id . ,peer-id) (user_id . ,target)))
+            ('private
+             (unless (qq-api-user-id-p target)
+               (user-error "qq: private poke requires a decimal peer QQ"))
+             `((user_id . ,target)))
+            (_
+             (user-error "qq: poke is unsupported for %s sessions" type)))))
+    (qq-api-call
+     "send_poke"
+     params
+     (lambda (response)
+       (when-let* ((self-id (qq-state-self-user-id)))
+         (qq-state-apply-poke-notice
+          `((time . ,(truncate (float-time)))
+            (post_type . "notice")
+            (notice_type . "notify")
+            (sub_type . "poke")
+            ,@(if (eq type 'group)
+                  `((group_id . ,peer-id)
+                    (user_id . ,self-id)
+                    (target_id . ,target))
+                `((user_id . ,target)
+                  (sender_id . ,self-id)
+                  (target_id . ,target))))))
+       (when callback
+         (funcall callback response)))
+     (or errback
+         (lambda (response reason)
+           (qq-api--default-error response reason))))))
+
 (defun qq-api-delete-message (message-id)
   "Recall MESSAGE-ID (NT snowflake string) via NapCat and mark it recalled."
   (interactive)

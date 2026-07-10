@@ -114,6 +114,31 @@
      (should (equal (alist-get 'preview message) "戳了戳 我"))
      (should-not (string-match-p "unknown" (alist-get 'preview message))))))
 
+(ert-deftest qq-state-merge-history-normalizes-poke-notice ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
+   (qq-state-merge-history
+    "group:20001"
+    '(((time . 1710000001)
+       (post_type . "notice")
+       (notice_type . "notify")
+       (sub_type . "poke")
+       (target_id . "90001")
+       (user_id . "10002")
+       (group_id . "20001"))))
+   (let ((message (car (qq-state-session-messages "group:20001"))))
+     (should (equal (alist-get 'local-id message)
+                    "local-poke-1710000001-10002-90001"))
+     (should (equal (alist-get 'preview message) "戳了戳 我"))
+     (should (equal (alist-get 'raw-event message)
+                    '((time . 1710000001)
+                      (post_type . "notice")
+                      (notice_type . "notify")
+                      (sub_type . "poke")
+                      (target_id . "90001")
+                      (user_id . "10002")
+                      (group_id . "20001")))))))
+
 (ert-deftest qq-state-apply-recent-contacts-creates-session-summary ()
   (qq-test-with-reset
    (qq-state-apply-recent-contacts

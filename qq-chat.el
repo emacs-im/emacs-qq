@@ -45,6 +45,8 @@
                   "qq-api" (source-session-key target-session-key message-ids
                                                 callback &optional errback))
 (declare-function qq-api-cancel-request "qq-api" (request-token))
+(declare-function qq-api-send-poke
+                  "qq-api" (session-key &optional target-id callback errback))
 
 (defvar-local qq-chat--session-key nil
   "Session key associated with the current chat buffer.")
@@ -203,6 +205,7 @@ loaded in the chatbuf.")
     (define-key map (kbd "i") #'qq-chat-open-user-at-point)
     (define-key map (kbd "g") #'qq-chat-goto-reply)
     (define-key map (kbd "x") #'qq-chat-goto-pop-message)
+    (define-key map (kbd "P") #'qq-chat-send-poke)
     (define-key map (kbd "m") #'qq-chat-message-transient)
     (define-key map (kbd "?") #'qq-chat-transient)
     map)
@@ -3410,6 +3413,36 @@ Updates header-line and redisplays only nodes whose render context changed
     (user-error "qq: this buffer is not bound to a session"))
   (qq-api-mark-session-read qq-chat--session-key))
 
+(defun qq-chat-send-poke (&optional target-id)
+  "Send a poke in the current chat.
+
+For a private chat, poke the peer.  In a group, use the message at point as
+the default target and prompt for a QQ number when point has no incoming
+sender."
+  (interactive)
+  (let* ((session (qq-chat--session))
+         (type (and session (alist-get 'type session)))
+         (message (ignore-errors (qq-chat--message-at-point)))
+         (message-target
+          (and message
+               (or (alist-get 'target-id message)
+                   (and (not (alist-get 'self-p message))
+                        (alist-get 'sender-id message)))))
+         (target
+          (if (eq type 'group)
+              (or target-id message-target (read-string "Poke QQ: "))
+            target-id)))
+    (unless qq-chat--session-key
+      (user-error "qq: this buffer is not bound to a session"))
+    (when (and (eq type 'group)
+               (string-empty-p (string-trim (or target ""))))
+      (user-error "qq: group poke requires a target QQ"))
+    (qq-api-send-poke
+     qq-chat--session-key
+     target
+     (lambda (_response)
+       (message "qq: poke sent")))))
+
 (defalias 'qq-chat-mark-read #'qq-chat-read-all)
 (defalias 'qq-chat-send #'qq-chat-send-message)
 (defalias 'qq-chat-load-older #'qq-chat-load-older-messages)
@@ -3422,6 +3455,7 @@ Updates header-line and redisplays only nodes whose render context changed
     (define-key map (kbd "C-c C-n") #'qq-chat-search-next)
     (define-key map (kbd "C-c C-p") #'qq-chat-search-prev)
     (define-key map (kbd "C-c r") #'qq-chat-read-all)
+    (define-key map (kbd "C-c P") #'qq-chat-send-poke)
     (define-key map (kbd "C-c m") #'qq-chat-message-transient)
     (define-key map (kbd "C-c f") #'qq-chat-forward-message)
     (define-key map (kbd "C-c M") #'qq-chat-toggle-forward-mark)

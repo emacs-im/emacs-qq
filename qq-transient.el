@@ -213,6 +213,7 @@ Prefer this over inline button rows (telega/disco style)."
     ("/" "Search" qq-chat-search)
     ("n" "Search next" qq-chat-search-next)
     ("p" "Search prev" qq-chat-search-prev)
+    ("P" "Poke" qq-chat-send-poke)
     ("R" "Mark read" qq-chat-read-all)
     ("v" "Forward marked" qq-chat-forward-marked-messages
      :inapt-if qq-transient--forward-marked-inapt-p)
