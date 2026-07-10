@@ -274,6 +274,8 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
     (target-id . ,(qq-state-session-key-target-id session-key))
     (title . ,(qq-state-session-key-target-id session-key))
     (unread-count . 0)
+    (muted-p . nil)
+    (message-notify-mode . unspecified)
     (first-unread-message-id . nil)
     (first-unread-message-seq . nil)
     (read-position-available . nil)
@@ -1122,6 +1124,13 @@ Keeps the row so the chat view can hide it (default) or show a stub when
         (qq-state--default-session-title (qq-state--session-template session-key))
         (qq-state-session-key-target-id session-key))))
 
+(defun qq-state--json-true-p (value)
+  "Return non-nil when JSON VALUE represents true."
+  (or (eq value t)
+      (and (numberp value) (not (zerop value)))
+      (and (stringp value)
+           (member (downcase value) '("true" "1" "yes")))))
+
 (defun qq-state-apply-recent-contacts (contacts)
   "Apply recent CONTACTS snapshot to local session store."
   (dolist (contact (or contacts '()))
@@ -1137,6 +1146,8 @@ Keeps the row so the chat view can hide it (default) or show a stub when
            (msg-time (qq-state--normalize-time (alist-get 'msgTime contact)))
            (msg-id (qq-state--normalize-id (alist-get 'msgId contact)))
            (unread-entry (assq 'unreadCount contact))
+           (disturb-entry (assq 'isMsgDisturb contact))
+           (notify-mode-entry (assq 'messageNotifyMode contact))
            (unread-count
             (and unread-entry
                  (max 0 (if (numberp (cdr unread-entry))
@@ -1174,7 +1185,11 @@ Keeps the row so the chat view can hide it (default) or show a stub when
          (last-message-id . ,msg-id)
          (last-message-preview . ,preview)
          ,@(when unread-entry
-             `((unread-count . ,unread-count))))
+             `((unread-count . ,unread-count)))
+         ,@(when disturb-entry
+             `((muted-p . ,(and (qq-state--json-true-p (cdr disturb-entry)) t))))
+         ,@(when notify-mode-entry
+             `((message-notify-mode . ,(intern (format "%s" (cdr notify-mode-entry)))))))
        nil)
       (when (listp last-message)
         (let ((message-copy (copy-tree last-message)))

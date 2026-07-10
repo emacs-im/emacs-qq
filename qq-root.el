@@ -56,11 +56,18 @@
          (unread (cl-count-if (lambda (session)
                                 (> (or (alist-get 'unread-count session) 0) 0))
                               sessions))
+         (important (cl-count-if #'qq-root--session-important-unread-p sessions))
+         (muted (cl-count-if (lambda (session)
+                               (and (qq-root--session-muted-p session)
+                                    (> (or (alist-get 'unread-count session) 0) 0)))
+                             sessions))
          (dms (cl-count-if (lambda (session)
                              (not (eq (alist-get 'type session) 'group)))
                            sessions)))
     (list :all (length sessions)
           :unread unread
+          :important important
+          :muted muted
           :dms dms)))
 
 (defun qq-root--filter-chip (label count &optional active)
@@ -75,7 +82,8 @@
   (let ((metrics (qq-root--activity-metrics)))
     (string-join
      (list (qq-root--filter-chip "Main" (or (plist-get metrics :all) 0) t)
-           (qq-root--filter-chip "Important" (or (plist-get metrics :unread) 0))
+           (qq-root--filter-chip "Important" (or (plist-get metrics :important) 0))
+           (qq-root--filter-chip "Muted" (or (plist-get metrics :muted) 0))
            (qq-root--filter-chip "DMs" (or (plist-get metrics :dms) 0))
            "[activity sort:recent]")
      "  ")))
@@ -98,11 +106,31 @@
       (alist-get 'key session)
       "session"))
 
+(defun qq-root--session-muted-p (session)
+  "Return non-nil when SESSION has QQ message notifications muted."
+  (eq (alist-get 'muted-p session) t))
+
+(defun qq-root--session-important-unread-p (session)
+  "Return non-nil when SESSION has unread messages that are not muted."
+  (and (> (or (alist-get 'unread-count session) 0) 0)
+       (not (qq-root--session-muted-p session))))
+
+(defun qq-root--session-badge (session)
+  "Return root activity badge for SESSION, including trailing space."
+  (let ((unread (or (alist-get 'unread-count session) 0)))
+    (cond
+     ((and (qq-root--session-muted-p session) (> unread 0))
+      (format "[mute:%d] " unread))
+     ((qq-root--session-muted-p session) "[mute] ")
+     ((> unread 0) (format "[%d] " unread))
+     (t ""))))
+
 (defun qq-root--session-icon-face (session)
   "Return fallback icon face for SESSION."
-  (if (eq (alist-get 'type session) 'group)
-      'font-lock-keyword-face
-    'font-lock-variable-name-face))
+  (cond
+   ((qq-root--session-muted-p session) 'shadow)
+   ((eq (alist-get 'type session) 'group) 'font-lock-keyword-face)
+   (t 'font-lock-variable-name-face)))
 
 (defun qq-root--insert-session-icon (session)
   "Insert inline avatar/icon for SESSION."
@@ -120,11 +148,9 @@
 (defun qq-root--session-preview-text (session)
   "Return one-line preview for SESSION."
   (let ((preview (string-trim (or (alist-get 'last-message-preview session) "")))
-        (unread (or (alist-get 'unread-count session) 0)))
+        (badge (qq-root--session-badge session)))
     (concat
-     (if (> unread 0)
-         (format "[%d] " unread)
-       "")
+     badge
      (if (string-empty-p preview)
          "(no preview yet)"
        preview))))
@@ -132,26 +158,32 @@
 (defun qq-root--session-one-line-row (session)
   "Return one-line row model for SESSION."
   (let* ((session-key (alist-get 'key session))
-         (unread (or (alist-get 'unread-count session) 0)))
+         (unread (or (alist-get 'unread-count session) 0))
+         (muted (qq-root--session-muted-p session))
+         (important (qq-root--session-important-unread-p session))
+         (badge (qq-root--session-badge session)))
     (disco-view-one-line-row-create
      :icon-inserter (lambda ()
                       (qq-root--insert-session-icon session))
      :context (qq-root--session-context-label session)
      :preview (qq-root--session-preview-text session)
-     :preview-leading-length (if (> unread 0)
-                                 (+ 2 (length (number-to-string unread)))
-                               0)
-     :preview-leading-face (and (> unread 0) 'warning)
+     :preview-leading-length (length badge)
+     :preview-leading-face (cond (important 'warning)
+                                 (muted 'shadow))
      :time (qq-root--format-time (alist-get 'last-message-time session))
      :time-face 'shadow
-     :time-tail-face (and (> unread 0) 'warning)
+     :time-tail-face (and important 'warning)
      :line-properties
      (list 'qq-root-row-type 'session
            'qq-root-session-key session-key
            'qq-root-unread-count unread
            'qq-root-has-unread (and (> unread 0) t)
+           'qq-root-muted-p muted
+           'qq-root-has-important-unread (and important t)
            'mouse-face 'highlight)
-     :help-echo (format "Open %s" session-key))))
+     :help-echo (format "Open %s%s"
+                        session-key
+                        (if muted " (message notifications muted)" "")))))
 
 (defun qq-root--insert-session-line (session)
   "Insert one session row for SESSION."

@@ -59,6 +59,33 @@
    (should (= 17 (alist-get 'unread-count
                             (qq-state-session "group:20001"))))))
 
+(ert-deftest qq-state-apply-recent-contacts-preserves-message-disturb-state ()
+  (qq-test-with-reset
+   (qq-state-apply-recent-contacts
+    '(((chatType . 2)
+       (peerUid . "20001")
+       (peerUin . "20001")
+       (peerName . "Muted Group")
+       (msgTime . "1710000000")
+       (msgId . "9007199254743009336")
+       (unreadCount . 17)
+       (isMsgDisturb . t)
+       (messageNotifyMode . "receive"))))
+   (let ((session (qq-state-session "group:20001")))
+     (should (eq t (alist-get 'muted-p session)))
+     (should (eq 'receive (alist-get 'message-notify-mode session))))
+   (qq-state-apply-recent-contacts
+    '(((chatType . 2)
+       (peerUid . "20001")
+       (peerUin . "20001")
+       (peerName . "Muted Group")
+       (msgTime . "1710000000")
+       (msgId . "9007199254743009336")
+       (unreadCount . 0)
+       (isMsgDisturb . :false))))
+   (should-not (alist-get 'muted-p
+                          (qq-state-session "group:20001")))))
+
 (ert-deftest qq-state-apply-session-read-state-keeps-snowflake-string ()
   (qq-test-with-reset
    (qq-state-upsert-session "group:20001" nil nil)
