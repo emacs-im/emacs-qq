@@ -48,6 +48,39 @@
                  (qq-root--session-preview-text
                   '((muted-p . t) (unread-count . 0))))))
 
+(ert-deftest qq-root-background-render-reuses-last-visible-width ()
+  (with-temp-buffer
+    (qq-root-mode)
+    (let ((qq-root--fill-column 88)
+          (compute-calls 0))
+      (cl-letf (((symbol-function 'qq-root--selected-window) (lambda () nil))
+                ((symbol-function 'qq-root--display-window) (lambda () nil))
+                ((symbol-function 'qq-root--compute-fill-column)
+                 (lambda (&optional _window)
+                   (cl-incf compute-calls)
+                   42)))
+        (should (= (qq-root--render-fill-column) 88))
+        (qq-root-render)
+        (should (= qq-root--fill-column 88))
+        (should (= compute-calls 0))))))
+
+(ert-deftest qq-root-selected-window-refreshes-cached-width ()
+  (with-temp-buffer
+    (qq-root-mode)
+    (let ((qq-root--fill-column 88)
+          rendered)
+      (cl-letf (((symbol-function 'qq-root--selected-window)
+                 (lambda () 'root-window))
+                ((symbol-function 'qq-root--compute-fill-column)
+                 (lambda (&optional window)
+                   (should (eq window 'root-window))
+                   104))
+                ((symbol-function 'qq-root-render)
+                 (lambda () (setq rendered t))))
+        (should (qq-root--reflow-visible))
+        (should (= qq-root--fill-column 104))
+        (should rendered)))))
+
 (provide 'qq-root-test)
 
 ;;; qq-root-test.el ends here

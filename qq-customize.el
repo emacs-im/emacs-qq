@@ -151,6 +151,14 @@ timestamps clear of the window edge while zooming or resizing."
                  (integer :tag "Additional margin columns"))
   :group 'qq)
 
+(defcustom qq-root-auto-fill-margin-columns 1
+  "Additional right margin columns used for root session rows.
+
+This mirrors `telega-root-auto-fill-margin-columns'."
+  :type '(choice (const :tag "No additional margin" nil)
+                 (integer :tag "Additional margin columns"))
+  :group 'qq)
+
 ;; Faces mirror telega-msg-* defaults (not a visual clone of every palette
 ;; trick).  Keep them ordinary so theming stays familiar.
 

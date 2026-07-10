@@ -30,9 +30,54 @@
 (defvar-local qq-root--rerender-timer nil
   "Idle timer used to debounce root rerenders.")
 
+(defvar-local qq-root--fill-column nil
+  "Last root width measured from a window that actually displayed it.")
+
+(defun qq-root--selected-window ()
+  "Return the selected window when it displays the current root buffer."
+  (let ((win (selected-window)))
+    (and (window-live-p win)
+         (eq (window-buffer win) (current-buffer))
+         win)))
+
+(defun qq-root--display-window ()
+  "Return the widest live window displaying the current root buffer."
+  (let ((best nil)
+        (best-width -1))
+    (dolist (win (get-buffer-window-list (current-buffer) nil t) best)
+      (let ((width (if (window-live-p win)
+                       (window-width win 'remap)
+                     -1)))
+        (when (> width best-width)
+          (setq best win
+                best-width width))))))
+
+(defun qq-root--compute-fill-column (&optional window)
+  "Compute root row width from live WINDOW, or return nil."
+  (when-let* ((win (or window (qq-root--display-window)))
+              (width (disco-view-window-fill-column
+                      win qq-root-auto-fill-margin-columns)))
+    (max 60 width)))
+
+(defun qq-root--render-fill-column ()
+  "Return a stable width for the next root render pass.
+
+Like telega/disco root autofill, measure the selected root window when
+possible.  A passive background update reuses the last measured width instead
+of accidentally borrowing the selected chat window."
+  (or (when-let* ((win (qq-root--selected-window)))
+        (qq-root--compute-fill-column win))
+      (and (integerp qq-root--fill-column)
+           (> qq-root--fill-column 0)
+           qq-root--fill-column)
+      (qq-root--compute-fill-column (qq-root--display-window))
+      80))
+
 (defun qq-root--buffer-width ()
   "Return current root rendering width in columns."
-  (max 60 (window-body-width (get-buffer-window (current-buffer) t))))
+  (max 60 (or qq-root--fill-column
+              (setq-local qq-root--fill-column
+                          (qq-root--render-fill-column)))))
 
 (defun qq-root--format-time (timestamp)
   "Return display string for TIMESTAMP."
@@ -352,6 +397,7 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
 (defun qq-root-render ()
   "Render the root buffer from local state."
   (interactive)
+  (setq-local qq-root--fill-column (qq-root--render-fill-column))
   (disco-view-render-preserving-position
    (lambda ()
      (let ((inhibit-read-only t)
@@ -401,7 +447,13 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
 `?' opens `qq-root-transient' (discoverable command menu)."
   (setq buffer-read-only t)
   (setq truncate-lines t)
-  (setq-local switch-to-buffer-preserve-window-point nil))
+  (setq-local switch-to-buffer-preserve-window-point nil)
+  (setq-local qq-root--fill-column nil)
+  (add-hook 'window-size-change-functions
+            #'qq-root--on-window-size-change nil t)
+  (add-hook 'display-line-numbers-mode-hook
+            #'qq-root--on-window-size-change nil t)
+  (add-hook 'text-scale-mode-hook #'qq-root--on-text-scale-change nil t))
 
 (defun qq-root-open ()
   "Open the emacs-qq root buffer."
@@ -411,7 +463,31 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
       (unless (derived-mode-p 'qq-root-mode)
         (qq-root-mode))
       (qq-root-render))
-    (pop-to-buffer buffer)))
+    (pop-to-buffer buffer)
+    (with-current-buffer buffer
+      (qq-root--reflow-visible t))))
+
+(defun qq-root--reflow-visible (&optional force)
+  "Reflow root from its real display window when width changed.
+
+When FORCE is non-nil, rerender even when the measured width is unchanged so
+pixel-valued alignment follows text scaling."
+  (when (derived-mode-p 'qq-root-mode)
+    (when-let* ((win (or (qq-root--selected-window)
+                         (qq-root--display-window)))
+                (next (qq-root--compute-fill-column win)))
+      (when (or force (not (equal next qq-root--fill-column)))
+        (setq-local qq-root--fill-column next)
+        (qq-root-render)
+        t))))
+
+(defun qq-root--on-window-size-change (&optional _frame)
+  "Reflow a visible root buffer after its window geometry changes."
+  (qq-root--reflow-visible nil))
+
+(defun qq-root--on-text-scale-change ()
+  "Reflow a visible root buffer after text scaling changes."
+  (qq-root--reflow-visible t))
 
 (defun qq-root--cancel-rerender-timer ()
   "Cancel any pending debounced rerender for current root buffer."
