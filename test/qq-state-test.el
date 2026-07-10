@@ -20,7 +20,9 @@
    (should (equal (qq-state-session-key 'group "67890")
                   "group:67890"))
    (should (equal (qq-state-session-key 'dataline "device-1")
-                  "dataline:device-1"))))
+                  "dataline:device-1"))
+   (should (equal (qq-state-session-key 'service "u_mail")
+                  "service:u_mail"))))
 
 (ert-deftest qq-state-apply-recent-contacts-creates-session-summary ()
   (qq-test-with-reset
@@ -43,6 +45,38 @@
      (should (equal (alist-get 'last-message-id session) "42"))
      (should (equal (alist-get 'last-message-preview session)
                     "hello from napcat")))))
+
+(ert-deftest qq-state-apply-recent-contacts-creates-service-session ()
+  (qq-test-with-reset
+   (qq-state-apply-recent-contacts
+    '(((chatType . 103)
+       (peerUid . "u_mail")
+       (peerUin . "90002")
+       (remark . "")
+       (peerName . "QQ邮箱提醒")
+       (msgTime . "1710000100")
+       (msgId . "9007199254747004845")
+       (lastestMsg
+        (time . 1710000100)
+        (message_type . "private")
+        (chat_type . 103)
+        (peer_uid . "u_mail")
+        (peer_uin . "90002")
+        (user_id . 90002)
+        (sender . ((user_id . 90002)
+                   (nickname . "QQ邮箱提醒")))
+        (raw_message . "[CQ:mail]")
+        (message . (((type . "mail")
+                     (data . ((sender . "Henrik Lissner")
+                              (subject . "Re: Doom Emacs")
+                              (prompt . "Henrik Lissner: Re: Doom Emacs"))))))))))
+   (let ((session (qq-state-session "service:u_mail")))
+     (should (equal (alist-get 'title session) "QQ邮箱提醒"))
+     (should (equal (alist-get 'type session) 'service))
+     (should (equal (alist-get 'chat-type session) "103"))
+     (should (equal (alist-get 'peer-uid session) "u_mail"))
+     (should (equal (alist-get 'last-message-preview session)
+                    "Henrik Lissner: Re: Doom Emacs")))))
 
 (ert-deftest qq-state-apply-recent-contacts-keeps-dataline-sessions-distinct ()
   (qq-test-with-reset
@@ -230,6 +264,42 @@
      (should (equal (alist-get 'sender-name message) "我的手机"))
      (should-not (alist-get 'self-p message))
      (should (= (alist-get 'unread-count session) 1)))))
+
+(ert-deftest qq-state-live-service-message-routes-by-peer-uid ()
+  (qq-test-with-reset
+   (qq-state-merge-live-message
+    '((post_type . "message")
+      (message_type . "private")
+      (chat_type . 103)
+      (peer_uid . "u_mail")
+      (peer_uin . "90002")
+      (peer_name . "QQ邮箱提醒")
+      (message_id . "9007199254747004845")
+      (user_id . 90002)
+      (time . 1710000100)
+      (sender . ((user_id . 90002)
+                 (nickname . "QQ邮箱提醒")))
+      (raw_message . "[CQ:mail]")
+      (message . (((type . "mail")
+                   (data . ((sender . "Henrik Lissner")
+                            (subject . "Re: Doom Emacs")
+                            (prompt . "Henrik Lissner: Re: Doom Emacs"))))))))
+   (let* ((session (qq-state-session "service:u_mail"))
+          (message (car (qq-state-session-messages "service:u_mail"))))
+     (should (equal (alist-get 'title session) "QQ邮箱提醒"))
+     (should (equal (alist-get 'preview message)
+                    "Henrik Lissner: Re: Doom Emacs"))
+     (should (= (alist-get 'unread-count session) 1)))))
+
+(ert-deftest qq-state-mail-segment-preview-prefers-protocol-prompt ()
+  (should
+   (equal
+    (qq-state-message-preview-from-segments
+     '(((type . "mail")
+        (data . ((sender . "Henrik Lissner")
+                 (subject . "Re: Doom Emacs")
+                 (prompt . "Henrik Lissner: Re: Doom Emacs"))))))
+    "Henrik Lissner: Re: Doom Emacs")))
 
 (ert-deftest qq-state-live-message-ignores-empty-group-card-when-choosing-sender-name ()
   (qq-test-with-reset

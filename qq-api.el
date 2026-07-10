@@ -106,6 +106,10 @@ ERRBACK falls back to `qq-api--default-error'."
        `((chat_type . ,(or (alist-get 'chat-type session) 8))
          (peer_uid . ,(or (alist-get 'peer-uid session)
                           target-id))))
+      ('service
+       `((chat_type . ,(or (alist-get 'chat-type session) 103))
+         (peer_uid . ,(or (alist-get 'peer-uid session)
+                          target-id))))
       (_
        `((user_id . ,(or (alist-get 'peer-uin session)
                          target-id)))))))
@@ -144,6 +148,7 @@ ERRBACK receives (RESPONSE REASON)."
          (action (pcase type
                    ('group "get_group_msg_history")
                    ('dataline "get_peer_msg_history")
+                   ('service "get_peer_msg_history")
                    (_ "get_friend_msg_history")))
          (n (max 1 (or count qq-history-fetch-count)))
          (params (append
@@ -190,6 +195,11 @@ Used by chatbuf jump (telega `telega-msg-get') as a fallback after seek."
       ('dataline
        (append params
                `((chat_type . ,(or (alist-get 'chat-type session) 8))
+                 (peer_uid . ,(or (alist-get 'peer-uid session)
+                                  target-id)))))
+      ('service
+       (append params
+               `((chat_type . ,(or (alist-get 'chat-type session) 103))
                  (peer_uid . ,(or (alist-get 'peer-uid session)
                                   target-id)))))
       (_

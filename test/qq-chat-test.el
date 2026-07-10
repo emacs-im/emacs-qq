@@ -1522,6 +1522,29 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
            (equal second
                   (plist-get (disco-media-card-context-at-point) :payload))))))))
 
+(ert-deftest qq-chat-renders-structured-mail-segment ()
+  (let ((segment '((type . "mail")
+                   (data . ((sender . "Henrik Lissner")
+                            (subject . "Re: Doom Emacs")
+                            (content . "Closed the issue as completed.")
+                            (detail . "邮件详情")
+                            (url . "https://mail.qq.com/example")))))
+        opened-url)
+    (with-temp-buffer
+      (let ((inhibit-read-only t))
+        (cl-letf (((symbol-function 'browse-url)
+                   (lambda (url &optional _new-window)
+                     (setq opened-url url))))
+          (qq-chat--insert-mail-segment segment nil nil)
+          (should (string-match-p "Mail · Henrik Lissner" (buffer-string)))
+          (should (string-match-p "Re: Doom Emacs" (buffer-string)))
+          (should (string-match-p "Closed the issue as completed" (buffer-string)))
+          (should-not (string-match-p "com.tencent.template.public" (buffer-string)))
+          (goto-char (point-min))
+          (search-forward "邮件详情")
+          (button-activate (button-at (1- (point))))
+          (should (equal opened-url "https://mail.qq.com/example")))))))
+
 (provide (quote qq-chat-test))
 
 ;;; qq-chat-test.el ends here

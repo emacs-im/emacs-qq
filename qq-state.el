@@ -191,11 +191,16 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   "Return non-nil when CHAT-TYPE denotes a 移动设备 / DataLine 会话."
   (member (qq-state--normalize-id chat-type) '("8" "134")))
 
+(defun qq-state--service-chat-type-p (chat-type)
+  "Return non-nil when CHAT-TYPE is a public/service-account peer session."
+  (equal (qq-state--normalize-id chat-type) "103"))
+
 (defun qq-state--session-type-from-chat-type (chat-type)
   "Return session type symbol inferred from raw CHAT-TYPE."
   (cond
    ((equal (qq-state--normalize-id chat-type) "2") 'group)
    ((qq-state--dataline-chat-type-p chat-type) 'dataline)
+   ((qq-state--service-chat-type-p chat-type) 'service)
    (t 'private)))
 
 (defun qq-state-session-key (type target-id)
@@ -204,6 +209,7 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
           (pcase type
             ((or 'group "group") "group")
             ((or 'dataline "dataline") "dataline")
+            ((or 'service "service") "service")
             (_ "private"))
           (qq-state--normalize-id target-id)))
 
@@ -212,6 +218,7 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   (cond
    ((string-prefix-p "group:" session-key) 'group)
    ((string-prefix-p "dataline:" session-key) 'dataline)
+   ((string-prefix-p "service:" session-key) 'service)
    (t 'private)))
 
 (defun qq-state-session-key-target-id (session-key)
@@ -251,6 +258,12 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
             (alist-get 'peer-name session)
             (alist-get 'remark session))
            "我的手机"))
+      ('service
+       (or (qq-state--first-present-string
+            (alist-get 'peer-name session)
+            (alist-get 'remark session))
+           (qq-state--cached-private-title
+            (or (alist-get 'peer-uin session) target-id))))
       (_
        (qq-state--cached-private-title target-id)))))
 
@@ -412,6 +425,15 @@ reply chrome elsewhere).  Media becomes short placeholders like
                     "file")))
           ("record" "[voice]")
           ("video" "[video]")
+          ("mail"
+           (or (qq-state--present-string (alist-get 'prompt data))
+               (let ((parts (delq nil
+                                  (list (qq-state--present-string
+                                         (alist-get 'sender data))
+                                        (qq-state--present-string
+                                         (alist-get 'subject data))))))
+                 (and parts (string-join parts ": ")))
+               "[mail]"))
           ("json" "[card]")
           ("xml" "[xml]")
           ("poke" "[poke]")
@@ -557,6 +579,10 @@ in the UI — that is wire format, not display text."
                   ((qq-state--dataline-chat-type-p chat-type))
                   (peer-uid (qq-state--message-peer-uid message)))
         (qq-state-session-key 'dataline peer-uid))
+      (when-let* ((chat-type (qq-state--message-chat-type message))
+                  ((qq-state--service-chat-type-p chat-type))
+                  (peer-uid (qq-state--message-peer-uid message)))
+        (qq-state-session-key 'service peer-uid))
       (pcase (alist-get 'message_type message)
         ("group"
          (qq-state-session-key 'group (alist-get 'group_id message)))
@@ -609,7 +635,9 @@ in the UI — that is wire format, not display text."
                   (self-p 'sent)
                   (t 'received)))
          (time (qq-state--normalize-time (alist-get 'time message)))
-         (target-id (or (and (qq-state--dataline-chat-type-p chat-type) peer-uid)
+         (target-id (or (and (or (qq-state--dataline-chat-type-p chat-type)
+                                 (qq-state--service-chat-type-p chat-type))
+                             peer-uid)
                         (qq-state--normalize-id (alist-get 'target_id message)))))
     `((id . ,server-id)
       (server-id . ,server-id)
@@ -847,7 +875,16 @@ Return three values via `cl-values':
       (push merged messages))
     (setq messages (qq-state--sort-messages messages))
     (puthash session-key messages qq-state--messages-by-session)
-    (qq-state-upsert-session session-key nil nil)
+    (qq-state-upsert-session
+     session-key
+     (delq nil
+           (list (and (alist-get 'peer-name merged)
+                      (cons 'peer-name (alist-get 'peer-name merged)))
+                 (and (alist-get 'peer-uid merged)
+                      (cons 'peer-uid (alist-get 'peer-uid merged)))
+                 (and (alist-get 'peer-uin merged)
+                      (cons 'peer-uin (alist-get 'peer-uin merged)))))
+     nil)
     (qq-state--index-message merged)
     (qq-state--sync-session-summary session-key)
     (when (and count-unread
@@ -1040,7 +1077,7 @@ Keeps the row so the chat view can hide it (default) or show a stub when
            (type (qq-state--session-type-from-chat-type chat-type))
            (peer-uid (qq-state--normalize-id (alist-get 'peerUid contact)))
            (peer-uin (qq-state--normalize-id (alist-get 'peerUin contact)))
-           (target-id (if (eq type 'dataline)
+           (target-id (if (memq type '(dataline service))
                           (or peer-uid peer-uin)
                         peer-uin))
            (session-key (qq-state-session-key type target-id))

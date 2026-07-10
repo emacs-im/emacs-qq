@@ -2115,6 +2115,46 @@ base emoji), never as OneBot CQ text."
         (or (qq-chat--face-segment-id segment) "?")))
       (_ nil))))
 
+(defun qq-chat--mail-segment-p (segment)
+  "Return non-nil when SEGMENT is a structured QQ Mail notification."
+  (equal (alist-get 'type segment) "mail"))
+
+(defun qq-chat--insert-mail-segment (segment prefix-state properties)
+  "Insert structured QQ Mail SEGMENT as a compact card."
+  (let* ((data (alist-get 'data segment))
+         (sender (alist-get 'sender data))
+         (subject (alist-get 'subject data))
+         (content (alist-get 'content data))
+         (prompt (alist-get 'prompt data))
+         (detail (or (alist-get 'detail data) "Open Mail"))
+         (url (alist-get 'url data))
+         (qq-ui-card-indent-prefix-state prefix-state)
+         (card-prefix-state (qq-ui-card-prefix-state)))
+    (qq-ui-insert-prefixed-lines
+     card-prefix-state
+     (if (and (stringp sender) (not (string-empty-p sender)))
+         (format "Mail · %s" sender)
+       "Mail")
+     :face 'bold
+     :properties properties)
+    (when (and (stringp subject) (not (string-empty-p subject)))
+      (qq-ui-insert-prefixed-lines
+       card-prefix-state subject :properties properties))
+    (when-let* ((body (cond
+                       ((and (stringp content) (not (string-empty-p content))) content)
+                       ((and (stringp prompt) (not (string-empty-p prompt))) prompt))))
+      (qq-ui-insert-prefixed-lines
+       card-prefix-state body :face 'shadow :properties properties))
+    (when (and (stringp url) (not (string-empty-p url)))
+      (let ((start (point)))
+        (qq-ui-insert-action-button
+         (format "[%s]" detail)
+         (lambda () (browse-url url t))
+         :help-echo "Open this message in QQ Mail")
+        (insert "\n")
+        (qq-ui-apply-line-prefix start (point) card-prefix-state)
+        (add-text-properties start (point) properties)))))
+
 (defun qq-chat--media-segment-p (segment)
   "Return non-nil when SEGMENT should render as a media block."
   (member (alist-get 'type segment)
@@ -2282,6 +2322,9 @@ Keep this short — size is useful; internal sub_type / emoji ids are not."
           (let ((type (alist-get 'type segment)))
             (unless (equal type "reply")
               (cond
+               ((qq-chat--mail-segment-p segment)
+                (flush-inline)
+                (qq-chat--insert-mail-segment segment prefix-state properties))
                ((qq-chat--media-segment-p segment)
                 (flush-inline)
                 (qq-chat--insert-segment-media-line segment prefix-state properties))
@@ -2336,6 +2379,11 @@ on the first inline line when the body is pure inline content."
           (let ((type (alist-get 'type segment)))
             (unless (equal type "reply")
               (cond
+               ((qq-chat--mail-segment-p segment)
+                (flush-inline nil)
+                (setq saw-block t)
+                (qq-chat--insert-mail-segment
+                 segment prefix-state properties))
                ((qq-chat--media-segment-p segment)
                 (flush-inline nil)
                 (setq saw-block t)
