@@ -14,6 +14,7 @@
 (depends-on "emacs" "27.1")
 (depends-on "websocket" "1.16")
 (depends-on "transient" "0.3")
+(depends-on "plz" "0.8")
 (depends-on "disco" :file "../disco.el")
 
 ;; `depends-on :file' installs a snapshot and skips it once installed.  Disco

@@ -11,6 +11,7 @@
 
 (require 'image-mode)
 (require 'json)
+(require 'plz)
 (require 'seq)
 (require 'subr-x)
 (require 'url-handlers)
@@ -47,15 +48,23 @@
 (defvar qq-media--remote-image-plz-queue-limit nil
   "Last applied queue limit for `qq-media--remote-image-plz-queue'.")
 
+(defvar qq-media--file-plz-queue nil
+  "Shared plz queue used for large QQ file downloads.")
+
 (defun qq-media-clear-cache ()
   "Clear cached resource metadata and disk-backed remote image cache."
   (interactive)
+  (when qq-media--remote-image-plz-queue
+    (plz-clear qq-media--remote-image-plz-queue))
+  (when qq-media--file-plz-queue
+    (plz-clear qq-media--file-plz-queue))
   (clrhash qq-media--resource-cache)
   (clrhash qq-media--image-cache)
   (clrhash qq-media--fetching-cache)
   (clrhash qq-media--download-state-table)
   (setq qq-media--remote-image-plz-queue nil)
   (setq qq-media--remote-image-plz-queue-limit nil)
+  (setq qq-media--file-plz-queue nil)
   (when (file-directory-p qq-media-cache-directory)
     (ignore-errors (delete-directory qq-media-cache-directory t)))
   (message "qq: media cache cleared"))
@@ -173,6 +182,12 @@ filters can call this outside a safe redisplay context; immediate
       (setq qq-media--remote-image-plz-queue-limit limit))
     qq-media--remote-image-plz-queue))
 
+(defun qq-media--file-ensure-queue ()
+  "Return the bounded queue used for file downloads."
+  (unless qq-media--file-plz-queue
+    (setq qq-media--file-plz-queue (make-plz-queue :limit 3)))
+  qq-media--file-plz-queue)
+
 (defun qq-media--prefer-remote-image-resource-p (key resource)
   "Return non-nil when RESOURCE at KEY should prefer remote image refresh.
 
@@ -260,7 +275,8 @@ non-preview resource path."
                       (let ((coding-system-for-write 'binary))
                         (write-region (point-min) (point-max) target-file nil 'silent)))
                     (setq image (funcall builder target-file spec))
-                    (qq-media--finish-resource-image-fetch key target-file image resource)))
+                    (qq-media--finish-resource-image-fetch
+                     key target-file image resource)))
                 :else
                 (lambda (_err)
                   (qq-media--finish-resource-image-fetch key nil nil resource)))
@@ -302,7 +318,8 @@ resource alist.  SPEC is forwarded to IMAGE-BUILDER, which defaults to
             (funcall
              fetcher
              (lambda (fetched-resource)
-               (let* ((resource* (qq-media--cache-resource key fetched-resource))
+               (when (gethash key qq-media--fetching-cache)
+                 (let* ((resource* (qq-media--cache-resource key fetched-resource))
                       (original-file* (and resource* (alist-get 'file resource*)))
                       (file* (and resource* (qq-media--resource-image-file key resource*))))
                  (cond
@@ -324,9 +341,10 @@ resource alist.  SPEC is forwarded to IMAGE-BUILDER, which defaults to
                     key resource* spec builder))
                   (t
                    (qq-media--finish-resource-image-fetch
-                    key nil nil resource*)))))
+                    key nil nil resource*))))))
              (lambda (_response _reason)
-               (qq-media--finish-resource-image-fetch key nil nil nil)))
+               (when (gethash key qq-media--fetching-cache)
+                 (qq-media--finish-resource-image-fetch key nil nil nil))))
             nil))))))
 
 (defun qq-media--resource-fetching-p (key)
@@ -903,8 +921,52 @@ opening it.  GIFs opened in Emacs start looping automatically."
               (qq-media--cache-resource cache-key resource))
             target))))))
 
-(defun qq-media--cache-file-resource-for-open (resource cache-key)
-  "Download non-image RESOURCE into disk cache and return its local path."
+(defun qq-media--async-error-text (error-data)
+  "Return a readable message for asynchronous ERROR-DATA."
+  (condition-case nil
+      (error-message-string error-data)
+    (error (format "%s" error-data))))
+
+(defun qq-media--copy-or-download-resource-to-async
+    (resource target success error)
+  "Copy or download RESOURCE into TARGET, then call SUCCESS or ERROR.
+
+Remote URLs are streamed by curl through plz instead of blocking the Emacs
+main thread or materializing the complete file in an Emacs buffer."
+  (let ((file (alist-get 'file resource))
+        (url (alist-get 'url resource)))
+    (condition-case err
+        (progn
+          (make-directory
+           (or (file-name-directory target) qq-media-download-directory) t)
+          (cond
+           ((qq-media-file-present-p file)
+            (unless (and (fboundp 'file-equal-p)
+                         (file-exists-p target)
+                         (file-equal-p file target))
+              (copy-file file target t))
+            (funcall success target))
+           ((qq-media-url-present-p url)
+            (let ((queue (qq-media--file-ensure-queue)))
+              (plz-queue
+                queue 'get url
+                :as `(file ,target)
+                :noquery t
+                :then (lambda (_file) (funcall success target))
+                :else (lambda (download-error)
+                        (funcall error
+                                 (qq-media--async-error-text download-error))))
+              (plz-run queue)))
+           (t
+            (funcall error "resource has neither local file nor URL"))))
+      (error
+       (funcall error (error-message-string err))))))
+
+(defun qq-media--cache-file-resource-for-open
+    (resource cache-key callback errback)
+  "Resolve non-image RESOURCE into disk cache for CALLBACK.
+
+ERRBACK receives a readable error string."
   (let* ((url (alist-get 'url resource))
          (name (qq-media--sanitize-filename
                 (or (qq-media--resource-name resource) "qq-media.bin")))
@@ -913,15 +975,16 @@ opening it.  GIFs opened in Emacs start looping automatically."
          (target (expand-file-name
                   (format "%s-%s" (substring (md5 key) 0 10) name)
                   directory)))
-    (unless (qq-media-url-present-p url)
-      (user-error "qq: resource has no URL"))
-    (unless (qq-media-file-present-p target)
-      (make-directory directory t)
-      (url-copy-file url target t))
-    (setf (alist-get 'file resource nil nil #'eq) target)
-    (when cache-key
-      (qq-media--cache-resource cache-key resource))
-    target))
+    (if (qq-media-file-present-p target)
+        (funcall callback target)
+      (qq-media--copy-or-download-resource-to-async
+       resource target
+       (lambda (file)
+         (setf (alist-get 'file resource nil nil #'eq) file)
+         (when cache-key
+           (qq-media--cache-resource cache-key resource))
+         (funcall callback file))
+       errback))))
 
 (defun qq-media-open-resource (resource &optional kind cache-key)
   "Open RESOURCE according to semantic KIND.
@@ -947,10 +1010,14 @@ existing QQ media resource cache."
             file
           (qq-media--cache-image-resource-for-open resource cache-key))))
       (_
-       (qq-media-open-file
-        (if (qq-media-file-present-p file)
-            file
-          (qq-media--cache-file-resource-for-open resource cache-key)))))))
+       (if (qq-media-file-present-p file)
+           (qq-media-open-file file)
+         (message "qq: downloading media…")
+         (qq-media--cache-file-resource-for-open
+          resource cache-key
+          #'qq-media-open-file
+          (lambda (reason)
+            (message "qq: failed to open media: %s" reason))))))))
 
 (defun qq-media-segment-default-save-name (segment)
   "Return default filename for saving SEGMENT locally."
@@ -1029,25 +1096,6 @@ existing QQ media resource cache."
      ((qq-media-file-present-p preview-file) preview-file)
      (t nil))))
 
-(defun qq-media--copy-or-download-resource-to (resource target)
-  "Copy RESOURCE into TARGET, downloading from URL when needed."
-  (let ((file (alist-get 'file resource))
-        (url (alist-get 'url resource)))
-    (make-directory (or (file-name-directory target) qq-media-download-directory) t)
-    (cond
-     ((qq-media-file-present-p file)
-      (if (and (fboundp 'file-equal-p)
-               (file-exists-p target)
-               (file-equal-p file target))
-          target
-        (copy-file file target t)
-        target))
-     ((qq-media-url-present-p url)
-      (url-copy-file url target t)
-      target)
-     (t
-      (error "resource has neither local file nor URL")))))
-
 (defun qq-media-segment-start-download (segment &optional open-after)
   "Download SEGMENT into `qq-media-download-directory'."
   (let* ((capabilities (qq-media-segment-capabilities segment))
@@ -1075,21 +1123,25 @@ existing QQ media resource cache."
        segment
        (lambda (resource)
          (condition-case err
-             (progn
-               (qq-media--copy-or-download-resource-to resource path)
+             (qq-media--copy-or-download-resource-to-async
+              resource path
+              (lambda (_file)
                (qq-media--put-segment-download-state
                 segment
                 (plist-put (plist-put (plist-put entry :status 'downloaded) :error nil) :path path))
                (message "qq: downloaded media -> %s" path)
                (when open-after
                  (qq-media-segment-open-local segment)))
+              (lambda (reason)
+                (qq-media--put-segment-download-state
+                 segment
+                 (plist-put (plist-put (plist-put entry :status 'error)
+                                       :error reason)
+                            :path path))
+                (message "qq: media download failed: %s" reason)))
            (error
-            (qq-media--put-segment-download-state
-             segment
-             (plist-put (plist-put (plist-put entry :status 'error)
-                                   :error (error-message-string err))
-                        :path path))
-            (message "qq: media download failed: %s" (error-message-string err)))))
+           (message "qq: media download setup failed: %s"
+                     (error-message-string err)))))
        (lambda (_response reason)
          (qq-media--put-segment-download-state
           segment
@@ -1130,13 +1182,11 @@ existing QQ media resource cache."
           (qq-media-resolve-segment-resource
            segment
            (lambda (resource)
-             (condition-case copy-err
-                 (progn
-                   (qq-media--copy-or-download-resource-to resource target)
-                   (message "qq: saved media -> %s" target))
-               (error
-                (message "qq: failed to save media: %s"
-                         (error-message-string copy-err)))))
+             (qq-media--copy-or-download-resource-to-async
+              resource target
+              (lambda (_file) (message "qq: saved media -> %s" target))
+              (lambda (reason)
+                (message "qq: failed to save media: %s" reason))))
            (lambda (_response reason)
              (message "qq: failed to save media: %s" reason))))
       (error

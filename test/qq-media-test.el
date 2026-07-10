@@ -52,6 +52,19 @@
     (should-not (file-exists-p cache-file))
     (should-not (file-directory-p qq-media-cache-directory))))
 
+(ert-deftest qq-media-clear-cache-cancels-active-download-queues ()
+  (let ((qq-media--remote-image-plz-queue 'image-queue)
+        (qq-media--file-plz-queue 'file-queue)
+        cleared)
+    (cl-letf (((symbol-function 'plz-clear)
+               (lambda (queue) (push queue cleared))))
+      (qq-media-clear-cache)
+      (should (= (length cleared) 2))
+      (should (memq 'image-queue cleared))
+      (should (memq 'file-queue cleared))
+      (should-not qq-media--remote-image-plz-queue)
+      (should-not qq-media--file-plz-queue))))
+
 (ert-deftest qq-media-ensure-resource-image-starts-remote-download-for-url-only-resource ()
   (qq-media-test-with-reset
    (let (started-key started-resource started-spec)
@@ -617,6 +630,31 @@
        (qq-media-open-resource
        '((url . "https://example.com/movie.mp4")) 'video)
        :type 'user-error))))
+
+(ert-deftest qq-media-remote-file-download-streams-asynchronously-with-plz ()
+  (let ((qq-media--file-plz-queue nil)
+        queued-properties
+        success-value
+        failure)
+    (cl-letf (((symbol-function 'make-plz-queue) (lambda (&rest _) 'queue))
+              ((symbol-function 'plz-run) #'ignore)
+              ((symbol-function 'plz-queue)
+               (lambda (&rest arguments)
+                 (setq queued-properties (nthcdr 3 arguments))))
+              ((symbol-function 'url-copy-file)
+               (lambda (&rest _)
+                 (ert-fail "large file downloads must not block on url-copy-file"))))
+      (qq-media--copy-or-download-resource-to-async
+       '((url . "https://example.com/report.pdf"))
+       "/tmp/qq-report.pdf"
+       (lambda (file) (setq success-value file))
+       (lambda (reason) (setq failure reason)))
+      (should-not success-value)
+      (should-not failure)
+      (should (equal (plist-get queued-properties :as)
+                     '(file "/tmp/qq-report.pdf")))
+      (funcall (plist-get queued-properties :then) "/tmp/qq-report.pdf")
+      (should (equal success-value "/tmp/qq-report.pdf")))))
 
 (ert-deftest qq-media-open-video-file-segment-delegates-to-player ()
   "An mp4 delivered as a file segment still takes the video-player path."
