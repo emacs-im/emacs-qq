@@ -20,6 +20,7 @@
 (require 'qq-chat)
 (require 'qq-state)
 (require 'qq-ui)
+(require 'qq-view)
 
 (declare-function qq-api-get-forward
                   "qq-api" (source callback &optional errback))
@@ -579,51 +580,17 @@ forwarded message is written to or looked up in `qq-state'."
       (and (> (point) (point-min))
            (get-text-property (1- (point)) 'qq-forward-entry-index))))
 
-(defun qq-forward--capture-view-state ()
-  "Capture entry-relative point and window-starts for local mutations.
+(defun qq-forward--mutate-preserving-view (mutator &optional after-restore)
+  "Run MUTATOR while preserving entry-relative point via `qq-view'.
 
-Mirrors the intent of `telega-save-cursor' / qq-chat's preserve helpers:
-restore by semantic entry index + offset, not absolute buffer positions."
-  (let* ((old-index (qq-forward--current-entry-index))
-         (old-entry-start
-          (and (integerp old-index)
-               (alist-get old-index (qq-forward--entry-positions))))
-         (old-offset (and old-entry-start
-                          (max 0 (- (point) old-entry-start)))))
-    (list :index old-index
-          :offset old-offset
-          :window-starts
-          (mapcar (lambda (win)
-                    (cons win (window-start win)))
-                  (get-buffer-window-list (current-buffer) nil t)))))
-
-(defun qq-forward--restore-view-state (state)
-  "Restore point and window-starts from STATE.
-
-STATE is produced by `qq-forward--capture-view-state'."
-  (let* ((old-index (plist-get state :index))
-         (old-offset (plist-get state :offset))
-         (positions (qq-forward--entry-positions))
-         (entry-start (and (integerp old-index)
-                           (alist-get old-index positions)))
-         (next-start
-          (and (integerp old-index)
-               (or (alist-get (1+ old-index) positions)
-                   (point-max)))))
-    (cond
-     ((and entry-start (integerp old-offset))
-      (goto-char (min (+ entry-start old-offset)
-                      (max entry-start (1- (or next-start (point-max)))))))
-     ((integerp old-index)
-      (qq-forward--goto-entry old-index)))
-    (dolist (cell (plist-get state :window-starts))
-      (when-let* ((win (car cell))
-                  ((window-live-p win))
-                  (start (cdr cell))
-                  ((and (integerp start)
-                        (>= start (point-min))
-                        (<= start (point-max)))))
-        (set-window-start win start t)))))
+Uses disco-view through the qq-view aliases (same path as qq-chat), with
+`qq-forward-entry-index' as the semantic anchor.  Do not reimplement
+telega-save-cursor here."
+  (qq-view-render-preserving-position
+   mutator
+   :anchor-property 'qq-forward-entry-index
+   :preserve-window-start t
+   :after-restore after-restore))
 
 (defun qq-forward--rebuild-media-index ()
   "Rebuild media-key -> entry-index table for the current forward viewer."
@@ -678,32 +645,30 @@ buffer."
   "Redisplay entry INDEXES without a full buffer erase.
 
 High indexes are processed first so earlier entry bounds remain valid while
-regions are replaced.  Point and window-start are restored via entry-relative
-offsets (telega-save-cursor spirit)."
+regions are replaced.  Point/window are restored through `qq-view'
+(disco-view).  After a real mutation, force-window-update like telega media
+callbacks."
   (let* ((indexes (sort (delete-dups (delq nil (copy-sequence indexes))) #'<))
-         (view (qq-forward--capture-view-state))
-         (inhibit-read-only t)
          changed)
     (when indexes
-      (save-excursion
-        (dolist (index (reverse indexes))
-          (when (qq-forward--redisplay-entry index)
-            (setq changed t))))
-      (when changed
-        (qq-forward--restore-view-state view)
-        ;; telega: after media image mutation, force window update so the new
-        ;; image/spec is painted without waiting for the next user command.
-        (force-window-update (current-buffer)))
+      (qq-forward--mutate-preserving-view
+       (lambda ()
+         (let ((inhibit-read-only t))
+           (save-excursion
+             (dolist (index (reverse indexes))
+               (when (qq-forward--redisplay-entry index)
+                 (setq changed t))))))
+       (lambda ()
+         (when changed
+           (force-window-update (current-buffer)))))
       changed)))
 
-(defun qq-forward--render ()
-  "Render the current `qq-forward-mode' buffer from buffer-local state.
+(defun qq-forward--render-body ()
+  "Erase and redraw the current forward viewer from buffer-local state.
 
-Full erase is reserved for initial load, refresh, and structural state
-changes.  Media cache ticks must use `qq-forward--redisplay-entries'
-instead — full rebuilds are what made C-n/C-p feel hard-snapped."
-  (let* ((view (qq-forward--capture-view-state))
-         (inhibit-read-only t))
+Caller is responsible for view preservation via
+`qq-forward--mutate-preserving-view'."
+  (let ((inhibit-read-only t))
     (erase-buffer)
     (insert (propertize "Chat History\n" 'face 'bold))
     (insert (propertize
@@ -728,8 +693,17 @@ instead — full rebuilds are what made C-n/C-p feel hard-snapped."
       (cl-loop for message in qq-forward--messages
                for index from 0
                do (qq-forward--insert-message message index))))
-    (qq-forward--rebuild-media-index)
-    (qq-forward--restore-view-state view)))
+    (qq-forward--rebuild-media-index)))
+
+(defun qq-forward--render ()
+  "Render the current `qq-forward-mode' buffer from buffer-local state.
+
+Full erase is reserved for initial load, refresh, and structural state
+changes.  Media cache ticks must use `qq-forward--redisplay-entries'
+instead — full rebuilds are what made C-n/C-p feel hard-snapped.
+
+View preservation goes through disco-view (`qq-view'), not a local fork."
+  (qq-forward--mutate-preserving-view #'qq-forward--render-body))
 
 (defun qq-forward--request-valid-p (buffer source generation)
   "Return non-nil when async result still belongs to BUFFER and GENERATION."
