@@ -142,6 +142,15 @@ available via `C-c ?' / `describe-mode'."
   :type 'boolean
   :group 'qq)
 
+(defcustom qq-chat-auto-fill-margin-columns 1
+  "Additional right margin columns used for chat timeline alignment.
+
+This mirrors `telega-chat-auto-fill-margin-columns' and keeps right-aligned
+timestamps clear of the window edge while zooming or resizing."
+  :type '(choice (const :tag "No additional margin" nil)
+                 (integer :tag "Additional margin columns"))
+  :group 'qq)
+
 ;; Faces mirror telega-msg-* defaults (not a visual clone of every palette
 ;; trick).  Keep them ordinary so theming stays familiar.
 

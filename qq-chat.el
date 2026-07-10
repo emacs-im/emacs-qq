@@ -91,6 +91,9 @@ Non-nil means we currently advertise typing via `set_input_status'.")
 (defvar-local qq-chat--rendering nil
   "Non-nil while the chat buffer is being rendered.")
 
+(defvar-local qq-chat--fill-column nil
+  "Cached telega-style timeline width for the active chat window.")
+
 (defconst qq-chat--empty-placeholder :qq-chat-empty-placeholder
   "Sentinel EWOC payload used for the empty timeline note.")
 
@@ -294,10 +297,38 @@ of the default chrome."
       (format-time-string "%H:%M" (seconds-to-time timestamp))
     ""))
 
+(defun qq-chat--render-window ()
+  "Return the best live window currently displaying this chat buffer."
+  (or (and (eq (window-buffer (selected-window)) (current-buffer))
+           (selected-window))
+      (let ((best nil)
+            (best-width -1))
+        (dolist (win (get-buffer-window-list (current-buffer) nil t) best)
+          (let ((width (if (window-live-p win)
+                           (window-width win 'remap)
+                         -1)))
+            (when (> width best-width)
+              (setq best win
+                    best-width width)))))))
+
+(defun qq-chat--compute-fill-column (&optional window)
+  "Compute telega-style timeline width for WINDOW."
+  (disco-view-window-fill-column
+   (or window (qq-chat--render-window))
+   qq-chat-auto-fill-margin-columns))
+
+(defun qq-chat--update-fill-column (&optional window)
+  "Refresh and return the cached timeline width for WINDOW."
+  (when-let* ((width (qq-chat--compute-fill-column window)))
+    (setq-local qq-chat--fill-column width)
+    width))
+
 (defun qq-chat--line-fill-column ()
   "Return the usable timeline width for the current chat buffer."
-  (or (and (window-live-p (get-buffer-window (current-buffer) t))
-           (window-body-width (get-buffer-window (current-buffer) t)))
+  (or (and (integerp qq-chat--fill-column)
+           (> qq-chat--fill-column 0)
+           qq-chat--fill-column)
+      (qq-chat--update-fill-column)
       (and (integerp fill-column) (> fill-column 0) fill-column)
       80))
 
@@ -1719,6 +1750,39 @@ otherwise restore message position by semantic anchor."
           (buffer-undo-list t))
       (save-excursion
         (ewoc-invalidate qq-chat--ewoc node)))))
+
+(defun qq-chat--refresh-timeline-layout ()
+  "Refresh all timeline nodes once after display geometry changes."
+  (when qq-chat--ewoc
+    (qq-chat--mutate-timeline-preserving-point
+     (lambda ()
+       (let ((qq-chat--rendering t)
+             (inhibit-read-only t)
+             (buffer-undo-list t))
+         (ewoc-refresh qq-chat--ewoc))))))
+
+(defun qq-chat--on-window-size-change (&optional _frame)
+  "Recompute chat width and refresh the timeline after window resizing."
+  (when (eq major-mode 'qq-chat-mode)
+    (when-let* ((win (qq-chat--render-window))
+                (next (qq-chat--compute-fill-column win)))
+      (when (and (> next 15)
+                 (not (equal next qq-chat--fill-column)))
+        (setq-local qq-chat--fill-column next
+                    fill-column next)
+        (qq-chat--refresh-timeline-layout)))))
+
+(defun qq-chat--on-text-scale-change ()
+  "Recompute pixel alignment and refresh after `text-scale-mode' changes."
+  (when (eq major-mode 'qq-chat-mode)
+    ;; Even an unchanged column count needs fresh pixel-valued :align-to
+    ;; spacers because the remapped character width changed.
+    (setq-local qq-chat--fill-column nil)
+    (when-let* ((win (qq-chat--render-window))
+                (next (qq-chat--compute-fill-column win)))
+      (setq-local qq-chat--fill-column next
+                  fill-column next))
+    (qq-chat--refresh-timeline-layout)))
 
 (defun qq-chat--redisplay-message-anchors-preserving-point (anchors)
   "Redisplay ANCHORS using single-node EWOC invalidation."
@@ -3712,6 +3776,7 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (setq-local qq-chat--marked-message-anchors nil)
   (setq-local qq-chat--forward-request-active-p nil)
   (setq-local qq-chat--rendering nil)
+  (setq-local qq-chat--fill-column nil)
   (setq-local qq-chat--ewoc nil)
   (setq-local qq-chat--empty-node nil)
   (setq-local qq-chat--message-node-table (make-hash-table :test #'equal))
@@ -3733,6 +3798,11 @@ Attach from clipboard with `C-c C-v' (telega-style)."
                (qq-chat--yank-media mime-type data nil))))
   (add-hook 'after-change-functions #'qq-chat--after-change nil t)
   (add-hook 'post-command-hook #'qq-chat--post-command nil t)
+  (add-hook 'window-size-change-functions
+            #'qq-chat--on-window-size-change nil t)
+  (add-hook 'display-line-numbers-mode-hook
+            #'qq-chat--on-window-size-change nil t)
+  (add-hook 'text-scale-mode-hook #'qq-chat--on-text-scale-change nil t)
   (qq-chat--update-context-mode))
 
 (defun qq-chat--initial-history-request-current-p
@@ -3837,7 +3907,9 @@ first unread message."
       (qq-chat-render)
       (goto-char (or (qq-chat--input-logical-end-position) (point-max)))
       (qq-chat--load-initial-history buffer session-key))
-    (pop-to-buffer buffer)))
+    (pop-to-buffer buffer)
+    (with-current-buffer buffer
+      (qq-chat--on-window-size-change))))
 
 (defun qq-chat--merge-deferred-node-anchors (anchors)
   "Merge ANCHORS into deferred node redisplay state for current buffer."

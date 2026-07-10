@@ -1726,6 +1726,43 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
                                    (string-width
                                     (qq-chat--format-time 1710000001))))))))))
 
+(ert-deftest qq-chat-window-resize-refreshes-layout-only-when-width-changes ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (setq qq-chat--fill-column 70)
+    (let ((win (selected-window))
+          (refresh-count 0))
+      (cl-letf (((symbol-function 'qq-chat--render-window) (lambda () win))
+                ((symbol-function 'qq-chat--compute-fill-column)
+                 (lambda (&optional candidate)
+                   (should (eq candidate win))
+                   90))
+                ((symbol-function 'qq-chat--refresh-timeline-layout)
+                 (lambda () (cl-incf refresh-count))))
+        (qq-chat--on-window-size-change)
+        (should (= qq-chat--fill-column 90))
+        (should (= fill-column 90))
+        (should (= refresh-count 1))
+        (qq-chat--on-window-size-change)
+        (should (= refresh-count 1))))))
+
+(ert-deftest qq-chat-text-scale-refreshes-pixel-alignment-at-same-width ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (setq qq-chat--fill-column 90)
+    (let ((win (selected-window))
+          (refresh-count 0))
+      (cl-letf (((symbol-function 'qq-chat--render-window) (lambda () win))
+                ((symbol-function 'qq-chat--compute-fill-column)
+                 (lambda (&optional candidate)
+                   (should (eq candidate win))
+                   90))
+                ((symbol-function 'qq-chat--refresh-timeline-layout)
+                 (lambda () (cl-incf refresh-count))))
+        (qq-chat--on-text-scale-change)
+        (should (= qq-chat--fill-column 90))
+        (should (= refresh-count 1))))))
+
 (ert-deftest qq-chat-timeline-inserts-explicit-newer-history-gap ()
   (with-temp-buffer
     (qq-chat-mode)
