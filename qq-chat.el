@@ -2614,9 +2614,23 @@ base emoji), never as OneBot CQ text."
         (data (alist-get 'data segment)))
     (pcase type
       ("text" (or (alist-get 'text data) ""))
-      ("at" (concat "@" (or (alist-get 'name data)
-                            (alist-get 'qq data)
-                            "mention")))
+      ("at"
+       (let* ((target (and (alist-get 'qq data)
+                           (format "%s" (alist-get 'qq data))))
+              (kind (cond
+                     ((equal target "all") 'at-all)
+                     ((and target
+                           (equal target (qq-state-self-user-id))) 'at-me)
+                     (t 'ordinary)))
+              (label (or (alist-get 'name data)
+                         (and (eq kind 'at-all) "全体成员")
+                         target
+                         "mention")))
+         (propertize (concat "@" label)
+                     'face (if (memq kind '(at-me at-all))
+                               'qq-msg-mention-self
+                             'qq-msg-mention)
+                     'qq-chat-mention-kind kind)))
       ("__unsupported"
        (qq-state-message-preview-from-segments (list segment)))
       ("face"

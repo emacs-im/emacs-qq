@@ -28,6 +28,7 @@
 (require 'qq-user)
 (require 'qq-root)
 (require 'qq-transient)
+(require 'qq-notifications)
 
 ;;;###autoload
 (defun qq ()

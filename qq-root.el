@@ -164,20 +164,37 @@ of accidentally borrowing the selected chat window."
   "Return non-nil when SESSION has QQ message notifications muted."
   (eq (alist-get 'muted-p session) t))
 
+(defun qq-root--session-mention-kinds (session)
+  "Return unread native mention kinds represented by SESSION."
+  (delq nil
+        (list (and (or (alist-get 'unread-at-me-message-id session)
+                       (alist-get 'unread-at-me-message-seq session))
+                   'at-me)
+              (and (or (alist-get 'unread-at-all-message-id session)
+                       (alist-get 'unread-at-all-message-seq session))
+                   'at-all))))
+
 (defun qq-root--session-important-unread-p (session)
-  "Return non-nil when SESSION has unread messages that are not muted."
+  "Return non-nil when SESSION has unmuted unread or an unread mention."
   (and (> (or (alist-get 'unread-count session) 0) 0)
-       (not (qq-root--session-muted-p session))))
+       (or (not (qq-root--session-muted-p session))
+           (qq-root--session-mention-kinds session))))
 
 (defun qq-root--session-badge (session)
   "Return root activity badge for SESSION, including trailing space."
-  (let ((unread (or (alist-get 'unread-count session) 0)))
-    (cond
-     ((and (qq-root--session-muted-p session) (> unread 0))
-      (format "[mute:%d] " unread))
-     ((qq-root--session-muted-p session) "[mute] ")
-     ((> unread 0) (format "[%d] " unread))
-     (t ""))))
+  (let* ((unread (or (alist-get 'unread-count session) 0))
+         (mentions (qq-root--session-mention-kinds session))
+         (mention-badge
+          (concat (when (memq 'at-me mentions) "[@] ")
+                  (when (memq 'at-all mentions) "[@all] ")))
+         (unread-badge
+          (cond
+           ((and (qq-root--session-muted-p session) (> unread 0))
+            (format "[mute:%d] " unread))
+           ((qq-root--session-muted-p session) "[mute] ")
+           ((> unread 0) (format "[%d] " unread))
+           (t ""))))
+    (concat mention-badge unread-badge)))
 
 (defun qq-root--session-icon-face (session)
   "Return fallback icon face for SESSION."

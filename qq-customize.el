@@ -159,6 +159,54 @@ This mirrors `telega-root-auto-fill-margin-columns'."
                  (integer :tag "Additional margin columns"))
   :group 'qq)
 
+(defgroup qq-notifications nil
+  "Desktop notifications for emacs-qq."
+  :group 'qq)
+
+(defcustom qq-notifications-delay 0.5
+  "Seconds to delay a message notification before rechecking visibility."
+  :type 'number
+  :group 'qq-notifications)
+
+(defcustom qq-notifications-timeout 4.0
+  "Seconds before emacs-qq closes its current desktop notification.
+
+Nil leaves notification lifetime to the desktop notification server."
+  :type '(choice (const :tag "Desktop default" nil) number)
+  :group 'qq-notifications)
+
+(defcustom qq-notifications-max-message-age 60
+  "Maximum incoming message age in seconds eligible for notification."
+  :type 'integer
+  :group 'qq-notifications)
+
+(defcustom qq-notifications-body-limit 120
+  "Maximum notification body width in characters."
+  :type 'integer
+  :group 'qq-notifications)
+
+(defcustom qq-notifications-show-preview t
+  "When non-nil, include a compact message preview in notifications."
+  :type 'boolean
+  :group 'qq-notifications)
+
+(defcustom qq-notifications-at-all-breaks-mute t
+  "When non-nil, unread @全体成员 messages can notify through group mute.
+
+Direct @self always breaks mute, matching QQ's native unread-at distinction."
+  :type 'boolean
+  :group 'qq-notifications)
+
+(defcustom qq-notifications-history-ring-size 30
+  "Number of recent desktop notifications retained by emacs-qq."
+  :type 'integer
+  :group 'qq-notifications)
+
+(defcustom qq-notifications-extra-args nil
+  "Additional keyword arguments appended to `notifications-notify'."
+  :type '(repeat sexp)
+  :group 'qq-notifications)
+
 ;; Faces mirror telega-msg-* defaults (not a visual clone of every palette
 ;; trick).  Keep them ordinary so theming stays familiar.
 
@@ -222,6 +270,16 @@ Same defaults as `telega-msg-deleted'."
 (defface qq-msg-status
   '((t :inherit shadow))
   "Face for pending/failed/recalled status suffixes and timestamps."
+  :group 'qq)
+
+(defface qq-msg-mention
+  '((t :inherit font-lock-variable-name-face))
+  "Face for ordinary QQ @mentions, matching telega's mention entity role."
+  :group 'qq)
+
+(defface qq-msg-mention-self
+  '((t :inherit (warning bold)))
+  "Face for @self and @全体成员 mentions requiring special attention."
   :group 'qq)
 
 (defface qq-msg-reaction

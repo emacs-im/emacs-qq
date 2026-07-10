@@ -876,6 +876,21 @@
        (when (file-directory-p dir)
          (delete-directory dir t))))))
 
+(ert-deftest qq-chat-native-priority-mentions-use-attention-face ()
+  (cl-letf (((symbol-function 'qq-state-self-user-id) (lambda () "90001")))
+    (let ((self (qq-chat--segment-inline-string
+                 '((type . "at") (data . ((qq . "90001") (name . "Me"))))))
+          (all (qq-chat--segment-inline-string
+                '((type . "at") (data . ((qq . "all"))))))
+          (other (qq-chat--segment-inline-string
+                  '((type . "at") (data . ((qq . "10002") (name . "Bob")))))))
+      (should (eq 'at-me (get-text-property 0 'qq-chat-mention-kind self)))
+      (should (eq 'at-all (get-text-property 0 'qq-chat-mention-kind all)))
+      (should (eq 'ordinary (get-text-property 0 'qq-chat-mention-kind other)))
+      (should (eq 'qq-msg-mention-self (get-text-property 0 'face self)))
+      (should (eq 'qq-msg-mention-self (get-text-property 0 'face all)))
+      (should (eq 'qq-msg-mention (get-text-property 0 'face other))))))
+
 (ert-deftest qq-chat-renders-clickable-reaction-chips ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session

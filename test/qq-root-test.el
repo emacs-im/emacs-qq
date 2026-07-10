@@ -48,6 +48,15 @@
                  (qq-root--session-preview-text
                   '((muted-p . t) (unread-count . 0))))))
 
+(ert-deftest qq-root-mentions-stay-important-through-muted-groups ()
+  (let ((session '((muted-p . t)
+                   (unread-count . 9)
+                   (unread-at-me-message-seq . "10001")
+                   (unread-at-all-message-seq . "10002"))))
+    (should (qq-root--session-important-unread-p session))
+    (should (equal "[@] [@all] [mute:9] "
+                   (qq-root--session-badge session)))))
+
 (ert-deftest qq-root-session-row-keeps-help-without-blanket-hover ()
   (with-temp-buffer
     (cl-letf (((symbol-function 'qq-media-session-avatar-display-string)

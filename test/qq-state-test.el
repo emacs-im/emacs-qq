@@ -285,6 +285,24 @@
    (should (= 17 (alist-get 'unread-count
                             (qq-state-session "group:20001"))))))
 
+(ert-deftest qq-state-apply-recent-contacts-calibrates-native-mentions ()
+  (qq-test-with-reset
+   (qq-state-apply-recent-contacts
+    '(((chatType . 2)
+       (peerUid . "20001")
+       (peerUin . "20001")
+       (peerName . "Group")
+       (msgTime . "1710000000")
+       (msgId . "9007199254743009336")
+       (unreadCount . 5)
+       (firstUnreadAtMeSeq . "30003")
+       (firstUnreadAtAllSeq . "30004"))))
+   (let ((session (qq-state-session "group:20001")))
+     (should (equal "30003"
+                    (alist-get 'unread-at-me-message-seq session)))
+     (should (equal "30004"
+                    (alist-get 'unread-at-all-message-seq session))))))
+
 (ert-deftest qq-state-apply-recent-contacts-preserves-message-disturb-state ()
   (qq-test-with-reset
    (qq-state-apply-recent-contacts
@@ -323,7 +341,12 @@
           (message_id . "9007199254742007089")))
       (latest
        . ((sequence . "30005")
-          (message_id . "9007199254742007094")))))
+          (message_id . "9007199254742007094")))
+      (mentions
+       (at_me . ((sequence . "30003")
+                 (message_id . "9007199254742007091")))
+       (at_all . ((sequence . "30004")
+                  (message_id . "9007199254742007092"))))))
    (let ((session (qq-state-session "group:20001")))
      (should (= 5 (alist-get 'unread-count session)))
      (should (equal "30001" (alist-get 'first-unread-message-seq session)))
@@ -331,7 +354,11 @@
                     (alist-get 'first-unread-message-id session)))
      (should (eq t (alist-get 'read-position-available session)))
      (should (equal "9007199254742007094"
-                    (alist-get 'read-latest-message-id session))))))
+                    (alist-get 'read-latest-message-id session)))
+     (should (equal "9007199254742007091"
+                    (alist-get 'unread-at-me-message-id session)))
+     (should (equal "30004"
+                    (alist-get 'unread-at-all-message-seq session))))))
 
 (ert-deftest qq-state-read-position-keeps-unresolved-sequence-unavailable ()
   (qq-test-with-reset
@@ -483,6 +510,31 @@
    (let ((message (car (qq-state-session-messages "private:10001"))))
      (should (qq-state-message-recalled-p message))
      (should (equal (alist-get 'preview message) "[message recalled]")))))
+
+(ert-deftest qq-state-live-message-classifies-only-native-self-and-all-mentions ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . 90001) (nickname . "Me")))
+   (qq-state-merge-live-message
+    '((post_type . "message")
+      (message_type . "group")
+      (group_id . 20001)
+      (message_id . "9007199254741004991")
+      (user_id . 10001)
+      (time . 1710000001)
+      (sender . ((user_id . 10001) (nickname . "Alice")))
+      (message . (((type . "at") (data . ((qq . "12345"))))
+                  ((type . "at") (data . ((qq . "90001"))))
+                  ((type . "at") (data . ((qq . "all"))))))))
+   (let* ((message (car (qq-state-session-messages "group:20001")))
+          (session (qq-state-session "group:20001")))
+     (should (equal '(at-me at-all)
+                    (qq-state-message-mention-kinds message)))
+     (should (qq-state-message-mentions-self-p message))
+     (should (qq-state-message-mentions-all-p message))
+     (should (equal "9007199254741004991"
+                    (alist-get 'unread-at-me-message-id session)))
+     (should (equal "9007199254741004991"
+                    (alist-get 'unread-at-all-message-id session))))))
 
 (ert-deftest qq-state-apply-recall-keeps-stub-in-store ()
   (qq-test-with-reset

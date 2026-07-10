@@ -22,6 +22,18 @@ Quick start:
 
 Then run `M-x qq`.
 
+Desktop notifications follow telega's opt-in global minor-mode model:
+
+```elisp
+(qq-notifications-mode 1)
+```
+
+Notifications are delayed briefly and suppressed when the target chat is
+selected on a focused frame.  Muted chats stay quiet except for native QQ
+`@我`; `@全体成员` mute breakthrough is controlled by
+`qq-notifications-at-all-breaks-mute`.  `M-x qq-notifications-history` opens
+the local notification history.
+
 Development with Eask:
 
 - `eask install-deps`

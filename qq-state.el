@@ -347,6 +347,10 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
     (target-id . ,(qq-state-session-key-target-id session-key))
     (title . ,(qq-state-session-key-target-id session-key))
     (unread-count . 0)
+    (unread-at-me-message-id . nil)
+    (unread-at-me-message-seq . nil)
+    (unread-at-all-message-id . nil)
+    (unread-at-all-message-seq . nil)
     (muted-p . nil)
     (message-notify-mode . unspecified)
     (first-unread-message-id . nil)
@@ -592,6 +596,35 @@ reply chrome elsewhere).  Media becomes short placeholders like
           (_ (format "[%s]" (or type "message"))))))
     (or segments '())
     "")))
+
+(defun qq-state--mention-kinds-from-segments (segments)
+  "Return native QQ mention kinds found in SEGMENTS.
+
+`at-me' denotes a direct mention of the current account and `at-all' denotes
+QQ's @全体成员.  Ordinary mentions of another member are deliberately ignored."
+  (let ((self-id (qq-state-self-user-id))
+        kinds)
+    (dolist (segment (or segments '()))
+      (when (equal (alist-get 'type segment) "at")
+        (let* ((data (alist-get 'data segment))
+               (target (qq-state--normalize-id (alist-get 'qq data))))
+          (cond
+           ((equal target "all") (cl-pushnew 'at-all kinds))
+           ((and self-id (equal target self-id))
+            (cl-pushnew 'at-me kinds))))))
+    (nreverse kinds)))
+
+(defun qq-state-message-mention-kinds (message)
+  "Return normalized native mention kinds for MESSAGE."
+  (copy-sequence (or (alist-get 'mention-kinds message) '())))
+
+(defun qq-state-message-mentions-self-p (message)
+  "Return non-nil when MESSAGE directly mentions the current account."
+  (and (memq 'at-me (qq-state-message-mention-kinds message)) t))
+
+(defun qq-state-message-mentions-all-p (message)
+  "Return non-nil when MESSAGE contains QQ's @全体成员."
+  (and (memq 'at-all (qq-state-message-mention-kinds message)) t))
 
 (defun qq-state--cq-looks-p (string)
   "Return non-nil when STRING looks like OneBot CQ `raw_message'."
@@ -904,6 +937,7 @@ the natural-language fragments.  The complete original notice remains in
          (sender-fields (qq-state--sender-display-fields session-key sender sender-id))
          (recalled-p (qq-state--raw-message-recalled-p message))
          (segments (if recalled-p '() (or (alist-get 'message message) '())))
+         (mention-kinds (qq-state--mention-kinds-from-segments segments))
          (raw-message (if recalled-p
                           "[message recalled]"
                         (or (alist-get 'raw_message message)
@@ -939,6 +973,8 @@ the natural-language fragments.  The complete original notice remains in
       (self-p . ,self-p)
       (status . ,status)
       (segments . ,segments)
+      (mention-kinds . ,mention-kinds)
+      (contains-mention-p . ,(and mention-kinds t))
       (raw-message . ,raw-message)
       (preview . ,(if recalled-p
                      "[message recalled]"
@@ -1226,12 +1262,22 @@ Return three values via `cl-values':
     (qq-state--index-message merged)
     (qq-state--sync-session-summary session-key)
     (when (and count-unread
+               (not existing)
                (not (alist-get 'self-p merged))
                (not (qq-state-message-recalled-p merged)))
       (let* ((session (or (gethash session-key qq-state--sessions)
                           (qq-state--session-template session-key)))
-             (current (or (alist-get 'unread-count session) 0)))
-        (qq-state-upsert-session session-key `((unread-count . ,(1+ current))) nil)))
+             (current (or (alist-get 'unread-count session) 0))
+             (anchor (qq-state-message-anchor merged))
+             (kinds (qq-state-message-mention-kinds merged)))
+        (qq-state-upsert-session
+         session-key
+         `((unread-count . ,(1+ current))
+           ,@(when (memq 'at-me kinds)
+               `((unread-at-me-message-id . ,anchor)))
+           ,@(when (memq 'at-all kinds)
+               `((unread-at-all-message-id . ,anchor))))
+         nil)))
     (cl-values merged mutation previous-anchor)))
 
 (defun qq-state-merge-live-message (message)
@@ -1441,7 +1487,15 @@ COUNT is clamped to a non-negative integer.  Views treat this mutation as a
 read-state change (header-line + optional unread divider), not a full
 timeline rebuild."
   (let ((n (max 0 (if (integerp count) count (truncate (or count 0))))))
-    (qq-state-upsert-session session-key `((unread-count . ,n)) nil)
+    (qq-state-upsert-session
+     session-key
+     `((unread-count . ,n)
+       ,@(when (zerop n)
+           '((unread-at-me-message-id . nil)
+             (unread-at-me-message-seq . nil)
+             (unread-at-all-message-id . nil)
+             (unread-at-all-message-seq . nil))))
+     nil)
     (qq-state--emit 'session
                     :session-key session-key
                     :session (qq-state-session session-key)
@@ -1474,12 +1528,19 @@ coerced to an Emacs number."
           (qq-protocol-optional-message-id
            (and (listp latest) (alist-get 'message_id latest))
            "read state"))
+         (mentions (alist-get 'mentions read-state))
+         (at-me (and (listp mentions) (alist-get 'at_me mentions)))
+         (at-all (and (listp mentions) (alist-get 'at_all mentions)))
          (available (and (> count 0) first-id)))
     (qq-state-upsert-session
      session-key
      `((unread-count . ,count)
        (first-unread-message-id . ,(and available first-id))
        (first-unread-message-seq . ,(and available first-seq))
+       (unread-at-me-message-id . ,(and (> count 0) (alist-get 'message_id at-me)))
+       (unread-at-me-message-seq . ,(and (> count 0) (alist-get 'sequence at-me)))
+       (unread-at-all-message-id . ,(and (> count 0) (alist-get 'message_id at-all)))
+       (unread-at-all-message-seq . ,(and (> count 0) (alist-get 'sequence at-all)))
        (read-position-available . ,(and available t))
        (read-latest-message-id . ,latest-id))
      nil)
@@ -1651,6 +1712,10 @@ older/fallback notices without it are applied as a one-step delta."
            (unread-entry (assq 'unreadCount contact))
            (disturb-entry (assq 'isMsgDisturb contact))
            (notify-mode-entry (assq 'messageNotifyMode contact))
+           (at-me-seq (qq-state--normalize-id
+                       (alist-get 'firstUnreadAtMeSeq contact)))
+           (at-all-seq (qq-state--normalize-id
+                        (alist-get 'firstUnreadAtAllSeq contact)))
            (unread-count
             (and unread-entry
                  (max 0 (if (numberp (cdr unread-entry))
@@ -1688,7 +1753,11 @@ older/fallback notices without it are applied as a one-step delta."
          (last-message-id . ,msg-id)
          (last-message-preview . ,preview)
          ,@(when unread-entry
-             `((unread-count . ,unread-count)))
+             `((unread-count . ,unread-count)
+               (unread-at-me-message-id . nil)
+               (unread-at-me-message-seq . ,(and (> unread-count 0) at-me-seq))
+               (unread-at-all-message-id . nil)
+               (unread-at-all-message-seq . ,(and (> unread-count 0) at-all-seq))))
          ,@(when disturb-entry
              `((muted-p . ,(and (qq-protocol-json-true-p (cdr disturb-entry)) t))))
          ,@(when notify-mode-entry
