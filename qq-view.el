@@ -22,6 +22,7 @@
 (defalias 'qq-view-insert-heading-line #'disco-view-insert-heading-line)
 (defalias 'qq-view-insert-note-line #'disco-view-insert-note-line)
 (defalias 'qq-view-insert-action-line #'disco-view-insert-action-line)
+(defalias 'qq-view-insert-action-button #'disco-ui-insert-action-button)
 (defalias 'qq-view-one-line-row-create #'disco-view-one-line-row-create)
 (defalias 'qq-view-canonicalize-number #'disco-view-canonicalize-number)
 (defalias 'qq-view-truncate-fill #'disco-view-truncate-fill)

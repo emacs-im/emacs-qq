@@ -49,14 +49,21 @@
       (should (equal (alist-get 'user_id value) "10001"))
       (should-error (qq-api-get-user 10001 #'ignore) :type 'user-error))))
 
-(ert-deftest qq-user-render-shows-profile-without-action-buttons ()
+(ert-deftest qq-user-render-shows-telega-style-profile-card ()
   (with-temp-buffer
     (qq-user-mode)
     (setq qq-user--user-id "10001"
           qq-user--profile (copy-tree qq-user-test--profile)
-          qq-user--like-count 42)
+          qq-user--like-count 42
+          qq-user--photo-loaded t
+          qq-user--photos
+          '(((id . "p1")
+             (original_url . "https://example.test/p1.jpg")
+             (thumbnail_url . "https://example.test/p1-thumb.jpg"))))
     (cl-letf (((symbol-function 'qq-media-avatar-display-string)
-               (lambda (_user-id) "@")))
+               (lambda (_user-id) "@"))
+              ((symbol-function 'qq-user-photo-preview-display-string)
+               (lambda (_user-id _photo fallback) fallback)))
       (qq-user-render))
     (let ((text (buffer-string)))
       (should (string-match-p "A" text))
@@ -65,10 +72,15 @@
       (should (string-match-p "消息免打扰" text))
       (should (string-match-p "分组:[[:space:]]+Friends" text))
       (should (string-match-p "获赞:[[:space:]]+42" text))
+      (should (string-match-p "照片墙:[[:space:]]+1" text))
       (should (string-match-p "SVIP 8" text))
       (should (string-match-p "hello from Emacs" text))
       (should-not (string-match-p "\\[Open\\]" text))
-      (should-not (button-at (point-min))))))
+      (goto-char (point-min))
+      (search-forward "发消息")
+      (should (button-at (1- (point))))
+      (search-forward "照片 1")
+      (should (button-at (1- (point)))))))
 
 (ert-deftest qq-user-render-omits-private-placeholder-values ()
   (with-temp-buffer
@@ -108,10 +120,15 @@
               ((symbol-function 'qq-api-get-user-like)
                (lambda (_user-id callback &optional _errback)
                  (funcall callback 42)
-                 'like-request)))
+                 'like-request))
+              ((symbol-function 'qq-api-get-user-photo-wall)
+               (lambda (_user-id callback &optional _errback)
+                 (funcall callback nil)
+                 'photo-request)))
       (qq-user-refresh)
       (should (equal qq-user--profile qq-user-test--profile))
       (should (= qq-user--like-count 42))
+      (should qq-user--photo-loaded)
       (should-not qq-user--loading)
       (should-not qq-user--request)
       (should-not qq-user--request-owner))))
@@ -148,6 +165,10 @@
               #'qq-user-open-chat))
   (should (eq (lookup-key qq-user-mode-map (kbd "p"))
               #'qq-user-open-photo-wall)))
+
+(ert-deftest qq-user-reuses-one-profile-buffer-like-telega ()
+  (should (equal (qq-user--buffer-name "10001") "*qq-user*"))
+  (should (equal (qq-user--buffer-name "10002") "*qq-user*")))
 
 (ert-deftest qq-api-get-user-social-actions-preserve-string-identity ()
   (let (calls like photos)

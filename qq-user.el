@@ -5,7 +5,7 @@
 ;;; Commentary:
 
 ;; Dedicated user profile view backed by the fork-native `emacs_get_user'
-;; action.  Actions use keys rather than inline button rows.
+;; action, with a Telega-style summary card and asynchronously filled details.
 
 ;;; Code:
 
@@ -14,12 +14,26 @@
 (require 'qq-api)
 (require 'qq-media)
 (require 'qq-state)
+(require 'qq-user-photo)
 (require 'qq-view)
 
 (declare-function qq-chat-open "qq-chat" (session-key))
 (declare-function qq-api-cancel-request "qq-api" (request-token))
-(declare-function qq-user-photo-open "qq-user-photo" (user-id display-name))
+(declare-function qq-user-photo-make-button
+                  "qq-user-photo" (start end user-id photo))
+(declare-function qq-view-insert-action-button
+                  "qq-view" (label action &rest keys))
 
+(defface qq-user-action-button
+  '((t :inherit mode-line-inactive :weight semi-bold
+       :box (:line-width -1 :style released-button)))
+  "Face used for action buttons on QQ user cards."
+  :group 'qq)
+
+(defface qq-user-card-title
+  '((t :inherit bold :height 1.15))
+  "Face used for the primary title on QQ user cards."
+  :group 'qq)
 (defvar-local qq-user--user-id nil
   "QQ number displayed by the current user buffer.")
 
@@ -47,9 +61,25 @@
 (defvar-local qq-user--like-request-owner nil
   "Owner object for the active profile-like request.")
 
+(defvar-local qq-user--photos nil
+  "Native photo-wall entries shown inline on the user page.")
+
+(defvar-local qq-user--photo-request nil
+  "Active inline photo-wall request token.")
+
+(defvar-local qq-user--photo-request-owner nil
+  "Owner object for the active inline photo-wall request.")
+
+(defvar-local qq-user--photo-loading nil
+  "Non-nil while inline photo-wall data is loading.")
+
+(defvar-local qq-user--photo-loaded nil
+  "Non-nil when inline photo-wall data was loaded successfully.")
+
 (defun qq-user--buffer-name (user-id)
   "Return profile buffer name for USER-ID."
-  (format "*qq-user:%s*" user-id))
+  (ignore user-id)
+  "*qq-user*")
 
 (defun qq-user--present-string (value)
   "Return non-empty string VALUE, or nil."
@@ -160,6 +190,51 @@
       ("none" "无")
       (_ nil))))
 
+(defun qq-user--photo-at-point ()
+  "Return inline native photo at point, or nil."
+  (get-text-property (point) 'qq-user-photo))
+
+(defun qq-user--insert-photo-wall ()
+  "Insert asynchronous photo-wall summary and previews."
+  (let ((count (and qq-user--photo-loaded (length qq-user--photos))))
+    (qq-user--insert-field
+     "照片墙"
+     (cond (qq-user--photo-loading "加载中…")
+           ((integerp count) count)
+           (t nil)))
+    (when qq-user--photos
+      (let ((index 0))
+        (dolist (photo qq-user--photos)
+          (setq index (1+ index))
+          (let ((start (point)))
+            (insert
+             (qq-user-photo-preview-display-string
+              qq-user--user-id photo (format "照片 %d" index))
+             " ")
+            (qq-user-photo-make-button
+             start (point) qq-user--user-id photo)))
+        (insert "\n")))))
+
+(defun qq-user--insert-action-buttons ()
+  "Insert the primary Telega-style user action row."
+  (insert "  ")
+  (qq-view-insert-action-button
+   " 发消息 " #'qq-user-open-chat
+   :face 'qq-user-action-button :help-echo "打开私聊 (m)")
+  (insert "  ")
+  (qq-view-insert-action-button
+   " 查看头像 " #'qq-user-open-avatar
+   :face 'qq-user-action-button :help-echo "查看头像 (a)")
+  (insert "  ")
+  (qq-view-insert-action-button
+   " 照片墙 " #'qq-user-open-photo-wall
+   :face 'qq-user-action-button :help-echo "打开照片墙 (p)")
+  (insert "  ")
+  (qq-view-insert-action-button
+   " 复制 QQ " #'qq-user-copy-id
+   :face 'qq-user-action-button :help-echo "复制 QQ 号 (w)")
+  (insert "\n"))
+
 (defun qq-user-render ()
   "Render the current user profile buffer."
   (interactive)
@@ -168,9 +243,6 @@
      (let ((inhibit-read-only t))
        (erase-buffer)
        (setq-local header-line-format '(:eval (qq-user--header-line)))
-       (qq-view-insert-note-line
-        "g refresh  m message  a avatar  p photos  w copy QQ  q quit")
-       (insert "\n")
        (cond
         (qq-user--loading
          (qq-view-insert-note-line "Loading user profile…"))
@@ -180,13 +252,26 @@
          (qq-view-insert-note-line "No user profile loaded."))
         (t
          (let ((avatar-start (point)))
-           (insert (qq-media-avatar-display-string qq-user--user-id)
-                   "  "
-                   (propertize (qq-user--display-name) 'face 'bold)
-                   "\n")
-           (add-text-properties
+           (insert (qq-media-avatar-display-string qq-user--user-id))
+           (make-text-button
             avatar-start (point)
-            (list 'qq-user-id qq-user--user-id)))
+            'follow-link t
+            'action (lambda (_button) (qq-user-open-avatar))
+            'help-echo "查看头像"
+            'qq-user-id qq-user--user-id)
+           (insert "  "
+                   (propertize (qq-user--display-name)
+                               'face 'qq-user-card-title)
+                   "\n")
+           (when-let* ((status (qq-user--status-label
+                                (alist-get 'status qq-user--profile))))
+             (insert "   " (propertize status 'face 'shadow) "\n")))
+         (insert "\n")
+         (qq-user--insert-action-buttons)
+         (qq-view-insert-note-line
+          "g 刷新 · m 私聊 · a 头像 · p 照片墙 · w 复制 · q 退出")
+         (insert "\n")
+         (qq-view-insert-heading-line "资料" :face 'bold)
          (when-let* ((nickname (qq-user--present-string
                                 (alist-get 'nickname qq-user--profile)))
                      (remark (qq-user--present-string
@@ -230,7 +315,9 @@
                                  (alist-get 'signature qq-user--profile))))
            (insert "\n")
            (qq-view-insert-heading-line "个性签名" :face 'bold)
-           (insert signature "\n"))))
+           (insert signature "\n"))
+         (insert "\n")
+         (qq-user--insert-photo-wall)))
        (goto-char (point-min))))
    :preserve-window-start t))
 
@@ -281,7 +368,8 @@
               (qq-api--default-error response reason)))))
       (when (eq qq-user--request-owner owner)
         (setq qq-user--request request))))
-  (qq-user--refresh-like))
+  (qq-user--refresh-like)
+  (qq-user--refresh-photos))
 
 (defun qq-user--like-request-current-p (buffer user-id owner)
   "Return non-nil when OWNER still loads likes for USER-ID in BUFFER."
@@ -321,6 +409,51 @@
       (when (eq qq-user--like-request-owner owner)
         (setq qq-user--like-request request)))))
 
+(defun qq-user--photo-request-current-p (buffer user-id owner)
+  "Return non-nil when OWNER still loads photos for USER-ID in BUFFER."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and (derived-mode-p 'qq-user-mode)
+              (equal qq-user--user-id user-id)
+              (eq qq-user--photo-request-owner owner)))))
+
+(defun qq-user--refresh-photos ()
+  "Refresh inline photo-wall entries for the current user."
+  (when qq-user--photo-request
+    (qq-api-cancel-request qq-user--photo-request))
+  (let ((buffer (current-buffer))
+        (user-id qq-user--user-id)
+        (owner (list 'user-photos qq-user--user-id)))
+    (setq qq-user--photos nil
+          qq-user--photo-loading t
+          qq-user--photo-loaded nil
+          qq-user--photo-request nil
+          qq-user--photo-request-owner owner)
+    (qq-user-render)
+    (let ((request
+           (qq-api-get-user-photo-wall
+            user-id
+            (lambda (photos)
+              (when (qq-user--photo-request-current-p buffer user-id owner)
+                (with-current-buffer buffer
+                  (setq qq-user--photos photos
+                        qq-user--photo-loading nil
+                        qq-user--photo-loaded t
+                        qq-user--photo-request nil
+                        qq-user--photo-request-owner nil)
+                  (qq-user-render))))
+            (lambda (_response _reason)
+              (when (qq-user--photo-request-current-p buffer user-id owner)
+                (with-current-buffer buffer
+                  (setq qq-user--photos nil
+                        qq-user--photo-loading nil
+                        qq-user--photo-loaded nil
+                        qq-user--photo-request nil
+                        qq-user--photo-request-owner nil)
+                  (qq-user-render)))))))
+      (when (eq qq-user--photo-request-owner owner)
+        (setq qq-user--photo-request request)))))
+
 (defun qq-user-open-chat ()
   "Open a private chat with the current profile user."
   (interactive)
@@ -348,16 +481,46 @@
     (user-error "qq: this buffer has no user identity"))
   (qq-user-photo-open qq-user--user-id (qq-user--display-name)))
 
+(defun qq-user-open-photo-at-point ()
+  "Open inline native photo at point."
+  (interactive)
+  (let ((photo (qq-user--photo-at-point)))
+    (unless photo
+      (user-error "qq: no profile photo at point"))
+    (qq-user-photo-open-entry qq-user--user-id photo)))
+
 (defun qq-user--cancel-request ()
   "Cancel the current user profile request when present."
   (when qq-user--request
     (qq-api-cancel-request qq-user--request))
   (when qq-user--like-request
     (qq-api-cancel-request qq-user--like-request))
+  (when qq-user--photo-request
+    (qq-api-cancel-request qq-user--photo-request))
   (setq qq-user--request nil
         qq-user--request-owner nil
         qq-user--like-request nil
-        qq-user--like-request-owner nil))
+        qq-user--like-request-owner nil
+        qq-user--photo-request nil
+        qq-user--photo-request-owner nil))
+
+(defun qq-user--select-user (user-id)
+  "Prepare the shared user buffer to display USER-ID."
+  (unless (equal qq-user--user-id user-id)
+    (qq-user--cancel-request)
+    (setq qq-user--profile nil
+          qq-user--loading nil
+          qq-user--error nil
+          qq-user--like-count nil
+          qq-user--photos nil
+          qq-user--photo-loading nil
+          qq-user--photo-loaded nil))
+  (setq qq-user--user-id user-id))
+
+(defun qq-user-button-backward ()
+  "Move point to the previous page button."
+  (interactive)
+  (forward-button -1))
 
 (defvar qq-user-mode-map
   (let ((map (make-sparse-keymap)))
@@ -365,6 +528,9 @@
     (define-key map (kbd "m") #'qq-user-open-chat)
     (define-key map (kbd "a") #'qq-user-open-avatar)
     (define-key map (kbd "p") #'qq-user-open-photo-wall)
+    (define-key map (kbd "RET") #'qq-user-open-photo-at-point)
+    (define-key map (kbd "TAB") #'forward-button)
+    (define-key map (kbd "<backtab>") #'qq-user-button-backward)
     (define-key map (kbd "w") #'qq-user-copy-id)
     (define-key map (kbd "q") #'quit-window)
     map)
@@ -386,22 +552,25 @@
     (with-current-buffer buffer
       (unless (derived-mode-p 'qq-user-mode)
         (qq-user-mode))
-      (setq qq-user--user-id user-id)
+      (qq-user--select-user user-id)
       (qq-user-render)
-      (unless qq-user--loading
+      (when (and (null qq-user--profile)
+                 (not qq-user--loading))
         (qq-user-refresh)))
     (pop-to-buffer buffer)
     buffer))
 
 (defun qq-user--handle-media-cache-update (media-key)
   "Rerender matching user buffers after MEDIA-KEY changes."
-  (when (and (stringp media-key)
-             (string-prefix-p "avatar:" media-key))
-    (let ((user-id (substring media-key (length "avatar:"))))
-      (when-let* ((buffer (get-buffer (qq-user--buffer-name user-id))))
-        (with-current-buffer buffer
-          (when (derived-mode-p 'qq-user-mode)
-            (qq-user-render)))))))
+  (when (stringp media-key)
+    (when-let* ((buffer (get-buffer (qq-user--buffer-name nil))))
+      (with-current-buffer buffer
+        (when (and (derived-mode-p 'qq-user-mode)
+                   (or (equal media-key (format "avatar:%s" qq-user--user-id))
+                       (string-prefix-p
+                        (format "photo-wall:%s:" qq-user--user-id)
+                        media-key)))
+          (qq-user-render))))))
 
 (add-hook 'qq-media-cache-update-hook #'qq-user--handle-media-cache-update)
 

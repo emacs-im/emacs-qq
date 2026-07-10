@@ -9,6 +9,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'button)
 (require 'subr-x)
 (require 'qq-api)
 (require 'qq-media)
@@ -48,22 +49,54 @@
           (or qq-user-photo--user-id "unknown")
           (if qq-user-photo--loading " · loading" "")))
 
-(defun qq-user-photo--url (photo)
+(defun qq-user-photo-url (photo)
   "Return best exact native URL from PHOTO."
   (or (alist-get 'original_url photo)
       (alist-get 'thumbnail_url photo)))
 
-(defun qq-user-photo--preview-url (photo)
+(defun qq-user-photo-preview-url (photo)
   "Return best preview URL from PHOTO."
   (or (alist-get 'thumbnail_url photo)
       (alist-get 'original_url photo)))
 
-(defun qq-user-photo--cache-key (photo)
-  "Return stable media cache key for PHOTO."
+(defun qq-user-photo-cache-key (user-id photo)
+  "Return stable media cache key for USER-ID and PHOTO."
   (format "photo-wall:%s:%s:%s"
-          qq-user-photo--user-id
+          user-id
           (alist-get 'id photo)
-          (md5 (or (qq-user-photo--preview-url photo) ""))))
+          (md5 (or (qq-user-photo-preview-url photo) ""))))
+
+(defun qq-user-photo-preview-display-string (user-id photo fallback)
+  "Return inline preview for USER-ID PHOTO, or FALLBACK while loading."
+  (qq-media-url-preview-display-string
+   (qq-user-photo-cache-key user-id photo)
+   (qq-user-photo-preview-url photo)
+   fallback))
+
+(defun qq-user-photo-open-entry (user-id photo)
+  "Open USER-ID's native PHOTO entry."
+  (qq-media-open-image-url
+   (qq-user-photo-cache-key user-id photo)
+   (qq-user-photo-url photo)))
+
+(defun qq-user-photo--button-action (button)
+  "Open native photo represented by BUTTON."
+  (qq-user-photo-open-entry
+   (button-get button 'qq-user-id)
+   (button-get button 'qq-user-photo)))
+
+(defun qq-user-photo-make-button (start end user-id photo)
+  "Turn START to END into a photo button for USER-ID and PHOTO."
+  (make-text-button
+   start end
+   'follow-link t
+   'action #'qq-user-photo--button-action
+   'help-echo "查看照片"
+   'face 'default
+   'mouse-face 'highlight
+   'qq-user-id user-id
+   'qq-user-photo photo
+   'rear-nonsticky '(qq-user-id qq-user-photo mouse-face)))
 
 (defun qq-user-photo--photo-at-point ()
   "Return native photo entry at point, or nil."
@@ -91,17 +124,15 @@
                   for index from 1
                   do
                   (let* ((start (point))
-                         (preview-url (qq-user-photo--preview-url photo))
-                         (key (qq-user-photo--cache-key photo)))
+                         (preview-url (qq-user-photo-preview-url photo))
+                         (key (qq-user-photo-cache-key
+                               qq-user-photo--user-id photo)))
                     (insert
                      (qq-media-url-preview-display-string
                       key preview-url (format "Photo %d" index))
                      "\n\n")
-                    (add-text-properties
-                     start (point)
-                     (list 'qq-user-photo photo
-                           'mouse-face 'highlight
-                           'rear-nonsticky '(qq-user-photo mouse-face)))))))
+                    (qq-user-photo-make-button
+                     start (point) qq-user-photo--user-id photo)))))
        (goto-char (point-min))))
    :preserve-window-start t))
 
@@ -111,9 +142,7 @@
   (let ((photo (qq-user-photo--photo-at-point)))
     (unless photo
       (user-error "qq: no photo at point"))
-    (qq-media-open-image-url
-     (qq-user-photo--cache-key photo)
-     (qq-user-photo--url photo))))
+    (qq-user-photo-open-entry qq-user-photo--user-id photo)))
 
 (defun qq-user-photo--request-current-p (buffer user-id owner)
   "Return non-nil when OWNER still loads USER-ID in BUFFER."
@@ -170,10 +199,17 @@
   (setq qq-user-photo--request nil
         qq-user-photo--request-owner nil))
 
+(defun qq-user-photo-button-backward ()
+  "Move point to the previous photo button."
+  (interactive)
+  (forward-button -1))
+
 (defvar qq-user-photo-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "g") #'qq-user-photo-refresh)
     (define-key map (kbd "RET") #'qq-user-photo-open-at-point)
+    (define-key map (kbd "TAB") #'forward-button)
+    (define-key map (kbd "<backtab>") #'qq-user-photo-button-backward)
     (define-key map (kbd "q") #'quit-window)
     map)
   "Keymap for `qq-user-photo-mode'.")
