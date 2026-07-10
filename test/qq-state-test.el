@@ -158,6 +158,34 @@
      (should-not (alist-get 'local-id message))
      (should (equal (alist-get 'preview message) "戳了戳 10002")))))
 
+(ert-deftest qq-state-poke-preserves-native-decoration-data ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
+   (let* ((message
+           (qq-state-apply-poke-notice
+            '((time . 1710000001)
+              (post_type . "notice")
+              (notice_type . "notify")
+              (sub_type . "poke")
+              (message_id . "9007199254741007778")
+              (group_id . "20001")
+              (user_id . "10002")
+              (target_id . "90001")
+              (raw_info .
+               (((type . "qq") (uid . "actor"))
+                ((type . "img")
+                 (src . "https://example.com/poke.png"))
+                ((type . "nor") (txt . "喷了喷"))
+                ((type . "qq") (uid . "target"))
+                ((type . "nor") (txt . "的加分喷雾，分数++")))))))
+          (data (qq-state-poke-message-data message)))
+     (should (equal (alist-get 'type (car (alist-get 'segments message)))
+                    "poke"))
+     (should (equal (alist-get 'image-url data)
+                    "https://example.com/poke.png"))
+     (should (equal (alist-get 'action data) "喷了喷"))
+     (should (equal (alist-get 'detail data) "的加分喷雾，分数++")))))
+
 (ert-deftest qq-state-apply-recent-contacts-creates-session-summary ()
   (qq-test-with-reset
    (qq-state-apply-recent-contacts

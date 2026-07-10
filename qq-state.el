@@ -376,7 +376,43 @@ Values from NEW replace values in OLD."
   (or (qq-state--poke-notice-p message)
       (let ((raw-event (alist-get 'raw-event message)))
         (and (listp raw-event)
-             (qq-state--poke-notice-p raw-event)))))
+             (qq-state--poke-notice-p raw-event)))
+      (seq-some
+       (lambda (segment)
+         (equal (alist-get 'type segment) "poke"))
+       (alist-get 'segments message))))
+
+(defun qq-state-poke-message-data (message)
+  "Return normalized visual data for poke MESSAGE.
+
+Older rows may only have `raw-event', so derive the same data lazily when
+their cached segment predates the richer poke renderer."
+  (when (qq-state-poke-message-p message)
+    (let* ((segment
+            (seq-find
+             (lambda (candidate)
+               (equal (alist-get 'type candidate) "poke"))
+             (alist-get 'segments message)))
+           (segment-data (and segment (alist-get 'data segment))))
+      (or segment-data
+          (let* ((notice (if (qq-state--poke-notice-p message)
+                             message
+                           (alist-get 'raw-event message)))
+                 (actor-id (qq-state--normalize-id
+                            (or (alist-get 'sender-id message)
+                                (alist-get 'sender_id notice)
+                                (alist-get 'user_id notice))))
+                 (target-id (qq-state--normalize-id
+                             (or (alist-get 'target-id message)
+                                 (alist-get 'target_id notice))))
+                 (actor-name (or (qq-state--present-string
+                                  (alist-get 'sender-name message))
+                                 (qq-state--poke-user-name actor-id nil)))
+                 (target-name (or (qq-state--present-string
+                                   (alist-get 'target-name message))
+                                  (qq-state--poke-user-name target-id nil))))
+            (qq-state--normalize-poke-info
+             notice actor-id target-id actor-name target-name))))))
 
 (defun qq-state--raw-message-recalled-p (message)
   "Return non-nil when raw OneBot MESSAGE is explicitly recalled.
@@ -535,7 +571,14 @@ reply chrome elsewhere).  Media becomes short placeholders like
                "[card]"))
           ("json" "[card]")
           ("xml" "[xml]")
-          ("poke" "[poke]")
+          ("poke"
+           (let ((action (qq-state--present-string (alist-get 'action data)))
+                 (target (qq-state--present-string (alist-get 'target-name data)))
+                 (detail (qq-state--present-string (alist-get 'detail data))))
+             (or (and action target (concat action " " target detail))
+                 (and action (concat action detail))
+                 (and target (concat "戳了戳 " target))
+                 "[poke]")))
           ("dice" "[dice]")
           ("rps" "[rps]")
           ("share" "[share]")
@@ -724,6 +767,39 @@ in the UI — that is wire format, not display text."
                    user-id)))
     (or name "某人")))
 
+(defun qq-state--normalize-poke-info
+    (notice actor-id target-id actor-name target-name)
+  "Return normalized visual metadata from POKE NOTICE.
+
+`raw_info' is NapCat's QQ-native gray-tip decoration list.  Keep only the
+small stable subset needed by the Emacs renderer: the action image URL and
+the natural-language fragments.  The complete original notice remains in
+`raw-event' for protocol/debugging purposes."
+  (let ((raw-info (alist-get 'raw_info notice))
+        image-url
+        texts)
+    (dolist (item (if (listp raw-info) raw-info '()))
+      (when (listp item)
+        (let ((text (qq-state--present-string (alist-get 'txt item)))
+              (type (qq-state--normalize-id (alist-get 'type item))))
+          (when (and (equal type "img") (null image-url))
+            (setq image-url
+                  (qq-state--present-string
+                   (or (alist-get 'src item)
+                       (alist-get 'url item)
+                       (alist-get 'jp item)))))
+          (when text
+            (push text texts)))))
+    (setq texts (nreverse texts))
+    `((actor-id . ,actor-id)
+      (target-id . ,target-id)
+      (actor-name . ,actor-name)
+      (target-name . ,target-name)
+      (image-url . ,image-url)
+      (action . ,(car texts))
+      (detail . ,(and (cdr texts) (string-join (cdr texts) "")))
+      (texts . ,texts))))
+
 (defun qq-state--normalize-poke-notice (notice &optional fallback-session-key)
   "Normalize a live or historical POKE NOTICE into a timeline message."
   (let* ((group-id (qq-state--normalize-id (alist-get 'group_id notice)))
@@ -744,6 +820,9 @@ in the UI — that is wire format, not display text."
           (qq-state--poke-user-name actor-id (alist-get 'sender_name notice)))
          (target-name
           (qq-state--poke-user-name target-id (alist-get 'target_name notice)))
+         (poke-info
+          (qq-state--normalize-poke-info
+           notice actor-id target-id actor-name target-name))
          (body (if target-id
                    (format "戳了戳 %s" target-name)
                  "戳了戳"))
@@ -780,12 +859,12 @@ in the UI — that is wire format, not display text."
             (sender-remark . nil)
             (self-p . ,self-p)
             (status . ,(if self-p 'sent 'received))
-            ;; Poke notices have no timeline message body.  Store the resolved
-            ;; presentation as text so the normal chat renderer does not turn
-            ;; it back into a generic `[poke]' placeholder.
-            (segments
-             . ,(list `((type . "text")
-                        (data . ((text . ,body))))))
+            ;; Poke notices are gray-tip records, not ordinary text messages.
+            ;; Keep their visual metadata as a dedicated segment so chat can
+            ;; render the QQ-style action without using the normal message
+            ;; header/body layout.
+            (segments . ,(list `((type . "poke")
+                                 (data . ,poke-info))))
             (raw-message . ,body)
             (preview . ,body)
             (message-type . ,(if group-id "group" "private"))

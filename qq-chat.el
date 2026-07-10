@@ -439,6 +439,7 @@ available."
     (while (and segments (not found))
       (let ((segment (car segments)))
         (when (or (qq-chat--forward-segment-p segment)
+                  (qq-chat--poke-segment-p segment)
                   (qq-chat--mail-segment-p segment)
                   (qq-chat--card-segment-p segment)
                   (qq-chat--media-segment-p segment))
@@ -2542,6 +2543,46 @@ base emoji), never as OneBot CQ text."
   "Return non-nil when SEGMENT is a structured QQ Mail notification."
   (equal (alist-get 'type segment) "mail"))
 
+(defun qq-chat--poke-segment-p (segment)
+  "Return non-nil when SEGMENT is a QQ gray-tip poke decoration."
+  (equal (alist-get 'type segment) "poke"))
+
+(defun qq-chat--insert-poke-message (message properties)
+  "Insert decorative gray-tip MESSAGE using PROPERTIES.
+
+Pokes deliberately bypass the ordinary message header/body layout.  They are
+QQ actions, not authored text, so show one compact action row and an optional
+description instead of a normal sender heading, timestamp, and message body."
+  (let* ((data (or (qq-state-poke-message-data message) '()))
+         (actor (or (qq-chat--present-string (alist-get 'actor-name data))
+                    (qq-chat--present-string (alist-get 'sender-name message))
+                    "某人"))
+         (target (qq-chat--present-string (alist-get 'target-name data)))
+         (action (or (qq-chat--present-string (alist-get 'action data))
+                     "戳了戳"))
+         (detail (qq-chat--present-string (alist-get 'detail data)))
+         (image-url (qq-chat--present-string (alist-get 'image-url data)))
+         (image
+          (if image-url
+              (qq-media-url-preview-display-string
+               (qq-media-poke-image-cache-key image-url)
+               image-url
+               "✦"
+               qq-media-poke-image-height)
+            "✦"))
+         (time (qq-chat--format-time-short (alist-get 'time message)))
+         (start (point))
+         (poke-properties (append properties (list 'face 'qq-msg-poke))))
+    (insert "  " image "  " actor "  " action)
+    (when target
+      (insert "  " target))
+    (when (and (stringp time) (not (string-empty-p time)))
+      (insert "  " (propertize time 'face 'qq-msg-status)))
+    (insert "\n")
+    (when detail
+      (insert "       " detail "\n"))
+    (add-text-properties start (point) poke-properties)))
+
 (defun qq-chat--card-segment-p (segment)
   "Return non-nil when SEGMENT is a normalized Ark rich card."
   (equal (alist-get 'type segment) "card"))
@@ -3080,54 +3121,59 @@ Visual model (telega-inspired; later appkit):
        "✓ selected for merged forwarding"
        :face 'warning
        :properties properties))
-    (if (qq-state-message-recalled-p message)
-        ;; Stub path for `qq-chat-show-recalled-messages' (telega deleted style).
-        (let ((header-start (point)))
-          (qq-chat--insert-message-sender message title-face)
-          (insert status-suffix)
-          (insert "  ")
-          (let ((time-start (point)))
-            (insert (qq-chat--format-time (alist-get 'time message)))
-            (add-text-properties time-start (point) (list 'face 'qq-msg-status)))
-          (insert "\n")
-          (add-text-properties
-           header-start (point)
-           (append properties (list 'face 'qq-msg-deleted)))
-          (qq-ui-insert-prefixed-lines
-           body-prefix-state
-           (qq-chat--message-body message)
-           :properties (append properties (list 'face 'qq-msg-deleted))))
-      (if compact
-          ;; Same-sender continuations still need segment-rich bodies (faces,
-          ;; images, …).  Never dump plain `preview'/CQ text here — that is what
-          ;; produced visible "[face:178]" while the image path already worked.
-          (progn
-            (when reply-id
-              (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
-            (qq-chat--insert-compact-message-body
-             message body-prefix-state properties short-time))
-        (let ((header-start (point)))
-          (when-let* ((sender-id (alist-get 'sender-id message)))
-            (let ((avatar-start (point)))
-              (insert (qq-media-avatar-display-string sender-id) " ")
-              (add-text-properties
-               avatar-start
-               (point)
-               '(mouse-face highlight
-                 help-echo "Open sender avatar"))))
-          (qq-chat--insert-message-sender message title-face)
-          (insert status-suffix)
-          (insert "  ")
-          (let ((time-start (point)))
-            (insert (qq-chat--format-time (alist-get 'time message)))
-            (add-text-properties time-start (point) (list 'face 'qq-msg-status)))
-          (insert "\n")
-          (qq-ui-append-face header-start (point) 'qq-msg-heading)
-          (add-text-properties header-start (point) properties))
-        (when reply-id
-          (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
-        (qq-chat--insert-message-body message body-prefix-state properties)))
-    (unless (qq-state-message-recalled-p message)
+    (cond
+     ((and (qq-state-poke-message-p message)
+           (not (qq-state-message-recalled-p message)))
+      (qq-chat--insert-poke-message message properties))
+     ((qq-state-message-recalled-p message)
+      ;; Stub path for `qq-chat-show-recalled-messages' (telega deleted style).
+      (let ((header-start (point)))
+        (qq-chat--insert-message-sender message title-face)
+        (insert status-suffix)
+        (insert "  ")
+        (let ((time-start (point)))
+          (insert (qq-chat--format-time (alist-get 'time message)))
+          (add-text-properties time-start (point) (list 'face 'qq-msg-status)))
+        (insert "\n")
+        (add-text-properties
+         header-start (point)
+         (append properties (list 'face 'qq-msg-deleted)))
+        (qq-ui-insert-prefixed-lines
+         body-prefix-state
+         (qq-chat--message-body message)
+         :properties (append properties (list 'face 'qq-msg-deleted)))))
+     (compact
+      ;; Same-sender continuations still need segment-rich bodies (faces,
+      ;; images, …).  Never dump plain `preview'/CQ text here — that is what
+      ;; produced visible "[face:178]" while the image path already worked.
+      (when reply-id
+        (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
+      (qq-chat--insert-compact-message-body
+       message body-prefix-state properties short-time))
+     (t
+      (let ((header-start (point)))
+        (when-let* ((sender-id (alist-get 'sender-id message)))
+          (let ((avatar-start (point)))
+            (insert (qq-media-avatar-display-string sender-id) " ")
+            (add-text-properties
+             avatar-start
+             (point)
+             '(mouse-face highlight
+               help-echo "Open sender avatar"))))
+        (qq-chat--insert-message-sender message title-face)
+        (insert status-suffix)
+        (insert "  ")
+        (let ((time-start (point)))
+          (insert (qq-chat--format-time (alist-get 'time message)))
+          (add-text-properties time-start (point) (list 'face 'qq-msg-status)))
+        (insert "\n")
+        (qq-ui-append-face header-start (point) 'qq-msg-heading)
+        (add-text-properties header-start (point) properties))
+      (when reply-id
+        (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
+      (qq-chat--insert-message-body message body-prefix-state properties)))
+    (unless (or (qq-state-message-recalled-p message)
+                (qq-state-poke-message-p message))
       (qq-chat--insert-reaction-line message body-prefix-state properties))
     (insert "\n")
     (add-text-properties start (point) properties)))

@@ -134,13 +134,15 @@ filters can call this outside a safe redisplay context; immediate
         (create-image file nil nil :height (max 1 height) :ascent 'center)
       (error nil))))
 
-(defun qq-media--preview-image-from-file (file _spec)
-  "Create a preview image object from FILE using disco-media helpers."
+(defun qq-media--preview-image-from-file (file spec)
+  "Create a preview image object from FILE using disco-media helpers.
+
+SPEC may be a numeric maximum height for compact decorative images."
   (when (qq-media-file-present-p file)
     (disco-media-preview-image-from-file
      file
      qq-media-preview-image-max-width
-     qq-media-preview-image-height)))
+     (if (numberp spec) spec qq-media-preview-image-height))))
 
 (defun qq-media--image-display-string (image fallback)
   "Return display string for IMAGE, or FALLBACK when IMAGE is nil."
@@ -1291,7 +1293,7 @@ When image data is not ready yet, return a textual fallback."
    (qq-media-avatar-image user-id)
    "@"))
 
-(defun qq-media-url-preview-image (key url)
+(defun qq-media-url-preview-image (key url &optional max-height)
   "Return preview image for remote URL under cache KEY.
 
 Trigger an asynchronous download when the image is not cached yet."
@@ -1300,16 +1302,21 @@ Trigger an asynchronous download when the image is not cached yet."
      key
      (lambda (done _error)
        (funcall done `((url . ,url))))
-     nil
+     max-height
      #'qq-media--preview-image-from-file)))
 
-(defun qq-media-url-preview-display-string (key url fallback)
+(defun qq-media-url-preview-display-string (key url fallback &optional max-height)
   "Return display string for remote image URL cached under KEY.
 
 Use FALLBACK until the preview is available."
   (qq-media--image-display-string
-   (qq-media-url-preview-image key url)
+   (qq-media-url-preview-image key url max-height)
    fallback))
+
+(defun qq-media-poke-image-cache-key (url)
+  "Return the cache key used for a decorative POKE image URL."
+  (and (qq-media-url-present-p url)
+       (format "poke-image-url:%s" url)))
 
 (defun qq-media-open-image-url (key url)
   "Open remote image URL using media cache KEY."
@@ -1838,6 +1845,9 @@ not ready yet, show the human face name (`/斜眼笑') rather than CQ."
       (push download-key keys))
     (when-let* ((preview-key (qq-media-segment-preview-key segment)))
       (push preview-key keys))
+    (when (and (equal type "poke")
+               (qq-media-url-present-p (alist-get 'image-url data)))
+      (push (qq-media-poke-image-cache-key (alist-get 'image-url data)) keys))
     (delete-dups (delq nil keys))))
 
 (defun qq-media-segment-preview-image (segment)

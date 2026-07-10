@@ -1668,6 +1668,31 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
           (push-button (point))
           (should (equal opened-url "https://example.com/thread")))))))
 
+(ert-deftest qq-chat-renders-poke-as-a-distinct-gray-tip-row ()
+  (let ((message
+         '((server-id . "poke-1")
+           (time . 1710000001)
+           (sender-id . "10001")
+           (sender-name . "Alice")
+           (target-id . "10002")
+           (segments
+            . (((type . "poke")
+                (data .
+                 ((actor-name . "Alice")
+                 (target-name . "Bob")
+                 (image-url . "https://example.com/poke.png")
+                 (action . "喷了喷")
+                 (detail . "的加分喷雾，分数++")))))))))
+    (with-temp-buffer
+      (let ((inhibit-read-only t))
+        (cl-letf (((symbol-function 'qq-media-url-preview-display-string)
+                   (lambda (&rest _args) "✦")))
+          (qq-chat--insert-poke-message message nil)
+          (should (equal (buffer-string)
+                         "  ✦  Alice  喷了喷  Bob  00:00\n       的加分喷雾，分数++\n"))
+          (should-not (string-match-p "@ Alice" (buffer-string)))
+          (should (eq (get-text-property 2 'face) 'qq-msg-poke)))))))
+
 (ert-deftest qq-chat-timeline-inserts-explicit-newer-history-gap ()
   (with-temp-buffer
     (qq-chat-mode)
