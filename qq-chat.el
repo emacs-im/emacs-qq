@@ -3521,12 +3521,11 @@ first unread message."
             (lambda (read-state)
               (when (qq-chat--initial-history-request-current-p
                      buffer session-key owner)
-         (let ((unread (or (alist-get 'unread_count read-state) 0))
-               (first-id (alist-get 'first_unread_message_id read-state))
-               (available
-                (qq-protocol-json-true-p
-                 (alist-get 'position_available read-state))))
-           (if (and (> unread 0) available first-id)
+         (let* ((unread (or (alist-get 'unread_count read-state) 0))
+                (first (alist-get 'first_unread read-state))
+                (first-id (and (listp first)
+                               (alist-get 'message_id first))))
+           (if (and (> unread 0) first-id)
                (qq-api-fetch-history-around
                 session-key first-id
                 (lambda (meta)

@@ -1139,27 +1139,26 @@ timeline rebuild."
 (defun qq-state-apply-session-read-state (session-key read-state)
   "Apply kernel READ-STATE to SESSION-KEY and emit a read mutation.
 
-READ-STATE is the payload from NapCat `get_peer_read_state'.  Message ids and
+READ-STATE is the payload from NapCat `emacs_get_read_state'.  Message ids and
 sequences remain strings; in particular, the NT snowflake message id is never
 coerced to an Emacs number."
   (let* ((raw-count (alist-get 'unread_count read-state))
          (count (max 0 (if (numberp raw-count)
                            (truncate raw-count)
                          (string-to-number (format "%s" (or raw-count 0))))))
+         (first (alist-get 'first_unread read-state))
+         (latest (alist-get 'latest read-state))
          (first-id
           (qq-protocol-optional-message-id
-           (alist-get 'first_unread_message_id read-state)
+           (and (listp first) (alist-get 'message_id first))
            "read state"))
          (first-seq (qq-state--normalize-id
-                     (alist-get 'first_unread_message_seq read-state)))
+                     (and (listp first) (alist-get 'sequence first))))
          (latest-id
           (qq-protocol-optional-message-id
-           (alist-get 'latest_message_id read-state)
+           (and (listp latest) (alist-get 'message_id latest))
            "read state"))
-         (available (and (> count 0)
-                         (qq-protocol-json-true-p
-                          (alist-get 'position_available read-state))
-                         first-id)))
+         (available (and (> count 0) first-id)))
     (qq-state-upsert-session
      session-key
      `((unread-count . ,count)

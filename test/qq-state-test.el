@@ -145,25 +145,30 @@
    (qq-state-apply-session-read-state
     "group:20001"
     '((unread_count . 5)
-      (first_unread_message_seq . "30001")
-      (first_unread_message_id . "9007199254742007089")
-      (position_available . t)))
+      (first_unread
+       . ((sequence . "30001")
+          (message_id . "9007199254742007089")))
+      (latest
+       . ((sequence . "30005")
+          (message_id . "9007199254742007094")))))
    (let ((session (qq-state-session "group:20001")))
      (should (= 5 (alist-get 'unread-count session)))
      (should (equal "30001" (alist-get 'first-unread-message-seq session)))
      (should (equal "9007199254742007089"
                     (alist-get 'first-unread-message-id session)))
-     (should (eq t (alist-get 'read-position-available session))))))
+     (should (eq t (alist-get 'read-position-available session)))
+     (should (equal "9007199254742007094"
+                    (alist-get 'read-latest-message-id session))))))
 
-(ert-deftest qq-state-read-position-rejects-decoded-json-false ()
+(ert-deftest qq-state-read-position-keeps-unresolved-sequence-unavailable ()
   (qq-test-with-reset
    (qq-state-upsert-session "group:20001" nil nil)
    (qq-state-apply-session-read-state
     "group:20001"
     '((unread_count . 5)
-      (first_unread_message_seq . "30001")
-      (first_unread_message_id . "9007199254742007089")
-      (position_available . :false)))
+      (first_unread
+       . ((sequence . "30001")
+          (message_id)))))
    (let ((session (qq-state-session "group:20001")))
      (should-not (alist-get 'first-unread-message-id session))
      (should-not (alist-get 'first-unread-message-seq session))

@@ -1648,8 +1648,10 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
                  (lambda (_session-key callback &optional _errback)
                    (funcall callback
                             '((unread_count . 7)
-                              (first_unread_message_id . "9007199254742007089")
-                              (position_available . t)))))
+                              (first_unread
+                               . ((sequence . "30001")
+                                  (message_id . "9007199254742007089")))
+                              (latest . nil)))))
                 ((symbol-function 'qq-api-fetch-history-around)
                  (lambda (session-key message-id callback &optional _errback count)
                    (setq around-call (list session-key message-id count))
@@ -1682,10 +1684,10 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
         (qq-chat--load-initial-history (current-buffer) "group:20001")
         (should (eq canceled 'request-1))
         (funcall (car read-callbacks)
-                 '((unread_count . 0) (position_available . :false)))
+                 '((unread_count . 0) (first_unread . nil) (latest . nil)))
         (should (= history-calls 0))
         (funcall (cadr read-callbacks)
-                 '((unread_count . 0) (position_available . :false)))
+                 '((unread_count . 0) (first_unread . nil) (latest . nil)))
         (should (= history-calls 1))))))
 
 (ert-deftest qq-chat-forward-segment-uses-dedicated-block-renderer ()

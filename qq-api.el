@@ -729,38 +729,55 @@ NapCat throws when `message_seq' is unknown or the page is empty
         (string-match-p "not exist" text)
         (string-match-p "no message" text))))
 
-(defun qq-api--session-peer-params (session-key)
-  "Return raw peer params for SESSION-KEY.
-
-Unlike `qq-api--session-request-params', this always returns the hard-cut
-NapCat extension pair `chat_type' + `peer_uid'."
+(defun qq-api--session-emacs-locator (session-key)
+  "Return the closed Emacs protocol locator for SESSION-KEY."
   (let* ((session (qq-state-session session-key))
-         (type (or (alist-get 'type session)
-                   (qq-state-session-key-type session-key)))
+         (raw-type (or (alist-get 'type session)
+                       (qq-state-session-key-type session-key)))
+         (type (pcase raw-type
+                 ((or 'group "group") 'group)
+                 ((or 'private "private") 'private)
+                 ((or 'dataline "dataline") 'dataline)
+                 ((or 'service "service") 'service)
+                 (_ raw-type)))
          (target-id (or (alist-get 'target-id session)
-                        (qq-state-session-key-target-id session-key)))
-         (chat-type (or (alist-get 'chat-type session)
-                        (pcase type
-                          ('group 2)
-                          ('dataline 8)
-                          ('service 103)
-                          (_ 1))))
-         (peer-uid (or (alist-get 'peer-uid session)
-                       (and (memq type '(group dataline service)) target-id))))
-    (unless peer-uid
-      (error "qq: session %s has no kernel peer uid" session-key))
-    `((chat_type . ,chat-type)
-      (peer_uid . ,(format "%s" peer-uid)))))
+                        (qq-state-session-key-target-id session-key))))
+    (pcase type
+      ((or 'group 'private)
+       (qq-api-chat-locator session-key))
+      ('dataline
+       (let ((peer-uid (or (alist-get 'peer-uid session) target-id))
+             (chat-type (alist-get 'chat-type session)))
+         (unless peer-uid
+           (error "qq: dataline session %s has no peer uid" session-key))
+         `((kind . "dataline")
+           (peer_uid . ,(format "%s" peer-uid))
+           (variant . ,(pcase (and chat-type (format "%s" chat-type))
+                         ("8" "desktop")
+                         ("134" "mobile")
+                         (_ (error "qq: unsupported dataline chat type %s"
+                                   chat-type)))))))
+      ('service
+       (let ((peer-uid (or (alist-get 'peer-uid session) target-id)))
+         (unless peer-uid
+           (error "qq: service session %s has no peer uid" session-key))
+         `((kind . "service")
+           (peer_uid . ,(format "%s" peer-uid)))))
+      (_ (error "qq: unsupported Emacs session type %s" type)))))
+
+(defun qq-api--session-emacs-params (session-key)
+  "Return native Emacs action params for SESSION-KEY."
+  `((chat . ,(qq-api--session-emacs-locator session-key))))
 
 (defun qq-api-fetch-session-read-state (session-key &optional callback errback)
   "Fetch the official Linux QQ read position for SESSION-KEY.
 
-NapCat resolves the kernel `firstUnreadMsgInfo.msgSeq' to the hard-cut NT
-snowflake `first_unread_message_id'.  CALLBACK receives the raw read-state
+NapCat resolves the kernel first-unread sequence to the hard-cut NT snowflake
+in `first_unread.message_id'.  CALLBACK receives the raw read-state
 payload after it has been applied to `qq-state'."
   (qq-api-call
-   "get_peer_read_state"
-   (qq-api--session-peer-params session-key)
+   "emacs_get_read_state"
+   (qq-api--session-emacs-params session-key)
    (lambda (response)
      (let ((read-state (qq-api--response-data response)))
        (qq-state-apply-session-read-state session-key read-state)
@@ -1069,8 +1086,8 @@ ERRBACK is called so the client can fall back to single-side seek."
                           :queued 0)))
     (puthash session-key operation qq-api--read-operations)
     (qq-api-call
-     "mark_msg_as_read"
-     (qq-api--session-request-params session-key)
+     "emacs_mark_read"
+     (qq-api--session-emacs-params session-key)
      (lambda (_response)
        (when (qq-api--read-operation-current-p session-key token)
          (let* ((current (gethash session-key qq-api--read-operations))

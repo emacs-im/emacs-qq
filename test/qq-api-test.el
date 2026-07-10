@@ -91,6 +91,8 @@
         (qq-api--read-operations (make-hash-table :test #'equal))
         (qq-api--read-operation-counter 0)
         cleared-before-call
+        captured-action
+        captured-params
         errback-fn
         success-fn)
     (qq-state-reset)
@@ -101,7 +103,9 @@
        (unread-count . 3))
      nil)
     (cl-letf (((symbol-function 'qq-api-call)
-               (lambda (_action _params callback &optional errback)
+               (lambda (action params callback &optional errback)
+                 (setq captured-action action
+                       captured-params params)
                  (setq cleared-before-call
                        (= 0 (alist-get 'unread-count
                                        (qq-state-session "private:10001"))))
@@ -110,6 +114,9 @@
                  'sent)))
       (qq-api-mark-session-read "private:10001")
       (should cleared-before-call)
+      (should (equal captured-action "emacs_mark_read"))
+      (should (equal (alist-get 'chat captured-params)
+                     '((kind . "private") (user_id . "10001"))))
       (should (= 0 (alist-get 'unread-count
                               (qq-state-session "private:10001"))))
       ;; Failure restores previous unread.
@@ -121,6 +128,30 @@
       (funcall success-fn '((status . ok)))
       (should (= 0 (alist-get 'unread-count
                               (qq-state-session "private:10001")))))))
+
+(ert-deftest qq-api-session-emacs-locator-tags-kernel-only-session-kinds ()
+  (cl-letf (((symbol-function 'qq-state-session)
+             (lambda (session-key)
+               (pcase session-key
+                 ("dataline:device-1"
+                  '((type . dataline)
+                    (target-id . "device-1")
+                    (chat-type . "134")
+                    (peer-uid . "device-1")))
+                 ("service:u_mail"
+                  '((type . service)
+                    (target-id . "u_mail")
+                    (chat-type . "103")
+                    (peer-uid . "u_mail")))))))
+    (should
+     (equal (qq-api--session-emacs-locator "dataline:device-1")
+            '((kind . "dataline")
+              (peer_uid . "device-1")
+              (variant . "mobile"))))
+    (should
+     (equal (qq-api--session-emacs-locator "service:u_mail")
+            '((kind . "service")
+              (peer_uid . "u_mail"))))))
 
 (ert-deftest qq-api-mark-session-read-coalesces-and-restores-new-arrivals ()
   (let ((qq-state-change-hook nil)
@@ -217,7 +248,7 @@
       (should (equal merged '("dataline:device-1" (((message_id . 1))))))
       (should (= (plist-get done-meta :added-count) 1)))))
 
-(ert-deftest qq-api-fetch-session-read-state-uses-raw-peer-and-applies-result ()
+(ert-deftest qq-api-fetch-session-read-state-uses-native-locator-and-applies-result ()
   (let (captured-action captured-params applied callback-value)
     (cl-letf (((symbol-function 'qq-state-session)
                (lambda (_session-key)
@@ -235,15 +266,17 @@
                        captured-params params)
                  (funcall callback
                           '((data . ((unread_count . 5)
-                                     (first_unread_message_id . "9007199254742007089")
-                                     (position_available . t)))))
+                                     (first_unread
+                                      . ((sequence . "30001")
+                                         (message_id . "9007199254742007089")))
+                                     (latest . nil)))))
                  'sent)))
       (qq-api-fetch-session-read-state
        "group:20001"
        (lambda (read-state) (setq callback-value read-state)))
-      (should (equal "get_peer_read_state" captured-action))
-      (should (equal "2" (alist-get 'chat_type captured-params)))
-      (should (equal "20001" (alist-get 'peer_uid captured-params)))
+      (should (equal "emacs_get_read_state" captured-action))
+      (should (equal '((kind . "group") (group_id . "20001"))
+                     (alist-get 'chat captured-params)))
       (should (equal (car applied) "group:20001"))
       (should (equal callback-value (cadr applied))))))
 
