@@ -18,6 +18,7 @@
 (require 'subr-x)
 (require 'qq-api)
 (require 'qq-chat)
+(require 'qq-media)
 (require 'qq-state)
 (require 'qq-ui)
 (require 'qq-view)
@@ -526,15 +527,29 @@ forwarded message is written to or looked up in `qq-state'."
     (qq-ui-apply-line-prefix start (point) prefix-state)))
 
 (defun qq-forward--insert-message (message index)
-  "Insert normalized forward MESSAGE numbered INDEX."
+  "Insert normalized forward MESSAGE numbered INDEX.
+
+Header matches the official forward list and qq-chat: avatar (when the
+sender has a user id) + name + time.  Avatar image updates redisplay via
+the existing media-key index (`avatar:USER-ID')."
   (let* ((start (point))
          (properties (qq-forward--entry-properties message index))
+         (sender-id (alist-get 'sender-id message))
          (sender (or (qq-forward--present-string
                       (alist-get 'sender-name message))
                      "unknown"))
          (time (qq-forward--format-time (alist-get 'time message)))
          (prefix-state (qq-ui-make-prefix-state "  " "  ")))
     (let ((header-start (point)))
+      ;; Same gate as qq-chat: any non-nil sender-id (string or number).
+      ;; Anonymous / virtual senders keep sender-id nil and skip the glyph.
+      (when sender-id
+        (let ((avatar-start (point)))
+          (insert (qq-media-avatar-display-string sender-id) " ")
+          (add-text-properties
+           avatar-start (point)
+           '(mouse-face highlight
+             help-echo "Open sender avatar"))))
       (insert sender)
       (unless (string-empty-p time)
         (insert "  ")

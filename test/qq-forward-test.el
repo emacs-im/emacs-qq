@@ -383,6 +383,44 @@ list are indistinguishable — both mean \"do not claim a count\"."
         (goto-char (1- (point-max)))
         (should (get-text-property (point) 'qq-forward-segment))))))
 
+(ert-deftest qq-forward-entry-header-includes-sender-avatar ()
+  "Forward entries render user avatars like the official GUI / qq-chat."
+  (let* ((origin '((kind . "group") (group_id . "20001")))
+         (message
+          (qq-forward--normalized-message
+           nil
+           '(((type . "text") (data . ((text . "hello")))))
+           "1" "1" 1710000000
+           '("10001" "Alice" nil nil)
+           "live" origin))
+         (anon
+          (qq-forward--normalized-message
+           nil
+           '(((type . "text") (data . ((text . "ghost")))))
+           "2" "2" 1710000001
+           '(nil "anonymous" "anon" nil)
+           "live" origin))
+         avatar-calls)
+    (cl-letf (((symbol-function 'qq-media-avatar-display-string)
+               (lambda (user-id)
+                 (push user-id avatar-calls)
+                 (propertize "@" 'qq-test-avatar user-id))))
+      (with-temp-buffer
+        (qq-forward--insert-message message 0)
+        (qq-forward--insert-message anon 1)
+        (should (equal avatar-calls '("10001")))
+        (goto-char (point-min))
+        (should (get-text-property (point) 'qq-test-avatar))
+        (should (equal (get-text-property (point) 'qq-test-avatar) "10001"))
+        (should (string-match-p "Alice" (buffer-string)))
+        (should (string-match-p "anonymous" (buffer-string)))
+        ;; Anonymous entry has no avatar glyph from our stub.
+        (goto-char (point-min))
+        (search-forward "anonymous")
+        (let ((entry-start (car (qq-forward--entry-bounds 1))))
+          (should-not
+           (get-text-property entry-start 'qq-test-avatar)))))))
+
 (ert-deftest qq-forward-media-cache-update-redisplays-only-affected-entry ()
   "Media ticks redisplay a single entry; other entries and header stay put."
   (qq-forward-test--with-clean-viewers
