@@ -67,9 +67,7 @@
 
 (defun qq-transient--resource-inapt-p ()
   "Return non-nil when open-resource is unavailable at point."
-  (let ((message (qq-transient--message-at-point)))
-    (or (null message)
-        (not (qq-chat--message-openable-p message)))))
+  (disco-media-card-action-inapt-reason 'open))
 
 (defun qq-transient--avatar-inapt-p ()
   "Return non-nil when avatar open is unavailable at point."
@@ -123,12 +121,22 @@ Prefer this over inline button rows (telega/disco style)."
      :inapt-if qq-transient--reply-inapt-p)
     ("d" "Recall" qq-chat-delete-message
      :inapt-if qq-transient--recall-inapt-p)
-    ("o" "Open resource" qq-chat-open-resource-at-point
-     :inapt-if qq-transient--resource-inapt-p)
     ("a" "Open avatar" qq-chat-open-avatar-at-point
      :inapt-if qq-transient--avatar-inapt-p)
     ("g" "Goto reply target" qq-chat-goto-reply
      :inapt-if qq-transient--goto-reply-inapt-p)]
+   ["Media"
+    ("o" "Open / play" disco-media-card-open
+     :inapt-if qq-transient--resource-inapt-p)
+    ("D" "Download / retry" disco-media-card-download
+     :inapt-if (lambda ()
+                 (disco-media-card-action-inapt-reason 'download)))
+    ("s" "Save as" disco-media-card-save-as
+     :inapt-if (lambda ()
+                 (disco-media-card-action-inapt-reason 'save-as)))
+    ("y" "Copy media URL" disco-media-card-copy-url
+     :inapt-if (lambda ()
+                 (disco-media-card-action-inapt-reason 'copy-url)))]
    ["Navigate"
     ("n" "Next message" qq-chat-next-message)
     ("p" "Previous message" qq-chat-previous-message)

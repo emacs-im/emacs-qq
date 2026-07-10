@@ -1457,19 +1457,17 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
          (ignore-errors (delete-file path)))))))
 
 (ert-deftest qq-chat-media-preview-uses-qq-opener-not-browser-url ()
-  "Clicking an inline image preview uses the semantic QQ media opener."
+  "A compact QQ card uses shared context and no inline action toolbar."
   (let* ((segment '((type . "image")
                     (data . ((url . "https://example.com/picture.gif")
                              (name . "picture.gif")))))
          preview-url
-         preview-action
          opened-segment)
     (with-temp-buffer
       (let ((inhibit-read-only t))
-        (cl-letf (((symbol-function 'qq-chat--insert-segment-transfer-line)
-                   (lambda (&rest _args) (insert "transfer\n")))
-                  ((symbol-function 'qq-media-segment-playable-p)
-                   (lambda (_segment) nil))
+        (cl-letf (((symbol-function 'qq-media-segment-download-state)
+                   (lambda (_segment)
+                     '(:status not-downloaded :path "/tmp/picture.gif")))
                   ((symbol-function 'qq-media-segment-preview-capable-p)
                    (lambda (_segment) t))
                   ((symbol-function 'qq-media-segment-preview-image)
@@ -1480,21 +1478,49 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
                    (lambda (_image url &optional _prefix _fallback)
                      (setq preview-url url)
                      (insert "PREVIEW")))
-                  ((symbol-function 'disco-media-add-action-properties)
-                   (lambda (_start _end callback _help)
-                     (setq preview-action callback)))
                   ((symbol-function 'qq-media-segment-open)
                    (lambda (media-segment)
                      (setq opened-segment media-segment))))
           (qq-chat--insert-segment-media-line segment nil nil)
           (should-not preview-url)
-          (should (functionp preview-action))
-          (should (string-match-p (regexp-quote "[Copy URL]")
+          (should (string-match-p (regexp-quote "[image] picture.gif")
                                   (buffer-string)))
-          (should-not (string-match-p (regexp-quote "[URL]")
-                                      (buffer-string)))
-          (funcall preview-action nil)
+          (dolist (old-action '("[Open]" "[Play]" "[Copy URL]"
+                                "[Download]" "[Save As]" "transfer:"))
+            (should-not (string-match-p (regexp-quote old-action)
+                                        (buffer-string))))
+          (goto-char (point-min))
+          (search-forward "PREVIEW")
+          (let ((context (disco-media-card-context-at-point)))
+            (should (equal (plist-get context :payload) segment))
+            (should (functionp (plist-get context :download-action)))
+            (should (functionp (plist-get context :save-as-action)))
+            (should (functionp (plist-get context :copy-url-action)))
+            (disco-media-card-call-action 'open context))
           (should (equal opened-segment segment)))))))
+
+(ert-deftest qq-chat-media-card-context-targets-exact-segment-at-point ()
+  "Shared card context keeps multi-segment QQ messages unambiguous."
+  (let ((first '((type . "image")
+                 (data . ((name . "first.png")
+                          (url . "https://example.com/first.png")))))
+        (second '((type . "video")
+                  (data . ((name . "second.mp4")
+                           (url . "https://example.com/second.mp4"))))))
+    (with-temp-buffer
+      (let ((inhibit-read-only t))
+        (cl-letf (((symbol-function 'qq-media-segment-download-state)
+                   (lambda (_segment)
+                     '(:status not-downloaded :path "/tmp/media")))
+                  ((symbol-function 'qq-media-segment-preview-capable-p)
+                   (lambda (_segment) nil)))
+          (qq-chat--insert-segment-media-line first nil nil)
+          (qq-chat--insert-segment-media-line second nil nil)
+          (goto-char (point-min))
+          (search-forward "second.mp4")
+          (should
+           (equal second
+                  (plist-get (disco-media-card-context-at-point) :payload))))))))
 
 (provide (quote qq-chat-test))
 

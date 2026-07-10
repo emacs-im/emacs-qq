@@ -15,6 +15,7 @@
 (require 'subr-x)
 (require 'ewoc)
 (require 'disco-chatbuf)
+(require 'disco-ins)
 (require 'disco-media)
 (require 'qq-api)
 (require 'qq-customize)
@@ -2174,175 +2175,94 @@ Keep this short — size is useful; internal sub_type / emoji ids are not."
                                               (alist-get 'file-size data)))))
     (or size "")))
 
-(defun qq-chat--insert-prefixed-plain-line (prefix-state text properties &optional face)
-  "Insert TEXT as one prefixed plain line using PREFIX-STATE and PROPERTIES."
-  (let ((line-start (point)))
-    (insert text "\n")
-    (add-text-properties line-start (point)
-                         (append properties
-                                 (when face (list 'face face))))
-    (qq-ui-apply-line-prefix line-start (point) prefix-state)))
+(defun qq-chat--segment-media-card-kind (segment)
+  "Return shared media card kind for OneBot SEGMENT."
+  (pcase (alist-get 'type segment)
+    ("record" 'audio)
+    ("mface" 'sticker)
+    (_ (qq-media-segment-kind segment))))
 
-(defun qq-chat--insert-message-action-button (label callback help-echo)
-  "Insert one message action button with LABEL, CALLBACK and HELP-ECHO."
-  (qq-ui-insert-action-button
-   label
-   callback
-   :face 'link
-   :help-echo help-echo
-   :properties '(read-only t front-sticky t rear-nonsticky (read-only))))
+(defun qq-chat--segment-media-card-context (segment)
+  "Adapt OneBot media SEGMENT to the shared card action protocol."
+  (let* ((state (qq-media-segment-download-state segment))
+         (status (plist-get state :status))
+         (url (alist-get 'url (alist-get 'data segment))))
+    (disco-media-card-context-create
+     :payload segment
+     :kind (qq-chat--segment-media-card-kind segment)
+     :title (qq-chat--segment-media-summary segment)
+     :open-action (when (qq-media-segment-openable-p segment)
+                    (lambda ()
+                      (qq-media-segment-open segment)))
+     :download-action (unless (memq status '(downloading downloaded))
+                        (lambda ()
+                          (qq-media-segment-start-download segment)))
+     :save-as-action (lambda ()
+                       (qq-media-segment-save-as segment))
+     :copy-url-action (when (qq-media-url-present-p url)
+                        (lambda ()
+                          (kill-new url)
+                          (message "qq: copied media URL"))))))
 
-(defun qq-chat--insert-segment-transfer-line (segment prefix-state properties)
-  "Insert one transfer/action line for media SEGMENT."
-  (let* ((download-state (qq-media-segment-download-state segment))
-         (download-status (plist-get download-state :status))
-         (download-path (plist-get download-state :path))
-         (download-error (plist-get download-state :error))
-         (local-file (qq-media-segment-local-file segment))
-         (line-start (point))
-         (inserted nil))
-    (insert "transfer: ")
-    (cond
-     ((eq download-status 'downloading)
-      (insert "[Downloading...]")
-      (setq inserted t))
-     (t
-      (when local-file
-        (qq-chat--insert-message-action-button
-         "[Open Local]"
-         (lambda ()
-           (qq-media-segment-open-local segment))
-         "Open the local cached/downloaded file")
-        (setq inserted t))
-      (pcase download-status
-        ('downloaded
-         (when inserted (insert " "))
-         (qq-chat--insert-message-action-button
-          "[Save As]"
-          (lambda ()
-            (qq-media-segment-save-as segment))
-          "Copy media to a chosen location")
-         (setq inserted t)
-         (when (and (stringp download-path) (not (string-empty-p download-path)))
-           (insert (format "  %s" (file-name-nondirectory download-path)))))
-        ('error
-         (when inserted (insert " "))
-         (qq-chat--insert-message-action-button
-          "[Retry]"
-          (lambda ()
-            (qq-media-segment-start-download segment))
-          "Retry media download")
-         (insert " ")
-         (qq-chat--insert-message-action-button
-          "[Save As]"
-          (lambda ()
-            (qq-media-segment-save-as segment))
-          "Save media to a chosen location")
-         (setq inserted t)
-         (when (and (stringp download-error) (not (string-empty-p download-error)))
-           (insert (format "  error=%s"
-                           (truncate-string-to-width download-error 56 nil nil t)))))
-        (_
-         (when inserted (insert " "))
-         (qq-chat--insert-message-action-button
-          "[Download]"
-          (lambda ()
-            (qq-media-segment-start-download segment))
-          "Download media into qq cache directory")
-         (insert " ")
-         (qq-chat--insert-message-action-button
-          "[Save As]"
-          (lambda ()
-            (qq-media-segment-save-as segment))
-          "Save media to a chosen location")
-         (setq inserted t)))))
-    (unless inserted
-      (insert "[Unavailable]"))
-    (insert "\n")
-    (qq-ui-apply-line-prefix line-start (point) prefix-state)
-    (add-text-properties line-start (point) (append properties (list 'face 'shadow)))))
+(defun qq-chat--media-card-fallback-context ()
+  "Return primary media context for the message at point."
+  (when-let* ((message (ignore-errors (qq-chat--message-at-point)))
+              (segment (qq-media-message-primary-segment message)))
+    (qq-chat--segment-media-card-context segment)))
 
 (defun qq-chat--insert-segment-media-line (segment prefix-state properties)
   "Insert one rich media card for SEGMENT using PREFIX-STATE and PROPERTIES."
-  (let* ((kind (qq-chat--segment-media-kind-label segment))
-         (summary (qq-chat--segment-media-summary segment))
+  (let* ((kind-label (qq-chat--segment-media-kind-label segment))
          (meta (qq-chat--segment-media-meta-line segment))
-         (data (alist-get 'data segment))
-         (url (alist-get 'url data))
+         (context (qq-chat--segment-media-card-context segment))
+         (state (qq-media-segment-download-state segment))
          (prefix-state (let ((qq-ui-card-indent-prefix-state prefix-state))
                          (qq-ui-card-prefix-state))))
-    (let ((title-start (point)))
-      (insert (format "%s: %s\n" kind summary))
-      (qq-ui-apply-line-prefix title-start (point) prefix-state)
-      (add-text-properties title-start (point) (append properties (list 'face 'bold))))
-    (when (and (stringp meta) (not (string-empty-p meta)))
-      (let ((meta-start (point)))
-        (insert meta "\n")
-        (qq-ui-apply-line-prefix meta-start (point) prefix-state)
-        (add-text-properties meta-start (point) (append properties (list 'face 'shadow)))))
-    (let ((action-start (point))
-          (inserted nil))
-      (when (qq-media-segment-playable-p segment)
-        (qq-chat--insert-message-action-button
-         "[Play]"
-         (lambda ()
-           (qq-media-segment-play segment))
-         (format "Play %s" kind))
-        (setq inserted t))
-      (when inserted
-        (insert " "))
-      (qq-chat--insert-message-action-button
-       "[Open]"
-       (lambda ()
-         (qq-media-segment-open segment))
-       (format "Open %s in Emacs or the configured media player" kind))
-      (when (and (stringp url) (not (string-empty-p url)))
-        (insert " ")
-        (qq-chat--insert-message-action-button
-         "[Copy URL]"
-         (lambda ()
-           (kill-new url)
-           (message "qq: copied media URL"))
-         "Copy resource URL"))
-      (insert "\n")
-      (qq-ui-apply-line-prefix action-start (point) prefix-state)
-      (add-text-properties action-start (point) (append properties (list 'face 'shadow))))
-    (qq-chat--insert-segment-transfer-line segment prefix-state properties)
-    (when (qq-media-segment-preview-capable-p segment)
-      (let ((preview-start (point))
-            (preview (qq-media-segment-preview-image segment))
-            (loading (qq-media-segment-preview-fetching-p segment))
-            preview-end)
-        (cond
-         (preview
-          (condition-case _
-              (progn
-                ;; Passing nil as URL prevents disco's browser action.  QQ
-                ;; installs its semantic Emacs/mpv opener below instead.
-                (disco-media-insert-image-slices
-                 preview
-                 nil
-                 nil
-                 (if (equal (alist-get 'type segment) "mface")
-                     "[sticker]"
-                   "[image]"))
-                (setq preview-end (point)))
-            (error
-             (insert "[preview unavailable]")))
-          (when preview-end
-            (disco-media-add-action-properties
-             preview-start preview-end
-             (lambda (&optional _event)
-               (interactive)
-               (qq-media-segment-open segment))
-             (format "Open %s in Emacs" kind)))
-          (insert "\n"))
-         (loading
-          (insert "[loading preview]\n"))
-         (t
-          (insert "[preview unavailable]\n")))
-        (qq-ui-apply-line-prefix preview-start (point) prefix-state)
-        (add-text-properties preview-start (point) (append properties (list 'face 'shadow)))))))
+    (disco-ins-insert-media-card
+     :kind (qq-chat--segment-media-card-kind segment)
+     :title (qq-chat--segment-media-summary segment)
+     :details (unless (string-empty-p meta) (list meta))
+     :status (disco-ins-media-transfer-status-text state)
+     :prefix prefix-state
+     :title-face 'bold
+     :meta-face 'shadow
+     :properties properties
+     :context context
+     :open-help-echo (format "Open %s in Emacs or the configured player"
+                             (downcase kind-label))
+     :body-inserter
+     (lambda (card-prefix-state)
+       (when (qq-media-segment-preview-capable-p segment)
+         (let ((preview-start (point))
+               (preview (qq-media-segment-preview-image segment))
+               (loading (qq-media-segment-preview-fetching-p segment))
+               preview-end)
+           (cond
+            (preview
+             (condition-case _
+                 (progn
+                   (disco-media-insert-image-slices
+                    preview nil nil
+                    (if (equal (alist-get 'type segment) "mface")
+                        "[sticker]"
+                      "[image]"))
+                   (setq preview-end (point)))
+               (error
+                (insert "[preview unavailable]")))
+             (when preview-end
+               (disco-media-add-action-properties
+                preview-start preview-end
+                (lambda (&optional _event)
+                  (interactive)
+                  (disco-media-card-call-action 'open context))
+                (format "Open %s" (downcase kind-label))))
+             (insert "\n"))
+            (loading
+             (insert "[loading preview]\n"))
+            (t
+             (insert "[preview unavailable]\n")))
+           (qq-ui-apply-line-prefix preview-start (point) card-prefix-state)
+           (qq-ui-append-face preview-start (point) 'shadow)))))))
 
 (defun qq-chat--insert-message-body (message prefix-state properties)
   "Insert MESSAGE content body using PREFIX-STATE and PROPERTIES."
@@ -2437,10 +2357,6 @@ on the first inline line when the body is pure inline content."
             (add-text-properties
              start (point)
              (append properties (list 'face 'qq-msg-status))))))))))
-
-(defun qq-chat--message-openable-p (message)
-  "Return non-nil when MESSAGE has an openable QQ media resource."
-  (qq-media-message-has-openable-resource-p message))
 
 (defun qq-chat--set-pending-reply (message)
   "Set MESSAGE as the pending reply target in current chat buffer."
@@ -2775,11 +2691,9 @@ new rows or reports the cursor missing."
        (user-error "qq: no message at point"))))
 
 (defun qq-chat-open-resource-at-point ()
-  "Open the most relevant media resource from the message at point."
+  "Open the exact media card at point, or the message's primary media."
   (interactive)
-  (qq-media-open-message-resource
-   (or (qq-chat--message-at-point)
-       (user-error "qq: no message at point"))))
+  (disco-media-card-open))
 
 (defun qq-chat-open-avatar-at-point ()
   "Open sender avatar for the message at point."
@@ -2884,6 +2798,8 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (setq-local qq-chat--displayed-message-anchors nil)
   (setq-local qq-chat--render-context-by-anchor (make-hash-table :test #'equal))
   (setq-local qq-chat--media-anchors-by-key (make-hash-table :test #'equal))
+  (setq-local disco-media-card-fallback-context-function
+              #'qq-chat--media-card-fallback-context)
   (setq-local qq-chat--deferred-node-anchors nil)
   (setq-local qq-chat--history-loading nil)
   (setq-local qq-chat--history-exhausted nil)
