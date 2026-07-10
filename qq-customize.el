@@ -199,6 +199,16 @@ Same defaults as `telega-msg-deleted'."
   "Face for pending/failed/recalled status suffixes and timestamps."
   :group 'qq)
 
+(defface qq-msg-reaction
+  '((t :inherit button))
+  "Face for a message reaction not selected by the current account."
+  :group 'qq)
+
+(defface qq-msg-reaction-chosen
+  '((t :inherit (highlight bold)))
+  "Face for a message reaction selected by the current account."
+  :group 'qq)
+
 (defcustom qq-media-avatar-image-height 20
   "Pixel height used for inline avatar images in chat buffers."
   :type 'integer

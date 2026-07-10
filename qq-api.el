@@ -1249,6 +1249,53 @@ second-level anchor."
    (lambda (_response)
      (qq-state-apply-recall message-id))))
 
+(defun qq-api-recall-poke (message-id &optional callback errback)
+  "Recall poke MESSAGE-ID via QQ's native recallNudge path.
+
+Pokes are gray-tip records, so they must not be sent through `delete_msg'."
+  (setq message-id
+        (qq-api-validate-message-id message-id "recall_poke"))
+  (qq-api-call
+   "recall_poke"
+   `((message_id . ,message-id))
+   (lambda (response)
+     (qq-state-apply-recall message-id)
+     (when callback
+       (funcall callback response)))
+   (or errback
+       (lambda (response reason)
+         (qq-api--default-error response reason)))))
+
+(defun qq-api-set-message-emoji-like
+    (message-id emoji-id set &optional callback errback)
+  "Add or remove EMOJI-ID on MESSAGE-ID according to SET.
+
+MESSAGE-ID remains the original NapCat NT snowflake string.  On success,
+optimistically apply one local reaction delta; the subsequent NapCat notice
+reconciles it with the authoritative aggregate count."
+  (setq message-id
+        (qq-api-validate-message-id message-id "set_msg_emoji_like"))
+  (setq emoji-id (format "%s" emoji-id))
+  (unless (string-match-p "\\`[0-9]+\\'" emoji-id)
+    (user-error "qq: reaction emoji_id must be a decimal string"))
+  (let ((set (and set t)))
+    (qq-api-call
+     "set_msg_emoji_like"
+     `((message_id . ,message-id)
+       (emoji_id . ,emoji-id)
+       (set . ,(if set t :false)))
+     (lambda (response)
+       (when-let* ((self-id (qq-state-self-user-id)))
+         (qq-state-apply-emoji-like-notice
+          `((notice_type . "group_msg_emoji_like")
+            (message_id . ,message-id)
+            (user_id . ,self-id)
+            (is_add . ,(if set t :false))
+            (likes . (((emoji_id . ,emoji-id)))))))
+       (when callback
+         (funcall callback response)))
+     (or errback #'qq-api--default-error))))
+
 (defun qq-api-get-avatar (user-id callback &optional errback no-cache)
   "Fetch avatar resource for USER-ID and pass it to CALLBACK."
   (qq-api-call
@@ -1378,6 +1425,8 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
   (pcase (alist-get 'notice_type notice)
     ((or "friend_recall" "group_recall")
      (qq-state-apply-recall (alist-get 'message_id notice)))
+    ("group_msg_emoji_like"
+     (qq-state-apply-emoji-like-notice notice))
     ("notify"
      (pcase (alist-get 'sub_type notice)
        ("input_status"

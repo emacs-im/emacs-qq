@@ -47,6 +47,8 @@
 (declare-function qq-api-cancel-request "qq-api" (request-token))
 (declare-function qq-api-send-poke
                   "qq-api" (session-key &optional target-id callback errback))
+(declare-function qq-api-recall-poke
+                  "qq-api" (message-id &optional callback errback))
 
 (defvar-local qq-chat--session-key nil
   "Session key associated with the current chat buffer.")
@@ -206,14 +208,15 @@ loaded in the chatbuf.")
     (define-key map (kbd "g") #'qq-chat-goto-reply)
     (define-key map (kbd "x") #'qq-chat-goto-pop-message)
     (define-key map (kbd "P") #'qq-chat-send-poke)
+    (define-key map (kbd "!") #'qq-chat-react-to-message)
     (define-key map (kbd "m") #'qq-chat-message-transient)
     (define-key map (kbd "?") #'qq-chat-transient)
     map)
   "Timeline-only keymap active when point is outside the draft region.
 
-Single-key message actions (`r' reply, `d' recall, `f' forward, `M' mark,
-`F' forward marked, `o' open media, `a' avatar, `i' user, `g' goto replied-to,
-`x' pop jump) and menus (`m'/`?') apply on the timeline.
+Single-key message actions (`r' reply, `d' recall, `!' react, `f' forward,
+`M' mark, `F' forward marked, `o' open media, `a' avatar, `i' user,
+`g' goto replied-to, `x' pop jump) and menus (`m'/`?') apply on the timeline.
 They are inactive in the composer so typing is never stolen.")
 
 (define-minor-mode qq-chat-timeline-mode
@@ -1909,6 +1912,19 @@ When SEGMENT-TYPE is nil, infer the most useful QQ segment type from PATH."
 (defvar qq-chat--face-history nil
   "Minibuffer history for `qq-chat-attach-face'.")
 
+(defun qq-chat--read-base-face-id (&optional prompt)
+  "Prompt for and return one QQ base face id.
+
+PROMPT defaults to \"QQ face: \".  Completion uses the existing QQ face
+panel ordering, names, and local image affixation."
+  (let ((choice
+         (completing-read
+          (or prompt "QQ face: ")
+          (qq-media-face-completion-table)
+          nil t nil 'qq-chat--face-history)))
+    (or (qq-media-face-id-from-completion choice)
+        (user-error "qq: not a face candidate: %s" choice))))
+
 (defun qq-chat-attach-face (&optional face-id)
   "Insert a QQ base face (system emoji) into the chat composer.
 
@@ -1923,14 +1939,7 @@ match QQ's base emoji panel order instead of history/length sort.
 Sends as a structured OneBot `face' segment (not Unicode, not CQ text).
 Bound via `qq-chat-attach-emoji' (`C-c C-e'); attach transient `e'."
   (interactive
-   (list
-    (let ((choice
-           (completing-read
-            "QQ face: "
-            (qq-media-face-completion-table)
-            nil t nil 'qq-chat--face-history)))
-      (or (qq-media-face-id-from-completion choice)
-          (user-error "qq: not a face candidate: %s" choice)))))
+   (list (qq-chat--read-base-face-id)))
   (let* ((id (format "%s" (or face-id
                               (user-error "qq: face id required"))))
          (segment `((type . "face")
@@ -2828,6 +2837,96 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
                 (push (format "[%s]" (or type "segment")) inline-parts))))))
         (flush-inline)))))
 
+(defun qq-chat--reaction-by-emoji-id (message emoji-id)
+  "Return MESSAGE reaction matching EMOJI-ID, or nil."
+  (seq-find
+   (lambda (reaction)
+     (equal (alist-get 'emoji-id reaction) (format "%s" emoji-id)))
+   (qq-state-message-reactions message)))
+
+(defun qq-chat--unicode-reaction-string (emoji-id)
+  "Return Unicode character represented by decimal EMOJI-ID, or nil."
+  (when (and (stringp emoji-id)
+             (string-match-p "\\`[0-9]+\\'" emoji-id))
+    (let* ((codepoint (string-to-number emoji-id))
+           (character (and (<= 0 codepoint #x10ffff)
+                           (not (<= #xd800 codepoint #xdfff))
+                           (decode-char 'ucs codepoint))))
+      (and character (char-to-string character)))))
+
+(defun qq-chat--reaction-display-string (reaction)
+  "Return inline display string for normalized REACTION."
+  (let ((emoji-id (alist-get 'emoji-id reaction))
+        (emoji-type (alist-get 'emoji-type reaction)))
+    (if (equal emoji-type "2")
+        (or (qq-chat--unicode-reaction-string emoji-id)
+            (format "[emoji:%s]" emoji-id))
+      (qq-media-face-display-string emoji-id))))
+
+(defun qq-chat--message-reactable-p (message)
+  "Return non-nil when MESSAGE can receive a group reaction."
+  (and (listp message)
+       (eq (alist-get 'type (qq-chat--session)) 'group)
+       (qq-api-message-id-p (alist-get 'server-id message))
+       (not (qq-state-message-recalled-p message))))
+
+(defun qq-chat-toggle-message-reaction (message-id emoji-id)
+  "Toggle EMOJI-ID on cached MESSAGE-ID, telega reaction-button style."
+  (interactive
+   (let* ((message (or (qq-chat--message-at-point)
+                       (user-error "qq: no message at point")))
+          (reaction (or (car (qq-state-message-reactions message))
+                        (user-error "qq: message has no reaction to toggle"))))
+     (list (alist-get 'server-id message)
+           (alist-get 'emoji-id reaction))))
+  (let* ((message (or (qq-chat--message-by-server-id message-id)
+                      (user-error "qq: reaction message is not loaded")))
+         (_reactable (or (qq-chat--message-reactable-p message)
+                         (user-error "qq: reactions require a live group message")))
+         (reaction (qq-chat--reaction-by-emoji-id message emoji-id))
+         (set (not (and reaction (alist-get 'chosen-p reaction)))))
+    (qq-api-set-message-emoji-like
+     message-id emoji-id set
+     (lambda (_response)
+       (message "qq: reaction %s (%s)"
+                (if set "added" "removed") emoji-id)))))
+
+(defun qq-chat--insert-reaction-line (message prefix-state properties)
+  "Insert shared disco reaction chips adapted for QQ MESSAGE."
+  (let ((reactions (qq-state-message-reactions message))
+        (message-id (alist-get 'server-id message)))
+    (when reactions
+      (when-let* ((span
+                   (disco-ins-insert-reaction-line
+                    reactions
+                    :prefix prefix-state
+                    :selected-face 'qq-msg-reaction-chosen
+                    :unselected-face 'qq-msg-reaction
+                    :label-function
+                    (lambda (reaction)
+                      (concat " "
+                              (qq-chat--reaction-display-string reaction)
+                              " "
+                              (number-to-string
+                               (or (alist-get 'count reaction) 0))
+                              " "))
+                    :selected-p-function
+                    (lambda (reaction) (alist-get 'chosen-p reaction))
+                    :action-function
+                    (lambda (reaction)
+                      (qq-chat-toggle-message-reaction
+                       message-id (alist-get 'emoji-id reaction)))
+                    :help-echo-function
+                    (lambda (reaction)
+                      (let ((emoji-id (alist-get 'emoji-id reaction)))
+                        (format "%s %s"
+                                (if (alist-get 'chosen-p reaction)
+                                    "Remove reaction"
+                                  "Add reaction")
+                                (or (qq-media-face-name emoji-id)
+                                    emoji-id)))))))
+        (add-text-properties (car span) (cdr span) properties)))))
+
 (defun qq-chat--insert-compact-message-body (message prefix-state properties short-time)
   "Insert a same-sender continuation body for MESSAGE.
 
@@ -2927,7 +3026,9 @@ on the first inline line when the body is pure inline content."
     (unless message-id
       (user-error "qq: selected message has no server id"))
     (when (y-or-n-p (format "Recall message %s? " message-id))
-      (qq-api-delete-message message-id))))
+      (if (qq-state-poke-message-p message)
+          (qq-api-recall-poke message-id)
+        (qq-api-delete-message message-id)))))
 
 (defun qq-chat--message-title-face (message)
   "Return sender title face for MESSAGE."
@@ -3026,6 +3127,8 @@ Visual model (telega-inspired; later appkit):
         (when reply-id
           (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
         (qq-chat--insert-message-body message body-prefix-state properties)))
+    (unless (qq-state-message-recalled-p message)
+      (qq-chat--insert-reaction-line message body-prefix-state properties))
     (insert "\n")
     (add-text-properties start (point) properties)))
 
@@ -3340,6 +3443,26 @@ new rows or reports the cursor missing."
    (or (qq-chat--message-at-point)
        (user-error "qq: no message at point"))))
 
+(defun qq-chat-react-to-message (&optional face-id message)
+  "Add QQ base FACE-ID as a reaction to MESSAGE at point.
+
+Like telega's `!' action, interactive use opens the existing QQ face picker.
+Clicking an existing reaction chip performs add/remove toggle instead."
+  (interactive)
+  (let* ((message (or message
+                      (qq-chat--message-at-point)
+                      (user-error "qq: no message at point")))
+         (_reactable (or (qq-chat--message-reactable-p message)
+                         (user-error "qq: reactions require a live group message")))
+         (message-id (alist-get 'server-id message))
+         (emoji-id (format "%s" (or face-id
+                                    (qq-chat--read-base-face-id
+                                     "React with QQ face: ")))))
+    (qq-api-set-message-emoji-like
+     message-id emoji-id t
+     (lambda (_response)
+       (message "qq: reaction added (%s)" emoji-id)))))
+
 (defun qq-chat-open-resource-at-point ()
   "Open the exact media card at point, or the message's primary media."
   (interactive)
@@ -3485,7 +3608,7 @@ sender."
 (define-derived-mode qq-chat-mode nil "QQ-Chat"
   "Major mode for emacs-qq chat buffers.
 
-Message actions use point + keys (`r'/`d'/`o'/`a' on the timeline) or
+Message actions use point + keys (`r'/`d'/`!'/`o'/`a' on the timeline) or
 `qq-chat-message-transient' (`C-c m' / timeline `m').  Chat-wide commands
 are in `qq-chat-transient' (`C-c ?' / timeline `?').
 Attach from clipboard with `C-c C-v' (telega-style)."

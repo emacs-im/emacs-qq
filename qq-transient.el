@@ -75,6 +75,11 @@
   (not (qq-chat--message-forwardable-p
         (qq-transient--message-at-point))))
 
+(defun qq-transient--reaction-inapt-p ()
+  "Return non-nil when reacting to the message at point is unavailable."
+  (not (qq-chat--message-reactable-p
+        (qq-transient--message-at-point))))
+
 (defun qq-transient--no-forward-marks-p ()
   "Return non-nil when there are no raw forward selections to clear."
   (null qq-chat--marked-message-anchors))
@@ -169,6 +174,8 @@ Prefer this over inline button rows (telega/disco style)."
      :inapt-if qq-transient--forward-inapt-p)
     ("d" "Recall" qq-chat-delete-message
      :inapt-if qq-transient--recall-inapt-p)
+    ("!" "React…" qq-chat-react-to-message
+     :inapt-if qq-transient--reaction-inapt-p)
     ("a" "Open avatar" qq-chat-open-avatar-at-point
      :inapt-if qq-transient--avatar-inapt-p)
     ("i" "User page" qq-chat-open-user-at-point

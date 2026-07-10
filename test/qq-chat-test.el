@@ -53,6 +53,8 @@
              (should (eq (key-binding (kbd "M") t) 'qq-chat-toggle-forward-mark))
              (should (eq (key-binding (kbd "F") t)
                          'qq-chat-forward-marked-messages))
+             (should (eq (key-binding (kbd "!") t)
+                         'qq-chat-react-to-message))
              (should (eq (key-binding (kbd "m") t) 'qq-chat-message-transient))
              (should (eq (key-binding (kbd "?") t) 'qq-chat-transient))
              (should (eq (key-binding (kbd "C-c /") t) 'qq-chat-search))
@@ -873,6 +875,80 @@
                (should (get-text-property (match-beginning 0) 'display)))))
        (when (file-directory-p dir)
          (delete-directory dir t))))))
+
+(ert-deftest qq-chat-renders-clickable-reaction-chips ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001"))
+    nil)
+   (puthash
+    "group:20001"
+    '(((server-id . "9007199254741004001")
+       (sender-id . "10001")
+       (sender-name . "Alice")
+       (time . 100)
+       (segments . (((type . "text") (data . ((text . "hello"))))))
+       (reactions . (((emoji-id . "178")
+                      (emoji-type . "1")
+                      (count . 3)
+                      (chosen-p . t))))))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (cl-letf (((symbol-function 'qq-media-face-display-string)
+                (lambda (_emoji-id) "/斜眼笑")))
+       (qq-chat-render))
+     (goto-char (point-min))
+     (should (search-forward "/斜眼笑 3" nil t))
+     (let ((button (button-at (1- (point)))))
+       (should button)
+       (should (eq (button-get button 'face) 'qq-msg-reaction-chosen))))))
+
+(ert-deftest qq-chat-reaction-chip-toggles-current-selection ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001"))
+    nil)
+   (puthash
+    "group:20001"
+    '(((server-id . "9007199254741004001")
+       (reactions . (((emoji-id . "178")
+                      (emoji-type . "1")
+                      (count . 1)
+                      (chosen-p . t))))))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let (called)
+       (cl-letf (((symbol-function 'qq-api-set-message-emoji-like)
+                  (lambda (message-id emoji-id set &rest _)
+                    (setq called (list message-id emoji-id set)))))
+         (qq-chat-toggle-message-reaction
+          "9007199254741004001" "178"))
+       (should (equal called
+                      '("9007199254741004001" "178" nil)))))))
+
+(ert-deftest qq-chat-react-command-adds-picked-face ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001"))
+    nil)
+   (let ((message '((server-id . "9007199254741004001"))))
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "group:20001")
+       (let (called)
+         (cl-letf (((symbol-function 'qq-api-set-message-emoji-like)
+                    (lambda (message-id emoji-id set &rest _)
+                      (setq called (list message-id emoji-id set)))))
+           (qq-chat-react-to-message "178" message))
+         (should (equal called
+                        '("9007199254741004001" "178" t))))))))
 
 (ert-deftest qq-chat-media-cache-update-targets-affected-message-anchors ()
   (qq-chat-test-with-reset

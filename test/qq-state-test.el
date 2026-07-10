@@ -154,6 +154,7 @@
              (target_id . "10002")))))
      (should (equal (alist-get 'id message) "9007199254741007777"))
      (should (equal (alist-get 'server-id message) "9007199254741007777"))
+     (should (qq-state-poke-message-p message))
      (should-not (alist-get 'local-id message))
      (should (equal (alist-get 'preview message) "戳了戳 10002")))))
 
@@ -844,6 +845,95 @@
            (message_type . "group") (group_id . "20001")
            (user_id . "10001") (time . 1710000003) (message . ()))))
        (should (= sort-count 1))))))
+
+(ert-deftest qq-state-message-reactions-normalize-history-snapshot ()
+  (qq-test-with-reset
+   (qq-state-merge-history
+    "group:20001"
+    '(((message_id . "9007199254741004001")
+       (message_type . "group")
+       (group_id . "20001")
+       (user_id . "10001")
+       (time . 1710000001)
+       (message . ())
+       (emoji_likes_list
+        . (((emoji_id . "178")
+            (emoji_type . "1")
+            (likes_cnt . "3")
+            (is_clicked . "1")))))))
+   (let* ((message (car (qq-state-session-messages "group:20001")))
+          (reaction (car (qq-state-message-reactions message))))
+     (should (equal (alist-get 'emoji-id reaction) "178"))
+     (should (equal (alist-get 'emoji-type reaction) "1"))
+     (should (= (alist-get 'count reaction) 3))
+     (should (eq (alist-get 'chosen-p reaction) t)))))
+
+(ert-deftest qq-state-emoji-like-notice-updates-one-message ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "Me")))
+   (qq-state-merge-history
+    "group:20001"
+    '(((message_id . "9007199254741004001")
+       (message_type . "group")
+       (group_id . "20001")
+       (user_id . "10001")
+       (time . 1710000001)
+       (message . ())
+       (emoji_likes_list
+        . (((emoji_id . "178")
+            (emoji_type . "1")
+            (likes_cnt . "2")
+            (is_clicked . "0")))))))
+   ;; Another member adds one; packet count is the aggregate.
+   (qq-state-apply-emoji-like-notice
+    '((notice_type . "group_msg_emoji_like")
+      (group_id . "20001")
+      (user_id . "10002")
+      (message_id . "9007199254741004001")
+      (is_add . t)
+      (likes . (((emoji_id . "178") (emoji_type . "1") (count . 3))))))
+   (let* ((message (car (qq-state-session-messages "group:20001")))
+          (reaction (car (qq-state-message-reactions message))))
+     (should (= (alist-get 'count reaction) 3))
+     (should-not (alist-get 'chosen-p reaction)))
+   ;; Our own add without a count is the optimistic one-step delta.
+   (qq-state-apply-emoji-like-notice
+    '((notice_type . "group_msg_emoji_like")
+      (group_id . "20001")
+      (user_id . "90001")
+      (message_id . "9007199254741004001")
+      (is_add . t)
+      (likes . (((emoji_id . "178"))))))
+   (let* ((message (car (qq-state-session-messages "group:20001")))
+          (reaction (car (qq-state-message-reactions message))))
+     (should (= (alist-get 'count reaction) 4))
+     (should (eq (alist-get 'chosen-p reaction) t)))
+   ;; A late action callback after the authoritative event is idempotent.
+   (qq-state-apply-emoji-like-notice
+    '((notice_type . "group_msg_emoji_like")
+      (group_id . "20001")
+      (user_id . "90001")
+      (message_id . "9007199254741004001")
+      (is_add . t)
+      (likes . (((emoji_id . "178"))))))
+   (should
+    (= 4
+       (alist-get
+        'count
+        (car
+         (qq-state-message-reactions
+          (car (qq-state-session-messages "group:20001")))))))
+   ;; An authoritative remove-to-zero deletes the chip.
+   (qq-state-apply-emoji-like-notice
+    '((notice_type . "group_msg_emoji_like")
+      (group_id . "20001")
+      (user_id . "90001")
+      (message_id . "9007199254741004001")
+      (is_add . :false)
+      (likes . (((emoji_id . "178") (count . 0))))))
+   (should-not
+    (qq-state-message-reactions
+     (car (qq-state-session-messages "group:20001"))))))
 
 (provide 'qq-state-test)
 

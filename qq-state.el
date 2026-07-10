@@ -92,6 +92,51 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
     (truncate (string-to-number value)))
    (t 0)))
 
+(defun qq-state--normalize-reaction-count (value)
+  "Return reaction count VALUE as a non-negative integer."
+  (max 0
+       (cond
+        ((integerp value) value)
+        ((numberp value) (truncate value))
+        ((and (stringp value)
+              (string-match-p "\\`[0-9]+\\'" value))
+         (string-to-number value))
+        (t 0))))
+
+(defun qq-state--infer-reaction-emoji-type (emoji-id)
+  "Infer QQ reaction type from string EMOJI-ID."
+  (if (> (length (or emoji-id "")) 3) "2" "1"))
+
+(defun qq-state--normalize-reactions (raw-reactions)
+  "Normalize RAW-REACTIONS from OneBot `emoji_likes_list'."
+  (seq-keep
+   (lambda (raw)
+     (when-let* ((emoji-id (qq-state--normalize-id
+                            (or (alist-get 'emoji_id raw)
+                                (alist-get 'emojiId raw)))))
+       (let ((count (qq-state--normalize-reaction-count
+                     (or (alist-get 'likes_cnt raw)
+                         (alist-get 'count raw)))))
+         (when (> count 0)
+           `((emoji-id . ,emoji-id)
+             (emoji-type . ,(qq-state--normalize-id
+                              (or (alist-get 'emoji_type raw)
+                                  (alist-get 'emojiType raw)
+                                  (qq-state--infer-reaction-emoji-type emoji-id))))
+             (count . ,count)
+             (chosen-p . ,(and
+                            (qq-protocol-json-true-p
+                             (or (alist-get 'is_clicked raw)
+                                 (alist-get 'isClicked raw)
+                                 (alist-get 'is_chosen raw)
+                                 (alist-get 'me raw)))
+                            t)))))))
+   (or raw-reactions '())))
+
+(defun qq-state-message-reactions (message)
+  "Return normalized reactions stored on MESSAGE."
+  (or (and (listp message) (alist-get 'reactions message)) '()))
+
 (defun qq-state--present-string (value)
   "Return VALUE when it is a non-empty string, else nil."
   (and (stringp value)
@@ -325,6 +370,13 @@ Values from NEW replace values in OLD."
 (defun qq-state-message-recalled-p (message)
   "Return non-nil when local MESSAGE has status `recalled'."
   (eq (alist-get 'status message) 'recalled))
+
+(defun qq-state-poke-message-p (message)
+  "Return non-nil when MESSAGE is a NapCat poke notice row."
+  (or (qq-state--poke-notice-p message)
+      (let ((raw-event (alist-get 'raw-event message)))
+        (and (listp raw-event)
+             (qq-state--poke-notice-p raw-event)))))
 
 (defun qq-state--raw-message-recalled-p (message)
   "Return non-nil when raw OneBot MESSAGE is explicitly recalled.
@@ -698,9 +750,9 @@ in the UI — that is wire format, not display text."
          (time (qq-state--normalize-time
                 (or (alist-get 'time notice) (float-time))))
          ;; The stock OneBot notice has no message_id.  The emacs fork adds the
-         ;; underlying NT grey-tip snowflake when it is available, which makes
-         ;; the poke eligible for the normal recall path.  Keep a deterministic
-         ;; local anchor only for stock/live synthetic notices without it.
+         ;; underlying NT gray-tip snowflake when it is available, which is the
+         ;; identity required by the dedicated recall_poke action. Keep a
+         ;; deterministic local anchor for synthetic notices without it.
          (server-id
           (qq-protocol-optional-message-id
            (alist-get 'message_id notice)
@@ -812,6 +864,9 @@ in the UI — that is wire format, not display text."
       (group-id . ,(qq-state--normalize-id (alist-get 'group_id message)))
       (user-id . ,(qq-state--normalize-id (alist-get 'user_id message)))
       (target-id . ,target-id)
+      ,@(when (assq 'emoji_likes_list message)
+          `((reactions . ,(qq-state--normalize-reactions
+                           (alist-get 'emoji_likes_list message)))))
       (order . ,(qq-state--next-message-order))
       (raw-event . ,(copy-tree message))))))
 
@@ -1325,6 +1380,111 @@ Keeps the row so the chat view can hide it (default) or show a stub when
                         :mutation 'update
                         :source 'notice)
         updated))))
+
+(defun qq-state--reaction-with-notice (reactions like is-add own-operation-p)
+  "Return REACTIONS after applying one emoji LIKE notice.
+
+IS-ADD identifies add versus remove.  OWN-OPERATION-P updates the local
+`chosen-p' flag; reactions by other users leave that flag unchanged."
+  (let* ((emoji-id (qq-state--normalize-id
+                    (or (alist-get 'emoji_id like)
+                        (alist-get 'emojiId like))))
+         (existing (and emoji-id
+                        (seq-find
+                         (lambda (reaction)
+                           (equal (alist-get 'emoji-id reaction) emoji-id))
+                         reactions))))
+    (if (null emoji-id)
+        reactions
+      (let* ((has-count (or (assq 'count like) (assq 'likes_cnt like)))
+             (old-count (qq-state--normalize-reaction-count
+                         (alist-get 'count existing)))
+             (already-applied-p
+              (and own-operation-p
+                   existing
+                   (eq (and (alist-get 'chosen-p existing) t)
+                       (and is-add t))))
+             (next-count
+              (if has-count
+                  (qq-state--normalize-reaction-count
+                   (or (alist-get 'count like) (alist-get 'likes_cnt like)))
+                (if already-applied-p
+                    old-count
+                  (max 0 (+ old-count (if is-add 1 -1))))))
+             (emoji-type
+              (qq-state--normalize-id
+               (or (alist-get 'emoji_type like)
+                   (alist-get 'emojiType like)
+                   (alist-get 'emoji-type existing)
+                   (qq-state--infer-reaction-emoji-type emoji-id))))
+             (chosen-p (if own-operation-p
+                           is-add
+                         (and existing (alist-get 'chosen-p existing))))
+             (next-item `((emoji-id . ,emoji-id)
+                          (emoji-type . ,emoji-type)
+                          (count . ,next-count)
+                          (chosen-p . ,(and chosen-p t))))
+             (next nil)
+             (replaced nil))
+        (dolist (reaction reactions)
+          (if (equal (alist-get 'emoji-id reaction) emoji-id)
+              (progn
+                (setq replaced t)
+                (when (> next-count 0)
+                  (push next-item next)))
+            (push reaction next)))
+        (when (and (not replaced) (> next-count 0))
+          (push next-item next))
+        (nreverse next)))))
+
+(defun qq-state-apply-emoji-like-notice (notice)
+  "Apply OneBot group emoji-like NOTICE to one cached message.
+
+The notice `count' is treated as the authoritative aggregate when present;
+older/fallback notices without it are applied as a one-step delta."
+  (let* ((message-id
+          (qq-protocol-optional-message-id
+           (alist-get 'message_id notice)
+           "group_msg_emoji_like notice"))
+         (group-id (qq-state--normalize-id (alist-get 'group_id notice)))
+         (session-key
+          (or (and message-id
+                   (gethash message-id qq-state--message-session-index))
+              (and group-id (qq-state-session-key 'group group-id))))
+         (messages (and session-key
+                        (copy-tree
+                         (or (gethash session-key qq-state--messages-by-session)
+                             '()))))
+         (existing
+          (and message-id messages
+               (qq-state--find-message
+                messages
+                (lambda (message)
+                  (equal (alist-get 'server-id message) message-id)))))
+         (is-add (qq-protocol-json-true-p (alist-get 'is_add notice)))
+         (operator-id (qq-state--normalize-id (alist-get 'user_id notice)))
+         (own-operation-p
+          (and operator-id
+               (equal operator-id (qq-state-self-user-id)))))
+    (when (and session-key existing)
+      (let ((reactions (copy-tree (qq-state-message-reactions existing))))
+        (dolist (like (or (alist-get 'likes notice) '()))
+          (setq reactions
+                (qq-state--reaction-with-notice
+                 reactions like is-add own-operation-p)))
+        (let ((updated (copy-tree existing)))
+          (setf (alist-get 'reactions updated nil nil #'eq) reactions)
+          (setq messages (qq-state--replace-message messages existing updated))
+          (puthash session-key messages qq-state--messages-by-session)
+          (qq-state--index-message updated)
+          (qq-state--sync-session-summary session-key)
+          (qq-state--emit 'message
+                          :session-key session-key
+                          :message (copy-tree updated)
+                          :message-anchor message-id
+                          :mutation 'update
+                          :source 'notice)
+          updated)))))
 
 (defun qq-state--recent-contact-title (contact session-key)
   "Return display title for recent CONTACT in SESSION-KEY."
