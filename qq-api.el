@@ -16,6 +16,7 @@
 (require 'qq-transport)
 
 (declare-function qq-transport-cancel "qq-transport" (echo))
+(declare-function qq-state-apply-poke-notice "qq-state" (notice))
 
 (defvar qq-api--read-operations (make-hash-table :test #'equal)
   "In-flight optimistic read operations keyed by session key.")
@@ -1276,6 +1277,8 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
      (pcase (alist-get 'sub_type notice)
        ("input_status"
         (qq-state-apply-input-status notice))
+       ("poke"
+        (qq-state-apply-poke-notice notice))
        (_ (qq-api--refresh-for-notice notice))))
     (_ (qq-api--refresh-for-notice notice))))
 

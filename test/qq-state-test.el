@@ -77,6 +77,43 @@
         (status_text . nil)))
      (should (equal (qq-state-action-text "private:20003")
                     "对方正在输入...")))))
+
+(ert-deftest qq-state-apply-poke-notice-uses-private-contact-names ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
+   (qq-state-apply-friends
+    '(((user_id . "10001")
+       (remark . "Alice")
+       (nickname . "Alice Nick"))))
+   (let ((message
+          (qq-state-apply-poke-notice
+           '((post_type . "notice")
+             (notice_type . "notify")
+             (sub_type . "poke")
+             (user_id . "10001")
+             (sender_id . "10001")
+             (target_id . "90001")))))
+     (should (equal (alist-get 'session-key message) "private:10001"))
+     (should (equal (alist-get 'sender-name message) "Alice"))
+     (should (equal (alist-get 'preview message) "戳了戳 我"))
+     (should-not (string-match-p "unknown" (alist-get 'preview message))))))
+
+(ert-deftest qq-state-apply-poke-notice-uses-id-fallback-in-group ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
+   (let ((message
+          (qq-state-apply-poke-notice
+           '((post_type . "notice")
+             (notice_type . "notify")
+             (sub_type . "poke")
+             (group_id . "20001")
+             (user_id . "10002")
+             (target_id . "90001")))))
+     (should (equal (alist-get 'session-key message) "group:20001"))
+     (should (equal (alist-get 'sender-name message) "10002"))
+     (should (equal (alist-get 'preview message) "戳了戳 我"))
+     (should-not (string-match-p "unknown" (alist-get 'preview message))))))
+
 (ert-deftest qq-state-apply-recent-contacts-creates-session-summary ()
   (qq-test-with-reset
    (qq-state-apply-recent-contacts

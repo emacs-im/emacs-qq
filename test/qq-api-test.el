@@ -326,6 +326,19 @@
       (should (equal (nreverse order)
                      '(status login friends groups contacts))))))
 
+(ert-deftest qq-api-handle-notice-dispatches-poke ()
+  (let (received)
+    (cl-letf (((symbol-function 'qq-state-apply-poke-notice)
+               (lambda (notice)
+                 (setq received notice))))
+      (qq-api--handle-notice
+       '((notice_type . "notify")
+         (sub_type . "poke")
+         (group_id . "20001")
+         (user_id . "10001")
+         (target_id . "90001")))
+      (should (equal (alist-get 'sub_type received) "poke")))))
+
 (ert-deftest qq-api-fetch-history-passes-message-seq-for-older-page ()
   (let (captured-params)
     (cl-letf (((symbol-function 'qq-state-session)

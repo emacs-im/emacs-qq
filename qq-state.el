@@ -968,6 +968,98 @@ Return three values via `cl-values':
                    (list :previous-anchor previous-anchor))))))
     session-key))
 
+(defun qq-state--poke-user-name (user-id explicit-name)
+  "Return a display name for POKE USER-ID, preferring EXPLICIT-NAME."
+  (let* ((user-id (qq-state--normalize-id user-id))
+         (friend (and user-id (gethash user-id qq-state--friends-by-id)))
+         (self-p (and user-id
+                      (equal user-id (qq-state-self-user-id))))
+         (name (or explicit-name
+                   (and self-p
+                        (qq-state--present-string
+                         (alist-get 'nickname qq-state--self-info)))
+                   (and friend
+                        (qq-state--present-string
+                         (alist-get 'remark friend)))
+                   (and friend
+                        (qq-state--present-string
+                         (alist-get 'nickname friend)))
+                   user-id)))
+    (or name "某人")))
+
+(defun qq-state-apply-poke-notice (notice)
+  "Append a local timeline message for OneBot NOTIFY/POKE NOTICE.
+
+NapCat reports pokes as notices rather than ordinary messages.  The notice has
+no message id or sender display object, so use a local event anchor and resolve
+names from the cached contacts.  Numeric IDs are a deliberate final fallback;
+never render the generic `unknown' label for a valid poke participant."
+  (let* ((group-id (qq-state--normalize-id (alist-get 'group_id notice)))
+         ;; In a private poke, user_id is the peer and sender_id is the actor
+         ;; (the fork emits sender_id for this case).  Group pokes use user_id
+         ;; as the actor, matching the OneBot notice contract.
+         (peer-id (and (null group-id)
+                       (qq-state--normalize-id (alist-get 'user_id notice))))
+         (session-key (cond
+                       (group-id (qq-state-session-key 'group group-id))
+                       (peer-id (qq-state-session-key 'private peer-id))))
+         (actor-id (qq-state--normalize-id
+                    (or (alist-get 'sender_id notice)
+                        (alist-get 'user_id notice))))
+         (target-id (qq-state--normalize-id (alist-get 'target_id notice)))
+         (actor-name
+          (qq-state--poke-user-name actor-id (alist-get 'sender_name notice)))
+         (target-name
+          (qq-state--poke-user-name target-id (alist-get 'target_name notice)))
+         (body (if target-id
+                   (format "戳了戳 %s" target-name)
+                 "戳了戳"))
+         (local-id (format "local-poke-%d"
+                           (cl-incf qq-state--local-message-counter)))
+         (self-p (and actor-id
+                      (equal actor-id (qq-state-self-user-id))))
+         (message
+          `((id . ,local-id)
+            (local-id . ,local-id)
+            (session-key . ,session-key)
+            (time . ,(qq-state--normalize-time
+                      (or (alist-get 'time notice) (float-time))))
+            (sender-id . ,actor-id)
+            (sender-name . ,actor-name)
+            (sender-secondary-name . nil)
+            (sender-card . nil)
+            (sender-nickname . ,actor-name)
+            (sender-remark . nil)
+            (self-p . ,self-p)
+            (status . ,(if self-p 'sent 'received))
+            ;; Poke notices have no timeline message body.  Store the resolved
+            ;; presentation as text so the normal chat renderer does not turn
+            ;; it back into a generic `[poke]' placeholder.
+            (segments
+             . ,(list `((type . "text")
+                        (data . ((text . ,body))))))
+            (raw-message . ,body)
+            (preview . ,body)
+            (message-type . ,(if group-id "group" "private"))
+            (group-id . ,group-id)
+            (user-id . ,actor-id)
+            (target-id . ,target-id)
+            (order . ,(qq-state--next-message-order))
+            (raw-event . ,(copy-tree notice)))))
+    (when session-key
+      (cl-multiple-value-bind (merged mutation _previous-anchor)
+          (qq-state--merge-normalized-message
+           session-key message (not self-p))
+        (when merged
+          (qq-state--emit
+           'message
+           :session-key session-key
+           :message (copy-tree merged)
+           :message-anchor (qq-state-message-anchor merged)
+           :mutation mutation
+           :source 'notice)
+          merged)))))
+
 (defun qq-state-merge-history (session-key raw-messages)
   "Merge RAW-MESSAGES history batch into SESSION-KEY.
 
