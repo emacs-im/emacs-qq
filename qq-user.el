@@ -18,6 +18,7 @@
 
 (declare-function qq-chat-open "qq-chat" (session-key))
 (declare-function qq-api-cancel-request "qq-api" (request-token))
+(declare-function qq-user-photo-open "qq-user-photo" (user-id display-name))
 
 (defvar-local qq-user--user-id nil
   "QQ number displayed by the current user buffer.")
@@ -36,6 +37,15 @@
 
 (defvar-local qq-user--error nil
   "Last profile loading error string, or nil.")
+
+(defvar-local qq-user--like-count nil
+  "Verified received profile-like count, or nil when unavailable.")
+
+(defvar-local qq-user--like-request nil
+  "Active profile-like request token for the current user buffer.")
+
+(defvar-local qq-user--like-request-owner nil
+  "Owner object for the active profile-like request.")
 
 (defun qq-user--buffer-name (user-id)
   "Return profile buffer name for USER-ID."
@@ -117,7 +127,9 @@
                    (and (eq (alist-get 'special_care relationship) t)
                         "特别关心")
                    (and (eq (alist-get 'blocked_by_me relationship) t)
-                        "已屏蔽")))
+                        "已屏蔽")
+                   (and (eq (alist-get 'muted relationship) t)
+                        "消息免打扰")))
        " · "))))
 
 (defun qq-user--level-label (level)
@@ -157,7 +169,7 @@
        (erase-buffer)
        (setq-local header-line-format '(:eval (qq-user--header-line)))
        (qq-view-insert-note-line
-        "g refresh  m message  a avatar  w copy QQ  q quit")
+        "g refresh  m message  a avatar  p photos  w copy QQ  q quit")
        (insert "\n")
        (cond
         (qq-user--loading
@@ -186,6 +198,10 @@
          (qq-user--insert-field
           "关系" (qq-user--relationship-label
                   (alist-get 'relationship qq-user--profile)))
+         (when-let* ((relationship (alist-get 'relationship qq-user--profile))
+                     (category (alist-get 'friend_category relationship))
+                     (name (qq-user--present-string (alist-get 'name category))))
+           (qq-user--insert-field "分组" name))
          (qq-user--insert-field
           "状态" (qq-user--status-label (alist-get 'status qq-user--profile)))
          (qq-user--insert-field "性别" (qq-user--sex-label
@@ -203,6 +219,9 @@
           "等级" (qq-user--level-label (alist-get 'qq_level qq-user--profile)))
          (qq-user--insert-field
           "会员" (qq-user--vip-label (alist-get 'vip qq-user--profile)))
+         (when (and (integerp qq-user--like-count)
+                    (>= qq-user--like-count 0))
+           (qq-user--insert-field "获赞" qq-user--like-count))
          (when-let* ((labels (alist-get 'labels qq-user--profile))
                      ((listp labels))
                      ((not (null labels))))
@@ -261,7 +280,46 @@
                   (qq-user-render)))
               (qq-api--default-error response reason)))))
       (when (eq qq-user--request-owner owner)
-        (setq qq-user--request request)))))
+        (setq qq-user--request request))))
+  (qq-user--refresh-like))
+
+(defun qq-user--like-request-current-p (buffer user-id owner)
+  "Return non-nil when OWNER still loads likes for USER-ID in BUFFER."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and (derived-mode-p 'qq-user-mode)
+              (equal qq-user--user-id user-id)
+              (eq qq-user--like-request-owner owner)))))
+
+(defun qq-user--refresh-like ()
+  "Refresh received profile-like count for the current user."
+  (when qq-user--like-request
+    (qq-api-cancel-request qq-user--like-request))
+  (let ((buffer (current-buffer))
+        (user-id qq-user--user-id)
+        (owner (list 'user-like qq-user--user-id)))
+    (setq qq-user--like-count nil
+          qq-user--like-request nil
+          qq-user--like-request-owner owner)
+    (let ((request
+           (qq-api-get-user-like
+            user-id
+            (lambda (count)
+              (when (qq-user--like-request-current-p buffer user-id owner)
+                (with-current-buffer buffer
+                  (setq qq-user--like-count count
+                        qq-user--like-request nil
+                        qq-user--like-request-owner nil)
+                  (qq-user-render))))
+            (lambda (_response _reason)
+              (when (qq-user--like-request-current-p buffer user-id owner)
+                (with-current-buffer buffer
+                  (setq qq-user--like-count nil
+                        qq-user--like-request nil
+                        qq-user--like-request-owner nil)
+                  (qq-user-render)))))))
+      (when (eq qq-user--like-request-owner owner)
+        (setq qq-user--like-request request)))))
 
 (defun qq-user-open-chat ()
   "Open a private chat with the current profile user."
@@ -283,18 +341,30 @@
   (kill-new qq-user--user-id)
   (message "qq: copied user id %s" qq-user--user-id))
 
+(defun qq-user-open-photo-wall ()
+  "Open the current user's native QQ photo wall."
+  (interactive)
+  (unless qq-user--user-id
+    (user-error "qq: this buffer has no user identity"))
+  (qq-user-photo-open qq-user--user-id (qq-user--display-name)))
+
 (defun qq-user--cancel-request ()
   "Cancel the current user profile request when present."
   (when qq-user--request
     (qq-api-cancel-request qq-user--request))
+  (when qq-user--like-request
+    (qq-api-cancel-request qq-user--like-request))
   (setq qq-user--request nil
-        qq-user--request-owner nil))
+        qq-user--request-owner nil
+        qq-user--like-request nil
+        qq-user--like-request-owner nil))
 
 (defvar qq-user-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "g") #'qq-user-refresh)
     (define-key map (kbd "m") #'qq-user-open-chat)
     (define-key map (kbd "a") #'qq-user-open-avatar)
+    (define-key map (kbd "p") #'qq-user-open-photo-wall)
     (define-key map (kbd "w") #'qq-user-copy-id)
     (define-key map (kbd "q") #'quit-window)
     map)

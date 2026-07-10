@@ -5,6 +5,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'qq-user)
+(require 'qq-user-photo)
 (require 'qq-chat)
 (require 'qq-root)
 
@@ -24,7 +25,9 @@
     (status . ((code . 10) (extended_code . 0) (description . "在线")))
     (relationship . ((kind . "friend")
                      (blocked_by_me . :false)
-                     (special_care . t)))
+                     (special_care . t)
+                     (muted . t)
+                     (friend_category . ((id . 7) (name . "Friends")))))
     (qq_level . ((stars . 1) (moons . 2) (suns . 3) (crowns . 4)))
     (vip . ((kind . "svip") (level . 8) (annual . t))))
   "One complete native profile fixture.")
@@ -50,7 +53,8 @@
   (with-temp-buffer
     (qq-user-mode)
     (setq qq-user--user-id "10001"
-          qq-user--profile (copy-tree qq-user-test--profile))
+          qq-user--profile (copy-tree qq-user-test--profile)
+          qq-user--like-count 42)
     (cl-letf (((symbol-function 'qq-media-avatar-display-string)
                (lambda (_user-id) "@")))
       (qq-user-render))
@@ -58,6 +62,9 @@
       (should (string-match-p "A" text))
       (should (string-match-p "QQ:[[:space:]]+10001" text))
       (should (string-match-p "特别关心" text))
+      (should (string-match-p "消息免打扰" text))
+      (should (string-match-p "分组:[[:space:]]+Friends" text))
+      (should (string-match-p "获赞:[[:space:]]+42" text))
       (should (string-match-p "SVIP 8" text))
       (should (string-match-p "hello from Emacs" text))
       (should-not (string-match-p "\\[Open\\]" text))
@@ -97,9 +104,14 @@
               ((symbol-function 'qq-api-get-user)
                (lambda (_user-id callback &optional _errback)
                  (funcall callback (copy-tree qq-user-test--profile))
-                 'request)))
+                 'request))
+              ((symbol-function 'qq-api-get-user-like)
+               (lambda (_user-id callback &optional _errback)
+                 (funcall callback 42)
+                 'like-request)))
       (qq-user-refresh)
       (should (equal qq-user--profile qq-user-test--profile))
+      (should (= qq-user--like-count 42))
       (should-not qq-user--loading)
       (should-not qq-user--request)
       (should-not qq-user--request-owner))))
@@ -133,7 +145,49 @@
   (should (eq (lookup-key qq-root-mode-map (kbd "i"))
               #'qq-root-open-user-at-point))
   (should (eq (lookup-key qq-user-mode-map (kbd "m"))
-              #'qq-user-open-chat)))
+              #'qq-user-open-chat))
+  (should (eq (lookup-key qq-user-mode-map (kbd "p"))
+              #'qq-user-open-photo-wall)))
+
+(ert-deftest qq-api-get-user-social-actions-preserve-string-identity ()
+  (let (calls like photos)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (action params callback &optional _errback)
+                 (push (list action params) calls)
+                 (funcall
+                  callback
+                  (pcase action
+                    ("emacs_get_user_like"
+                     '((data . ((user_id . "10001") (total_count . 42)))))
+                    ("emacs_get_user_photo_wall"
+                     '((data . ((user_id . "10001")
+                                (photos . (((id . "p1")
+                                            (original_url . "https://example.test/p1.jpg")
+                                            (thumbnail_url))))))))))
+                 'request)))
+      (qq-api-get-user-like "10001" (lambda (count) (setq like count)))
+      (qq-api-get-user-photo-wall "10001" (lambda (value) (setq photos value))))
+    (should (= like 42))
+    (should (equal (alist-get 'id (car photos)) "p1"))
+    (should (member '("emacs_get_user_like" ((user_id . "10001"))) calls))
+    (should (member '("emacs_get_user_photo_wall" ((user_id . "10001"))) calls))))
+
+(ert-deftest qq-user-photo-render-has-no-inline-open-button ()
+  (with-temp-buffer
+    (qq-user-photo-mode)
+    (setq qq-user-photo--user-id "10001"
+          qq-user-photo--photos
+          '(((id . "p1")
+             (original_url . "https://example.test/p1.jpg")
+             (thumbnail_url . "https://example.test/p1-thumb.jpg"))))
+    (cl-letf (((symbol-function 'qq-media-url-preview-display-string)
+               (lambda (_key _url fallback) fallback)))
+      (qq-user-photo-render))
+    (should (string-match-p "Photo 1" (buffer-string)))
+    (should-not (string-match-p "\\[Open\\]" (buffer-string)))
+    (goto-char (point-min))
+    (search-forward "Photo 1")
+    (should (equal (alist-get 'id (qq-user-photo--photo-at-point)) "p1"))))
 
 (provide 'qq-user-test)
 

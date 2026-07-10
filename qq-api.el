@@ -1277,6 +1277,42 @@ second-level anchor."
                  response (error-message-string error-data)))))
    errback))
 
+(defun qq-api-get-user-like (user-id callback &optional errback)
+  "Fetch verified profile-like count for USER-ID and call CALLBACK."
+  (unless (qq-api-user-id-p user-id)
+    (user-error "qq: user likes require a decimal string user id"))
+  (qq-api-call
+   "emacs_get_user_like"
+   `((user_id . ,user-id))
+   (lambda (response)
+     (condition-case error-data
+         (let ((data (qq-api--response-data response)))
+           (unless (equal (alist-get 'user_id data) user-id)
+             (error "qq: emacs_get_user_like returned a different user identity"))
+           (funcall callback (alist-get 'total_count data)))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   errback))
+
+(defun qq-api-get-user-photo-wall (user-id callback &optional errback)
+  "Fetch native photo wall for USER-ID and pass its photos to CALLBACK."
+  (unless (qq-api-user-id-p user-id)
+    (user-error "qq: photo wall requires a decimal string user id"))
+  (qq-api-call
+   "emacs_get_user_photo_wall"
+   `((user_id . ,user-id))
+   (lambda (response)
+     (condition-case error-data
+         (let ((data (qq-api--response-data response)))
+           (unless (equal (alist-get 'user_id data) user-id)
+             (error "qq: emacs_get_user_photo_wall returned a different user identity"))
+           (funcall callback (alist-get 'photos data)))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   errback))
+
 (defun qq-api-get-group-avatar (group-id callback &optional errback no-cache)
   "Fetch group avatar resource for GROUP-ID and pass it to CALLBACK."
   (qq-api-call

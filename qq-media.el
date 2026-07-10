@@ -1291,6 +1291,32 @@ When image data is not ready yet, return a textual fallback."
    (qq-media-avatar-image user-id)
    "@"))
 
+(defun qq-media-url-preview-image (key url)
+  "Return preview image for remote URL under cache KEY.
+
+Trigger an asynchronous download when the image is not cached yet."
+  (when (qq-media-url-present-p url)
+    (qq-media--ensure-resource-image
+     key
+     (lambda (done _error)
+       (funcall done `((url . ,url))))
+     nil
+     #'qq-media--preview-image-from-file)))
+
+(defun qq-media-url-preview-display-string (key url fallback)
+  "Return display string for remote image URL cached under KEY.
+
+Use FALLBACK until the preview is available."
+  (qq-media--image-display-string
+   (qq-media-url-preview-image key url)
+   fallback))
+
+(defun qq-media-open-image-url (key url)
+  "Open remote image URL using media cache KEY."
+  (unless (qq-media-url-present-p url)
+    (user-error "qq: image has no remote URL"))
+  (qq-media-open-resource `((url . ,url)) 'image key))
+
 (defun qq-media-group-avatar-image (group-id)
   "Return inline group avatar image for GROUP-ID, triggering fetch when needed."
   (qq-media--ensure-resource-image
