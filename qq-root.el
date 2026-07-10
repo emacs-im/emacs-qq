@@ -146,16 +146,21 @@
                                   "session"))))))
 
 (defun qq-root--session-preview-text (session)
-  "Return one-line preview for SESSION."
+  "Return one-line preview for SESSION.
+
+Mirrors telega `telega-ins--chat-status': peer chat-actions (typing) take
+priority over the last-message preview."
   (let* ((session-key (alist-get 'key session))
-         (input-text (and session-key (qq-state-input-status-text session-key)))
+         (action-text (and qq-chat-show-peer-actions
+                           session-key
+                           (qq-state-action-text session-key)))
          (preview (string-trim (or (alist-get 'last-message-preview session) "")))
          (badge (qq-root--session-badge session)))
     (concat
      badge
      (cond
-      ((and (stringp input-text) (not (string-empty-p input-text)))
-       input-text)
+      ((and (stringp action-text) (not (string-empty-p action-text)))
+       (concat (or qq-chat-action-prefix ".. ") action-text))
       ((string-empty-p preview)
        "(no preview yet)")
       (t preview)))))
@@ -414,7 +419,7 @@ when this function is used as `qq-media-cache-update-hook'."
 (defun qq-root--handle-state-change (event)
   "Refresh visible root buffer after relevant state EVENT changes."
   (when (memq (plist-get event :type)
-              '(reset connection self-info session message history input-status
+              '(reset connection self-info session message history action
                       sessions-refreshed friends-refreshed groups-refreshed))
     (qq-root--rerender-open-root)))
 

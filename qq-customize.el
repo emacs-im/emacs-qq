@@ -76,11 +76,33 @@ Nil means use `qq-history-fetch-count'.  NapCat `get_*_msg_history' with
   :group 'qq)
 
 (defcustom qq-input-status-ttl 6
-  "Seconds to keep a friend's \"typing\" / input-status after the last push.
+  "Seconds to keep a friend's chat-action (typing) after the last push.
 
-NapCat's `notify/input_status' event has no guaranteed stop packet, so the
-client auto-clears the status unless a newer push refreshes it."
+Modeled after telega's ephemeral chat actions.  NapCat's
+`notify/input_status' has no guaranteed stop packet, so the client
+auto-clears unless a newer push refreshes it."
   :type 'integer
+  :group 'qq)
+
+(defcustom qq-chat-show-peer-actions t
+  "When non-nil, show peer chat-actions (e.g. 正在输入) in chat footer and root.
+
+Telega equivalent: footer `telega-chatbuf-footer-ins-prompt-delim' with
+actions + root `telega-ins--chat-status' preferring actions."
+  :type 'boolean
+  :group 'qq)
+
+(defcustom qq-chat-send-typing t
+  "When non-nil, emit `set_input_status' while composing private-chat input.
+
+Telega equivalent: `telega-chatbuf--set-action' \"Typing\" / \"Cancel\" driven
+by input non-emptiness after commands."
+  :type 'boolean
+  :group 'qq)
+
+(defcustom qq-chat-action-prefix ".. "
+  "Prefix shown before peer action text in footer/root (telega typing symbol)."
+  :type 'string
   :group 'qq)
 
 (defcustom qq-chat-show-recalled-messages nil

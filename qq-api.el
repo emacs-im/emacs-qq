@@ -1147,6 +1147,18 @@ When REPLY-TO-MESSAGE-ID is non-nil, send the text as a reply."
      (when-let* ((status (alist-get 'status event nil nil #'eq)))
        (qq-state-set-status status)))))
 
+(defun qq-api-set-input-status (user-id event-type &optional callback errback)
+  "Tell USER-ID our input status (OneBot `set_input_status').
+
+EVENT-TYPE 1 = typing (show 正在输入 on peer); 0 = cancel.
+CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
+  (qq-api-call
+   "set_input_status"
+   `((user_id . ,(format "%s" user-id))
+     (event_type . ,(or event-type 1)))
+   (or callback #'ignore)
+   (or errback #'ignore)))
+
 (defun qq-api--handle-notice (notice)
   "Handle websocket NOTICE event."
   (pcase (alist-get 'notice_type notice)

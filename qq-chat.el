@@ -51,6 +51,11 @@
 (defvar-local qq-chat--draft-input-rich ""
   "Current unsent draft for the chat buffer, preserving input object properties.")
 
+(defvar-local qq-chat--my-action nil
+  "Local outgoing chat-action for this buffer (telega `telega-chatbuf--my-action').
+
+Non-nil means we currently advertise typing via `set_input_status'.")
+
 (defvaralias 'qq-chat--input-marker 'disco-chatbuf--input-marker
   "Marker for the beginning of the editable input region.")
 
@@ -227,20 +232,16 @@ They are inactive in the composer so typing is never stolen.")
   "Return dynamic header line for the active chat buffer.
 
 Telega-like: title first, connection only when not connected, unread as a
-compact badge.  Peer input-status (\"正在输入\") is shown when live.  Debug
-fields (target id) stay out of the default chrome."
+compact badge.  Peer typing/actions live in the footer prompt delimiter
+(see `qq-chat--input-footer-context-text'), not here.  Debug fields stay out
+of the default chrome."
   (let* ((session (qq-chat--session))
          (title (or (alist-get 'title session) qq-chat--session-key))
          (status (qq-state-connection-status))
          (unread (or (alist-get 'unread-count session) 0))
-         (input-text (and qq-chat--session-key
-                          (qq-state-input-status-text qq-chat--session-key)))
          (status-part (if (eq status 'connected)
                           ""
                         (format "  [%s]" status)))
-         (input-part (if (and (stringp input-text) (not (string-empty-p input-text)))
-                         (format "  · %s" input-text)
-                       ""))
          (unread-part (if (> unread 0)
                           (format "  · %d unread" unread)
                         ""))
@@ -248,7 +249,7 @@ fields (target id) stay out of the default chrome."
          (marked-part (if (> marked-count 0)
                           (format "  · %d marked" marked-count)
                         "")))
-    (format " %s%s%s%s%s" title status-part input-part unread-part marked-part)))
+    (format " %s%s%s%s" title status-part unread-part marked-part)))
 
 (defun qq-chat--insert-read-only (text &optional face properties)
   "Insert read-only TEXT with optional FACE and PROPERTIES."
@@ -766,7 +767,9 @@ because its result is only `{kind:single}'."
     (unless (equal text qq-chat--draft-input)
       (setq qq-chat--draft-input text)
       (setq qq-chat--input-index nil)
-      (setq qq-chat--input-pending nil))))
+      (setq qq-chat--input-pending nil)
+      ;; telega: after input ops, Typing if non-empty else Cancel.
+      (qq-chat--maybe-update-my-action-from-input))))
 
 (defun qq-chat--reply-message ()
   "Return current reply target message from shared aux state, or nil."
@@ -905,14 +908,63 @@ shown when loading or exhausted (disco-style)."
      text)
     text))
 
+(defun qq-chat--action-indicator-text ()
+  "Return telega-style peer action indicator for the current chat, or nil.
+
+Mirrors `telega-chatbuf-footer-ins-prompt-delim' + `telega-ins--actions':
+actions are shown on the footer delimiter line above the composer."
+  (when (and qq-chat-show-peer-actions
+             qq-chat--session-key)
+    (when-let* ((text (qq-state-action-text qq-chat--session-key)))
+      (propertize
+       (format "(%s%s)" (or qq-chat-action-prefix ".. ") text)
+       'face 'shadow))))
+
+(defun qq-chat--set-my-action (action)
+  "Set outgoing chatbuf ACTION like telega `telega-chatbuf--set-action'.
+
+ACTION is `typing', `cancel', or nil.  Only private sessions send
+`set_input_status' (NapCat limitation)."
+  (let* ((want (cond
+                ((eq action 'typing) 'typing)
+                ((memq action '(cancel nil)) nil)
+                ((equal action "Typing") 'typing)
+                ((equal action "Cancel") nil)
+                (t nil)))
+         (session (qq-chat--session))
+         (type (and session (alist-get 'type session)))
+         (target (and session (alist-get 'target-id session))))
+    (unless (eq qq-chat--my-action want)
+      (setq qq-chat--my-action want)
+      (when (and qq-chat-send-typing
+                 (eq type 'private)
+                 target)
+        (qq-api-set-input-status target (if want 1 0))))))
+
+(defun qq-chat--maybe-update-my-action-from-input ()
+  "Advertise typing when private-chat draft is non-empty (telega parity)."
+  (let ((input-p (and (stringp qq-chat--draft-input)
+                      (not (string-empty-p qq-chat--draft-input)))))
+    (cond
+     ((and (not qq-chat--my-action) input-p)
+      (qq-chat--set-my-action 'typing))
+     ((and qq-chat--my-action (not input-p))
+      (qq-chat--set-my-action 'cancel)))))
+
 (defun qq-chat--input-footer-context-text ()
   "Return dynamic footer text shown above the composer prompt.
 
-Reply aux already carries its own faces/button; do not blanket-propertize
-it or the cancel `[×]' loses its link face."
-  (let ((reply-context (qq-chat--reply-context-text)))
+Order (telega-inspired):
+1. peer chat-action / typing indicator
+2. reply aux (keeps its own faces/button; do not blanket-propertize
+   or the cancel `[×]' loses its link face)."
+  (let ((action-text (qq-chat--action-indicator-text))
+        (reply-context (qq-chat--reply-context-text)))
     (concat
      "\n"
+     (if action-text
+         (concat action-text "\n")
+       "")
      (if (string-empty-p reply-context)
          ""
        reply-context))))
@@ -3208,6 +3260,8 @@ new rows or reports the cursor missing."
       (setq qq-chat--input-pending nil)
       (setq qq-chat--draft-input "")
       (setq qq-chat--draft-input-rich "")
+      ;; telega: empty input after send → chatActionCancel
+      (qq-chat--set-my-action 'cancel)
       (qq-chat--set-reply-message nil)
       (qq-chat--chat-update 'footer 'prompt)
       (qq-api-send-message qq-chat--session-key send-segments raw-message))))
@@ -3507,12 +3561,13 @@ Prefer `qq-state' `:mutation' metadata when present:
 - history / reset → full render (batch timeline rebuild still coarse)
 - session read → header-line + local unread-divider patch
 - other session → header-line+header
+- action (typing) → footer only (telega updateChatAction → footer-ins-prompt-delim)
 - friends/groups refresh → header + timeline (sender titles may change)"
   (let ((event-session-key (plist-get event :session-key))
         (event-type (plist-get event :type))
         (event-message (plist-get event :message))
         (event-mutation (plist-get event :mutation)))
-    (when (memq event-type '(message history reset session input-status
+    (when (memq event-type '(message history reset session action
                              sessions-refreshed friends-refreshed groups-refreshed))
       (dolist (buffer (buffer-list))
         (with-current-buffer buffer
@@ -3545,9 +3600,10 @@ Prefer `qq-state' `:mutation' metadata when present:
                 (if (eq event-mutation 'read)
                     (qq-chat--apply-read-state-change-partially)
                   (qq-chat--chat-update 'header-line 'header))))
-             ((eq event-type 'input-status)
+             ((eq event-type 'action)
+              ;; telega: updateChatAction dirties footer prompt-delim only.
               (when (equal event-session-key qq-chat--session-key)
-                (qq-chat--header-line-update)))
+                (qq-chat--apply-frame-update)))
              ((eq event-type 'sessions-refreshed)
               (qq-chat--chat-update 'header-line 'header))
              ((memq event-type '(friends-refreshed groups-refreshed))

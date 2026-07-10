@@ -42,15 +42,17 @@ and fall back to full render only for `history'/`reset' or failed patches.")
 (defvar qq-state--local-message-session-index (make-hash-table :test #'equal))
 (defvar qq-state--message-order-counter 0)
 (defvar qq-state--local-message-counter 0)
-(defvar qq-state--input-status (make-hash-table :test #'equal)
-  "Map session-key → active input-status alist.
+(defvar qq-state--actions (make-hash-table :test #'equal)
+  "Peer chat-actions by session-key (telega telega--actions counterpart).
 
-Each value is an alist with:
-- `text' — display string (e.g. \"对方正在输入...\")
-- `event-type' — raw NapCat/OB11 event_type number
-- `user-id' — peer UIN string
-- `expires-at' — float-time when status should auto-clear
-- `timer' — Emacs timer object that clears this entry"))
+Value is an alist of (SENDER-ID . ACTION), where SENDER-ID is a UIN string
+and ACTION is an alist:
+
+- type: symbol, currently only typing (maps from NapCat input_status)
+- text: display string (kernel status_text or a local fallback)
+- event-type: raw OneBot/kernel event_type number
+- expires-at: float-time auto-clear deadline
+- timer: Emacs timer that clears this sender's action")
 
 (defun qq-state--emit (type &rest plist)
   "Emit state TYPE event with extra PLIST fields.
@@ -133,10 +135,17 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   "Return the next local message ordering number."
   (cl-incf qq-state--message-order-counter))
 
-(defun qq-state--cancel-input-status-timer (entry)
-  "Cancel any expire timer stored on input-status ENTRY."
-  (when-let* ((timer (and (listp entry) (alist-get 'timer entry))))
-    (cancel-timer timer)))
+(defun qq-state--cancel-action-timer (action)
+  "Cancel any expire timer stored on ACTION alist."
+  (when-let* ((timer (and (listp action) (alist-get 'timer action))))
+    (when (timerp timer)
+      (cancel-timer timer))))
+
+(defun qq-state--cancel-session-action-timers (actions)
+  "Cancel timers for every ACTION in the session ACTIONS alist."
+  (dolist (cell actions)
+    (when (consp cell)
+      (qq-state--cancel-action-timer (cdr cell)))))
 
 (defun qq-state-reset ()
   "Reset all in-memory emacs-qq state."
@@ -147,10 +156,10 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   (setq qq-state--requests nil)
   (setq qq-state--message-order-counter 0)
   (setq qq-state--local-message-counter 0)
-  (maphash (lambda (_key entry)
-             (qq-state--cancel-input-status-timer entry))
-           qq-state--input-status)
-  (clrhash qq-state--input-status)
+  (maphash (lambda (_key actions)
+             (qq-state--cancel-session-action-timers actions))
+           qq-state--actions)
+  (clrhash qq-state--actions)
   (clrhash qq-state--sessions)
   (clrhash qq-state--messages-by-session)
   (clrhash qq-state--friends-by-id)
@@ -1299,57 +1308,112 @@ Keeps the row so the chat view can hide it (default) or show a stub when
   "Return pending request events tracked in memory."
   (copy-tree qq-state--requests))
 
-(defun qq-state--input-status-active-p (entry)
-  "Return non-nil when input-status ENTRY is still live."
-  (and (listp entry)
-       (stringp (alist-get 'text entry))
-       (not (string-empty-p (alist-get 'text entry)))
-       (let ((expires-at (alist-get 'expires-at entry)))
+(defun qq-state--action-live-p (action &optional now)
+  "Return non-nil when ACTION has not expired relative to NOW."
+  (and (listp action)
+       (let ((expires-at (alist-get 'expires-at action)))
          (or (null expires-at)
-             (> expires-at (float-time))))))
+             (> expires-at (or now (float-time)))))))
 
-(defun qq-state-input-status (session-key)
-  "Return live input-status alist for SESSION-KEY, or nil.
+(defun qq-state--actions-without-timers (actions)
+  "Return a copy of ACTIONS alist without internal timer objects."
+  (mapcar (lambda (cell)
+            (cons (car cell)
+                  (assq-delete-all 'timer (copy-tree (cdr cell)))))
+          actions))
 
-Returned copy never includes the internal `timer' object."
-  (when-let* ((entry (gethash session-key qq-state--input-status)))
-    (if (qq-state--input-status-active-p entry)
-        (let ((copy (copy-tree entry)))
-          (setq copy (assq-delete-all 'timer copy))
-          copy)
-      (qq-state-clear-input-status session-key)
-      nil)))
+(defun qq-state--prune-session-actions (session-key &optional now)
+  "Drop expired actions for SESSION-KEY.
 
-(defun qq-state-input-status-text (session-key)
-  "Return live typing/status text for SESSION-KEY, or nil."
-  (alist-get 'text (qq-state-input-status session-key)))
+Return non-nil when anything was removed."
+  (let* ((now (or now (float-time)))
+         (actions (gethash session-key qq-state--actions))
+         (kept nil)
+         (removed nil))
+    (dolist (cell actions)
+      (if (qq-state--action-live-p (cdr cell) now)
+          (push cell kept)
+        (qq-state--cancel-action-timer (cdr cell))
+        (setq removed t)))
+    (cond
+     ((null kept)
+      (when actions
+        (remhash session-key qq-state--actions)
+        t))
+     (removed
+      (puthash session-key (nreverse kept) qq-state--actions)
+      t)
+     (t nil))))
 
-(defun qq-state-clear-input-status (session-key &optional silent)
-  "Clear input-status for SESSION-KEY.
+(defun qq-state-session-actions (session-key)
+  "Return live chat-actions alist for SESSION-KEY (telega-style).
 
-When SILENT is non-nil, do not emit a state-change event (used while
-replacing an existing status)."
-  (when-let* ((entry (gethash session-key qq-state--input-status)))
-    (qq-state--cancel-input-status-timer entry)
-    (remhash session-key qq-state--input-status)
+Each element is (SENDER-ID . ACTION-ALIST).  Timers are stripped."
+  (qq-state--prune-session-actions session-key)
+  (qq-state--actions-without-timers
+   (copy-tree (gethash session-key qq-state--actions))))
+
+(defun qq-state-action-text (session-key)
+  "Return one-line action display text for SESSION-KEY, or nil.
+
+Mirrors telega `telega-ins--actions' first-action preference: show the
+first live action's `text' (kernel status_text for QQ typing)."
+  (when-let* ((actions (qq-state-session-actions session-key))
+              (first (car actions))
+              (text (alist-get 'text (cdr first))))
+    (and (stringp text)
+         (not (string-empty-p text))
+         text)))
+
+;; Backward-compatible alias used by early call sites / tests.
+(defalias 'qq-state-input-status-text #'qq-state-action-text)
+
+(defun qq-state-clear-session-actions (session-key &optional silent)
+  "Clear all chat-actions for SESSION-KEY.
+
+When SILENT is non-nil, do not emit a state-change event."
+  (when-let* ((actions (gethash session-key qq-state--actions)))
+    (qq-state--cancel-session-action-timers actions)
+    (remhash session-key qq-state--actions)
     (unless silent
-      (qq-state--emit 'input-status
+      (qq-state--emit 'action
                       :session-key session-key
                       :mutation 'delete
                       :source 'notice
-                      :input-status nil))
+                      :actions nil))
     t))
 
+(defun qq-state-clear-sender-action (session-key sender-id &optional silent)
+  "Clear SENDER-ID's action in SESSION-KEY (telega chatActionCancel)."
+  (let* ((sender-id (qq-state--normalize-id sender-id))
+         (actions (gethash session-key qq-state--actions))
+         (cell (and sender-id (assoc sender-id actions))))
+    (when cell
+      (qq-state--cancel-action-timer (cdr cell))
+      (setq actions (assoc-delete-all sender-id actions))
+      (if actions
+          (puthash session-key actions qq-state--actions)
+        (remhash session-key qq-state--actions))
+      (unless silent
+        (qq-state--emit 'action
+                        :session-key session-key
+                        :mutation 'delete
+                        :source 'notice
+                        :actions (qq-state-session-actions session-key)))
+      t)))
+
 (defun qq-state-apply-input-status (notice)
-  "Apply OneBot input_status NOTICE into local state.
+  "Apply OneBot `input_status' NOTICE as a telega-like chat action.
 
-Expected shape:
+Maps NapCat:
   notice_type=notify, sub_type=input_status
-  user_id, event_type, status_text
+  user_id / event_type / status_text
+to `qq-state--actions' entry of type `typing'.
 
-`event_type' 1 (or any positive value with non-empty status_text) means
-typing/active; 0 or empty status_text clears the status.  Active status
-auto-expires after `qq-input-status-ttl' seconds unless refreshed."
+Semantics (aligned with telega updateChatAction):
+- event_type > 0 and non-empty status_text → set/replace sender action
+- event_type 0 or empty status_text → cancel that sender's action
+- missing cancel packets are handled by `qq-input-status-ttl' auto-expire"
   (let* ((user-id (qq-state--normalize-id (alist-get 'user_id notice)))
          (status-text (alist-get 'status_text notice))
          (event-type (alist-get 'event_type notice))
@@ -1362,36 +1426,45 @@ auto-expires after `qq-input-status-ttl' seconds unless refreshed."
                         (> event-num 0)
                         (stringp text)
                         (not (string-empty-p text))))
+         ;; Private peer is the typer; session key follows private:<uin>.
          (session-key (and user-id (qq-state-session-key 'private user-id))))
     (cond
      ((null session-key) nil)
      ((not active-p)
-      (qq-state-clear-input-status session-key)
+      (qq-state-clear-sender-action session-key user-id)
       nil)
      (t
       (let* ((ttl (max 1 (or qq-input-status-ttl 6)))
              (expires-at (+ (float-time) ttl))
-             (old (gethash session-key qq-state--input-status))
-             (entry `((text . ,text)
-                      (event-type . ,event-num)
-                      (user-id . ,user-id)
-                      (expires-at . ,expires-at)
-                      (timer . nil))))
-        (qq-state--cancel-input-status-timer old)
-        (let ((timer (run-at-time
-                      ttl nil
-                      (lambda ()
-                        (when-let* ((cur (gethash session-key qq-state--input-status)))
-                          (when (equal (alist-get 'expires-at cur) expires-at)
-                            (qq-state-clear-input-status session-key)))))))
-          (setf (alist-get 'timer entry) timer)
-          (puthash session-key entry qq-state--input-status)
-          (qq-state--emit 'input-status
-                          :session-key session-key
-                          :mutation (if old 'update 'create)
-                          :source 'notice
-                          :input-status (qq-state-input-status session-key))
-          (qq-state-input-status session-key)))))))
+             (actions (copy-sequence (gethash session-key qq-state--actions)))
+             (old (assoc user-id actions))
+             (action `((type . typing)
+                       (text . ,text)
+                       (event-type . ,event-num)
+                       (expires-at . ,expires-at)
+                       (timer . nil)))
+             (timer (run-at-time
+                     ttl nil
+                     (lambda ()
+                       (when-let* ((cur (assoc user-id
+                                               (gethash session-key
+                                                        qq-state--actions))))
+                         (when (equal (alist-get 'expires-at (cdr cur))
+                                      expires-at)
+                           (qq-state-clear-sender-action session-key user-id)))))))
+        (when old
+          (qq-state--cancel-action-timer (cdr old))
+          (setq actions (assoc-delete-all user-id actions)))
+        (setf (alist-get 'timer action) timer)
+        (puthash session-key
+                 (cons (cons user-id action) actions)
+                 qq-state--actions)
+        (qq-state--emit 'action
+                        :session-key session-key
+                        :mutation (if old 'update 'create)
+                        :source 'notice
+                        :actions (qq-state-session-actions session-key))
+        (qq-state-session-actions session-key))))))
 
 (provide 'qq-state)
 

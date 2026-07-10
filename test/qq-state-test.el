@@ -25,6 +25,7 @@
                   "service:u_mail"))))
 
 (ert-deftest qq-state-apply-input-status-tracks-and-clears ()
+  "NapCat input_status maps to telega-like session actions."
   (qq-test-with-reset
    (let ((qq-input-status-ttl 30)
          seen)
@@ -39,17 +40,21 @@
           (user_id . 10001)
           (event_type . 1)
           (status_text . "对方正在输入...")))
-       (should (equal (qq-state-input-status-text "private:10001")
+       (should (equal (qq-state-action-text "private:10001")
                       "对方正在输入..."))
-       (should (memq 'input-status seen))
-       ;; empty / event_type 0 clears
+       (let ((actions (qq-state-session-actions "private:10001")))
+         (should (equal (car (car actions)) "10001"))
+         (should (eq (alist-get 'type (cdr (car actions))) 'typing)))
+       (should (memq 'action seen))
+       ;; event_type 0 / empty text = chatActionCancel
        (qq-state-apply-input-status
         '((notice_type . "notify")
           (sub_type . "input_status")
           (user_id . "10001")
           (event_type . 0)
           (status_text . "")))
-       (should (null (qq-state-input-status-text "private:10001")))))))
+       (should (null (qq-state-action-text "private:10001")))
+       (should (null (qq-state-session-actions "private:10001")))))))
 
 (ert-deftest qq-state-apply-recent-contacts-creates-session-summary ()
   (qq-test-with-reset
