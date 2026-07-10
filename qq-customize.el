@@ -44,6 +44,15 @@ When nil, emacs-qq falls back to `qq-onebot-token-env-var'."
   :type 'integer
   :group 'qq)
 
+(defcustom qq-transport-request-timeout 30
+  "Seconds before an unanswered NapCat action fails locally.
+
+Nil disables request timeouts.  A timeout removes the request from the
+transport pending table and invokes its error callback exactly once."
+  :type '(choice (const :tag "Disabled" nil)
+                 (number :tag "Seconds"))
+  :group 'qq)
+
 (defcustom qq-chat-history-auto-load-threshold 2000
   "Character distance from buffer top that triggers an older-history page.
 

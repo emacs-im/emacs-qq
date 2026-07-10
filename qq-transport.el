@@ -15,6 +15,8 @@
 (require 'qq-customize)
 (require 'qq-state)
 
+(defvar qq-transport-request-timeout)
+
 (defvar qq-transport-event-hook nil
   "Hook called with one raw websocket event alist argument.")
 
@@ -87,13 +89,11 @@
 
 (defun qq-transport--fail-pending (reason)
   "Fail all pending callbacks with REASON."
-  (maphash
-   (lambda (_echo entry)
-     (let ((errback (plist-get entry :error)))
-       (when errback
-         (funcall errback nil reason))))
-   qq-transport--pending)
-  (clrhash qq-transport--pending))
+  (let (echoes)
+    (maphash (lambda (echo _entry) (push echo echoes))
+             qq-transport--pending)
+    (dolist (echo echoes)
+      (qq-transport--complete echo 'error nil reason))))
 
 (defun qq-transport--disconnect (&optional schedule-reconnect)
   "Disconnect websocket transport.
@@ -120,24 +120,54 @@ When SCHEDULE-RECONNECT is non-nil, queue a reconnect attempt."
   (qq-transport--disconnect nil)
   (message "qq: transport stopped"))
 
+(defun qq-transport--cancel-entry-timer (entry)
+  "Cancel the request timeout stored in pending ENTRY."
+  (when-let* ((timer (plist-get entry :timer)))
+    (when (timerp timer)
+      (cancel-timer timer))))
+
+(defun qq-transport--invoke-callback (callback &rest args)
+  "Invoke CALLBACK with ARGS without breaking transport cleanup."
+  (when callback
+    (condition-case err
+        (apply callback args)
+      (error
+       (message "qq: transport callback error: %s"
+                (error-message-string err))))))
+
+(defun qq-transport--complete (echo outcome response reason)
+  "Complete ECHO exactly once with OUTCOME, RESPONSE, and REASON.
+
+OUTCOME is `success' or `error'.  Return non-nil when a pending request was
+completed, and nil for stale responses or timers."
+  (when-let* ((entry (gethash echo qq-transport--pending)))
+    (remhash echo qq-transport--pending)
+    (qq-transport--cancel-entry-timer entry)
+    (if (eq outcome 'success)
+        (qq-transport--invoke-callback
+         (plist-get entry :success) response)
+      (qq-transport--invoke-callback
+       (plist-get entry :error) response reason))
+    t))
+
+(defun qq-transport--request-timeout (echo action)
+  "Fail pending ECHO for ACTION after its local timeout."
+  (qq-transport--complete
+   echo 'error nil (format "%s request timed out" action)))
+
 (defun qq-transport--dispatch-response (payload)
   "Dispatch action response PAYLOAD to a pending callback."
   (let* ((echo (alist-get 'echo payload nil nil #'equal))
-         (entry (and echo (gethash echo qq-transport--pending)))
          (status (alist-get 'status payload))
          (retcode (alist-get 'retcode payload))
          (message-text (or (alist-get 'message payload)
                            (alist-get 'wording payload)
                            "request failed")))
     (when echo
-      (remhash echo qq-transport--pending))
-    (when entry
       (if (and (equal status "ok")
                (or (null retcode) (equal retcode 0)))
-          (when-let* ((callback (plist-get entry :success)))
-            (funcall callback payload))
-        (when-let* ((errback (plist-get entry :error)))
-          (funcall errback payload message-text))))))
+          (qq-transport--complete echo 'success payload nil)
+        (qq-transport--complete echo 'error payload message-text)))))
 
 (defun qq-transport--handle-payload (payload)
   "Handle websocket PAYLOAD decoded from JSON."
@@ -203,7 +233,14 @@ Return the generated echo token, or nil if transport is unavailable."
           (funcall errback nil "transport is not connected"))
         nil)
     (let* ((echo (qq-transport--next-echo))
-           (entry (list :action action :success callback :error errback))
+           (timeout qq-transport-request-timeout)
+           (timer (and (numberp timeout)
+                       (> timeout 0)
+                       (run-at-time timeout nil
+                                    #'qq-transport--request-timeout
+                                    echo action)))
+           (entry (list :action action :success callback :error errback
+                        :timer timer))
            (payload `((action . ,action)
                       (params . ,(or params (make-hash-table :test #'equal)))
                       (echo . ,echo))))
@@ -213,9 +250,8 @@ Return the generated echo token, or nil if transport is unavailable."
             (websocket-send-text qq-transport--ws (qq-transport--json-encode payload))
             echo)
         (error
-         (remhash echo qq-transport--pending)
-         (when errback
-           (funcall errback nil (error-message-string err)))
+         (qq-transport--complete
+          echo 'error nil (error-message-string err))
          nil)))))
 
 (provide 'qq-transport)
