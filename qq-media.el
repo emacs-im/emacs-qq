@@ -9,7 +9,7 @@
 
 ;;; Code:
 
-(require 'browse-url)
+(require 'image-mode)
 (require 'json)
 (require 'seq)
 (require 'subr-x)
@@ -37,7 +37,8 @@
   "Download state plist table keyed by QQ media logical identity.")
 
 (defconst qq-media--remote-image-cache-extensions
-  '("webp" "png" "jpg" "jpeg" "gif" "img")
+  '("webp" "png" "jpg" "jpeg" "gif" "bmp" "heic" "heif"
+    "tif" "tiff" "svg" "svgz" "img")
   "Preferred file extensions for cached remote QQ image resources.")
 
 (defvar qq-media--remote-image-plz-queue nil
@@ -68,20 +69,6 @@
   "Return non-nil when FILE exists locally."
   (and (stringp file)
        (file-exists-p file)))
-
-(defun qq-media-open-resource (resource)
-  "Open RESOURCE preferring a local file, falling back to URL.
-
-RESOURCE is an alist that may contain `file' and `url'."
-  (let ((file (alist-get 'file resource))
-        (url (alist-get 'url resource)))
-    (cond
-     ((qq-media-file-present-p file)
-      (find-file file))
-     ((qq-media-url-present-p url)
-      (browse-url url t))
-     (t
-      (user-error "qq: resource has neither local file nor URL")))))
 
 (defun qq-media--cached-resource (key)
   "Return cached resource for KEY when still usable."
@@ -433,8 +420,10 @@ never treats a local absolute path as a NapCat file id."
   "Return non-nil when FILENAME looks like an image file."
   (and (stringp filename)
        (string-match-p
-        (rx "." (or "png" "jpg" "jpeg" "gif" "webp" "bmp" "heic" "heif") string-end)
-        (downcase filename))))
+        (rx "." (or "png" "jpg" "jpeg" "gif" "webp" "bmp"
+                    "heic" "heif" "tif" "tiff" "svg" "svgz")
+            string-end)
+        (downcase (car (split-string filename "[?#]"))))))
 
 (defun qq-media-imageish-file-segment-p (segment)
   "Return non-nil when SEGMENT is a file that should preview like an image."
@@ -581,7 +570,16 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
 
 (defun qq-media-segment-open (segment)
   "Open OneBot message SEGMENT using QQ-aware resource resolution."
-  (qq-media-resolve-segment-resource segment #'qq-media-open-resource))
+  (let ((kind (qq-media-segment-kind segment))
+        (cache-key (qq-media--segment-resource-key segment)))
+    (if (eq kind 'video)
+        (qq-media-segment-play segment)
+      (if-let* ((file (qq-media-segment-local-file segment)))
+          (qq-media-open-resource `((file . ,file)) kind cache-key)
+        (qq-media-resolve-segment-resource
+         segment
+         (lambda (resource)
+           (qq-media-open-resource resource kind cache-key)))))))
 
 (defun qq-media-segment-openable-p (segment)
   "Return non-nil when SEGMENT can be opened via `qq-media'."
@@ -590,7 +588,7 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
 
 (defun qq-media-segment-playable-p (segment)
   "Return non-nil when SEGMENT supports `qq-media-segment-play'."
-  (equal (alist-get 'type segment) "video"))
+  (eq (qq-media-segment-kind segment) 'video))
 
 (defun qq-media--sanitize-filename (filename)
   "Return filesystem-safe variant of FILENAME."
@@ -606,6 +604,211 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
     (and (stringp name)
          (not (string-empty-p name))
          name)))
+
+(defun qq-media--video-file-name-p (filename)
+  "Return non-nil when FILENAME looks like a video file."
+  (and (stringp filename)
+       (string-match-p
+        (rx "." (or "mp4" "mov" "mkv" "webm" "avi" "flv" "m4v") string-end)
+        (downcase (car (split-string filename "[?#]"))))))
+
+(defun qq-media--gif-file-name-p (filename)
+  "Return non-nil when FILENAME looks like a GIF image."
+  (and (stringp filename)
+       (string-match-p
+        (rx ".gif" string-end)
+        (downcase (car (split-string filename "[?#]"))))))
+
+(defun qq-media-segment-kind (segment)
+  "Return semantic open kind for OneBot SEGMENT."
+  (let* ((type (alist-get 'type segment))
+         (data (alist-get 'data segment))
+         (name (or (alist-get 'name data)
+                   (alist-get 'file data)
+                   (qq-media--segment-url-filename (alist-get 'url data)))))
+    (cond
+     ((equal type "video") 'video)
+     ((member type '("image" "face" "mface")) 'image)
+     ((and (equal type "file") (qq-media--image-file-name-p name)) 'image)
+     ((and (equal type "file") (qq-media--video-file-name-p name)) 'video)
+     (t 'file))))
+
+(defun qq-media--resource-name (resource)
+  "Return best filename hint from RESOURCE."
+  (let ((file (alist-get 'file resource)))
+    (or (alist-get 'name resource)
+        (alist-get 'filename resource)
+        (alist-get 'file_name resource)
+        (and (stringp file) (file-name-nondirectory file))
+        (qq-media--segment-url-filename (alist-get 'url resource)))))
+
+(defun qq-media--resource-kind (resource &optional kind)
+  "Return explicit KIND or infer an open kind from RESOURCE."
+  (or kind
+      (let ((name (qq-media--resource-name resource)))
+        (cond
+         ((qq-media--video-file-name-p name) 'video)
+         ((qq-media--image-file-name-p name) 'image)
+         (t 'file)))))
+
+(defun qq-media--command-argv (command)
+  "Return argv list parsed from COMMAND, or nil."
+  (and (stringp command)
+       (not (string-empty-p (string-trim command)))
+       (split-string-and-unquote command)))
+
+(defun qq-media--command-runnable-p (command)
+  "Return non-nil when COMMAND names an executable program."
+  (when-let* ((argv (qq-media--command-argv command))
+              (program (car argv)))
+    (or (and (file-name-absolute-p program)
+             (file-executable-p program))
+        (executable-find program))))
+
+(defun qq-media-play-video-source (source)
+  "Play local file or URL SOURCE with `qq-media-video-player-command'."
+  (unless (and (stringp source) (not (string-empty-p source)))
+    (user-error "qq: video has no playable source"))
+  (unless (qq-media--command-runnable-p qq-media-video-player-command)
+    (user-error "qq: video player is unavailable; customize `qq-media-video-player-command'"))
+  (let* ((argv (qq-media--command-argv qq-media-video-player-command))
+         (program (car argv))
+         (process
+          (make-process
+           :name "qq-video-player"
+           :buffer nil
+           :command (append argv (list source))
+           :noquery t)))
+    (message "qq: playing video with %s" (file-name-nondirectory program))
+    process))
+
+(defun qq-media--maybe-start-gif-animation (file)
+  "Start GIF animation for FILE when its `image-mode' buffer is idle."
+  (when (and qq-media-animate-gifs
+             (qq-media--gif-file-name-p file))
+    (when-let* ((buffer (get-file-buffer file)))
+      (with-current-buffer buffer
+        (when (derived-mode-p 'image-mode)
+          (let ((image (image-get-display-property)))
+            (when (and image
+                       (image-multi-frame-p image)
+                       (not (image-animate-timer image)))
+              (setq-local image-animate-loop t)
+              (image-toggle-animation))))))))
+
+(defun qq-media-open-file (file)
+  "Open local FILE with `qq-media-open-file-function'.
+
+Like telega, refresh an existing unmodified file buffer's modtime before
+opening it.  GIFs opened in Emacs start looping automatically."
+  (unless (qq-media-file-present-p file)
+    (user-error "qq: local media file does not exist: %s" file))
+  (when-let* ((buffer (get-file-buffer file)))
+    (with-current-buffer buffer
+      (unless (buffer-modified-p)
+        (set-visited-file-modtime))))
+  (prog1
+      (funcall qq-media-open-file-function file)
+    (qq-media--maybe-start-gif-animation file)))
+
+(defun qq-media--resource-image-cache-key (resource cache-key)
+  "Return image disk-cache key for RESOURCE and optional CACHE-KEY."
+  (or cache-key
+      (when-let* ((url (alist-get 'url resource)))
+        (format "open-image-url:%s" url))))
+
+(defun qq-media--read-file-prefix (file limit)
+  "Return up to LIMIT literal bytes from FILE."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file nil 0 limit)
+    (buffer-string)))
+
+(defun qq-media--cache-image-resource-for-open (resource cache-key)
+  "Download image RESOURCE into disk cache and return its local path."
+  (let* ((url (alist-get 'url resource))
+         (key (qq-media--resource-image-cache-key resource cache-key))
+         (existing (and key (qq-media--remote-image-cache-existing-file key))))
+    (if existing
+        (progn
+          (setf (alist-get 'file resource nil nil #'eq) existing)
+          (when cache-key
+            (qq-media--cache-resource cache-key resource))
+          existing)
+      (progn
+        (unless (qq-media-url-present-p url)
+          (user-error "qq: image resource has no URL"))
+        (let* ((cache-base (qq-media--remote-image-cache-file-base key))
+               (temporary (format "%s.part" cache-base))
+               (extension-hint
+                (downcase (or (file-name-extension
+                               (or (qq-media--segment-url-filename url) ""))
+                              "img")))
+               (url-extension
+                (if (member extension-hint qq-media--remote-image-cache-extensions)
+                    extension-hint
+                  "img")))
+          (make-directory (file-name-directory temporary) t)
+          (url-copy-file url temporary t)
+          (let* ((bytes (disco-media-normalize-image-bytes
+                         (qq-media--read-file-prefix temporary 64)))
+                 (extension (disco-media-bytes->extension bytes url-extension))
+                 (target (format "%s.%s" cache-base extension)))
+            (unless (equal temporary target)
+              (rename-file temporary target t))
+            (setf (alist-get 'file resource nil nil #'eq) target)
+            (when cache-key
+              (qq-media--cache-resource cache-key resource))
+            target))))))
+
+(defun qq-media--cache-file-resource-for-open (resource cache-key)
+  "Download non-image RESOURCE into disk cache and return its local path."
+  (let* ((url (alist-get 'url resource))
+         (name (qq-media--sanitize-filename
+                (or (qq-media--resource-name resource) "qq-media.bin")))
+         (key (or cache-key (format "open-file-url:%s" url)))
+         (directory (expand-file-name "open" qq-media-cache-directory))
+         (target (expand-file-name
+                  (format "%s-%s" (substring (md5 key) 0 10) name)
+                  directory)))
+    (unless (qq-media-url-present-p url)
+      (user-error "qq: resource has no URL"))
+    (unless (qq-media-file-present-p target)
+      (make-directory directory t)
+      (url-copy-file url target t))
+    (setf (alist-get 'file resource nil nil #'eq) target)
+    (when cache-key
+      (qq-media--cache-resource cache-key resource))
+    target))
+
+(defun qq-media-open-resource (resource &optional kind cache-key)
+  "Open RESOURCE according to semantic KIND.
+
+Images and GIFs open through Emacs, videos use mpv (or the configured video
+player), and other remote files are cached before opening.  Browser fallback
+is intentionally not used.  CACHE-KEY associates downloaded files with the
+existing QQ media resource cache."
+  (let* ((resource (copy-tree resource))
+         (kind (qq-media--resource-kind resource kind))
+         (file (alist-get 'file resource))
+         (url (alist-get 'url resource)))
+    (pcase kind
+      ('video
+       (qq-media-play-video-source
+        (cond
+         ((qq-media-file-present-p file) file)
+         ((qq-media-url-present-p url) url)
+         (t (user-error "qq: video resource has neither local file nor URL")))))
+      ('image
+       (qq-media-open-file
+        (if (qq-media-file-present-p file)
+            file
+          (qq-media--cache-image-resource-for-open resource cache-key))))
+      (_
+       (qq-media-open-file
+        (if (qq-media-file-present-p file)
+            file
+          (qq-media--cache-file-resource-for-open resource cache-key)))))))
 
 (defun qq-media-segment-default-save-name (segment)
   "Return default filename for saving SEGMENT locally."
@@ -670,10 +873,16 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
   (let* ((download-state (qq-media-segment-download-state segment))
          (download-path (plist-get download-state :path))
          (cached-resource (qq-media--cached-resource (qq-media--segment-resource-key segment)))
-         (cached-file (and cached-resource (alist-get 'file cached-resource))))
+         (cached-file (and cached-resource (alist-get 'file cached-resource)))
+         (preview-key (qq-media-segment-preview-key segment))
+         (preview-resource (and preview-key (qq-media--cached-resource preview-key)))
+         (preview-file (or (and preview-resource (alist-get 'file preview-resource))
+                           (and preview-key
+                                (qq-media--remote-image-cache-existing-file preview-key)))))
     (cond
      ((qq-media-file-present-p download-path) download-path)
      ((qq-media-file-present-p cached-file) cached-file)
+     ((qq-media-file-present-p preview-file) preview-file)
      (t nil))))
 
 (defun qq-media--copy-or-download-resource-to (resource target)
@@ -706,7 +915,7 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
      ((and (eq status 'downloaded)
            (qq-media-file-present-p path))
       (when open-after
-        (find-file path))
+        (qq-media-segment-open-local segment))
       path)
      (t
       (qq-media--put-segment-download-state
@@ -724,7 +933,7 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
                 (plist-put (plist-put (plist-put entry :status 'downloaded) :error nil) :path path))
                (message "qq: downloaded media -> %s" path)
                (when open-after
-                 (find-file path)))
+                 (qq-media-segment-open-local segment)))
            (error
             (qq-media--put-segment-download-state
              segment
@@ -742,7 +951,10 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
 (defun qq-media-segment-open-local (segment)
   "Open the best local file available for SEGMENT."
   (if-let* ((file (qq-media-segment-local-file segment)))
-      (find-file file)
+      (qq-media-open-resource
+       `((file . ,file))
+       (qq-media-segment-kind segment)
+       (qq-media--segment-resource-key segment))
     (user-error "qq: media segment has no local file yet")))
 
 (defun qq-media-segment-save-as (segment &optional target-path)
@@ -781,7 +993,7 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
   (unless (qq-media-segment-playable-p segment)
     (user-error "qq: segment is not playable"))
   (if-let* ((file (qq-media-segment-local-file segment)))
-      (disco-media-play-video-file file)
+      (qq-media-play-video-source file)
     (qq-media-resolve-segment-resource
      segment
      (lambda (resource)
@@ -790,9 +1002,9 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
                       (qq-media--segment-url segment))))
          (cond
           ((qq-media-file-present-p resolved-file)
-           (disco-media-play-video-file resolved-file))
+           (qq-media-play-video-source resolved-file))
           ((qq-media-url-present-p url)
-           (disco-media-play-video-url url))
+           (qq-media-play-video-source url))
           (t
            (user-error "qq: video segment has no playable source"))))))))
 
@@ -825,7 +1037,8 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
    (format "avatar:%s" user-id)
    (lambda (done)
      (qq-api-get-avatar user-id done))
-   #'qq-media-open-resource))
+   (lambda (resource)
+     (qq-media-open-resource resource 'image (format "avatar:%s" user-id)))))
 
 (defun qq-media-open-group-avatar (group-id)
   "Open group avatar for GROUP-ID."
@@ -835,7 +1048,9 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
    (format "group-avatar:%s" group-id)
    (lambda (done)
      (qq-api-get-group-avatar group-id done))
-   #'qq-media-open-resource))
+   (lambda (resource)
+     (qq-media-open-resource
+      resource 'image (format "group-avatar:%s" group-id)))))
 
 (defun qq-media-open-session-avatar (session)
   "Open session avatar for SESSION."

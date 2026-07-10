@@ -534,6 +534,120 @@
       (when (file-directory-p dir)
         (delete-directory dir t)))))
 
+(ert-deftest qq-media-open-remote-image-caches-and-opens-in-emacs ()
+  "A remote image is cached by content type and never sent to a browser."
+  (let* ((qq-media-cache-directory (make-temp-file "qq-media-open" t))
+         (qq-media-animate-gifs nil)
+         (resource '((url . "https://example.com/assets/no-extension")))
+         opened-file)
+    (unwind-protect
+        (cl-letf (((symbol-function 'url-copy-file)
+                   (lambda (_url target &optional _ok-if-already-exists)
+                     (with-temp-file target
+                       (set-buffer-multibyte nil)
+                       (insert "GIF89aqq-test"))))
+                  ((symbol-function 'browse-url)
+                   (lambda (&rest _args)
+                     (ert-fail "media must not open in a browser"))))
+          (let ((qq-media-open-file-function
+                 (lambda (file)
+                   (setq opened-file file))))
+            (qq-media-open-resource resource 'image "image:test"))
+          (should (stringp opened-file))
+          (should (file-exists-p opened-file))
+          (should (equal (file-name-extension opened-file) "gif"))
+          (should (file-in-directory-p opened-file qq-media-cache-directory)))
+      (when (file-directory-p qq-media-cache-directory)
+        (delete-directory qq-media-cache-directory t)))))
+
+(ert-deftest qq-media-open-gif-starts-only-an-idle-animation ()
+  "Opening a GIF starts looping, but never toggles an active animation off."
+  (let ((qq-media-animate-gifs t)
+        (gif "/tmp/qq-animated.gif")
+        (timer nil)
+        (toggle-count 0))
+    (with-temp-buffer
+      (cl-letf (((symbol-function 'get-file-buffer)
+                 (lambda (_file) (current-buffer)))
+                ((symbol-function 'derived-mode-p)
+                 (lambda (&rest _modes) t))
+                ((symbol-function 'image-get-display-property)
+                 (lambda () '(image :type gif)))
+                ((symbol-function 'image-multi-frame-p)
+                 (lambda (_image) '(2 . 0.1)))
+                ((symbol-function 'image-animate-timer)
+                 (lambda (_image) timer))
+                ((symbol-function 'image-toggle-animation)
+                 (lambda () (cl-incf toggle-count))))
+        (qq-media--maybe-start-gif-animation gif)
+        (should (= toggle-count 1))
+        (should image-animate-loop)
+        (setq timer t)
+        (qq-media--maybe-start-gif-animation gif)
+        (should (= toggle-count 1))))))
+
+(ert-deftest qq-media-open-video-url-uses-configured-player ()
+  "Video URLs are passed to mpv without browser fallback."
+  (let ((qq-media-video-player-command "mpv --no-terminal")
+        command)
+    (cl-letf (((symbol-function 'qq-media--command-runnable-p)
+               (lambda (_configured-command) t))
+              ((symbol-function 'make-process)
+               (lambda (&rest properties)
+                 (setq command (plist-get properties :command))
+                 'qq-test-player))
+              ((symbol-function 'browse-url)
+               (lambda (&rest _args)
+                 (ert-fail "video must not open in a browser"))))
+      (should
+       (eq (qq-media-open-resource
+            '((url . "https://example.com/movie.mp4")) 'video)
+           'qq-test-player))
+      (should (equal command
+                     '("mpv" "--no-terminal"
+                       "https://example.com/movie.mp4"))))))
+
+(ert-deftest qq-media-open-video-errors-when-player-is-unavailable ()
+  "A missing player is explicit and does not silently use a browser."
+  (let ((qq-media-video-player-command nil))
+    (cl-letf (((symbol-function 'browse-url)
+               (lambda (&rest _args)
+                 (ert-fail "video must not open in a browser"))))
+      (should-error
+       (qq-media-open-resource
+       '((url . "https://example.com/movie.mp4")) 'video)
+       :type 'user-error))))
+
+(ert-deftest qq-media-segment-kind-recognizes-media-file-urls ()
+  "File segments infer image/video behavior even when URLs have queries."
+  (should
+   (eq (qq-media-segment-kind
+        '((type . "file")
+          (data . ((file . "https://example.com/picture.gif?token=1")))))
+       'image))
+  (let ((video '((type . "file")
+                 (data . ((name . "movie.MP4#fragment"))))))
+    (should (eq (qq-media-segment-kind video) 'video))
+    (should (qq-media-segment-playable-p video))))
+
+(ert-deftest qq-media-open-video-file-segment-delegates-to-player ()
+  "An mp4 delivered as a file segment still takes the video-player path."
+  (let* ((segment '((type . "file")
+                    (data . ((name . "movie.mp4")
+                             (url . "https://example.com/movie.mp4")))))
+         played-source)
+    (cl-letf (((symbol-function 'qq-media-segment-local-file)
+               (lambda (_segment) nil))
+              ((symbol-function 'qq-media-resolve-segment-resource)
+               (lambda (_segment callback &optional _errback)
+                 (funcall callback
+                          '((url . "https://example.com/movie.mp4")))))
+              ((symbol-function 'qq-media-play-video-source)
+               (lambda (source)
+                 (setq played-source source))))
+      (qq-media-segment-open segment)
+      (should (equal played-source "https://example.com/movie.mp4")))))
+
 (provide 'qq-media-test)
 
 ;;; qq-media-test.el ends here

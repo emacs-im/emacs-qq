@@ -2295,14 +2295,15 @@ Keep this short — size is useful; internal sub_type / emoji ids are not."
        "[Open]"
        (lambda ()
          (qq-media-segment-open segment))
-       (format "Open %s" kind))
+       (format "Open %s in Emacs or the configured media player" kind))
       (when (and (stringp url) (not (string-empty-p url)))
         (insert " ")
         (qq-chat--insert-message-action-button
-         "[URL]"
+         "[Copy URL]"
          (lambda ()
-           (browse-url url t))
-         "Open resource URL"))
+           (kill-new url)
+           (message "qq: copied media URL"))
+         "Copy resource URL"))
       (insert "\n")
       (qq-ui-apply-line-prefix action-start (point) prefix-state)
       (add-text-properties action-start (point) (append properties (list 'face 'shadow))))
@@ -2310,19 +2311,31 @@ Keep this short — size is useful; internal sub_type / emoji ids are not."
     (when (qq-media-segment-preview-capable-p segment)
       (let ((preview-start (point))
             (preview (qq-media-segment-preview-image segment))
-            (loading (qq-media-segment-preview-fetching-p segment)))
+            (loading (qq-media-segment-preview-fetching-p segment))
+            preview-end)
         (cond
          (preview
           (condition-case _
-              (disco-media-insert-image-slices
-               preview
-               (and (stringp url) (not (string-empty-p url)) url)
-               nil
-               (if (equal (alist-get 'type segment) "mface")
-                   "[sticker]"
-                 "[image]"))
+              (progn
+                ;; Passing nil as URL prevents disco's browser action.  QQ
+                ;; installs its semantic Emacs/mpv opener below instead.
+                (disco-media-insert-image-slices
+                 preview
+                 nil
+                 nil
+                 (if (equal (alist-get 'type segment) "mface")
+                     "[sticker]"
+                   "[image]"))
+                (setq preview-end (point)))
             (error
              (insert "[preview unavailable]")))
+          (when preview-end
+            (disco-media-add-action-properties
+             preview-start preview-end
+             (lambda (&optional _event)
+               (interactive)
+               (qq-media-segment-open segment))
+             (format "Open %s in Emacs" kind)))
           (insert "\n"))
          (loading
           (insert "[loading preview]\n"))

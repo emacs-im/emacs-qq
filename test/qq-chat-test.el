@@ -1456,6 +1456,46 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
                                                   (nth 1 segments))))))
          (ignore-errors (delete-file path)))))))
 
+(ert-deftest qq-chat-media-preview-uses-qq-opener-not-browser-url ()
+  "Clicking an inline image preview uses the semantic QQ media opener."
+  (let* ((segment '((type . "image")
+                    (data . ((url . "https://example.com/picture.gif")
+                             (name . "picture.gif")))))
+         preview-url
+         preview-action
+         opened-segment)
+    (with-temp-buffer
+      (let ((inhibit-read-only t))
+        (cl-letf (((symbol-function 'qq-chat--insert-segment-transfer-line)
+                   (lambda (&rest _args) (insert "transfer\n")))
+                  ((symbol-function 'qq-media-segment-playable-p)
+                   (lambda (_segment) nil))
+                  ((symbol-function 'qq-media-segment-preview-capable-p)
+                   (lambda (_segment) t))
+                  ((symbol-function 'qq-media-segment-preview-image)
+                   (lambda (_segment) 'qq-test-image))
+                  ((symbol-function 'qq-media-segment-preview-fetching-p)
+                   (lambda (_segment) nil))
+                  ((symbol-function 'disco-media-insert-image-slices)
+                   (lambda (_image url &optional _prefix _fallback)
+                     (setq preview-url url)
+                     (insert "PREVIEW")))
+                  ((symbol-function 'disco-media-add-action-properties)
+                   (lambda (_start _end callback _help)
+                     (setq preview-action callback)))
+                  ((symbol-function 'qq-media-segment-open)
+                   (lambda (media-segment)
+                     (setq opened-segment media-segment))))
+          (qq-chat--insert-segment-media-line segment nil nil)
+          (should-not preview-url)
+          (should (functionp preview-action))
+          (should (string-match-p (regexp-quote "[Copy URL]")
+                                  (buffer-string)))
+          (should-not (string-match-p (regexp-quote "[URL]")
+                                      (buffer-string)))
+          (funcall preview-action nil)
+          (should (equal opened-segment segment)))))))
+
 (provide (quote qq-chat-test))
 
 ;;; qq-chat-test.el ends here
