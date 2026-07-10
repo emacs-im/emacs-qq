@@ -608,50 +608,83 @@ and must not be retained as an `unsupported.raw' diagnostic payload."
    (lambda (response)
      (qq-state-set-status (qq-api--response-data response)))))
 
-(defun qq-api-refresh-login-info ()
-  "Refresh login info from NapCat."
+(defun qq-api-refresh-login-info (&optional callback errback)
+  "Refresh login info from NapCat, then call CALLBACK with it."
   (interactive)
   (qq-api-call
    "get_login_info"
    nil
    (lambda (response)
-     (qq-state-set-self-info (qq-api--response-data response)))))
+     (let ((info (qq-api--response-data response)))
+       (qq-state-set-self-info info)
+       (when callback (funcall callback info))))
+   errback))
 
-(defun qq-api-refresh-recent-contacts ()
-  "Refresh recent contact snapshot from NapCat."
+(defun qq-api-refresh-recent-contacts (&optional callback errback)
+  "Refresh recent contacts, then call CALLBACK with the contact list."
   (interactive)
   (qq-api-call
    "get_recent_contact"
    `((count . ,(max 1 qq-recent-contact-count)))
    (lambda (response)
-     (qq-state-apply-recent-contacts (qq-api--response-data response)))))
+     (let ((contacts (qq-api--response-data response)))
+       (qq-state-apply-recent-contacts contacts)
+       (when callback (funcall callback contacts))))
+   errback))
 
-(defun qq-api-refresh-friend-list ()
-  "Refresh friend list from NapCat."
+(defun qq-api-refresh-friend-list (&optional callback errback)
+  "Refresh friend list, then call CALLBACK with it."
   (interactive)
   (qq-api-call
    "get_friend_list"
    nil
    (lambda (response)
-     (qq-state-apply-friends (qq-api--response-data response)))))
+     (let ((friends (qq-api--response-data response)))
+       (qq-state-apply-friends friends)
+       (when callback (funcall callback friends))))
+   errback))
 
-(defun qq-api-refresh-group-list ()
-  "Refresh group list from NapCat."
+(defun qq-api-refresh-group-list (&optional callback errback)
+  "Refresh group list, then call CALLBACK with it."
   (interactive)
   (qq-api-call
    "get_group_list"
    nil
    (lambda (response)
-     (qq-state-apply-groups (qq-api--response-data response)))))
+     (let ((groups (qq-api--response-data response)))
+       (qq-state-apply-groups groups)
+       (when callback (funcall callback groups))))
+   errback))
 
 (defun qq-api-bootstrap ()
-  "Run the standard initial data bootstrap sequence."
+  "Run initial bootstrap in dependency order.
+
+Self identity and friend names must exist before recent-contact messages are
+normalized; otherwise an arbitrary response order can permanently classify a
+self message as incoming or store a weaker sender display name."
   (interactive)
   (qq-api-refresh-status)
-  (qq-api-refresh-login-info)
-  (qq-api-refresh-recent-contacts)
-  (qq-api-refresh-friend-list)
-  (qq-api-refresh-group-list))
+  (cl-labels
+      ((recent () (qq-api-refresh-recent-contacts))
+       (groups ()
+         (qq-api-refresh-group-list
+          (lambda (_groups) (recent))
+          (lambda (response reason)
+            (qq-api--default-error response reason)
+            (recent))))
+       (friends ()
+         (qq-api-refresh-friend-list
+          (lambda (_friends) (groups))
+          (lambda (response reason)
+            (qq-api--default-error response reason)
+            (groups)))))
+    (qq-api-refresh-login-info
+     (lambda (_info) (friends))
+     (lambda (response reason)
+       ;; Friend/group/session data remains useful when login info fails, but
+       ;; the deterministic chain is preserved for the next refresh.
+       (qq-api--default-error response reason)
+       (friends)))))
 
 (defun qq-api-refresh ()
   "Refresh all primary runtime data from NapCat."
