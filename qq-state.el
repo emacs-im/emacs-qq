@@ -979,23 +979,69 @@ Return a plist:
   :oldest-message-id (after merge).  Chat uses `:added-count' to detect
   beginning-of-history when NapCat returns only already-cached rows."
   (qq-state-upsert-session session-key nil nil)
-  (let ((known-ids (make-hash-table :test #'equal))
-        (added 0)
-        batch-ids
-        (batch (or raw-messages '())))
-    (dolist (message (or (gethash session-key qq-state--messages-by-session) '()))
-      (when-let* ((server-id (alist-get 'server-id message)))
-        (puthash server-id t known-ids)))
+  (let* ((messages
+          (copy-tree
+           (or (gethash session-key qq-state--messages-by-session) '())))
+         (server-cells (make-hash-table :test #'equal))
+         (local-cells (make-hash-table :test #'equal))
+         (added 0)
+         batch-ids
+         session-fields
+         (batch (or raw-messages '())))
+    ;; Keep cons cells as O(1) replacement handles.  A history page is one
+    ;; store transaction: normalize and merge every row, then sort/index/sync
+    ;; the session exactly once.
+    (let ((tail messages))
+      (while tail
+        (let* ((message (car tail))
+               (server-id (alist-get 'server-id message))
+               (local-id (alist-get 'local-id message)))
+          (when server-id (puthash server-id tail server-cells))
+          (when local-id (puthash local-id tail local-cells)))
+        (setq tail (cdr tail))))
     (dolist (raw-message batch)
-      (let* ((normalized (qq-state--normalize-raw-message raw-message session-key))
+      (let* ((normalized
+              (qq-state--normalize-raw-message raw-message session-key))
              (server-id (alist-get 'server-id normalized))
-             (already (and server-id (gethash server-id known-ids))))
+             (direct-cell (and server-id (gethash server-id server-cells)))
+             (pending
+              (and (null direct-cell)
+                   (qq-state--weak-pending-match messages normalized)))
+             (cell (or direct-cell
+                       (and pending
+                            (gethash (alist-get 'local-id pending)
+                                     local-cells))))
+             (existing (and cell (car cell)))
+             (merged (if existing
+                         (qq-state--merge-alists existing normalized)
+                       normalized))
+             (old-order (and existing (alist-get 'order existing))))
         (when server-id
           (push server-id batch-ids))
-        (qq-state--merge-normalized-message session-key normalized nil)
-        (when (and server-id (not already))
+        (when old-order
+          (setf (alist-get 'order merged nil nil #'eq) old-order))
+        (when (and existing
+                   (qq-state-message-recalled-p existing)
+                   (not (qq-state-message-recalled-p merged)))
+          (setq merged (qq-state--as-recalled-message merged)))
+        (if cell
+            (setcar cell merged)
+          (push merged messages)
+          (setq cell messages))
+        (when (and server-id (null direct-cell))
           (cl-incf added)
-          (puthash server-id t known-ids))))
+          (puthash server-id cell server-cells))
+        (when-let* ((local-id (alist-get 'local-id merged)))
+          (puthash local-id cell local-cells))
+        (dolist (key '(peer-name peer-uid peer-uin))
+          (when-let* ((value (alist-get key merged)))
+            (setf (alist-get key session-fields nil nil #'eq) value)))))
+    (setq messages (qq-state--sort-messages messages))
+    (puthash session-key messages qq-state--messages-by-session)
+    (when session-fields
+      (qq-state-upsert-session session-key session-fields nil))
+    (qq-state--reindex-session-messages session-key messages)
+    (qq-state--sync-session-summary session-key)
     (setq batch-ids (delete-dups (nreverse batch-ids)))
     (let ((oldest (qq-state-session-oldest-message-id session-key))
           (count (length batch)))

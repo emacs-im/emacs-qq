@@ -739,6 +739,27 @@
     (should (equal (plist-get meta :oldest-message-id) "90"))
     (should (= (length (qq-state-session-messages "private:10001")) 2))))
 
+(ert-deftest qq-state-history-batch-sorts-store-once ()
+  (qq-test-with-reset
+   (let ((sort-count 0)
+         (original-sort (symbol-function 'qq-state--sort-messages)))
+     (cl-letf (((symbol-function 'qq-state--sort-messages)
+                (lambda (messages)
+                  (cl-incf sort-count)
+                  (funcall original-sort messages))))
+       (qq-state-merge-history
+        "group:20001"
+        '(((message_id . "9007199254741004001")
+           (message_type . "group") (group_id . "20001")
+           (user_id . "10001") (time . 1710000001) (message . ()))
+          ((message_id . "9007199254741004002")
+           (message_type . "group") (group_id . "20001")
+           (user_id . "10001") (time . 1710000002) (message . ()))
+          ((message_id . "9007199254741004003")
+           (message_type . "group") (group_id . "20001")
+           (user_id . "10001") (time . 1710000003) (message . ()))))
+       (should (= sort-count 1))))))
+
 (provide 'qq-state-test)
 
 ;;; qq-state-test.el ends here
