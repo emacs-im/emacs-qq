@@ -56,6 +56,27 @@
        (should (null (qq-state-action-text "private:10001")))
        (should (null (qq-state-session-actions "private:10001")))))))
 
+(ert-deftest qq-state-apply-input-status-defaults-when-status-text-missing ()
+  "Kernel often omits statusText; still treat as typing when not cancel."
+  (qq-test-with-reset
+   (cl-letf (((symbol-function 'run-at-time)
+              (lambda (&rest _) 'fake-timer)))
+     ;; no status_text, no event_type
+     (qq-state-apply-input-status
+      '((notice_type . "notify")
+        (sub_type . "input_status")
+        (user_id . 20002)))
+     (should (equal (qq-state-action-text "private:20002")
+                    "对方正在输入..."))
+     ;; event_type present, status_text null-like
+     (qq-state-apply-input-status
+      '((notice_type . "notify")
+        (sub_type . "input_status")
+        (user_id . "20003")
+        (event_type . 1)
+        (status_text . nil)))
+     (should (equal (qq-state-action-text "private:20003")
+                    "对方正在输入...")))))
 (ert-deftest qq-state-apply-recent-contacts-creates-session-summary ()
   (qq-test-with-reset
    (qq-state-apply-recent-contacts

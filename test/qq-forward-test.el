@@ -91,6 +91,24 @@
       (should-not (qq-forward-segment-p legacy))
       (should-error (qq-forward-open-segment legacy) :type 'user-error))))
 
+(ert-deftest qq-forward-message-count-does-not-treat-nil-as-zero ()
+  "Remote forwards have no inline snapshot; nil must not become 0.
+
+In Elisp the empty list is nil, so a missing inline snapshot and an empty
+list are indistinguishable — both mean \"do not claim a count\"."
+  (should (null (qq-forward--inline-message-count nil)))
+  (should (null (qq-forward--inline-message-count '())))
+  (should (equal (qq-forward--inline-message-count []) 0))
+  (should (equal (qq-forward--inline-message-count
+                  (list (qq-forward-test--native-message "0" "a")
+                        (qq-forward-test--native-message "1" "b")))
+                 2))
+  (should (equal (qq-forward--count-from-presentation
+                  '((summary . "查看3条转发消息")))
+                 3))
+  (should (null (qq-forward--count-from-presentation
+                 '((summary . "no count here"))))))
+
 (ert-deftest qq-forward-root-event-adapter-qualifies-message-source ()
   (let* ((legacy
           '((type . "forward")

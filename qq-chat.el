@@ -881,14 +881,11 @@ because its result is only `{kind:single}'."
 (defun qq-chat--header-text ()
   "Build EWOC header text for the current chat state.
 
-Default is title-only.  Long help lines are optional via
-`qq-chat-show-header-help' (see also `C-c ?').  Older-history load state is
-shown when loading or exhausted (disco-style)."
-  (let* ((session (qq-chat--session))
-         (title (or (alist-get 'title session) qq-chat--session-key))
-         (text
+Title lives only in `header-line-format' (`qq-chat--header-line'); do not
+repeat it here.  EWOC header is reserved for optional help and history
+load state (disco-style)."
+  (let* ((text
           (with-temp-buffer
-            (qq-view-insert-heading-line title)
             (when qq-chat-show-header-help
               (qq-view-insert-note-line (qq-chat--header-help-text)))
             (cond
@@ -898,14 +895,16 @@ shown when loading or exhausted (disco-style)."
               (qq-view-insert-note-line "(loading older messages…)"))
              (qq-chat--history-exhausted
               (qq-view-insert-note-line "(older history exhausted)")))
-            (insert "\n")
+            (when (> (buffer-size) 0)
+              (insert "\n"))
             (buffer-string))))
-    (add-text-properties
-     0 (length text)
-     '(read-only t
-       front-sticky (read-only)
-       rear-nonsticky (read-only))
-     text)
+    (when (> (length text) 0)
+      (add-text-properties
+       0 (length text)
+       '(read-only t
+         front-sticky (read-only)
+         rear-nonsticky (read-only))
+       text))
     text))
 
 (defun qq-chat--action-indicator-text ()

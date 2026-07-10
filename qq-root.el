@@ -180,9 +180,13 @@ priority over the last-message preview."
      :preview-leading-length (length badge)
      :preview-leading-face (cond (important 'warning)
                                  (muted 'shadow))
+     ;; Plain timestamp only.  Unread is already shown by the leading
+     ;; badge ([n] / [mute:n]); do not reuse disco's time-tail-face
+     ;; (meant for a trailing status glyph) or the last time digit
+     ;; gets a spurious warning color.
      :time (qq-root--format-time (alist-get 'last-message-time session))
      :time-face 'shadow
-     :time-tail-face (and important 'warning)
+     :time-tail-face nil
      :line-properties
      (list 'qq-root-row-type 'session
            'qq-root-session-key session-key

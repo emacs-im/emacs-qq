@@ -106,10 +106,17 @@
 (defun qq-media--note-cache-updated (&optional media-key)
   "Notify UI that media cache content changed.
 
-When MEDIA-KEY is non-nil, it identifies the logical cache entry that changed."
-  (run-hook-with-args 'qq-media-cache-update-hook media-key)
-  (when (functionp qq-media-rerender-function)
-    (funcall qq-media-rerender-function)))
+When MEDIA-KEY is non-nil, it identifies the logical cache entry that changed.
+
+Defer the hook to the next command loop via `run-at-time'.  plz process
+filters can call this outside a safe redisplay context; immediate
+`erase-buffer' in special-mode forward viewers is unreliable from filters."
+  (run-at-time
+   0 nil
+   (lambda ()
+     (run-hook-with-args 'qq-media-cache-update-hook media-key)
+     (when (functionp qq-media-rerender-function)
+       (funcall qq-media-rerender-function)))))
 
 (defun qq-media--image-from-file (file height)
   "Create an Emacs image object from FILE at pixel HEIGHT, or nil."
@@ -193,14 +200,20 @@ files do not permanently override fresher public avatar URLs."
      (t nil))))
 
 (defun qq-media--finish-resource-image-fetch (key &optional file image resource)
-  "Finalize image fetch for KEY using FILE, IMAGE, and RESOURCE."
+  "Finalize image fetch for KEY using FILE, IMAGE, and RESOURCE.
+
+Always clear the fetching flag and notify UI.  Previously we only called
+`qq-media--note-cache-updated' when IMAGE was non-nil, so a successful file
+download that failed `create-image' (or a failed URL fetch) left forward
+viewers stuck on \"[loading preview]\" while RET open still worked via the
+non-preview resource path."
   (when (and resource file)
     (setf (alist-get 'file resource nil nil #'eq) file)
     (qq-media--cache-resource key resource))
   (when image
-    (qq-media--cache-image key image)
-    (qq-media--note-cache-updated key))
-  (remhash key qq-media--fetching-cache))
+    (qq-media--cache-image key image))
+  (remhash key qq-media--fetching-cache)
+  (qq-media--note-cache-updated key))
 
 (defun qq-media--start-resource-image-download (key resource spec builder)
   "Download remote image RESOURCE for KEY, then build image with BUILDER."
@@ -294,24 +307,26 @@ resource alist.  SPEC is forwarded to IMAGE-BUILDER, which defaults to
                       (file* (and resource* (qq-media--resource-image-file key resource*))))
                  (cond
                   ((qq-media-file-present-p file*)
-                   (let ((image (funcall builder file* spec)))
-                     (when image
-                       (qq-media--cache-image key image)
-                       (qq-media--note-cache-updated key))
-                     (remhash key qq-media--fetching-cache)))
+                   (qq-media--finish-resource-image-fetch
+                    key file*
+                    (funcall builder file* spec)
+                    resource*))
                   ((and (qq-media--prefer-remote-image-resource-p key resource*)
                         (qq-media-file-present-p original-file*))
                    (let ((image (funcall builder original-file* spec)))
                      (when image
                        (qq-media--cache-image key image)
                        (qq-media--note-cache-updated key)))
-                   (qq-media--start-resource-image-download key resource* spec builder))
+                   (qq-media--start-resource-image-download
+                    key resource* spec builder))
                   ((qq-media-url-present-p (alist-get 'url resource*))
-                   (qq-media--start-resource-image-download key resource* spec builder))
+                   (qq-media--start-resource-image-download
+                    key resource* spec builder))
                   (t
-                   (remhash key qq-media--fetching-cache)))))
+                   (qq-media--finish-resource-image-fetch
+                    key nil nil resource*)))))
              (lambda (_response _reason)
-               (remhash key qq-media--fetching-cache)))
+               (qq-media--finish-resource-image-fetch key nil nil nil)))
             nil))))))
 
 (defun qq-media--resource-fetching-p (key)
@@ -1747,20 +1762,27 @@ not ready yet, show the human face name (`/斜眼笑') rather than CQ."
 (defun qq-media-segment-preview-image (segment)
   "Return inline preview image for SEGMENT, triggering fetch when needed.
 
-Resolution order matches `qq-media--resolve-fileish-segment': local path,
-then NapCat get_image for remote keys, then segment URL.  Preview failures
-are soft (no NapCat error spam).
+Live evidence (emacsclient, forward image
+`25BA8E226776B3099D323947E8FE87BE.png`):
+- `get_image` with the bare NT file name never invokes success/error
+  (left `fetching' stuck for 12s+ with no resource cache).
+- The segment `url' downloads successfully via plz in a few seconds and
+  builds a preview image.
 
-When SEGMENT already has an existing local path (outbound attach), seed the
-resource cache so the image can be built synchronously without touching NapCat."
+So when the wire segment already carries a URL (or local path), seed that
+into the preview resource cache *before* `ensure', so we take the URL
+download branch instead of blocking forever on `get_image'.  Only fall back
+to NapCat `get_image' when there is no usable URL/local path.
+
+Preview failures are soft (no NapCat error spam)."
   (let ((key (qq-media-segment-preview-key segment))
-        (local (qq-media--segment-existing-path segment)))
+        (local (qq-media--segment-existing-path segment))
+        (url (qq-media--segment-url segment)))
     (when key
-      (when local
+      (when (or local (qq-media-url-present-p url))
         (qq-media--cache-resource
          key
-         (qq-media--resource-from-local+url
-          local (qq-media--segment-url segment))))
+         (qq-media--resource-from-local+url local url)))
       (qq-media--ensure-resource-image
        key
        (lambda (done error)

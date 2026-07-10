@@ -189,6 +189,40 @@ a remote reference that must be fetched.")
       (when (equal (alist-get 'kind content) "inline")
         (assq 'messages content)))))
 
+(defun qq-forward--inline-message-count (inline-content)
+  "Return number of inline forward messages in INLINE-CONTENT, or nil.
+
+Important: in Elisp `(listp nil)' is non-nil and `(length nil)' is 0.
+Remote forward-cards have no inline snapshot, so callers must treat nil
+as \"unknown\", not zero — otherwise the UI always shows
+\"0 forwarded messages\"."
+  (cond
+   ((vectorp inline-content)
+    (length inline-content))
+   ((null inline-content)
+    nil)
+   ((proper-list-p inline-content)
+    (length inline-content))
+   (t nil)))
+
+(defun qq-forward--count-from-presentation (presentation)
+  "Best-effort message count from PRESENTATION summary text, or nil.
+
+QQ Ark summaries often look like \"查看3条转发消息\" when the nested
+snapshot is remote-only."
+  (let ((summary (qq-forward--present-string
+                  (and (listp presentation) (alist-get 'summary presentation)))))
+    (cond
+     ((and (stringp summary)
+           (string-match "查看\\([0-9]+\\)条" summary))
+      (string-to-number (match-string 1 summary)))
+     ((and (stringp summary)
+           (string-match "\\([0-9]+\\)\\s-*条转发" summary))
+      (string-to-number (match-string 1 summary)))
+     ((and (stringp summary)
+           (string-match "\\([0-9]+\\)\\s-*forwarded" summary))
+      (string-to-number (match-string 1 summary)))
+     (t nil))))
 (defun qq-forward--unsupported-segment (payload)
   "Return safe internal placeholder for unsupported native PAYLOAD."
   (let* ((summary (qq-forward--present-string
@@ -540,9 +574,22 @@ forwarded message is written to or looked up in `qq-state'."
            (get-text-property (1- (point)) 'qq-forward-entry-index))))
 
 (defun qq-forward--render ()
-  "Render the current `qq-forward-mode' buffer from buffer-local state."
-  (let ((old-index (qq-forward--current-entry-index))
-        (inhibit-read-only t))
+  "Render the current `qq-forward-mode' buffer from buffer-local state.
+
+Preserve the user's place inside the current entry when possible.  A full
+erase/rebuild that always jumps to the entry header (the old behavior)
+makes C-n/C-p feel like the cursor is hard-snapped back whenever media
+previews finish and re-render the buffer."
+  (let* ((old-index (qq-forward--current-entry-index))
+         (old-entry-start
+          (and (integerp old-index)
+               (alist-get old-index (qq-forward--entry-positions))))
+         (old-offset (and old-entry-start
+                          (max 0 (- (point) old-entry-start))))
+         (old-window-start
+          (when-let* ((win (get-buffer-window (current-buffer) t)))
+            (window-start win)))
+         (inhibit-read-only t))
     (erase-buffer)
     (insert (propertize "Chat History\n" 'face 'bold))
     (insert (propertize
@@ -567,9 +614,27 @@ forwarded message is written to or looked up in `qq-state'."
       (cl-loop for message in qq-forward--messages
                for index from 0
                do (qq-forward--insert-message message index))))
-    (goto-char (point-min))
-    (when (integerp old-index)
-      (qq-forward--goto-entry old-index))))
+    (let* ((positions (qq-forward--entry-positions))
+           (entry-start (and (integerp old-index)
+                             (alist-get old-index positions)))
+           (next-start
+            (and (integerp old-index)
+                 (or (alist-get (1+ old-index) positions)
+                     (point-max)))))
+      (cond
+       ((and entry-start old-offset)
+        (goto-char (min (+ entry-start old-offset)
+                        (max entry-start (1- (or next-start (point-max)))))))
+       ((integerp old-index)
+        (qq-forward--goto-entry old-index))
+       (t
+        (goto-char (point-min)))))
+    (when-let* ((win (get-buffer-window (current-buffer) t))
+                (start old-window-start)
+                ((and (integerp start)
+                      (>= start (point-min))
+                      (<= start (point-max)))))
+      (set-window-start win start t))))
 
 (defun qq-forward--request-valid-p (buffer source generation)
   "Return non-nil when async result still belongs to BUFFER and GENERATION."
@@ -821,8 +886,8 @@ records issue a fresh `emacs_get_forward' request."
           (and inline-cell
                (qq-api-validate-native-forward-messages
                 (cdr inline-cell) "native forward inline content")))
-         (count (and (or (listp inline-content) (vectorp inline-content))
-                     (length inline-content)))
+         (count (or (qq-forward--inline-message-count inline-content)
+                    (qq-forward--count-from-presentation presentation)))
          (source (qq-forward--segment-source segment))
          (reference (and source (qq-forward--source-reference source)))
          (open-action (lambda () (qq-forward-open-segment segment)))
@@ -867,7 +932,7 @@ records issue a fresh `emacs_get_forward' request."
       (unless (equal detail title)
         (qq-ui-insert-prefixed-lines
          card-prefix-state detail :face 'shadow :properties card-properties)))
-    (when count
+    (when (and (numberp count) (> count 0))
       (qq-ui-insert-prefixed-lines
        card-prefix-state
        (format "%d forwarded message%s" count (if (= count 1) "" "s"))
@@ -875,6 +940,43 @@ records issue a fresh `emacs_get_forward' request."
        :properties card-properties))
     (add-text-properties start (point) card-properties)
     (point)))
+
+(defvar-local qq-forward--media-rerender-timer nil
+  "Debounce timer for media-driven re-renders of this forward viewer.")
+
+(defun qq-forward--rerender-buffer-now (buffer)
+  "Re-render BUFFER if it is still a live forward viewer."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq qq-forward--media-rerender-timer nil)
+      (when (and (derived-mode-p 'qq-forward-mode)
+                 (not qq-forward--loading)
+                 (or qq-forward--messages qq-forward--error))
+        (let ((inhibit-read-only t))
+          (qq-forward--render))))))
+
+(defun qq-forward--rerender-open-viewers (&optional _media-key)
+  "Schedule re-render of live `qq-forward-mode' buffers after media updates.
+
+Chat buffers patch single nodes; this viewer still full-redraws.  Debounce
+so a burst of preview completions does not thrash point (C-n/C-p feeling
+\"hard snapped back\" on every image).  Point restore lives in
+`qq-forward--render'."
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (and (derived-mode-p 'qq-forward-mode)
+                 (not qq-forward--loading)
+                 (or qq-forward--messages qq-forward--error))
+        (when (timerp qq-forward--media-rerender-timer)
+          (cancel-timer qq-forward--media-rerender-timer))
+        (setq qq-forward--media-rerender-timer
+              (run-at-time
+               0.05 nil
+               #'qq-forward--rerender-buffer-now
+               buffer))))))
+
+(add-hook 'qq-media-cache-update-hook #'qq-forward--rerender-open-viewers)
+
 (provide 'qq-forward)
 
 ;;; qq-forward.el ends here

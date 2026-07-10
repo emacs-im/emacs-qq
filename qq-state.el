@@ -1411,21 +1411,30 @@ Maps NapCat:
 to `qq-state--actions' entry of type `typing'.
 
 Semantics (aligned with telega updateChatAction):
-- event_type > 0 and non-empty status_text → set/replace sender action
-- event_type 0 or empty status_text → cancel that sender's action
-- missing cancel packets are handled by `qq-input-status-ttl' auto-expire"
+- event_type = 0 → cancel that sender's action
+- event_type missing or > 0 → typing (status_text optional; default
+  \"对方正在输入...\")
+- missing cancel packets are handled by `qq-input-status-ttl' auto-expire
+
+Note: kernel/NAPI sometimes omits statusText; JSON then has no status_text
+field.  Requiring a non-empty status_text previously dropped every event."
   (let* ((user-id (qq-state--normalize-id (alist-get 'user_id notice)))
          (status-text (alist-get 'status_text notice))
          (event-type (alist-get 'event_type notice))
+         ;; nil when field absent — do NOT default to 0 (0 means cancel).
          (event-num (cond
                      ((numberp event-type) event-type)
-                     ((stringp event-type) (string-to-number event-type))
-                     (t 0)))
-         (text (and (stringp status-text) (string-trim status-text)))
-         (active-p (and user-id
-                        (> event-num 0)
-                        (stringp text)
-                        (not (string-empty-p text))))
+                     ((and (stringp event-type) (not (string-empty-p event-type)))
+                      (string-to-number event-type))
+                     (t nil)))
+         (explicit-cancel-p (and (numberp event-num) (= event-num 0)))
+         (text
+          (let ((trimmed (and (stringp status-text) (string-trim status-text))))
+            (cond
+             ((and trimmed (not (string-empty-p trimmed))) trimmed)
+             (explicit-cancel-p nil)
+             (t "对方正在输入..."))))
+         (active-p (and user-id (not explicit-cancel-p) text))
          ;; Private peer is the typer; session key follows private:<uin>.
          (session-key (and user-id (qq-state-session-key 'private user-id))))
     (cond
@@ -1440,7 +1449,7 @@ Semantics (aligned with telega updateChatAction):
              (old (assoc user-id actions))
              (action `((type . typing)
                        (text . ,text)
-                       (event-type . ,event-num)
+                       (event-type . ,(or event-num 1))
                        (expires-at . ,expires-at)
                        (timer . nil)))
              (timer (run-at-time
@@ -1465,7 +1474,6 @@ Semantics (aligned with telega updateChatAction):
                         :source 'notice
                         :actions (qq-state-session-actions session-key))
         (qq-state-session-actions session-key))))))
-
 (provide 'qq-state)
 
 ;;; qq-state.el ends here
