@@ -76,21 +76,23 @@
     ("male" "男")
     ("female" "女")
     ("private" "保密")
-    (_ "未知")))
+    (_ nil)))
 
 (defun qq-user--birthday-label (birthday)
   "Return display label for BIRTHDAY object."
-  (when (listp birthday)
+  (when (consp birthday)
     (let ((year (alist-get 'year birthday))
           (month (alist-get 'month birthday))
           (day (alist-get 'day birthday)))
-      (if year
-          (format "%04d-%02d-%02d" year month day)
-        (format "%02d-%02d" month day)))))
+      (when (and (integerp month) (<= 1 month 12)
+                 (integerp day) (<= 1 day 31))
+        (if (and (integerp year) (> year 0))
+            (format "%04d-%02d-%02d" year month day)
+          (format "%02d-%02d" month day))))))
 
 (defun qq-user--location-label (location)
   "Return display label for LOCATION object."
-  (when (listp location)
+  (when (consp location)
     (let ((parts (delq nil
                        (mapcar #'qq-user--present-string
                                (list (alist-get 'country location)
@@ -100,49 +102,51 @@
 
 (defun qq-user--status-label (status)
   "Return display label for STATUS object."
-  (when (listp status)
-    (or (qq-user--present-string (alist-get 'description status))
-        (format "状态 %s" (or (alist-get 'code status) 0)))))
+  (when (consp status)
+    (qq-user--present-string (alist-get 'description status))))
 
 (defun qq-user--relationship-label (relationship)
   "Return display label for RELATIONSHIP object."
-  (when (listp relationship)
-    (string-join
-     (delq nil
-           (list (if (equal (alist-get 'kind relationship) "friend")
-                     "好友"
-                   "陌生人")
-                 (and (eq (alist-get 'special_care relationship) t)
-                      "特别关心")
-                 (and (eq (alist-get 'blocked_by_me relationship) t)
-                      "已屏蔽")))
-     " · ")))
+  (when (consp relationship)
+    (when-let* ((kind (pcase (alist-get 'kind relationship)
+                        ("friend" "好友")
+                        ("stranger" "陌生人"))))
+      (string-join
+       (delq nil
+             (list kind
+                   (and (eq (alist-get 'special_care relationship) t)
+                        "特别关心")
+                   (and (eq (alist-get 'blocked_by_me relationship) t)
+                        "已屏蔽")))
+       " · "))))
 
 (defun qq-user--level-label (level)
   "Return display label for QQ LEVEL object."
-  (when (listp level)
-    (format "%d 皇冠 · %d 太阳 · %d 月亮 · %d 星星"
-            (or (alist-get 'crowns level) 0)
-            (or (alist-get 'suns level) 0)
-            (or (alist-get 'moons level) 0)
-            (or (alist-get 'stars level) 0))))
+  (when (consp level)
+    (let ((parts
+           (cl-loop for (field label) in '((crowns "皇冠")
+                                            (suns "太阳")
+                                            (moons "月亮")
+                                            (stars "星星"))
+                    for count = (alist-get field level)
+                    when (and (integerp count) (> count 0))
+                    collect (format "%d %s" count label))))
+      (and parts (string-join parts " · ")))))
 
 (defun qq-user--vip-label (vip)
   "Return display label for VIP object."
-  (when (listp vip)
+  (when (consp vip)
     (pcase (alist-get 'kind vip)
-      ("svip" (format "SVIP %s%s"
-                      (or (alist-get 'level vip) 0)
-                      (if (eq (alist-get 'annual vip) t) " · 年费" "")))
-      ("vip" (format "VIP %s%s"
-                     (or (alist-get 'level vip) 0)
-                     (if (eq (alist-get 'annual vip) t) " · 年费" "")))
-      (_ "无"))))
-
-(defun qq-user--registered-label (timestamp)
-  "Return registration date for TIMESTAMP."
-  (when (and (integerp timestamp) (> timestamp 0))
-    (format-time-string "%Y-%m-%d" (seconds-to-time timestamp))))
+      ((or "svip" "vip")
+       (let ((name (if (equal (alist-get 'kind vip) "svip") "SVIP" "VIP"))
+             (level (alist-get 'level vip)))
+         (concat name
+                 (if (and (integerp level) (> level 0))
+                     (format " %d" level)
+                   "")
+                 (if (eq (alist-get 'annual vip) t) " · 年费" ""))))
+      ("none" "无")
+      (_ nil))))
 
 (defun qq-user-render ()
   "Render the current user profile buffer."
@@ -186,7 +190,9 @@
           "状态" (qq-user--status-label (alist-get 'status qq-user--profile)))
          (qq-user--insert-field "性别" (qq-user--sex-label
                                         (alist-get 'sex qq-user--profile)))
-         (qq-user--insert-field "年龄" (alist-get 'age qq-user--profile))
+         (let ((age (alist-get 'age qq-user--profile)))
+           (when (and (integerp age) (> age 0))
+             (qq-user--insert-field "年龄" age)))
          (qq-user--insert-field
           "生日" (qq-user--birthday-label (alist-get 'birthday qq-user--profile)))
          (qq-user--insert-field
@@ -197,9 +203,6 @@
           "等级" (qq-user--level-label (alist-get 'qq_level qq-user--profile)))
          (qq-user--insert-field
           "会员" (qq-user--vip-label (alist-get 'vip qq-user--profile)))
-         (qq-user--insert-field
-          "注册" (qq-user--registered-label
-                  (alist-get 'registered_at qq-user--profile)))
          (when-let* ((labels (alist-get 'labels qq-user--profile))
                      ((listp labels))
                      ((not (null labels))))

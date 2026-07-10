@@ -20,7 +20,6 @@
     (location . ((country . "中国") (province . "上海") (city)))
     (occupation . "Engineer")
     (college . "Example University")
-    (registered_at . 123456)
     (labels . ("Emacs" "QQ"))
     (status . ((code . 10) (extended_code . 0) (description . "在线")))
     (relationship . ((kind . "friend")
@@ -63,6 +62,32 @@
       (should (string-match-p "hello from Emacs" text))
       (should-not (string-match-p "\\[Open\\]" text))
       (should-not (button-at (point-min))))))
+
+(ert-deftest qq-user-render-omits-private-placeholder-values ()
+  (with-temp-buffer
+    (qq-user-mode)
+    (setq qq-user--user-id "10001"
+          qq-user--profile
+          '((user_id . "10001")
+            (nickname . "Alice")
+            (sex . "unknown")
+            (age)
+            (status . ((code . 99) (description)))
+            (relationship . ((kind . "friend")))
+            (qq_level)
+            (vip)
+            (registered_at . 123456)))
+    (cl-letf (((symbol-function 'qq-media-avatar-display-string)
+               (lambda (_user-id) "@")))
+      (qq-user-render))
+    (let ((text (buffer-string)))
+      (should (string-match-p "关系:[[:space:]]+好友" text))
+      (should-not (string-match-p "状态:" text))
+      (should-not (string-match-p "年龄:" text))
+      (should-not (string-match-p "性别:" text))
+      (should-not (string-match-p "等级:" text))
+      (should-not (string-match-p "会员:" text))
+      (should-not (string-match-p "注册:" text)))))
 
 (ert-deftest qq-user-refresh-handles-synchronous-response-ownership ()
   (with-temp-buffer
