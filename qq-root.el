@@ -30,6 +30,12 @@
 (defvar-local qq-root--rerender-timer nil
   "Idle timer used to debounce root rerenders.")
 
+(defvar-local qq-root--rendering nil
+  "Non-nil while a root render pass is inserting rows.")
+
+(defvar-local qq-root--rerender-pending nil
+  "Non-nil when an update requested another render during a render pass.")
+
 (defvar-local qq-root--fill-column nil
   "Last root width measured from a window that actually displayed it.")
 
@@ -397,29 +403,40 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
 (defun qq-root-render ()
   "Render the root buffer from local state."
   (interactive)
-  (setq-local qq-root--fill-column (qq-root--render-fill-column))
-  (disco-view-render-preserving-position
-   (lambda ()
-     (let ((inhibit-read-only t)
-           (sessions (qq-state-sessions)))
-       (erase-buffer)
-       (setq-local header-line-format '(:eval (qq-root--header-line)))
-       (qq-view-insert-note-line (qq-root--filters-line) :face 'font-lock-doc-face)
-       (qq-view-insert-note-line (qq-root--mode-divider-line) :face 'shadow)
-       (qq-view-insert-note-line
-        "g refresh  RET open  i user  a avatar  TAB/n/p move  u next unread  s// search  ?: menu  q quit")
-       (insert "\n")
-       (if sessions
-           (dolist (session sessions)
-             (qq-root--insert-session-line session))
-         (qq-view-insert-note-line "No sessions available yet.")
-         (qq-view-insert-note-line "Press `g` to refresh after transport connects."))
-       (goto-char (point-min))
-       (forward-line 2)
-       (unless (qq-root--session-key-at-point)
-         (qq-root-button-forward))))
-   :anchor-property 'qq-root-session-key
-   :preserve-window-start t))
+  (if qq-root--rendering
+      (setq qq-root--rerender-pending t)
+    (let ((qq-root--rendering t))
+      (unwind-protect
+          (progn
+            (setq-local qq-root--fill-column (qq-root--render-fill-column))
+            (disco-view-render-preserving-position
+             (lambda ()
+               (let ((inhibit-read-only t)
+                     (sessions (qq-state-sessions)))
+                 (erase-buffer)
+                 (setq-local header-line-format '(:eval (qq-root--header-line)))
+                 (qq-view-insert-note-line
+                  (qq-root--filters-line) :face 'font-lock-doc-face)
+                 (qq-view-insert-note-line
+                  (qq-root--mode-divider-line) :face 'shadow)
+                 (qq-view-insert-note-line
+                  "g refresh  RET open  i user  a avatar  TAB/n/p move  u next unread  s// search  ?: menu  q quit")
+                 (insert "\n")
+                 (if sessions
+                     (dolist (session sessions)
+                       (qq-root--insert-session-line session))
+                   (qq-view-insert-note-line "No sessions available yet.")
+                   (qq-view-insert-note-line
+                    "Press `g` to refresh after transport connects."))
+                 (goto-char (point-min))
+                 (forward-line 2)
+                 (unless (qq-root--session-key-at-point)
+                   (qq-root-button-forward))))
+             :anchor-property 'qq-root-session-key
+             :preserve-window-start t))
+        (when qq-root--rerender-pending
+          (setq qq-root--rerender-pending nil)
+          (qq-root--rerender-open-root))))))
 
 (defvar qq-root-mode-map
   (let ((map (make-sparse-keymap)))
@@ -449,6 +466,8 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
   (setq truncate-lines t)
   (setq-local switch-to-buffer-preserve-window-point nil)
   (setq-local qq-root--fill-column nil)
+  (setq-local qq-root--rendering nil)
+  (setq-local qq-root--rerender-pending nil)
   (add-hook 'window-size-change-functions
             #'qq-root--on-window-size-change nil t)
   (add-hook 'display-line-numbers-mode-hook

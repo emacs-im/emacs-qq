@@ -81,6 +81,31 @@
         (should (= qq-root--fill-column 104))
         (should rendered)))))
 
+(ert-deftest qq-root-render-coalesces-reentrant-update ()
+  (with-temp-buffer
+    (qq-root-mode)
+    (let ((sessions '(((key . "group:1")
+                       (type . group)
+                       (title . "Group")
+                       (last-message-preview . "hello"))))
+          (insertions 0)
+          scheduled)
+      (cl-letf (((symbol-function 'qq-state-sessions) (lambda () sessions))
+                ((symbol-function 'qq-root--insert-session-line)
+                 (lambda (_session)
+                   (cl-incf insertions)
+                   (when (= insertions 1)
+                     (qq-root-render))
+                   (insert "row\n")))
+                ((symbol-function 'qq-root--rerender-open-root)
+                 (lambda (&rest _) (setq scheduled t))))
+        (qq-root-render)
+        (should (= insertions 1))
+        (should scheduled)
+        (should-not qq-root--rendering)
+        (should-not qq-root--rerender-pending)
+        (should (= 1 (how-many "^row$" (point-min) (point-max))))))))
+
 (provide 'qq-root-test)
 
 ;;; qq-root-test.el ends here
