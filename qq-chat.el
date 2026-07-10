@@ -24,6 +24,24 @@
 (require 'qq-ui)
 (require 'qq-view)
 
+;; `qq-forward' requires this module to reuse the message-body renderer, so
+;; keep the reverse dependency lazy and avoid a load cycle.
+(autoload 'qq-forward-segment-p "qq-forward")
+(autoload 'qq-forward-insert-segment "qq-forward")
+(autoload 'qq-forward-event-segment-to-internal "qq-forward")
+
+(declare-function qq-forward-segment-p "qq-forward" (segment))
+(declare-function qq-forward-insert-segment
+                  "qq-forward" (segment prefix-state properties))
+(declare-function qq-forward-event-segment-to-internal
+                  "qq-forward" (segment session-key))
+(declare-function qq-api-forward-message
+                  "qq-api" (message-id source-session-key target-session-key
+                                        callback &optional errback))
+(declare-function qq-api-send-forward-bundle
+                  "qq-api" (source-session-key target-session-key message-ids
+                                                callback &optional errback))
+
 (defvar-local qq-chat--session-key nil
   "Session key associated with the current chat buffer.")
 
@@ -150,12 +168,21 @@ loaded in the chatbuf.")
 (defvar-local qq-chat--messages-pop-ring nil
   "Ring of message anchors for jump-back (telega `telega-chatbuf--messages-pop-ring').")
 
+(defvar-local qq-chat--marked-message-anchors nil
+  "Message anchors selected for one merged-forward operation.")
+
+(defvar-local qq-chat--forward-request-active-p nil
+  "Non-nil while one merged-forward request from this chat is in flight.")
+
 (defvar qq-chat-timeline-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "q") #'quit-window)
     ;; Message actions at point (telega-style single keys; never steal input).
     (define-key map (kbd "r") #'qq-chat-reply-to-message)
     (define-key map (kbd "d") #'qq-chat-delete-message)
+    (define-key map (kbd "f") #'qq-chat-forward-message)
+    (define-key map (kbd "M") #'qq-chat-toggle-forward-mark)
+    (define-key map (kbd "F") #'qq-chat-forward-marked-messages)
     (define-key map (kbd "o") #'qq-chat-open-resource-at-point)
     (define-key map (kbd "a") #'qq-chat-open-avatar-at-point)
     (define-key map (kbd "g") #'qq-chat-goto-reply)
@@ -165,8 +192,9 @@ loaded in the chatbuf.")
     map)
   "Timeline-only keymap active when point is outside the draft region.
 
-Single-key message actions (`r' reply, `d' recall, `o' open media, `a' avatar,
-`g' goto replied-to, `x' pop jump) and menus (`m'/`?') apply on the timeline.
+Single-key message actions (`r' reply, `d' recall, `f' forward, `M' mark,
+`F' forward marked, `o' open media, `a' avatar, `g' goto replied-to,
+`x' pop jump) and menus (`m'/`?') apply on the timeline.
 They are inactive in the composer so typing is never stolen.")
 
 (define-minor-mode qq-chat-timeline-mode
@@ -199,18 +227,28 @@ They are inactive in the composer so typing is never stolen.")
   "Return dynamic header line for the active chat buffer.
 
 Telega-like: title first, connection only when not connected, unread as a
-compact badge.  Debug fields (target id) stay out of the default chrome."
+compact badge.  Peer input-status (\"正在输入\") is shown when live.  Debug
+fields (target id) stay out of the default chrome."
   (let* ((session (qq-chat--session))
          (title (or (alist-get 'title session) qq-chat--session-key))
          (status (qq-state-connection-status))
          (unread (or (alist-get 'unread-count session) 0))
+         (input-text (and qq-chat--session-key
+                          (qq-state-input-status-text qq-chat--session-key)))
          (status-part (if (eq status 'connected)
                           ""
                         (format "  [%s]" status)))
+         (input-part (if (and (stringp input-text) (not (string-empty-p input-text)))
+                         (format "  · %s" input-text)
+                       ""))
          (unread-part (if (> unread 0)
                           (format "  · %d unread" unread)
+                        ""))
+         (marked-count (length (qq-chat-marked-messages)))
+         (marked-part (if (> marked-count 0)
+                          (format "  · %d marked" marked-count)
                         "")))
-    (format " %s%s%s" title status-part unread-part)))
+    (format " %s%s%s%s%s" title status-part input-part unread-part marked-part)))
 
 (defun qq-chat--insert-read-only (text &optional face properties)
   "Insert read-only TEXT with optional FACE and PROPERTIES."
@@ -358,13 +396,28 @@ available."
         (and left-name right-name
              (equal left-name right-name))))))
 
+(defun qq-chat--canonical-forward-segment (segment)
+  "Translate SEGMENT at the root-event boundary, or return nil."
+  (let ((type (and (listp segment) (alist-get 'type segment)))
+        (data (and (listp segment) (alist-get 'data segment))))
+    (and (or (equal type "forward")
+             (and (equal type "card")
+                  (equal (alist-get 'kind data) "forward")))
+         (qq-forward-event-segment-to-internal
+          segment qq-chat--session-key))))
+
+(defun qq-chat--forward-segment-p (segment)
+  "Return non-nil when SEGMENT translates to a forward record."
+  (and (qq-chat--canonical-forward-segment segment) t))
+
 (defun qq-chat--message-has-block-segments-p (message)
   "Return non-nil when MESSAGE contains block-like render segments."
   (let ((segments (alist-get 'segments message))
         found)
     (while (and segments (not found))
       (let ((segment (car segments)))
-        (when (or (qq-chat--mail-segment-p segment)
+        (when (or (qq-chat--forward-segment-p segment)
+                  (qq-chat--mail-segment-p segment)
                   (qq-chat--card-segment-p segment)
                   (qq-chat--media-segment-p segment))
           (setq found t))
@@ -435,6 +488,7 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
         'qq-chat-message-id (alist-get 'server-id message)
         'qq-chat-message-local-id (alist-get 'local-id message)
         'qq-chat-session-key qq-chat--session-key
+        'qq-chat-forward-marked (and (qq-chat--message-marked-p message) t)
         'read-only t
         'front-sticky '(read-only)
         'rear-nonsticky '(read-only)
@@ -449,6 +503,179 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
      (lambda (message)
        (equal (qq-chat--message-anchor message) anchor))
      messages)))
+
+(defun qq-chat--message-forwardable-p (message)
+  "Return non-nil when MESSAGE can be forwarded by its server ID."
+  (and (listp message)
+       (qq-api-message-id-p (alist-get 'server-id message))
+       (not (qq-state-message-recalled-p message))))
+
+(defun qq-chat--message-marked-p (message)
+  "Return non-nil when MESSAGE is selected for merged forwarding."
+  (member (qq-chat--message-anchor message) qq-chat--marked-message-anchors))
+
+(defun qq-chat-marked-messages ()
+  "Return selected messages in current timeline order."
+  (seq-filter
+   (lambda (message)
+     (and (qq-chat--message-forwardable-p message)
+          (qq-chat--message-marked-p message)))
+   (qq-state-session-messages qq-chat--session-key)))
+
+(defun qq-chat--forwardable-target-sessions ()
+  "Return all private/group targets known from sessions and contact caches."
+  (let ((by-key (make-hash-table :test #'equal))
+        targets)
+    (dolist (session (qq-state-sessions))
+      (when (member (format "%s"
+                            (or (alist-get 'type session)
+                                (qq-state-session-key-type
+                                 (alist-get 'key session))))
+                    '("private" "group"))
+        (puthash (alist-get 'key session) session by-key)))
+    (dolist (friend (qq-state-friends))
+      (when-let* ((id (alist-get 'user_id friend))
+                  (key (qq-state-session-key 'private id)))
+        (unless (gethash key by-key)
+          (puthash
+           key
+           `((key . ,key)
+             (type . private)
+             (target-id . ,(format "%s" id))
+             (peer-uin . ,(format "%s" id))
+             (title . ,(or (qq-chat--present-string
+                            (alist-get 'remark friend))
+                           (qq-chat--present-string
+                            (alist-get 'nickname friend))
+                           (format "%s" id))))
+           by-key))))
+    (dolist (group (qq-state-groups))
+      (when-let* ((id (alist-get 'group_id group))
+                  (key (qq-state-session-key 'group id)))
+        (unless (gethash key by-key)
+          (puthash
+           key
+           `((key . ,key)
+             (type . group)
+             (target-id . ,(format "%s" id))
+             (title . ,(or (qq-chat--present-string
+                            (alist-get 'group_name group))
+                           (format "%s" id))))
+           by-key))))
+    (maphash (lambda (_key target) (push target targets)) by-key)
+    (sort targets
+          (lambda (left right)
+            (string-lessp (or (alist-get 'title left) "")
+                          (or (alist-get 'title right) ""))))))
+
+(defun qq-chat--read-forward-target ()
+  "Read and return one private/group target session key."
+  (let* ((sessions (qq-chat--forwardable-target-sessions))
+         (choices
+          (mapcar
+           (lambda (session)
+             (let ((key (alist-get 'key session)))
+               (cons (format "%s  [%s]"
+                             (or (alist-get 'title session) key)
+                             key)
+                     key)))
+           sessions)))
+    (unless choices
+      (user-error "qq: no private/group forwarding target available"))
+    (cdr (assoc (completing-read "Forward to: " choices nil t) choices))))
+
+(defun qq-chat-toggle-forward-mark ()
+  "Toggle merged-forward selection for the message at point."
+  (interactive)
+  (let* ((message (or (qq-chat--message-at-point)
+                      (user-error "qq: no message at point")))
+         (anchor (qq-chat--message-anchor message)))
+    (unless (qq-chat--message-forwardable-p message)
+      (user-error "qq: this message cannot be forwarded"))
+    (if (member anchor qq-chat--marked-message-anchors)
+        (setq qq-chat--marked-message-anchors
+              (delete anchor qq-chat--marked-message-anchors))
+      (setq qq-chat--marked-message-anchors
+            (append qq-chat--marked-message-anchors (list anchor))))
+    (qq-chat--redisplay-message-anchors-preserving-point (list anchor))
+    (qq-chat--header-line-update)
+    (message "qq: %d message%s marked for forwarding"
+             (length qq-chat--marked-message-anchors)
+             (if (= (length qq-chat--marked-message-anchors) 1) "" "s"))))
+
+(defun qq-chat-clear-forward-marks (&optional quiet)
+  "Clear merged-forward message selection.
+
+Suppress the status message when QUIET is non-nil."
+  (interactive)
+  (let ((anchors (copy-sequence qq-chat--marked-message-anchors)))
+    (setq qq-chat--marked-message-anchors nil)
+    (when anchors
+      (qq-chat--redisplay-message-anchors-preserving-point anchors))
+    (qq-chat--header-line-update)
+    (unless quiet
+      (message "qq: forwarding selection cleared"))))
+
+(defun qq-chat-forward-message (&optional target-session-key)
+  "Forward the message at point to TARGET-SESSION-KEY.
+
+Interactively, prompt for a cached private or group session.  This uses the
+fork-native single-forward request and deliberately creates no optimistic row,
+because its result is only `{kind:single}'."
+  (interactive)
+  (let* ((message (or (qq-chat--message-at-point)
+                      (user-error "qq: no message at point")))
+         (message-id (alist-get 'server-id message)))
+    (unless (qq-chat--message-forwardable-p message)
+      (user-error "qq: this message cannot be forwarded"))
+    (let ((target (or target-session-key (qq-chat--read-forward-target))))
+      (qq-api-forward-message
+       message-id
+       qq-chat--session-key
+       target
+       (lambda (_response)
+         (message "qq: forwarded message to %s" target))))))
+
+(defun qq-chat-forward-marked-messages (&optional target-session-key)
+  "Send marked messages as one merged forward to TARGET-SESSION-KEY."
+  (interactive)
+  (when qq-chat--forward-request-active-p
+    (user-error "qq: a merged-forward request is already in progress"))
+  (let ((messages (qq-chat-marked-messages)))
+    (unless messages
+      (user-error "qq: no messages marked for forwarding"))
+    (let* ((target (or target-session-key (qq-chat--read-forward-target)))
+           (buffer (current-buffer))
+           (sent-anchors (mapcar #'qq-chat--message-anchor messages)))
+      (setq qq-chat--forward-request-active-p t)
+      (condition-case error-data
+          (qq-api-send-forward-bundle
+           qq-chat--session-key
+           target
+           (mapcar (lambda (message) (alist-get 'server-id message)) messages)
+           (lambda (_response)
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (setq qq-chat--forward-request-active-p nil
+                       qq-chat--marked-message-anchors
+                       (seq-remove
+                        (lambda (anchor) (member anchor sent-anchors))
+                        qq-chat--marked-message-anchors))
+                 (qq-chat--redisplay-message-anchors-preserving-point
+                  sent-anchors)
+                 (qq-chat--header-line-update)))
+             (message "qq: forwarded %d messages to %s"
+                      (length messages) target))
+           (lambda (response reason)
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (setq qq-chat--forward-request-active-p nil)
+                 (qq-chat--header-line-update)))
+             (qq-api--default-error response reason)))
+        (error
+         (setq qq-chat--forward-request-active-p nil)
+         (qq-chat--header-line-update)
+         (signal (car error-data) (cdr error-data)))))))
 
 (defun qq-chat--message-positions ()
   "Return list of message start positions in the current buffer."
@@ -2226,6 +2453,8 @@ base emoji), never as OneBot CQ text."
       ("at" (concat "@" (or (alist-get 'name data)
                             (alist-get 'qq data)
                             "mention")))
+      ("__unsupported"
+       (qq-state-message-preview-from-segments (list segment)))
       ("face"
        (qq-media-face-display-string
         (or (qq-chat--face-segment-id segment) "?")))
@@ -2299,31 +2528,45 @@ base emoji), never as OneBot CQ text."
          (url (qq-chat--present-string (alist-get 'url data)))
          (body (or content
                    (and (not title) prompt)))
+         (open-action (and url (lambda () (browse-url url t))))
+         (map (when open-action
+                (let ((map (make-sparse-keymap)))
+                  (set-keymap-parent map button-map)
+                  (define-key map (kbd "RET")
+                    (lambda () (interactive) (funcall open-action)))
+                  (define-key map [mouse-1]
+                    (lambda () (interactive) (funcall open-action)))
+                  map)))
+         (card-properties
+          (append
+           properties
+           (when open-action
+             (list 'mouse-face 'highlight
+                   'help-echo (format "Open this %s" (downcase label))
+                   'follow-link t
+                   'keymap map
+                   'button t
+                   'category 'default-button
+                   'action (lambda (_button) (funcall open-action))))))
          (qq-ui-card-indent-prefix-state prefix-state)
-         (card-prefix-state (qq-ui-card-prefix-state)))
+         (card-prefix-state (qq-ui-card-prefix-state))
+         (start (point)))
     (qq-ui-insert-prefixed-lines
      card-prefix-state
      (if source (format "%s · %s" label source) label)
      :face 'bold
-     :properties properties)
+     :properties card-properties)
     (when title
       (qq-ui-insert-prefixed-lines
-       card-prefix-state title :properties properties))
+       card-prefix-state title :properties card-properties))
     (when body
       (qq-ui-insert-prefixed-lines
-       card-prefix-state body :face 'shadow :properties properties))
+       card-prefix-state body :face 'shadow :properties card-properties))
     (when (and summary (not (equal summary body)))
       (qq-ui-insert-prefixed-lines
-       card-prefix-state summary :face 'shadow :properties properties))
-    (when url
-      (let ((start (point)))
-        (qq-ui-insert-action-button
-         "[Open]"
-         (lambda () (browse-url url t))
-         :help-echo (format "Open this %s" (downcase label)))
-        (insert "\n")
-        (qq-ui-apply-line-prefix start (point) card-prefix-state)
-        (add-text-properties start (point) properties)))))
+       card-prefix-state summary :face 'shadow :properties card-properties))
+    (when open-action
+      (add-text-properties start (point) card-properties))))
 
 (defun qq-chat--media-segment-p (segment)
   "Return non-nil when SEGMENT should render as a media block."
@@ -2392,24 +2635,27 @@ Keep this short — size is useful; internal sub_type / emoji ids are not."
     ("mface" 'sticker)
     (_ (qq-media-segment-kind segment))))
 
-(defun qq-chat--segment-media-card-context (segment)
-  "Adapt OneBot media SEGMENT to the shared card action protocol."
-  (let* ((state (qq-media-segment-download-state segment))
-         (status (plist-get state :status))
-         (url (alist-get 'url (alist-get 'data segment))))
+(defun qq-chat--segment-media-card-context (segment &optional capabilities)
+  "Adapt OneBot media SEGMENT to the shared card action protocol.
+
+CAPABILITIES defaults to the centralized `qq-media' action/status model."
+  (let* ((capabilities (or capabilities
+                           (qq-media-segment-capabilities segment)))
+         (url (plist-get capabilities :remote-url)))
     (disco-media-card-context-create
      :payload segment
      :kind (qq-chat--segment-media-card-kind segment)
      :title (qq-chat--segment-media-summary segment)
-     :open-action (when (qq-media-segment-openable-p segment)
+     :open-action (when (plist-get capabilities :open)
                     (lambda ()
                       (qq-media-segment-open segment)))
-     :download-action (unless (memq status '(downloading downloaded))
+     :download-action (when (plist-get capabilities :download)
                         (lambda ()
                           (qq-media-segment-start-download segment)))
-     :save-as-action (lambda ()
-                       (qq-media-segment-save-as segment))
-     :copy-url-action (when (qq-media-url-present-p url)
+     :save-as-action (when (plist-get capabilities :save)
+                       (lambda ()
+                         (qq-media-segment-save-as segment)))
+     :copy-url-action (when (plist-get capabilities :copy-url)
                         (lambda ()
                           (kill-new url)
                           (message "qq: copied media URL"))))))
@@ -2424,15 +2670,16 @@ Keep this short — size is useful; internal sub_type / emoji ids are not."
   "Insert one rich media card for SEGMENT using PREFIX-STATE and PROPERTIES."
   (let* ((kind-label (qq-chat--segment-media-kind-label segment))
          (meta (qq-chat--segment-media-meta-line segment))
-         (context (qq-chat--segment-media-card-context segment))
-         (state (qq-media-segment-download-state segment))
+         (capabilities (qq-media-segment-capabilities segment))
+         (context (qq-chat--segment-media-card-context
+                   segment capabilities))
          (prefix-state (let ((qq-ui-card-indent-prefix-state prefix-state))
                          (qq-ui-card-prefix-state))))
     (disco-ins-insert-media-card
      :kind (qq-chat--segment-media-card-kind segment)
      :title (qq-chat--segment-media-summary segment)
      :details (unless (string-empty-p meta) (list meta))
-     :status (disco-ins-media-transfer-status-text state)
+     :status (plist-get capabilities :status)
      :prefix prefix-state
      :title-face 'bold
      :meta-face 'shadow
@@ -2492,6 +2739,11 @@ Keep this short — size is useful; internal sub_type / emoji ids are not."
           (let ((type (alist-get 'type segment)))
             (unless (equal type "reply")
               (cond
+               ((qq-chat--forward-segment-p segment)
+                (flush-inline)
+                (qq-forward-insert-segment
+                 (qq-chat--canonical-forward-segment segment)
+                 prefix-state properties))
                ((qq-chat--mail-segment-p segment)
                 (flush-inline)
                 (qq-chat--insert-mail-segment segment prefix-state properties))
@@ -2552,6 +2804,12 @@ on the first inline line when the body is pure inline content."
           (let ((type (alist-get 'type segment)))
             (unless (equal type "reply")
               (cond
+               ((qq-chat--forward-segment-p segment)
+                (flush-inline nil)
+                (setq saw-block t)
+                (qq-forward-insert-segment
+                 (qq-chat--canonical-forward-segment segment)
+                 prefix-state properties))
                ((qq-chat--mail-segment-p segment)
                 (flush-inline nil)
                 (setq saw-block t)
@@ -2639,12 +2897,19 @@ Visual model (telega-inspired; later appkit):
          (properties (qq-chat--message-line-properties message anchor))
          (status-suffix (qq-chat--status-suffix message))
          (compact (plist-get context :compact))
+         (marked (qq-chat--message-marked-p message))
          (body-prefix-state (qq-ui-make-prefix-state body-prefix body-prefix))
          (short-time (qq-chat--format-time-short (alist-get 'time message))))
     (when (and (stringp insert-date) (not (string-empty-p insert-date)))
       (qq-chat--insert-date-separator-row (qq-chat--message-day-label insert-date)))
     (when insert-unread
       (qq-chat--insert-unread-divider-row))
+    (when marked
+      (qq-ui-insert-prefixed-lines
+       body-prefix-state
+       "✓ selected for merged forwarding"
+       :face 'warning
+       :properties properties))
     (if (qq-state-message-recalled-p message)
         ;; Stub path for `qq-chat-show-recalled-messages' (telega deleted style).
         (let ((header-start (point)))
@@ -3069,6 +3334,9 @@ Updates header-line and redisplays only nodes whose render context changed
     (define-key map (kbd "C-c C-p") #'qq-chat-search-prev)
     (define-key map (kbd "C-c r") #'qq-chat-read-all)
     (define-key map (kbd "C-c m") #'qq-chat-message-transient)
+    (define-key map (kbd "C-c f") #'qq-chat-forward-message)
+    (define-key map (kbd "C-c M") #'qq-chat-toggle-forward-mark)
+    (define-key map (kbd "C-c F") #'qq-chat-forward-marked-messages)
     (define-key map (kbd "M-<") #'qq-chat-load-older-messages)
     (define-key map (kbd "M->") #'qq-chat-return-to-latest)
     (define-key map (kbd "RET") #'qq-chat-return-dwim)
@@ -3106,6 +3374,8 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (disco-chatbuf-aux-reset)
   (disco-chatbuf-input-options-reset)
   (setq-local qq-chat--last-search-query nil)
+  (setq-local qq-chat--marked-message-anchors nil)
+  (setq-local qq-chat--forward-request-active-p nil)
   (setq-local qq-chat--rendering nil)
   (setq-local qq-chat--ewoc nil)
   (setq-local qq-chat--empty-node nil)
@@ -3242,7 +3512,7 @@ Prefer `qq-state' `:mutation' metadata when present:
         (event-type (plist-get event :type))
         (event-message (plist-get event :message))
         (event-mutation (plist-get event :mutation)))
-    (when (memq event-type '(message history reset session
+    (when (memq event-type '(message history reset session input-status
                              sessions-refreshed friends-refreshed groups-refreshed))
       (dolist (buffer (buffer-list))
         (with-current-buffer buffer
@@ -3275,6 +3545,9 @@ Prefer `qq-state' `:mutation' metadata when present:
                 (if (eq event-mutation 'read)
                     (qq-chat--apply-read-state-change-partially)
                   (qq-chat--chat-update 'header-line 'header))))
+             ((eq event-type 'input-status)
+              (when (equal event-session-key qq-chat--session-key)
+                (qq-chat--header-line-update)))
              ((eq event-type 'sessions-refreshed)
               (qq-chat--chat-update 'header-line 'header))
              ((memq event-type '(friends-refreshed groups-refreshed))

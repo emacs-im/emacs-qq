@@ -49,6 +49,10 @@
              (should (eq (key-binding (kbd "q") t) 'quit-window))
              (should (eq (key-binding (kbd "r") t) 'qq-chat-reply-to-message))
              (should (eq (key-binding (kbd "d") t) 'qq-chat-delete-message))
+             (should (eq (key-binding (kbd "f") t) 'qq-chat-forward-message))
+             (should (eq (key-binding (kbd "M") t) 'qq-chat-toggle-forward-mark))
+             (should (eq (key-binding (kbd "F") t)
+                         'qq-chat-forward-marked-messages))
              (should (eq (key-binding (kbd "m") t) 'qq-chat-message-transient))
              (should (eq (key-binding (kbd "?") t) 'qq-chat-transient))
              (should (eq (key-binding (kbd "C-c /") t) 'qq-chat-search))
@@ -1582,9 +1586,10 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
           (should (string-match-p "和豆包的对话" (buffer-string)))
           (should (string-match-p "点击查看对话内容" (buffer-string)))
           (should-not (string-match-p "com.tencent.tuwen.lua" (buffer-string)))
+          (should-not (string-match-p "\\[Open\\]" (buffer-string)))
           (goto-char (point-min))
-          (search-forward "Open")
-          (button-activate (button-at (1- (point))))
+          (should (button-at (point)))
+          (push-button (point))
           (should (equal opened-url "https://example.com/thread")))))))
 
 (ert-deftest qq-chat-timeline-inserts-explicit-newer-history-gap ()
@@ -1654,6 +1659,170 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
         (qq-chat--load-initial-history (current-buffer) "group:20001")
         (should (equal around-call '("group:20001" "m-first" 40)))
         (should (equal (nth 2 completed) "m-first"))))))
+
+(ert-deftest qq-chat-forward-segment-uses-dedicated-block-renderer ()
+  (let* ((segment '((type . "forward")
+                    (data
+                     . ((content
+                         . ((kind . "remote")
+                            (reference
+                             . ((kind . "message")
+                                (message_id . "9007199254743009336")
+                                (chat . ((kind . "group")
+                                         (group_id . "20001")))))))))))
+         (message `((server-id . "9007199254743009336")
+                    (segments . (,segment))))
+         called)
+    (with-temp-buffer
+      (let ((inhibit-read-only t))
+        (cl-letf (((symbol-function 'qq-forward-insert-segment)
+                   (lambda (candidate _prefix _properties)
+                     (setq called candidate)
+                     (insert "FORWARD-CARD\n"))))
+          (should (qq-chat--message-has-block-segments-p message))
+          (qq-chat--insert-message-body message nil nil)
+          (should (equal called segment))
+          (should (equal (buffer-string) "FORWARD-CARD\n")))))))
+
+(ert-deftest qq-chat-single-forward-keeps-snowflake-string ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Source") (target-id . "20001") (type . group))
+    nil)
+   (puthash
+    "group:20001"
+    '(((server-id . "9007199254743009336")
+       (sender-id . "10001")
+       (sender-name . "Alice")
+       (time . 100)
+       (raw-message . "hello")))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat-render)
+     (goto-char (point-min))
+     (search-forward "hello")
+     (let (call)
+       (cl-letf (((symbol-function 'qq-api-forward-message)
+                  (lambda (message-id source target callback
+                                      &optional _errback)
+                    (setq call (list message-id source target))
+                    (funcall callback nil))))
+         (qq-chat-forward-message "private:10002")
+         (should (equal call
+                        '("9007199254743009336"
+                          "group:20001" "private:10002"))))))))
+
+(ert-deftest qq-chat-forward-targets-include-non-session-friends-and-groups ()
+  (qq-chat-test-with-reset
+   (qq-state-apply-friends
+    '(((user_id . "10001") (nickname . "Alice") (remark . "A"))))
+   (qq-state-apply-groups
+    '(((group_id . "20001") (group_name . "Group A"))))
+   (let ((targets (qq-chat--forwardable-target-sessions)))
+     (should (assoc "private:10001"
+                    (mapcar (lambda (target)
+                              (cons (alist-get 'key target) target))
+                            targets)))
+     (should (assoc "group:20001"
+                    (mapcar (lambda (target)
+                              (cons (alist-get 'key target) target))
+                            targets))))))
+
+(ert-deftest qq-chat-marked-forward-preserves-timeline-order-and-clears ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Source") (target-id . "20001") (type . group))
+    nil)
+   (puthash
+    "group:20001"
+    '(((server-id . "9007199254743009336")
+       (sender-id . "10001") (sender-name . "Alice")
+       (time . 100) (raw-message . "first"))
+      ((server-id . "9007199254743009444")
+       (sender-id . "10002") (sender-name . "Bob")
+       (time . 101) (raw-message . "second")))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat-render)
+     ;; Mark newest first to prove send order follows the timeline, not clicks.
+     (goto-char (point-min))
+     (search-forward "second")
+     (qq-chat-toggle-forward-mark)
+     (goto-char (point-min))
+     (search-forward "first")
+     (qq-chat-toggle-forward-mark)
+     (should (= 2 (length (qq-chat-marked-messages))))
+     (let (source target captured-ids)
+       (cl-letf (((symbol-function 'qq-api-send-forward-bundle)
+                  (lambda (source-session-key target-session-key ids callback
+                                              &optional _errback)
+                    (setq source source-session-key
+                          target target-session-key
+                          captured-ids ids)
+                    (funcall callback nil))))
+         (qq-chat-forward-marked-messages "group:30001")
+         (should (equal source "group:20001"))
+         (should (equal target "group:30001"))
+         (should
+          (equal captured-ids
+                 '("9007199254743009336" "9007199254743009444")))
+         (should (seq-every-p #'stringp captured-ids))
+         (should-not qq-chat--marked-message-anchors))))))
+
+(ert-deftest qq-chat-forward-callback-preserves-marks-added-in-flight ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Source") (target-id . "20001") (type . group))
+    nil)
+   (puthash
+    "group:20001"
+    '(((server-id . "9007199254743009336")
+       (sender-id . "10001") (sender-name . "Alice")
+       (time . 100) (raw-message . "first"))
+      ((server-id . "9007199254743009444")
+       (sender-id . "10002") (sender-name . "Bob")
+       (time . 101) (raw-message . "second"))
+      ((server-id . "9007199254743009555")
+       (sender-id . "10003") (sender-name . "Carol")
+       (time . 102) (raw-message . "third")))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat-render)
+     (goto-char (point-min))
+     (search-forward "first")
+     (qq-chat-toggle-forward-mark)
+     (goto-char (point-min))
+     (search-forward "second")
+     (qq-chat-toggle-forward-mark)
+     (let (success-callback)
+       (cl-letf (((symbol-function 'qq-api-send-forward-bundle)
+                  (lambda (_source _target _ids callback &optional _errback)
+                    (setq success-callback callback))))
+         (qq-chat-forward-marked-messages "group:30001")
+         (should qq-chat--forward-request-active-p)
+         (should-error
+          (qq-chat-forward-marked-messages "group:30001")
+          :type 'user-error)
+         (goto-char (point-min))
+         (search-forward "third")
+         (qq-chat-toggle-forward-mark)
+         (funcall success-callback nil)
+         (should-not qq-chat--forward-request-active-p)
+         (should (equal qq-chat--marked-message-anchors
+                        '("9007199254743009555")))
+         (should (equal
+                  (mapcar #'qq-chat--message-anchor
+                          (qq-chat-marked-messages))
+                  '("9007199254743009555"))))))))
 
 (provide (quote qq-chat-test))
 

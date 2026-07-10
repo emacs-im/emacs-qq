@@ -618,18 +618,6 @@
        '((url . "https://example.com/movie.mp4")) 'video)
        :type 'user-error))))
 
-(ert-deftest qq-media-segment-kind-recognizes-media-file-urls ()
-  "File segments infer image/video behavior even when URLs have queries."
-  (should
-   (eq (qq-media-segment-kind
-        '((type . "file")
-          (data . ((file . "https://example.com/picture.gif?token=1")))))
-       'image))
-  (let ((video '((type . "file")
-                 (data . ((name . "movie.MP4#fragment"))))))
-    (should (eq (qq-media-segment-kind video) 'video))
-    (should (qq-media-segment-playable-p video))))
-
 (ert-deftest qq-media-open-video-file-segment-delegates-to-player ()
   "An mp4 delivered as a file segment still takes the video-player path."
   (let* ((segment '((type . "file")
@@ -647,6 +635,126 @@
                  (setq played-source source))))
       (qq-media-segment-open segment)
       (should (equal played-source "https://example.com/movie.mp4")))))
+
+;; Strict video remote-status model overrides for the pre-wire-model fixtures.
+
+(ert-deftest qq-media-expired-video-does-not-resolve-a-remote-resource ()
+  (qq-media-test-with-reset
+   (let ((segment '((type . "video")
+                    (data . ((file . "expired-video-token")
+                             (remote_status . "expired")))))
+         api-called resolved failure)
+     (cl-letf (((symbol-function 'qq-api-call)
+                (lambda (&rest _) (setq api-called t))))
+       (let ((caps (qq-media-segment-capabilities segment)))
+         (should (equal (plist-get caps :status) "Expired"))
+         (should-not (plist-get caps :open))
+         (should-not (plist-get caps :download))
+         (should-not (plist-get caps :save))
+         (should-not (plist-get caps :copy-url)))
+       (qq-media-resolve-segment-resource
+        segment
+        (lambda (resource) (setq resolved resource))
+        (lambda (_response reason) (setq failure reason)))
+       (should-not api-called)
+       (should-not resolved)
+       (should (equal failure "video resource has expired"))))))
+
+(ert-deftest qq-media-expired-video-keeps-an-existing-local-copy-usable ()
+  (qq-media-test-with-reset
+   (let* ((file (make-temp-file "qq-expired-video" nil ".mp4"))
+          (segment `((type . "video")
+                     (data . ((path . ,file)
+                              (remote_status . "expired")))))
+          resolved)
+     (unwind-protect
+         (let ((caps (qq-media-segment-capabilities segment)))
+           (should (plist-get caps :open))
+           (should (plist-get caps :save))
+           (should-not (plist-get caps :download))
+           (should-not (plist-get caps :copy-url))
+           (should (equal (plist-get caps :status) "Expired"))
+           (qq-media-resolve-segment-resource
+            segment (lambda (resource) (setq resolved resource)))
+           (should (equal (alist-get 'file resolved) file)))
+       (when (file-exists-p file) (delete-file file))))))
+
+(ert-deftest qq-media-nonstring-remote-status-is-invalid ()
+  (let ((caps
+         (qq-media-segment-capabilities
+          '((type . "video")
+            (data . ((file . "token") (remote_status . :false)))))))
+    (should (eq (plist-get caps :remote-status) 'invalid))
+    (should (equal (plist-get caps :status) "Invalid remote status"))
+    (should-not (plist-get caps :open))))
+
+(ert-deftest qq-media-video-remote-status-four-state-capabilities ()
+  (dolist (case
+           '(("unavailable" "Unavailable" "video resource is unavailable")
+             ("unresolved" "Unresolved" "video resource is unresolved")))
+    (pcase-let ((`(,wire ,status ,reason) case))
+      (let* ((segment `((type . "video")
+                        (data . ((file . "remote-token")
+                                 (remote_status . ,wire)))))
+             (caps (qq-media-segment-capabilities segment))
+             api-called failure)
+        (should (equal (plist-get caps :status) status))
+        (dolist (key '(:open :download :save :copy-url :resolve-remote))
+          (should-not (plist-get caps key)))
+        (cl-letf (((symbol-function 'qq-api-call)
+                   (lambda (&rest _) (setq api-called t))))
+          (qq-media-resolve-segment-resource
+           segment #'ignore
+           (lambda (_response text) (setq failure text))))
+        (should-not api-called)
+        (should (equal failure reason))))))
+
+(ert-deftest qq-media-available-video-uses-only-wire-url ()
+  (qq-media-test-with-reset
+   (let* ((url "https://example.com/movie.mp4")
+          (segment `((type . "video")
+                     (data . ((file . "must-not-go-to-get-file")
+                              (url . ,url)
+                              (remote_status . "available")))))
+          api-called resolved)
+     (let ((caps (qq-media-segment-capabilities segment)))
+       (dolist (key '(:open :download :save :copy-url :resolve-remote))
+         (should (plist-get caps key)))
+       (should (equal (plist-get caps :remote-url) url)))
+     (cl-letf (((symbol-function 'qq-api-call)
+                (lambda (&rest _) (setq api-called t))))
+       (qq-media-resolve-segment-resource
+        segment (lambda (resource) (setq resolved resource))))
+     (should-not api-called)
+     (should (equal resolved `((url . ,url)))))))
+
+(ert-deftest qq-media-video-missing-status-or-available-without-url-is-invalid ()
+  (dolist (segment
+           '(((type . "video") (data . ((file . "token"))))
+             ((type . "video")
+              (data . ((file . "token") (remote_status . "bogus"))))
+             ((type . "video")
+              (data . ((file . "token") (remote_status . "available"))))))
+    (let ((caps (qq-media-segment-capabilities segment)))
+      (should-not (plist-get caps :resolve-remote))
+      (should-not (plist-get caps :open))
+      (if (equal (alist-get 'remote_status (alist-get 'data segment))
+                 "available")
+          (should (equal (plist-get caps :remote-error)
+                         "available video resource has no URL"))
+        (should (eq (plist-get caps :remote-status) 'invalid))))))
+
+(ert-deftest qq-media-segment-kind-recognizes-media-file-urls ()
+  (should
+   (eq (qq-media-segment-kind
+        '((type . "file")
+          (data . ((file . "https://example.com/picture.gif?token=1")))))
+       'image))
+  (let ((video '((type . "file")
+                 (data . ((name . "movie.MP4#fragment")
+                          (url . "https://example.com/movie.mp4"))))))
+    (should (eq (qq-media-segment-kind video) 'video))
+    (should (qq-media-segment-playable-p video))))
 
 (provide 'qq-media-test)
 

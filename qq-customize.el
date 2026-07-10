@@ -75,6 +75,14 @@ Nil means use `qq-history-fetch-count'.  NapCat `get_*_msg_history' with
   :type 'boolean
   :group 'qq)
 
+(defcustom qq-input-status-ttl 6
+  "Seconds to keep a friend's \"typing\" / input-status after the last push.
+
+NapCat's `notify/input_status' event has no guaranteed stop packet, so the
+client auto-clears the status unless a newer push refreshes it."
+  :type 'integer
+  :group 'qq)
+
 (defcustom qq-chat-show-recalled-messages nil
   "When non-nil, show recalled messages as stubs in the chat timeline.
 

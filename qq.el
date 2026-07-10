@@ -23,6 +23,7 @@
 (require 'qq-transport)
 (require 'qq-api)
 (require 'qq-chat)
+(require 'qq-forward)
 (require 'qq-root)
 (require 'qq-transient)
 

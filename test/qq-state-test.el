@@ -24,6 +24,33 @@
    (should (equal (qq-state-session-key 'service "u_mail")
                   "service:u_mail"))))
 
+(ert-deftest qq-state-apply-input-status-tracks-and-clears ()
+  (qq-test-with-reset
+   (let ((qq-input-status-ttl 30)
+         seen)
+     (cl-letf (((symbol-function 'run-at-time)
+                (lambda (&rest _)
+                  'fake-timer)))
+       (add-hook 'qq-state-change-hook
+                 (lambda (event) (push (plist-get event :type) seen)))
+       (qq-state-apply-input-status
+        '((notice_type . "notify")
+          (sub_type . "input_status")
+          (user_id . 10001)
+          (event_type . 1)
+          (status_text . "对方正在输入...")))
+       (should (equal (qq-state-input-status-text "private:10001")
+                      "对方正在输入..."))
+       (should (memq 'input-status seen))
+       ;; empty / event_type 0 clears
+       (qq-state-apply-input-status
+        '((notice_type . "notify")
+          (sub_type . "input_status")
+          (user_id . "10001")
+          (event_type . 0)
+          (status_text . "")))
+       (should (null (qq-state-input-status-text "private:10001")))))))
+
 (ert-deftest qq-state-apply-recent-contacts-creates-session-summary ()
   (qq-test-with-reset
    (qq-state-apply-recent-contacts
@@ -467,6 +494,17 @@
                           (data . ((file . "foo.png")
                                    (url . "https://example.com/x")))))))))
      (should (equal (qq-state-message-preview message) "[image]")))))
+
+(ert-deftest qq-state-unsupported-segment-preview-is-visible-but-does-not-dump-raw ()
+  (let ((preview
+         (qq-state-message-preview-from-segments
+          '(((type . "__unsupported")
+             (data . ((native_keys . ["mysteryElement"])
+                      (summary . "mystery  native\n element")
+                      (raw . ((secret . "DO-NOT-RENDER"))))))))))
+    (should (equal preview
+                   "[unsupported QQ element: mystery native element]"))
+    (should-not (string-match-p "DO-NOT-RENDER" preview))))
 
 (ert-deftest qq-state-message-preview-from-cq-strips-reply-and-face ()
   ;; Prefer human face name when qq-media face table is available.

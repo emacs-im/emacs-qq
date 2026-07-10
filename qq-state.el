@@ -42,6 +42,15 @@ and fall back to full render only for `history'/`reset' or failed patches.")
 (defvar qq-state--local-message-session-index (make-hash-table :test #'equal))
 (defvar qq-state--message-order-counter 0)
 (defvar qq-state--local-message-counter 0)
+(defvar qq-state--input-status (make-hash-table :test #'equal)
+  "Map session-key → active input-status alist.
+
+Each value is an alist with:
+- `text' — display string (e.g. \"对方正在输入...\")
+- `event-type' — raw NapCat/OB11 event_type number
+- `user-id' — peer UIN string
+- `expires-at' — float-time when status should auto-clear
+- `timer' — Emacs timer object that clears this entry"))
 
 (defun qq-state--emit (type &rest plist)
   "Emit state TYPE event with extra PLIST fields.
@@ -124,6 +133,11 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   "Return the next local message ordering number."
   (cl-incf qq-state--message-order-counter))
 
+(defun qq-state--cancel-input-status-timer (entry)
+  "Cancel any expire timer stored on input-status ENTRY."
+  (when-let* ((timer (and (listp entry) (alist-get 'timer entry))))
+    (cancel-timer timer)))
+
 (defun qq-state-reset ()
   "Reset all in-memory emacs-qq state."
   (setq qq-state--connection-status 'disconnected)
@@ -133,6 +147,10 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   (setq qq-state--requests nil)
   (setq qq-state--message-order-counter 0)
   (setq qq-state--local-message-counter 0)
+  (maphash (lambda (_key entry)
+             (qq-state--cancel-input-status-timer entry))
+           qq-state--input-status)
+  (clrhash qq-state--input-status)
   (clrhash qq-state--sessions)
   (clrhash qq-state--messages-by-session)
   (clrhash qq-state--friends-by-id)
@@ -407,6 +425,14 @@ reply chrome elsewhere).  Media becomes short placeholders like
                                 "mention")))
           ;; Reply chrome is rendered separately in chatbuf / composer.
           ("reply" "")
+          ("__unsupported"
+           (let* ((summary (alist-get 'summary data))
+                  (summary (if (stringp summary)
+                               (replace-regexp-in-string
+                                "[\n\r\t ]+" " " summary)
+                             "unknown element")))
+             (format "[unsupported QQ element: %s]"
+                     (truncate-string-to-width summary 80 nil nil t))))
           ("face"
            (let* ((text (or (alist-get 'faceText data)
                             (alist-get 'face_text data)))
@@ -1241,9 +1267,23 @@ Keeps the row so the chat view can hide it (default) or show a stub when
   "Return cached friend object for USER-ID."
   (copy-tree (gethash (qq-state--normalize-id user-id) qq-state--friends-by-id)))
 
+(defun qq-state-friends ()
+  "Return all cached friend objects."
+  (let (friends)
+    (maphash (lambda (_id friend) (push (copy-tree friend) friends))
+             qq-state--friends-by-id)
+    friends))
+
 (defun qq-state-group (group-id)
   "Return cached group object for GROUP-ID."
   (copy-tree (gethash (qq-state--normalize-id group-id) qq-state--groups-by-id)))
+
+(defun qq-state-groups ()
+  "Return all cached group objects."
+  (let (groups)
+    (maphash (lambda (_id group) (push (copy-tree group) groups))
+             qq-state--groups-by-id)
+    groups))
 
 (defun qq-state-add-request (request)
   "Append REQUEST event to local request list."
@@ -1258,6 +1298,100 @@ Keeps the row so the chat view can hide it (default) or show a stub when
 (defun qq-state-requests ()
   "Return pending request events tracked in memory."
   (copy-tree qq-state--requests))
+
+(defun qq-state--input-status-active-p (entry)
+  "Return non-nil when input-status ENTRY is still live."
+  (and (listp entry)
+       (stringp (alist-get 'text entry))
+       (not (string-empty-p (alist-get 'text entry)))
+       (let ((expires-at (alist-get 'expires-at entry)))
+         (or (null expires-at)
+             (> expires-at (float-time))))))
+
+(defun qq-state-input-status (session-key)
+  "Return live input-status alist for SESSION-KEY, or nil.
+
+Returned copy never includes the internal `timer' object."
+  (when-let* ((entry (gethash session-key qq-state--input-status)))
+    (if (qq-state--input-status-active-p entry)
+        (let ((copy (copy-tree entry)))
+          (setq copy (assq-delete-all 'timer copy))
+          copy)
+      (qq-state-clear-input-status session-key)
+      nil)))
+
+(defun qq-state-input-status-text (session-key)
+  "Return live typing/status text for SESSION-KEY, or nil."
+  (alist-get 'text (qq-state-input-status session-key)))
+
+(defun qq-state-clear-input-status (session-key &optional silent)
+  "Clear input-status for SESSION-KEY.
+
+When SILENT is non-nil, do not emit a state-change event (used while
+replacing an existing status)."
+  (when-let* ((entry (gethash session-key qq-state--input-status)))
+    (qq-state--cancel-input-status-timer entry)
+    (remhash session-key qq-state--input-status)
+    (unless silent
+      (qq-state--emit 'input-status
+                      :session-key session-key
+                      :mutation 'delete
+                      :source 'notice
+                      :input-status nil))
+    t))
+
+(defun qq-state-apply-input-status (notice)
+  "Apply OneBot input_status NOTICE into local state.
+
+Expected shape:
+  notice_type=notify, sub_type=input_status
+  user_id, event_type, status_text
+
+`event_type' 1 (or any positive value with non-empty status_text) means
+typing/active; 0 or empty status_text clears the status.  Active status
+auto-expires after `qq-input-status-ttl' seconds unless refreshed."
+  (let* ((user-id (qq-state--normalize-id (alist-get 'user_id notice)))
+         (status-text (alist-get 'status_text notice))
+         (event-type (alist-get 'event_type notice))
+         (event-num (cond
+                     ((numberp event-type) event-type)
+                     ((stringp event-type) (string-to-number event-type))
+                     (t 0)))
+         (text (and (stringp status-text) (string-trim status-text)))
+         (active-p (and user-id
+                        (> event-num 0)
+                        (stringp text)
+                        (not (string-empty-p text))))
+         (session-key (and user-id (qq-state-session-key 'private user-id))))
+    (cond
+     ((null session-key) nil)
+     ((not active-p)
+      (qq-state-clear-input-status session-key)
+      nil)
+     (t
+      (let* ((ttl (max 1 (or qq-input-status-ttl 6)))
+             (expires-at (+ (float-time) ttl))
+             (old (gethash session-key qq-state--input-status))
+             (entry `((text . ,text)
+                      (event-type . ,event-num)
+                      (user-id . ,user-id)
+                      (expires-at . ,expires-at)
+                      (timer . nil))))
+        (qq-state--cancel-input-status-timer old)
+        (let ((timer (run-at-time
+                      ttl nil
+                      (lambda ()
+                        (when-let* ((cur (gethash session-key qq-state--input-status)))
+                          (when (equal (alist-get 'expires-at cur) expires-at)
+                            (qq-state-clear-input-status session-key)))))))
+          (setf (alist-get 'timer entry) timer)
+          (puthash session-key entry qq-state--input-status)
+          (qq-state--emit 'input-status
+                          :session-key session-key
+                          :mutation (if old 'update 'create)
+                          :source 'notice
+                          :input-status (qq-state-input-status session-key))
+          (qq-state-input-status session-key)))))))
 
 (provide 'qq-state)
 

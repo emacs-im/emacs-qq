@@ -393,7 +393,8 @@ Order:
 
 NapCat/NT still owns remote materialization and QQ disk cache; the client
 never treats a local absolute path as a NapCat file id."
-  (let* ((url (qq-media--segment-url segment))
+  (let* ((capabilities (qq-media-segment-capabilities segment))
+         (url (plist-get capabilities :remote-url))
          (local (qq-media--segment-existing-path segment))
          (remote-keys (qq-media--segment-remote-file-keys segment))
          (error-fn (or errback #'qq-api--default-error))
@@ -459,6 +460,114 @@ ERRBACK with FINAL-ERROR or the last backend reason."
 (defun qq-media--segment-url (segment)
   "Return best direct URL from SEGMENT, or nil."
   (alist-get 'url (alist-get 'data segment)))
+
+(defun qq-media--video-remote-status (segment)
+  "Return normalized remote status symbol for video SEGMENT.
+
+The wire values are `available', `expired', `unavailable', and `unresolved'.
+A missing or otherwise unknown value is an invalid protocol state and must
+not enable a remote operation."
+  (let ((value (alist-get 'remote_status (alist-get 'data segment))))
+    (cond
+     ((equal value "available") 'available)
+     ((equal value "expired") 'expired)
+     ((equal value "unavailable") 'unavailable)
+     ((equal value "unresolved") 'unresolved)
+     (t 'invalid))))
+
+(defun qq-media--transfer-status-text (state)
+  "Return compact user-visible transfer status for download STATE."
+  (let ((status (plist-get state :status))
+        (path (plist-get state :path))
+        (error-text (plist-get state :error)))
+    (pcase status
+      ('downloading "downloading…")
+      ('downloaded
+       (if (and (stringp path) (not (string-empty-p path)))
+           (format "local: %s" (file-name-nondirectory path))
+         "downloaded"))
+      ('error
+       (if (and (stringp error-text) (not (string-empty-p error-text)))
+           (format "download failed: %s"
+                   (truncate-string-to-width error-text 68 nil nil t))
+         "download failed"))
+      (_ nil))))
+
+(defun qq-media-segment-capabilities (segment)
+  "Return the centralized action/status model for media SEGMENT.
+
+The result is a plist with `:open', `:download', `:save', `:copy-url',
+`:status', `:local-file', `:remote-status', `:resolve-remote', `:remote-url',
+and `:remote-error'.  Video remote state comes exclusively from
+`remote_status'; a real local file remains usable independently of that
+state.  Only `available' with a non-empty URL permits a remote operation.
+`expired', `unavailable', `unresolved', and invalid/missing states never
+probe a second interface such as get_file."
+  (let* ((type (alist-get 'type segment))
+         (data (alist-get 'data segment))
+         (supported (member type
+                            '("image" "file" "record" "video" "face" "mface")))
+         (video-p (equal type "video"))
+         (remote-status (if video-p
+                            (qq-media--video-remote-status segment)
+                          'not-applicable))
+         (local-file (or (qq-media--segment-existing-path segment)
+                         (qq-media-segment-local-file segment)))
+         (url (qq-media--segment-url segment))
+         (url-p (qq-media-url-present-p url))
+         (usable-url-p (and url-p
+                            (or (not video-p)
+                                (eq remote-status 'available))))
+         (remote-keys (qq-media--segment-remote-file-keys segment))
+         (face-id (and (equal type "face") (alist-get 'id data)))
+         (remote-source-p (if video-p
+                              usable-url-p
+                            (or remote-keys usable-url-p face-id)))
+         (resolve-remote
+          (and supported remote-source-p
+               (or (not video-p)
+                   (eq remote-status 'available))))
+         (remote-url
+          (and usable-url-p
+               url))
+         (download-state (qq-media-segment-download-state segment))
+         (download-status (plist-get download-state :status))
+         (open (and supported (or local-file resolve-remote)))
+         (download (and supported resolve-remote (not local-file)
+                        (not (memq download-status
+                                   '(downloading downloaded)))))
+         (save (and supported (or local-file resolve-remote)))
+         (copy-url (and remote-url t))
+         (remote-error
+          (and video-p
+               (pcase remote-status
+                 ('expired "video resource has expired")
+                 ('unavailable "video resource is unavailable")
+                 ('invalid "video resource has invalid remote_status")
+                 ('unresolved "video resource is unresolved")
+                 ('available
+                  (unless usable-url-p
+                    "available video resource has no URL")))))
+         (status
+          (if video-p
+              (pcase remote-status
+                ('expired "Expired")
+                ('unavailable "Unavailable")
+                ('unresolved "Unresolved")
+                ('invalid "Invalid remote status")
+                (_ (qq-media--transfer-status-text download-state)))
+            (qq-media--transfer-status-text download-state))))
+    (list :open open
+          :download download
+          :save save
+          :copy-url copy-url
+          :status status
+          :local-file local-file
+          :remote-status remote-status
+          :resolve-remote resolve-remote
+          :remote-url remote-url
+          :remote-error remote-error
+          :download-state download-state)))
 
 (defun qq-media--segment-resource-key (segment)
   "Return logical resource cache key for SEGMENT, or nil."
@@ -541,18 +650,31 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
 (defun qq-media-resolve-segment-resource (segment callback &optional errback)
   "Resolve media resource for SEGMENT and pass it to CALLBACK."
   (let ((cache-key (qq-media--segment-resource-key segment))
-        (url (qq-media--segment-url segment))
-        (local (qq-media--segment-existing-path segment)))
+        (capabilities (qq-media-segment-capabilities segment)))
+    (let ((url (plist-get capabilities :remote-url))
+          (local (plist-get capabilities :local-file))
+          (remote-error (plist-get capabilities :remote-error)))
     (cond
-     ((and cache-key (qq-media--cached-resource cache-key))
-      (funcall callback (qq-media--cached-resource cache-key)))
-     ;; Local-first even when no logical cache key is available.
      (local
       (let ((resource (qq-media--resource-from-local+url local url)))
         (when cache-key
           (qq-media--cache-resource cache-key resource)
           (qq-media--note-cache-updated cache-key))
         (funcall callback resource)))
+     ((not (plist-get capabilities :resolve-remote))
+      (if errback
+          (funcall errback nil (or remote-error "media resource is unavailable"))
+        (user-error "qq: %s" (or remote-error "media resource is unavailable"))))
+     ;; The video wire model has already resolved the one official URL.  Never
+     ;; send its file token through the generic get_file fallback path.
+     ((and (equal (alist-get 'type segment) "video") url)
+      (let ((resource `((url . ,url))))
+        (when cache-key
+          (qq-media--cache-resource cache-key resource)
+          (qq-media--note-cache-updated cache-key))
+        (funcall callback resource)))
+     ((and cache-key (qq-media--cached-resource cache-key))
+      (funcall callback (qq-media--cached-resource cache-key)))
      (cache-key
       (qq-media--fetch-segment-resource
        segment
@@ -566,7 +688,7 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
      (errback
       (funcall errback nil "resource has neither local file, cache key, nor URL"))
      (t
-      (user-error "qq: segment has neither local file nor URL")))))
+      (user-error "qq: segment has neither local file nor URL"))))))
 
 (defun qq-media-segment-open (segment)
   "Open OneBot message SEGMENT using QQ-aware resource resolution."
@@ -583,12 +705,12 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
 
 (defun qq-media-segment-openable-p (segment)
   "Return non-nil when SEGMENT can be opened via `qq-media'."
-  (member (alist-get 'type segment)
-          '("image" "file" "record" "video" "face" "mface")))
+  (plist-get (qq-media-segment-capabilities segment) :open))
 
 (defun qq-media-segment-playable-p (segment)
   "Return non-nil when SEGMENT supports `qq-media-segment-play'."
-  (eq (qq-media-segment-kind segment) 'video))
+  (and (eq (qq-media-segment-kind segment) 'video)
+       (plist-get (qq-media-segment-capabilities segment) :open)))
 
 (defun qq-media--sanitize-filename (filename)
   "Return filesystem-safe variant of FILENAME."
@@ -870,7 +992,8 @@ existing QQ media resource cache."
 
 (defun qq-media-segment-local-file (segment)
   "Return best local file path for SEGMENT, or nil."
-  (let* ((download-state (qq-media-segment-download-state segment))
+  (let* ((segment-file (qq-media--segment-existing-path segment))
+         (download-state (qq-media-segment-download-state segment))
          (download-path (plist-get download-state :path))
          (cached-resource (qq-media--cached-resource (qq-media--segment-resource-key segment)))
          (cached-file (and cached-resource (alist-get 'file cached-resource)))
@@ -880,6 +1003,7 @@ existing QQ media resource cache."
                            (and preview-key
                                 (qq-media--remote-image-cache-existing-file preview-key)))))
     (cond
+     ((qq-media-file-present-p segment-file) segment-file)
      ((qq-media-file-present-p download-path) download-path)
      ((qq-media-file-present-p cached-file) cached-file)
      ((qq-media-file-present-p preview-file) preview-file)
@@ -906,7 +1030,8 @@ existing QQ media resource cache."
 
 (defun qq-media-segment-start-download (segment &optional open-after)
   "Download SEGMENT into `qq-media-download-directory'."
-  (let* ((entry (qq-media-segment-download-state segment))
+  (let* ((capabilities (qq-media-segment-capabilities segment))
+         (entry (plist-get capabilities :download-state))
          (path (plist-get entry :path))
          (status (plist-get entry :status)))
     (cond
@@ -917,6 +1042,10 @@ existing QQ media resource cache."
       (when open-after
         (qq-media-segment-open-local segment))
       path)
+     ((not (plist-get capabilities :download))
+      (user-error "qq: %s"
+                  (or (plist-get capabilities :remote-error)
+                      "media resource cannot be downloaded")))
      (t
       (qq-media--put-segment-download-state
        segment
@@ -960,7 +1089,12 @@ existing QQ media resource cache."
 (defun qq-media-segment-save-as (segment &optional target-path)
   "Save SEGMENT to TARGET-PATH, prompting when nil."
   (interactive)
-  (let* ((default-name (qq-media-segment-default-save-name segment))
+  (let* ((capabilities (qq-media-segment-capabilities segment))
+         (_ (unless (plist-get capabilities :save)
+              (user-error "qq: %s"
+                          (or (plist-get capabilities :remote-error)
+                              "media resource cannot be saved"))))
+         (default-name (qq-media-segment-default-save-name segment))
          (target (or target-path
                      (read-file-name "Save media as: "
                                      nil
@@ -999,7 +1133,8 @@ existing QQ media resource cache."
      (lambda (resource)
        (let ((resolved-file (alist-get 'file resource))
              (url (or (alist-get 'url resource)
-                      (qq-media--segment-url segment))))
+                      (plist-get (qq-media-segment-capabilities segment)
+                                 :remote-url))))
          (cond
           ((qq-media-file-present-p resolved-file)
            (qq-media-play-video-source resolved-file))

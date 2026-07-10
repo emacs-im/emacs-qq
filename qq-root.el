@@ -147,13 +147,18 @@
 
 (defun qq-root--session-preview-text (session)
   "Return one-line preview for SESSION."
-  (let ((preview (string-trim (or (alist-get 'last-message-preview session) "")))
-        (badge (qq-root--session-badge session)))
+  (let* ((session-key (alist-get 'key session))
+         (input-text (and session-key (qq-state-input-status-text session-key)))
+         (preview (string-trim (or (alist-get 'last-message-preview session) "")))
+         (badge (qq-root--session-badge session)))
     (concat
      badge
-     (if (string-empty-p preview)
-         "(no preview yet)"
-       preview))))
+     (cond
+      ((and (stringp input-text) (not (string-empty-p input-text)))
+       input-text)
+      ((string-empty-p preview)
+       "(no preview yet)")
+      (t preview)))))
 
 (defun qq-root--session-one-line-row (session)
   "Return one-line row model for SESSION."
@@ -409,7 +414,7 @@ when this function is used as `qq-media-cache-update-hook'."
 (defun qq-root--handle-state-change (event)
   "Refresh visible root buffer after relevant state EVENT changes."
   (when (memq (plist-get event :type)
-              '(reset connection self-info session message history
+              '(reset connection self-info session message history input-status
                       sessions-refreshed friends-refreshed groups-refreshed))
     (qq-root--rerender-open-root)))
 

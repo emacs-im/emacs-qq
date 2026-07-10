@@ -26,6 +26,9 @@
 (declare-function qq-disconnect "qq")
 (declare-function qq-reset-session-state "qq")
 
+(defvar qq-chat--forward-request-active-p)
+(defvar qq-chat--marked-message-anchors)
+
 
 ;;; Availability helpers
 
@@ -64,6 +67,20 @@
         (null (alist-get 'server-id message))
         (not (alist-get 'self-p message))
         (qq-state-message-recalled-p message))))
+
+(defun qq-transient--forward-inapt-p ()
+  "Return non-nil when forwarding the message at point is unavailable."
+  (not (qq-chat--message-forwardable-p
+        (qq-transient--message-at-point))))
+
+(defun qq-transient--no-forward-marks-p ()
+  "Return non-nil when there are no raw forward selections to clear."
+  (null qq-chat--marked-message-anchors))
+
+(defun qq-transient--forward-marked-inapt-p ()
+  "Return non-nil when a merged-forward submission is unavailable."
+  (or qq-chat--forward-request-active-p
+      (null (qq-chat-marked-messages))))
 
 (defun qq-transient--resource-inapt-p ()
   "Return non-nil when open-resource is unavailable at point."
@@ -119,6 +136,10 @@ Prefer this over inline button rows (telega/disco style)."
   [["Message"
     ("r" "Reply" qq-chat-reply-to-message
      :inapt-if qq-transient--reply-inapt-p)
+    ("f" "Forward" qq-chat-forward-message
+     :inapt-if qq-transient--forward-inapt-p)
+    ("M" "Mark / unmark" qq-chat-toggle-forward-mark
+     :inapt-if qq-transient--forward-inapt-p)
     ("d" "Recall" qq-chat-delete-message
      :inapt-if qq-transient--recall-inapt-p)
     ("a" "Open avatar" qq-chat-open-avatar-at-point
@@ -164,6 +185,10 @@ Prefer this over inline button rows (telega/disco style)."
     ("n" "Search next" qq-chat-search-next)
     ("p" "Search prev" qq-chat-search-prev)
     ("R" "Mark read" qq-chat-read-all)
+    ("v" "Forward marked" qq-chat-forward-marked-messages
+     :inapt-if qq-transient--forward-marked-inapt-p)
+    ("U" "Clear forward marks" qq-chat-clear-forward-marks
+     :inapt-if qq-transient--no-forward-marks-p)
     ("m" "Message at point…" qq-chat-message-transient
      :inapt-if qq-transient--no-message-at-point-p)]
    ["Composer"

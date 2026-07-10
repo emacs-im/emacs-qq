@@ -32,6 +32,9 @@
      (goto-char (point-min))
      (should (qq-transient--no-message-at-point-p))
      (should (qq-transient--reply-inapt-p))
+     (should (qq-transient--forward-inapt-p))
+     (should (qq-transient--no-forward-marks-p))
+     (should (qq-transient--forward-marked-inapt-p))
      (should (qq-transient--recall-inapt-p)))))
 
 (ert-deftest qq-transient-message-inapt-with-other-users-message ()
@@ -43,7 +46,7 @@
     nil)
    (puthash
     "private:10001"
-    '(((server-id . "m1")
+    '(((server-id . "9007199254742007089")
        (sender-id . "10001")
        (sender-name . "Alice")
        (time . 100)
@@ -58,6 +61,7 @@
      (search-forward "hello")
      (should-not (qq-transient--no-message-at-point-p))
      (should-not (qq-transient--reply-inapt-p))
+     (should-not (qq-transient--forward-inapt-p))
      ;; Only self messages can be recalled.
      (should (qq-transient--recall-inapt-p))
      (should-not (qq-transient--avatar-inapt-p)))))
