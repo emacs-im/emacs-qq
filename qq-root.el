@@ -247,8 +247,7 @@ priority over the last-message preview."
            'qq-root-unread-count unread
            'qq-root-has-unread (and (> unread 0) t)
            'qq-root-muted-p muted
-           'qq-root-has-important-unread (and important t)
-           'mouse-face 'highlight)
+           'qq-root-has-important-unread (and important t))
      :help-echo (format "Open %s%s"
                         session-key
                         (if muted " (message notifications muted)" "")))))

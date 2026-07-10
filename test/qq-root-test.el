@@ -48,6 +48,21 @@
                  (qq-root--session-preview-text
                   '((muted-p . t) (unread-count . 0))))))
 
+(ert-deftest qq-root-session-row-keeps-help-without-blanket-hover ()
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'qq-media-session-avatar-display-string)
+               (lambda (_session) "#"))
+              ((symbol-function 'qq-root--buffer-width) (lambda () 80)))
+      (qq-root--insert-session-line
+       '((key . "group:1")
+         (type . group)
+         (title . "Group")
+         (last-message-preview . "hello"))))
+    (should (equal "Open group:1"
+                   (get-text-property (point-min) 'help-echo)))
+    (should-not (text-property-not-all
+                 (point-min) (point-max) 'mouse-face nil))))
+
 (ert-deftest qq-root-background-render-reuses-last-visible-width ()
   (with-temp-buffer
     (qq-root-mode)
