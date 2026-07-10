@@ -88,6 +88,8 @@
 
 (ert-deftest qq-api-mark-session-read-clears-unread-optimistically ()
   (let ((qq-state-change-hook nil)
+        (qq-api--read-operations (make-hash-table :test #'equal))
+        (qq-api--read-operation-counter 0)
         cleared-before-call
         errback-fn
         success-fn)
@@ -119,6 +121,55 @@
       (funcall success-fn '((status . ok)))
       (should (= 0 (alist-get 'unread-count
                               (qq-state-session "private:10001")))))))
+
+(ert-deftest qq-api-mark-session-read-coalesces-and-restores-new-arrivals ()
+  (let ((qq-state-change-hook nil)
+        (qq-api--read-operations (make-hash-table :test #'equal))
+        (qq-api--read-operation-counter 0)
+        calls)
+    (qq-state-reset)
+    (qq-state-upsert-session
+     "private:10001"
+     '((type . private) (target-id . "10001") (unread-count . 5)) nil)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional errback)
+                 (push (cons callback errback) calls)
+                 'sent))
+              ((symbol-function 'qq-api--default-error) #'ignore))
+      (qq-api-mark-session-read "private:10001")
+      ;; A live message arrives after the request was sent and is immediately
+      ;; cleared by the visible chat's second mark-read call.
+      (qq-state-set-session-unread "private:10001" 1)
+      (qq-api-mark-session-read "private:10001")
+      (should (= (length calls) 1))
+      (funcall (cdar calls) nil "network down")
+      (should (= (alist-get 'unread-count
+                            (qq-state-session "private:10001"))
+                 6)))))
+
+(ert-deftest qq-api-mark-session-read-follows-up-for-coalesced-arrivals ()
+  (let ((qq-state-change-hook nil)
+        (qq-api--read-operations (make-hash-table :test #'equal))
+        (qq-api--read-operation-counter 0)
+        calls)
+    (qq-state-reset)
+    (qq-state-upsert-session
+     "private:10001"
+     '((type . private) (target-id . "10001") (unread-count . 2)) nil)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional errback)
+                 (setq calls (append calls (list (cons callback errback))))
+                 'sent)))
+      (qq-api-mark-session-read "private:10001")
+      (qq-state-set-session-unread "private:10001" 1)
+      (qq-api-mark-session-read "private:10001")
+      (should (= (length calls) 1))
+      (funcall (caar calls) '((status . "ok")))
+      (should (= (length calls) 2))
+      (should (= 0 (alist-get 'unread-count
+                              (qq-state-session "private:10001"))))
+      (funcall (car (nth 1 calls)) '((status . "ok")))
+      (should-not (gethash "private:10001" qq-api--read-operations)))))
 
 (ert-deftest qq-api-send-text-builds-reply-segments ()
   (let (sent-session sent-segments sent-raw)

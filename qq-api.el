@@ -15,6 +15,12 @@
 (require 'qq-state)
 (require 'qq-transport)
 
+(defvar qq-api--read-operations (make-hash-table :test #'equal)
+  "In-flight optimistic read operations keyed by session key.")
+
+(defvar qq-api--read-operation-counter 0
+  "Monotonic token used to reject stale read callbacks.")
+
 (defun qq-api--response-data (response)
   "Extract `data' payload from RESPONSE alist."
   (alist-get 'data response nil nil #'eq))
@@ -1011,31 +1017,70 @@ ERRBACK is called so the client can fall back to single-side seek."
            (funcall callback meta))))
      errback)))
 
-(defun qq-api-mark-session-read (session-key)
-  "Mark SESSION-KEY as read both locally and in NapCat.
+(defun qq-api--read-operation-current-p (session-key token)
+  "Return non-nil when TOKEN still owns SESSION-KEY's read operation."
+  (equal token
+         (plist-get (gethash session-key qq-api--read-operations) :token)))
 
-Clear unread optimistically before the network roundtrip (telega/disco
-style).  On API failure, restore the previous unread count when the
-session is still at zero."
-  (interactive)
-  (let* ((session (qq-state-session session-key))
-         (previous-unread (or (and session (alist-get 'unread-count session)) 0)))
-    (when (> previous-unread 0)
-      (qq-state-clear-session-unread session-key))
+(defun qq-api--start-mark-session-read (session-key cleared-count)
+  "Start one read request for SESSION-KEY owning CLEARED-COUNT unread rows."
+  (let* ((token (cl-incf qq-api--read-operation-counter))
+         (operation (list :token token
+                          :cleared (max 0 cleared-count)
+                          :queued 0)))
+    (puthash session-key operation qq-api--read-operations)
     (qq-api-call
      "mark_msg_as_read"
      (qq-api--session-request-params session-key)
      (lambda (_response)
-       ;; Idempotent: success after optimistic clear is a no-op for state.
-       (qq-state-clear-session-unread session-key))
+       (when (qq-api--read-operation-current-p session-key token)
+         (let* ((current (gethash session-key qq-api--read-operations))
+                (queued (or (plist-get current :queued) 0)))
+           (remhash session-key qq-api--read-operations)
+           ;; Rows cleared while the first request was already in flight need
+           ;; their own server acknowledgement.  They stay locally clear, but
+           ;; remain owned by the follow-up operation for rollback purposes.
+           (when (> queued 0)
+             (qq-api--start-mark-session-read session-key queued)))))
      (lambda (response reason)
-       (let* ((current (qq-state-session session-key))
-              (current-unread (or (and current (alist-get 'unread-count current)) 0)))
-         (when (and (> previous-unread 0)
-                    current
-                    (= current-unread 0))
-           (qq-state-set-session-unread session-key previous-unread)))
-       (qq-api--default-error response reason)))))
+       (when (qq-api--read-operation-current-p session-key token)
+         (let* ((current-operation
+                 (gethash session-key qq-api--read-operations))
+                (owned (+ (or (plist-get current-operation :cleared) 0)
+                          (or (plist-get current-operation :queued) 0)))
+                (session (qq-state-session session-key))
+                (current-unread
+                 (or (and session (alist-get 'unread-count session)) 0)))
+           (remhash session-key qq-api--read-operations)
+           (when (and session (> owned 0))
+             (qq-state-set-session-unread
+              session-key (+ current-unread owned)))
+           (qq-api--default-error response reason)))))
+    token))
+
+(defun qq-api-mark-session-read (session-key)
+  "Mark SESSION-KEY as read locally and in NapCat without losing races.
+
+Concurrent calls coalesce behind one request.  Unread rows that arrive while
+that request is in flight are cleared optimistically, then acknowledged by a
+follow-up request.  A failure restores exactly the rows owned by the failed
+operation in addition to any newer unread rows."
+  (interactive)
+  (let* ((session (qq-state-session session-key))
+         (unread (or (and session (alist-get 'unread-count session)) 0))
+         (operation (gethash session-key qq-api--read-operations)))
+    (when (> unread 0)
+      (qq-state-clear-session-unread session-key))
+    (if operation
+        (progn
+          (when (> unread 0)
+            (setq operation
+                  (plist-put operation :queued
+                             (+ (or (plist-get operation :queued) 0)
+                                unread)))
+            (puthash session-key operation qq-api--read-operations))
+          (plist-get operation :token))
+      (qq-api--start-mark-session-read session-key unread))))
 
 (defun qq-api--send-text-segments (text &optional reply-to-message-id)
   "Return send_msg segment list for TEXT and optional REPLY-TO-MESSAGE-ID."
