@@ -729,10 +729,15 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
 
 (defun qq-media--sanitize-filename (filename)
   "Return filesystem-safe variant of FILENAME."
-  (replace-regexp-in-string
-   "[[:cntrl:]/\\\\]+"
-   "_"
-   (or filename "qq-media.bin")))
+  (apply #'string
+         (mapcar (lambda (character)
+                   (if (or (< character 32)
+                           (= character 127)
+                           (= character ?/)
+                           (= character ?\\))
+                       ?_
+                     character))
+                 (string-to-list (or filename "qq-media.bin")))))
 
 (defun qq-media--segment-url-filename (url)
   "Extract a best-effort filename from URL."

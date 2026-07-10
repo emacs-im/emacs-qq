@@ -527,7 +527,7 @@ Strips reply tags and collapses media/face codes."
          (pos 0)
          (len (length s)))
     (while (< pos len)
-      (if (string-match "\\[CQ:\\([a-zA-Z0-9_-]+\\)\\(\\,[^]]*\\)?\\]" s pos)
+      (if (string-match "\\[CQ:\\([a-zA-Z0-9_-]+\\)\\(,[^]]*\\)?\\]" s pos)
           (let* ((start (match-beginning 0))
                  (end (match-end 0))
                  (type (match-string 1 s))
