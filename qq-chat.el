@@ -567,8 +567,7 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
         'qq-chat-forward-marked (and (qq-chat--message-marked-p message) t)
         'read-only t
         'front-sticky '(read-only)
-        'rear-nonsticky '(read-only)
-        'mouse-face 'highlight))
+        'rear-nonsticky '(read-only)))
 
 (defun qq-chat--message-at-point ()
   "Return message object under point in the current chat buffer, or nil."

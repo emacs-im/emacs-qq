@@ -1726,6 +1726,17 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
                                    (string-width
                                     (qq-chat--format-time 1710000001))))))))))
 
+(ert-deftest qq-chat-message-hover-is-limited-to-interactive-children ()
+  (let ((properties
+         (qq-chat--message-line-properties
+          '((server-id . "m1") (local-id . nil)) "m1")))
+    ;; Like telega's outer `telega-msg' button: retain message identity and
+    ;; read-only behavior without a blanket mouse face.  Interactive children
+    ;; (avatar, sender, media, links, reactions) install their own hover face.
+    (should (equal (plist-get properties 'qq-chat-message-anchor) "m1"))
+    (should (plist-get properties 'read-only))
+    (should-not (plist-member properties 'mouse-face))))
+
 (ert-deftest qq-chat-window-resize-refreshes-layout-only-when-width-changes ()
   (with-temp-buffer
     (qq-chat-mode)
