@@ -697,17 +697,26 @@ in the UI — that is wire format, not display text."
                  "戳了戳"))
          (time (qq-state--normalize-time
                 (or (alist-get 'time notice) (float-time))))
-         ;; Notices have no server message id.  Keep the anchor deterministic
-         ;; so a live notice and the same row returned by history merge once.
-         (local-id (if (> time 0)
-                       (format "local-poke-%s-%s-%s"
-                               time (or actor-id "0") (or target-id "0"))
-                     (format "local-poke-%d"
-                             (cl-incf qq-state--local-message-counter))))
+         ;; The stock OneBot notice has no message_id.  The emacs fork adds the
+         ;; underlying NT grey-tip snowflake when it is available, which makes
+         ;; the poke eligible for the normal recall path.  Keep a deterministic
+         ;; local anchor only for stock/live synthetic notices without it.
+         (server-id
+          (qq-protocol-optional-message-id
+           (alist-get 'message_id notice)
+           "poke notice"))
+         (local-id (and (null server-id)
+                        (if (> time 0)
+                            (format "local-poke-%s-%s-%s"
+                                    time (or actor-id "0") (or target-id "0"))
+                          (format "local-poke-%d"
+                                  (cl-incf qq-state--local-message-counter)))))
+         (anchor (or server-id local-id))
          (self-p (and actor-id
                       (equal actor-id (qq-state-self-user-id))))
          (message
-          `((id . ,local-id)
+          `((id . ,anchor)
+            (server-id . ,server-id)
             (local-id . ,local-id)
             (session-key . ,session-key)
             (time . ,time)
@@ -1062,9 +1071,10 @@ Return three values via `cl-values':
   "Append a local timeline message for OneBot NOTIFY/POKE NOTICE.
 
 NapCat reports pokes as notices rather than ordinary messages.  The notice has
-no message id or sender display object, so use a local event anchor and resolve
-names from the cached contacts.  Numeric IDs are a deliberate final fallback;
-never render the generic `unknown' label for a valid poke participant."
+no sender display object; use the fork's NT message id when present, otherwise
+a local event anchor, and resolve names from the cached contacts.  Numeric IDs
+are a deliberate final fallback; never render the generic `unknown' label for a
+valid poke participant."
   (let* ((message (qq-state--normalize-poke-notice notice))
          (session-key (alist-get 'session-key message))
          (self-p (alist-get 'self-p message)))

@@ -139,6 +139,24 @@
                       (user_id . "10002")
                       (group_id . "20001")))))))
 
+(ert-deftest qq-state-poke-with-server-id-is-recallable ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
+   (let ((message
+          (qq-state-apply-poke-notice
+           '((time . 1710000001)
+             (post_type . "notice")
+             (notice_type . "notify")
+             (sub_type . "poke")
+             (message_id . "9007199254741007777")
+             (group_id . "20001")
+             (user_id . "90001")
+             (target_id . "10002")))))
+     (should (equal (alist-get 'id message) "9007199254741007777"))
+     (should (equal (alist-get 'server-id message) "9007199254741007777"))
+     (should-not (alist-get 'local-id message))
+     (should (equal (alist-get 'preview message) "戳了戳 10002")))))
+
 (ert-deftest qq-state-apply-recent-contacts-creates-session-summary ()
   (qq-test-with-reset
    (qq-state-apply-recent-contacts
