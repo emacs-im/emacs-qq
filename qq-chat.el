@@ -30,12 +30,14 @@
 (autoload 'qq-forward-segment-p "qq-forward")
 (autoload 'qq-forward-insert-segment "qq-forward")
 (autoload 'qq-forward-event-segment-to-internal "qq-forward")
+(autoload 'qq-user-open "qq-user" nil t)
 
 (declare-function qq-forward-segment-p "qq-forward" (segment))
 (declare-function qq-forward-insert-segment
                   "qq-forward" (segment prefix-state properties))
 (declare-function qq-forward-event-segment-to-internal
                   "qq-forward" (segment session-key))
+(declare-function qq-user-open "qq-user" (user-id))
 (declare-function qq-api-forward-message
                   "qq-api" (message-id source-session-key target-session-key
                                         callback &optional errback))
@@ -198,6 +200,7 @@ loaded in the chatbuf.")
     (define-key map (kbd "F") #'qq-chat-forward-marked-messages)
     (define-key map (kbd "o") #'qq-chat-open-resource-at-point)
     (define-key map (kbd "a") #'qq-chat-open-avatar-at-point)
+    (define-key map (kbd "i") #'qq-chat-open-user-at-point)
     (define-key map (kbd "g") #'qq-chat-goto-reply)
     (define-key map (kbd "x") #'qq-chat-goto-pop-message)
     (define-key map (kbd "m") #'qq-chat-message-transient)
@@ -206,7 +209,7 @@ loaded in the chatbuf.")
   "Timeline-only keymap active when point is outside the draft region.
 
 Single-key message actions (`r' reply, `d' recall, `f' forward, `M' mark,
-`F' forward marked, `o' open media, `a' avatar, `g' goto replied-to,
+`F' forward marked, `o' open media, `a' avatar, `i' user, `g' goto replied-to,
 `x' pop jump) and menus (`m'/`?') apply on the timeline.
 They are inactive in the composer so typing is never stolen.")
 
@@ -372,9 +375,13 @@ available."
   (let* ((parts (qq-chat--message-sender-display-parts message))
          (primary (car parts))
          (secondary (cdr parts))
+         (sender-id (alist-get 'sender-id message))
          (action (lambda ()
-                   (qq-media-open-message-avatar message)))
-         (help-echo "Open sender avatar")
+                   (if (and (qq-api-user-id-p sender-id)
+                            (not (equal sender-id "0")))
+                       (qq-user-open sender-id)
+                     (user-error "qq: sender has no user profile"))))
+         (help-echo "Open sender profile")
          (properties '(read-only t front-sticky t rear-nonsticky (read-only))))
     (qq-ui-insert-action-button
      primary
@@ -3341,6 +3348,27 @@ new rows or reports the cursor missing."
   (qq-media-open-message-avatar
    (or (qq-chat--message-at-point)
        (user-error "qq: no message at point"))))
+
+(defun qq-chat-open-user-at-point ()
+  "Open the sender user page for the message at point."
+  (interactive)
+  (let* ((message (or (qq-chat--message-at-point)
+                      (user-error "qq: no message at point")))
+         (user-id (alist-get 'sender-id message)))
+    (unless (and (qq-api-user-id-p user-id) (not (equal user-id "0")))
+      (user-error "qq: message sender has no user profile"))
+    (qq-user-open user-id)))
+
+(defun qq-chat-open-peer-user ()
+  "Open the current private peer's user page."
+  (interactive)
+  (let* ((session (qq-state-session qq-chat--session-key))
+         (type (alist-get 'type session))
+         (user-id (or (alist-get 'peer-uin session)
+                      (alist-get 'target-id session))))
+    (unless (and (eq type 'private) (qq-api-user-id-p user-id))
+      (user-error "qq: current chat has no user profile"))
+    (qq-user-open user-id)))
 
 (defun qq-chat-cancel-dwim ()
   "Cancel reply context, or clear draft when no reply is pending.

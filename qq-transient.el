@@ -21,6 +21,7 @@
 (require 'qq-media)
 (require 'qq-root)
 (require 'qq-state)
+(require 'qq-user)
 
 (declare-function qq-connect "qq")
 (declare-function qq-disconnect "qq")
@@ -28,6 +29,7 @@
 
 (defvar qq-chat--forward-request-active-p)
 (defvar qq-chat--marked-message-anchors)
+(defvar qq-chat--session-key)
 
 
 ;;; Availability helpers
@@ -92,6 +94,22 @@
     (or (null message)
         (null (alist-get 'sender-id message)))))
 
+(defun qq-transient--user-inapt-p ()
+  "Return non-nil when the message sender has no user page."
+  (let* ((message (qq-transient--message-at-point))
+         (user-id (and message (alist-get 'sender-id message))))
+    (not (and (qq-api-user-id-p user-id) (not (equal user-id "0"))))))
+
+(defun qq-transient--peer-user-inapt-p ()
+  "Return non-nil when the current chat has no private peer user page."
+  (let* ((session (and (boundp 'qq-chat--session-key)
+                       (qq-state-session qq-chat--session-key)))
+         (user-id (and session
+                       (or (alist-get 'peer-uin session)
+                           (alist-get 'target-id session)))))
+    (not (and (eq (alist-get 'type session) 'private)
+              (qq-api-user-id-p user-id)))))
+
 (defun qq-transient--no-reply-context-p ()
   "Return non-nil when composer has no pending reply."
   (null (qq-chat--reply-message)))
@@ -105,6 +123,15 @@
 (defun qq-transient--no-session-at-point-p ()
   "Return non-nil when root point is not on a session row."
   (null (ignore-errors (qq-root--session-key-at-point))))
+
+(defun qq-transient--root-user-inapt-p ()
+  "Return non-nil when the root session has no user page."
+  (let* ((session (ignore-errors (qq-root--session-at-point)))
+         (user-id (and session
+                       (or (alist-get 'peer-uin session)
+                           (alist-get 'target-id session)))))
+    (not (and (eq (alist-get 'type session) 'private)
+              (qq-api-user-id-p user-id)))))
 
 
 ;;; Attach helpers (typed)
@@ -144,6 +171,8 @@ Prefer this over inline button rows (telega/disco style)."
      :inapt-if qq-transient--recall-inapt-p)
     ("a" "Open avatar" qq-chat-open-avatar-at-point
      :inapt-if qq-transient--avatar-inapt-p)
+    ("i" "User page" qq-chat-open-user-at-point
+     :inapt-if qq-transient--user-inapt-p)
     ("g" "Goto reply target" qq-chat-goto-reply
      :inapt-if qq-transient--goto-reply-inapt-p)]
    ["Media"
@@ -204,6 +233,8 @@ Prefer this over inline button rows (telega/disco style)."
     ("d" "Recall at point" qq-chat-delete-message
      :inapt-if qq-transient--recall-inapt-p)]
    ["Session"
+    ("i" "User page" qq-chat-open-peer-user
+     :inapt-if qq-transient--peer-user-inapt-p)
     ("q" "Quit window" quit-window)
     ("?" "Describe mode" describe-mode)]])
 
@@ -219,6 +250,9 @@ Prefer this over inline button rows (telega/disco style)."
      :inapt-if qq-transient--no-session-at-point-p)
     ("a" "Open avatar" qq-root-open-avatar-at-point
      :inapt-if qq-transient--no-session-at-point-p)
+    ("i" "User page" qq-root-open-user-at-point
+     :inapt-if qq-transient--root-user-inapt-p)
+    ("I" "My profile" qq-root-open-self-user)
     ("s" "Search session…" qq-root-search)
     ("u" "Next unread" qq-root-next-unread)]
    ["Connection"

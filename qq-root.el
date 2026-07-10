@@ -18,6 +18,9 @@
 (require 'qq-state)
 (require 'qq-view)
 
+(autoload 'qq-user-open "qq-user" nil t)
+(declare-function qq-user-open "qq-user" (user-id))
+
 (defconst qq-root-buffer-name "*qq-root*"
   "Name of the emacs-qq root buffer.")
 
@@ -234,6 +237,26 @@ priority over the last-message preview."
    (or (qq-root--session-at-point)
        (user-error "qq: no session at point"))))
 
+(defun qq-root-open-user-at-point ()
+  "Open the private session user's profile at point."
+  (interactive)
+  (let* ((session (or (qq-root--session-at-point)
+                      (user-error "qq: no session at point")))
+         (user-id (or (alist-get 'peer-uin session)
+                      (alist-get 'target-id session))))
+    (unless (and (eq (alist-get 'type session) 'private)
+                 (qq-api-user-id-p user-id))
+      (user-error "qq: session has no user profile"))
+    (qq-user-open user-id)))
+
+(defun qq-root-open-self-user ()
+  "Open the logged-in user's profile."
+  (interactive)
+  (let ((user-id (alist-get 'user_id (qq-state-self-info))))
+    (unless (qq-api-user-id-p user-id)
+      (user-error "qq: self user profile is unavailable"))
+    (qq-user-open user-id)))
+
 (defun qq-root-mouse-open-at-point (event)
   "Open the session clicked by mouse EVENT."
   (interactive "e")
@@ -338,7 +361,7 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
        (qq-view-insert-note-line (qq-root--filters-line) :face 'font-lock-doc-face)
        (qq-view-insert-note-line (qq-root--mode-divider-line) :face 'shadow)
        (qq-view-insert-note-line
-        "g refresh  RET open  a avatar  TAB/n/p move  u next unread  s// search  ?: menu  q quit")
+        "g refresh  RET open  i user  a avatar  TAB/n/p move  u next unread  s// search  ?: menu  q quit")
        (insert "\n")
        (if sessions
            (dolist (session sessions)
@@ -359,6 +382,8 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
     (define-key map (kbd "/") #'qq-root-search)
     (define-key map (kbd "RET") #'qq-root-open-at-point)
     (define-key map (kbd "a") #'qq-root-open-avatar-at-point)
+    (define-key map (kbd "i") #'qq-root-open-user-at-point)
+    (define-key map (kbd "I") #'qq-root-open-self-user)
     (define-key map [mouse-1] #'qq-root-mouse-open-at-point)
     (define-key map (kbd "n") #'qq-root-button-forward)
     (define-key map (kbd "p") #'qq-root-button-backward)

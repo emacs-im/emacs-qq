@@ -1208,6 +1208,24 @@ When REPLY-TO-MESSAGE-ID is non-nil, send the text as a reply."
      (funcall callback (qq-api--response-data response)))
    errback))
 
+(defun qq-api-get-user (user-id callback &optional errback)
+  "Fetch native profile for USER-ID and pass it to CALLBACK."
+  (unless (qq-api-user-id-p user-id)
+    (user-error "qq: user profile requires a decimal string user id"))
+  (qq-api-call
+   "emacs_get_user"
+   `((user_id . ,user-id))
+   (lambda (response)
+     (condition-case error-data
+         (let ((profile (qq-api--response-data response)))
+           (unless (equal (alist-get 'user_id profile) user-id)
+             (error "qq: emacs_get_user returned a different user identity"))
+           (funcall callback profile))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   errback))
+
 (defun qq-api-get-group-avatar (group-id callback &optional errback no-cache)
   "Fetch group avatar resource for GROUP-ID and pass it to CALLBACK."
   (qq-api-call

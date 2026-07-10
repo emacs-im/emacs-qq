@@ -24,6 +24,7 @@
 (require 'qq-api)
 (require 'qq-chat)
 (require 'qq-forward)
+(require 'qq-user)
 (require 'qq-root)
 (require 'qq-transient)
 
