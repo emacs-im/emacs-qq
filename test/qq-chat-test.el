@@ -1684,14 +1684,47 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
                  (action . "喷了喷")
                  (detail . "的加分喷雾，分数++")))))))))
     (with-temp-buffer
-      (let ((inhibit-read-only t))
+      (let ((inhibit-read-only t)
+            (fill-column 80))
         (cl-letf (((symbol-function 'qq-media-url-preview-display-string)
                    (lambda (&rest _args) "✦")))
           (qq-chat--insert-poke-message message nil)
-          (should (equal (buffer-string)
-                         "  ✦  Alice  喷了喷  Bob  00:00\n       的加分喷雾，分数++\n"))
+          (should (string-match-p
+                   (regexp-quote
+                    "( ✦ Alice 喷了喷 Bob 的加分喷雾，分数++ )")
+                   (buffer-string)))
+          (should (string-match-p "00:00" (buffer-string)))
+          (should (= (count-lines (point-min) (point-max)) 1))
+          (should (string-match-p "的加分喷雾，分数++" (buffer-string)))
           (should-not (string-match-p "@ Alice" (buffer-string)))
+          (goto-char (point-min))
+          (search-forward "00:00")
+          (should (equal (get-text-property (- (match-beginning 0) 1)
+                                            'display)
+                         '(space :align-to 75)))
           (should (eq (get-text-property 2 'face) 'qq-msg-poke)))))))
+
+(ert-deftest qq-chat-history-header-right-aligns-time-through-disco-ins ()
+  (with-temp-buffer
+    (let ((inhibit-read-only t)
+          (fill-column 50)
+          (message '((server-id . "m1")
+                     (time . 1710000001)
+                     (sender-id . "10001")
+                     (sender-name . "Alice")
+                     (segments . (((type . "text")
+                                   (data . ((text . "hello")))))))))
+      (cl-letf (((symbol-function 'qq-media-avatar-display-string)
+                 (lambda (&rest _args) "A")))
+        (qq-chat--render-message message nil)
+        (goto-char (point-min))
+        (search-forward (qq-chat--format-time 1710000001))
+        (should (equal (get-text-property (- (match-beginning 0) 1)
+                                          'display)
+                       `(space :align-to
+                               ,(- 50
+                                   (string-width
+                                    (qq-chat--format-time 1710000001))))))))))
 
 (ert-deftest qq-chat-timeline-inserts-explicit-newer-history-gap ()
   (with-temp-buffer

@@ -803,6 +803,7 @@ the natural-language fragments.  The complete original notice remains in
 (defun qq-state--normalize-poke-notice (notice &optional fallback-session-key)
   "Normalize a live or historical POKE NOTICE into a timeline message."
   (let* ((group-id (qq-state--normalize-id (alist-get 'group_id notice)))
+         (local-poke-p (and (alist-get 'emacs_local_p notice) t))
          ;; In a private poke, user_id is the peer and sender_id is the actor
          ;; (the fork emits sender_id for this case).  Group pokes use user_id
          ;; as the actor, matching the OneBot notice contract.
@@ -836,12 +837,18 @@ the natural-language fragments.  The complete original notice remains in
           (qq-protocol-optional-message-id
            (alist-get 'message_id notice)
            "poke notice"))
-         (local-id (and (null server-id)
-                        (if (> time 0)
-                            (format "local-poke-%s-%s-%s"
-                                    time (or actor-id "0") (or target-id "0"))
-                          (format "local-poke-%d"
-                                  (cl-incf qq-state--local-message-counter)))))
+         (local-id
+          (and (null server-id)
+               (cond
+                (local-poke-p
+                 (format "local-poke-%d"
+                         (cl-incf qq-state--local-message-counter)))
+                ((> time 0)
+                 (format "local-poke-%s-%s-%s"
+                         time (or actor-id "0") (or target-id "0")))
+                (t
+                 (format "local-poke-%d"
+                         (cl-incf qq-state--local-message-counter))))))
          (anchor (or server-id local-id))
          (self-p (and actor-id
                       (equal actor-id (qq-state-self-user-id))))
@@ -858,6 +865,7 @@ the natural-language fragments.  The complete original notice remains in
             (sender-nickname . ,actor-name)
             (sender-remark . nil)
             (self-p . ,self-p)
+            (local-poke-p . ,local-poke-p)
             (status . ,(if self-p 'sent 'received))
             ;; Poke notices are gray-tip records, not ordinary text messages.
             ;; Keep their visual metadata as a dedicated segment so chat can
@@ -1038,6 +1046,40 @@ pending message model."
               (<= (abs (- time (qq-state--normalize-time (alist-get 'time it))))
                   qq-self-message-dedupe-window)))))))
 
+(defun qq-state--poke-echo-match (messages message)
+  "Return the nearest opposite-provenance poke echo for MESSAGE.
+
+NapCat may deliver the websocket notice before or after the `send_poke'
+response.  Match exactly one local/remote pair by actor, target and time while
+leaving repeated pokes as distinct timeline records."
+  (when (qq-state-poke-message-p message)
+    (let* ((sender-id (alist-get 'sender-id message))
+           (target-id (alist-get 'target-id message))
+           (time (qq-state--normalize-time (alist-get 'time message)))
+           (local-p (alist-get 'local-poke-p message))
+           (candidates
+            (seq-filter
+             (lambda (it)
+               (and (qq-state-poke-message-p it)
+                    (not (alist-get 'poke-echo-reconciled-p it))
+                    (not (eq (and (alist-get 'local-poke-p it) t)
+                             (and local-p t)))
+                    (equal (alist-get 'sender-id it) sender-id)
+                    (equal (alist-get 'target-id it) target-id)
+                    (<= (abs (- time
+                                (qq-state--normalize-time
+                                 (alist-get 'time it))))
+                        qq-self-message-dedupe-window)))
+             messages)))
+      (car
+       (sort candidates
+             (lambda (left right)
+               (< (abs (- time
+                          (qq-state--normalize-time (alist-get 'time left))))
+                  (abs (- time
+                          (qq-state--normalize-time
+                           (alist-get 'time right)))))))))))
+
 (defun qq-state--index-message (message)
   "Refresh lookup indexes for MESSAGE."
   (let ((server-id (alist-get 'server-id message))
@@ -1128,11 +1170,23 @@ Return three values via `cl-values':
 3. previous timeline anchor when a pending local-id is promoted to server-id,
    else nil"
   (let* ((messages (copy-tree (or (gethash session-key qq-state--messages-by-session) '())))
-         (existing (or (qq-state--direct-message-match messages message)
+         (direct (qq-state--direct-message-match messages message))
+         (poke-echo (and (null direct)
+                         (qq-state--poke-echo-match messages message)))
+         (existing (or direct
+                       poke-echo
                        (qq-state--weak-pending-match messages message)))
-         (merged (if existing
-                     (qq-state--merge-alists existing message)
-                   message))
+         ;; If the real notice won the race, the later synthetic callback must
+         ;; not replace its snowflake/raw_info with a local anchor.  In the
+         ;; opposite order, merge normally so the local row is promoted.
+         (merged (cond
+                  ((and poke-echo
+                        (alist-get 'local-poke-p message)
+                        (not (alist-get 'local-poke-p existing)))
+                   (copy-tree existing))
+                  (existing
+                   (qq-state--merge-alists existing message))
+                  (t message)))
          (old-order (and existing (alist-get 'order existing)))
          (previous-anchor
           (and existing
@@ -1144,6 +1198,8 @@ Return three values via `cl-values':
                       (not (alist-get 'server-id existing))
                       old-local))))
          (mutation (if existing 'update 'create)))
+    (when poke-echo
+      (setf (alist-get 'poke-echo-reconciled-p merged nil nil #'eq) t))
     (when old-order
       (setf (alist-get 'order merged nil nil #'eq) old-order))
     ;; Keep recalled once known unless the incoming payload is itself recalled
@@ -1213,17 +1269,19 @@ valid poke participant."
          (session-key (alist-get 'session-key message))
          (self-p (alist-get 'self-p message)))
     (when session-key
-      (cl-multiple-value-bind (merged mutation _previous-anchor)
+      (cl-multiple-value-bind (merged mutation previous-anchor)
           (qq-state--merge-normalized-message
            session-key message (not self-p))
         (when merged
-          (qq-state--emit
-           'message
-           :session-key session-key
-           :message (copy-tree merged)
-           :message-anchor (qq-state-message-anchor merged)
-           :mutation mutation
-           :source 'notice)
+          (apply #'qq-state--emit
+                 'message
+                 :session-key session-key
+                 :message (copy-tree merged)
+                 :message-anchor (qq-state-message-anchor merged)
+                 :mutation mutation
+                 :source 'notice
+                 (when previous-anchor
+                   (list :previous-anchor previous-anchor)))
           merged)))))
 
 (defun qq-state-merge-history (session-key raw-messages)

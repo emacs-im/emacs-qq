@@ -294,6 +294,28 @@ of the default chrome."
       (format-time-string "%H:%M" (seconds-to-time timestamp))
     ""))
 
+(defun qq-chat--line-fill-column ()
+  "Return the usable timeline width for the current chat buffer."
+  (or (and (window-live-p (get-buffer-window (current-buffer) t))
+           (window-body-width (get-buffer-window (current-buffer) t)))
+      (and (integerp fill-column) (> fill-column 0) fill-column)
+      80))
+
+(cl-defun qq-chat--insert-right-aligned-time
+    (time &optional left-prefix-width (overflow-newline-p t))
+  "Insert TIME at the shared disco timeline right edge.
+
+LEFT-PREFIX-WIDTH reserves a display-only prefix applied by the caller.
+OVERFLOW-NEWLINE-P controls whether an overlong row may move TIME to a new
+line; nil keeps service rows such as poke strictly one-line."
+  (when (and (stringp time) (not (string-empty-p time)))
+    (disco-ins-insert-right-aligned-text
+     time
+     (qq-chat--line-fill-column)
+     :face 'qq-msg-status
+     :left-prefix-width left-prefix-width
+     :overflow-newline-p overflow-newline-p)))
+
 (defun qq-chat--message-day-key (message)
   "Return local calendar day key string for MESSAGE, or nil."
   (let ((timestamp (alist-get 'time message)))
@@ -2550,9 +2572,11 @@ base emoji), never as OneBot CQ text."
 (defun qq-chat--insert-poke-message (message properties)
   "Insert decorative gray-tip MESSAGE using PROPERTIES.
 
-Pokes deliberately bypass the ordinary message header/body layout.  They are
-QQ actions, not authored text, so show one compact action row and an optional
-description instead of a normal sender heading, timestamp, and message body."
+Pokes deliberately bypass the ordinary message header/body layout.  Following
+telega's special-message inserter, render one centered `( action )' row with
+horizontal bars and keep the time at the far right.  QQ's native descriptive
+tail stays on that same row; truncate the action before allowing it to collide
+with the timestamp."
   (let* ((data (or (qq-state-poke-message-data message) '()))
          (actor (or (qq-chat--present-string (alist-get 'actor-name data))
                     (qq-chat--present-string (alist-get 'sender-name message))
@@ -2571,17 +2595,35 @@ description instead of a normal sender heading, timestamp, and message body."
                qq-media-poke-image-height)
             "✦"))
          (time (qq-chat--format-time-short (alist-get 'time message)))
+         (time-width (string-width time))
+         (max-content-width
+          (max 1 (- (qq-chat--line-fill-column) time-width 12)))
+         (content
+          (truncate-string-to-width
+           (concat image " "
+                   (string-join
+                    (delq nil (list actor action target detail))
+                    " "))
+           max-content-width nil nil "…"))
+         (core (concat "( " content " )"))
+         (available (- (qq-chat--line-fill-column)
+                       (string-width core)
+                       time-width
+                       8))
+         (bar-count (max 0 (floor (/ (max 0 available) 2))))
+         (bars (make-string bar-count ?-))
          (start (point))
          (poke-properties (append properties (list 'face 'qq-msg-poke))))
-    (insert "  " image "  " actor "  " action)
-    (when target
-      (insert "  " target))
-    (when (and (stringp time) (not (string-empty-p time)))
-      (insert "  " (propertize time 'face 'qq-msg-status)))
+    (insert bars " " core " " bars)
+    (qq-chat--insert-right-aligned-time time nil nil)
     (insert "\n")
-    (when detail
-      (insert "       " detail "\n"))
-    (add-text-properties start (point) poke-properties)))
+    (add-text-properties start (point) poke-properties)
+    (when (not (string-empty-p time))
+      (save-excursion
+        (goto-char (1- (point)))
+        (let ((time-start (- (point) (length time))))
+          (add-text-properties time-start (point)
+                               (list 'face 'qq-msg-status)))))))
 
 (defun qq-chat--card-segment-p (segment)
   "Return non-nil when SEGMENT is a normalized Ark rich card."
@@ -2985,11 +3027,11 @@ on the first inline line when the body is pure inline content."
                (when (and with-time
                           (stringp short-time)
                           (not (string-empty-p short-time)))
-                 (insert "  ")
-                 (let ((time-start (point)))
-                   (insert short-time)
-                   (add-text-properties time-start (point)
-                                        (list 'face 'qq-msg-status))))
+                 (qq-chat--insert-right-aligned-time
+                  short-time
+                  (string-width
+                   (or (qq-ui-prefix-state-current prefix-state) ""))
+                  t))
                (insert "\n")
                (qq-ui-apply-line-prefix start (point) prefix-state)
                (add-text-properties start (point) properties)
@@ -3000,11 +3042,11 @@ on the first inline line when the body is pure inline content."
                (start (point)))
           (insert (if (string-empty-p text) "(empty message)" text))
           (when (and (stringp short-time) (not (string-empty-p short-time)))
-            (insert "  ")
-            (let ((time-start (point)))
-              (insert short-time)
-              (add-text-properties time-start (point)
-                                   (list 'face 'qq-msg-status))))
+            (qq-chat--insert-right-aligned-time
+             short-time
+             (string-width
+              (or (qq-ui-prefix-state-current prefix-state) ""))
+             t))
           (insert "\n")
           (qq-ui-apply-line-prefix start (point) prefix-state)
           (add-text-properties start (point) properties)))
@@ -3045,7 +3087,12 @@ on the first inline line when the body is pure inline content."
                    (not (string-empty-p short-time))
                    (null inline-parts))
           (let ((start (point)))
-            (insert short-time "\n")
+            (qq-chat--insert-right-aligned-time
+             short-time
+             (string-width
+              (or (qq-ui-prefix-state-current prefix-state) ""))
+             t)
+            (insert "\n")
             (qq-ui-apply-line-prefix start (point) prefix-state)
             (add-text-properties
              start (point)
@@ -3130,10 +3177,8 @@ Visual model (telega-inspired; later appkit):
       (let ((header-start (point)))
         (qq-chat--insert-message-sender message title-face)
         (insert status-suffix)
-        (insert "  ")
-        (let ((time-start (point)))
-          (insert (qq-chat--format-time (alist-get 'time message)))
-          (add-text-properties time-start (point) (list 'face 'qq-msg-status)))
+        (qq-chat--insert-right-aligned-time
+         (qq-chat--format-time (alist-get 'time message)) nil t)
         (insert "\n")
         (add-text-properties
          header-start (point)
@@ -3162,10 +3207,8 @@ Visual model (telega-inspired; later appkit):
                help-echo "Open sender avatar"))))
         (qq-chat--insert-message-sender message title-face)
         (insert status-suffix)
-        (insert "  ")
-        (let ((time-start (point)))
-          (insert (qq-chat--format-time (alist-get 'time message)))
-          (add-text-properties time-start (point) (list 'face 'qq-msg-status)))
+        (qq-chat--insert-right-aligned-time
+         (qq-chat--format-time (alist-get 'time message)) nil t)
         (insert "\n")
         (qq-ui-append-face header-start (point) 'qq-msg-heading)
         (add-text-properties header-start (point) properties))

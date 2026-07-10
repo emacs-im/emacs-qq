@@ -1222,6 +1222,7 @@ second-level anchor."
        (when-let* ((self-id (qq-state-self-user-id)))
          (qq-state-apply-poke-notice
           `((time . ,(truncate (float-time)))
+            (emacs_local_p . t)
             (post_type . "notice")
             (notice_type . "notify")
             (sub_type . "poke")

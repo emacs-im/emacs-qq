@@ -178,15 +178,11 @@ Same idea as `telega-msg-inline-reply'."
   :group 'qq)
 
 (defface qq-msg-poke
-  '((((class color) (background light))
-     :foreground "#8a5a00" :background "#fff4cf" :extend t)
-    (((class color) (background dark))
-     :foreground "#ffd866" :background "#3a3322" :extend t)
-    (t :inherit qq-msg-inline-reply :extend t))
+  '((t :inherit shadow))
   "Face for QQ gray-tip poke decorations.
 
-Pokes use a separate visual treatment instead of the ordinary message
-heading/body layout."
+Pokes use telega-style centered special-message chrome instead of the ordinary
+message heading/body layout."
   :group 'qq)
 
 (defface qq-msg-deleted
@@ -231,7 +227,7 @@ Same defaults as `telega-msg-deleted'."
   :type 'integer
   :group 'qq)
 
-(defcustom qq-media-poke-image-height 48
+(defcustom qq-media-poke-image-height 28
   "Maximum pixel height used for decorative poke action images."
   :type 'integer
   :group 'qq)

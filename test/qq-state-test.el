@@ -186,6 +186,70 @@
      (should (equal (alist-get 'action data) "喷了喷"))
      (should (equal (alist-get 'detail data) "的加分喷雾，分数++")))))
 
+(ert-deftest qq-state-poke-promotes-local-row-when-notice-arrives-later ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
+   (let (events local-id)
+     (add-hook 'qq-state-change-hook (lambda (event) (push event events)))
+     (setq local-id
+           (alist-get
+            'local-id
+            (qq-state-apply-poke-notice
+             '((time . 1710000000)
+               (emacs_local_p . t)
+               (post_type . "notice")
+               (notice_type . "notify")
+               (sub_type . "poke")
+               (group_id . "20001")
+               (user_id . "90001")
+               (target_id . "10002")))))
+     (qq-state-apply-poke-notice
+      '((time . 1710000001)
+        (post_type . "notice")
+        (notice_type . "notify")
+        (sub_type . "poke")
+        (message_id . "9007199254741007780")
+        (group_id . "20001")
+        (user_id . "90001")
+        (target_id . "10002")))
+     (let ((messages (qq-state-session-messages "group:20001")))
+       (should (= (length messages) 1))
+       (should (equal (alist-get 'server-id (car messages))
+                      "9007199254741007780"))
+       (should-not (alist-get 'local-id (car messages))))
+     (should (equal (plist-get (car events) :previous-anchor) local-id)))))
+
+(ert-deftest qq-state-poke-ignores-late-local-callback-after-real-notice ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
+   (qq-state-apply-poke-notice
+    '((time . 1710000000)
+      (post_type . "notice")
+      (notice_type . "notify")
+      (sub_type . "poke")
+      (message_id . "9007199254741007781")
+      (group_id . "20001")
+      (user_id . "90001")
+      (target_id . "10002")
+      (raw_info . (((type . "nor") (txt . "喷了喷"))))))
+   (qq-state-apply-poke-notice
+    '((time . 1710000001)
+      (emacs_local_p . t)
+      (post_type . "notice")
+      (notice_type . "notify")
+      (sub_type . "poke")
+      (group_id . "20001")
+      (user_id . "90001")
+      (target_id . "10002")))
+   (let* ((messages (qq-state-session-messages "group:20001"))
+          (message (car messages)))
+     (should (= (length messages) 1))
+     (should (equal (alist-get 'server-id message)
+                    "9007199254741007781"))
+     (should-not (alist-get 'local-id message))
+     (should (equal (alist-get 'action (qq-state-poke-message-data message))
+                    "喷了喷")))))
+
 (ert-deftest qq-state-apply-recent-contacts-creates-session-summary ()
   (qq-test-with-reset
    (qq-state-apply-recent-contacts
