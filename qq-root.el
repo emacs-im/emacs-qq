@@ -444,6 +444,14 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
 (defun qq-root-render ()
   "Render the root buffer from local state."
   (interactive)
+  ;; Root is a generated, read-only view.  Recording each erase/reinsert cycle
+  ;; can retain many complete copies of the session list and eventually trip
+  ;; `undo-outer-limit'.  Enforce this here as well as in `qq-root-mode' so an
+  ;; already-open buffer (or one where undo was re-enabled) is repaired on its
+  ;; next refresh.
+  (unless (eq buffer-undo-list t)
+    (buffer-disable-undo))
+  (setq-local buffer-undo-list t)
   (if qq-root--rendering
       (setq qq-root--rerender-pending t)
     (let ((qq-root--rendering t))
@@ -505,6 +513,8 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
 `?' opens `qq-root-transient' (discoverable command menu)."
   (setq buffer-read-only t)
   (setq truncate-lines t)
+  (buffer-disable-undo)
+  (setq-local buffer-undo-list t)
   (setq-local switch-to-buffer-preserve-window-point nil)
   (setq-local qq-root--fill-column nil)
   (setq-local qq-root--rendering nil)

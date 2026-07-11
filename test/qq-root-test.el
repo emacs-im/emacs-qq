@@ -98,6 +98,24 @@
         (should (= qq-root--fill-column 88))
         (should (= compute-calls 0))))))
 
+(ert-deftest qq-root-mode-disables-undo-history ()
+  (with-temp-buffer
+    (qq-root-mode)
+    (should (eq buffer-undo-list t))))
+
+(ert-deftest qq-root-render-discards-reenabled-undo-history ()
+  (qq-root-test-with-reset
+   (with-temp-buffer
+     (qq-root-mode)
+     (buffer-enable-undo)
+     (let ((inhibit-read-only t))
+       (insert "stale generated root contents"))
+     (should (listp buffer-undo-list))
+     (cl-letf (((symbol-function 'qq-root--selected-window) (lambda () nil))
+               ((symbol-function 'qq-root--display-window) (lambda () nil)))
+       (qq-root-render))
+     (should (eq buffer-undo-list t)))))
+
 (ert-deftest qq-root-selected-window-refreshes-cached-width ()
   (with-temp-buffer
     (qq-root-mode)
