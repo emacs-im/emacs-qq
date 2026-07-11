@@ -51,18 +51,15 @@
     (should-not (file-exists-p cache-file))
     (should-not (file-directory-p qq-media-cache-directory))))
 
-(ert-deftest qq-media-clear-cache-cancels-active-download-queues ()
+(ert-deftest qq-media-clear-cache-cancels-active-preview-downloads ()
   (let ((qq-media--remote-image-plz-queue 'image-queue)
-        (qq-media--file-plz-queue 'file-queue)
         cleared)
     (cl-letf (((symbol-function 'plz-clear)
                (lambda (queue) (push queue cleared))))
       (qq-media-clear-cache)
-      (should (= (length cleared) 2))
+      (should (= (length cleared) 1))
       (should (memq 'image-queue cleared))
-      (should (memq 'file-queue cleared))
-      (should-not qq-media--remote-image-plz-queue)
-      (should-not qq-media--file-plz-queue))))
+      (should-not qq-media--remote-image-plz-queue))))
 
 (ert-deftest qq-media-ensure-resource-image-starts-remote-download-for-url-only-resource ()
   (qq-media-test-with-reset
@@ -546,114 +543,34 @@
       (when (file-directory-p dir)
         (delete-directory dir t)))))
 
-(ert-deftest qq-media-open-remote-image-caches-and-opens-in-emacs ()
-  "A remote image is cached by content type and never sent to a browser."
-  (let* ((qq-media-cache-directory (make-temp-file "qq-media-open" t))
-         (qq-media-animate-gifs nil)
-         (resource '((url . "https://example.com/assets/no-extension")))
-         opened-file)
-    (unwind-protect
-        (cl-letf (((symbol-function 'url-copy-file)
-                   (lambda (_url target &optional _ok-if-already-exists)
-                     (with-temp-file target
-                       (set-buffer-multibyte nil)
-                       (insert "GIF89aqq-test"))))
-                  ((symbol-function 'browse-url)
-                   (lambda (&rest _args)
-                     (ert-fail "media must not open in a browser"))))
-          (let ((qq-media-open-file-function
-                 (lambda (file)
-                   (setq opened-file file))))
-            (qq-media-open-resource resource 'image "image:test"))
-          (should (stringp opened-file))
-          (should (file-exists-p opened-file))
-          (should (equal (file-name-extension opened-file) "gif"))
-          (should (file-in-directory-p opened-file qq-media-cache-directory)))
-      (when (file-directory-p qq-media-cache-directory)
-        (delete-directory qq-media-cache-directory t)))))
-
-(ert-deftest qq-media-open-gif-starts-only-an-idle-animation ()
-  "Opening a GIF starts looping, but never toggles an active animation off."
-  (let ((qq-media-animate-gifs t)
-        (gif "/tmp/qq-animated.gif")
-        (timer nil)
-        (toggle-count 0))
-    (with-temp-buffer
-      (cl-letf (((symbol-function 'get-file-buffer)
-                 (lambda (_file) (current-buffer)))
-                ((symbol-function 'derived-mode-p)
-                 (lambda (&rest _modes) t))
-                ((symbol-function 'image-get-display-property)
-                 (lambda () '(image :type gif)))
-                ((symbol-function 'image-multi-frame-p)
-                 (lambda (_image) '(2 . 0.1)))
-                ((symbol-function 'image-animate-timer)
-                 (lambda (_image) timer))
-                ((symbol-function 'image-toggle-animation)
-                 (lambda () (cl-incf toggle-count))))
-        (qq-media--maybe-start-gif-animation gif)
-        (should (= toggle-count 1))
-        (should image-animate-loop)
-        (setq timer t)
-        (qq-media--maybe-start-gif-animation gif)
-        (should (= toggle-count 1))))))
-
-(ert-deftest qq-media-open-video-url-uses-configured-player ()
-  "Video URLs are passed to mpv without browser fallback."
-  (let ((qq-media-video-player-command "mpv --no-terminal")
-        command)
-    (cl-letf (((symbol-function 'qq-media--command-runnable-p)
-               (lambda (_configured-command) t))
-              ((symbol-function 'make-process)
-               (lambda (&rest properties)
-                 (setq command (plist-get properties :command))
-                 'qq-test-player))
-              ((symbol-function 'browse-url)
-               (lambda (&rest _args)
-                 (ert-fail "video must not open in a browser"))))
-      (should
-       (eq (qq-media-open-resource
-            '((url . "https://example.com/movie.mp4")) 'video)
-           'qq-test-player))
-      (should (equal command
-                     '("mpv" "--no-terminal"
-                       "https://example.com/movie.mp4"))))))
-
-(ert-deftest qq-media-open-video-errors-when-player-is-unavailable ()
-  "A missing player is explicit and does not silently use a browser."
-  (let ((qq-media-video-player-command nil))
-    (cl-letf (((symbol-function 'browse-url)
-               (lambda (&rest _args)
-                 (ert-fail "video must not open in a browser"))))
-      (should-error
-       (qq-media-open-resource
-       '((url . "https://example.com/movie.mp4")) 'video)
-       :type 'user-error))))
-
-(ert-deftest qq-media-remote-file-download-streams-asynchronously-with-plz ()
-  (let ((qq-media--file-plz-queue nil)
-        queued-properties
-        success-value
-        failure)
-    (cl-letf (((symbol-function 'make-plz-queue) (lambda (&rest _) 'queue))
-              ((symbol-function 'plz-run) #'ignore)
-              ((symbol-function 'plz-queue)
+(ert-deftest qq-media-open-resource-adapts-shared-backend-and-cache ()
+  "QQ supplies only its cache policy to the shared media opener."
+  (let ((qq-media-cache-directory "/tmp/qq-media-cache/")
+        (qq-media--resource-cache (make-hash-table :test #'equal))
+        captured)
+    (cl-letf (((symbol-function 'disco-media-open-resource)
                (lambda (&rest arguments)
-                 (setq queued-properties (nthcdr 3 arguments))))
-              ((symbol-function 'url-copy-file)
-               (lambda (&rest _)
-                 (ert-fail "large file downloads must not block on url-copy-file"))))
-      (qq-media--copy-or-download-resource-to-async
-       '((url . "https://example.com/report.pdf"))
-       "/tmp/qq-report.pdf"
-       (lambda (file) (setq success-value file))
-       (lambda (reason) (setq failure reason)))
-      (should-not success-value)
-      (should-not failure)
-      (should (equal (plist-get queued-properties :as)
-                     '(file "/tmp/qq-report.pdf")))
-      (funcall (plist-get queued-properties :then) "/tmp/qq-report.pdf")
-      (should (equal success-value "/tmp/qq-report.pdf")))))
+                 (setq captured arguments)
+                 (funcall
+                  (plist-get (nthcdr 3 arguments) :cache-update-function)
+                  '((file . "/tmp/cat.png")
+                    (url . "https://example.com/cat.png")))
+                 'opened)))
+      (should (eq 'opened
+                  (qq-media-open-resource
+                   '((url . "https://example.com/cat.png"))
+                   'image
+                   "image:test")))
+      (should (equal (nth 0 captured)
+                     '((url . "https://example.com/cat.png"))))
+      (should (eq (nth 1 captured) 'image))
+      (should (equal (nth 2 captured) "image:test"))
+      (should (equal (plist-get (nthcdr 3 captured) :cache-directory)
+                     qq-media-cache-directory))
+      (should (equal (plist-get (nthcdr 3 captured) :client-label) "qq"))
+      (should (equal (alist-get 'file
+                                (qq-media--cached-resource "image:test"))
+                     "/tmp/cat.png")))))
 
 (ert-deftest qq-media-open-video-file-segment-delegates-to-player ()
   "An mp4 delivered as a file segment still takes the video-player path."
@@ -667,7 +584,7 @@
                (lambda (_segment callback &optional _errback)
                  (funcall callback
                           '((url . "https://example.com/movie.mp4")))))
-              ((symbol-function 'qq-media-play-video-source)
+              ((symbol-function 'disco-media-play-video-source)
                (lambda (source)
                  (setq played-source source))))
       (qq-media-segment-open segment)

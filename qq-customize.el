@@ -387,30 +387,6 @@ fallbacks and previews when the face image is not yet available."
   :type 'integer
   :group 'qq)
 
-(defcustom qq-media-open-file-function #'find-file
-  "Function used to open downloaded files and images.
-
-The default keeps media inside Emacs, matching telega's
-`telega-open-file-function'.  The function receives one local filename."
-  :type 'function
-  :group 'qq)
-
-(defcustom qq-media-animate-gifs t
-  "When non-nil, start GIF animation after opening it in `image-mode'."
-  :type 'boolean
-  :group 'qq)
-
-(defcustom qq-media-video-player-command
-  (and (executable-find "mpv") "mpv")
-  "Command used to play QQ video files and URLs.
-
-The default is mpv when available.  Unlike the old media path, an unset or
-unrunnable command reports an error instead of opening a web browser."
-  :type '(choice
-          (const :tag "No video player" nil)
-          (string :tag "Command line"))
-  :group 'qq)
-
 (defcustom qq-media-download-directory
   (locate-user-emacs-file "qq-downloads/")
   "Directory used for QQ media downloads copied from NapCat resources."
