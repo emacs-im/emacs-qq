@@ -4,7 +4,7 @@
 
 ;;; Commentary:
 
-;; Transient command menus modeled after disco-room / telega:
+;; Transient command menus for the root, chat, and message contexts:
 ;; - chat-level menu (`qq-chat-transient')
 ;; - message-at-point menu (`qq-chat-message-transient')
 ;; - attach menu (`qq-chat-attach-transient')
@@ -16,6 +16,7 @@
 ;;; Code:
 
 (require 'transient)
+(require 'appkit-media)
 (require 'qq-api)
 (require 'qq-chat)
 (require 'qq-media)
@@ -92,7 +93,7 @@
 
 (defun qq-transient--resource-inapt-p ()
   "Return non-nil when open-resource is unavailable at point."
-  (disco-media-card-action-inapt-reason 'open))
+  (appkit-media-card-action-inapt-reason 'open))
 
 (defun qq-transient--avatar-inapt-p ()
   "Return non-nil when avatar open is unavailable at point."
@@ -192,7 +193,7 @@
 (transient-define-prefix qq-chat-message-transient ()
   "Message actions for the QQ chat message at point.
 
-Prefer this over inline button rows (telega/disco style)."
+Prefer this over inline button rows."
   [["Message"
     ("r" "Reply" qq-chat-reply-to-message
      :inapt-if qq-transient--reply-inapt-p)
@@ -211,17 +212,17 @@ Prefer this over inline button rows (telega/disco style)."
     ("g" "Goto reply target" qq-chat-goto-reply
      :inapt-if qq-transient--goto-reply-inapt-p)]
    ["Media"
-    ("o" "Open / play" disco-media-card-open
+    ("o" "Open / play" appkit-media-card-open
      :inapt-if qq-transient--resource-inapt-p)
-    ("D" "Download / retry" disco-media-card-download
+    ("D" "Download / retry" appkit-media-card-download
      :inapt-if (lambda ()
-                 (disco-media-card-action-inapt-reason 'download)))
-    ("s" "Save as" disco-media-card-save-as
+                 (appkit-media-card-action-inapt-reason 'download)))
+    ("s" "Save as" appkit-media-card-save-as
      :inapt-if (lambda ()
-                 (disco-media-card-action-inapt-reason 'save-as)))
-    ("y" "Copy media URL" disco-media-card-copy-url
+                 (appkit-media-card-action-inapt-reason 'save-as)))
+    ("y" "Copy media URL" appkit-media-card-copy-url
      :inapt-if (lambda ()
-                 (disco-media-card-action-inapt-reason 'copy-url)))]
+                 (appkit-media-card-action-inapt-reason 'copy-url)))]
    ["Navigate"
     ("n" "Next message" qq-chat-next-message)
     ("p" "Previous message" qq-chat-previous-message)

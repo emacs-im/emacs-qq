@@ -37,11 +37,11 @@
                     (last-message-preview . "quiet message")))
          (row (qq-root--session-one-line-row session)))
     (should (equal "[mute:9] quiet message"
-                   (disco-view-one-line-row-preview row)))
-    (should (= 9 (disco-view-one-line-row-preview-leading-length row)))
+                   (appkit-view-one-line-row-preview row)))
+    (should (= 9 (appkit-view-one-line-row-preview-leading-length row)))
     (should (eq 'shadow
-                (disco-view-one-line-row-preview-leading-face row)))
-    (should-not (disco-view-one-line-row-time-tail-face row))))
+                (appkit-view-one-line-row-preview-leading-face row)))
+    (should-not (appkit-view-one-line-row-time-tail-face row))))
 
 (ert-deftest qq-root-shows-muted-state-without-messages ()
   (should (equal "[mute]"

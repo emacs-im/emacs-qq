@@ -3,7 +3,7 @@
 ;; Author: emacs-qq contributors
 ;; Keywords: comm
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1") (websocket "1.16") (transient "0.3") (plz "0.8") (appkit "0.1") (disco "0"))
+;; Package-Requires: ((emacs "27.1") (websocket "1.16") (transient "0.3") (appkit "0.1"))
 
 ;;; Commentary:
 
@@ -11,10 +11,10 @@
 ;;
 ;; Current MVP scope:
 ;; - connect to NapCat over OneBot websocket
-;; - browse recent sessions in a disco-style root buffer
+;; - browse recent sessions in an appkit-backed root buffer
 ;; - open one chat buffer, fetch history, send text messages
 ;; - keep state updated from websocket events
-;; - transient menus for root / chat / message / attach (telega/disco style)
+;; - transient menus for root / chat / message / attachments
 
 ;;; Code:
 

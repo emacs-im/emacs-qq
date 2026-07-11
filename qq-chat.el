@@ -4,7 +4,8 @@
 
 ;;; Commentary:
 
-;; Chat buffer modeled after disco.el's room view, while borrowing
+;; Chat buffer built on appkit's shared timeline and presentation primitives,
+;; while borrowing
 ;; telega.el-style naming and the most familiar chat input bindings.
 
 ;;; Code:
@@ -15,13 +16,13 @@
 (require 'subr-x)
 (require 'appkit-core)
 (require 'appkit-invalidation)
-(require 'disco-chat-avatar)
+(require 'appkit-chat-avatar)
 (require 'appkit-chatbuf)
 (require 'appkit-chat-timeline)
-(require 'disco-ins)
-(require 'disco-media)
-(require 'disco-ui)
-(require 'disco-view)
+(require 'appkit-chat-ins)
+(require 'appkit-media)
+(require 'appkit-ui)
+(require 'appkit-view)
 (require 'qq-api)
 (require 'qq-customize)
 (require 'qq-media)
@@ -275,7 +276,7 @@ of the default chrome."
 
 (defun qq-chat--compute-fill-column (&optional window)
   "Compute telega-style timeline width for WINDOW."
-  (disco-view-window-fill-column
+  (appkit-view-window-fill-column
    (or window (qq-chat--render-window))
    qq-chat-auto-fill-margin-columns))
 
@@ -296,13 +297,13 @@ of the default chrome."
 
 (cl-defun qq-chat--insert-right-aligned-time
     (time &optional left-prefix-width (overflow-newline-p t))
-  "Insert TIME at the shared disco timeline right edge.
+  "Insert TIME at the shared appkit timeline right edge.
 
 LEFT-PREFIX-WIDTH reserves a display-only prefix applied by the caller.
 OVERFLOW-NEWLINE-P controls whether an overlong row may move TIME to a new
 line; nil keeps service rows such as poke strictly one-line."
   (when (and (stringp time) (not (string-empty-p time)))
-    (disco-ins-insert-right-aligned-text
+    (appkit-chat-ins-insert-right-aligned-text
      time
      (qq-chat--line-fill-column)
      :face 'qq-msg-status
@@ -404,7 +405,7 @@ available."
                      (user-error "qq: sender has no user profile"))))
          (help-echo "Open sender profile")
          (properties '(read-only t front-sticky t rear-nonsticky (read-only))))
-    (disco-ui-insert-action-button
+    (appkit-ui-insert-action-button
      primary
      action
      :face face
@@ -415,7 +416,7 @@ available."
         (insert " • ")
         (add-text-properties separator-start (point)
                              (append properties '(face shadow))))
-      (disco-ui-insert-action-button
+      (appkit-ui-insert-action-button
        secondary
        action
        :face face
@@ -846,11 +847,11 @@ repeat it here.  EWOC header is reserved for history load state."
           (with-temp-buffer
             (cond
              ((eq (qq-chat--history-get :loading) 'newer)
-              (disco-view-insert-note-line "(loading newer messages…)"))
+              (appkit-view-insert-note-line "(loading newer messages…)"))
              (qq-chat--history-loading
-              (disco-view-insert-note-line "(loading older messages…)"))
+              (appkit-view-insert-note-line "(loading older messages…)"))
              (qq-chat--history-exhausted
-              (disco-view-insert-note-line "(older history exhausted)")))
+              (appkit-view-insert-note-line "(older history exhausted)")))
             (when (> (buffer-size) 0)
               (insert "\n"))
             (buffer-string))))
@@ -1204,7 +1205,7 @@ Order (telega-inspired):
 (defun qq-chat--render-empty-placeholder ()
   "Insert the empty timeline placeholder row."
   (let ((start (point)))
-    (disco-view-insert-note-line "No messages loaded yet.")
+    (appkit-view-insert-note-line "No messages loaded yet.")
     (insert "\n")
     (add-text-properties
      start (point)
@@ -1289,7 +1290,7 @@ Favorite stickers (`image' with sub_type 1, or mface) try local thumbs."
               (file (or (alist-get 'file data)
                         (alist-get 'path data)))
               (image (and file
-                          (qq-media-file-present-p file)
+                          (appkit-media-file-present-p file)
                           (qq-media--image-from-file
                            file
                            (max qq-media-face-image-height 32)))))
@@ -1301,7 +1302,7 @@ Favorite stickers (`image' with sub_type 1, or mface) try local thumbs."
                         (alist-get 'path data)))
               (sticker-p (member sub '(1 "1")))
               (image (and file
-                          (qq-media-file-present-p file)
+                          (appkit-media-file-present-p file)
                           (qq-media--image-from-file
                            file
                            (if sticker-p
@@ -1680,7 +1681,7 @@ Never dump OneBot CQ / raw_message here — previews come from
 
 (defun qq-chat--insert-date-separator-row (day-label)
   "Insert a date separator row for DAY-LABEL."
-  (disco-view-insert-note-line
+  (appkit-view-insert-note-line
    (format "-- %s --" day-label)
    :face 'qq-msg-date-separator))
 
@@ -1688,7 +1689,7 @@ Never dump OneBot CQ / raw_message here — previews come from
   "Insert the unread separator row above the first unread message.
 
 Label matches telega's unread bar wording (\"Unread Messages\")."
-  (disco-view-insert-note-line
+  (appkit-view-insert-note-line
    "Unread Messages"
    :face 'qq-msg-unread-divider))
 
@@ -1900,7 +1901,7 @@ REPLY-ID via `qq-chat-goto-message'."
                              (qq-chat-goto-message target))
                    'qq-chat-reply-id target
                    'qq-chat-reply-button t)))
-    (disco-ui-apply-line-prefix reply-start (point) prefix-state)))
+    (appkit-ui-apply-line-prefix reply-start (point) prefix-state)))
 
 (defun qq-chat--face-segment-id (segment)
   "Return QQ base face id from face SEGMENT, or nil."
@@ -1958,7 +1959,7 @@ base emoji), never as OneBot CQ text."
 (defun qq-chat--insert-gray-tip-message (message properties)
   "Insert centered JSON gray-tip MESSAGE using PROPERTIES."
   (let ((start (point)))
-    (disco-ins-insert-divider-row
+    (appkit-chat-ins-insert-divider-row
      (qq-chat--message-body message)
      'qq-msg-poke
      (qq-chat--line-fill-column))
@@ -2033,9 +2034,9 @@ with the timestamp."
          (prompt (alist-get 'prompt data))
          (detail (or (alist-get 'detail data) "Open Mail"))
          (url (alist-get 'url data))
-         (disco-ui-card-indent-prefix-state prefix-state)
-         (card-prefix-state (disco-ui-card-prefix-state)))
-    (disco-ui-insert-prefixed-lines
+         (appkit-ui-card-indent-prefix-state prefix-state)
+         (card-prefix-state (appkit-ui-card-prefix-state)))
+    (appkit-ui-insert-prefixed-lines
      card-prefix-state
      (if (and (stringp sender) (not (string-empty-p sender)))
          (format "Mail · %s" sender)
@@ -2043,21 +2044,21 @@ with the timestamp."
      :face 'bold
      :properties properties)
     (when (and (stringp subject) (not (string-empty-p subject)))
-      (disco-ui-insert-prefixed-lines
+      (appkit-ui-insert-prefixed-lines
        card-prefix-state subject :properties properties))
     (when-let* ((body (cond
                        ((and (stringp content) (not (string-empty-p content))) content)
                        ((and (stringp prompt) (not (string-empty-p prompt))) prompt))))
-      (disco-ui-insert-prefixed-lines
+      (appkit-ui-insert-prefixed-lines
        card-prefix-state body :face 'shadow :properties properties))
     (when (and (stringp url) (not (string-empty-p url)))
       (let ((start (point)))
-        (disco-ui-insert-action-button
+        (appkit-ui-insert-action-button
          (format "[%s]" detail)
          (lambda () (browse-url url t))
          :help-echo "Open this message in QQ Mail")
         (insert "\n")
-        (disco-ui-apply-line-prefix start (point) card-prefix-state)
+        (appkit-ui-apply-line-prefix start (point) card-prefix-state)
         (add-text-properties start (point) properties)))))
 
 (defun qq-chat--card-kind-label (kind)
@@ -2104,22 +2105,22 @@ with the timestamp."
                    'button t
                    'category 'default-button
                    'action (lambda (_button) (funcall open-action))))))
-         (disco-ui-card-indent-prefix-state prefix-state)
-         (card-prefix-state (disco-ui-card-prefix-state))
+         (appkit-ui-card-indent-prefix-state prefix-state)
+         (card-prefix-state (appkit-ui-card-prefix-state))
          (start (point)))
-    (disco-ui-insert-prefixed-lines
+    (appkit-ui-insert-prefixed-lines
      card-prefix-state
      (if source (format "%s · %s" label source) label)
      :face 'bold
      :properties card-properties)
     (when title
-      (disco-ui-insert-prefixed-lines
+      (appkit-ui-insert-prefixed-lines
        card-prefix-state title :properties card-properties))
     (when body
-      (disco-ui-insert-prefixed-lines
+      (appkit-ui-insert-prefixed-lines
        card-prefix-state body :face 'shadow :properties card-properties))
     (when (and summary (not (equal summary body)))
-      (disco-ui-insert-prefixed-lines
+      (appkit-ui-insert-prefixed-lines
        card-prefix-state summary :face 'shadow :properties card-properties))
     (when open-action
       (add-text-properties start (point) card-properties))))
@@ -2198,7 +2199,7 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
   (let* ((capabilities (or capabilities
                            (qq-media-segment-capabilities segment)))
          (url (plist-get capabilities :remote-url)))
-    (disco-media-card-context-create
+    (appkit-media-card-context-create
      :payload segment
      :kind (qq-chat--segment-media-card-kind segment)
      :title (qq-chat--segment-media-summary segment)
@@ -2229,9 +2230,9 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
          (capabilities (qq-media-segment-capabilities segment))
          (context (qq-chat--segment-media-card-context
                    segment capabilities))
-         (prefix-state (let ((disco-ui-card-indent-prefix-state prefix-state))
-                         (disco-ui-card-prefix-state))))
-    (disco-ins-insert-media-card
+         (prefix-state (let ((appkit-ui-card-indent-prefix-state prefix-state))
+                         (appkit-ui-card-prefix-state))))
+    (appkit-chat-ins-insert-media-card
      :kind (qq-chat--segment-media-card-kind segment)
      :title (qq-chat--segment-media-summary segment)
      :details (unless (string-empty-p meta) (list meta))
@@ -2254,7 +2255,7 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
             (preview
              (condition-case _
                  (progn
-                   (disco-media-insert-image-slices
+                   (appkit-media-insert-image-slices
                     preview nil nil
                     (cond
                      ((equal (alist-get 'type segment) "mface") "[sticker]")
@@ -2264,19 +2265,19 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
                (error
                 (insert "[preview unavailable]")))
              (when preview-end
-               (disco-media-add-action-properties
+               (appkit-media-add-action-properties
                 preview-start preview-end
                 (lambda (&optional _event)
                   (interactive)
-                  (disco-media-card-call-action 'open context))
+                  (appkit-media-card-call-action 'open context))
                 (format "Open %s" (downcase kind-label))))
              (insert "\n"))
             (loading
              (insert "[loading preview]\n"))
             (t
              (insert "[preview unavailable]\n")))
-           (disco-ui-apply-line-prefix preview-start (point) card-prefix-state)
-           (disco-ui-append-face preview-start (point) 'shadow)))))))
+           (appkit-ui-apply-line-prefix preview-start (point) card-prefix-state)
+           (appkit-ui-append-face preview-start (point) 'shadow)))))))
 
 (defun qq-chat--insert-message-body (message prefix-state properties)
   "Insert MESSAGE content body using PREFIX-STATE and PROPERTIES."
@@ -2284,14 +2285,14 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
         (inline-parts nil))
     (cl-labels ((flush-inline ()
                   (when inline-parts
-                    (disco-ui-insert-prefixed-lines
+                    (appkit-ui-insert-prefixed-lines
                      prefix-state
                      (mapconcat #'identity (nreverse inline-parts) "")
                      :properties properties)
                     (setq inline-parts nil))))
       (if (or (qq-state-message-recalled-p message)
               (null segments))
-          (disco-ui-insert-prefixed-lines prefix-state (qq-chat--message-body message) :properties properties)
+          (appkit-ui-insert-prefixed-lines prefix-state (qq-chat--message-body message) :properties properties)
         (dolist (segment segments)
           (let ((type (alist-get 'type segment)))
             (unless (equal type "reply")
@@ -2371,12 +2372,12 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
                 (if set "added" "removed") emoji-id)))))
 
 (defun qq-chat--insert-reaction-line (message prefix-state properties)
-  "Insert shared disco reaction chips adapted for QQ MESSAGE."
+  "Insert shared appkit reaction chips adapted for QQ MESSAGE."
   (let ((reactions (qq-state-message-reactions message))
         (message-id (alist-get 'server-id message)))
     (when reactions
       (when-let* ((span
-                   (disco-ins-insert-reaction-line
+                   (appkit-chat-ins-insert-reaction-line
                     reactions
                     :prefix prefix-state
                     :selected-face 'qq-msg-reaction-chosen
@@ -2426,10 +2427,10 @@ on the first inline line when the body is pure inline content."
                  (qq-chat--insert-right-aligned-time
                   short-time
                   (string-width
-                   (or (disco-ui-prefix-state-current prefix-state) ""))
+                   (or (appkit-ui-prefix-state-current prefix-state) ""))
                   t))
                (insert "\n")
-               (disco-ui-apply-line-prefix start (point) prefix-state)
+               (appkit-ui-apply-line-prefix start (point) prefix-state)
                (add-text-properties start (point) properties)
                (setq inline-parts nil)))))
       (cond
@@ -2441,10 +2442,10 @@ on the first inline line when the body is pure inline content."
             (qq-chat--insert-right-aligned-time
              short-time
              (string-width
-              (or (disco-ui-prefix-state-current prefix-state) ""))
+              (or (appkit-ui-prefix-state-current prefix-state) ""))
              t))
           (insert "\n")
-          (disco-ui-apply-line-prefix start (point) prefix-state)
+          (appkit-ui-apply-line-prefix start (point) prefix-state)
           (add-text-properties start (point) properties)))
        (t
         (dolist (segment segments)
@@ -2486,10 +2487,10 @@ on the first inline line when the body is pure inline content."
             (qq-chat--insert-right-aligned-time
              short-time
              (string-width
-              (or (disco-ui-prefix-state-current prefix-state) ""))
+              (or (appkit-ui-prefix-state-current prefix-state) ""))
              t)
             (insert "\n")
-            (disco-ui-apply-line-prefix start (point) prefix-state)
+            (appkit-ui-apply-line-prefix start (point) prefix-state)
             (add-text-properties
              start (point)
              (append properties (list 'face 'qq-msg-status))))))))))
@@ -2528,9 +2529,9 @@ on the first inline line when the body is pure inline content."
                      (not (equal (format "%s" sender-id) "0"))
                      (qq-media-avatar-image sender-id)))
          (prefixes
-          (disco-chat-avatar-prefixes
+          (appkit-chat-avatar-prefixes
            image "@"
-           :pixel-size (disco-chat-avatar-two-line-pixel-size)
+           :pixel-size (appkit-chat-avatar-two-line-pixel-size)
            :resize t))
          (avatar-properties
           (list 'mouse-face 'highlight
@@ -2575,16 +2576,16 @@ Visual model (telega-inspired; later appkit):
           (or (plist-get avatar-prefixes :rest-body) "  "))
          (body-prefix-state
           (if compact
-              (disco-ui-make-prefix-state body-rest-prefix body-rest-prefix)
-            (disco-ui-make-prefix-state body-first-prefix body-rest-prefix)))
+              (appkit-ui-make-prefix-state body-rest-prefix body-rest-prefix)
+            (appkit-ui-make-prefix-state body-first-prefix body-rest-prefix)))
          (short-time (qq-chat--format-time-short (alist-get 'time message))))
     (when (and (stringp insert-date) (not (string-empty-p insert-date)))
       (qq-chat--insert-date-separator-row (qq-chat--message-day-label insert-date)))
     (when insert-unread
       (qq-chat--insert-unread-divider-row))
     (when marked
-      (disco-ui-insert-prefixed-lines
-       (disco-ui-make-prefix-state body-rest-prefix body-rest-prefix)
+      (appkit-ui-insert-prefixed-lines
+       (appkit-ui-make-prefix-state body-rest-prefix body-rest-prefix)
        "✓ selected for merged forwarding"
        :face 'warning
        :properties properties))
@@ -2604,13 +2605,13 @@ Visual model (telega-inspired; later appkit):
          (string-width header-prefix)
          t)
         (insert "\n")
-        (disco-ui-apply-line-prefix
+        (appkit-ui-apply-line-prefix
          header-start (point)
-         (disco-ui-make-prefix-state header-prefix body-rest-prefix))
+         (appkit-ui-make-prefix-state header-prefix body-rest-prefix))
         (add-text-properties
          header-start (point)
          (append properties (list 'face 'qq-msg-deleted)))
-        (disco-ui-insert-prefixed-lines
+        (appkit-ui-insert-prefixed-lines
          body-prefix-state
          (qq-chat--message-body message)
          :properties (append properties (list 'face 'qq-msg-deleted)))))
@@ -2631,10 +2632,10 @@ Visual model (telega-inspired; later appkit):
          (string-width header-prefix)
          t)
         (insert "\n")
-        (disco-ui-apply-line-prefix
+        (appkit-ui-apply-line-prefix
          header-start (point)
-         (disco-ui-make-prefix-state header-prefix body-rest-prefix))
-        (disco-ui-append-face header-start (point) 'qq-msg-heading)
+         (appkit-ui-make-prefix-state header-prefix body-rest-prefix))
+        (appkit-ui-append-face header-start (point) 'qq-msg-heading)
         (add-text-properties header-start (point) properties))
       (when reply-id
         (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
@@ -2807,7 +2808,7 @@ Return non-nil on success."
       (goto-char (or (appkit-chatbuf-input-start-position) (point-max))))))
 
 (defun qq-chat-load-older-messages (&optional quiet)
-  "Load one older history page for the current chat (telega/disco `M-<').
+  "Load one older history page for the current chat with `M-<'.
 
 Uses the oldest cached snowflake `server-id' as NapCat `message_seq'.  Guards
 against concurrent requests and marks history exhausted when NapCat returns no
@@ -2982,7 +2983,7 @@ Clicking an existing reaction chip performs add/remove toggle instead."
 (defun qq-chat-open-resource-at-point ()
   "Open the exact media card at point, or the message's primary media."
   (interactive)
-  (disco-media-card-open))
+  (appkit-media-card-open))
 
 (defun qq-chat-open-avatar-at-point ()
   "Open sender avatar for the message at point."
@@ -3135,12 +3136,14 @@ Message actions use point + keys (`r'/`d'/`!'/`o'/`a' on the timeline) or
   are in `qq-chat-transient' (`C-c ?' / timeline `?').
 Attach from clipboard with `C-c C-v' (telega-style)."
   (appkit-chatbuf-mode-setup)
+  ;; Keep vertically sliced two-line avatars visually contiguous.
+  (setq-local line-spacing 0)
   (appkit-chatbuf-reset-state 32)
   (setq-local qq-chat--last-search-query nil)
   (setq-local qq-chat--marked-message-anchors nil)
   (setq-local qq-chat--forward-request-active-p nil)
   (setq-local qq-chat--fill-column nil)
-  (setq-local disco-media-card-fallback-context-function
+  (setq-local appkit-media-card-fallback-context-function
               #'qq-chat--media-card-fallback-context)
   (qq-chat--reset-history-state)
   (setq-local qq-chat--pending-jump-id nil)

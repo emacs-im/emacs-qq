@@ -15,8 +15,9 @@
 (require 'qq-media)
 (require 'qq-state)
 (require 'qq-user-photo)
-(require 'disco-ui)
-(require 'disco-view)
+(require 'appkit-ui)
+(require 'appkit-view)
+(require 'appkit-position)
 
 (declare-function qq-chat-open "qq-chat" (session-key))
 (declare-function qq-api-cancel-request "qq-api" (request-token))
@@ -216,19 +217,19 @@
 (defun qq-user--insert-action-buttons ()
   "Insert the primary Telega-style user action row."
   (insert "  ")
-  (disco-ui-insert-action-button
+  (appkit-ui-insert-action-button
    " 发消息 " #'qq-user-open-chat
    :face 'qq-user-action-button :help-echo "打开私聊 (m)")
   (insert "  ")
-  (disco-ui-insert-action-button
+  (appkit-ui-insert-action-button
    " 查看头像 " #'qq-user-open-avatar
    :face 'qq-user-action-button :help-echo "查看头像 (a)")
   (insert "  ")
-  (disco-ui-insert-action-button
+  (appkit-ui-insert-action-button
    " 照片墙 " #'qq-user-open-photo-wall
    :face 'qq-user-action-button :help-echo "打开照片墙 (p)")
   (insert "  ")
-  (disco-ui-insert-action-button
+  (appkit-ui-insert-action-button
    " 复制 QQ " #'qq-user-copy-id
    :face 'qq-user-action-button :help-echo "复制 QQ 号 (w)")
   (insert "\n"))
@@ -236,18 +237,18 @@
 (defun qq-user-render ()
   "Render the current user profile buffer."
   (interactive)
-  (disco-view-render-preserving-position
+  (appkit-position-render-preserving
    (lambda ()
      (let ((inhibit-read-only t))
        (erase-buffer)
        (setq-local header-line-format '(:eval (qq-user--header-line)))
        (cond
         (qq-user--loading
-         (disco-view-insert-note-line "Loading user profile…"))
+         (appkit-view-insert-note-line "Loading user profile…"))
         (qq-user--error
-         (disco-view-insert-note-line qq-user--error :face 'error))
+         (appkit-view-insert-note-line qq-user--error :face 'error))
         ((null qq-user--profile)
-         (disco-view-insert-note-line "No user profile loaded."))
+         (appkit-view-insert-note-line "No user profile loaded."))
         (t
          (let ((avatar-start (point)))
            (insert (qq-media-avatar-display-string qq-user--user-id))
@@ -266,10 +267,10 @@
              (insert "   " (propertize status 'face 'shadow) "\n")))
          (insert "\n")
          (qq-user--insert-action-buttons)
-         (disco-view-insert-note-line
+         (appkit-view-insert-note-line
           "g 刷新 · m 私聊 · a 头像 · p 照片墙 · w 复制 · q 退出")
          (insert "\n")
-         (disco-view-insert-heading-line "资料" :face 'bold)
+         (appkit-view-insert-heading-line "资料" :face 'bold)
          (when-let* ((nickname (qq-user--present-string
                                 (alist-get 'nickname qq-user--profile)))
                      (remark (qq-user--present-string
@@ -312,7 +313,7 @@
          (when-let* ((signature (qq-user--present-string
                                  (alist-get 'signature qq-user--profile))))
            (insert "\n")
-           (disco-view-insert-heading-line "个性签名" :face 'bold)
+           (appkit-view-insert-heading-line "个性签名" :face 'bold)
            (insert signature "\n"))
          (insert "\n")
          (qq-user--insert-photo-wall)))

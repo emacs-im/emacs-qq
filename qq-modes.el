@@ -7,7 +7,7 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 'disco-mode-line)
+(require 'appkit-mode-line)
 (require 'qq-customize)
 (require 'qq-state)
 (require 'qq-root)
@@ -62,7 +62,7 @@ sessions because native QQ mentions are priority activity."
 
 (defun qq-mode-line-icon ()
   "Return clickable QQ label for the mode line."
-  (disco-mode-line-indicator
+  (appkit-mode-line-indicator
    "QQ" :face 'mode-line-emphasis
    :command #'qq-mode-line-open-root :help-echo "Open QQ"))
 
@@ -70,7 +70,7 @@ sessions because native QQ mentions are priority activity."
   "Return mode-line text for unmuted unread messages."
   (let ((count (car (qq-mode-line--counts))))
     (unless (zerop count)
-      (disco-mode-line-indicator
+      (appkit-mode-line-indicator
        (number-to-string count) :prefix " " :face 'qq-mode-line-unread
        :command #'qq-mode-line-open-unread
        :help-echo "Open unread QQ chats"))))
@@ -79,7 +79,7 @@ sessions because native QQ mentions are priority activity."
   "Return mode-line text for sessions with unread native mentions."
   (let ((count (cdr (qq-mode-line--counts))))
     (unless (zerop count)
-      (disco-mode-line-indicator
+      (appkit-mode-line-indicator
        (format "@%d" count) :prefix " " :face 'qq-mode-line-mention
        :command #'qq-mode-line-open-mention
        :help-echo "Open QQ chats with unread mentions"))))
@@ -87,7 +87,7 @@ sessions because native QQ mentions are priority activity."
 (defun qq-mode-line-update (&rest _ignored)
   "Refresh the cached QQ mode-line status."
   (when qq-mode-line-mode
-    (disco-mode-line-update-cache
+    (appkit-mode-line-update-cache
      'qq-mode-line-string qq-mode-line-string-format)))
 
 ;;;###autoload
@@ -98,10 +98,10 @@ sessions because native QQ mentions are priority activity."
   :group 'qq-modes
   (if qq-mode-line-mode
       (progn
-        (disco-mode-line-install 'qq-mode-line-format)
+        (appkit-mode-line-install 'qq-mode-line-format)
         (add-hook 'qq-state-change-hook #'qq-mode-line-update)
         (qq-mode-line-update))
-    (disco-mode-line-uninstall 'qq-mode-line-format)
+    (appkit-mode-line-uninstall 'qq-mode-line-format)
     (setq qq-mode-line-string "")
     (remove-hook 'qq-state-change-hook #'qq-mode-line-update)
     (force-mode-line-update t)))

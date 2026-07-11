@@ -1603,7 +1603,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                    (lambda (_segment) 'qq-test-image))
                   ((symbol-function 'qq-media-segment-preview-fetching-p)
                    (lambda (_segment) nil))
-                  ((symbol-function 'disco-media-insert-image-slices)
+                  ((symbol-function 'appkit-media-insert-image-slices)
                    (lambda (_image url &optional _prefix _fallback)
                      (setq preview-url url)
                      (insert "PREVIEW")))
@@ -1620,12 +1620,12 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                                         (buffer-string))))
           (goto-char (point-min))
           (search-forward "PREVIEW")
-          (let ((context (disco-media-card-context-at-point)))
+          (let ((context (appkit-media-card-context-at-point)))
             (should (equal (plist-get context :payload) segment))
             (should (functionp (plist-get context :download-action)))
             (should (functionp (plist-get context :save-as-action)))
             (should (functionp (plist-get context :copy-url-action)))
-            (disco-media-card-call-action 'open context))
+            (appkit-media-card-call-action 'open context))
           (should (equal opened-segment segment)))))))
 
 (ert-deftest qq-chat-video-preview-keeps-video-alt-text ()
@@ -1642,7 +1642,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                    (lambda (_segment) 'qq-video-preview))
                   ((symbol-function 'qq-media-segment-preview-fetching-p)
                    (lambda (_segment) nil))
-                  ((symbol-function 'disco-media-insert-image-slices)
+                  ((symbol-function 'appkit-media-insert-image-slices)
                    (lambda (_image _action &optional _prefix alt-text)
                      (setq fallback alt-text)
                      (insert "VIDEO-PREVIEW"))))
@@ -1670,7 +1670,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
           (search-forward "second.mp4")
           (should
            (equal second
-                  (plist-get (disco-media-card-context-at-point) :payload))))))))
+                  (plist-get (appkit-media-card-context-at-point) :payload))))))))
 
 (ert-deftest qq-chat-renders-structured-mail-segment ()
   (let ((segment '((type . "mail")
@@ -1780,7 +1780,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
               "新进群账号疑似来自非大陆地区，请谨慎核实对方身份。查看异常>"
               (buffer-substring-no-properties (point-min) (point-max)))))))
 
-(ert-deftest qq-chat-history-header-right-aligns-time-through-disco-ins ()
+(ert-deftest qq-chat-history-header-right-aligns-time-through-appkit ()
   (with-temp-buffer
     (let ((inhibit-read-only t)
           (fill-column 50)
@@ -1832,9 +1832,9 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                (lambda (user-id)
                  (setq avatar-user-id user-id)
                  'avatar-image))
-              ((symbol-function 'disco-chat-avatar-two-line-pixel-size)
+              ((symbol-function 'appkit-chat-avatar-two-line-pixel-size)
                (lambda () 42))
-              ((symbol-function 'disco-chat-avatar-prefixes)
+              ((symbol-function 'appkit-chat-avatar-prefixes)
                (lambda (image fallback &rest args)
                  (setq shared-args (list image fallback args))
                  '(:header "TOP "
@@ -1886,6 +1886,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
 (ert-deftest qq-chat-text-scale-refreshes-pixel-alignment-at-same-width ()
   (with-temp-buffer
     (qq-chat-mode)
+    (should (= line-spacing 0))
     (setq qq-chat--fill-column 90)
     (let ((win (selected-window))
           (refresh-count 0))

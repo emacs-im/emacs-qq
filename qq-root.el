@@ -4,7 +4,7 @@
 
 ;;; Commentary:
 
-;; Persistent keyed-EWOC root view.  Session rows use disco.el's shared list
+;; Persistent keyed-EWOC root view.  Session rows use appkit's shared list
 ;; reconciliation and one-line presentation infrastructure.
 
 ;;; Code:
@@ -12,7 +12,9 @@
 (require 'cl-lib)
 (require 'ewoc)
 (require 'subr-x)
-(require 'disco-view)
+(require 'appkit-view)
+(require 'appkit-position)
+(require 'appkit-ewoc)
 (require 'qq-api)
 (require 'qq-chat)
 (require 'qq-media)
@@ -69,15 +71,15 @@
 (defun qq-root--compute-fill-column (&optional window)
   "Compute root row width from live WINDOW, or return nil."
   (when-let* ((win (or window (qq-root--display-window)))
-              (width (disco-view-window-fill-column
+              (width (appkit-view-window-fill-column
                       win qq-root-auto-fill-margin-columns)))
     (max 60 width)))
 
 (defun qq-root--stable-fill-column ()
   "Return a stable width for the next root reconciliation.
 
-Like telega/disco root autofill, measure the selected root window when
-possible.  A passive background update reuses the last measured width instead
+Measure the selected root window when possible.  A passive background update
+reuses the last measured width instead
 of accidentally borrowing the selected chat window."
   (or (when-let* ((win (qq-root--selected-window)))
         (qq-root--compute-fill-column win))
@@ -151,7 +153,7 @@ of accidentally borrowing the selected chat window."
      "  ")))
 
 (defun qq-root--mode-divider-line ()
-  "Return divider line with active mode marker like disco root."
+  "Return a divider line carrying the active root mode marker."
   (let* ((label "(activity/all)")
          (width (max (qq-root--buffer-width) (+ 8 (string-width label))))
          (filler (max 0 (- width (string-width label) 2)))
@@ -252,7 +254,7 @@ priority over the last-message preview."
          (muted (qq-root--session-muted-p session))
          (important (qq-root--session-important-unread-p session))
          (badge (qq-root--session-badge session)))
-    (disco-view-one-line-row-create
+    (appkit-view-one-line-row-create
      :icon-inserter (lambda ()
                       (qq-root--insert-session-icon session))
      :context (qq-root--session-context-label session)
@@ -261,7 +263,7 @@ priority over the last-message preview."
      :preview-leading-face (cond (important 'warning)
                                  (muted 'shadow))
      ;; Plain timestamp only.  Unread is already shown by the leading
-     ;; badge ([n] / [mute:n]); do not reuse disco's time-tail-face
+     ;; badge ([n] / [mute:n]); keep a dedicated time-tail face
      ;; (meant for a trailing status glyph) or the last time digit
      ;; gets a spurious warning color.
      :time (qq-root--format-time (alist-get 'last-message-time session))
@@ -280,7 +282,7 @@ priority over the last-message preview."
 
 (defun qq-root--insert-session-line (session)
   "Insert one session row for SESSION."
-  (disco-view-insert-one-line-row
+  (appkit-view-insert-one-line-row
    (qq-root--session-one-line-row session)
    :indent 2
    :width (qq-root--buffer-width)
@@ -295,7 +297,7 @@ priority over the last-message preview."
   "Insert one persistent root ENTRY."
   (pcase (qq-root--entry-type entry)
     ('note
-     (disco-view-insert-note-line (qq-root--entry-text entry)
+     (appkit-view-insert-note-line (qq-root--entry-text entry)
                                   :face (qq-root--entry-face entry)))
     ('blank (insert "\n"))
     ('session (qq-root--insert-session-line (qq-root--entry-session entry)))
@@ -343,7 +345,7 @@ Rows whose data and position are unchanged retain their EWOC nodes."
   (unless (ewoc-p qq-root--ewoc)
     (error "qq: root view is not initialized"))
   (let ((snapshot
-         (disco-view-capture-position
+         (appkit-position-capture
           :anchor-property 'qq-root-session-key
           :preserve-window-start t))
         (inhibit-read-only t)
@@ -351,30 +353,30 @@ Rows whose data and position are unchanged retain their EWOC nodes."
     (setq-local qq-root--fill-column (qq-root--stable-fill-column))
     (with-silent-modifications
       (setq qq-root--node-table
-            (disco-view-reconcile-keyed-ewoc
+            (appkit-ewoc-reconcile
              qq-root--ewoc
              (qq-root--project-entries)
              #'qq-root--entry-key
              :force-keys force-keys)))
     (when snapshot
-      (disco-view-restore-position snapshot))
+      (appkit-position-restore snapshot))
     (force-mode-line-update)
     (force-window-update (current-buffer))))
 
 (defun qq-root--invalidate (keys)
   "Invalidate persistent root rows identified by KEYS."
   (let ((snapshot
-         (disco-view-capture-position
+         (appkit-position-capture
           :anchor-property 'qq-root-session-key
           :preserve-window-start t))
         (inhibit-read-only t)
         (buffer-undo-list t))
     (with-silent-modifications
       (dolist (key keys)
-        (disco-view-invalidate-keyed-ewoc-node
+        (appkit-ewoc-invalidate-key
          qq-root--ewoc qq-root--node-table key)))
     (when snapshot
-      (disco-view-restore-position snapshot))
+      (appkit-position-restore snapshot))
     (force-window-update (current-buffer))))
 
 (defun qq-root--session-key-at-point (&optional pos)
