@@ -17,6 +17,15 @@
 (require 'qq-api)
 (require 'qq-customize)
 
+(declare-function disco-media-start-video-preview
+                  "disco-media" (cache-key source media cache-base callback))
+(declare-function disco-media-cancel-video-preview
+                  "disco-media" (cache-key))
+(declare-function disco-media-video-preview-policy-key
+                  "disco-media" ())
+(declare-function disco-media-stop-inline-animation
+                  "disco-media" (image))
+
 (defvar qq-media-cache-update-hook nil
   "Hook run after media resource/image cache updates.")
 
@@ -25,6 +34,9 @@
 
 (defvar qq-media--image-cache (make-hash-table :test #'equal)
   "In-memory image object cache keyed by logical resource identity.")
+
+(defvar qq-media--preview-missing-cache (make-hash-table :test #'equal)
+  "Preview keys whose current media source could not produce an image.")
 
 (defvar qq-media--fetching-cache (make-hash-table :test #'equal)
   "Set of logical resource identities currently being fetched.")
@@ -48,8 +60,18 @@
   (interactive)
   (when qq-media--remote-image-plz-queue
     (plz-clear qq-media--remote-image-plz-queue))
+  (maphash
+   (lambda (_key image)
+     (when (consp image)
+       (disco-media-stop-inline-animation image)))
+   qq-media--image-cache)
+  (maphash
+   (lambda (key _fetching)
+     (disco-media-cancel-video-preview (concat "qq:" key)))
+   qq-media--fetching-cache)
   (clrhash qq-media--resource-cache)
   (clrhash qq-media--image-cache)
+  (clrhash qq-media--preview-missing-cache)
   (clrhash qq-media--fetching-cache)
   (clrhash qq-media--download-state-table)
   (setq qq-media--remote-image-plz-queue nil)
@@ -441,10 +463,22 @@ never treats a local absolute path as a NapCat file id."
                         (alist-get 'file data))))
          (disco-media-image-file-name-p name))))
 
+(defun qq-media-videoish-segment-p (segment)
+  "Return non-nil when SEGMENT carries a video preview source."
+  (let* ((type (alist-get 'type segment))
+         (data (alist-get 'data segment))
+         (name (or (alist-get 'name data)
+                   (alist-get 'file data)
+                   (alist-get 'url data))))
+    (or (equal type "video")
+        (and (equal type "file")
+             (disco-media-video-file-name-p name)))))
+
 (defun qq-media-segment-preview-capable-p (segment)
   "Return non-nil when SEGMENT supports inline preview rendering."
   (or (member (alist-get 'type segment) '("image" "mface"))
-      (qq-media-imageish-file-segment-p segment)))
+      (qq-media-imageish-file-segment-p segment)
+      (qq-media-videoish-segment-p segment)))
 
 (defun qq-media--call-fileish-action (action file-keys callback errback &optional final-error)
   "Call ACTION with FILE-KEYS until one succeeds.
@@ -1544,9 +1578,12 @@ not ready yet, show the human face name (`/斜眼笑') rather than CQ."
   "Return preview cache key for SEGMENT, or nil when unsupported."
   (when (qq-media-segment-preview-capable-p segment)
     (let* ((type (alist-get 'type segment))
-           (preview-type (if (qq-media-imageish-file-segment-p segment)
-                             "file-image"
-                           type))
+           (preview-type (cond
+                          ((qq-media-imageish-file-segment-p segment)
+                           "file-image")
+                          ((qq-media-videoish-segment-p segment)
+                           (disco-media-video-preview-policy-key))
+                          (t type)))
            (file-key (qq-media--segment-file-key segment))
            (url (qq-media--segment-url segment)))
       (cond
@@ -1575,6 +1612,85 @@ not ready yet, show the human face name (`/斜眼笑') rather than CQ."
       (push (qq-media-poke-image-cache-key (alist-get 'image-url data)) keys))
     (delete-dups (delq nil keys))))
 
+(defun qq-media--video-preview-descriptor (segment key)
+  "Adapt video SEGMENT to shared preview metadata under KEY."
+  (let* ((data (alist-get 'data segment))
+         (capabilities (qq-media-segment-capabilities segment))
+         (local-file (plist-get capabilities :local-file))
+         (remote-url (plist-get capabilities :remote-url))
+         (preview-source
+          (seq-find
+           (lambda (candidate)
+             (or (qq-media-file-present-p candidate)
+                 (qq-media-url-present-p candidate)))
+           (list (alist-get 'thumb data)
+                 (alist-get 'thumbnail data)
+                 (alist-get 'thumbnail_url data))))
+         (name (or (alist-get 'name data)
+                   (and (stringp local-file)
+                        (file-name-nondirectory local-file))
+                   (disco-media-url-filename remote-url)
+                   "video.mp4")))
+    `((id . ,key)
+      (filename . ,name)
+      (content_type . "video/mp4")
+      ,@(when local-file `((file . ,local-file)))
+      ,@(when remote-url `((url . ,remote-url)))
+      ,@(when preview-source `((preview_source . ,preview-source)))
+      ,@(when-let* ((size (or (alist-get 'file_size data)
+                              (alist-get 'size data))))
+          `((size . ,size)))
+      ,@(when-let* ((duration (or (alist-get 'duration_secs data)
+                                  (alist-get 'duration data))))
+          `((duration_secs . ,duration)))
+      ,@(when-let* ((width (alist-get 'width data)))
+          `((width . ,width)))
+      ,@(when-let* ((height (alist-get 'height data)))
+          `((height . ,height))))))
+
+(defun qq-media--video-segment-preview-image (segment key)
+  "Return cached preview for video SEGMENT, starting extraction if needed."
+  (or (qq-media--cached-image key)
+      (unless (or (gethash key qq-media--fetching-cache)
+                  (gethash key qq-media--preview-missing-cache))
+        (let* ((descriptor (qq-media--video-preview-descriptor segment key))
+               (source (or (and (qq-media-file-present-p
+                                 (alist-get 'file descriptor))
+                                (alist-get 'file descriptor))
+                           (alist-get 'url descriptor)))
+               (preview-source (alist-get 'preview_source descriptor))
+               (cache-base (qq-media--remote-image-cache-file-base key))
+               (cache-file (qq-media--remote-image-cache-existing-file key)))
+          (cond
+           ((and cache-file (qq-media-file-present-p cache-file))
+            (qq-media--cache-image
+             key
+             (qq-media--preview-image-from-file cache-file nil)))
+           ((not (or (qq-media-file-present-p source)
+                     (qq-media-url-present-p source)
+                     (qq-media-file-present-p preview-source)
+                     (qq-media-url-present-p preview-source)))
+            (puthash key t qq-media--preview-missing-cache)
+            nil)
+           (t
+            (puthash key t qq-media--fetching-cache)
+            (make-directory (file-name-directory cache-base) t)
+            (condition-case err
+                (disco-media-start-video-preview
+                 (concat "qq:" key) source descriptor cache-base
+                 (lambda (image _target-file)
+                   (remhash key qq-media--fetching-cache)
+                   (if image
+                       (qq-media--cache-image key image)
+                     (puthash key t qq-media--preview-missing-cache))
+                   (qq-media--note-cache-updated key)))
+              (error
+               (remhash key qq-media--fetching-cache)
+               (puthash key t qq-media--preview-missing-cache)
+               (message "qq: video preview failed for %s: %s"
+                        key (error-message-string err))))
+            nil))))))
+
 (defun qq-media-segment-preview-image (segment)
   "Return inline preview image for SEGMENT, triggering fetch when needed.
 
@@ -1595,25 +1711,29 @@ Preview failures are soft (no NapCat error spam)."
         (local (qq-media--segment-existing-path segment))
         (url (qq-media--segment-url segment)))
     (when key
-      (when (or local (qq-media-url-present-p url))
-        (qq-media--cache-resource
+      (if (qq-media-videoish-segment-p segment)
+          (when-let* ((image (qq-media--video-segment-preview-image segment key)))
+            (or (disco-media-attachment-video-display-image image)
+                image))
+        (when (or local (qq-media-url-present-p url))
+          (qq-media--cache-resource
+           key
+           (qq-media--resource-from-local+url local url)))
+        (qq-media--ensure-resource-image
          key
-         (qq-media--resource-from-local+url local url)))
-      (qq-media--ensure-resource-image
-       key
-       (lambda (done error)
-         (if (qq-media-segment-preview-capable-p segment)
-             (qq-media--resolve-fileish-segment
-              segment
-              "get_image"
-              done
-              ;; Soft-fail: clear fetching without user-error / NapCat spam.
-              (lambda (_response _reason)
-                (funcall error nil "preview image not found"))
-              "preview image not found")
-           (funcall done nil)))
-       nil
-       #'qq-media--preview-image-from-file))))
+         (lambda (done error)
+           (if (qq-media-segment-preview-capable-p segment)
+               (qq-media--resolve-fileish-segment
+                segment
+                "get_image"
+                done
+                ;; Soft-fail: clear fetching without user-error / NapCat spam.
+                (lambda (_response _reason)
+                  (funcall error nil "preview image not found"))
+                "preview image not found")
+             (funcall done nil)))
+         nil
+         #'qq-media--preview-image-from-file)))))
 
 (defun qq-media-segment-preview-fetching-p (segment)
   "Return non-nil when preview fetch for SEGMENT is currently active."

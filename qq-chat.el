@@ -2161,9 +2161,10 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
                  (progn
                    (disco-media-insert-image-slices
                     preview nil nil
-                    (if (equal (alist-get 'type segment) "mface")
-                        "[sticker]"
-                      "[image]"))
+                    (cond
+                     ((equal (alist-get 'type segment) "mface") "[sticker]")
+                     ((qq-media-videoish-segment-p segment) "[video]")
+                     (t "[image]")))
                    (setq preview-end (point)))
                (error
                 (insert "[preview unavailable]")))

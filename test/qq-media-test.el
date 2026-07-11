@@ -61,6 +61,26 @@
       (should (memq 'image-queue cleared))
       (should-not qq-media--remote-image-plz-queue))))
 
+(ert-deftest qq-media-clear-cache-cancels-shared-video-previews ()
+  (let ((qq-media--resource-cache (make-hash-table :test #'equal))
+        (qq-media--image-cache (make-hash-table :test #'equal))
+        (qq-media--preview-missing-cache (make-hash-table :test #'equal))
+        (qq-media--fetching-cache (make-hash-table :test #'equal))
+        (qq-media--download-state-table (make-hash-table :test #'equal))
+        (qq-media--remote-image-plz-queue nil)
+        (qq-media-cache-directory (make-temp-file "qq-clear-video" t))
+        cancelled)
+    (unwind-protect
+        (progn
+          (puthash "video:key" t qq-media--fetching-cache)
+          (cl-letf (((symbol-function 'disco-media-cancel-video-preview)
+                     (lambda (key) (push key cancelled))))
+            (qq-media-clear-cache))
+          (should (equal cancelled '("qq:video:key")))
+          (should-not (gethash "video:key" qq-media--fetching-cache)))
+      (when (file-directory-p qq-media-cache-directory)
+        (delete-directory qq-media-cache-directory t)))))
+
 (ert-deftest qq-media-ensure-resource-image-starts-remote-download-for-url-only-resource ()
   (qq-media-test-with-reset
    (let (started-key started-resource started-spec)
@@ -589,6 +609,83 @@
                  (setq played-source source))))
       (qq-media-segment-open segment)
       (should (equal played-source "https://example.com/movie.mp4")))))
+
+(ert-deftest qq-media-video-segments-are-inline-preview-capable ()
+  (should
+   (qq-media-segment-preview-capable-p
+    '((type . "video")
+      (data . ((path . "/tmp/short.mp4")
+               (file_size . "2048")
+               (remote_status . "unavailable"))))))
+  (should
+   (qq-media-segment-preview-capable-p
+    '((type . "file")
+      (data . ((name . "short.mp4")
+               (url . "https://example.com/short.mp4")))))))
+
+(ert-deftest qq-media-video-preview-reuses-shared-animation-pipeline ()
+  (qq-media-test-with-reset
+   (let* ((qq-media-cache-directory (make-temp-file "qq-video-preview" t))
+          (source (make-temp-file "qq-short-video" nil ".mp4"))
+          (segment `((type . "video")
+                     (data . ((path . ,source)
+                              (name . "short.mp4")
+                              (file_size . "2048")
+                              (remote_status . "unavailable")))))
+          (key (qq-media-segment-preview-key segment))
+          (image '(image :type gif :disco-inline-animation t))
+          captured-key captured-source captured-media updated)
+     (unwind-protect
+         (cl-letf (((symbol-function 'disco-media-start-video-preview)
+                      (lambda (process-key media-source media _cache-base callback)
+                        (setq captured-key process-key
+                              captured-source media-source
+                              captured-media media)
+                        (funcall callback image "/tmp/preview.gif")))
+                     ((symbol-function 'qq-media--note-cache-updated)
+                      (lambda (media-key) (setq updated media-key)))
+                     ((symbol-function 'disco-media-attachment-video-display-image)
+                      (lambda (candidate) candidate))
+                     ((symbol-function 'image-size)
+                      (lambda (&rest _args) '(16 . 16))))
+             (qq-media-segment-preview-image segment)
+             (should (equal captured-key (concat "qq:" key)))
+             (should (equal captured-source source))
+             (should (equal (alist-get 'size captured-media) "2048"))
+             (should (eq image (gethash key qq-media--image-cache)))
+             (should-not (gethash key qq-media--fetching-cache))
+             (should (eq image (qq-media-segment-preview-image segment)))
+             (should (equal updated key)))
+       (when (file-exists-p source) (delete-file source))
+       (when (file-directory-p qq-media-cache-directory)
+         (delete-directory qq-media-cache-directory t))))))
+
+(ert-deftest qq-media-video-preview-uses-local-poster-without-video-source ()
+  (qq-media-test-with-reset
+   (let* ((qq-media-cache-directory (make-temp-file "qq-video-poster" t))
+          (poster (make-temp-file "qq-video-poster" nil ".png"))
+          (segment `((type . "video")
+                     (data . ((path . "/missing/video.mp4")
+                              (thumb . ,poster)
+                              (name . "video.mp4")
+                              (file_size . "2048")
+                              (remote_status . "unavailable")))))
+          (image '(image :type jpeg))
+          captured-source captured-media)
+     (unwind-protect
+         (cl-letf (((symbol-function 'disco-media-start-video-preview)
+                    (lambda (_key source media _cache-base callback)
+                      (setq captured-source source
+                            captured-media media)
+                      (funcall callback image "/tmp/poster.jpg")))
+                   ((symbol-function 'disco-media-attachment-video-display-image)
+                    (lambda (candidate) candidate)))
+           (qq-media-segment-preview-image segment)
+           (should-not captured-source)
+           (should (equal (alist-get 'preview_source captured-media) poster)))
+       (when (file-exists-p poster) (delete-file poster))
+       (when (file-directory-p qq-media-cache-directory)
+         (delete-directory qq-media-cache-directory t))))))
 
 ;; Strict video remote-status model overrides for the pre-wire-model fixtures.
 

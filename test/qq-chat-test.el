@@ -1607,6 +1607,27 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
             (disco-media-card-call-action 'open context))
           (should (equal opened-segment segment)))))))
 
+(ert-deftest qq-chat-video-preview-keeps-video-alt-text ()
+  (let ((segment '((type . "video")
+                   (data . ((name . "short.mp4")
+                            (url . "https://example.com/short.mp4")
+                            (remote_status . "available")))))
+        fallback)
+    (with-temp-buffer
+      (let ((inhibit-read-only t))
+        (cl-letf (((symbol-function 'qq-media-segment-preview-capable-p)
+                   (lambda (_segment) t))
+                  ((symbol-function 'qq-media-segment-preview-image)
+                   (lambda (_segment) 'qq-video-preview))
+                  ((symbol-function 'qq-media-segment-preview-fetching-p)
+                   (lambda (_segment) nil))
+                  ((symbol-function 'disco-media-insert-image-slices)
+                   (lambda (_image _action &optional _prefix alt-text)
+                     (setq fallback alt-text)
+                     (insert "VIDEO-PREVIEW"))))
+          (qq-chat--insert-segment-media-line segment nil nil)
+          (should (equal fallback "[video]")))))))
+
 (ert-deftest qq-chat-media-card-context-targets-exact-segment-at-point ()
   "Shared card context keeps multi-segment QQ messages unambiguous."
   (let ((first '((type . "image")
