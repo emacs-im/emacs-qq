@@ -13,6 +13,7 @@
 (require 'ring)
 (require 'button)
 (require 'subr-x)
+(require 'disco-chat-avatar)
 (require 'disco-chatbuf)
 (require 'disco-chat-timeline)
 (require 'disco-ins)
@@ -2421,12 +2422,27 @@ on the first inline line when the body is pure inline content."
       'qq-msg-self-title
     'qq-msg-user-title))
 
-(defun qq-chat--message-body-prefix (_message &optional compact)
-  "Return body line-prefix string for MESSAGE.
-
-Telega uses avatar-width spaces, not ASCII gutters.  We use a fixed two-space
-indent for body rows; compact continuations use the same indent."
-  (if compact "  " "  "))
+(defun qq-chat--message-avatar-prefixes (message)
+  "Return shared telega-style two-line avatar prefixes for MESSAGE."
+  (let* ((sender-id (alist-get 'sender-id message))
+         (image (and sender-id
+                     (not (equal (format "%s" sender-id) "0"))
+                     (qq-media-avatar-image sender-id)))
+         (prefixes
+          (disco-chat-avatar-prefixes
+           image "@"
+           :pixel-size (disco-chat-avatar-two-line-pixel-size)
+           :resize t))
+         (avatar-properties
+          (list 'mouse-face 'highlight
+                'help-echo "Open sender avatar"
+                'qq-chat-avatar-sender-id sender-id)))
+    (dolist (key '(:header :first-body))
+      (let ((prefix (copy-sequence (plist-get prefixes key))))
+        (when (and (stringp prefix) (> (length prefix) 0))
+          (add-text-properties 0 (length prefix) avatar-properties prefix))
+        (setq prefixes (plist-put prefixes key prefix))))
+    prefixes))
 
 (defun qq-chat--render-message (message context)
   "Insert one formatted MESSAGE block using projected CONTEXT.
@@ -2442,13 +2458,26 @@ Visual model (telega-inspired; later appkit):
          (insert-date (plist-get context :insert-date))
          (insert-unread (plist-get context :insert-unread))
          (title-face (qq-chat--message-title-face message))
-         (body-prefix (qq-chat--message-body-prefix message))
          (reply-id (qq-chat--message-reply-id message))
          (properties (qq-chat--message-line-properties message anchor))
          (status-suffix (qq-chat--status-suffix message))
          (compact (plist-get context :compact))
          (marked (qq-chat--message-marked-p message))
-         (body-prefix-state (disco-ui-make-prefix-state body-prefix body-prefix))
+         (ordinary-message-p
+          (not (or (qq-state-gray-tip-message-p message)
+                   (qq-state-poke-message-p message))))
+         (avatar-prefixes
+          (and ordinary-message-p
+               (qq-chat--message-avatar-prefixes message)))
+         (header-prefix (or (plist-get avatar-prefixes :header) ""))
+         (body-first-prefix
+          (or (plist-get avatar-prefixes :first-body) "  "))
+         (body-rest-prefix
+          (or (plist-get avatar-prefixes :rest-body) "  "))
+         (body-prefix-state
+          (if compact
+              (disco-ui-make-prefix-state body-rest-prefix body-rest-prefix)
+            (disco-ui-make-prefix-state body-first-prefix body-rest-prefix)))
          (short-time (qq-chat--format-time-short (alist-get 'time message))))
     (when (and (stringp insert-date) (not (string-empty-p insert-date)))
       (qq-chat--insert-date-separator-row (qq-chat--message-day-label insert-date)))
@@ -2456,7 +2485,7 @@ Visual model (telega-inspired; later appkit):
       (qq-chat--insert-unread-divider-row))
     (when marked
       (disco-ui-insert-prefixed-lines
-       body-prefix-state
+       (disco-ui-make-prefix-state body-rest-prefix body-rest-prefix)
        "✓ selected for merged forwarding"
        :face 'warning
        :properties properties))
@@ -2472,8 +2501,13 @@ Visual model (telega-inspired; later appkit):
         (qq-chat--insert-message-sender message title-face)
         (insert status-suffix)
         (qq-chat--insert-right-aligned-time
-         (qq-chat--format-time (alist-get 'time message)) nil t)
+         (qq-chat--format-time (alist-get 'time message))
+         (string-width header-prefix)
+         t)
         (insert "\n")
+        (disco-ui-apply-line-prefix
+         header-start (point)
+         (disco-ui-make-prefix-state header-prefix body-rest-prefix))
         (add-text-properties
          header-start (point)
          (append properties (list 'face 'qq-msg-deleted)))
@@ -2491,19 +2525,16 @@ Visual model (telega-inspired; later appkit):
        message body-prefix-state properties short-time))
      (t
       (let ((header-start (point)))
-        (when-let* ((sender-id (alist-get 'sender-id message)))
-          (let ((avatar-start (point)))
-            (insert (qq-media-avatar-display-string sender-id) " ")
-            (add-text-properties
-             avatar-start
-             (point)
-             '(mouse-face highlight
-               help-echo "Open sender avatar"))))
         (qq-chat--insert-message-sender message title-face)
         (insert status-suffix)
         (qq-chat--insert-right-aligned-time
-         (qq-chat--format-time (alist-get 'time message)) nil t)
+         (qq-chat--format-time (alist-get 'time message))
+         (string-width header-prefix)
+         t)
         (insert "\n")
+        (disco-ui-apply-line-prefix
+         header-start (point)
+         (disco-ui-make-prefix-state header-prefix body-rest-prefix))
         (disco-ui-append-face header-start (point) 'qq-msg-heading)
         (add-text-properties header-start (point) properties))
       (when reply-id

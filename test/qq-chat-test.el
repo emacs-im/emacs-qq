@@ -1723,8 +1723,9 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
                      (sender-name . "Alice")
                      (segments . (((type . "text")
                                    (data . ((text . "hello")))))))))
-      (cl-letf (((symbol-function 'qq-media-avatar-display-string)
-                 (lambda (&rest _args) "A")))
+      (cl-letf (((symbol-function 'qq-chat--message-avatar-prefixes)
+                 (lambda (&rest _args)
+                   '(:header "AVA " :first-body "    " :rest-body "    "))))
         (qq-chat--render-message message nil)
         (goto-char (point-min))
         (search-forward (qq-chat--format-time 1710000001))
@@ -1734,6 +1735,55 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
                                ,(- 50
                                    (string-width
                                     (qq-chat--format-time 1710000001))))))))))
+
+(ert-deftest qq-chat-avatar-spans-heading-and-first-body-line ()
+  (with-temp-buffer
+    (let ((inhibit-read-only t)
+          (fill-column 80)
+          (message '((server-id . "m1")
+                     (time . 1710000001)
+                     (sender-id . "10001")
+                     (sender-name . "Alice")
+                     (segments . (((type . "text")
+                                   (data . ((text . "hello\nworld")))))))))
+      (cl-letf (((symbol-function 'qq-chat--message-avatar-prefixes)
+                 (lambda (&rest _args)
+                   '(:header "TOP "
+                     :first-body "BOTTOM "
+                     :rest-body "       "))))
+        (qq-chat--render-message message nil)
+        (goto-char (point-min))
+        (should (equal (get-text-property (point) 'line-prefix) "TOP "))
+        (forward-line 1)
+        (should (equal (get-text-property (point) 'line-prefix) "BOTTOM "))
+        (forward-line 1)
+        (should (equal (get-text-property (point) 'line-prefix) "       "))))))
+
+(ert-deftest qq-chat-avatar-prefixes-use-shared-two-line-renderer ()
+  (let (avatar-user-id shared-args)
+    (cl-letf (((symbol-function 'qq-media-avatar-image)
+               (lambda (user-id)
+                 (setq avatar-user-id user-id)
+                 'avatar-image))
+              ((symbol-function 'disco-chat-avatar-two-line-pixel-size)
+               (lambda () 42))
+              ((symbol-function 'disco-chat-avatar-prefixes)
+               (lambda (image fallback &rest args)
+                 (setq shared-args (list image fallback args))
+                 '(:header "TOP "
+                   :first-body "BOTTOM "
+                   :rest-body "       "))))
+      (let ((prefixes
+             (qq-chat--message-avatar-prefixes
+              '((sender-id . "10001") (sender-name . "Alice")))))
+        (should (equal avatar-user-id "10001"))
+        (should (equal shared-args
+                       '(avatar-image "@" (:pixel-size 42 :resize t))))
+        (should (eq (get-text-property 0 'mouse-face
+                                      (plist-get prefixes :header))
+                    'highlight))
+        (should-not (get-text-property 0 'mouse-face
+                                      (plist-get prefixes :rest-body)))))))
 
 (ert-deftest qq-chat-message-hover-is-limited-to-interactive-children ()
   (let ((properties

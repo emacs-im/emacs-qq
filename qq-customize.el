@@ -315,7 +315,9 @@ Same defaults as `telega-msg-deleted'."
   :group 'qq)
 
 (defcustom qq-media-avatar-image-height 20
-  "Pixel height used for inline avatar images in chat buffers."
+  "Pixel height used when decoding avatar image resources.
+
+Chat timelines rescale these resources to the shared two-text-line geometry."
   :type 'integer
   :group 'qq)
 
