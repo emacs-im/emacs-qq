@@ -163,6 +163,28 @@ This mirrors `telega-root-auto-fill-margin-columns'."
   "Desktop notifications for emacs-qq."
   :group 'qq)
 
+(defgroup qq-modes nil
+  "Global presentation modes for emacs-qq."
+  :group 'qq)
+
+(defcustom qq-mode-line-string-format
+  '("  " (:eval (qq-mode-line-icon))
+    (:eval (qq-mode-line-unread-unmuted))
+    (:eval (qq-mode-line-mentions)))
+  "Format used by `qq-mode-line-mode' in `mode-line-misc-info'."
+  :type 'sexp
+  :group 'qq-modes)
+
+(defface qq-mode-line-unread
+  '((t :inherit warning :weight bold))
+  "Face for the unmuted unread message count in the mode line."
+  :group 'qq-modes)
+
+(defface qq-mode-line-mention
+  '((t :inherit error :weight bold))
+  "Face for the unread mention count in the mode line."
+  :group 'qq-modes)
+
 (defcustom qq-notifications-delay 0.5
   "Seconds to delay a message notification before rechecking visibility."
   :type 'number
