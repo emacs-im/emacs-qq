@@ -717,9 +717,11 @@ self message as incoming or store a weaker sender display name."
        `((chat_type . ,(or (alist-get 'chat-type session) 103))
          (peer_uid . ,(or (alist-get 'peer-uid session)
                           target-id))))
-      (_
+      ('private
        `((user_id . ,(or (alist-get 'peer-uin session)
-                         target-id)))))))
+                         target-id))))
+      (_
+       (user-error "qq: unsupported session key %S" session-key)))))
 
 (defun qq-api--history-exhausted-error-p (response reason)
   "Return non-nil when RESPONSE/REASON means no older history page.
@@ -1148,6 +1150,8 @@ local pending rendering.
 
 The NapCat hard-cut returns `message_id' as the NT snowflake string; that value
 is stored as the message `server-id' and becomes the timeline anchor."
+  (unless (qq-state-session-sendable-p session-key)
+    (user-error "qq: this session is read-only"))
   (let* ((segments (copy-tree (or segments '())))
          (pending (qq-state-insert-pending-message session-key segments raw-message))
          (local-id (alist-get 'local-id pending))

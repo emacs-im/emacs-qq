@@ -86,6 +86,22 @@
       (should (equal (alist-get 'peer_uid captured-params) "device-1"))
       (should-not (alist-get 'user_id captured-params)))))
 
+(ert-deftest qq-api-send-message-rejects-read-only-service-session ()
+  (let (pending-called api-called)
+    (cl-letf (((symbol-function 'qq-state-insert-pending-message)
+               (lambda (&rest _args)
+                 (setq pending-called t)))
+              ((symbol-function 'qq-api-call)
+               (lambda (&rest _args)
+                 (setq api-called t))))
+      (should-error
+       (qq-api-send-message
+        "service:u_mail"
+        '(((type . "text") (data . ((text . "hello"))))))
+       :type 'user-error)
+      (should-not pending-called)
+      (should-not api-called))))
+
 (ert-deftest qq-api-mark-session-read-clears-unread-optimistically ()
   (let ((qq-state-change-hook nil)
         (qq-api--read-operations (make-hash-table :test #'equal))

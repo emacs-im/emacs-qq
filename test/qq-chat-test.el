@@ -72,6 +72,24 @@
          (when (buffer-live-p buffer)
            (kill-buffer buffer)))))))
 
+(ert-deftest qq-chat-service-session-has-no-composer ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "service:u_mail"
+    '((title . "QQ邮箱提醒")
+      (type . service)
+      (target-id . "u_mail")
+      (chat-type . "103"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "service:u_mail")
+     (qq-chat-render)
+     (should-not (disco-chatbuf-input-region-bounds))
+     (should-not (string-match-p ">>> " (buffer-string)))
+     (should-error (qq-chat-edit-draft) :type 'user-error)
+     (should-error (qq-chat-send-message) :type 'user-error))))
+
 (ert-deftest qq-chat-set-draft-preserves-shared-timeline-and-composer ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session

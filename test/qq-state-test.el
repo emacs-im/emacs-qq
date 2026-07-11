@@ -22,7 +22,16 @@
    (should (equal (qq-state-session-key 'dataline "device-1")
                   "dataline:device-1"))
    (should (equal (qq-state-session-key 'service "u_mail")
-                  "service:u_mail"))))
+                  "service:u_mail"))
+   (should-error (qq-state-session-key 'unknown "target"))))
+
+(ert-deftest qq-state-session-sendable-p-is-an-explicit-capability ()
+  (should (qq-state-session-sendable-p "private:10001"))
+  (should (qq-state-session-sendable-p "group:20001"))
+  (should (qq-state-session-sendable-p "dataline:device-1"))
+  (should-not (qq-state-session-sendable-p "service:u_mail"))
+  (should-not (qq-state-session-sendable-p "unknown:target"))
+  (should-not (qq-state-session-sendable-p nil)))
 
 (ert-deftest qq-state-apply-input-status-tracks-and-clears ()
   "NapCat input_status maps to telega-like session actions."

@@ -816,11 +816,20 @@ because its result is only `{kind:single}'."
   "Return visible prompt text for the current chat buffer."
   ">>> ")
 
+(defun qq-chat--composer-visible-p ()
+  "Return non-nil when the current session has a writable composer."
+  (qq-state-session-sendable-p qq-chat--session-key))
+
+(defun qq-chat--ensure-composer-visible ()
+  "Signal a user error unless the current session has a composer."
+  (unless (qq-chat--composer-visible-p)
+    (user-error "qq: this session is read-only")))
+
 (defun qq-chat--bind-input-region-from-footer ()
   "Bind the shared persistent tail input to canonical draft state."
   (disco-chatbuf-init-state 32)
   (disco-chatbuf-bind-input-region
-   :visible-p t
+   :visible-p (qq-chat--composer-visible-p)
    :prompt (qq-chat--prompt-text)
    :input-text (disco-chatbuf-input-state)
    :post-bind-function #'disco-chatbuf-input-apply-text-properties))
@@ -1234,6 +1243,7 @@ Favorite stickers (`image' with sub_type 1, or mface) try local thumbs."
 
 (defun qq-chat--insert-input-segment-object (segment)
   "Insert outbound QQ SEGMENT into the current input region as one object."
+  (qq-chat--ensure-composer-visible)
   (unless (disco-chatbuf-point-in-input-p)
     (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max))))
   (when (and (disco-chatbuf-point-in-input-p)
@@ -2390,6 +2400,7 @@ on the first inline line when the body is pure inline content."
 
 (defun qq-chat--set-pending-reply (message)
   "Set MESSAGE as the pending reply target in current chat buffer."
+  (qq-chat--ensure-composer-visible)
   (let ((message-id (alist-get 'server-id message)))
     (unless message-id
       (user-error "qq: selected message has no server id"))
@@ -2770,6 +2781,7 @@ new rows or reports the cursor missing."
   (interactive)
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
+  (qq-chat--ensure-composer-visible)
   (let* ((text (qq-chat--current-draft-string))
          (reply-message (qq-chat--reply-message))
          (reply-id (and reply-message
@@ -2796,6 +2808,7 @@ new rows or reports the cursor missing."
 (defun qq-chat-return-dwim (arg)
   "Send current draft, or insert newline with prefix ARG."
   (interactive "P")
+  (qq-chat--ensure-composer-visible)
   (if (not (disco-chatbuf-point-in-input-p))
       (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max)))
     (if arg
@@ -2805,6 +2818,7 @@ new rows or reports the cursor missing."
 (defun qq-chat-edit-draft ()
   "Move point to the editable draft area."
   (interactive)
+  (qq-chat--ensure-composer-visible)
   (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max))))
 
 (defun qq-chat-draft-prev ()

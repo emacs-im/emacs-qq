@@ -281,19 +281,26 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   "Build a stable session key from TYPE and TARGET-ID."
   (format "%s:%s"
           (pcase type
+            ((or 'private "private") "private")
             ((or 'group "group") "group")
             ((or 'dataline "dataline") "dataline")
             ((or 'service "service") "service")
-            (_ "private"))
+            (_ (error "qq: unsupported session type %S" type)))
           (qq-state--normalize-id target-id)))
 
 (defun qq-state-session-key-type (session-key)
   "Return session type symbol extracted from SESSION-KEY."
-  (cond
-   ((string-prefix-p "group:" session-key) 'group)
-   ((string-prefix-p "dataline:" session-key) 'dataline)
-   ((string-prefix-p "service:" session-key) 'service)
-   (t 'private)))
+  (when (stringp session-key)
+    (cond
+     ((string-prefix-p "private:" session-key) 'private)
+     ((string-prefix-p "group:" session-key) 'group)
+     ((string-prefix-p "dataline:" session-key) 'dataline)
+     ((string-prefix-p "service:" session-key) 'service))))
+
+(defun qq-state-session-sendable-p (session-key)
+  "Return non-nil when SESSION-KEY supports outbound messages."
+  (memq (qq-state-session-key-type session-key)
+        '(private group dataline)))
 
 (defun qq-state-session-key-target-id (session-key)
   "Return target id extracted from SESSION-KEY."
