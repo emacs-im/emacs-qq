@@ -93,18 +93,21 @@
         ((eq value :false) "否")
         (t nil)))
 
-(defun qq-group--coded-label (object name-key code-key)
-  "Return a label from OBJECT using NAME-KEY and raw CODE-KEY."
-  (when (consp object)
-    (let ((name (qq-group--present-string (alist-get name-key object)))
-          (code (alist-get code-key object)))
-      (cond ((and name (integerp code)) (format "%s · code %d" name code))
-            (name name)
-            ((integerp code) (format "code %d" code))))))
+(defun qq-group--permission-label (value)
+  "Return a localized label for verified permission VALUE."
+  (pcase value
+    ("member" "成员")
+    ("admin" "管理员")
+    ("owner" "群主")))
 
-(defun qq-group--raw-code-label (value)
-  "Return VALUE formatted explicitly as an untranslated native code."
-  (and (integerp value) (format "code %d" value)))
+(defun qq-group--join-mode-label (value)
+  "Return a localized label for verified native join-mode VALUE."
+  (pcase value
+    ("open" "允许任何人加入")
+    ("approval" "需管理员审核")
+    ("closed" "不允许任何人加入")
+    ("question_answer" "需正确回答问题")
+    ("question_approval" "回答问题后由管理员审核")))
 
 (defun qq-group-open-chat ()
   "Open the current group chat."
@@ -222,12 +225,12 @@
          (qq-group--insert-field
           "置顶" (qq-group--boolean-label (alist-get 'pinned qq-group--profile)))
          (qq-group--insert-field
-          "群分类" (qq-group--coded-label
-                    (alist-get 'category qq-group--profile) 'name 'code))
+          "群分类" (qq-group--present-string
+                    (alist-get 'name (alist-get 'category qq-group--profile))))
          (qq-group--insert-field "群等级" (alist-get 'grade qq-group--profile))
          (qq-group--insert-field
-          "我的权限" (qq-group--raw-code-label
-                      (alist-get 'self_permission_code qq-group--profile)))
+          "我的权限" (qq-group--permission-label
+                      (alist-get 'self_permission qq-group--profile)))
          (when-let* ((mute (alist-get 'mute qq-group--profile)))
            (qq-group--insert-field
             "全员禁言至" (qq-group--timestamp-label (alist-get 'all_until mute)))
@@ -235,13 +238,12 @@
             "我的禁言至" (qq-group--timestamp-label (alist-get 'self_until mute))))
          (when-let* ((join (alist-get 'join qq-group--profile)))
            (qq-group--insert-field
-            "入群模式" (qq-group--raw-code-label (alist-get 'mode_code join)))
+            "入群模式" (qq-group--join-mode-label (alist-get 'mode join)))
            (qq-group--insert-field "入群问题" (alist-get 'question join))
            (qq-group--insert-field "我的答案" (alist-get 'answer join)))
          (qq-group--insert-field
-          "认证" (qq-group--coded-label
-                  (alist-get 'certification qq-group--profile)
-                  'text 'type_code))
+          "认证" (qq-group--present-string
+                  (alist-get 'text (alist-get 'certification qq-group--profile))))
          (when-let* ((school (alist-get 'school qq-group--profile)))
            (qq-group--insert-field
             "学校"
