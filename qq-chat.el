@@ -31,6 +31,7 @@
 (autoload 'qq-forward-insert-segment "qq-forward")
 (autoload 'qq-forward-event-segment-to-internal "qq-forward")
 (autoload 'qq-user-open "qq-user" nil t)
+(autoload 'qq-group-open "qq-group" nil t)
 
 (declare-function qq-forward-segment-p "qq-forward" (segment))
 (declare-function qq-forward-insert-segment
@@ -38,6 +39,7 @@
 (declare-function qq-forward-event-segment-to-internal
                   "qq-forward" (segment session-key))
 (declare-function qq-user-open "qq-user" (user-id))
+(declare-function qq-group-open "qq-group" (group-id))
 (declare-function qq-api-forward-message
                   "qq-api" (message-id source-session-key target-session-key
                                         callback &optional errback))
@@ -208,6 +210,7 @@ loaded in the chatbuf.")
     (define-key map (kbd "o") #'qq-chat-open-resource-at-point)
     (define-key map (kbd "a") #'qq-chat-open-avatar-at-point)
     (define-key map (kbd "i") #'qq-chat-open-user-at-point)
+    (define-key map (kbd "h") #'qq-chat-open-peer-info)
     (define-key map (kbd "g") #'qq-chat-goto-reply)
     (define-key map (kbd "x") #'qq-chat-goto-pop-message)
     (define-key map (kbd "P") #'qq-chat-send-poke)
@@ -3662,6 +3665,25 @@ Clicking an existing reaction chip performs add/remove toggle instead."
       (user-error "qq: current chat has no user profile"))
     (qq-user-open user-id)))
 
+(defun qq-chat-open-peer-info ()
+  "Open the current private user or group profile page."
+  (interactive)
+  (let* ((session (or (qq-state-session qq-chat--session-key)
+                      (user-error "qq: current chat has no session")))
+         (type (alist-get 'type session))
+         (target-id (or (and (eq type 'private) (alist-get 'peer-uin session))
+                        (alist-get 'target-id session))))
+    (pcase type
+      ('private
+       (unless (qq-api-user-id-p target-id)
+         (user-error "qq: current chat has no user profile"))
+       (qq-user-open target-id))
+      ('group
+       (unless (qq-api-group-id-p target-id)
+         (user-error "qq: current chat has no group profile"))
+       (qq-group-open target-id))
+      (_ (user-error "qq: current chat has no profile page")))))
+
 (defun qq-chat-cancel-dwim ()
   "Cancel reply context, or clear draft when no reply is pending.
 
@@ -3749,6 +3771,7 @@ sender."
     (define-key map (kbd "C-c f") #'qq-chat-forward-message)
     (define-key map (kbd "C-c M") #'qq-chat-toggle-forward-mark)
     (define-key map (kbd "C-c F") #'qq-chat-forward-marked-messages)
+    (define-key map (kbd "C-c i") #'qq-chat-open-peer-info)
     (define-key map (kbd "M-<") #'qq-chat-load-older-messages)
     (define-key map (kbd "M->") #'qq-chat-return-to-latest)
     (define-key map (kbd "RET") #'qq-chat-return-dwim)

@@ -22,6 +22,7 @@
 (require 'qq-root)
 (require 'qq-state)
 (require 'qq-user)
+(require 'qq-group)
 
 (declare-function qq-connect "qq")
 (declare-function qq-disconnect "qq")
@@ -115,6 +116,20 @@
     (not (and (eq (alist-get 'type session) 'private)
               (qq-api-user-id-p user-id)))))
 
+(defun qq-transient--chat-info-inapt-p ()
+  "Return non-nil when the current chat has no profile page."
+  (let* ((session (and (boundp 'qq-chat--session-key)
+                       (qq-state-session qq-chat--session-key)))
+         (type (and session (alist-get 'type session)))
+         (target-id (and session
+                         (or (and (eq type 'private)
+                                  (alist-get 'peer-uin session))
+                             (alist-get 'target-id session)))))
+    (pcase type
+      ('private (not (qq-api-user-id-p target-id)))
+      ('group (not (qq-api-group-id-p target-id)))
+      (_ t))))
+
 (defun qq-transient--no-reply-context-p ()
   "Return non-nil when composer has no pending reply."
   (null (qq-chat--reply-message)))
@@ -137,6 +152,19 @@
                            (alist-get 'target-id session)))))
     (not (and (eq (alist-get 'type session) 'private)
               (qq-api-user-id-p user-id)))))
+
+(defun qq-transient--root-info-inapt-p ()
+  "Return non-nil when the root session has no profile page."
+  (let* ((session (ignore-errors (qq-root--session-at-point)))
+         (type (and session (alist-get 'type session)))
+         (target-id (and session
+                         (or (and (eq type 'private)
+                                  (alist-get 'peer-uin session))
+                             (alist-get 'target-id session)))))
+    (pcase type
+      ('private (not (qq-api-user-id-p target-id)))
+      ('group (not (qq-api-group-id-p target-id)))
+      (_ t))))
 
 
 ;;; Attach helpers (typed)
@@ -241,6 +269,8 @@ Prefer this over inline button rows (telega/disco style)."
     ("d" "Recall at point" qq-chat-delete-message
      :inapt-if qq-transient--recall-inapt-p)]
    ["Session"
+    ("h" "Chat info" qq-chat-open-peer-info
+     :inapt-if qq-transient--chat-info-inapt-p)
     ("i" "User page" qq-chat-open-peer-user
      :inapt-if qq-transient--peer-user-inapt-p)
     ("q" "Quit window" quit-window)
@@ -258,8 +288,8 @@ Prefer this over inline button rows (telega/disco style)."
      :inapt-if qq-transient--no-session-at-point-p)
     ("a" "Open avatar" qq-root-open-avatar-at-point
      :inapt-if qq-transient--no-session-at-point-p)
-    ("i" "User page" qq-root-open-user-at-point
-     :inapt-if qq-transient--root-user-inapt-p)
+    ("i" "Session info" qq-root-open-info-at-point
+     :inapt-if qq-transient--root-info-inapt-p)
     ("I" "My profile" qq-root-open-self-user)
     ("s" "Search session…" qq-root-search)
     ("u" "Next unread" qq-root-next-unread)]

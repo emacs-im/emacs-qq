@@ -70,6 +70,11 @@ low bits may already have been lost."
   (and (stringp value)
        (string-match-p "\\`[0-9]+\\'" value)))
 
+(defun qq-api-group-id-p (value)
+  "Return non-nil when VALUE is a canonical QQ group-code string."
+  (and (stringp value)
+       (string-match-p "\\`[0-9]+\\'" value)))
+
 (defun qq-api-entry-id-p (value)
   "Return non-nil when VALUE is a canonical native snapshot entry id."
   (and (stringp value)
@@ -1369,6 +1374,24 @@ reconciles it with the authoritative aggregate count."
      (no_cache . ,(if no-cache t :false)))
    (lambda (response)
      (funcall callback (qq-api--response-data response)))
+   errback))
+
+(defun qq-api-get-group (group-id callback &optional errback)
+  "Fetch native group profile for GROUP-ID and pass it to CALLBACK."
+  (unless (qq-api-group-id-p group-id)
+    (user-error "qq: group profile requires a decimal string group id"))
+  (qq-api-call
+   "emacs_get_group"
+   `((group_id . ,group-id))
+   (lambda (response)
+     (condition-case error-data
+         (let ((profile (qq-api--response-data response)))
+           (unless (equal (alist-get 'group_id profile) group-id)
+             (error "qq: emacs_get_group returned a different group identity"))
+           (funcall callback profile))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
    errback))
 
 (defun qq-api-get-base-emoji (emoji-id callback &optional errback emoji-type download)

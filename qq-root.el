@@ -19,7 +19,9 @@
 (require 'qq-view)
 
 (autoload 'qq-user-open "qq-user" nil t)
+(autoload 'qq-group-open "qq-group" nil t)
 (declare-function qq-user-open "qq-user" (user-id))
+(declare-function qq-group-open "qq-group" (group-id))
 
 (defconst qq-root-buffer-name "*qq-root*"
   "Name of the emacs-qq root buffer.")
@@ -320,6 +322,25 @@ priority over the last-message preview."
       (user-error "qq: session has no user profile"))
     (qq-user-open user-id)))
 
+(defun qq-root-open-info-at-point ()
+  "Open the user or group profile for the session at point."
+  (interactive)
+  (let* ((session (or (qq-root--session-at-point)
+                      (user-error "qq: no session at point")))
+         (type (alist-get 'type session))
+         (target-id (or (and (eq type 'private) (alist-get 'peer-uin session))
+                        (alist-get 'target-id session))))
+    (pcase type
+      ('private
+       (unless (qq-api-user-id-p target-id)
+         (user-error "qq: session has no user profile"))
+       (qq-user-open target-id))
+      ('group
+       (unless (qq-api-group-id-p target-id)
+         (user-error "qq: session has no group profile"))
+       (qq-group-open target-id))
+      (_ (user-error "qq: session has no profile page")))))
+
 (defun qq-root-open-self-user ()
   "Open the logged-in user's profile."
   (interactive)
@@ -465,7 +486,7 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
     (define-key map (kbd "/") #'qq-root-search)
     (define-key map (kbd "RET") #'qq-root-open-at-point)
     (define-key map (kbd "a") #'qq-root-open-avatar-at-point)
-    (define-key map (kbd "i") #'qq-root-open-user-at-point)
+    (define-key map (kbd "i") #'qq-root-open-info-at-point)
     (define-key map (kbd "I") #'qq-root-open-self-user)
     (define-key map [mouse-1] #'qq-root-mouse-open-at-point)
     (define-key map (kbd "n") #'qq-root-button-forward)

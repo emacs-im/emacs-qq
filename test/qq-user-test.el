@@ -160,7 +160,7 @@
   (should (eq (lookup-key qq-chat-timeline-mode-map (kbd "i"))
               #'qq-chat-open-user-at-point))
   (should (eq (lookup-key qq-root-mode-map (kbd "i"))
-              #'qq-root-open-user-at-point))
+              #'qq-root-open-info-at-point))
   (should (eq (lookup-key qq-user-mode-map (kbd "m"))
               #'qq-user-open-chat))
   (should (eq (lookup-key qq-user-mode-map (kbd "p"))
