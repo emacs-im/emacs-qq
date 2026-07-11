@@ -206,6 +206,7 @@
       (qq-user-photo-render))
     (should (string-match-p "Photo 1" (buffer-string)))
     (should-not (string-match-p "\\[Open\\]" (buffer-string)))
+    (should-not (string-match-p "g refresh" (buffer-string)))
     (goto-char (point-min))
     (search-forward "Photo 1")
     (should (equal (alist-get 'id (qq-user-photo--photo-at-point)) "p1"))))

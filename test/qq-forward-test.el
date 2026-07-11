@@ -66,6 +66,19 @@
     (should (eq (lookup-key qq-forward-mode-map (kbd "p")) #'qq-forward-previous-message))
     (should (eq (lookup-key qq-forward-mode-map (kbd "RET")) #'qq-forward-activate))))
 
+(ert-deftest qq-forward-header-omits-static-keybinding-cheat-sheet ()
+  (with-temp-buffer
+    (qq-forward-mode)
+    (setq qq-forward--lookup-kind 'message
+          qq-forward--lookup-id "message-1"
+          qq-forward--messages nil
+          qq-forward--loading nil
+          qq-forward--error nil)
+    (qq-forward--render-body)
+    (should (string-match-p "message_id: message-1" (buffer-string)))
+    (should-not (string-match-p "n/p: navigate" (buffer-string)))
+    (should-not (string-match-p "RET: open" (buffer-string)))))
+
 (ert-deftest qq-forward-recognizes-only-canonical-native-derived-segments ()
   (let* ((source (qq-forward-test--message-source
                   "9007199254742007089" "20001"))

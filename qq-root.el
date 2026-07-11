@@ -314,9 +314,6 @@ priority over the last-message preview."
            (qq-root--entry-create
             :key 'divider :type 'note
             :text (qq-root--mode-divider-line) :face 'shadow)
-           (qq-root--entry-create
-            :key 'key-hints :type 'note
-            :text "g refresh  RET open  i user  a avatar  TAB/n/p move  u next unread  s// search  ?: menu  q quit")
            (qq-root--entry-create :key 'metadata-gap :type 'blank))))
     (append
      metadata
@@ -331,10 +328,7 @@ priority over the last-message preview."
      (unless sessions
        (list
         (qq-root--entry-create
-         :key 'empty :type 'note :text "No sessions available yet.")
-        (qq-root--entry-create
-         :key 'empty-hint :type 'note
-         :text "Press `g` to refresh after transport connects."))))))
+         :key 'empty :type 'note :text "No sessions available yet."))))))
 
 (defun qq-root--session-entry-keys ()
   "Return stable entry keys for all current sessions."

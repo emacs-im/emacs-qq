@@ -103,6 +103,16 @@
     (qq-root-mode)
     (should (eq buffer-undo-list t))))
 
+(ert-deftest qq-root-projects-navigation-without-a-key-cheat-sheet ()
+  (qq-root-test-with-reset
+   (with-temp-buffer
+     (cl-letf (((symbol-function 'qq-root--buffer-width) (lambda () 80)))
+       (let* ((entries (qq-root--project-entries))
+              (texts (delq nil (mapcar #'qq-root--entry-text entries))))
+         (should-not (seq-some (lambda (text)
+                                 (string-match-p "g refresh\\|Press `g`" text))
+                               texts)))))))
+
 (ert-deftest qq-root-sync-preserves-nodes-and-never-erases-buffer ()
   (qq-root-test-with-reset
    (qq-state-upsert-session

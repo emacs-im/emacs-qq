@@ -687,7 +687,7 @@ Caller is responsible for view preservation via
     (erase-buffer)
     (insert (propertize "Chat History\n" 'face 'bold))
     (insert (propertize
-             (format "%s    n/p: navigate  RET: open nested  g: refresh  q: quit\n\n"
+             (format "%s\n\n"
                      (pcase qq-forward--lookup-kind
                        ('message
                         (format "message_id: %s" qq-forward--lookup-id))

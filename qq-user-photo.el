@@ -110,8 +110,6 @@
      (let ((inhibit-read-only t))
        (erase-buffer)
        (setq-local header-line-format '(:eval (qq-user-photo--header-line)))
-       (disco-view-insert-note-line "g refresh  RET view  q quit")
-       (insert "\n")
        (cond
         (qq-user-photo--loading
          (disco-view-insert-note-line "Loading photo wall…"))

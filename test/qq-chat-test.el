@@ -17,6 +17,13 @@
          (progn ,@body)
        (qq-state-reset))))
 
+(ert-deftest qq-chat-header-contains-state-not-a-key-cheat-sheet ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (let ((header (qq-chat--header-text)))
+      (should-not (string-match-p "M-<" header))
+      (should-not (string-match-p "C-c" header)))))
+
 (ert-deftest qq-chat-input-region-uses-editing-keymap ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session

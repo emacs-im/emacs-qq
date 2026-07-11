@@ -829,12 +829,9 @@ because its result is only `{kind:single}'."
   "Build EWOC header text for the current chat state.
 
 Title lives only in `header-line-format' (`qq-chat--header-line'); do not
-repeat it here.  EWOC header is reserved for optional help and history
-load state (disco-style)."
+repeat it here.  EWOC header is reserved for history load state."
   (let* ((text
           (with-temp-buffer
-            (when qq-chat-show-header-help
-              (disco-view-insert-note-line (qq-chat--header-help-text)))
             (cond
              ((eq (qq-chat--history-get :loading) 'newer)
               (disco-view-insert-note-line "(loading newer messages…)"))
@@ -1575,11 +1572,6 @@ Never dump OneBot CQ / raw_message here — previews come from
          body
          "\n")
       "")))
-
-(defun qq-chat--header-help-text ()
-  "Return header help text for chat actions."
-  (concat
-   "M-<: older · M->: latest   r/d/o/a · g reply-jump · x pop · m/?   C-c C-e face · C-c C-v · C-c C-c"))
 
 (defun qq-chat--insert-date-separator-row (day-label)
   "Insert a date separator row for DAY-LABEL."

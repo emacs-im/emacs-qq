@@ -134,14 +134,6 @@ authoritative position is unavailable."
   :type 'boolean
   :group 'qq)
 
-(defcustom qq-chat-show-header-help nil
-  "When non-nil, show the long keybinding help line in the chat EWOC header.
-
-Default nil keeps the buffer header as title-only (telega-like).  Help remains
-available via `C-c ?' / `describe-mode'."
-  :type 'boolean
-  :group 'qq)
-
 (defcustom qq-chat-auto-fill-margin-columns 1
   "Additional right margin columns used for chat timeline alignment.
 
