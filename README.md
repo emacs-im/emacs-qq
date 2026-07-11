@@ -75,7 +75,7 @@ Use `eask link list` to inspect active Eask links and
 Architecture notes:
 
 - QQ modules depend directly on disco's `disco-ui`, `disco-view`,
-  `disco-chatbuf`, and `disco-chat-timeline` infrastructure
+  `appkit-chatbuf`, and `appkit-chat-timeline` infrastructure
 - `qq-media.el` provides QQ-specific resource resolution for avatars, images, files, and base emojis
 - `qq-chat.el` adapts OneBot segments to the shared `disco-ins` compact media-card and `disco-media` action-context protocol; card layout and transient action routing are not QQ-specific
 - `qq-root.el` intentionally follows the disco.el root-buffer direction

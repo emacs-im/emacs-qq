@@ -17,6 +17,10 @@
          (progn ,@body)
        (qq-state-reset))))
 
+(defun qq-chat-test-sync-invalidations ()
+  "Synchronously flush the current chat view's queued invalidations."
+  (appkit-sync-invalidations (appkit-current-view)))
+
 (ert-deftest qq-chat-header-contains-state-not-a-key-cheat-sheet ()
   (with-temp-buffer
     (qq-chat-mode)
@@ -42,7 +46,7 @@
              (qq-chat-render)
              (qq-chat-edit-draft)
              (qq-chat--update-context-mode)
-             (should (disco-chatbuf-point-in-input-p))
+             (should (appkit-chatbuf-point-in-input-p))
              (should (eq (key-binding (kbd "q") t)
                          'self-insert-command))
              (should (eq (key-binding (kbd "s") t)
@@ -85,7 +89,7 @@
      (qq-chat-mode)
      (setq qq-chat--session-key "service:u_mail")
      (qq-chat-render)
-     (should-not (disco-chatbuf-input-region-bounds))
+     (should-not (appkit-chatbuf-input-region-bounds))
      (should-not (string-match-p ">>> " (buffer-string)))
      (should-error (qq-chat-edit-draft) :type 'user-error)
      (should-error (qq-chat-send-message) :type 'user-error))))
@@ -100,15 +104,16 @@
    (with-temp-buffer
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
+     (qq-chat--ensure-view)
      (qq-chat-render)
-     (let ((ewoc (disco-chat-timeline-ewoc))
-           (input-start (disco-chatbuf-input-start-position))
-           (prompt-start (disco-chatbuf-prompt-start-position)))
+     (let ((ewoc (appkit-chat-timeline-ewoc))
+           (input-start (appkit-chatbuf-input-start-position))
+           (prompt-start (appkit-chatbuf-prompt-start-position)))
        (qq-chat--set-draft "updated body")
-       (should (eq ewoc (disco-chat-timeline-ewoc)))
-       (should (= input-start (disco-chatbuf-input-start-position)))
-       (should (= prompt-start (disco-chatbuf-prompt-start-position)))
-       (should (equal "updated body" (disco-chatbuf-input-state)))
+       (should (eq ewoc (appkit-chat-timeline-ewoc)))
+       (should (= input-start (appkit-chatbuf-input-start-position)))
+       (should (= prompt-start (appkit-chatbuf-prompt-start-position)))
+       (should (equal "updated body" (appkit-chatbuf-input-state)))
        (should (equal "updated body" (qq-chat--current-draft-string)))))))
 
 (ert-deftest qq-chat-mode-and-render-do-not-duplicate-prompt ()
@@ -129,9 +134,9 @@
      (let ((count 0)
            (pos (point-min)))
        (while (< pos (point-max))
-         (when (and (eq (get-text-property pos 'field) 'disco-chatbuf-prompt)
+         (when (and (eq (get-text-property pos 'field) 'appkit-chatbuf-prompt)
                     (not (eq (get-text-property (max (point-min) (1- pos)) 'field)
-                             'disco-chatbuf-prompt)))
+                             'appkit-chatbuf-prompt)))
            (setq count (1+ count)))
          (setq pos (1+ pos)))
        (should (= 1 count))))))
@@ -167,7 +172,7 @@
      (let ((before (point)))
        (qq-chat-render)
        (should (= before (point)))
-       (should-not (disco-chatbuf-point-in-input-p)))
+       (should-not (appkit-chatbuf-point-in-input-p)))
      ;; Cancel reply (C-c C-k / footer ×).
      (should (qq-chat--reply-message))
      (qq-chat-cancel-dwim)
@@ -282,9 +287,9 @@
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
-     (let ((ewoc (disco-chat-timeline-ewoc))
-           (node-m1 (disco-chat-timeline-node "m1"))
-           (node-m2 (disco-chat-timeline-node "m2")))
+     (let ((ewoc (appkit-chat-timeline-ewoc))
+           (node-m1 (appkit-chat-timeline-node "m1"))
+           (node-m2 (appkit-chat-timeline-node "m2")))
        (puthash
         "private:10001"
         '(((server-id . "m1")
@@ -304,12 +309,12 @@
            (raw-message . "third")))
         qq-state--messages-by-session)
        (qq-chat-render)
-       (should (eq ewoc (disco-chat-timeline-ewoc)))
-       (should (eq node-m1 (disco-chat-timeline-node "m1")))
-       (should (eq node-m2 (disco-chat-timeline-node "m2")))
-       (should (disco-chat-timeline-node "m3"))
+       (should (eq ewoc (appkit-chat-timeline-ewoc)))
+       (should (eq node-m1 (appkit-chat-timeline-node "m1")))
+       (should (eq node-m2 (appkit-chat-timeline-node "m2")))
+       (should (appkit-chat-timeline-node "m3"))
        (should (equal '("m1" "m2" "m3")
-                      (disco-chat-timeline-keys)))
+                      (appkit-chat-timeline-keys)))
        (should (string-match-p "second updated" (buffer-string)))))))
 
 (ert-deftest qq-chat-render-preserves-empty-active-region-after-set-mark ()
@@ -377,7 +382,7 @@
        (beginning-of-line)
        (push-mark (point) t t)
        (let ((before (point)))
-         (disco-chat-timeline-invalidate (disco-chat-timeline-keys))
+         (appkit-chat-timeline-invalidate (appkit-chat-timeline-keys))
          (should mark-active)
          (should (= before (point)))
          (should (= before (mark t))))))))
@@ -404,6 +409,7 @@
    (with-temp-buffer
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
+     (qq-chat--ensure-view)
      (let (sync-args render-called)
        (cl-letf (((symbol-function 'qq-chat--sync-timeline)
                   (lambda (&rest args) (setq sync-args args)))
@@ -415,6 +421,7 @@
             :mutation create
             :message-anchor "9007199254741004645"
             :message ((server-id . "9007199254741004645"))))
+         (qq-chat-test-sync-invalidations)
          (should (equal (plist-get sync-args :changed-resources)
                         '((:message "9007199254741004645"))))
          (should-not render-called))))))
@@ -424,6 +431,7 @@
    (with-temp-buffer
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
+     (qq-chat--ensure-view)
      (let (events)
        (cl-letf (((symbol-function 'qq-chat--header-line-update)
                   (lambda () (push 'header events)))
@@ -431,6 +439,7 @@
                   (lambda () (push 'frame events))))
          (qq-chat--handle-state-change
           '(:type session :session-key "private:10001" :mutation session))
+         (qq-chat-test-sync-invalidations)
          (should (equal events '(frame header))))))))
 
 (ert-deftest qq-chat-read-state-change-uses-projected-context-sync ()
@@ -438,11 +447,13 @@
    (with-temp-buffer
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
+     (qq-chat--ensure-view)
      (let (called)
        (cl-letf (((symbol-function 'qq-chat--apply-read-state-change)
                   (lambda () (setq called t))))
          (qq-chat--handle-state-change
           '(:type session :session-key "private:10001" :mutation read))
+         (qq-chat-test-sync-invalidations)
          (should called))))))
 
 (ert-deftest qq-chat-recall-hides-node-by-default ()
@@ -473,7 +484,7 @@
        (setq qq-chat--session-key "private:10001")
        (qq-chat-render)
        (should (equal '("9007199254741007777")
-                      (disco-chat-timeline-keys)))
+                      (appkit-chat-timeline-keys)))
        (qq-state-apply-recall "9007199254741007777")
        (qq-chat--handle-state-change
         (list :type 'message
@@ -481,7 +492,8 @@
               :mutation 'update
               :message-anchor "9007199254741007777"
               :message (car (qq-state-session-messages "private:10001"))))
-       (should (equal (disco-chat-timeline-keys)
+       (qq-chat-test-sync-invalidations)
+       (should (equal (appkit-chat-timeline-keys)
                       (list qq-chat--empty-placeholder)))
        (should (qq-state-message-recalled-p
                 (car (qq-state-session-messages "private:10001"))))))))
@@ -519,8 +531,9 @@
               :mutation 'update
               :message-anchor "9007199254741008888"
               :message (car (qq-state-session-messages "private:10001"))))
+       (qq-chat-test-sync-invalidations)
        (should (equal '("9007199254741008888")
-                      (disco-chat-timeline-keys)))
+                      (appkit-chat-timeline-keys)))
        (should (string-match-p
                 "recalled"
                 (buffer-substring-no-properties (point-min) (point-max))))))))
@@ -530,6 +543,7 @@
    (with-temp-buffer
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
+     (qq-chat--ensure-view)
      (let (events)
        (cl-letf (((symbol-function 'qq-chat--header-line-update)
                   (lambda () (push 'header events)))
@@ -538,6 +552,7 @@
                  ((symbol-function 'qq-chat--sync-timeline)
                   (lambda (&rest args) (push (cons 'timeline args) events))))
          (qq-chat--handle-state-change '(:type friends-refreshed :count 1))
+         (qq-chat-test-sync-invalidations)
          (should (equal (mapcar (lambda (event)
                                   (if (consp event) (car event) event))
                                 events)
@@ -554,7 +569,7 @@
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
-     (should (equal (disco-chat-timeline-keys)
+     (should (equal (appkit-chat-timeline-keys)
                     (list qq-chat--empty-placeholder)))
      (goto-char (point-min))
      (should (search-forward "No messages loaded yet." nil t))
@@ -565,7 +580,7 @@
                         (raw-message . "first")))))
        (puthash "private:10001" messages qq-state--messages-by-session)
        (qq-chat--sync-timeline)
-       (should (equal (disco-chat-timeline-keys) '("m1")))
+       (should (equal (appkit-chat-timeline-keys) '("m1")))
        (goto-char (point-min))
        (should (search-forward "first" nil t))
        (goto-char (point-min))
@@ -659,8 +674,8 @@
                   qq-state--messages-by-session)
          (qq-chat--apply-message-state-change
           (list :type 'message :message-anchor "m1" :message recalled)))
-       (should-not (disco-chat-timeline-node "m1"))
-       (should (disco-chat-timeline-node "m2"))
+       (should-not (appkit-chat-timeline-node "m1"))
+       (should (appkit-chat-timeline-node "m2"))
        (goto-char (point-min))
        (should (search-forward "↪ Alice: [message recalled]" nil t))))))
 
@@ -734,18 +749,18 @@
                      (preview . "hi")))))
        (puthash "private:10001" pending qq-state--messages-by-session)
        (qq-chat--sync-timeline)
-       (let ((node (disco-chat-timeline-node local-id)))
+       (let ((node (appkit-chat-timeline-node local-id)))
          (should node)
-         (should (equal (disco-chat-timeline-keys) (list local-id)))
+         (should (equal (appkit-chat-timeline-keys) (list local-id)))
          (puthash "private:10001" sent qq-state--messages-by-session)
          (qq-chat--apply-message-state-change
           (list :type 'message
                 :message-anchor snowflake
                 :previous-anchor local-id
                 :message (car sent)))
-         (should-not (disco-chat-timeline-node local-id))
-         (should (eq node (disco-chat-timeline-node snowflake))))
-       (should (equal (disco-chat-timeline-keys) (list snowflake)))
+         (should-not (appkit-chat-timeline-node local-id))
+         (should (eq node (appkit-chat-timeline-node snowflake))))
+       (should (equal (appkit-chat-timeline-keys) (list snowflake)))
        (goto-char (point-min))
        (should (search-forward "hi" nil t))))))
 
@@ -766,10 +781,10 @@
        (qq-chat-mode)
        (setq qq-chat--session-key "private:10001")
        (qq-chat-render)
-       (should (equal (disco-chat-timeline-keys) '("m1")))
+       (should (equal (appkit-chat-timeline-keys) '("m1")))
        (puthash "private:10001" nil qq-state--messages-by-session)
        (qq-chat--sync-timeline)
-       (should (equal (disco-chat-timeline-keys)
+       (should (equal (appkit-chat-timeline-keys)
                       (list qq-chat--empty-placeholder)))
        (goto-char (point-min))
        (should (search-forward "No messages loaded yet." nil t))))))
@@ -787,8 +802,11 @@
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
      (let (requested)
-       (cl-letf (((symbol-function 'disco-chat-timeline-invalidate)
-                  (lambda (keys &rest _) (setq requested keys))))
+       (cl-letf (((symbol-function 'appkit-invalidate)
+                  (lambda (_view &rest args)
+                    (setq requested (plist-get args :entries))))
+                 ((symbol-function 'appkit-schedule-sync)
+                  (lambda (&rest _) nil)))
          (qq-chat--rerender-open-chats)
          (should (equal '("m1") requested)))))))
 
@@ -973,10 +991,13 @@
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
      (let (requested)
-       (cl-letf (((symbol-function 'disco-chat-timeline-invalidate)
-                  (lambda (keys &rest _) (setq requested keys))))
+       (cl-letf (((symbol-function 'qq-chat--sync-timeline)
+                  (lambda (&rest args)
+                    (setq requested
+                          (plist-get args :changed-resources)))))
          (qq-chat--rerender-open-chats "face:88")
-         (should (equal '("m1") requested)))))))
+         (qq-chat-test-sync-invalidations)
+         (should (equal '((:media "face:88")) requested)))))))
 
 (ert-deftest qq-chat-node-refresh-defers-while-mark-active ()
   (qq-chat-test-with-reset
@@ -1003,12 +1024,12 @@
        (beginning-of-line)
        (push-mark (point) t t)
        (let (invalidated)
-         (cl-letf (((symbol-function 'disco-view-invalidate-keyed-ewoc-node)
+         (cl-letf (((symbol-function 'appkit-ewoc-invalidate-key)
                     (lambda (_ewoc _table key) (push key invalidated))))
            (qq-chat--request-row-redisplay '("m1"))
            (should-not invalidated)
            (setq mark-active nil)
-           (disco-chat-timeline-flush-deferred)
+           (appkit-chat-timeline-flush-deferred)
            (should (equal invalidated '("m1")))))))))
 
 (ert-deftest qq-chat-row-refresh-uses-shared-invalidation-api ()
@@ -1036,7 +1057,7 @@
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
      (let (call)
-       (cl-letf (((symbol-function 'disco-chat-timeline-invalidate)
+       (cl-letf (((symbol-function 'appkit-chat-timeline-invalidate)
                   (lambda (keys &rest options)
                     (setq call (cons keys options)))))
          (qq-chat--request-row-redisplay '("m1" "m2"))
@@ -1112,11 +1133,11 @@
        (qq-chat-render)
        (goto-char (point-min))
        (should (search-forward "Unread Messages" nil t))
-       (let ((ctx (disco-chat-timeline-context "m2")))
+       (let ((ctx (appkit-chat-timeline-context "m2")))
          (should (plist-get ctx :insert-unread)))
        (qq-state-clear-session-unread "private:10001")
        (qq-chat--apply-read-state-change)
-       (should-not (plist-get (disco-chat-timeline-context "m2")
+       (should-not (plist-get (appkit-chat-timeline-context "m2")
                               :insert-unread))
        (goto-char (point-min))
        (should-not (search-forward "Unread Messages" nil t))))))
@@ -1144,7 +1165,7 @@
                     ('image/png qq-chat-test--1x1-png)
                     (_ nil)))))
        (qq-chat-attach-clipboard)
-       (should (disco-chatbuf-input-has-objects-p))
+       (should (appkit-chatbuf-input-has-objects-p))
        (let ((segments (qq-chat--current-input-segments)))
          (should (= 1 (length segments)))
          (should (equal "image" (alist-get 'type (car segments))))
@@ -1165,7 +1186,7 @@
        (setq qq-chat--session-key "private:10001")
        (qq-chat-render)
        (qq-chat-attach-face "178")
-       (should (disco-chatbuf-input-has-objects-p))
+       (should (appkit-chatbuf-input-has-objects-p))
        (let ((segments (qq-chat--current-input-segments)))
          (should (= 1 (length segments)))
          (should (equal "face" (alist-get 'type (car segments))))
@@ -1278,7 +1299,7 @@
        (unwind-protect
            (let (sent-session sent-segments sent-raw)
              (qq-chat-attach-file path "file")
-             (should (disco-chatbuf-input-has-objects-p))
+             (should (appkit-chatbuf-input-has-objects-p))
              (should (equal '("file")
                             (mapcar (lambda (segment) (alist-get 'type segment))
                                     (qq-chat--current-input-segments))))
@@ -1532,7 +1553,7 @@
   "Image object must not swallow following Chinese when sending.
 
 Regression: object text-properties were rear-sticky, so CJK typed after an
-attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
+attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "private:10001"
@@ -1551,7 +1572,7 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
              (with-temp-file path (insert "x"))
              (qq-chat-attach-file path "image")
              ;; Type CJK after the attachment object (normal user flow).
-             (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max)))
+             (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max)))
              (insert "你好世界")
              (qq-chat--sync-draft-from-buffer)
              (setq segments (qq-chat--current-input-segments))
@@ -1753,7 +1774,7 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
      (qq-chat-mode)
      (setq qq-chat--session-key "group:987654321")
      (qq-chat-render)
-     (should (equal (disco-chat-timeline-keys)
+     (should (equal (appkit-chat-timeline-keys)
                     '("9007199254750003456")))
      (should (string-match-p
               "新进群账号疑似来自非大陆地区，请谨慎核实对方身份。查看异常>"
@@ -1921,7 +1942,7 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
     (goto-char (point-min))
     (let ((qq-chat-history-auto-load-threshold 2000)
           called)
-      (cl-letf (((symbol-function 'disco-chatbuf-point-in-input-p) (lambda () nil))
+      (cl-letf (((symbol-function 'appkit-chatbuf-point-in-input-p) (lambda () nil))
                 ((symbol-function 'qq-chat-load-older-messages)
                  (lambda (&optional quiet) (setq called quiet))))
         (qq-chat--maybe-auto-load-older)

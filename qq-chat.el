@@ -13,9 +13,11 @@
 (require 'ring)
 (require 'button)
 (require 'subr-x)
+(require 'appkit-core)
+(require 'appkit-invalidation)
 (require 'disco-chat-avatar)
-(require 'disco-chatbuf)
-(require 'disco-chat-timeline)
+(require 'appkit-chatbuf)
+(require 'appkit-chat-timeline)
 (require 'disco-ins)
 (require 'disco-media)
 (require 'disco-ui)
@@ -24,6 +26,7 @@
 (require 'qq-customize)
 (require 'qq-media)
 (require 'qq-protocol)
+(require 'qq-runtime)
 (require 'qq-state)
 
 ;; `qq-forward' requires this module to reuse the message-body renderer, so
@@ -714,16 +717,16 @@ because its result is only `{kind:single}'."
 
 (defun qq-chat--message-positions ()
   "Return list of message start positions in the current buffer."
-  (when (disco-chat-timeline-live-p)
+  (when (appkit-chat-timeline-live-p)
     (delq nil
-          (mapcar #'disco-chat-timeline-key-position
-                  (disco-chat-timeline-keys)))))
+          (mapcar #'appkit-chat-timeline-key-position
+                  (appkit-chat-timeline-keys)))))
 
 (defun qq-chat--current-message-position ()
   "Return the start position of the message at point, or nil."
-  (when (disco-chat-timeline-live-p)
-    (when-let* ((anchor (disco-chat-timeline-key-at-point)))
-      (disco-chat-timeline-key-position anchor))))
+  (when (appkit-chat-timeline-live-p)
+    (when-let* ((anchor (appkit-chat-timeline-key-at-point)))
+      (appkit-chat-timeline-key-position anchor))))
 
 (defun qq-chat-next-message ()
   "Move point to the next rendered message block."
@@ -750,54 +753,54 @@ because its result is only `{kind:single}'."
 
 (defun qq-chat--current-draft-string ()
   "Return canonical draft as plain text."
-  (disco-chatbuf-string-plain-text (disco-chatbuf-input-state)))
+  (appkit-chatbuf-string-plain-text (appkit-chatbuf-input-state)))
 
 (defun qq-chat--sync-draft-from-buffer ()
   "Sync canonical draft from the editable buffer region."
-  (let ((result (disco-chatbuf-input-state-sync)))
+  (let ((result (appkit-chatbuf-input-state-sync)))
     (when (plist-get result :changed-p)
       (qq-chat--maybe-update-my-action-from-input))
     (plist-get result :value)))
 
 (defun qq-chat--reply-message ()
   "Return current reply target message from shared aux state, or nil."
-  (let ((state (disco-chatbuf-aux-state)))
+  (let ((state (appkit-chatbuf-aux-state)))
     (and (eq (plist-get state :aux-type) 'reply)
          (plist-get state :aux-msg))))
 
 (defun qq-chat--set-reply-message (message)
   "Set shared reply aux state to MESSAGE, or clear it when nil."
   (if message
-      (disco-chatbuf-aux-set
+      (appkit-chatbuf-aux-set
        (list :aux-type 'reply
              :aux-msg message
              :message-id (alist-get 'server-id message)))
-    (disco-chatbuf-aux-reset)))
+    (appkit-chatbuf-aux-reset)))
 
 (defun qq-chat--after-change (beg end _old-len)
   "Keep draft state synced after editable-region changes from BEG to END."
-  (disco-chatbuf-after-change
+  (appkit-chatbuf-after-change
    beg end
-   :rendering-p (disco-chatbuf-rendering-p)
+   :rendering-p (appkit-chatbuf-rendering-p)
    :sync-function #'qq-chat--sync-draft-from-buffer
    :prune-broken-objects t))
 
 (defun qq-chat--update-context-mode ()
   "Enable timeline bindings only when point is outside the draft input."
-  (let ((timeline-p (not (disco-chatbuf-point-in-input-p))))
+  (let ((timeline-p (not (appkit-chatbuf-point-in-input-p))))
     (unless (eq qq-chat-timeline-mode timeline-p)
       (qq-chat-timeline-mode (if timeline-p 1 -1)))))
 
 (defun qq-chat--flush-deferred-node-redisplay ()
   "Flush any node redisplay deferred while a region was active."
-  (when (disco-chat-timeline-live-p)
-    (disco-chat-timeline-flush-deferred)))
+  (when (appkit-chat-timeline-live-p)
+    (appkit-chat-timeline-flush-deferred)))
 
 (defun qq-chat--maybe-auto-load-older ()
   "Load an older page when point approaches the timeline top."
   (when (and qq-chat-history-auto-load-threshold
              qq-chat--session-key
-             (not (disco-chatbuf-point-in-input-p))
+             (not (appkit-chatbuf-point-in-input-p))
              (< (point) (+ (point-min)
                            (max 0 qq-chat-history-auto-load-threshold)))
              (not (qq-chat--history-get :loading))
@@ -806,8 +809,8 @@ because its result is only `{kind:single}'."
 
 (defun qq-chat--post-command ()
   "Keep point inside the logical draft area when editing input."
-  (unless (disco-chatbuf-rendering-p)
-    (disco-chatbuf-post-command-clamp-point)
+  (unless (appkit-chatbuf-rendering-p)
+    (appkit-chatbuf-post-command-clamp-point)
     (qq-chat--flush-deferred-node-redisplay)
     (qq-chat--update-context-mode)
     (qq-chat--maybe-auto-load-older)))
@@ -827,12 +830,12 @@ because its result is only `{kind:single}'."
 
 (defun qq-chat--bind-input-region-from-footer ()
   "Bind the shared persistent tail input to canonical draft state."
-  (disco-chatbuf-init-state 32)
-  (disco-chatbuf-bind-input-region
+  (appkit-chatbuf-init-state 32)
+  (appkit-chatbuf-bind-input-region
    :visible-p (qq-chat--composer-visible-p)
    :prompt (qq-chat--prompt-text)
-   :input-text (disco-chatbuf-input-state)
-   :post-bind-function #'disco-chatbuf-input-apply-text-properties))
+   :input-text (appkit-chatbuf-input-state)
+   :post-bind-function #'appkit-chatbuf-input-apply-text-properties))
 
 (defun qq-chat--header-text ()
   "Build EWOC header text for the current chat state.
@@ -897,8 +900,8 @@ ACTION is `typing', `cancel', or nil.  Only private sessions send
   "Advertise typing when private-chat draft is non-empty (telega parity)."
   (let ((input-p
          (not (string-empty-p
-               (disco-chatbuf-string-plain-text
-                (disco-chatbuf-input-state))))))
+               (appkit-chatbuf-string-plain-text
+                (appkit-chatbuf-input-state))))))
     (cond
      ((and (not qq-chat--my-action) input-p)
       (qq-chat--set-my-action 'typing))
@@ -1014,11 +1017,11 @@ Order (telega-inspired):
 (defun qq-chat--project-timeline (messages)
   "Project visible QQ MESSAGES into shared timeline rows."
   (if (null messages)
-      (list (disco-chat-timeline-row-create
+      (list (appkit-chat-timeline-row-create
              :key qq-chat--empty-placeholder
              :payload qq-chat--empty-placeholder))
     (let ((first-unread (qq-chat--first-unread-anchor messages)))
-      (disco-chat-timeline-project
+      (appkit-chat-timeline-project
        messages
        #'qq-chat--message-anchor
        :context-function
@@ -1029,12 +1032,104 @@ Order (telega-inspired):
 
 (defun qq-chat--ensure-timeline ()
   "Ensure current QQ chat owns one shared projected timeline."
-  (disco-chat-timeline-ensure
+  (qq-chat--ensure-view)
+  (appkit-chat-timeline-ensure
    :printer #'qq-chat--row-printer
    :anchor-property 'qq-chat-message-anchor
    :header (qq-chat--header-text)
    :footer (qq-chat--footer-text)
    :after-mutation-function #'qq-chat--update-context-mode))
+
+(defun qq-chat--view-id ()
+  "Return the opaque appkit view id for the current QQ chat."
+  (unless qq-chat--session-key
+    (error "qq: chat buffer has no session key"))
+  (list 'chat qq-chat--session-key))
+
+(defun qq-chat--apply-state-event (event)
+  "Apply queued QQ state EVENT inside an appkit sync transaction."
+  (let ((event-session-key (plist-get event :session-key))
+        (event-type (plist-get event :type))
+        (event-mutation (plist-get event :mutation)))
+    (pcase event-type
+      ('message
+       (when (equal event-session-key qq-chat--session-key)
+         (qq-chat--apply-message-state-change event)
+         (when (and qq-auto-mark-read
+                    (get-buffer-window (current-buffer) t))
+           (qq-chat-read-all))))
+      ('history
+       (when (equal event-session-key qq-chat--session-key)
+         (qq-chat--header-line-update)
+         (qq-chat--update-frame)
+         (qq-chat--sync-timeline)))
+      ('reset
+       (qq-chat-render))
+      ('session
+       (when (equal event-session-key qq-chat--session-key)
+         (if (eq event-mutation 'read)
+             (qq-chat--apply-read-state-change)
+           (qq-chat--header-line-update)
+           (qq-chat--update-frame))))
+      ('action
+       (when (equal event-session-key qq-chat--session-key)
+         (qq-chat--update-frame)))
+      ('sessions-refreshed
+       (qq-chat--header-line-update)
+       (qq-chat--update-frame))
+      ((or 'friends-refreshed 'groups-refreshed)
+       (qq-chat--header-line-update)
+       (qq-chat--update-frame)
+       (qq-chat--sync-timeline
+        :force-keys (appkit-chat-timeline-keys))))))
+
+(defun qq-chat--sync-invalidations (view invalidations)
+  "Synchronize current chat from coalesced appkit INVALIDATIONS."
+  (let ((events (appkit-view-pending-events-snapshot view))
+        (resources (appkit-invalidations-resource-keys invalidations))
+        (entries (appkit-invalidations-entry-keys invalidations)))
+    (dolist (event events)
+      (when (appkit-view-live-p view)
+        (qq-chat--apply-state-event event)))
+    (when (appkit-view-live-p view)
+      (appkit-view-acknowledge-events view (length events)))
+    (when (appkit-view-live-p view)
+      (cond
+       ((and (null events)
+             (or (appkit-invalidations-structure-p invalidations)
+                 (appkit-invalidations-parts invalidations)
+                 (appkit-invalidations-position-p invalidations)))
+        (qq-chat-render))
+       ((or resources entries)
+        (qq-chat--header-line-update)
+        (qq-chat--update-frame)
+        (qq-chat--sync-timeline
+         :force-keys entries
+         :changed-resources resources))))))
+
+(defun qq-chat--ensure-view ()
+  "Return the live appkit view owning the current QQ chat buffer."
+  (let* ((app (qq-runtime-app))
+         (id (qq-chat--view-id))
+         (current (appkit-current-view)))
+    (cond
+     ((and (appkit-view-live-p current)
+           (eq app (appkit-view-app current))
+           (equal id (appkit-view-id current)))
+      (setf (appkit-view-state current) qq-chat--session-key
+            (appkit-view-sync-function current)
+            #'qq-chat--sync-invalidations)
+      current)
+     ((appkit-view-live-p current)
+      (error "qq: chat buffer belongs to a different appkit view"))
+     (t
+      (appkit-attach-view
+       :app app
+       :id id
+       :state qq-chat--session-key
+       :mode 'qq-chat-mode
+       :sync-function #'qq-chat--sync-invalidations
+       :parts '(frame timeline composer))))))
 
 (defun qq-chat--header-line-update ()
   "Update chat header line and buffer name."
@@ -1045,7 +1140,7 @@ Order (telega-inspired):
 (defun qq-chat--update-frame ()
   "Synchronize QQ chat header, footer, prompt, and canonical composer."
   (qq-chat--ensure-timeline)
-  (disco-chat-timeline-set-frame
+  (appkit-chat-timeline-set-frame
    (qq-chat--header-text)
    (qq-chat--footer-text)
    :bind-input-function #'qq-chat--bind-input-region-from-footer))
@@ -1054,7 +1149,7 @@ Order (telega-inspired):
     (&key (messages nil messages-p) force-keys changed-resources rekeys)
   "Synchronize QQ rows through the shared projected timeline controller."
   (qq-chat--ensure-timeline)
-  (disco-chat-timeline-sync
+  (appkit-chat-timeline-sync
    (qq-chat--project-timeline
     (if messages-p messages (qq-chat--timeline-messages)))
    :force-keys force-keys
@@ -1063,21 +1158,21 @@ Order (telega-inspired):
 
 (defun qq-chat--message-affects-composer-context-p (message-id)
   "Return non-nil when MESSAGE-ID is the active reply target."
-  (equal message-id (disco-chatbuf-aux-message-id)))
+  (equal message-id (appkit-chatbuf-aux-message-id)))
 
 (defun qq-chat--refresh-composer-context-for-message (message-id)
   "Refresh the active reply composer context after MESSAGE-ID changes."
   (when (qq-chat--message-affects-composer-context-p message-id)
     (when-let* ((message (qq-chat--message-by-server-id message-id)))
-      (let ((state (copy-sequence (disco-chatbuf-aux-state))))
+      (let ((state (copy-sequence (appkit-chatbuf-aux-state))))
         (setq state (plist-put state :aux-msg message))
-        (disco-chatbuf-aux-set state)))
+        (appkit-chatbuf-aux-set state)))
     (qq-chat--update-frame)))
 
 (defun qq-chat--refresh-timeline-layout ()
   "Refresh projected QQ rows after display geometry changes."
-  (when (disco-chat-timeline-live-p)
-    (disco-chat-timeline-refresh)))
+  (when (appkit-chat-timeline-live-p)
+    (appkit-chat-timeline-refresh)))
 
 (defun qq-chat--on-window-size-change (&optional _frame)
   "Recompute chat width and refresh rows after window resizing."
@@ -1102,8 +1197,8 @@ Order (telega-inspired):
 
 (defun qq-chat--request-row-redisplay (anchors)
   "Redisplay projected ANCHORS, deferring while a region is active."
-  (when (and anchors (disco-chat-timeline-live-p))
-    (disco-chat-timeline-invalidate
+  (when (and anchors (appkit-chat-timeline-live-p))
+    (appkit-chat-timeline-invalidate
      anchors :defer-while-mark-active t)))
 
 (defun qq-chat--render-empty-placeholder ()
@@ -1146,8 +1241,8 @@ Order (telega-inspired):
 
 (defun qq-chat--row-printer (row)
   "EWOC pretty-printer for one projected QQ chat ROW."
-  (let ((message (disco-chat-timeline-row-payload row))
-        (context (disco-chat-timeline-row-context row)))
+  (let ((message (appkit-chat-timeline-row-payload row))
+        (context (appkit-chat-timeline-row-context row)))
     (cond
    ((eq message qq-chat--empty-placeholder)
     (qq-chat--render-empty-placeholder))
@@ -1158,16 +1253,16 @@ Order (telega-inspired):
 
 (defun qq-chat--set-draft (text)
   "Set canonical draft TEXT and update the shared tail composer."
-  (disco-chatbuf-input-state-set text :reset-history-p t)
-  (disco-chatbuf-with-structural-update
-    (disco-chatbuf-input-replace (disco-chatbuf-input-state))
-    (disco-chatbuf-input-apply-text-properties))
-  (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max))))
+  (appkit-chatbuf-input-state-set text :reset-history-p t)
+  (appkit-chatbuf-with-generated-update
+    (appkit-chatbuf-input-replace (appkit-chatbuf-input-state))
+    (appkit-chatbuf-input-apply-text-properties))
+  (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max))))
 
 (defun qq-chat--push-input-history (text)
   "Insert TEXT into input history when appropriate."
-  (unless (disco-chatbuf-input-has-objects-p)
-    (disco-chatbuf-input-history-push text)))
+  (unless (appkit-chatbuf-input-has-objects-p)
+    (appkit-chatbuf-input-history-push text)))
 
 (defun qq-chat--guess-file-segment-type (path)
   "Return best QQ send segment type for local PATH."
@@ -1244,17 +1339,17 @@ Favorite stickers (`image' with sub_type 1, or mface) try local thumbs."
 (defun qq-chat--insert-input-segment-object (segment)
   "Insert outbound QQ SEGMENT into the current input region as one object."
   (qq-chat--ensure-composer-visible)
-  (unless (disco-chatbuf-point-in-input-p)
-    (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max))))
-  (when (and (disco-chatbuf-point-in-input-p)
-             (> (point) (or (disco-chatbuf-input-start-position) (point-min)))
+  (unless (appkit-chatbuf-point-in-input-p)
+    (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max))))
+  (when (and (appkit-chatbuf-point-in-input-p)
+             (> (point) (or (appkit-chatbuf-input-start-position) (point-min)))
              (let ((ch (char-before)))
                (and ch (not (memq ch '(32 9 10))))))
     (insert " "))
   (let* ((object (qq-chat--segment-input-object segment))
          (label (plist-get object :label)))
-    (disco-chatbuf-input-insert label :object object)
-    (disco-chatbuf-input-apply-text-properties)))
+    (appkit-chatbuf-input-insert label :object object)
+    (appkit-chatbuf-input-apply-text-properties)))
 
 (defun qq-chat-attach-file (path &optional segment-type)
   "Insert local PATH into the chat input as a structured segment object.
@@ -1487,7 +1582,7 @@ image/video inference."
 
 Follow telega's `telega-chatbuf--input-imcs' shape:
 
-1. Split the input string by `disco-chatbuf-input-object-property'
+1. Split the input string by `appkit-chatbuf-input-object-property'
    (telega splits on `telega-attach' via `telega--split-by-text-prop').
 2. Chunks with no object property → plain `text' segments (CJK included).
 3. Chunks with an object → the structured segment (image/face/file/…).
@@ -1495,9 +1590,9 @@ Follow telega's `telega-chatbuf--input-imcs' shape:
 With telega-style insert (object body + trailing spacer with
 `rear-nonsticky t'), typed text after an attachment is a separate chunk and
 is not swallowed into the image segment."
-  (let* ((input (or (disco-chatbuf-input-string) ""))
-         (object-prop disco-chatbuf-input-object-property)
-         (chunks (disco-chatbuf-split-by-text-property input object-prop))
+  (let* ((input (or (appkit-chatbuf-input-string) ""))
+         (object-prop appkit-chatbuf-input-object-property)
+         (chunks (appkit-chatbuf-split-by-text-property input object-prop))
          segments)
     (dolist (chunk chunks)
       (let ((object (and (not (string-empty-p chunk))
@@ -1609,8 +1704,8 @@ Label matches telega's unread bar wording (\"Unread Messages\")."
 (defun qq-chat--message-position (server-id)
   "Return buffer position of SERVER-ID's projected row, or nil."
   (and server-id
-       (disco-chat-timeline-live-p)
-       (disco-chat-timeline-key-position (format "%s" server-id))))
+       (appkit-chat-timeline-live-p)
+       (appkit-chat-timeline-key-position (format "%s" server-id))))
 
 (defun qq-chat--message-end-position (start)
   "Return end position of the message block starting at START."
@@ -2407,7 +2502,7 @@ on the first inline line when the body is pure inline content."
       (user-error "qq: selected message has no server id"))
     (qq-chat--set-reply-message message)
     (qq-chat--update-frame)
-    (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max)))
+    (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max)))
     (message "qq: next message will reply to %s" message-id)))
 
 (defun qq-chat--delete-message-internal (message)
@@ -2558,7 +2653,7 @@ Return non-nil on success."
   (let ((case-fold-search t)
         (history-end
          (max (point-min)
-              (1- (or (disco-chatbuf-input-start-position) (point-max))))))
+              (1- (or (appkit-chatbuf-input-start-position) (point-max))))))
     (save-restriction
       (narrow-to-region (point-min) (max (point-min) history-end))
       (if forward
@@ -2604,8 +2699,9 @@ Return non-nil on success."
   (interactive)
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
-  (when (disco-chatbuf-input-region-bounds)
-    (disco-chatbuf-input-state-sync :reset-history-p nil))
+  (qq-chat--ensure-view)
+  (when (appkit-chatbuf-input-region-bounds)
+    (appkit-chatbuf-input-state-sync :reset-history-p nil))
   (qq-chat--header-line-update)
   (qq-chat--update-frame)
   (qq-chat--sync-timeline))
@@ -2650,7 +2746,7 @@ Return non-nil on success."
       (let ((session-key qq-chat--session-key)
             (buffer (current-buffer))
             (requested (max 1 qq-history-fetch-count))
-            (point-anchor (and (not (disco-chatbuf-point-in-input-p))
+            (point-anchor (and (not (appkit-chatbuf-point-in-input-p))
                                (get-text-property (point)
                                                   'qq-chat-message-anchor)))
             (point-anchor-offset 0))
@@ -2708,7 +2804,7 @@ Return non-nil on success."
                     (alist-get 'last-message-id (qq-chat--session)))))
     (if (and latest (qq-chat--goto-loaded-message latest nil))
         (message "qq: latest cached message")
-      (goto-char (or (disco-chatbuf-input-start-position) (point-max))))))
+      (goto-char (or (appkit-chatbuf-input-start-position) (point-max))))))
 
 (defun qq-chat-load-older-messages (&optional quiet)
   "Load one older history page for the current chat (telega/disco `M-<').
@@ -2793,13 +2889,13 @@ new rows or reports the cursor missing."
                            `(((type . "reply")
                               (data . ((id . ,(format "%s" reply-id)))))))
                          content-segments))
-         (raw-message (unless (disco-chatbuf-input-has-objects-p)
+         (raw-message (unless (appkit-chatbuf-input-has-objects-p)
                         text)))
-    (if (and (not (disco-chatbuf-input-has-objects-p))
+    (if (and (not (appkit-chatbuf-input-has-objects-p))
              (string-empty-p (string-trim text)))
         (message "qq: draft is empty")
       (qq-chat--push-input-history text)
-      (disco-chatbuf-input-state-clear :reset-history-p t)
+      (appkit-chatbuf-input-state-clear :reset-history-p t)
       ;; telega: empty input after send → chatActionCancel
       (qq-chat--set-my-action 'cancel)
       (qq-chat--set-reply-message nil)
@@ -2810,8 +2906,8 @@ new rows or reports the cursor missing."
   "Send current draft, or insert newline with prefix ARG."
   (interactive "P")
   (qq-chat--ensure-composer-visible)
-  (if (not (disco-chatbuf-point-in-input-p))
-      (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max)))
+  (if (not (appkit-chatbuf-point-in-input-p))
+      (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max)))
     (if arg
         (insert "\n")
       (qq-chat-send-message))))
@@ -2820,16 +2916,16 @@ new rows or reports the cursor missing."
   "Move point to the editable draft area."
   (interactive)
   (qq-chat--ensure-composer-visible)
-  (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max))))
+  (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max))))
 
 (defun qq-chat-draft-prev ()
   "Replace draft with previous entry from input history."
   (interactive)
   (condition-case _err
       (progn
-        (disco-chatbuf-input-history-prev)
+        (appkit-chatbuf-input-history-prev)
         (qq-chat--sync-draft-from-buffer)
-        (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max))))
+        (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max))))
     (user-error
      (user-error "qq: no previous inputs"))))
 
@@ -2838,9 +2934,9 @@ new rows or reports the cursor missing."
   (interactive)
   (condition-case _err
       (progn
-        (disco-chatbuf-input-history-next)
+        (appkit-chatbuf-input-history-next)
         (qq-chat--sync-draft-from-buffer)
-        (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max))))
+        (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max))))
     (user-error
      (user-error "qq: not currently browsing input history"))))
 
@@ -2945,7 +3041,7 @@ Bound to `C-c C-k' (also ESC ESC / C-M-c).  Reply footer × is clickable."
     (qq-chat--set-reply-message nil)
     (qq-chat--update-frame)
     (message "qq: reply target cleared"))
-   ((or (disco-chatbuf-input-history-active-p)
+   ((or (appkit-chatbuf-input-history-active-p)
         (not (string-empty-p (string-trim (qq-chat--current-draft-string)))))
     (qq-chat-clear-draft)
     (message "qq: draft cleared"))
@@ -3038,9 +3134,8 @@ Message actions use point + keys (`r'/`d'/`!'/`o'/`a' on the timeline) or
 `qq-chat-message-transient' (`C-c m' / timeline `m').  Chat-wide commands
   are in `qq-chat-transient' (`C-c ?' / timeline `?').
 Attach from clipboard with `C-c C-v' (telega-style)."
-  (disco-chatbuf-mode-setup)
-  (disco-chatbuf-reset-state 32)
-  (disco-chat-timeline-reset)
+  (appkit-chatbuf-mode-setup)
+  (appkit-chatbuf-reset-state 32)
   (setq-local qq-chat--last-search-query nil)
   (setq-local qq-chat--marked-message-anchors nil)
   (setq-local qq-chat--forward-request-active-p nil)
@@ -3167,31 +3262,36 @@ first unread message."
   (unless session-key
     (user-error "qq: session key is required"))
   (qq-state-upsert-session session-key nil nil)
-  (let ((buffer (get-buffer-create (qq-chat--buffer-name session-key))))
+  (let* ((view
+          (appkit-open-view
+           :app (qq-runtime-app)
+           :id (list 'chat session-key)
+           :mode 'qq-chat-mode
+           :buffer-name (qq-chat--buffer-name session-key)
+           :state session-key
+           :sync-function #'qq-chat--sync-invalidations
+           :parts '(frame timeline composer)))
+         (buffer (appkit-view-buffer view)))
     (with-current-buffer buffer
-      (unless (derived-mode-p 'qq-chat-mode)
-        (qq-chat-mode))
       (setq qq-chat--session-key session-key)
       (qq-chat-render)
-      (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max)))
+      (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max)))
       (qq-chat--load-initial-history buffer session-key))
     (pop-to-buffer buffer)
     (with-current-buffer buffer
       (qq-chat--on-window-size-change))))
 
 (defun qq-chat--rerender-open-chats (&optional media-key)
-  "Redisplay open chat rows affected by MEDIA-KEY."
+  "Invalidate open chat rows affected by MEDIA-KEY."
   (dolist (buffer (buffer-list))
     (with-current-buffer buffer
       (when (and (derived-mode-p 'qq-chat-mode)
-                 (disco-chat-timeline-live-p))
-        (let ((keys
-               (if media-key
-                   (disco-chat-timeline-dependent-keys
-                    (list (list :media media-key)))
-                 (disco-chat-timeline-keys))))
-          (disco-chat-timeline-invalidate
-           keys :defer-while-mark-active t))))))
+                 (appkit-view-live-p (appkit-current-view)))
+        (let ((view (appkit-current-view)))
+          (if media-key
+              (appkit-invalidate view :resource (list :media media-key))
+            (appkit-invalidate view :entries (appkit-chat-timeline-keys)))
+          (appkit-schedule-sync view))))))
 
 (defun qq-chat--message-event-rekeys (event)
   "Return explicit local-to-server row rekeys described by EVENT."
@@ -3205,7 +3305,7 @@ first unread message."
          (old-key
           (seq-find (lambda (key)
                       (and (not (equal key new-key))
-                           (disco-chat-timeline-node key)))
+                           (appkit-chat-timeline-node key)))
                     old-keys)))
     (and old-key new-key (list (cons old-key new-key)))))
 
@@ -3231,46 +3331,26 @@ first unread message."
        (or anchor previous-anchor)))))
 
 (defun qq-chat--handle-state-change (event)
-  "Synchronize open QQ chats after state EVENT."
+  "Queue state EVENT invalidations for open QQ chats."
   (let ((event-session-key (plist-get event :session-key))
-        (event-type (plist-get event :type))
-        (event-mutation (plist-get event :mutation)))
+        (event-type (plist-get event :type)))
     (when (memq event-type '(message history reset session action
                              sessions-refreshed friends-refreshed groups-refreshed))
       (dolist (buffer (buffer-list))
         (with-current-buffer buffer
-          (when (derived-mode-p 'qq-chat-mode)
-            (pcase event-type
-              ('message
-               (when (equal event-session-key qq-chat--session-key)
-                 (qq-chat--apply-message-state-change event)
-                 (when (and qq-auto-mark-read
-                            (get-buffer-window buffer t))
-                   (qq-chat-read-all))))
-              ('history
-               (when (equal event-session-key qq-chat--session-key)
-                 (qq-chat--header-line-update)
-                 (qq-chat--update-frame)
-                 (qq-chat--sync-timeline)))
-              ('reset
-               (qq-chat-render))
-              ('session
-               (when (equal event-session-key qq-chat--session-key)
-                 (if (eq event-mutation 'read)
-                     (qq-chat--apply-read-state-change)
-                   (qq-chat--header-line-update)
-                   (qq-chat--update-frame))))
-              ('action
-               (when (equal event-session-key qq-chat--session-key)
-                 (qq-chat--update-frame)))
-              ('sessions-refreshed
-               (qq-chat--header-line-update)
-               (qq-chat--update-frame))
-              ((or 'friends-refreshed 'groups-refreshed)
-               (qq-chat--header-line-update)
-               (qq-chat--update-frame)
-               (qq-chat--sync-timeline
-                :force-keys (disco-chat-timeline-keys))))))))))
+          (when (and (derived-mode-p 'qq-chat-mode)
+                     (appkit-view-live-p (appkit-current-view))
+                     (or (memq event-type
+                               '(reset sessions-refreshed
+                                 friends-refreshed groups-refreshed))
+                         (equal event-session-key qq-chat--session-key)))
+            (let ((view (appkit-current-view)))
+              (appkit-view-enqueue-event view event)
+              (appkit-invalidate
+               view :part (if (memq event-type '(session action sessions-refreshed))
+                              'frame
+                            'timeline))
+              (appkit-schedule-sync view))))))))
 
 (add-hook 'qq-media-cache-update-hook #'qq-chat--rerender-open-chats)
 (add-hook 'qq-state-change-hook #'qq-chat--handle-state-change)

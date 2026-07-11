@@ -3,7 +3,7 @@
 ;; Author: emacs-qq contributors
 ;; Keywords: comm
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1") (websocket "1.16") (transient "0.3") (plz "0.8") (disco "0"))
+;; Package-Requires: ((emacs "27.1") (websocket "1.16") (transient "0.3") (plz "0.8") (appkit "0.1") (disco "0"))
 
 ;;; Commentary:
 
@@ -19,6 +19,7 @@
 ;;; Code:
 
 (require 'qq-customize)
+(require 'qq-runtime)
 (require 'qq-state)
 (require 'qq-transport)
 (require 'qq-api)
@@ -36,6 +37,7 @@
 (defun qq ()
   "Start emacs-qq and open the root buffer."
   (interactive)
+  (qq-runtime-app)
   (qq-root-open)
   (qq-connect))
 
@@ -68,7 +70,7 @@ When transport is already open, request a fresh snapshot immediately."
 (defun qq-reset-session-state ()
   "Clear in-memory transport and store state used by emacs-qq."
   (interactive)
-  (qq-transport-stop)
+  (qq-runtime-stop)
   (qq-state-reset)
   (message "qq: in-memory state reset"))
 
