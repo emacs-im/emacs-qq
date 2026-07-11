@@ -44,7 +44,7 @@
     (should-not (disco-view-one-line-row-time-tail-face row))))
 
 (ert-deftest qq-root-shows-muted-state-without-messages ()
-  (should (equal "[mute] (no messages yet)"
+  (should (equal "[mute]"
                  (qq-root--session-preview-text
                   '((muted-p . t) (unread-count . 0))))))
 
@@ -53,8 +53,8 @@
                  (qq-root--session-preview-text
                   '((last-message-preview . " first\nsecond\r\n  third "))))))
 
-(ert-deftest qq-root-known-message-without-preview-uses-generic-label ()
-  (should (equal "[message]"
+(ert-deftest qq-root-does-not-invent-a-missing-message-preview ()
+  (should (equal ""
                  (qq-root--session-preview-text
                   '((last-message-id . "9007199254741004991"))))))
 
@@ -82,7 +82,7 @@
     (should-not (text-property-not-all
                  (point-min) (point-max) 'mouse-face nil))))
 
-(ert-deftest qq-root-background-render-reuses-last-visible-width ()
+(ert-deftest qq-root-background-sync-reuses-last-visible-width ()
   (with-temp-buffer
     (qq-root-mode)
     (let ((qq-root--fill-column 88)
@@ -93,8 +93,8 @@
                  (lambda (&optional _window)
                    (cl-incf compute-calls)
                    42)))
-        (should (= (qq-root--render-fill-column) 88))
-        (qq-root-render)
+        (should (= (qq-root--stable-fill-column) 88))
+        (qq-root--sync)
         (should (= qq-root--fill-column 88))
         (should (= compute-calls 0))))))
 
@@ -103,18 +103,39 @@
     (qq-root-mode)
     (should (eq buffer-undo-list t))))
 
-(ert-deftest qq-root-render-discards-reenabled-undo-history ()
+(ert-deftest qq-root-sync-preserves-nodes-and-never-erases-buffer ()
   (qq-root-test-with-reset
+   (qq-state-upsert-session
+    "private:1"
+    '((type . private) (target-id . "1") (title . "One")
+      (last-message-time . 2) (last-message-preview . "old"))
+    nil)
+   (qq-state-upsert-session
+    "group:2"
+    '((type . group) (target-id . "2") (title . "Two")
+      (last-message-time . 1) (last-message-preview . "quiet"))
+    nil)
    (with-temp-buffer
-     (qq-root-mode)
-     (buffer-enable-undo)
-     (let ((inhibit-read-only t))
-       (insert "stale generated root contents"))
-     (should (listp buffer-undo-list))
-     (cl-letf (((symbol-function 'qq-root--selected-window) (lambda () nil))
-               ((symbol-function 'qq-root--display-window) (lambda () nil)))
-       (qq-root-render))
-     (should (eq buffer-undo-list t)))))
+     (cl-letf (((symbol-function 'qq-media-session-avatar-display-string)
+                (lambda (_session) "#")))
+       (qq-root-mode)
+       (qq-root--sync)
+       (let ((one-node (gethash '(session . "private:1") qq-root--node-table))
+             (two-node (gethash '(session . "group:2") qq-root--node-table)))
+         (should one-node)
+         (should two-node)
+         (qq-state-upsert-session
+          "private:1" '((last-message-preview . "updated")) nil)
+         (cl-letf (((symbol-function 'erase-buffer)
+                    (lambda () (ert-fail "incremental sync erased the buffer"))))
+           (qq-root--sync))
+         (should (eq one-node
+                     (gethash '(session . "private:1") qq-root--node-table)))
+         (should (eq two-node
+                     (gethash '(session . "group:2") qq-root--node-table)))
+         (should (string-match-p "updated" (buffer-string)))
+         (should-not (string-match-p "old" (buffer-string)))
+         (should (eq buffer-undo-list t)))))))
 
 (ert-deftest qq-root-selected-window-refreshes-cached-width ()
   (with-temp-buffer
@@ -127,36 +148,45 @@
                  (lambda (&optional window)
                    (should (eq window 'root-window))
                    104))
-                ((symbol-function 'qq-root-render)
-                 (lambda () (setq rendered t))))
+                ((symbol-function 'qq-root--sync)
+                 (lambda (&optional _force-keys) (setq rendered t))))
         (should (qq-root--reflow-visible))
         (should (= qq-root--fill-column 104))
         (should rendered)))))
 
-(ert-deftest qq-root-render-coalesces-reentrant-update ()
-  (with-temp-buffer
-    (qq-root-mode)
-    (let ((sessions '(((key . "group:1")
-                       (type . group)
-                       (title . "Group")
-                       (last-message-preview . "hello"))))
-          (insertions 0)
-          scheduled)
-      (cl-letf (((symbol-function 'qq-state-sessions) (lambda () sessions))
-                ((symbol-function 'qq-root--insert-session-line)
-                 (lambda (_session)
-                   (cl-incf insertions)
-                   (when (= insertions 1)
-                     (qq-root-render))
-                   (insert "row\n")))
-                ((symbol-function 'qq-root--rerender-open-root)
-                 (lambda (&rest _) (setq scheduled t))))
-        (qq-root-render)
-        (should (= insertions 1))
-        (should scheduled)
-        (should-not qq-root--rendering)
-        (should-not qq-root--rerender-pending)
-        (should (= 1 (how-many "^row$" (point-min) (point-max))))))))
+(ert-deftest qq-root-media-update-targets-only-owning-session-node ()
+  (let ((sessions
+         '(((key . "private:1") (type . private) (target-id . "1"))
+           ((key . "group:2") (type . group) (target-id . "2"))))
+        calls)
+    (cl-letf (((symbol-function 'qq-state-sessions) (lambda () sessions))
+              ((symbol-function 'qq-root--invalidate-open-root)
+               (lambda (&optional keys) (push keys calls))))
+      (qq-root--handle-media-cache-update "avatar:1")
+      (qq-root--handle-media-cache-update "unrelated")
+      (qq-root--handle-media-cache-update "group-avatar:2"))
+    (should (equal (nreverse calls)
+                   '(((session . "private:1"))
+                     ((session . "group:2")))))))
+
+(ert-deftest qq-root-state-events-have-explicit-update-paths ()
+  (let (syncs invalidations (headers 0))
+    (cl-letf (((symbol-function 'qq-root--sync-open-root)
+               (lambda () (push t syncs)))
+              ((symbol-function 'qq-root--invalidate-open-root)
+               (lambda (keys) (push keys invalidations)))
+              ((symbol-function 'qq-root--refresh-header)
+               (lambda () (cl-incf headers))))
+      (qq-root--handle-state-change '(:type connection))
+      (qq-root--handle-state-change
+       '(:type action :session-key "group:1"))
+      (qq-root--handle-state-change
+       '(:type message :session-key "group:1"))
+      (qq-root--handle-state-change '(:type heartbeat)))
+    (should (= headers 1))
+    (should (equal syncs '(t)))
+    (should (equal invalidations
+                   '(((session . "group:1")))))))
 
 (provide 'qq-root-test)
 

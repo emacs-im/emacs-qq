@@ -4,19 +4,19 @@
 
 ;;; Commentary:
 
-;; Root buffer modeled after disco.el's root view, with a unified one-line list
-;; style shared with the chat buffer helpers.
+;; Persistent keyed-EWOC root view.  Session rows use disco.el's shared list
+;; reconciliation and one-line presentation infrastructure.
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'ewoc)
 (require 'subr-x)
 (require 'disco-view)
 (require 'qq-api)
 (require 'qq-chat)
 (require 'qq-media)
 (require 'qq-state)
-(require 'qq-view)
 
 (autoload 'qq-user-open "qq-user" nil t)
 (autoload 'qq-group-open "qq-group" nil t)
@@ -29,17 +29,23 @@
 (defconst qq-root--activity-icon-slot-width 4
   "Reserved icon slot width for one-line session rows.")
 
-(defvar-local qq-root--rerender-timer nil
-  "Idle timer used to debounce root rerenders.")
+(defvar-local qq-root--ewoc nil
+  "Persistent EWOC containing root metadata and session rows.")
 
-(defvar-local qq-root--rendering nil
-  "Non-nil while a root render pass is inserting rows.")
-
-(defvar-local qq-root--rerender-pending nil
-  "Non-nil when an update requested another render during a render pass.")
+(defvar-local qq-root--node-table nil
+  "Stable root entry key to EWOC node table.")
 
 (defvar-local qq-root--fill-column nil
   "Last root width measured from a window that actually displayed it.")
+
+(cl-defstruct (qq-root--entry
+               (:constructor qq-root--entry-create))
+  key
+  type
+  text
+  face
+  session
+  width)
 
 (defun qq-root--selected-window ()
   "Return the selected window when it displays the current root buffer."
@@ -67,8 +73,8 @@
                       win qq-root-auto-fill-margin-columns)))
     (max 60 width)))
 
-(defun qq-root--render-fill-column ()
-  "Return a stable width for the next root render pass.
+(defun qq-root--stable-fill-column ()
+  "Return a stable width for the next root reconciliation.
 
 Like telega/disco root autofill, measure the selected root window when
 possible.  A passive background update reuses the last measured width instead
@@ -82,10 +88,10 @@ of accidentally borrowing the selected chat window."
       80))
 
 (defun qq-root--buffer-width ()
-  "Return current root rendering width in columns."
+  "Return current root row width in columns."
   (max 60 (or qq-root--fill-column
               (setq-local qq-root--fill-column
-                          (qq-root--render-fill-column)))))
+                          (qq-root--stable-fill-column)))))
 
 (defun qq-root--format-time (timestamp)
   "Return display string for TIMESTAMP."
@@ -106,9 +112,9 @@ of accidentally borrowing the selected chat window."
                 (format " (%s)" user-id)
               ""))))
 
-(defun qq-root--activity-metrics ()
-  "Return simple root activity metrics plist."
-  (let* ((sessions (qq-state-sessions))
+(defun qq-root--activity-metrics (&optional sessions)
+  "Return root activity metrics for SESSIONS or current state."
+  (let* ((sessions (or sessions (qq-state-sessions)))
          (unread (cl-count-if (lambda (session)
                                 (> (or (alist-get 'unread-count session) 0) 0))
                               sessions))
@@ -133,9 +139,9 @@ of accidentally borrowing the selected chat window."
           label
           count))
 
-(defun qq-root--filters-line ()
-  "Return filter-chip line inspired by disco root view."
-  (let ((metrics (qq-root--activity-metrics)))
+(defun qq-root--filters-line (&optional sessions)
+  "Return filter-chip line for SESSIONS or current state."
+  (let ((metrics (qq-root--activity-metrics sessions)))
     (string-join
      (list (qq-root--filter-chip "Main" (or (plist-get metrics :all) 0) t)
            (qq-root--filter-chip "Important" (or (plist-get metrics :important) 0))
@@ -199,7 +205,7 @@ of accidentally borrowing the selected chat window."
     (concat mention-badge unread-badge)))
 
 (defun qq-root--session-icon-face (session)
-  "Return fallback icon face for SESSION."
+  "Return the icon face for SESSION."
   (cond
    ((qq-root--session-muted-p session) 'shadow)
    ((eq (alist-get 'type session) 'group) 'font-lock-keyword-face)
@@ -230,17 +236,14 @@ priority over the last-message preview."
                             (qq-state-action-text session-key))))
          (preview (qq-state-preview-one-line
                    (alist-get 'last-message-preview session)))
-         (badge (qq-root--session-badge session)))
-    (concat
-     badge
-     (cond
-      ((and (stringp action-text) (not (string-empty-p action-text)))
-       (concat (or qq-chat-action-prefix ".. ") action-text))
-      ((string-empty-p preview)
-       (if (alist-get 'last-message-id session)
-           "[message]"
-         "(no messages yet)"))
-      (t preview)))))
+         (badge (qq-root--session-badge session))
+         (content
+          (if (and (stringp action-text) (not (string-empty-p action-text)))
+              (concat (or qq-chat-action-prefix ".. ") action-text)
+            preview)))
+    (if (string-empty-p content)
+        (string-trim-right badge)
+      (concat badge content))))
 
 (defun qq-root--session-one-line-row (session)
   "Return one-line row model for SESSION."
@@ -283,6 +286,102 @@ priority over the last-message preview."
    :width (qq-root--buffer-width)
    :icon-slot-width qq-root--activity-icon-slot-width
    :context-width-spec '(0.32 16 30)))
+
+(defun qq-root--session-entry-key (session-key)
+  "Return the stable root entry key for SESSION-KEY."
+  (cons 'session session-key))
+
+(defun qq-root--entry-printer (entry)
+  "Insert one persistent root ENTRY."
+  (pcase (qq-root--entry-type entry)
+    ('note
+     (disco-view-insert-note-line (qq-root--entry-text entry)
+                                  :face (qq-root--entry-face entry)))
+    ('blank (insert "\n"))
+    ('session (qq-root--insert-session-line (qq-root--entry-session entry)))
+    (type (error "qq: unknown root entry type %S" type))))
+
+(defun qq-root--project-entries ()
+  "Project current state into stable-keyed root entries."
+  (let* ((sessions (qq-state-sessions))
+         (width (qq-root--buffer-width))
+         (metadata
+          (list
+           (qq-root--entry-create
+            :key 'filters :type 'note
+            :text (qq-root--filters-line sessions)
+            :face 'font-lock-doc-face)
+           (qq-root--entry-create
+            :key 'divider :type 'note
+            :text (qq-root--mode-divider-line) :face 'shadow)
+           (qq-root--entry-create
+            :key 'key-hints :type 'note
+            :text "g refresh  RET open  i user  a avatar  TAB/n/p move  u next unread  s// search  ?: menu  q quit")
+           (qq-root--entry-create :key 'metadata-gap :type 'blank))))
+    (append
+     metadata
+     (mapcar
+      (lambda (session)
+        (qq-root--entry-create
+         :key (qq-root--session-entry-key (alist-get 'key session))
+         :type 'session
+         :session session
+         :width width))
+      sessions)
+     (unless sessions
+       (list
+        (qq-root--entry-create
+         :key 'empty :type 'note :text "No sessions available yet.")
+        (qq-root--entry-create
+         :key 'empty-hint :type 'note
+         :text "Press `g` to refresh after transport connects."))))))
+
+(defun qq-root--session-entry-keys ()
+  "Return stable entry keys for all current sessions."
+  (mapcar (lambda (session)
+            (qq-root--session-entry-key (alist-get 'key session)))
+          (qq-state-sessions)))
+
+(defun qq-root--sync (&optional force-keys)
+  "Reconcile the persistent root view, invalidating FORCE-KEYS.
+
+Rows whose data and position are unchanged retain their EWOC nodes."
+  (unless (ewoc-p qq-root--ewoc)
+    (error "qq: root view is not initialized"))
+  (let ((snapshot
+         (disco-view-capture-position
+          :anchor-property 'qq-root-session-key
+          :preserve-window-start t))
+        (inhibit-read-only t)
+        (buffer-undo-list t))
+    (setq-local qq-root--fill-column (qq-root--stable-fill-column))
+    (with-silent-modifications
+      (setq qq-root--node-table
+            (disco-view-reconcile-keyed-ewoc
+             qq-root--ewoc
+             (qq-root--project-entries)
+             #'qq-root--entry-key
+             :force-keys force-keys)))
+    (when snapshot
+      (disco-view-restore-position snapshot))
+    (force-mode-line-update)
+    (force-window-update (current-buffer))))
+
+(defun qq-root--invalidate (keys)
+  "Invalidate persistent root rows identified by KEYS."
+  (let ((snapshot
+         (disco-view-capture-position
+          :anchor-property 'qq-root-session-key
+          :preserve-window-start t))
+        (inhibit-read-only t)
+        (buffer-undo-list t))
+    (with-silent-modifications
+      (dolist (key keys)
+        (disco-view-invalidate-keyed-ewoc-node
+         qq-root--ewoc qq-root--node-table key)))
+    (when snapshot
+      (disco-view-restore-position snapshot))
+    (force-window-update (current-buffer))))
 
 (defun qq-root--session-key-at-point (&optional pos)
   "Return root session key at POS, or current point when POS is nil."
@@ -436,56 +535,9 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
      (cdr (assoc (completing-read "Session: " choices nil t) choices)))))
 
 (defun qq-root-refresh ()
-  "Refresh root state and redraw the buffer."
+  "Request a fresh root snapshot from NapCat."
   (interactive)
-  (qq-api-refresh)
-  (qq-root-render))
-
-(defun qq-root-render ()
-  "Render the root buffer from local state."
-  (interactive)
-  ;; Root is a generated, read-only view.  Recording each erase/reinsert cycle
-  ;; can retain many complete copies of the session list and eventually trip
-  ;; `undo-outer-limit'.  Enforce this here as well as in `qq-root-mode' so an
-  ;; already-open buffer (or one where undo was re-enabled) is repaired on its
-  ;; next refresh.
-  (unless (eq buffer-undo-list t)
-    (buffer-disable-undo))
-  (setq-local buffer-undo-list t)
-  (if qq-root--rendering
-      (setq qq-root--rerender-pending t)
-    (let ((qq-root--rendering t))
-      (unwind-protect
-          (progn
-            (setq-local qq-root--fill-column (qq-root--render-fill-column))
-            (disco-view-render-preserving-position
-             (lambda ()
-               (let ((inhibit-read-only t)
-                     (sessions (qq-state-sessions)))
-                 (erase-buffer)
-                 (setq-local header-line-format '(:eval (qq-root--header-line)))
-                 (qq-view-insert-note-line
-                  (qq-root--filters-line) :face 'font-lock-doc-face)
-                 (qq-view-insert-note-line
-                  (qq-root--mode-divider-line) :face 'shadow)
-                 (qq-view-insert-note-line
-                  "g refresh  RET open  i user  a avatar  TAB/n/p move  u next unread  s// search  ?: menu  q quit")
-                 (insert "\n")
-                 (if sessions
-                     (dolist (session sessions)
-                       (qq-root--insert-session-line session))
-                   (qq-view-insert-note-line "No sessions available yet.")
-                   (qq-view-insert-note-line
-                    "Press `g` to refresh after transport connects."))
-                 (goto-char (point-min))
-                 (forward-line 2)
-                 (unless (qq-root--session-key-at-point)
-                   (qq-root-button-forward))))
-             :anchor-property 'qq-root-session-key
-             :preserve-window-start t))
-        (when qq-root--rerender-pending
-          (setq qq-root--rerender-pending nil)
-          (qq-root--rerender-open-root))))))
+  (qq-api-refresh))
 
 (defvar qq-root-mode-map
   (let ((map (make-sparse-keymap)))
@@ -517,8 +569,13 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
   (setq-local buffer-undo-list t)
   (setq-local switch-to-buffer-preserve-window-point nil)
   (setq-local qq-root--fill-column nil)
-  (setq-local qq-root--rendering nil)
-  (setq-local qq-root--rerender-pending nil)
+  (setq-local qq-root--node-table (make-hash-table :test #'equal))
+  (setq-local header-line-format '(:eval (qq-root--header-line)))
+  (let ((inhibit-read-only t)
+        (buffer-undo-list t))
+    (erase-buffer)
+    (setq-local qq-root--ewoc
+                (ewoc-create #'qq-root--entry-printer nil nil t)))
   (add-hook 'window-size-change-functions
             #'qq-root--on-window-size-change nil t)
   (add-hook 'display-line-numbers-mode-hook
@@ -531,16 +588,18 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
   (let ((buffer (get-buffer-create qq-root-buffer-name)))
     (with-current-buffer buffer
       (unless (derived-mode-p 'qq-root-mode)
-        (qq-root-mode))
-      (qq-root-render))
+        (qq-root-mode)))
     (pop-to-buffer buffer)
     (with-current-buffer buffer
-      (qq-root--reflow-visible t))))
+      (qq-root--reflow-visible t)
+      (unless (qq-root--session-key-at-point)
+        (goto-char (point-min))
+        (qq-root-button-forward)))))
 
 (defun qq-root--reflow-visible (&optional force)
   "Reflow root from its real display window when width changed.
 
-When FORCE is non-nil, rerender even when the measured width is unchanged so
+When FORCE is non-nil, invalidate rows even when the width is unchanged so
 pixel-valued alignment follows text scaling."
   (when (derived-mode-p 'qq-root-mode)
     (when-let* ((win (or (qq-root--selected-window)
@@ -548,7 +607,7 @@ pixel-valued alignment follows text scaling."
                 (next (qq-root--compute-fill-column win)))
       (when (or force (not (equal next qq-root--fill-column)))
         (setq-local qq-root--fill-column next)
-        (qq-root-render)
+        (qq-root--sync (and force (qq-root--session-entry-keys)))
         t))))
 
 (defun qq-root--on-window-size-change (&optional _frame)
@@ -559,46 +618,65 @@ pixel-valued alignment follows text scaling."
   "Reflow a visible root buffer after text scaling changes."
   (qq-root--reflow-visible t))
 
-(defun qq-root--cancel-rerender-timer ()
-  "Cancel any pending debounced rerender for current root buffer."
-  (when (timerp qq-root--rerender-timer)
-    (cancel-timer qq-root--rerender-timer)
-    (setq qq-root--rerender-timer nil)))
-
-(defun qq-root--rerender-buffer-if-live (buffer)
-  "Rerender BUFFER when it is a live root buffer."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (setq qq-root--rerender-timer nil)
-      (when (derived-mode-p 'qq-root-mode)
-        (qq-root-render)))))
-
-(defun qq-root--rerender-open-root (&optional _media-key immediate)
-  "Rerender the live root buffer after UI-affecting changes.
-
-When IMMEDIATE is non-nil, rerender synchronously.  Otherwise debounce the
-refresh until Emacs becomes idle, which avoids point-motion stutter while many
-avatar/media cache updates arrive in a burst.  Optional _MEDIA-KEY is ignored
-when this function is used as `qq-media-cache-update-hook'."
+(defun qq-root--sync-open-root ()
+  "Synchronize the live root buffer."
   (let ((buffer (get-buffer qq-root-buffer-name)))
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
-        (qq-root--cancel-rerender-timer)
-        (if immediate
-            (qq-root--rerender-buffer-if-live buffer)
-          (setq qq-root--rerender-timer
-                (run-with-idle-timer 0.05 nil
-                                     #'qq-root--rerender-buffer-if-live
-                                     buffer)))))))
+        (when (derived-mode-p 'qq-root-mode)
+          (qq-root--sync))))))
+
+(defun qq-root--invalidate-open-root (keys)
+  "Invalidate KEYS in the live root buffer."
+  (let ((buffer (get-buffer qq-root-buffer-name)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (when (derived-mode-p 'qq-root-mode)
+          (qq-root--invalidate keys))))))
+
+(defun qq-root--session-avatar-media-key (session)
+  "Return the exact avatar cache key used by SESSION, or nil."
+  (let ((target-id (alist-get 'target-id session)))
+    (when target-id
+      (pcase (alist-get 'type session)
+        ('dataline nil)
+        ('group (format "group-avatar:%s" target-id))
+        (_ (format "avatar:%s" target-id))))))
+
+(defun qq-root--handle-media-cache-update (media-key)
+  "Invalidate root rows whose avatar is identified by MEDIA-KEY."
+  (when (stringp media-key)
+    (let (keys)
+      (dolist (session (qq-state-sessions))
+        (when (equal media-key (qq-root--session-avatar-media-key session))
+          (push (qq-root--session-entry-key (alist-get 'key session)) keys)))
+      (when keys
+        (qq-root--invalidate-open-root keys)))))
+
+(defun qq-root--refresh-header ()
+  "Refresh the root header without touching persistent entries."
+  (when-let* ((buffer (get-buffer qq-root-buffer-name)))
+    (with-current-buffer buffer
+      (when (derived-mode-p 'qq-root-mode)
+        (force-mode-line-update)
+        (force-window-update buffer)))))
 
 (defun qq-root--handle-state-change (event)
-  "Refresh visible root buffer after relevant state EVENT changes."
-  (when (memq (plist-get event :type)
-              '(reset connection self-info session message history action
-                      sessions-refreshed friends-refreshed groups-refreshed))
-    (qq-root--rerender-open-root)))
+  "Apply state EVENT to the persistent root view."
+  (let ((type (plist-get event :type))
+        (session-key (plist-get event :session-key)))
+    (pcase type
+      ((or 'connection 'self-info)
+       (qq-root--refresh-header))
+      ('action
+       (when session-key
+         (qq-root--invalidate-open-root
+          (list (qq-root--session-entry-key session-key)))))
+      ((or 'reset 'session 'message 'history 'sessions-refreshed
+           'friends-refreshed 'groups-refreshed)
+       (qq-root--sync-open-root)))))
 
-(add-hook 'qq-media-cache-update-hook #'qq-root--rerender-open-root)
+(add-hook 'qq-media-cache-update-hook #'qq-root--handle-media-cache-update)
 (add-hook 'qq-state-change-hook #'qq-root--handle-state-change)
 
 (provide 'qq-root)
