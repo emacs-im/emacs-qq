@@ -13,7 +13,7 @@
 (require 'subr-x)
 (require 'qq-api)
 (require 'qq-media)
-(require 'qq-view)
+(require 'disco-view)
 
 (declare-function qq-api-cancel-request "qq-api" (request-token))
 
@@ -105,20 +105,20 @@
 (defun qq-user-photo-render ()
   "Render the current native photo-wall buffer."
   (interactive)
-  (qq-view-render-preserving-position
+  (disco-view-render-preserving-position
    (lambda ()
      (let ((inhibit-read-only t))
        (erase-buffer)
        (setq-local header-line-format '(:eval (qq-user-photo--header-line)))
-       (qq-view-insert-note-line "g refresh  RET view  q quit")
+       (disco-view-insert-note-line "g refresh  RET view  q quit")
        (insert "\n")
        (cond
         (qq-user-photo--loading
-         (qq-view-insert-note-line "Loading photo wall…"))
+         (disco-view-insert-note-line "Loading photo wall…"))
         (qq-user-photo--error
-         (qq-view-insert-note-line qq-user-photo--error :face 'error))
+         (disco-view-insert-note-line qq-user-photo--error :face 'error))
         ((null qq-user-photo--photos)
-         (qq-view-insert-note-line "No public photos."))
+         (disco-view-insert-note-line "No public photos."))
         (t
          (cl-loop for photo in qq-user-photo--photos
                   for index from 1

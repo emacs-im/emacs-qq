@@ -219,7 +219,7 @@
                        ((type . "text")
                         (data . ((text . "hello"))))))))))
 
-(ert-deftest qq-api-fetch-history-uses-peer-history-for-dataline-sessions ()
+(ert-deftest qq-api-fetch-older-history-uses-peer-history-for-dataline-sessions ()
   (let (captured-action captured-params merged done-meta)
     (cl-letf (((symbol-function 'qq-state-session)
                (lambda (_session-key)
@@ -240,7 +240,7 @@
                  (setq captured-params params)
                  (funcall callback '((data . ((messages . (((message_id . 1))))))) )
                  'sent)))
-      (qq-api-fetch-history "dataline:device-1" nil
+      (qq-api-fetch-older-history "dataline:device-1" nil
                             (lambda (meta) (setq done-meta meta)))
       (should (equal captured-action "get_peer_msg_history"))
       (should (equal (alist-get 'chat_type captured-params) "8"))
@@ -280,7 +280,7 @@
       (should (equal (car applied) "group:20001"))
       (should (equal callback-value (cadr applied))))))
 
-(ert-deftest qq-api-fetch-history-uses-peer-history-for-service-sessions ()
+(ert-deftest qq-api-fetch-older-history-uses-peer-history-for-service-sessions ()
   (let (captured-action captured-params)
     (cl-letf (((symbol-function 'qq-state-session)
                (lambda (_session-key)
@@ -297,7 +297,7 @@
                        captured-params params)
                  (funcall callback '((data . ((messages . nil)))))
                  'sent)))
-      (qq-api-fetch-history "service:u_mail")
+      (qq-api-fetch-older-history "service:u_mail")
       (should (equal captured-action "get_peer_msg_history"))
       (should (equal (alist-get 'chat_type captured-params) "103"))
       (should (equal (alist-get 'peer_uid captured-params) "u_mail"))
@@ -338,6 +338,18 @@
          (user_id . "10001")
          (target_id . "90001")))
       (should (equal (alist-get 'sub_type received) "poke")))))
+
+(ert-deftest qq-api-handle-notice-dispatches-gray-tip ()
+  (let (received)
+    (cl-letf (((symbol-function 'qq-state-apply-gray-tip-notice)
+               (lambda (notice) (setq received notice))))
+      (qq-api--handle-notice
+       '((notice_type . "notify")
+         (sub_type . "gray_tip")
+         (group_id . 20001)
+         (message_id . "9007199254750003456")
+         (busi_id . "19366")))
+      (should (equal (alist-get 'busi_id received) "19366")))))
 
 (ert-deftest qq-api-handle-notice-dispatches-emoji-like ()
   (let (received)
@@ -423,7 +435,7 @@
       (should-error (qq-api-recall-poke 9007199254741007777)
                     :type 'user-error))))
 
-(ert-deftest qq-api-fetch-history-passes-message-seq-for-older-page ()
+(ert-deftest qq-api-fetch-older-history-passes-message-seq-for-older-page ()
   (let (captured-params)
     (cl-letf (((symbol-function 'qq-state-session)
                (lambda (_session-key)
@@ -439,7 +451,7 @@
                  (setq captured-params params)
                  (funcall callback '((data . ((messages . nil)))))
                  'sent)))
-      (qq-api-fetch-history "private:10001" "9007199254741004999")
+      (qq-api-fetch-older-history "private:10001" "9007199254741004999")
       (should (equal (alist-get 'message_seq captured-params)
                      "9007199254741004999"))
       (should (eq (alist-get 'reverse_order captured-params) t))

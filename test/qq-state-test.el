@@ -114,6 +114,36 @@
      (should (equal (alist-get 'preview message) "戳了戳 我"))
      (should-not (string-match-p "unknown" (alist-get 'preview message))))))
 
+(ert-deftest qq-state-apply-gray-tip-notice-creates-group-system-row ()
+  (qq-test-with-reset
+   (let (events)
+     (add-hook 'qq-state-change-hook (lambda (event) (push event events)))
+     (let ((message
+            (qq-state-apply-gray-tip-notice
+             '((post_type . "notice")
+               (notice_type . "notify")
+               (sub_type . "gray_tip")
+               (group_id . 987654321)
+               (user_id . 0)
+               (message_id . "9007199254750003456")
+               (busi_id . "19366")
+               (content . "{\"align\":\"center\",\"items\":[{\"txt\":\"新进群账号疑似来自非大陆地区，请谨慎核实对方身份。\",\"type\":\"nor\"},{\"txt\":\"查看异常>\",\"type\":\"url\"}]}\n")
+               (raw_info . ((msgTime . "1710000000")))))))
+       (should (qq-state-gray-tip-message-p message))
+       (should (equal (alist-get 'session-key message) "group:987654321"))
+       (should (equal (alist-get 'server-id message)
+                      "9007199254750003456"))
+       (should (equal (alist-get 'preview message)
+                      "新进群账号疑似来自非大陆地区，请谨慎核实对方身份。查看异常>"))
+       (should (equal (qq-state-message-preview message)
+                      "新进群账号疑似来自非大陆地区，请谨慎核实对方身份。查看异常>"))
+       (should (equal
+                (alist-get 'last-message-preview
+                           (qq-state-session "group:987654321"))
+                "新进群账号疑似来自非大陆地区，请谨慎核实对方身份。查看异常>"))
+       (should (equal (plist-get (car events) :message-anchor)
+                      "9007199254750003456"))))))
+
 (ert-deftest qq-state-merge-history-normalizes-poke-notice ()
   (qq-test-with-reset
    (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))

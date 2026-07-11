@@ -4,14 +4,14 @@
 
 (require 'ert)
 (require 'qq-chat)
+(require 'qq-forward)
 (require 'qq-state)
 (require 'qq-transient)
 
 (defmacro qq-chat-test-with-reset (&rest body)
   "Run BODY with clean qq state and disabled live-update hooks."
   `(let ((qq-state-change-hook nil)
-         (qq-media-cache-update-hook nil)
-         (qq-media-rerender-function nil))
+         (qq-media-cache-update-hook nil))
      (qq-state-reset)
      (unwind-protect
          (progn ,@body)
@@ -35,7 +35,7 @@
              (qq-chat-render)
              (qq-chat-edit-draft)
              (qq-chat--update-context-mode)
-             (should (qq-chat--point-in-input-p))
+             (should (disco-chatbuf-point-in-input-p))
              (should (eq (key-binding (kbd "q") t)
                          'self-insert-command))
              (should (eq (key-binding (kbd "s") t)
@@ -65,7 +65,7 @@
          (when (buffer-live-p buffer)
            (kill-buffer buffer)))))))
 
-(ert-deftest qq-chat-set-draft-preserves-ewoc-and-input-markers ()
+(ert-deftest qq-chat-set-draft-preserves-shared-timeline-and-composer ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "private:10001"
@@ -76,13 +76,14 @@
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
-     (let ((ewoc qq-chat--ewoc)
-           (input-marker qq-chat--input-marker)
-           (prompt-marker qq-chat--input-prompt-marker))
+     (let ((ewoc (disco-chat-timeline-ewoc))
+           (input-start (disco-chatbuf-input-start-position))
+           (prompt-start (disco-chatbuf-prompt-start-position)))
        (qq-chat--set-draft "updated body")
-       (should (eq ewoc qq-chat--ewoc))
-       (should (eq input-marker qq-chat--input-marker))
-       (should (eq prompt-marker qq-chat--input-prompt-marker))
+       (should (eq ewoc (disco-chat-timeline-ewoc)))
+       (should (= input-start (disco-chatbuf-input-start-position)))
+       (should (= prompt-start (disco-chatbuf-prompt-start-position)))
+       (should (equal "updated body" (disco-chatbuf-input-state)))
        (should (equal "updated body" (qq-chat--current-draft-string)))))))
 
 (ert-deftest qq-chat-mode-and-render-do-not-duplicate-prompt ()
@@ -129,7 +130,7 @@
         (segments . (((type . "image")
                       (data . ((file . "x.png")
                                (url . "http://example.com/x"))))))))
-     (qq-chat--update-frame-preserving-point)
+     (qq-chat--update-frame)
      (goto-char (point-min))
      (search-forward "Reply to Alice")
      (search-forward "[image]")
@@ -141,7 +142,7 @@
      (let ((before (point)))
        (qq-chat-render)
        (should (= before (point)))
-       (should-not (qq-chat--point-in-input-p)))
+       (should-not (disco-chatbuf-point-in-input-p)))
      ;; Cancel reply (C-c C-k / footer ×).
      (should (qq-chat--reply-message))
      (qq-chat-cancel-dwim)
@@ -256,10 +257,9 @@
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
-     (let ((ewoc qq-chat--ewoc)
-           (node-m1 (gethash "m1" qq-chat--message-node-table))
-           (node-m2 (gethash "m2" qq-chat--message-node-table))
-           redisplayed)
+     (let ((ewoc (disco-chat-timeline-ewoc))
+           (node-m1 (disco-chat-timeline-node "m1"))
+           (node-m2 (disco-chat-timeline-node "m2")))
        (puthash
         "private:10001"
         '(((server-id . "m1")
@@ -278,20 +278,13 @@
            (time . 300)
            (raw-message . "third")))
         qq-state--messages-by-session)
-       (let ((orig-redisplay (symbol-function 'qq-chat--redisplay-node)))
-         (cl-letf (((symbol-function 'qq-chat--redisplay-node)
-                    (lambda (node)
-                      (push (qq-chat--message-anchor (ewoc--node-data node))
-                            redisplayed)
-                      (funcall orig-redisplay node))))
-           (qq-chat-render)))
-       (should (eq ewoc qq-chat--ewoc))
-       (should (eq node-m1 (gethash "m1" qq-chat--message-node-table)))
-       (should (eq node-m2 (gethash "m2" qq-chat--message-node-table)))
-       (should (gethash "m3" qq-chat--message-node-table))
+       (qq-chat-render)
+       (should (eq ewoc (disco-chat-timeline-ewoc)))
+       (should (eq node-m1 (disco-chat-timeline-node "m1")))
+       (should (eq node-m2 (disco-chat-timeline-node "m2")))
+       (should (disco-chat-timeline-node "m3"))
        (should (equal '("m1" "m2" "m3")
-                      qq-chat--displayed-message-anchors))
-       (should (equal '("m2" "m3") (sort redisplayed #'string<)))
+                      (disco-chat-timeline-keys)))
        (should (string-match-p "second updated" (buffer-string)))))))
 
 (ert-deftest qq-chat-render-preserves-empty-active-region-after-set-mark ()
@@ -359,12 +352,12 @@
        (beginning-of-line)
        (push-mark (point) t t)
        (let ((before (point)))
-         (qq-chat--invalidate-message-anchors-preserving-point qq-chat--displayed-message-anchors)
+         (disco-chat-timeline-invalidate (disco-chat-timeline-keys))
          (should mark-active)
          (should (= before (point)))
          (should (= before (mark t))))))))
 
-(ert-deftest qq-chat-handle-state-change-ignores-heartbeat ()
+(ert-deftest qq-chat-handle-state-change-ignores-unrelated-events ()
   (qq-chat-test-with-reset
    (with-temp-buffer
      (qq-chat-mode)
@@ -372,110 +365,60 @@
      (let (events)
        (cl-letf (((symbol-function 'qq-chat-render)
                   (lambda () (push 'render events)))
-                 ((symbol-function 'qq-chat--chat-update)
-                  (lambda (&rest _parts) (push 'chat-update events)))
+                 ((symbol-function 'qq-chat--sync-timeline)
+                  (lambda (&rest _) (push 'timeline events)))
+                 ((symbol-function 'qq-chat--update-frame)
+                  (lambda () (push 'frame events)))
                  ((symbol-function 'qq-chat--header-line-update)
-                  (lambda () (push 'header-line events)))
-                 ((symbol-function 'qq-chat--apply-single-message-change-partially)
-                  (lambda (&rest _args) (push 'partial events)))
-                 ((symbol-function 'qq-chat--request-node-redisplay)
-                  (lambda (&rest _args) (push 'nodes events))))
+                  (lambda () (push 'header-line events))))
          (qq-chat--handle-state-change '(:type heartbeat :timestamp 1.0))
          (should-not events))))))
 
-(ert-deftest qq-chat-handle-state-change-prefers-partial-message-update ()
+(ert-deftest qq-chat-message-state-change-uses-one-projected-sync-path ()
   (qq-chat-test-with-reset
    (with-temp-buffer
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
-     (let (partial-calls render-called)
-       (cl-letf (((symbol-function 'qq-chat--apply-single-message-change-partially)
-                  (lambda (anchor _messages)
-                    (push anchor partial-calls)
-                    t))
+     (let (sync-args render-called)
+       (cl-letf (((symbol-function 'qq-chat--sync-timeline)
+                  (lambda (&rest args) (setq sync-args args)))
                  ((symbol-function 'qq-chat-render)
-                  (lambda ()
-                    (setq render-called t))))
-         (qq-chat--handle-state-change
-          '(:type message
-            :session-key "private:10001"
-            :message ((server-id . "9007199254741004645"))))
-         (should (equal '("9007199254741004645") partial-calls))
-         (should-not render-called))))))
-
-(ert-deftest qq-chat-handle-state-change-falls-back-to-full-render-when-partial-fails ()
-  (qq-chat-test-with-reset
-   (with-temp-buffer
-     (qq-chat-mode)
-     (setq qq-chat--session-key "private:10001")
-     (let (render-called)
-       (cl-letf (((symbol-function 'qq-chat--apply-single-message-change-partially)
-                  (lambda (_anchor _messages)
-                    nil))
-                 ((symbol-function 'qq-chat-render)
-                  (lambda ()
-                    (setq render-called t))))
-         (qq-chat--handle-state-change '(:type message
-                                         :session-key "private:10001"
-                                         :message ((server-id . "42"))))
-         (should render-called))))))
-
-(ert-deftest qq-chat-handle-state-change-session-uses-partitioned-header-update ()
-  (qq-chat-test-with-reset
-   (with-temp-buffer
-     (qq-chat-mode)
-     (setq qq-chat--session-key "private:10001")
-     (let (updates render-called)
-       (cl-letf (((symbol-function 'qq-chat--chat-update)
-                  (lambda (&rest parts)
-                    (push parts updates)))
-                 ((symbol-function 'qq-chat-render)
-                  (lambda ()
-                    (setq render-called t))))
-         (qq-chat--handle-state-change '(:type session
-                                         :session-key "private:10001"
-                                         :mutation session))
-         (should (equal '((header-line header)) updates))
-         (should-not render-called))))))
-
-(ert-deftest qq-chat-handle-state-change-read-mutation-applies-partial-read ()
-  (qq-chat-test-with-reset
-   (with-temp-buffer
-     (qq-chat-mode)
-     (setq qq-chat--session-key "private:10001")
-     (let (partial-called render-called)
-       (cl-letf (((symbol-function 'qq-chat--apply-read-state-change-partially)
-                  (lambda ()
-                    (setq partial-called t)
-                    t))
-                 ((symbol-function 'qq-chat-render)
-                  (lambda ()
-                    (setq render-called t))))
-         (qq-chat--handle-state-change '(:type session
-                                         :session-key "private:10001"
-                                         :mutation read))
-         (should partial-called)
-         (should-not render-called))))))
-
-(ert-deftest qq-chat-handle-state-change-prefers-event-message-anchor ()
-  (qq-chat-test-with-reset
-   (with-temp-buffer
-     (qq-chat-mode)
-     (setq qq-chat--session-key "private:10001")
-     (let (partial-calls)
-       (cl-letf (((symbol-function 'qq-chat--apply-single-message-change-partially)
-                  (lambda (anchor _messages)
-                    (push anchor partial-calls)
-                    t))
-                 ((symbol-function 'qq-chat-render)
-                  (lambda () nil)))
+                  (lambda () (setq render-called t))))
          (qq-chat--handle-state-change
           '(:type message
             :session-key "private:10001"
             :mutation create
             :message-anchor "9007199254741004645"
-            :message ((server-id . "other"))))
-         (should (equal '("9007199254741004645") partial-calls)))))))
+            :message ((server-id . "9007199254741004645"))))
+         (should (equal (plist-get sync-args :changed-resources)
+                        '((:message "9007199254741004645"))))
+         (should-not render-called))))))
+
+(ert-deftest qq-chat-session-state-change-updates-shared-frame ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (let (events)
+       (cl-letf (((symbol-function 'qq-chat--header-line-update)
+                  (lambda () (push 'header events)))
+                 ((symbol-function 'qq-chat--update-frame)
+                  (lambda () (push 'frame events))))
+         (qq-chat--handle-state-change
+          '(:type session :session-key "private:10001" :mutation session))
+         (should (equal events '(frame header))))))))
+
+(ert-deftest qq-chat-read-state-change-uses-projected-context-sync ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (let (called)
+       (cl-letf (((symbol-function 'qq-chat--apply-read-state-change)
+                  (lambda () (setq called t))))
+         (qq-chat--handle-state-change
+          '(:type session :session-key "private:10001" :mutation read))
+         (should called))))))
 
 (ert-deftest qq-chat-recall-hides-node-by-default ()
   "Default: recalled stays in state but leaves the timeline."
@@ -505,7 +448,7 @@
        (setq qq-chat--session-key "private:10001")
        (qq-chat-render)
        (should (equal '("9007199254741007777")
-                      qq-chat--displayed-message-anchors))
+                      (disco-chat-timeline-keys)))
        (qq-state-apply-recall "9007199254741007777")
        (qq-chat--handle-state-change
         (list :type 'message
@@ -513,7 +456,8 @@
               :mutation 'update
               :message-anchor "9007199254741007777"
               :message (car (qq-state-session-messages "private:10001"))))
-       (should-not qq-chat--displayed-message-anchors)
+       (should (equal (disco-chat-timeline-keys)
+                      (list qq-chat--empty-placeholder)))
        (should (qq-state-message-recalled-p
                 (car (qq-state-session-messages "private:10001"))))))))
 
@@ -551,7 +495,7 @@
               :message-anchor "9007199254741008888"
               :message (car (qq-state-session-messages "private:10001"))))
        (should (equal '("9007199254741008888")
-                      qq-chat--displayed-message-anchors))
+                      (disco-chat-timeline-keys)))
        (should (string-match-p
                 "recalled"
                 (buffer-substring-no-properties (point-min) (point-max))))))))
@@ -561,14 +505,20 @@
    (with-temp-buffer
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
-     (let (updates)
-       (cl-letf (((symbol-function 'qq-chat--chat-update)
-                  (lambda (&rest parts)
-                    (push parts updates))))
+     (let (events)
+       (cl-letf (((symbol-function 'qq-chat--header-line-update)
+                  (lambda () (push 'header events)))
+                 ((symbol-function 'qq-chat--update-frame)
+                  (lambda () (push 'frame events)))
+                 ((symbol-function 'qq-chat--sync-timeline)
+                  (lambda (&rest args) (push (cons 'timeline args) events))))
          (qq-chat--handle-state-change '(:type friends-refreshed :count 1))
-         (should (equal '((header-line header timeline)) updates)))))))
+         (should (equal (mapcar (lambda (event)
+                                  (if (consp event) (car event) event))
+                                events)
+                        '(timeline frame header))))))))
 
-(ert-deftest qq-chat-partial-message-update-updates-empty-timeline-placeholder ()
+(ert-deftest qq-chat-projected-sync-replaces-empty-timeline-placeholder ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "private:10001"
@@ -579,7 +529,8 @@
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
-     (should qq-chat--empty-node)
+     (should (equal (disco-chat-timeline-keys)
+                    (list qq-chat--empty-placeholder)))
      (goto-char (point-min))
      (should (search-forward "No messages loaded yet." nil t))
      (let ((messages '(((server-id . "m1")
@@ -588,8 +539,8 @@
                         (time . 100)
                         (raw-message . "first")))))
        (puthash "private:10001" messages qq-state--messages-by-session)
-       (should (qq-chat--apply-single-message-change-partially "m1" messages))
-       (should-not qq-chat--empty-node)
+       (qq-chat--sync-timeline)
+       (should (equal (disco-chat-timeline-keys) '("m1")))
        (goto-char (point-min))
        (should (search-forward "first" nil t))
        (goto-char (point-min))
@@ -635,19 +586,13 @@
        (qq-chat-render)
        (qq-chat--set-reply-message source-old)
        (qq-chat--set-draft "draft stays")
-       (qq-chat--chat-update 'footer)
+       (qq-chat--update-frame)
        (puthash "private:10001" updated qq-state--messages-by-session)
-       (let ((redisplay-original (symbol-function 'qq-chat--redisplay-node))
-             redisplayed)
-         (cl-letf (((symbol-function 'qq-chat--redisplay-node)
-                    (lambda (node)
-                      (push (qq-chat--message-anchor (ewoc--node-data node))
-                            redisplayed)
-                      (funcall redisplay-original node))))
-           (should (qq-chat--apply-single-message-change-partially
-                    "m1" (qq-chat--timeline-messages updated))))
-         (should (member "m1" redisplayed))
-         (should (member "m2" redisplayed)))
+       (qq-chat--apply-message-state-change
+        (list :type 'message
+              :session-key "private:10001"
+              :message-anchor "m1"
+              :message source-new))
        (should (equal "new body"
                       (qq-state-message-preview (qq-chat--reply-message))))
        (should (equal "draft stays" (qq-chat--current-draft-string)))
@@ -687,10 +632,10 @@
        (let ((recalled (qq-state--as-recalled-message source)))
          (puthash "private:10001" (list recalled reply)
                   qq-state--messages-by-session)
-         (should (qq-chat--apply-single-message-change-partially
-                  "m1" (qq-chat--timeline-messages (list recalled reply)))))
-       (should-not (gethash "m1" qq-chat--message-node-table))
-       (should (gethash "m2" qq-chat--message-node-table))
+         (qq-chat--apply-message-state-change
+          (list :type 'message :message-anchor "m1" :message recalled)))
+       (should-not (disco-chat-timeline-node "m1"))
+       (should (disco-chat-timeline-node "m2"))
        (goto-char (point-min))
        (should (search-forward "↪ Alice: [message recalled]" nil t))))))
 
@@ -726,7 +671,7 @@
        (goto-char (point-min))
        (should (search-forward "↪ id m1" nil t))
        (puthash "private:10001" (list source reply) qq-state--messages-by-session)
-       (qq-chat--chat-update 'timeline)
+       (qq-chat--sync-timeline :changed-resources '((:message "m1")))
        (goto-char (point-min))
        (should (search-forward "↪ Alice: source arrived" nil t))))))
 
@@ -763,18 +708,23 @@
                      (raw-message . "hi")
                      (preview . "hi")))))
        (puthash "private:10001" pending qq-state--messages-by-session)
-       (should (qq-chat--apply-single-message-change-partially local-id pending))
-       (should (gethash local-id qq-chat--message-node-table))
-       (should (equal qq-chat--displayed-message-anchors (list local-id)))
-       (puthash "private:10001" sent qq-state--messages-by-session)
-       (should (qq-chat--apply-single-message-change-partially snowflake sent))
-       (should-not (gethash local-id qq-chat--message-node-table))
-       (should (gethash snowflake qq-chat--message-node-table))
-       (should (equal qq-chat--displayed-message-anchors (list snowflake)))
+       (qq-chat--sync-timeline)
+       (let ((node (disco-chat-timeline-node local-id)))
+         (should node)
+         (should (equal (disco-chat-timeline-keys) (list local-id)))
+         (puthash "private:10001" sent qq-state--messages-by-session)
+         (qq-chat--apply-message-state-change
+          (list :type 'message
+                :message-anchor snowflake
+                :previous-anchor local-id
+                :message (car sent)))
+         (should-not (disco-chat-timeline-node local-id))
+         (should (eq node (disco-chat-timeline-node snowflake))))
+       (should (equal (disco-chat-timeline-keys) (list snowflake)))
        (goto-char (point-min))
        (should (search-forward "hi" nil t))))))
 
-(ert-deftest qq-chat-partial-message-delete-restores-empty-timeline-placeholder ()
+(ert-deftest qq-chat-projected-sync-restores-empty-timeline-placeholder ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "private:10001"
@@ -791,24 +741,31 @@
        (qq-chat-mode)
        (setq qq-chat--session-key "private:10001")
        (qq-chat-render)
-       (should-not qq-chat--empty-node)
+       (should (equal (disco-chat-timeline-keys) '("m1")))
        (puthash "private:10001" nil qq-state--messages-by-session)
-       (should (qq-chat--apply-single-message-change-partially "m1" nil))
-       (should qq-chat--empty-node)
+       (qq-chat--sync-timeline)
+       (should (equal (disco-chat-timeline-keys)
+                      (list qq-chat--empty-placeholder)))
        (goto-char (point-min))
        (should (search-forward "No messages loaded yet." nil t))))))
 
 (ert-deftest qq-chat-media-cache-update-requests-node-refresh ()
   (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001" '((title . "Alice") (target-id . "10001")) nil)
+   (puthash "private:10001"
+            '(((server-id . "m1") (sender-id . "10001")
+               (time . 1) (raw-message . "hello")))
+            qq-state--messages-by-session)
    (with-temp-buffer
      (qq-chat-mode)
-     (setq qq-chat--displayed-message-anchors '("m1"))
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
      (let (requested)
-       (cl-letf (((symbol-function 'qq-chat--request-node-redisplay)
-                  (lambda (anchors)
-                    (push anchors requested))))
+       (cl-letf (((symbol-function 'disco-chat-timeline-invalidate)
+                  (lambda (keys &rest _) (setq requested keys))))
          (qq-chat--rerender-open-chats)
-         (should (equal '(("m1")) requested)))))))
+         (should (equal '("m1") requested)))))))
 
 (ert-deftest qq-chat-compact-face-message-uses-image-display ()
   "Same-sender face continuations must not render plain [face:id] text."
@@ -991,11 +948,10 @@
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
      (let (requested)
-       (cl-letf (((symbol-function 'qq-chat--request-node-redisplay)
-                  (lambda (anchors)
-                    (push anchors requested))))
+       (cl-letf (((symbol-function 'disco-chat-timeline-invalidate)
+                  (lambda (keys &rest _) (setq requested keys))))
          (qq-chat--rerender-open-chats "face:88")
-         (should (equal '(("m1")) requested)))))))
+         (should (equal '("m1") requested)))))))
 
 (ert-deftest qq-chat-node-refresh-defers-while-mark-active ()
   (qq-chat-test-with-reset
@@ -1021,15 +977,16 @@
        (search-forward "first")
        (beginning-of-line)
        (push-mark (point) t t)
-       (let (called)
-         (cl-letf (((symbol-function 'qq-chat--invalidate-message-anchors-preserving-point)
-                    (lambda (anchors)
-                      (setq called anchors))))
-           (qq-chat--request-node-redisplay '("m1"))
-           (should-not called)
-           (should (equal '("m1") qq-chat--deferred-node-anchors))))))))
+       (let (invalidated)
+         (cl-letf (((symbol-function 'disco-view-invalidate-keyed-ewoc-node)
+                    (lambda (_ewoc _table key) (push key invalidated))))
+           (qq-chat--request-row-redisplay '("m1"))
+           (should-not invalidated)
+           (setq mark-active nil)
+           (disco-chat-timeline-flush-deferred)
+           (should (equal invalidated '("m1")))))))))
 
-(ert-deftest qq-chat-node-refresh-uses-single-node-redisplay-helper ()
+(ert-deftest qq-chat-row-refresh-uses-shared-invalidation-api ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "private:10001"
@@ -1053,15 +1010,15 @@
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
-     (let (redisplayed)
-       (cl-letf (((symbol-function 'qq-chat--redisplay-node)
-                  (lambda (node)
-                    (push (qq-chat--message-anchor (ewoc--node-data node))
-                          redisplayed))))
-         (qq-chat--request-node-redisplay '("m1" "m2"))
-         (should (equal '("m1" "m2") (nreverse redisplayed))))))))
+     (let (call)
+       (cl-letf (((symbol-function 'disco-chat-timeline-invalidate)
+                  (lambda (keys &rest options)
+                    (setq call (cons keys options)))))
+         (qq-chat--request-row-redisplay '("m1" "m2"))
+         (should (equal (car call) '("m1" "m2")))
+         (should (eq (plist-get (cdr call) :defer-while-mark-active) t)))))))
 
-(ert-deftest qq-chat-first-unread-anchor-uses-session-unread-count ()
+(ert-deftest qq-chat-first-unread-anchor-does-not-guess-from-count ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "private:10001"
@@ -1078,8 +1035,6 @@
        (qq-chat-mode)
        (setq qq-chat--session-key "private:10001")
        (let ((qq-chat-show-unread-divider t))
-         (should (equal "m2" (qq-chat--first-unread-anchor messages)))
-         (qq-state-clear-session-unread "private:10001")
          (should-not (qq-chat--first-unread-anchor messages)))))))
 
 (ert-deftest qq-chat-first-unread-anchor-prefers-kernel-position ()
@@ -1107,7 +1062,8 @@
     "private:10001"
     '((title . "Alice")
       (target-id . "10001")
-      (unread-count . 1))
+      (unread-count . 1)
+      (first-unread-message-id . "m2"))
     nil)
    (puthash
     "private:10001"
@@ -1131,11 +1087,11 @@
        (qq-chat-render)
        (goto-char (point-min))
        (should (search-forward "Unread Messages" nil t))
-       (let ((ctx (gethash "m2" qq-chat--render-context-by-anchor)))
+       (let ((ctx (disco-chat-timeline-context "m2")))
          (should (plist-get ctx :insert-unread)))
        (qq-state-clear-session-unread "private:10001")
-       (qq-chat--apply-read-state-change-partially)
-       (should-not (plist-get (gethash "m2" qq-chat--render-context-by-anchor)
+       (qq-chat--apply-read-state-change)
+       (should-not (plist-get (disco-chat-timeline-context "m2")
                               :insert-unread))
        (goto-char (point-min))
        (should-not (search-forward "Unread Messages" nil t))))))
@@ -1349,7 +1305,7 @@
      (qq-chat-render)
      (should (equal (qq-state-session-oldest-message-id "private:10001") "200"))
      (let (captured-before)
-       (cl-letf (((symbol-function 'qq-api-fetch-history)
+       (cl-letf (((symbol-function 'qq-api-fetch-older-history)
                   (lambda (session-key &optional before callback _errback)
                     (setq captured-before before)
                     (should (equal session-key "private:10001"))
@@ -1366,7 +1322,7 @@
      ;; Exhausted path: zero added.
      (setq qq-chat--history-loading nil)
      (setq qq-chat--history-exhausted nil)
-     (cl-letf (((symbol-function 'qq-api-fetch-history)
+     (cl-letf (((symbol-function 'qq-api-fetch-older-history)
                 (lambda (_session-key &optional _before callback _errback)
                   (when callback
                     (funcall callback
@@ -1375,7 +1331,7 @@
        (should qq-chat--history-exhausted)
        (should-not qq-chat--history-loading))
      ;; Guard when exhausted.
-     (cl-letf (((symbol-function 'qq-api-fetch-history)
+     (cl-letf (((symbol-function 'qq-api-fetch-older-history)
                 (lambda (&rest _) (error "should not fetch when exhausted"))))
        (qq-chat-load-older-messages)
        (should qq-chat--history-exhausted)))))
@@ -1489,7 +1445,7 @@
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
-     (let (around-called load-older-called oneside-called)
+     (let (around-called load-older-called)
        (cl-letf (((symbol-function 'qq-api-fetch-history-around)
                   (lambda (session-key message-id callback &optional _errback _count)
                     (setq around-called message-id)
@@ -1514,24 +1470,37 @@
                     (when callback
                       (funcall callback
                                (list :added-count 1 :message-count 1)))))
-                 ((symbol-function 'qq-api-fetch-history)
-                  (lambda (&rest _)
-                    (setq oneside-called t)
-                    (error "around succeeded; one-side seek should not run")))
                  ((symbol-function 'qq-chat-load-older-messages)
                   (lambda ()
                     (setq load-older-called t)
-                    (error "jump must not call load-older")))
-                 ((symbol-function 'qq-api-get-msg)
-                  (lambda (&rest _)
-                    (error "around succeeded; get_msg should not run"))))
+                    (error "jump must not call load-older"))))
          (qq-chat-goto-message "100" 'no-pop)
          (should (equal around-called "100"))
          (should-not load-older-called)
-         (should-not oneside-called)
          (should (equal "100"
                         (get-text-property (point) 'qq-chat-message-anchor)))
          (should-not qq-chat--pending-jump-id))))))
+
+(ert-deftest qq-chat-jump-reports-missing-around-target-without-retry ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (setq qq-chat--session-key "private:10001"
+          qq-chat--pending-jump-id "100")
+    (let ((requests 0)
+          failure)
+      (cl-letf (((symbol-function 'qq-api-fetch-history-around)
+                 (lambda (_session _target callback &optional _errback _count)
+                   (cl-incf requests)
+                   (funcall callback '(:message-count 0))))
+                ((symbol-function 'qq-chat--note-history-window) #'ignore)
+                ((symbol-function 'qq-chat--finish-jump-if-loaded)
+                 (lambda (_target) nil))
+                ((symbol-function 'qq-chat--jump-fail)
+                 (lambda (target reason) (setq failure (list target reason)))))
+        (qq-chat--seek-history-for-jump
+         "private:10001" "100" (current-buffer))
+        (should (= requests 1))
+        (should (equal failure '("100" "around window omitted target")))))))
 
 
 (ert-deftest qq-chat-input-segments-keep-cjk-text-after-image-object ()
@@ -1557,7 +1526,7 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
              (with-temp-file path (insert "x"))
              (qq-chat-attach-file path "image")
              ;; Type CJK after the attachment object (normal user flow).
-             (goto-char (or (qq-chat--input-logical-end-position) (point-max)))
+             (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max)))
              (insert "你好世界")
              (qq-chat--sync-draft-from-buffer)
              (setq segments (qq-chat--current-input-segments))
@@ -1719,6 +1688,31 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
                          '(space :align-to 75)))
           (should (eq (get-text-property 2 'face) 'qq-msg-poke)))))))
 
+(ert-deftest qq-chat-renders-json-gray-tip-as-system-divider ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:987654321"
+    '((type . group) (title . "Test Group") (target-id . "987654321"))
+    nil)
+   (qq-state-apply-gray-tip-notice
+    '((post_type . "notice")
+      (notice_type . "notify")
+      (sub_type . "gray_tip")
+      (group_id . 987654321)
+      (user_id . 0)
+      (message_id . "9007199254750003456")
+      (busi_id . "19366")
+      (content . "{\"items\":[{\"txt\":\"新进群账号疑似来自非大陆地区，请谨慎核实对方身份。\",\"type\":\"nor\"},{\"txt\":\"查看异常>\",\"type\":\"url\"}]}")))
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:987654321")
+     (qq-chat-render)
+     (should (equal (disco-chat-timeline-keys)
+                    '("9007199254750003456")))
+     (should (string-match-p
+              "新进群账号疑似来自非大陆地区，请谨慎核实对方身份。查看异常>"
+              (buffer-substring-no-properties (point-min) (point-max)))))))
+
 (ert-deftest qq-chat-history-header-right-aligns-time-through-disco-ins ()
   (with-temp-buffer
     (let ((inhibit-read-only t)
@@ -1816,7 +1810,8 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
                             :message-count 5
                             :batch-message-ids ("m20" "m21" "m22" "m23" "m24")
                             :batch-newest-message-id "m24"))))
-              ((symbol-function 'qq-chat--chat-update) #'ignore))
+              ((symbol-function 'qq-chat--update-frame) #'ignore)
+              ((symbol-function 'qq-chat--sync-timeline) #'ignore))
       (qq-chat-load-newer-messages t)
       (should-not (qq-chat--history-get :gap-after-id))
       (should (qq-chat--history-get :newer-loaded)))))
@@ -1830,7 +1825,7 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
     (goto-char (point-min))
     (let ((qq-chat-history-auto-load-threshold 2000)
           called)
-      (cl-letf (((symbol-function 'qq-chat--point-in-input-p) (lambda () nil))
+      (cl-letf (((symbol-function 'disco-chatbuf-point-in-input-p) (lambda () nil))
                 ((symbol-function 'qq-chat-load-older-messages)
                  (lambda (&optional quiet) (setq called quiet))))
         (qq-chat--maybe-auto-load-older)
@@ -1873,7 +1868,7 @@ attachment inherited `disco-chatbuf-input-object' and was dropped on parse."
                    (intern (format "request-%d" (cl-incf request-count)))))
                 ((symbol-function 'qq-api-cancel-request)
                  (lambda (request) (setq canceled request)))
-                ((symbol-function 'qq-api-fetch-history)
+                ((symbol-function 'qq-api-fetch-older-history)
                  (lambda (&rest _)
                    (cl-incf history-calls)
                    'history-request)))

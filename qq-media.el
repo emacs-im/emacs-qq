@@ -22,9 +22,6 @@
 (defvar qq-media-cache-update-hook nil
   "Hook run after media resource/image cache updates.")
 
-(defvar qq-media-rerender-function nil
-  "Compatibility function called after media resource/image cache updates.")
-
 (defvar qq-media--resource-cache (make-hash-table :test #'equal)
   "Simple in-memory resource cache keyed by logical resource identity.")
 
@@ -123,9 +120,7 @@ filters can call this outside a safe redisplay context; immediate
   (run-at-time
    0 nil
    (lambda ()
-     (run-hook-with-args 'qq-media-cache-update-hook media-key)
-     (when (functionp qq-media-rerender-function)
-       (funcall qq-media-rerender-function)))))
+     (run-hook-with-args 'qq-media-cache-update-hook media-key))))
 
 (defun qq-media--image-from-file (file height)
   "Create an Emacs image object from FILE at pixel HEIGHT, or nil."

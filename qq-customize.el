@@ -129,8 +129,8 @@ Requires NapCat fork to mark messages with `recalled' / `recall_time'."
   "When non-nil, render an unread divider before the first unread message.
 
 NapCat uses Linux QQ's `getABatchOfContactMsgBoxInfo' and resolves its first
-unread msgSeq to an exact NT snowflake.  The unread-count approximation is
-kept only as compatibility fallback for older NapCat builds."
+unread msgSeq to an exact NT snowflake.  The divider is omitted when that
+authoritative position is unavailable."
   :type 'boolean
   :group 'qq)
 

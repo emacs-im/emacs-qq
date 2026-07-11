@@ -14,7 +14,8 @@
 (require 'qq-api)
 (require 'qq-media)
 (require 'qq-state)
-(require 'qq-view)
+(require 'disco-ui)
+(require 'disco-view)
 
 (declare-function qq-chat-open "qq-chat" (session-key))
 (declare-function qq-user-open "qq-user" (user-id))
@@ -143,20 +144,20 @@
 (defun qq-group--insert-action-buttons ()
   "Insert primary group action buttons."
   (insert "  ")
-  (qq-view-insert-action-button
+  (disco-ui-insert-action-button
    " 打开群聊 " #'qq-group-open-chat
    :face 'qq-group-action-button :help-echo "打开群聊 (m)")
   (insert "  ")
-  (qq-view-insert-action-button
+  (disco-ui-insert-action-button
    " 查看头像 " #'qq-group-open-avatar
    :face 'qq-group-action-button :help-echo "查看群头像 (a)")
   (when (qq-api-user-id-p (alist-get 'owner_id qq-group--profile))
     (insert "  ")
-    (qq-view-insert-action-button
+    (disco-ui-insert-action-button
      " 群主资料 " #'qq-group-open-owner
      :face 'qq-group-action-button :help-echo "打开群主资料 (o)"))
   (insert "  ")
-  (qq-view-insert-action-button
+  (disco-ui-insert-action-button
    " 复制群号 " #'qq-group-copy-id
    :face 'qq-group-action-button :help-echo "复制群号 (w)")
   (insert "\n"))
@@ -164,18 +165,18 @@
 (defun qq-group-render ()
   "Render the current group profile buffer."
   (interactive)
-  (qq-view-render-preserving-position
+  (disco-view-render-preserving-position
    (lambda ()
      (let ((inhibit-read-only t))
        (erase-buffer)
        (setq-local header-line-format '(:eval (qq-group--header-line)))
        (cond
         (qq-group--loading
-         (qq-view-insert-note-line "Loading group profile…"))
+         (disco-view-insert-note-line "Loading group profile…"))
         (qq-group--error
-         (qq-view-insert-note-line qq-group--error :face 'error))
+         (disco-view-insert-note-line qq-group--error :face 'error))
         ((null qq-group--profile)
-         (qq-view-insert-note-line "No group profile loaded."))
+         (disco-view-insert-note-line "No group profile loaded."))
         (t
          (let ((avatar-start (point)))
            (insert (qq-media-group-avatar-display-string qq-group--group-id))
@@ -197,10 +198,10 @@
                    "\n"))
          (insert "\n")
          (qq-group--insert-action-buttons)
-         (qq-view-insert-note-line
+         (disco-view-insert-note-line
           "g 刷新 · m 群聊 · a 头像 · o 群主 · w 复制 · q 退出")
          (insert "\n")
-         (qq-view-insert-heading-line "资料" :face 'bold)
+         (disco-view-insert-heading-line "资料" :face 'bold)
          (let ((name (qq-group--present-string
                       (alist-get 'name qq-group--profile)))
                (remark (qq-group--present-string
@@ -259,7 +260,7 @@
            (when-let* ((text (qq-group--present-string
                               (alist-get (cdr section) qq-group--profile))))
              (insert "\n")
-             (qq-view-insert-heading-line (car section) :face 'bold)
+             (disco-view-insert-heading-line (car section) :face 'bold)
              (insert text "\n")))))
        (goto-char (point-min))))
    :preserve-window-start t))

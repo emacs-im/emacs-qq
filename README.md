@@ -74,11 +74,12 @@ Use `eask link list` to inspect active Eask links and
 
 Architecture notes:
 
-- `qq-ui.el` and `qq-view.el` are thin adapters over disco's shared rendering helpers
+- QQ modules depend directly on disco's `disco-ui`, `disco-view`,
+  `disco-chatbuf`, and `disco-chat-timeline` infrastructure
 - `qq-media.el` provides QQ-specific resource resolution for avatars, images, files, and base emojis
 - `qq-chat.el` adapts OneBot segments to the shared `disco-ins` compact media-card and `disco-media` action-context protocol; card layout and transient action routing are not QQ-specific
 - `qq-root.el` intentionally follows the disco.el root-buffer direction
-- `qq-chat.el` is the primary chat implementation; `qq-room.el` stays as a compatibility shim
+- `qq-chat.el` projects QQ messages into the shared keyed chat timeline
 - chat keybindings currently center on telega-like habits (`RET`, `M-p`, `M-n`, `C-c C-c`, `C-c C-k`, `r`, `C-c C-r`, `C-c C-d`, `o`, `a`)
 
 Recommended NapCat settings for development:

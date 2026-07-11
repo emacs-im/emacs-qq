@@ -20,8 +20,8 @@
 (require 'qq-chat)
 (require 'qq-media)
 (require 'qq-state)
-(require 'qq-ui)
-(require 'qq-view)
+(require 'disco-ui)
+(require 'disco-view)
 
 (declare-function qq-api-get-forward
                   "qq-api" (source callback &optional errback))
@@ -524,7 +524,7 @@ forwarded message is written to or looked up in `qq-state'."
                              'action (lambda (_button)
                                        (funcall action))))))))
       (add-text-properties start (point) reply-properties))
-    (qq-ui-apply-line-prefix start (point) prefix-state)))
+    (disco-ui-apply-line-prefix start (point) prefix-state)))
 
 (defun qq-forward--insert-message (message index)
   "Insert normalized forward MESSAGE numbered INDEX.
@@ -539,7 +539,7 @@ the existing media-key index (`avatar:USER-ID')."
                       (alist-get 'sender-name message))
                      "unknown"))
          (time (qq-forward--format-time (alist-get 'time message)))
-         (prefix-state (qq-ui-make-prefix-state "  " "  ")))
+         (prefix-state (disco-ui-make-prefix-state "  " "  ")))
     (let ((header-start (point)))
       ;; Same gate as qq-chat: any non-nil sender-id (string or number).
       ;; Anonymous / virtual senders keep sender-id nil and skip the glyph.
@@ -557,7 +557,7 @@ the existing media-key index (`avatar:USER-ID')."
           (insert time)
           (add-text-properties time-start (point) '(face shadow))))
       (insert "\n")
-      (qq-ui-append-face header-start (point) 'qq-msg-heading)
+      (disco-ui-append-face header-start (point) 'qq-msg-heading)
       (add-text-properties header-start (point) properties))
     (when-let* ((target (qq-forward--message-reply-target message)))
       (qq-forward--insert-reply-preview-line
@@ -596,12 +596,12 @@ the existing media-key index (`avatar:USER-ID')."
            (get-text-property (1- (point)) 'qq-forward-entry-index))))
 
 (defun qq-forward--mutate-preserving-view (mutator &optional after-restore)
-  "Run MUTATOR while preserving entry-relative point via `qq-view'.
+  "Run MUTATOR while preserving entry-relative point via disco-view.
 
-Uses disco-view through the qq-view aliases (same path as qq-chat), with
+Uses the same disco-view path as qq-chat, with
 `qq-forward-entry-index' as the semantic anchor.  Do not reimplement
 telega-save-cursor here."
-  (qq-view-render-preserving-position
+  (disco-view-render-preserving-position
    mutator
    :anchor-property 'qq-forward-entry-index
    :preserve-window-start t
@@ -660,8 +660,8 @@ buffer."
   "Redisplay entry INDEXES without a full buffer erase.
 
 High indexes are processed first so earlier entry bounds remain valid while
-regions are replaced.  Point/window are restored through `qq-view'
-(disco-view).  After a real mutation, force-window-update like telega media
+regions are replaced.  Point/window are restored through disco-view.
+After a real mutation, force-window-update like telega media
 callbacks."
   (let* ((indexes (sort (delete-dups (delq nil (copy-sequence indexes))) #'<))
          changed)
@@ -717,7 +717,7 @@ Full erase is reserved for initial load, refresh, and structural state
 changes.  Media cache ticks must use `qq-forward--redisplay-entries'
 instead — full rebuilds are what made C-n/C-p feel hard-snapped.
 
-View preservation goes through disco-view (`qq-view'), not a local fork."
+View preservation goes through disco-view, not a local fork."
   (qq-forward--mutate-preserving-view #'qq-forward--render-body))
 
 (defun qq-forward--request-valid-p (buffer source generation)
@@ -1001,9 +1001,9 @@ records issue a fresh `emacs_get_forward' request."
                         'category 'default-button
                         'action (lambda (_button) (funcall open-action)))))
          (start (point))
-         (qq-ui-card-indent-prefix-state prefix-state)
-         (card-prefix-state (qq-ui-card-prefix-state)))
-    (qq-ui-insert-prefixed-lines
+         (disco-ui-card-indent-prefix-state prefix-state)
+         (card-prefix-state (disco-ui-card-prefix-state)))
+    (disco-ui-insert-prefixed-lines
      card-prefix-state
      (if source-label
          (format "Chat History · %s" source-label)
@@ -1011,14 +1011,14 @@ records issue a fresh `emacs_get_forward' request."
      :face 'bold
      :properties card-properties)
     (when title
-      (qq-ui-insert-prefixed-lines
+      (disco-ui-insert-prefixed-lines
        card-prefix-state title :properties card-properties))
     (dolist (detail details)
       (unless (equal detail title)
-        (qq-ui-insert-prefixed-lines
+        (disco-ui-insert-prefixed-lines
          card-prefix-state detail :face 'shadow :properties card-properties)))
     (when (and (numberp count) (> count 0))
-      (qq-ui-insert-prefixed-lines
+      (disco-ui-insert-prefixed-lines
        card-prefix-state
        (format "%d forwarded message%s" count (if (= count 1) "" "s"))
        :face 'shadow

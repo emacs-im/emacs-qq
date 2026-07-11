@@ -829,29 +829,13 @@ ERRBACK receives (RESPONSE REASON)."
            (funcall callback meta))))
      errback)))
 
-(defun qq-api-fetch-history (session-key &optional before-message-id callback errback count)
+(defun qq-api-fetch-older-history (session-key &optional before-message-id callback errback count)
   "Fetch latest or older history for SESSION-KEY.
 
-This compatibility entry point treats BEFORE-MESSAGE-ID as an older-page
-cursor.  Use `qq-api-fetch-history-page' for newer gap filling."
+BEFORE-MESSAGE-ID is the optional older-page cursor."
   (interactive)
   (qq-api-fetch-history-page session-key before-message-id 'older
                              callback errback count))
-
-(defun qq-api-get-msg (message-id callback &optional errback)
-  "Fetch a single message by MESSAGE-ID (NapCat hard-cut snowflake string).
-
-CALLBACK receives the raw OneBot message alist (response `data').
-Used by chatbuf jump (telega `telega-msg-get') as a fallback after seek."
-  (setq message-id
-        (qq-api-validate-message-id message-id "get_msg"))
-  (qq-api-call
-   "get_msg"
-   `((message_id . ,message-id))
-   (lambda (response)
-     (when callback
-       (funcall callback (qq-api--response-data response))))
-   errback))
 
 (defun qq-api-chat-locator (session-key)
   "Return strict fork-native ChatLocator for SESSION-KEY."
@@ -1457,6 +1441,8 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
         (qq-state-apply-input-status notice))
        ("poke"
         (qq-state-apply-poke-notice notice))
+       ("gray_tip"
+        (qq-state-apply-gray-tip-notice notice))
        (_ (qq-api--refresh-for-notice notice))))
     (_ (qq-api--refresh-for-notice notice))))
 

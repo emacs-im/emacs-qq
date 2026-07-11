@@ -13,17 +13,17 @@
 (require 'ring)
 (require 'button)
 (require 'subr-x)
-(require 'ewoc)
 (require 'disco-chatbuf)
+(require 'disco-chat-timeline)
 (require 'disco-ins)
 (require 'disco-media)
+(require 'disco-ui)
+(require 'disco-view)
 (require 'qq-api)
 (require 'qq-customize)
 (require 'qq-media)
 (require 'qq-protocol)
 (require 'qq-state)
-(require 'qq-ui)
-(require 'qq-view)
 
 ;; `qq-forward' requires this module to reuse the message-body renderer, so
 ;; keep the reverse dependency lazy and avoid a load cycle.
@@ -55,31 +55,10 @@
 (defvar-local qq-chat--session-key nil
   "Session key associated with the current chat buffer.")
 
-(defvar-local qq-chat--draft-input ""
-  "Current unsent draft for the chat buffer.")
-
-(defvar-local qq-chat--draft-input-rich ""
-  "Current unsent draft for the chat buffer, preserving input object properties.")
-
 (defvar-local qq-chat--my-action nil
   "Local outgoing chat-action for this buffer (telega `telega-chatbuf--my-action').
 
 Non-nil means we currently advertise typing via `set_input_status'.")
-
-(defvaralias 'qq-chat--input-marker 'disco-chatbuf--input-marker
-  "Marker for the beginning of the editable input region.")
-
-(defvaralias 'qq-chat--input-prompt-marker 'disco-chatbuf--prompt-marker
-  "Marker for the beginning of the visible input prompt.")
-
-(defvaralias 'qq-chat--input-ring 'disco-chatbuf--input-ring
-  "Ring containing previously sent inputs.")
-
-(defvaralias 'qq-chat--input-index 'disco-chatbuf--input-idx
-  "Current index inside `qq-chat--input-ring', or nil when editing draft.")
-
-(defvaralias 'qq-chat--input-pending 'disco-chatbuf--input-pending
-  "Draft remembered before entering input history navigation.")
 
 (defvar-local qq-chat--last-search-query nil
   "Last in-chat search query.")
@@ -89,9 +68,6 @@ Non-nil means we currently advertise typing via `set_input_status'.")
 
 (defvar qq-chat-group-messages-timespan 300
   "Maximum time gap in seconds used for compact message grouping.")
-
-(defvar-local qq-chat--rendering nil
-  "Non-nil while the chat buffer is being rendered.")
 
 (defvar-local qq-chat--fill-column nil
   "Cached telega-style timeline width for the active chat window.")
@@ -112,27 +88,6 @@ Non-nil means we currently advertise typing via `set_input_status'.")
     (history-gap . t)
     (gap-after-id . ,after-message-id)
     (self-p . t)))
-
-(defvar-local qq-chat--ewoc nil
-  "Persistent EWOC backing the current chat timeline.")
-
-(defvar-local qq-chat--empty-node nil
-  "EWOC node used for the empty timeline placeholder, or nil.")
-
-(defvar-local qq-chat--message-node-table nil
-  "Hash table of rendered message nodes keyed by message anchor.")
-
-(defvar-local qq-chat--displayed-message-anchors nil
-  "Rendered message anchors in timeline order.")
-
-(defvar-local qq-chat--render-context-by-anchor nil
-  "Render context plist table keyed by message anchor.")
-
-(defvar-local qq-chat--deferred-node-anchors nil
-  "Message anchors whose redisplay is deferred while a region is active.")
-
-(defvar-local qq-chat--media-anchors-by-key nil
-  "Hash table mapping media cache keys to affected message anchors.")
 
 (defvar-local qq-chat--history-loading nil
   "Non-nil while an older-history request is in flight for this chat.")
@@ -445,7 +400,7 @@ available."
                      (user-error "qq: sender has no user profile"))))
          (help-echo "Open sender profile")
          (properties '(read-only t front-sticky t rear-nonsticky (read-only))))
-    (qq-ui-insert-action-button
+    (disco-ui-insert-action-button
      primary
      action
      :face face
@@ -456,7 +411,7 @@ available."
         (insert " • ")
         (add-text-properties separator-start (point)
                              (append properties '(face shadow))))
-      (qq-ui-insert-action-button
+      (disco-ui-insert-action-button
        secondary
        action
        :face face
@@ -496,6 +451,7 @@ available."
       (let ((segment (car segments)))
         (when (or (qq-chat--forward-segment-p segment)
                   (qq-chat--poke-segment-p segment)
+                  (qq-chat--gray-tip-segment-p segment)
                   (qq-chat--mail-segment-p segment)
                   (qq-chat--card-segment-p segment)
                   (qq-chat--media-segment-p segment))
@@ -675,7 +631,7 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
               (delete anchor qq-chat--marked-message-anchors))
       (setq qq-chat--marked-message-anchors
             (append qq-chat--marked-message-anchors (list anchor))))
-    (qq-chat--redisplay-message-anchors-preserving-point (list anchor))
+    (qq-chat--request-row-redisplay (list anchor))
     (qq-chat--header-line-update)
     (message "qq: %d message%s marked for forwarding"
              (length qq-chat--marked-message-anchors)
@@ -689,7 +645,7 @@ Suppress the status message when QUIET is non-nil."
   (let ((anchors (copy-sequence qq-chat--marked-message-anchors)))
     (setq qq-chat--marked-message-anchors nil)
     (when anchors
-      (qq-chat--redisplay-message-anchors-preserving-point anchors))
+      (qq-chat--request-row-redisplay anchors))
     (qq-chat--header-line-update)
     (unless quiet
       (message "qq: forwarding selection cleared"))))
@@ -739,7 +695,7 @@ because its result is only `{kind:single}'."
                        (seq-remove
                         (lambda (anchor) (member anchor sent-anchors))
                         qq-chat--marked-message-anchors))
-                 (qq-chat--redisplay-message-anchors-preserving-point
+                 (qq-chat--request-row-redisplay
                   sent-anchors)
                  (qq-chat--header-line-update)))
              (message "qq: forwarded %d messages to %s"
@@ -757,21 +713,16 @@ because its result is only `{kind:single}'."
 
 (defun qq-chat--message-positions ()
   "Return list of message start positions in the current buffer."
-  (let ((pos (point-min))
-        result)
-    (while (and pos (< pos (point-max)))
-      (setq pos (text-property-not-all pos (point-max) 'qq-chat-message-anchor nil))
-      (when pos
-        (push pos result)
-        (setq pos (next-single-property-change pos 'qq-chat-message-anchor nil (point-max)))))
-    (nreverse result)))
+  (when (disco-chat-timeline-live-p)
+    (delq nil
+          (mapcar #'disco-chat-timeline-key-position
+                  (disco-chat-timeline-keys)))))
 
 (defun qq-chat--current-message-position ()
   "Return the start position of the message at point, or nil."
-  (let ((anchor (or (get-text-property (point) 'qq-chat-message-anchor)
-                    (get-text-property (line-beginning-position) 'qq-chat-message-anchor))))
-    (and anchor
-         (text-property-any (point-min) (point-max) 'qq-chat-message-anchor anchor))))
+  (when (disco-chat-timeline-live-p)
+    (when-let* ((anchor (disco-chat-timeline-key-at-point)))
+      (disco-chat-timeline-key-position anchor))))
 
 (defun qq-chat-next-message ()
   "Move point to the next rendered message block."
@@ -796,62 +747,22 @@ because its result is only `{kind:single}'."
         (goto-char previous)
       (message "qq: no earlier message"))))
 
-(defun qq-chat--input-region-bounds ()
-  "Return current writable draft region as (START . END), or nil."
-  (disco-chatbuf-input-region-bounds))
-
-(defun qq-chat--input-start-position ()
-  "Return draft input start position, or nil."
-  (disco-chatbuf-input-start-position))
-
-(defun qq-chat--input-prompt-start-position ()
-  "Return prompt start position preceding current draft input, or nil."
-  (disco-chatbuf-prompt-start-position))
-
-(defun qq-chat--input-logical-end-position ()
-  "Return logical draft end position for the tail input region."
-  (disco-chatbuf-input-logical-end-position))
-
-(defun qq-chat--point-in-input-p (&optional position)
-  "Return non-nil when POSITION or point is inside the draft region."
-  (disco-chatbuf-point-in-input-p position))
-
-(defun qq-chat--point-in-prompt-p (&optional position)
-  "Return non-nil when POSITION or point is inside the prompt glyph span."
-  (disco-chatbuf-point-in-prompt-p position))
-
-(defun qq-chat--apply-input-text-properties ()
-  "Normalize current draft text properties after redraws and edits."
-  (disco-chatbuf-input-apply-text-properties))
-
 (defun qq-chat--current-draft-string ()
-  "Return current draft text from the chat buffer."
-  (if (and (not qq-chat--rendering)
-           (qq-chat--input-region-bounds))
-      (substring-no-properties (or (disco-chatbuf-input-string) ""))
-    qq-chat--draft-input))
-
-(defun qq-chat--capture-draft ()
-  "Capture current editable draft into local draft state."
-  (setq qq-chat--draft-input (qq-chat--current-draft-string))
-  (setq qq-chat--draft-input-rich (or (disco-chatbuf-input-string) qq-chat--draft-input)))
+  "Return canonical draft as plain text."
+  (disco-chatbuf-string-plain-text (disco-chatbuf-input-state)))
 
 (defun qq-chat--sync-draft-from-buffer ()
-  "Sync draft state from the editable buffer region."
-  (let* ((rich (or (disco-chatbuf-input-string) ""))
-         (text (substring-no-properties rich)))
-    (setq qq-chat--draft-input-rich rich)
-    (unless (equal text qq-chat--draft-input)
-      (setq qq-chat--draft-input text)
-      (setq qq-chat--input-index nil)
-      (setq qq-chat--input-pending nil)
-      ;; telega: after input ops, Typing if non-empty else Cancel.
-      (qq-chat--maybe-update-my-action-from-input))))
+  "Sync canonical draft from the editable buffer region."
+  (let ((result (disco-chatbuf-input-state-sync)))
+    (when (plist-get result :changed-p)
+      (qq-chat--maybe-update-my-action-from-input))
+    (plist-get result :value)))
 
 (defun qq-chat--reply-message ()
   "Return current reply target message from shared aux state, or nil."
-  (and (eq (plist-get disco-chatbuf--aux-plist :aux-type) 'reply)
-       (plist-get disco-chatbuf--aux-plist :aux-msg)))
+  (let ((state (disco-chatbuf-aux-state)))
+    (and (eq (plist-get state :aux-type) 'reply)
+         (plist-get state :aux-msg))))
 
 (defun qq-chat--set-reply-message (message)
   "Set shared reply aux state to MESSAGE, or clear it when nil."
@@ -866,29 +777,26 @@ because its result is only `{kind:single}'."
   "Keep draft state synced after editable-region changes from BEG to END."
   (disco-chatbuf-after-change
    beg end
-   :rendering-p qq-chat--rendering
+   :rendering-p (disco-chatbuf-rendering-p)
    :sync-function #'qq-chat--sync-draft-from-buffer
    :prune-broken-objects t))
 
 (defun qq-chat--update-context-mode ()
   "Enable timeline bindings only when point is outside the draft input."
-  (let ((timeline-p (not (qq-chat--point-in-input-p))))
+  (let ((timeline-p (not (disco-chatbuf-point-in-input-p))))
     (unless (eq qq-chat-timeline-mode timeline-p)
       (qq-chat-timeline-mode (if timeline-p 1 -1)))))
 
 (defun qq-chat--flush-deferred-node-redisplay ()
   "Flush any node redisplay deferred while a region was active."
-  (when (and qq-chat--deferred-node-anchors
-             (not mark-active))
-    (let ((anchors (prog1 qq-chat--deferred-node-anchors
-                     (setq qq-chat--deferred-node-anchors nil))))
-      (qq-chat--invalidate-message-anchors-preserving-point anchors))))
+  (when (disco-chat-timeline-live-p)
+    (disco-chat-timeline-flush-deferred)))
 
 (defun qq-chat--maybe-auto-load-older ()
   "Load an older page when point approaches the timeline top."
   (when (and qq-chat-history-auto-load-threshold
              qq-chat--session-key
-             (not (qq-chat--point-in-input-p))
+             (not (disco-chatbuf-point-in-input-p))
              (< (point) (+ (point-min)
                            (max 0 qq-chat-history-auto-load-threshold)))
              (not (qq-chat--history-get :loading))
@@ -897,63 +805,24 @@ because its result is only `{kind:single}'."
 
 (defun qq-chat--post-command ()
   "Keep point inside the logical draft area when editing input."
-  (unless qq-chat--rendering
+  (unless (disco-chatbuf-rendering-p)
     (disco-chatbuf-post-command-clamp-point)
     (qq-chat--flush-deferred-node-redisplay)
     (qq-chat--update-context-mode)
     (qq-chat--maybe-auto-load-older)))
 
-(defun qq-chat--capture-window-input-offsets ()
-  "Return (WINDOW . OFFSET) pairs for windows currently in draft input."
-  (let ((bounds (qq-chat--input-region-bounds))
-        offsets)
-    (when bounds
-      (let ((start (car bounds))
-            (end (cdr bounds)))
-        (dolist (win (get-buffer-window-list (current-buffer) nil t))
-          (let ((window-point (window-point win)))
-            (when (and (<= start window-point)
-                       (<= window-point end))
-              (push (cons win (- window-point start)) offsets))))))
-    offsets))
-
-(defun qq-chat--restore-window-input-offsets (offsets)
-  "Restore window points in OFFSETS relative to current draft input start."
-  (let ((start (qq-chat--input-start-position))
-        (logical-end (qq-chat--input-logical-end-position)))
-    (when (and (number-or-marker-p start)
-               (number-or-marker-p logical-end))
-      (dolist (entry offsets)
-        (let ((win (car entry))
-              (offset (cdr entry)))
-          (when (and (window-live-p win)
-                     (eq (window-buffer win) (current-buffer)))
-            (set-window-point
-             win
-             (min logical-end
-                  (max start (+ start offset))))))))))
-
 (defun qq-chat--prompt-text ()
   "Return visible prompt text for the current chat buffer."
   ">>> ")
 
-(defun qq-chat--clear-input-region-markers ()
-  "Detach current chat composer markers during hard resets only."
-  (disco-chatbuf-clear-prompt-and-input))
-
 (defun qq-chat--bind-input-region-from-footer ()
-  "Ensure the persistent tail input region exists and matches current draft."
+  "Bind the shared persistent tail input to canonical draft state."
   (disco-chatbuf-init-state 32)
-  (let ((target-input (or qq-chat--draft-input-rich qq-chat--draft-input "")))
-    (save-excursion
-      (goto-char (point-max))
-      (if (disco-chatbuf-prompt-button-live-p)
-          (disco-chatbuf-prompt-update (qq-chat--prompt-text))
-        (disco-chatbuf-install-prompt (qq-chat--prompt-text))))
-    (qq-chat--apply-input-text-properties)
-    (unless (equal (or (disco-chatbuf-input-string) "") target-input)
-      (disco-chatbuf-input-set-text target-input)
-      (qq-chat--apply-input-text-properties))))
+  (disco-chatbuf-bind-input-region
+   :visible-p t
+   :prompt (qq-chat--prompt-text)
+   :input-text (disco-chatbuf-input-state)
+   :post-bind-function #'disco-chatbuf-input-apply-text-properties))
 
 (defun qq-chat--header-text ()
   "Build EWOC header text for the current chat state.
@@ -964,14 +833,14 @@ load state (disco-style)."
   (let* ((text
           (with-temp-buffer
             (when qq-chat-show-header-help
-              (qq-view-insert-note-line (qq-chat--header-help-text)))
+              (disco-view-insert-note-line (qq-chat--header-help-text)))
             (cond
              ((eq (qq-chat--history-get :loading) 'newer)
-              (qq-view-insert-note-line "(loading newer messages…)"))
+              (disco-view-insert-note-line "(loading newer messages…)"))
              (qq-chat--history-loading
-              (qq-view-insert-note-line "(loading older messages…)"))
+              (disco-view-insert-note-line "(loading older messages…)"))
              (qq-chat--history-exhausted
-              (qq-view-insert-note-line "(older history exhausted)")))
+              (disco-view-insert-note-line "(older history exhausted)")))
             (when (> (buffer-size) 0)
               (insert "\n"))
             (buffer-string))))
@@ -1019,8 +888,10 @@ ACTION is `typing', `cancel', or nil.  Only private sessions send
 
 (defun qq-chat--maybe-update-my-action-from-input ()
   "Advertise typing when private-chat draft is non-empty (telega parity)."
-  (let ((input-p (and (stringp qq-chat--draft-input)
-                      (not (string-empty-p qq-chat--draft-input)))))
+  (let ((input-p
+         (not (string-empty-p
+               (disco-chatbuf-string-plain-text
+                (disco-chatbuf-input-state))))))
     (cond
      ((and (not qq-chat--my-action) input-p)
       (qq-chat--set-my-action 'typing))
@@ -1056,77 +927,38 @@ Order (telega-inspired):
      text)
     text))
 
-(defun qq-chat--message-render-context (message)
-  "Return render context plist for MESSAGE, or nil when missing."
-  (let ((anchor (qq-chat--message-anchor message)))
-    (and anchor
-         qq-chat--render-context-by-anchor
-         (gethash anchor qq-chat--render-context-by-anchor))))
-
 (defun qq-chat--first-unread-anchor (messages)
-  "Return anchor of the first unread message in MESSAGES, or nil.
-
-Prefer the exact NT snowflake returned by NapCat's Linux QQ read-state action.
-For older NapCat builds, fall back to the oldest among the last N non-self
-timeline rows."
+  "Return the exact first-unread anchor present in MESSAGES."
   (when qq-chat-show-unread-divider
     (let* ((session (qq-chat--session))
-           (n (or (and session (alist-get 'unread-count session)) 0))
-           (exact (and (> n 0)
+           (count (and session (alist-get 'unread-count session)))
+           (exact (and (integerp count)
+                       (> count 0)
                        (alist-get 'first-unread-message-id session))))
-      (when (and (integerp n) (> n 0) messages)
-        (or (and exact
-                 (seq-find (lambda (message)
-                             (equal exact (qq-chat--message-anchor message)))
-                           messages)
-                 exact)
-            (let* ((incoming (cl-remove-if (lambda (message)
-                                             (or (alist-get 'self-p message)
-                                                 (qq-chat--history-gap-message-p message)))
-                                           messages))
-                   (len (length incoming)))
-              (when (> len 0)
-                (qq-chat--message-anchor
-                 (nth (max 0 (- len n)) incoming)))))))))
+      (and exact
+           (seq-some (lambda (message)
+                       (equal exact (qq-chat--message-anchor message)))
+                     messages)
+           exact))))
 
 (defun qq-chat--compute-message-render-context (previous-message message
-                                                                &optional first-unread-anchor)
-  "Return render context for MESSAGE given PREVIOUS-MESSAGE.
-
-When FIRST-UNREAD-ANCHOR is non-nil and matches MESSAGE, set
-`:insert-unread'."
+                                                                 first-unread-anchor)
+  "Project render context for MESSAGE after PREVIOUS-MESSAGE."
   (let* ((day-key (qq-chat--message-day-key message))
-         (previous-day-key (and previous-message
-                                (qq-chat--message-day-key previous-message)))
-         (insert-date (and day-key
-                           (not (equal day-key previous-day-key))
-                           day-key))
-         (compact (and previous-message
-                       (qq-chat--messages-compact-group-p previous-message message)))
-         (anchor (qq-chat--message-anchor message))
-         (insert-unread (and qq-chat-show-unread-divider
-                             first-unread-anchor
-                             anchor
-                             (equal anchor first-unread-anchor))))
-    (list :compact (and compact t)
-          :insert-date insert-date
-          :insert-unread (and insert-unread t))))
-
-(defun qq-chat--rebuild-render-contexts (messages)
-  "Recompute full render contexts for MESSAGES in display order."
-  (unless (hash-table-p qq-chat--render-context-by-anchor)
-    (setq qq-chat--render-context-by-anchor (make-hash-table :test #'equal)))
-  (clrhash qq-chat--render-context-by-anchor)
-  (let ((first-unread (qq-chat--first-unread-anchor messages))
-        (previous-message nil))
-    (dolist (message messages)
-      (let ((anchor (qq-chat--message-anchor message)))
-        (when anchor
-          (puthash anchor
-                   (qq-chat--compute-message-render-context
-                    previous-message message first-unread)
-                   qq-chat--render-context-by-anchor)))
-      (setq previous-message message))))
+         (previous-day-key
+          (and previous-message (qq-chat--message-day-key previous-message)))
+         (anchor (qq-chat--message-anchor message)))
+    (list :compact
+          (and previous-message
+               (qq-chat--messages-compact-group-p previous-message message)
+               t)
+          :insert-date
+          (and day-key (not (equal day-key previous-day-key)) day-key)
+          :insert-unread
+          (and first-unread-anchor
+               anchor
+               (equal anchor first-unread-anchor)
+               t))))
 
 (defun qq-chat--message-media-cache-keys (message)
   "Return media cache keys that can affect MESSAGE rendering."
@@ -1139,34 +971,22 @@ When FIRST-UNREAD-ANCHOR is non-nil and matches MESSAGE, set
       (setq keys (nconc (qq-media-segment-cache-keys segment) keys)))
     (delete-dups (delq nil keys))))
 
-(defun qq-chat--rebuild-media-anchor-index (messages)
-  "Recompute media cache key -> message anchor index for MESSAGES."
-  (unless (hash-table-p qq-chat--media-anchors-by-key)
-    (setq qq-chat--media-anchors-by-key (make-hash-table :test #'equal)))
-  (clrhash qq-chat--media-anchors-by-key)
-  (dolist (message messages)
-    (when-let* ((anchor (qq-chat--message-anchor message)))
-      (dolist (key (qq-chat--message-media-cache-keys message))
-        (puthash key
-                 (cons anchor (gethash key qq-chat--media-anchors-by-key))
-                 qq-chat--media-anchors-by-key)))))
-
-(defun qq-chat--media-anchors-for-key (media-key)
-  "Return rendered message anchors affected by MEDIA-KEY in current buffer."
-  (when (and (stringp media-key)
-             (hash-table-p qq-chat--media-anchors-by-key))
-    (delete-dups (copy-sequence (gethash media-key qq-chat--media-anchors-by-key)))))
+(defun qq-chat--message-dependency-keys (message)
+  "Return opaque resource keys that can change rendered MESSAGE."
+  (let (dependencies)
+    (when-let* ((reply-id (qq-chat--message-reply-id message)))
+      (push (list :message reply-id) dependencies))
+    (dolist (media-key (qq-chat--message-media-cache-keys message))
+      (push (list :media media-key) dependencies))
+    (delete-dups dependencies)))
 
 (defun qq-chat--message-visible-in-timeline-p (message)
-  "Return non-nil when MESSAGE should appear in the chat timeline.
-
-Recalled messages are hidden unless `qq-chat-show-recalled-messages' is set
-(telega dual-mode: default hide, optional stub)."
+  "Return non-nil when MESSAGE belongs in the projected timeline."
   (or qq-chat-show-recalled-messages
       (not (qq-state-message-recalled-p message))))
 
 (defun qq-chat--timeline-messages (&optional messages)
-  "Return MESSAGES (or current session messages) filtered for timeline display."
+  "Return visible MESSAGES with the synthetic newer-history gap inserted."
   (let* ((visible
           (seq-filter #'qq-chat--message-visible-in-timeline-p
                       (or messages
@@ -1184,590 +1004,79 @@ Recalled messages are hidden unless `qq-chat-show-recalled-messages' is set
             (setq inserted t)))
         (if inserted (nreverse result) visible)))))
 
-(defun qq-chat--message-anchor-list (messages)
-  "Return message anchors in display order, skipping missing anchors."
-  (delq nil (mapcar #'qq-chat--message-anchor messages)))
+(defun qq-chat--project-timeline (messages)
+  "Project visible QQ MESSAGES into shared timeline rows."
+  (if (null messages)
+      (list (disco-chat-timeline-row-create
+             :key qq-chat--empty-placeholder
+             :payload qq-chat--empty-placeholder))
+    (let ((first-unread (qq-chat--first-unread-anchor messages)))
+      (disco-chat-timeline-project
+       messages
+       #'qq-chat--message-anchor
+       :context-function
+       (lambda (previous message)
+         (qq-chat--compute-message-render-context
+          previous message first-unread))
+       :dependencies-function #'qq-chat--message-dependency-keys))))
 
-(defun qq-chat--timeline-order-compatible-p (current-anchors target-anchors)
-  "Return non-nil when CURRENT-ANCHORS can reconcile into TARGET-ANCHORS."
-  (let ((current-set (make-hash-table :test #'equal))
-        common-current
-        common-target)
-    (dolist (anchor current-anchors)
-      (puthash anchor t current-set))
-    (dolist (anchor current-anchors)
-      (when (member anchor target-anchors)
-        (push anchor common-current)))
-    (dolist (anchor target-anchors)
-      (when (gethash anchor current-set)
-        (push anchor common-target)))
-    (equal (nreverse common-current)
-           (nreverse common-target))))
-
-(defun qq-chat--neighbor-anchors-in-sequence (anchors target-anchor)
-  "Return prev/current/next anchors around TARGET-ANCHOR within ANCHORS."
-  (when-let* ((index (cl-position target-anchor anchors :test #'equal)))
-    (delq nil
-          (list (nth (1- index) anchors)
-                (nth index anchors)
-                (nth (1+ index) anchors)))))
-
-(defun qq-chat--message-neighborhood-anchors (current-anchors target-anchors anchor)
-  "Return anchors affected by ANCHOR moving from CURRENT-ANCHORS to TARGET-ANCHORS."
-  (delete-dups
-   (append (qq-chat--neighbor-anchors-in-sequence current-anchors anchor)
-           (qq-chat--neighbor-anchors-in-sequence target-anchors anchor))))
-
-(defun qq-chat--reply-dependent-anchors (messages message-id)
-  "Return anchors of MESSAGES whose reply preview depends on MESSAGE-ID.
-
-This mirrors telega's replied-message dependency redisplay and
-`disco-room--reply-dependent-message-ids': changing or loading the source
-message must also redisplay rows that quote it."
-  (when message-id
-    (let ((target (format "%s" message-id))
-          dependent-anchors)
-      (dolist (message messages)
-        (when (equal (qq-chat--message-reply-id message) target)
-          (when-let* ((anchor (qq-chat--message-anchor message)))
-            (push anchor dependent-anchors))))
-      (nreverse dependent-anchors))))
-
-(defun qq-chat--message-affects-composer-context-p (message-id)
-  "Return non-nil when MESSAGE-ID is the active composer reply target."
-  (when-let* ((composer-id (disco-chatbuf-aux-message-id)))
-    (equal (format "%s" message-id) (format "%s" composer-id))))
-
-(defun qq-chat--refresh-composer-context-for-message (message-id)
-  "Refresh active reply composer context after MESSAGE-ID changes.
-
-Like telega's updateMessageEdited aux handling, replace the cached aux message
-with the latest state object before redisplaying the footer."
-  (when (qq-chat--message-affects-composer-context-p message-id)
-    (when-let* ((message (qq-chat--message-by-server-id message-id)))
-      (plist-put disco-chatbuf--aux-plist :aux-msg message))
-    (qq-chat--apply-frame-update)))
-
-(defun qq-chat--current-first-unread-context-anchor ()
-  "Return the anchor currently marked `:insert-unread' in render contexts."
-  (when (hash-table-p qq-chat--render-context-by-anchor)
-    (catch 'found
-      (maphash
-       (lambda (anchor context)
-         (when (plist-get context :insert-unread)
-           (throw 'found anchor)))
-       qq-chat--render-context-by-anchor)
-      nil)))
-
-(defun qq-chat--recompute-render-contexts-for-anchors (messages anchors)
-  "Recompute render contexts in MESSAGES only for ANCHORS.
-
-Also refreshes previous/new first-unread anchors so the divider can move
-without a full timeline rebuild."
-  (unless (hash-table-p qq-chat--render-context-by-anchor)
-    (setq qq-chat--render-context-by-anchor (make-hash-table :test #'equal)))
-  (let* ((first-unread (qq-chat--first-unread-anchor messages))
-         (previous-first (qq-chat--current-first-unread-context-anchor))
-         (anchors (delete-dups
-                   (delq nil
-                         (append (copy-sequence (or anchors '()))
-                                 (list previous-first first-unread)))))
-         (target-set (make-hash-table :test #'equal))
-         (previous-message nil)
-         seen)
-    (dolist (anchor anchors)
-      (when anchor
-        (puthash anchor t target-set)))
-    (dolist (message messages)
-      (let ((anchor (qq-chat--message-anchor message)))
-        (when (and anchor (gethash anchor target-set))
-          (puthash anchor
-                   (qq-chat--compute-message-render-context
-                    previous-message message first-unread)
-                   qq-chat--render-context-by-anchor)
-          (push anchor seen))
-        (setq previous-message message)))
-    (dolist (anchor anchors)
-      (when (and anchor (not (member anchor seen)))
-        (remhash anchor qq-chat--render-context-by-anchor)))))
-
-(defun qq-chat--copy-render-contexts-for-anchors (anchors)
-  "Return alist snapshot of current render contexts for ANCHORS."
-  (let (snapshot)
-    (dolist (anchor anchors)
-      (when anchor
-        (push (cons anchor
-                    (copy-tree (gethash anchor qq-chat--render-context-by-anchor)))
-              snapshot)))
-    snapshot))
-
-(defun qq-chat--changed-render-context-anchors (anchors old-snapshot)
-  "Return anchors in ANCHORS whose render context changed from OLD-SNAPSHOT."
-  (let (changed)
-    (dolist (anchor anchors)
-      (when anchor
-        (let ((previous (alist-get anchor old-snapshot nil nil #'equal))
-              (current (gethash anchor qq-chat--render-context-by-anchor)))
-          (unless (equal previous current)
-            (push anchor changed)))))
-    (nreverse changed)))
-
-(defun qq-chat--insert-message-node-before (message before-node)
-  "Insert MESSAGE before BEFORE-NODE, or at end when BEFORE-NODE is nil."
-  (when qq-chat--ewoc
-    (let ((qq-chat--rendering t)
-          (inhibit-read-only t)
-          (buffer-undo-list t))
-      (let* ((node (if before-node
-                       (ewoc-enter-before qq-chat--ewoc before-node message)
-                     (ewoc-enter-last qq-chat--ewoc message)))
-             (anchor (qq-chat--message-anchor message)))
-        (when (and node anchor qq-chat--message-node-table)
-          (puthash anchor node qq-chat--message-node-table))
-        node))))
-
-(defun qq-chat--delete-message-node (anchor)
-  "Delete EWOC node identified by ANCHOR.
-
-Return non-nil when a node is removed."
-  (let ((node (and anchor
-                   qq-chat--message-node-table
-                   (gethash anchor qq-chat--message-node-table))))
-    (when (and node qq-chat--ewoc)
-      (let ((qq-chat--rendering t)
-            (inhibit-read-only t)
-            (buffer-undo-list t))
-        (ewoc-delete qq-chat--ewoc node)
-        (remhash anchor qq-chat--message-node-table)
-        t))))
-
-(defun qq-chat--ensure-ewoc ()
-  "Ensure current chat buffer owns one persistent EWOC instance."
-  (unless (hash-table-p qq-chat--message-node-table)
-    (setq qq-chat--message-node-table (make-hash-table :test #'equal)))
-  (unless (hash-table-p qq-chat--render-context-by-anchor)
-    (setq qq-chat--render-context-by-anchor (make-hash-table :test #'equal)))
-  (unless (hash-table-p qq-chat--media-anchors-by-key)
-    (setq qq-chat--media-anchors-by-key (make-hash-table :test #'equal)))
-  (unless qq-chat--ewoc
-    (let ((qq-chat--rendering t)
-          (inhibit-read-only t)
-          (buffer-undo-list t))
-      (erase-buffer)
-      (setq qq-chat--displayed-message-anchors nil)
-      (setq qq-chat--empty-node nil)
-      (setq qq-chat--ewoc
-            (ewoc-create #'qq-chat--ewoc-printer
-                         (qq-chat--header-text)
-                         (qq-chat--footer-text)
-                         t)))))
+(defun qq-chat--ensure-timeline ()
+  "Ensure current QQ chat owns one shared projected timeline."
+  (disco-chat-timeline-ensure
+   :printer #'qq-chat--row-printer
+   :anchor-property 'qq-chat-message-anchor
+   :header (qq-chat--header-text)
+   :footer (qq-chat--footer-text)
+   :after-mutation-function #'qq-chat--update-context-mode))
 
 (defun qq-chat--header-line-update ()
-  "Update chat header line and buffer name in telega-like fashion."
+  "Update chat header line and buffer name."
   (qq-chat--ensure-buffer-name)
   (setq-local header-line-format '(:eval (qq-chat--header-line)))
   (force-mode-line-update))
 
-(defun qq-chat--apply-frame-update ()
-  "Update current chat EWOC header/footer in place and rebind composer."
-  (qq-chat--ensure-ewoc)
-  (let ((qq-chat--rendering t)
-        (inhibit-read-only t)
-        (buffer-undo-list t))
-    (qq-chat--clear-input-region-markers)
-    (ewoc-set-hf qq-chat--ewoc
-                 (qq-chat--header-text)
-                 (qq-chat--footer-text)))
-  (qq-chat--bind-input-region-from-footer))
+(defun qq-chat--update-frame ()
+  "Synchronize QQ chat header, footer, prompt, and canonical composer."
+  (qq-chat--ensure-timeline)
+  (disco-chat-timeline-set-frame
+   (qq-chat--header-text)
+   (qq-chat--footer-text)
+   :bind-input-function #'qq-chat--bind-input-region-from-footer))
 
-(defun qq-chat--prompt-update ()
-  "Update the persistent tail prompt/input without touching the timeline."
-  (qq-chat--ensure-ewoc)
-  (qq-chat--bind-input-region-from-footer))
+(cl-defun qq-chat--sync-timeline
+    (&key (messages nil messages-p) force-keys changed-resources rekeys)
+  "Synchronize QQ rows through the shared projected timeline controller."
+  (qq-chat--ensure-timeline)
+  (disco-chat-timeline-sync
+   (qq-chat--project-timeline
+    (if messages-p messages (qq-chat--timeline-messages)))
+   :force-keys force-keys
+   :changed-resources changed-resources
+   :rekeys rekeys))
 
-(defun qq-chat--clear-empty-node ()
-  "Remove the empty timeline placeholder node, if present."
-  (when (and qq-chat--ewoc qq-chat--empty-node)
-    (let ((qq-chat--rendering t)
-          (inhibit-read-only t)
-          (buffer-undo-list t))
-      (ewoc-delete qq-chat--ewoc qq-chat--empty-node))
-    (setq qq-chat--empty-node nil)))
+(defun qq-chat--message-affects-composer-context-p (message-id)
+  "Return non-nil when MESSAGE-ID is the active reply target."
+  (equal message-id (disco-chatbuf-aux-message-id)))
 
-(defun qq-chat--ensure-empty-node ()
-  "Ensure the empty timeline placeholder node exists."
-  (qq-chat--ensure-ewoc)
-  (unless qq-chat--empty-node
-    (let ((qq-chat--rendering t)
-          (inhibit-read-only t)
-          (buffer-undo-list t))
-      (setq qq-chat--empty-node
-            (ewoc-enter-last qq-chat--ewoc qq-chat--empty-placeholder)))))
-
-(defun qq-chat--clear-timeline ()
-  "Remove all currently rendered message nodes from the chat EWOC."
-  (qq-chat--ensure-ewoc)
-  (let ((qq-chat--rendering t)
-        (inhibit-read-only t)
-        (buffer-undo-list t))
-    (ewoc-filter qq-chat--ewoc (lambda (_message) nil)))
-  (setq qq-chat--displayed-message-anchors nil)
-  (setq qq-chat--empty-node nil)
-  (clrhash qq-chat--message-node-table)
-  (clrhash qq-chat--render-context-by-anchor)
-  (when (hash-table-p qq-chat--media-anchors-by-key)
-    (clrhash qq-chat--media-anchors-by-key)))
-
-(defun qq-chat--reconcile-timeline (messages)
-  "Reconcile current chat EWOC nodes against MESSAGES in display order."
-  (qq-chat--ensure-ewoc)
-  (let* ((target-anchors (qq-chat--message-anchor-list messages))
-         (current-anchors (or qq-chat--displayed-message-anchors '()))
-         (context-anchors (delete-dups (append (copy-sequence current-anchors)
-                                               (copy-sequence target-anchors))))
-         (context-snapshot (qq-chat--copy-render-contexts-for-anchors context-anchors))
-         (target-set (make-hash-table :test #'equal))
-         touched-anchors
-         removed-anchors
-         reply-dependent-anchors)
-    (when target-anchors
-      (qq-chat--clear-empty-node))
-    (dolist (anchor target-anchors)
-      (puthash anchor t target-set))
-    (unless (qq-chat--timeline-order-compatible-p current-anchors target-anchors)
-      (qq-chat--clear-timeline)
-      (setq current-anchors '()))
-    (dolist (anchor current-anchors)
-      (unless (gethash anchor target-set)
-        (push anchor removed-anchors)
-        (qq-chat--delete-message-node anchor)))
-    (cl-loop for message in messages
-             for index from 0 do
-             (let* ((anchor (qq-chat--message-anchor message))
-                    (node (and anchor (gethash anchor qq-chat--message-node-table))))
-               (if node
-                   (progn
-                     (unless (equal (ewoc--node-data node) message)
-                       (push anchor touched-anchors))
-                     (let ((qq-chat--rendering t)
-                           (inhibit-read-only t)
-                           (buffer-undo-list t))
-                       (ewoc-set-data node message)))
-                 (let ((before-node
-                        (cl-loop for later-anchor in (nthcdr (1+ index) target-anchors)
-                                 for later-node = (gethash later-anchor qq-chat--message-node-table)
-                                 when later-node return later-node)))
-                   (push anchor touched-anchors)
-                   (qq-chat--insert-message-node-before message before-node)))))
-    ;; Telega redisplays a reply row when its asynchronously fetched source
-    ;; becomes available.  History reconcile is the equivalent path here:
-    ;; new/updated/removed source rows invalidate the quoting rows as well.
-    (dolist (source-anchor (delete-dups
-                            (append (copy-sequence touched-anchors)
-                                    (copy-sequence removed-anchors))))
-      (setq reply-dependent-anchors
-            (nconc (qq-chat--reply-dependent-anchors messages source-anchor)
-                   reply-dependent-anchors)))
-    (setq qq-chat--displayed-message-anchors target-anchors)
-    (qq-chat--rebuild-render-contexts messages)
-    (qq-chat--rebuild-media-anchor-index messages)
-    (if target-anchors
-        (qq-chat--clear-empty-node)
-      (qq-chat--ensure-empty-node))
-    (dolist (anchor
-             (delete-dups
-              (append touched-anchors
-                      reply-dependent-anchors
-                      (qq-chat--changed-render-context-anchors
-                       target-anchors context-snapshot))))
-      (when-let* ((node (gethash anchor qq-chat--message-node-table)))
-        (qq-chat--redisplay-node node)))))
-
-(defun qq-chat--rekey-message-node-if-needed (message)
-  "If MESSAGE was shown under local-id, rekey node/tables to server-id.
-
-Return the new anchor when a rekey happened, else nil.  Needed when NapCat
-returns the NT snowflake `message_id' after optimistic pending insert."
-  (let* ((local-id (alist-get 'local-id message))
-         (server-id (alist-get 'server-id message))
-         (node (and local-id
-                    server-id
-                    (not (equal local-id server-id))
-                    qq-chat--message-node-table
-                    (gethash local-id qq-chat--message-node-table))))
-    (when node
-      (remhash local-id qq-chat--message-node-table)
-      (puthash server-id node qq-chat--message-node-table)
-      (setq qq-chat--displayed-message-anchors
-            (mapcar (lambda (anchor)
-                      (if (equal anchor local-id) server-id anchor))
-                    (or qq-chat--displayed-message-anchors '())))
-      (when (and (hash-table-p qq-chat--render-context-by-anchor)
-                 (gethash local-id qq-chat--render-context-by-anchor))
-        (puthash server-id
-                 (gethash local-id qq-chat--render-context-by-anchor)
-                 qq-chat--render-context-by-anchor)
-        (remhash local-id qq-chat--render-context-by-anchor))
-      (when (hash-table-p qq-chat--media-anchors-by-key)
-        (maphash
-         (lambda (key anchors)
-           (puthash key
-                    (mapcar (lambda (anchor)
-                              (if (equal anchor local-id) server-id anchor))
-                            anchors)
-                    qq-chat--media-anchors-by-key))
-         qq-chat--media-anchors-by-key))
-      (setq qq-chat--deferred-node-anchors
-            (mapcar (lambda (anchor)
-                      (if (equal anchor local-id) server-id anchor))
-                    (or qq-chat--deferred-node-anchors '())))
-      server-id)))
-
-(defun qq-chat--apply-single-message-change-partially (anchor messages)
-  "Apply one ANCHOR change against MESSAGES incrementally.
-
-Return non-nil when the persistent EWOC was patched successfully."
-  (let* ((message-for-rekey
-          (seq-find (lambda (message)
-                      (or (equal (qq-chat--message-anchor message) anchor)
-                          (equal (alist-get 'local-id message) anchor)
-                          (equal (alist-get 'server-id message) anchor)))
-                    messages))
-         (_rekey (and message-for-rekey
-                      (when-let* ((rekeyed (qq-chat--rekey-message-node-if-needed
-                                            message-for-rekey)))
-                        (setq anchor rekeyed)
-                        rekeyed)))
-         (current-anchors (or qq-chat--displayed-message-anchors '()))
-         (target-anchors (qq-chat--message-anchor-list messages))
-         (present-before (member anchor current-anchors))
-         (present-after (member anchor target-anchors))
-         (reply-dependent-anchors
-          (qq-chat--reply-dependent-anchors messages anchor))
-         (composer-context-affected-p
-          (qq-chat--message-affects-composer-context-p anchor))
-         (affected-anchors
-          (delete-dups
-           (delq nil
-                 (append (qq-chat--message-neighborhood-anchors
-                          current-anchors target-anchors anchor)
-                         ;; Unread divider may leave the neighborhood when
-                         ;; unread-count changes as a side effect of this message.
-                         (list (qq-chat--current-first-unread-context-anchor)
-                               (qq-chat--first-unread-anchor messages))))))
-         (target-message (or message-for-rekey
-                             (seq-find (lambda (message)
-                                         (equal (qq-chat--message-anchor message)
-                                                anchor))
-                                       messages)))
-         (context-snapshot (qq-chat--copy-render-contexts-for-anchors
-                            affected-anchors)))
-    (when (and anchor
-               qq-chat--ewoc
-               (or present-before present-after)
-               (qq-chat--timeline-order-compatible-p current-anchors target-anchors))
-      (qq-chat--mutate-timeline-preserving-point
-       (lambda ()
-         (when target-anchors
-           (qq-chat--clear-empty-node))
-         (cond
-          ((and present-before (not present-after))
-           (qq-chat--delete-message-node anchor))
-          ((and present-after (not present-before) target-message)
-           (let ((before-node
-                  (cl-loop for later-anchor in (cdr (member anchor target-anchors))
-                           for later-node = (gethash later-anchor qq-chat--message-node-table)
-                           when later-node return later-node)))
-             (qq-chat--insert-message-node-before target-message before-node)))
-          ((and present-after target-message)
-           (when-let* ((node (gethash anchor qq-chat--message-node-table)))
-             (let ((qq-chat--rendering t)
-                   (inhibit-read-only t)
-                   (buffer-undo-list t))
-               (ewoc-set-data node target-message)))))
-         (setq qq-chat--displayed-message-anchors target-anchors)
-         (qq-chat--recompute-render-contexts-for-anchors messages affected-anchors)
-         (qq-chat--rebuild-media-anchor-index messages)
-         (when composer-context-affected-p
-           (qq-chat--refresh-composer-context-for-message anchor))
-         (if target-anchors
-             (qq-chat--clear-empty-node)
-           (qq-chat--ensure-empty-node))
-         (dolist (affected-anchor
-                  (delete-dups
-                   (append
-                    (and present-after (list anchor))
-                    reply-dependent-anchors
-                    (qq-chat--changed-render-context-anchors
-                     affected-anchors context-snapshot)
-                    (list (qq-chat--current-first-unread-context-anchor)))))
-           (when-let* ((node (gethash affected-anchor qq-chat--message-node-table)))
-             (qq-chat--redisplay-node node)))))
-      t)))
-
-(defun qq-chat--footer-start-position ()
-  "Return EWOC footer start position for the current chat buffer, or nil."
-  (and qq-chat--ewoc
-       (ignore-errors
-         (ewoc-location (ewoc--footer qq-chat--ewoc)))))
-
-(defun qq-chat--footer-region-bounds ()
-  "Return footer context bounds as (START . END), or nil when unavailable."
-  (when-let* ((footer-start (qq-chat--footer-start-position))
-              (prompt-start (qq-chat--input-prompt-start-position)))
-    (when (<= footer-start prompt-start)
-      (cons footer-start prompt-start))))
-
-(defun qq-chat--footer-offset-at-position (&optional position)
-  "Return footer-relative offset for POSITION or point, or nil."
-  (when-let* ((bounds (qq-chat--footer-region-bounds)))
-    (let ((pos (or position (point))))
-      (when (and (<= (car bounds) pos)
-                 (< pos (cdr bounds)))
-        (- pos (car bounds))))))
-
-(defun qq-chat--capture-footer-point-offset ()
-  "Return point offset inside the footer context region, or nil."
-  (qq-chat--footer-offset-at-position (point)))
-
-(defun qq-chat--restore-footer-point-offset (offset)
-  "Restore point inside the footer context region using OFFSET."
-  (when (numberp offset)
-    (when-let* ((bounds (qq-chat--footer-region-bounds)))
-      (let ((start (car bounds))
-            (end (cdr bounds)))
-        (goto-char (min (max start (1- end))
-                        (+ start offset)))))))
-
-(defun qq-chat--capture-position-state (&optional position)
-  "Capture chat-relative position state for POSITION or point."
-  (let ((pos (or position (point))))
-    (cond
-     ((qq-chat--point-in-input-p pos)
-      (when-let* ((input-start (qq-chat--input-start-position)))
-        (list :zone 'input
-              :offset (- pos input-start))))
-     ((numberp (qq-chat--footer-offset-at-position pos))
-      (list :zone 'footer
-            :offset (qq-chat--footer-offset-at-position pos)))
-     (t
-      (save-excursion
-        (goto-char pos)
-        (list :zone 'message
-              :snapshot (qq-view-capture-position
-                         :anchor-property 'qq-chat-message-anchor
-                         :preserve-window-start nil)))))))
-
-(defun qq-chat--restore-position-state (state)
-  "Restore point from STATE and return restored position."
-  (pcase (plist-get state :zone)
-    ('input
-     (when-let* ((input-start (qq-chat--input-start-position))
-                 (logical-end (qq-chat--input-logical-end-position)))
-       (goto-char (min logical-end
-                       (max input-start
-                            (+ input-start (or (plist-get state :offset) 0)))))))
-    ('footer
-     (qq-chat--restore-footer-point-offset (plist-get state :offset)))
-    (_
-     (when-let* ((snapshot (plist-get state :snapshot)))
-       (qq-view-restore-position snapshot))))
-  (point))
-
-(defun qq-chat--capture-mark-state ()
-  "Capture active mark state for later redraw restoration, or nil."
-  (when mark-active
-    (qq-chat--capture-position-state (mark t))))
-
-(defun qq-chat--restore-mark-state (state)
-  "Restore active mark STATE after a redraw.
-
-When STATE is nil, deactivate any transient region left by buffer mutation."
-  (if (not state)
-      (setq mark-active nil
-            deactivate-mark t)
-    (let ((mark-pos (save-excursion
-                      (qq-chat--restore-position-state state)
-                      (point))))
-      (set-marker (mark-marker) mark-pos)
-      (setq mark-active t
-            deactivate-mark nil))))
-
-(defun qq-chat--at-message-bottom-p ()
-  "Return non-nil when point is at timeline bottom, outside draft input."
-  (and (= (point) (point-max))
-       (not (qq-chat--point-in-input-p))
-       (not (numberp (qq-chat--capture-footer-point-offset)))))
-
-(defun qq-chat--mutate-timeline-preserving-point (mutator)
-  "Run MUTATOR while preserving reading/composer position.
-
-Follow the same broad strategy as
-`disco-room--mutate-timeline-preserving-point': keep composer cursor stable,
-keep footer point stable, keep bottom-following buffers at the bottom, and
-otherwise restore message position by semantic anchor."
-  (let* ((window-input-offsets (qq-chat--capture-window-input-offsets))
-         (mark-state (qq-chat--capture-mark-state))
-         (input-start (qq-chat--input-start-position))
-         (in-input (and (number-or-marker-p input-start)
-                        (qq-chat--point-in-input-p)))
-         (input-offset (and in-input (- (point) input-start)))
-         (footer-offset (and (not in-input)
-                             (qq-chat--capture-footer-point-offset)))
-         (at-bottom (and (not in-input)
-                         (not (numberp footer-offset))
-                         (qq-chat--at-message-bottom-p)))
-         (snapshot (and (not in-input)
-                        (not (numberp footer-offset))
-                        (not at-bottom)
-                        (qq-view-capture-position
-                         :anchor-property 'qq-chat-message-anchor
-                         :preserve-window-start t))))
-    (unwind-protect
-        (progn
-          (funcall mutator)
-          (cond
-           ((and in-input (numberp input-offset))
-            (let ((new-start (qq-chat--input-start-position))
-                  (logical-end (qq-chat--input-logical-end-position)))
-              (when (and (number-or-marker-p new-start)
-                         (number-or-marker-p logical-end))
-                (goto-char (min logical-end
-                                (max new-start (+ new-start input-offset)))))))
-           ((numberp footer-offset)
-            (qq-chat--restore-footer-point-offset footer-offset))
-           (at-bottom
-            (goto-char (point-max)))
-           (snapshot
-            (qq-view-restore-position snapshot))))
-      (qq-chat--restore-window-input-offsets window-input-offsets)
-      (qq-chat--restore-mark-state mark-state)
-      (qq-chat--update-context-mode))))
-
-(defun qq-chat--redisplay-node (node)
-  "Redisplay a single EWOC NODE for the current chat buffer."
-  (when (and qq-chat--ewoc node)
-    (let ((qq-chat--rendering t)
-          (inhibit-read-only t)
-          (buffer-undo-list t))
-      (save-excursion
-        (ewoc-invalidate qq-chat--ewoc node)))))
+(defun qq-chat--refresh-composer-context-for-message (message-id)
+  "Refresh the active reply composer context after MESSAGE-ID changes."
+  (when (qq-chat--message-affects-composer-context-p message-id)
+    (when-let* ((message (qq-chat--message-by-server-id message-id)))
+      (let ((state (copy-sequence (disco-chatbuf-aux-state))))
+        (setq state (plist-put state :aux-msg message))
+        (disco-chatbuf-aux-set state)))
+    (qq-chat--update-frame)))
 
 (defun qq-chat--refresh-timeline-layout ()
-  "Refresh all timeline nodes once after display geometry changes."
-  (when qq-chat--ewoc
-    (qq-chat--mutate-timeline-preserving-point
-     (lambda ()
-       (let ((qq-chat--rendering t)
-             (inhibit-read-only t)
-             (buffer-undo-list t))
-         (ewoc-refresh qq-chat--ewoc))))))
+  "Refresh projected QQ rows after display geometry changes."
+  (when (disco-chat-timeline-live-p)
+    (disco-chat-timeline-refresh)))
 
 (defun qq-chat--on-window-size-change (&optional _frame)
-  "Recompute chat width and refresh the timeline after window resizing."
+  "Recompute chat width and refresh rows after window resizing."
   (when (eq major-mode 'qq-chat-mode)
-    (when-let* ((win (qq-chat--render-window))
-                (next (qq-chat--compute-fill-column win)))
+    (when-let* ((window (qq-chat--render-window))
+                (next (qq-chat--compute-fill-column window)))
       (when (and (> next 15)
                  (not (equal next qq-chat--fill-column)))
         (setq-local qq-chat--fill-column next
@@ -1775,68 +1084,25 @@ otherwise restore message position by semantic anchor."
         (qq-chat--refresh-timeline-layout)))))
 
 (defun qq-chat--on-text-scale-change ()
-  "Recompute pixel alignment and refresh after `text-scale-mode' changes."
+  "Recompute pixel alignment after `text-scale-mode' changes."
   (when (eq major-mode 'qq-chat-mode)
-    ;; Even an unchanged column count needs fresh pixel-valued :align-to
-    ;; spacers because the remapped character width changed.
     (setq-local qq-chat--fill-column nil)
-    (when-let* ((win (qq-chat--render-window))
-                (next (qq-chat--compute-fill-column win)))
+    (when-let* ((window (qq-chat--render-window))
+                (next (qq-chat--compute-fill-column window)))
       (setq-local qq-chat--fill-column next
                   fill-column next))
     (qq-chat--refresh-timeline-layout)))
 
-(defun qq-chat--redisplay-message-anchors-preserving-point (anchors)
-  "Redisplay ANCHORS using single-node EWOC invalidation."
-  (when (and qq-chat--ewoc anchors)
-    (qq-chat--mutate-timeline-preserving-point
-     (lambda ()
-       (dolist (anchor (delete-dups (delq nil (copy-sequence anchors))))
-         (when-let* ((node (gethash anchor qq-chat--message-node-table)))
-           (qq-chat--redisplay-node node)))))))
-
-(defun qq-chat--invalidate-message-anchors-preserving-point (anchors)
-  "Compatibility wrapper for anchor-local node redisplay."
-  (qq-chat--redisplay-message-anchors-preserving-point anchors))
-
-(defun qq-chat--chat-update (&rest parts)
-  "Update dirty PARTS of the current chat buffer.
-
-PARTS is a list containing any of `header-line', `header', `footer',
-`prompt', or `timeline'.  When PARTS is empty, perform a full partitioned
-update similar in spirit to `telega-chatbuf--chat-update'."
-  (let* ((full-p (or (null parts) (memq 'full parts)))
-         (initial-frame-p (or full-p
-                              (null qq-chat--ewoc)
-                              (not (disco-chatbuf-prompt-button-live-p))))
-         (header-line-p (or full-p initial-frame-p (memq 'header-line parts)))
-         (header-p (or full-p initial-frame-p (memq 'header parts)))
-         (footer-p (or full-p initial-frame-p (memq 'footer parts)))
-         (prompt-p (or full-p initial-frame-p (memq 'prompt parts)))
-         (timeline-p (or full-p initial-frame-p (memq 'timeline parts)))
-         (messages (and timeline-p (qq-chat--timeline-messages))))
-    (when header-line-p
-      (qq-chat--header-line-update))
-    (when (or header-p footer-p prompt-p timeline-p)
-      (let ((qq-chat--rendering t))
-        (qq-chat--mutate-timeline-preserving-point
-         (lambda ()
-           (qq-chat--ensure-ewoc)
-           (when (or header-p footer-p)
-             (qq-chat--apply-frame-update))
-           (when (and prompt-p (not (or header-p footer-p)))
-             (qq-chat--prompt-update))
-           (when timeline-p
-             (qq-chat--reconcile-timeline messages))))))))
-
-(defun qq-chat--update-frame-preserving-point ()
-  "Refresh chat header/footer/prompt while preserving message position."
-  (qq-chat--chat-update 'header 'footer 'prompt))
+(defun qq-chat--request-row-redisplay (anchors)
+  "Redisplay projected ANCHORS, deferring while a region is active."
+  (when (and anchors (disco-chat-timeline-live-p))
+    (disco-chat-timeline-invalidate
+     anchors :defer-while-mark-active t)))
 
 (defun qq-chat--render-empty-placeholder ()
   "Insert the empty timeline placeholder row."
   (let ((start (point)))
-    (qq-view-insert-note-line "No messages loaded yet.")
+    (disco-view-insert-note-line "No messages loaded yet.")
     (insert "\n")
     (add-text-properties
      start (point)
@@ -1871,22 +1137,25 @@ update similar in spirit to `telega-chatbuf--chat-update'."
            'qq-chat-internal 'history-gap
            'face 'shadow))))
 
-(defun qq-chat--ewoc-printer (message)
-  "EWOC pretty-printer for one chat MESSAGE."
-  (cond
+(defun qq-chat--row-printer (row)
+  "EWOC pretty-printer for one projected QQ chat ROW."
+  (let ((message (disco-chat-timeline-row-payload row))
+        (context (disco-chat-timeline-row-context row)))
+    (cond
    ((eq message qq-chat--empty-placeholder)
     (qq-chat--render-empty-placeholder))
    ((qq-chat--history-gap-message-p message)
     (qq-chat--render-history-gap message))
    (t
-    (qq-chat--render-message message))))
+    (qq-chat--render-message message context)))))
 
 (defun qq-chat--set-draft (text)
-  "Set current draft TEXT and refresh only the tail composer region."
-  (setq qq-chat--draft-input text)
-  (setq qq-chat--draft-input-rich (or text ""))
-  (qq-chat--chat-update 'prompt)
-  (goto-char (or (qq-chat--input-logical-end-position) (point-max))))
+  "Set canonical draft TEXT and update the shared tail composer."
+  (disco-chatbuf-input-state-set text :reset-history-p t)
+  (disco-chatbuf-with-structural-update
+    (disco-chatbuf-input-replace (disco-chatbuf-input-state))
+    (disco-chatbuf-input-apply-text-properties))
+  (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max))))
 
 (defun qq-chat--push-input-history (text)
   "Insert TEXT into input history when appropriate."
@@ -1967,17 +1236,17 @@ Favorite stickers (`image' with sub_type 1, or mface) try local thumbs."
 
 (defun qq-chat--insert-input-segment-object (segment)
   "Insert outbound QQ SEGMENT into the current input region as one object."
-  (unless (qq-chat--point-in-input-p)
-    (goto-char (or (qq-chat--input-logical-end-position) (point-max))))
-  (when (and (qq-chat--point-in-input-p)
-             (> (point) (or (qq-chat--input-start-position) (point-min)))
+  (unless (disco-chatbuf-point-in-input-p)
+    (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max))))
+  (when (and (disco-chatbuf-point-in-input-p)
+             (> (point) (or (disco-chatbuf-input-start-position) (point-min)))
              (let ((ch (char-before)))
                (and ch (not (memq ch '(32 9 10))))))
     (insert " "))
   (let* ((object (qq-chat--segment-input-object segment))
          (label (plist-get object :label)))
     (disco-chatbuf-input-insert label :object object)
-    (qq-chat--apply-input-text-properties)))
+    (disco-chatbuf-input-apply-text-properties)))
 
 (defun qq-chat-attach-file (path &optional segment-type)
   "Insert local PATH into the chat input as a structured segment object.
@@ -2220,9 +1489,7 @@ With telega-style insert (object body + trailing spacer with
 is not swallowed into the image segment."
   (let* ((input (or (disco-chatbuf-input-string) ""))
          (object-prop disco-chatbuf-input-object-property)
-         (chunks (if (fboundp 'disco-chatbuf--split-by-text-prop)
-                     (disco-chatbuf--split-by-text-prop input object-prop)
-                   (list input)))
+         (chunks (disco-chatbuf-split-by-text-property input object-prop))
          segments)
     (dolist (chunk chunks)
       (let ((object (and (not (string-empty-p chunk))
@@ -2315,7 +1582,7 @@ Never dump OneBot CQ / raw_message here — previews come from
 
 (defun qq-chat--insert-date-separator-row (day-label)
   "Insert a date separator row for DAY-LABEL."
-  (qq-view-insert-note-line
+  (disco-view-insert-note-line
    (format "-- %s --" day-label)
    :face 'qq-msg-date-separator))
 
@@ -2323,7 +1590,7 @@ Never dump OneBot CQ / raw_message here — previews come from
   "Insert the unread separator row above the first unread message.
 
 Label matches telega's unread bar wording (\"Unread Messages\")."
-  (qq-view-insert-note-line
+  (disco-view-insert-note-line
    "Unread Messages"
    :face 'qq-msg-unread-divider))
 
@@ -2337,22 +1604,10 @@ Label matches telega's unread bar wording (\"Unread Messages\")."
      (qq-state-session-messages qq-chat--session-key))))
 
 (defun qq-chat--message-position (server-id)
-  "Return buffer position of SERVER-ID's rendered message, or nil.
-
-Like locating a telega message button by id.
-Note: `text-property-any' uses `eq'; snowflake string ids need `equal'."
-  (when server-id
-    (let ((want (format "%s" server-id))
-          (pos (point-min))
-          found)
-      (while (and (not found) (< pos (point-max)))
-        (let ((here (get-text-property pos 'qq-chat-message-anchor)))
-          (if (and here (equal (format "%s" here) want))
-              (setq found pos)
-            (setq pos (or (next-single-property-change
-                           pos 'qq-chat-message-anchor nil (point-max))
-                          (point-max))))))
-      found)))
+  "Return buffer position of SERVER-ID's projected row, or nil."
+  (and server-id
+       (disco-chat-timeline-live-p)
+       (disco-chat-timeline-key-position (format "%s" server-id))))
 
 (defun qq-chat--message-end-position (start)
   "Return end position of the message block starting at START."
@@ -2427,53 +1682,8 @@ Return non-nil on success."
                (format " (%s)" reason)
              "")))
 
-(defun qq-chat--jump-via-get-msg (session-key target buffer)
-  "Fallback: `get_msg' TARGET then jump (telega `telega-msg-get').
-
-Does not iterative load-older; seek already tried once."
-  (qq-api-get-msg
-   target
-   (lambda (raw)
-     (when (buffer-live-p buffer)
-       (with-current-buffer buffer
-         (when (equal qq-chat--session-key session-key)
-           (when (and raw (listp raw))
-             (qq-state-merge-history session-key (list raw)))
-           (unless (qq-chat--finish-jump-if-loaded target)
-             (qq-chat--jump-fail target "get_msg ok but not in timeline"))))))
-   (lambda (_response reason)
-     (when (buffer-live-p buffer)
-       (with-current-buffer buffer
-         (when (equal qq-chat--session-key session-key)
-           (qq-chat--jump-fail
-            target
-            (or reason "get_msg failed"))))))))
-
-(defun qq-chat--seek-history-one-side (session-key target buffer)
-  "Fallback seek: one-sided `get_*_msg_history' with message_seq = TARGET."
-  (qq-api-fetch-history
-   session-key
-   target
-   (lambda (meta)
-     (when (buffer-live-p buffer)
-       (with-current-buffer buffer
-         (when (equal qq-chat--session-key session-key)
-           (qq-chat--note-history-window meta)
-           (if (qq-chat--finish-jump-if-loaded target)
-               nil
-             (qq-chat--jump-via-get-msg session-key target buffer))))))
-   (lambda (_response _reason)
-     (when (buffer-live-p buffer)
-       (with-current-buffer buffer
-         (when (equal qq-chat--session-key session-key)
-           (qq-chat--jump-via-get-msg session-key target buffer)))))
-   (qq-chat--jump-history-count)))
-
 (defun qq-chat--seek-history-for-jump (session-key target buffer)
-  "Load history for jump to TARGET (telega around, NapCat fork).
-
-Primary: fork `get_msg_history_around' (older+newer window around snowflake).
-Fallback: one-sided seek at TARGET, then `get_msg'."
+  "Load the fork-native history window centered on TARGET."
   (qq-api-fetch-history-around
    session-key
    target
@@ -2482,27 +1692,21 @@ Fallback: one-sided seek at TARGET, then `get_msg'."
        (with-current-buffer buffer
          (when (equal qq-chat--session-key session-key)
            (qq-chat--note-history-window meta)
-           (if (qq-chat--finish-jump-if-loaded target)
-               nil
-             (qq-chat--seek-history-one-side session-key target buffer))))))
-   (lambda (_response _reason)
+           (unless (qq-chat--finish-jump-if-loaded target)
+             (qq-chat--jump-fail target "around window omitted target"))))))
+   (lambda (_response reason)
      (when (buffer-live-p buffer)
        (with-current-buffer buffer
          (when (equal qq-chat--session-key session-key)
-           ;; Unknown action or peer miss → one-sided seek / get_msg.
-           (qq-chat--seek-history-one-side session-key target buffer)))))
+           (qq-chat--jump-fail target reason)))))
    (qq-chat--jump-history-count)))
 
 (defun qq-chat-goto-message (message-id &optional no-pop)
   "Goto MESSAGE-ID in the current chatbuf (telega `telega-chatbuf--goto-msg').
 
-1. Push message at point onto the pop ring (unless NO-POP)
-2. If already loaded, jump and pulse-highlight
-3. Else NapCat fork `get_msg_history_around' (window around TARGET)
-4. Else one-sided history seek (`message_seq' = TARGET)
-5. Else `get_msg' single-message fallback
-
-Does not walk load-older from the buffer's oldest id."
+Push the message at point onto the pop ring unless NO-POP.  Already loaded
+targets jump immediately; other targets use the fork-native
+`get_msg_history_around' action exactly once."
   (interactive
    (list (or (get-text-property (point) 'qq-chat-reply-id)
              (qq-chat--message-reply-id (qq-chat--message-at-point))
@@ -2598,7 +1802,7 @@ REPLY-ID via `qq-chat-goto-message'."
                              (qq-chat-goto-message target))
                    'qq-chat-reply-id target
                    'qq-chat-reply-button t)))
-    (qq-ui-apply-line-prefix reply-start (point) prefix-state)))
+    (disco-ui-apply-line-prefix reply-start (point) prefix-state)))
 
 (defun qq-chat--face-segment-id (segment)
   "Return QQ base face id from face SEGMENT, or nil."
@@ -2648,6 +1852,19 @@ base emoji), never as OneBot CQ text."
 (defun qq-chat--poke-segment-p (segment)
   "Return non-nil when SEGMENT is a QQ gray-tip poke decoration."
   (equal (alist-get 'type segment) "poke"))
+
+(defun qq-chat--gray-tip-segment-p (segment)
+  "Return non-nil when SEGMENT is a QQ JSON gray-tip notice."
+  (equal (alist-get 'type segment) "gray-tip"))
+
+(defun qq-chat--insert-gray-tip-message (message properties)
+  "Insert centered JSON gray-tip MESSAGE using PROPERTIES."
+  (let ((start (point)))
+    (disco-ins-insert-divider-row
+     (qq-chat--message-body message)
+     'qq-msg-poke
+     (qq-chat--line-fill-column))
+    (add-text-properties start (point) properties)))
 
 (defun qq-chat--insert-poke-message (message properties)
   "Insert decorative gray-tip MESSAGE using PROPERTIES.
@@ -2718,9 +1935,9 @@ with the timestamp."
          (prompt (alist-get 'prompt data))
          (detail (or (alist-get 'detail data) "Open Mail"))
          (url (alist-get 'url data))
-         (qq-ui-card-indent-prefix-state prefix-state)
-         (card-prefix-state (qq-ui-card-prefix-state)))
-    (qq-ui-insert-prefixed-lines
+         (disco-ui-card-indent-prefix-state prefix-state)
+         (card-prefix-state (disco-ui-card-prefix-state)))
+    (disco-ui-insert-prefixed-lines
      card-prefix-state
      (if (and (stringp sender) (not (string-empty-p sender)))
          (format "Mail · %s" sender)
@@ -2728,21 +1945,21 @@ with the timestamp."
      :face 'bold
      :properties properties)
     (when (and (stringp subject) (not (string-empty-p subject)))
-      (qq-ui-insert-prefixed-lines
+      (disco-ui-insert-prefixed-lines
        card-prefix-state subject :properties properties))
     (when-let* ((body (cond
                        ((and (stringp content) (not (string-empty-p content))) content)
                        ((and (stringp prompt) (not (string-empty-p prompt))) prompt))))
-      (qq-ui-insert-prefixed-lines
+      (disco-ui-insert-prefixed-lines
        card-prefix-state body :face 'shadow :properties properties))
     (when (and (stringp url) (not (string-empty-p url)))
       (let ((start (point)))
-        (qq-ui-insert-action-button
+        (disco-ui-insert-action-button
          (format "[%s]" detail)
          (lambda () (browse-url url t))
          :help-echo "Open this message in QQ Mail")
         (insert "\n")
-        (qq-ui-apply-line-prefix start (point) card-prefix-state)
+        (disco-ui-apply-line-prefix start (point) card-prefix-state)
         (add-text-properties start (point) properties)))))
 
 (defun qq-chat--card-kind-label (kind)
@@ -2789,22 +2006,22 @@ with the timestamp."
                    'button t
                    'category 'default-button
                    'action (lambda (_button) (funcall open-action))))))
-         (qq-ui-card-indent-prefix-state prefix-state)
-         (card-prefix-state (qq-ui-card-prefix-state))
+         (disco-ui-card-indent-prefix-state prefix-state)
+         (card-prefix-state (disco-ui-card-prefix-state))
          (start (point)))
-    (qq-ui-insert-prefixed-lines
+    (disco-ui-insert-prefixed-lines
      card-prefix-state
      (if source (format "%s · %s" label source) label)
      :face 'bold
      :properties card-properties)
     (when title
-      (qq-ui-insert-prefixed-lines
+      (disco-ui-insert-prefixed-lines
        card-prefix-state title :properties card-properties))
     (when body
-      (qq-ui-insert-prefixed-lines
+      (disco-ui-insert-prefixed-lines
        card-prefix-state body :face 'shadow :properties card-properties))
     (when (and summary (not (equal summary body)))
-      (qq-ui-insert-prefixed-lines
+      (disco-ui-insert-prefixed-lines
        card-prefix-state summary :face 'shadow :properties card-properties))
     (when open-action
       (add-text-properties start (point) card-properties))))
@@ -2914,8 +2131,8 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
          (capabilities (qq-media-segment-capabilities segment))
          (context (qq-chat--segment-media-card-context
                    segment capabilities))
-         (prefix-state (let ((qq-ui-card-indent-prefix-state prefix-state))
-                         (qq-ui-card-prefix-state))))
+         (prefix-state (let ((disco-ui-card-indent-prefix-state prefix-state))
+                         (disco-ui-card-prefix-state))))
     (disco-ins-insert-media-card
      :kind (qq-chat--segment-media-card-kind segment)
      :title (qq-chat--segment-media-summary segment)
@@ -2959,8 +2176,8 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
              (insert "[loading preview]\n"))
             (t
              (insert "[preview unavailable]\n")))
-           (qq-ui-apply-line-prefix preview-start (point) card-prefix-state)
-           (qq-ui-append-face preview-start (point) 'shadow)))))))
+           (disco-ui-apply-line-prefix preview-start (point) card-prefix-state)
+           (disco-ui-append-face preview-start (point) 'shadow)))))))
 
 (defun qq-chat--insert-message-body (message prefix-state properties)
   "Insert MESSAGE content body using PREFIX-STATE and PROPERTIES."
@@ -2968,14 +2185,14 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
         (inline-parts nil))
     (cl-labels ((flush-inline ()
                   (when inline-parts
-                    (qq-ui-insert-prefixed-lines
+                    (disco-ui-insert-prefixed-lines
                      prefix-state
                      (mapconcat #'identity (nreverse inline-parts) "")
                      :properties properties)
                     (setq inline-parts nil))))
       (if (or (qq-state-message-recalled-p message)
               (null segments))
-          (qq-ui-insert-prefixed-lines prefix-state (qq-chat--message-body message) :properties properties)
+          (disco-ui-insert-prefixed-lines prefix-state (qq-chat--message-body message) :properties properties)
         (dolist (segment segments)
           (let ((type (alist-get 'type segment)))
             (unless (equal type "reply")
@@ -3110,10 +2327,10 @@ on the first inline line when the body is pure inline content."
                  (qq-chat--insert-right-aligned-time
                   short-time
                   (string-width
-                   (or (qq-ui-prefix-state-current prefix-state) ""))
+                   (or (disco-ui-prefix-state-current prefix-state) ""))
                   t))
                (insert "\n")
-               (qq-ui-apply-line-prefix start (point) prefix-state)
+               (disco-ui-apply-line-prefix start (point) prefix-state)
                (add-text-properties start (point) properties)
                (setq inline-parts nil)))))
       (cond
@@ -3125,10 +2342,10 @@ on the first inline line when the body is pure inline content."
             (qq-chat--insert-right-aligned-time
              short-time
              (string-width
-              (or (qq-ui-prefix-state-current prefix-state) ""))
+              (or (disco-ui-prefix-state-current prefix-state) ""))
              t))
           (insert "\n")
-          (qq-ui-apply-line-prefix start (point) prefix-state)
+          (disco-ui-apply-line-prefix start (point) prefix-state)
           (add-text-properties start (point) properties)))
        (t
         (dolist (segment segments)
@@ -3170,10 +2387,10 @@ on the first inline line when the body is pure inline content."
             (qq-chat--insert-right-aligned-time
              short-time
              (string-width
-              (or (qq-ui-prefix-state-current prefix-state) ""))
+              (or (disco-ui-prefix-state-current prefix-state) ""))
              t)
             (insert "\n")
-            (qq-ui-apply-line-prefix start (point) prefix-state)
+            (disco-ui-apply-line-prefix start (point) prefix-state)
             (add-text-properties
              start (point)
              (append properties (list 'face 'qq-msg-status))))))))))
@@ -3184,8 +2401,8 @@ on the first inline line when the body is pure inline content."
     (unless message-id
       (user-error "qq: selected message has no server id"))
     (qq-chat--set-reply-message message)
-    (qq-chat--chat-update 'footer)
-    (goto-char (or (qq-chat--input-logical-end-position) (point-max)))
+    (qq-chat--update-frame)
+    (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max)))
     (message "qq: next message will reply to %s" message-id)))
 
 (defun qq-chat--delete-message-internal (message)
@@ -3211,11 +2428,8 @@ Telega uses avatar-width spaces, not ASCII gutters.  We use a fixed two-space
 indent for body rows; compact continuations use the same indent."
   (if compact "  " "  "))
 
-(defun qq-chat--render-message (message &optional previous-message)
-  "Insert one formatted MESSAGE block.
-
-When PREVIOUS-MESSAGE is non-nil and no stored render context is available,
-fall back to computing compact grouping directly.
+(defun qq-chat--render-message (message context)
+  "Insert one formatted MESSAGE block using projected CONTEXT.
 
 Visual model (telega-inspired; later appkit):
 - optional date / unread bars above the node
@@ -3225,8 +2439,6 @@ Visual model (telega-inspired; later appkit):
 - no per-message action button row (use `C-c m r/d/o/a' at point)"
   (let* ((anchor (qq-chat--message-anchor message))
          (start (point))
-         (context (or (qq-chat--message-render-context message)
-                      (qq-chat--compute-message-render-context previous-message message)))
          (insert-date (plist-get context :insert-date))
          (insert-unread (plist-get context :insert-unread))
          (title-face (qq-chat--message-title-face message))
@@ -3236,19 +2448,21 @@ Visual model (telega-inspired; later appkit):
          (status-suffix (qq-chat--status-suffix message))
          (compact (plist-get context :compact))
          (marked (qq-chat--message-marked-p message))
-         (body-prefix-state (qq-ui-make-prefix-state body-prefix body-prefix))
+         (body-prefix-state (disco-ui-make-prefix-state body-prefix body-prefix))
          (short-time (qq-chat--format-time-short (alist-get 'time message))))
     (when (and (stringp insert-date) (not (string-empty-p insert-date)))
       (qq-chat--insert-date-separator-row (qq-chat--message-day-label insert-date)))
     (when insert-unread
       (qq-chat--insert-unread-divider-row))
     (when marked
-      (qq-ui-insert-prefixed-lines
+      (disco-ui-insert-prefixed-lines
        body-prefix-state
        "✓ selected for merged forwarding"
        :face 'warning
        :properties properties))
     (cond
+     ((qq-state-gray-tip-message-p message)
+      (qq-chat--insert-gray-tip-message message properties))
      ((and (qq-state-poke-message-p message)
            (not (qq-state-message-recalled-p message)))
       (qq-chat--insert-poke-message message properties))
@@ -3263,7 +2477,7 @@ Visual model (telega-inspired; later appkit):
         (add-text-properties
          header-start (point)
          (append properties (list 'face 'qq-msg-deleted)))
-        (qq-ui-insert-prefixed-lines
+        (disco-ui-insert-prefixed-lines
          body-prefix-state
          (qq-chat--message-body message)
          :properties (append properties (list 'face 'qq-msg-deleted)))))
@@ -3290,13 +2504,14 @@ Visual model (telega-inspired; later appkit):
         (qq-chat--insert-right-aligned-time
          (qq-chat--format-time (alist-get 'time message)) nil t)
         (insert "\n")
-        (qq-ui-append-face header-start (point) 'qq-msg-heading)
+        (disco-ui-append-face header-start (point) 'qq-msg-heading)
         (add-text-properties header-start (point) properties))
       (when reply-id
         (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
       (qq-chat--insert-message-body message body-prefix-state properties)))
     (unless (or (qq-state-message-recalled-p message)
-                (qq-state-poke-message-p message))
+                (qq-state-poke-message-p message)
+                (qq-state-gray-tip-message-p message))
       (qq-chat--insert-reaction-line message body-prefix-state properties))
     (insert "\n")
     (add-text-properties start (point) properties)))
@@ -3306,10 +2521,9 @@ Visual model (telega-inspired; later appkit):
 
 Return non-nil on success."
   (let ((case-fold-search t)
-        (history-end (max (point-min)
-                          (1- (or (and (markerp qq-chat--input-marker)
-                                       (marker-position qq-chat--input-marker))
-                                  (point-max))))))
+        (history-end
+         (max (point-min)
+              (1- (or (disco-chatbuf-input-start-position) (point-max))))))
     (save-restriction
       (narrow-to-region (point-min) (max (point-min) history-end))
       (if forward
@@ -3350,17 +2564,16 @@ Return non-nil on success."
   (unless (qq-chat--history-search qq-chat--last-search-query nil)
     (message "qq: no previous match for %s" qq-chat--last-search-query)))
 
-(defun qq-chat--render-internal ()
-  "Apply a full partitioned update for the current chat buffer."
-  (qq-chat--chat-update 'header-line 'header 'footer 'prompt 'timeline))
-
 (defun qq-chat-render ()
-  "Render current chat buffer from local state."
+  "Synchronize current chat frame and projected timeline from local state."
   (interactive)
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
-  (qq-chat--capture-draft)
-  (qq-chat--render-internal))
+  (when (disco-chatbuf-input-region-bounds)
+    (disco-chatbuf-input-state-sync :reset-history-p nil))
+  (qq-chat--header-line-update)
+  (qq-chat--update-frame)
+  (qq-chat--sync-timeline))
 
 (defun qq-chat-refresh ()
   "Refresh current chat contents from local state and NapCat history."
@@ -3372,7 +2585,7 @@ Return non-nil on success."
     (when gap-after
       (qq-chat--set-history-gap gap-after)))
   (qq-chat-render)
-  (qq-api-fetch-history qq-chat--session-key))
+  (qq-api-fetch-older-history qq-chat--session-key))
 
 (defun qq-chat--note-history-window (meta)
   "Update newer-gap state after an around-window merge described by META."
@@ -3384,7 +2597,8 @@ Return non-nil on success."
     (if (and latest newest (not (member latest batch-ids)))
         (qq-chat--set-history-gap newest)
       (qq-chat--set-history-gap nil))
-    (qq-chat--chat-update 'header 'timeline)))
+    (qq-chat--update-frame)
+    (qq-chat--sync-timeline)))
 
 (defun qq-chat-load-newer-messages (&optional quiet)
   "Fill one page on the newer side of the current history gap."
@@ -3401,7 +2615,7 @@ Return non-nil on success."
       (let ((session-key qq-chat--session-key)
             (buffer (current-buffer))
             (requested (max 1 qq-history-fetch-count))
-            (point-anchor (and (not (qq-chat--point-in-input-p))
+            (point-anchor (and (not (disco-chatbuf-point-in-input-p))
                                (get-text-property (point)
                                                   'qq-chat-message-anchor)))
             (point-anchor-offset 0))
@@ -3431,7 +2645,8 @@ Return non-nil on success."
                    (if finished
                        (qq-chat--set-history-gap nil)
                      (qq-chat--set-history-gap newest))
-                   (qq-chat--chat-update 'header 'timeline)
+                   (qq-chat--update-frame)
+                   (qq-chat--sync-timeline)
                    (when point-anchor
                      (when-let* ((anchor-pos (qq-chat--message-position point-anchor)))
                        (goto-char (+ anchor-pos point-anchor-offset))
@@ -3447,7 +2662,7 @@ Return non-nil on success."
              (with-current-buffer buffer
                (when (equal qq-chat--session-key session-key)
                  (qq-chat--history-set :loading nil)
-                 (qq-chat--chat-update 'header)
+                 (qq-chat--update-frame)
                  (qq-api--default-error response reason)))))
          requested))))))
 
@@ -3458,7 +2673,7 @@ Return non-nil on success."
                     (alist-get 'last-message-id (qq-chat--session)))))
     (if (and latest (qq-chat--goto-loaded-message latest nil))
         (message "qq: latest cached message")
-      (goto-char (or (qq-chat--input-start-position) (point-max))))))
+      (goto-char (or (disco-chatbuf-input-start-position) (point-max))))))
 
 (defun qq-chat-load-older-messages (&optional quiet)
   "Load one older history page for the current chat (telega/disco `M-<').
@@ -3481,7 +2696,7 @@ new rows or reports the cursor missing."
       (unless before
         (user-error "qq: no oldest message cursor; refresh first (C-c g)"))
       (qq-chat--history-set :loading 'older)
-      (qq-api-fetch-history
+      (qq-api-fetch-older-history
        session-key
        before
        (lambda (meta)
@@ -3493,15 +2708,16 @@ new rows or reports the cursor missing."
                  (cond
                   ((<= added 0)
                    (qq-chat--history-set :older-loaded t)
-                   (qq-chat--chat-update 'header-line 'header)
+                   (qq-chat--header-line-update)
+                   (qq-chat--update-frame)
                    ;; Jump uses seek-at-target, not load-older chains.
                    (when qq-chat--pending-jump-id
                      (qq-chat--finish-jump-if-loaded qq-chat--pending-jump-id))
                    (unless (or quiet qq-chat--pending-jump-id)
                      (message "qq: reached beginning of history")))
                   (t
-                   ;; Timeline already reconciled via history hook.
-                   (qq-chat--chat-update 'header-line 'header)
+                   (qq-chat--header-line-update)
+                   (qq-chat--update-frame)
                    (when qq-chat--pending-jump-id
                      (qq-chat--finish-jump-if-loaded qq-chat--pending-jump-id))
                    (unless (or quiet qq-chat--pending-jump-id)
@@ -3516,12 +2732,14 @@ new rows or reports the cursor missing."
                (if (qq-api--history-exhausted-error-p response reason)
                    (progn
                      (qq-chat--history-set :older-loaded t)
-                     (qq-chat--chat-update 'header-line 'header)
+                     (qq-chat--header-line-update)
+                     (qq-chat--update-frame)
                      (when qq-chat--pending-jump-id
                        (qq-chat--finish-jump-if-loaded qq-chat--pending-jump-id))
                      (unless (or quiet qq-chat--pending-jump-id)
                        (message "qq: reached beginning of history")))
-                 (qq-chat--chat-update 'header-line 'header)
+                 (qq-chat--header-line-update)
+                 (qq-chat--update-frame)
                  (qq-api--default-error response reason)))))))))))
 
 (defun qq-chat-send-message ()
@@ -3545,21 +2763,18 @@ new rows or reports the cursor missing."
              (string-empty-p (string-trim text)))
         (message "qq: draft is empty")
       (qq-chat--push-input-history text)
-      (setq qq-chat--input-index nil)
-      (setq qq-chat--input-pending nil)
-      (setq qq-chat--draft-input "")
-      (setq qq-chat--draft-input-rich "")
+      (disco-chatbuf-input-state-clear :reset-history-p t)
       ;; telega: empty input after send → chatActionCancel
       (qq-chat--set-my-action 'cancel)
       (qq-chat--set-reply-message nil)
-      (qq-chat--chat-update 'footer 'prompt)
+      (qq-chat--update-frame)
       (qq-api-send-message qq-chat--session-key send-segments raw-message))))
 
 (defun qq-chat-return-dwim (arg)
   "Send current draft, or insert newline with prefix ARG."
   (interactive "P")
-  (if (not (qq-chat--point-in-input-p))
-      (goto-char (or (qq-chat--input-logical-end-position) (point-max)))
+  (if (not (disco-chatbuf-point-in-input-p))
+      (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max)))
     (if arg
         (insert "\n")
       (qq-chat-send-message))))
@@ -3567,7 +2782,7 @@ new rows or reports the cursor missing."
 (defun qq-chat-edit-draft ()
   "Move point to the editable draft area."
   (interactive)
-  (goto-char (or (qq-chat--input-logical-end-position) (point-max))))
+  (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max))))
 
 (defun qq-chat-draft-prev ()
   "Replace draft with previous entry from input history."
@@ -3576,7 +2791,7 @@ new rows or reports the cursor missing."
       (progn
         (disco-chatbuf-input-history-prev)
         (qq-chat--sync-draft-from-buffer)
-        (goto-char (or (qq-chat--input-logical-end-position) (point-max))))
+        (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max))))
     (user-error
      (user-error "qq: no previous inputs"))))
 
@@ -3587,15 +2802,13 @@ new rows or reports the cursor missing."
       (progn
         (disco-chatbuf-input-history-next)
         (qq-chat--sync-draft-from-buffer)
-        (goto-char (or (qq-chat--input-logical-end-position) (point-max))))
+        (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max))))
     (user-error
      (user-error "qq: not currently browsing input history"))))
 
 (defun qq-chat-clear-draft ()
   "Clear current draft and exit input history navigation."
   (interactive)
-  (setq qq-chat--input-index nil)
-  (setq qq-chat--input-pending nil)
   (qq-chat--set-draft ""))
 
 (defun qq-chat-reply-to-message ()
@@ -3692,30 +2905,20 @@ Bound to `C-c C-k' (also ESC ESC / C-M-c).  Reply footer × is clickable."
   (cond
    ((qq-chat--reply-message)
     (qq-chat--set-reply-message nil)
-    (qq-chat--chat-update 'footer)
+    (qq-chat--update-frame)
     (message "qq: reply target cleared"))
-   ((or qq-chat--input-index
-        qq-chat--input-pending
+   ((or (disco-chatbuf-input-history-active-p)
         (not (string-empty-p (string-trim (qq-chat--current-draft-string)))))
     (qq-chat-clear-draft)
     (message "qq: draft cleared"))
    (t
     (message "qq: nothing to cancel"))))
 
-(defun qq-chat--apply-read-state-change-partially ()
-  "Apply unread/read-state change without full timeline rebuild.
-
-Updates header-line and redisplays only nodes whose render context changed
-(typically the previous first-unread row losing its divider)."
-  (let* ((messages (qq-chat--timeline-messages))
-         (anchors (or qq-chat--displayed-message-anchors '()))
-         (snapshot (qq-chat--copy-render-contexts-for-anchors anchors)))
-    (qq-chat--rebuild-render-contexts messages)
-    (qq-chat--header-line-update)
-    (let ((changed (qq-chat--changed-render-context-anchors anchors snapshot)))
-      (when changed
-        (qq-chat--redisplay-message-anchors-preserving-point changed)))
-    t))
+(defun qq-chat--apply-read-state-change ()
+  "Synchronize unread-divider context after session read-state changes."
+  (qq-chat--header-line-update)
+  (qq-chat--sync-timeline)
+  t)
 
 (defun qq-chat-read-all ()
   "Mark the current chat as read."
@@ -3753,10 +2956,6 @@ sender."
      target
      (lambda (_response)
        (message "qq: poke sent")))))
-
-(defalias 'qq-chat-mark-read #'qq-chat-read-all)
-(defalias 'qq-chat-send #'qq-chat-send-message)
-(defalias 'qq-chat-load-older #'qq-chat-load-older-messages)
 
 (defvar qq-chat-mode-map
   (let ((map (make-sparse-keymap)))
@@ -3799,29 +2998,17 @@ sender."
 
 Message actions use point + keys (`r'/`d'/`!'/`o'/`a' on the timeline) or
 `qq-chat-message-transient' (`C-c m' / timeline `m').  Chat-wide commands
-are in `qq-chat-transient' (`C-c ?' / timeline `?').
+  are in `qq-chat-transient' (`C-c ?' / timeline `?').
 Attach from clipboard with `C-c C-v' (telega-style)."
   (disco-chatbuf-mode-setup)
-  (setq-local qq-chat--draft-input "")
-  (setq-local qq-chat--draft-input-rich "")
-  (qq-chat--clear-input-region-markers)
-  (disco-chatbuf-init-state 32)
-  (disco-chatbuf-aux-reset)
-  (disco-chatbuf-input-options-reset)
+  (disco-chatbuf-reset-state 32)
+  (disco-chat-timeline-reset)
   (setq-local qq-chat--last-search-query nil)
   (setq-local qq-chat--marked-message-anchors nil)
   (setq-local qq-chat--forward-request-active-p nil)
-  (setq-local qq-chat--rendering nil)
   (setq-local qq-chat--fill-column nil)
-  (setq-local qq-chat--ewoc nil)
-  (setq-local qq-chat--empty-node nil)
-  (setq-local qq-chat--message-node-table (make-hash-table :test #'equal))
-  (setq-local qq-chat--displayed-message-anchors nil)
-  (setq-local qq-chat--render-context-by-anchor (make-hash-table :test #'equal))
-  (setq-local qq-chat--media-anchors-by-key (make-hash-table :test #'equal))
   (setq-local disco-media-card-fallback-context-function
               #'qq-chat--media-card-fallback-context)
-  (setq-local qq-chat--deferred-node-anchors nil)
   (qq-chat--reset-history-state)
   (setq-local qq-chat--pending-jump-id nil)
   (setq-local qq-chat--messages-pop-ring
@@ -3867,10 +3054,20 @@ first unread message."
       (when qq-auto-mark-read
         (qq-api-mark-session-read session-key)))))
 
+(defun qq-chat--fail-initial-history-load
+    (buffer session-key owner response reason)
+  "Finish OWNER with an explicit initial-history failure."
+  (when (qq-chat--initial-history-request-current-p
+         buffer session-key owner)
+    (with-current-buffer buffer
+      (setq qq-chat--initial-history-owner nil
+            qq-chat--initial-history-request nil))
+    (qq-api--default-error response reason)))
+
 (defun qq-chat--load-latest-initial-history (buffer session-key owner)
   "Load latest history for BUFFER, then complete read handling."
   (let ((request
-         (qq-api-fetch-history
+         (qq-api-fetch-older-history
           session-key nil
           (lambda (_meta)
             (qq-chat--complete-initial-history-load
@@ -3911,18 +3108,15 @@ first unread message."
                 (lambda (meta)
                   (qq-chat--complete-initial-history-load
                    buffer session-key owner first-id meta))
-                (lambda (_response _reason)
-                  (qq-chat--load-latest-initial-history
-                   buffer session-key owner))
+                (lambda (response reason)
+                  (qq-chat--fail-initial-history-load
+                   buffer session-key owner response reason))
                 (max qq-history-fetch-count (* 2 qq-history-fetch-count)))
              (qq-chat--load-latest-initial-history
               buffer session-key owner)))))
-            (lambda (_response _reason)
-              ;; Backward-compatible path for an older NapCat without read state.
-              (when (qq-chat--initial-history-request-current-p
-                     buffer session-key owner)
-                (qq-chat--load-latest-initial-history
-                 buffer session-key owner))))))
+            (lambda (response reason)
+              (qq-chat--fail-initial-history-load
+               buffer session-key owner response reason)))))
       (when (qq-chat--initial-history-request-current-p
              buffer session-key owner)
         (with-current-buffer buffer
@@ -3941,104 +3135,104 @@ first unread message."
         (qq-chat-mode))
       (setq qq-chat--session-key session-key)
       (qq-chat-render)
-      (goto-char (or (qq-chat--input-logical-end-position) (point-max)))
+      (goto-char (or (disco-chatbuf-input-logical-end-position) (point-max)))
       (qq-chat--load-initial-history buffer session-key))
     (pop-to-buffer buffer)
     (with-current-buffer buffer
       (qq-chat--on-window-size-change))))
 
-(defun qq-chat--merge-deferred-node-anchors (anchors)
-  "Merge ANCHORS into deferred node redisplay state for current buffer."
-  (setq qq-chat--deferred-node-anchors
-        (delete-dups
-         (append (copy-sequence (or qq-chat--deferred-node-anchors '()))
-                 (copy-sequence (or anchors '()))))))
-
-(defun qq-chat--request-node-redisplay (anchors)
-  "Redisplay ANCHORS now, or defer while a region is active.
-
-This intentionally avoids the old idle-queue approach.  In line with telega's
-node redisplay and disco-room's partial mutation helpers, chat updates happen
-immediately unless the user is actively selecting a region."
-  (let ((effective-anchors (delete-dups (copy-sequence (or anchors '())))))
-    (when effective-anchors
-      (if mark-active
-          (qq-chat--merge-deferred-node-anchors effective-anchors)
-        (qq-chat--invalidate-message-anchors-preserving-point effective-anchors)))))
-
 (defun qq-chat--rerender-open-chats (&optional media-key)
-  "Refresh affected chat message nodes after media cache updates.
-
-When MEDIA-KEY is non-nil, only invalidate rendered messages that depend on the
-changed cache entry."
+  "Redisplay open chat rows affected by MEDIA-KEY."
   (dolist (buffer (buffer-list))
     (with-current-buffer buffer
-      (when (derived-mode-p 'qq-chat-mode)
-        (let ((anchors (or (and media-key
-                                (qq-chat--media-anchors-for-key media-key))
-                           qq-chat--displayed-message-anchors)))
-          (qq-chat--request-node-redisplay anchors))))))
+      (when (and (derived-mode-p 'qq-chat-mode)
+                 (disco-chat-timeline-live-p))
+        (let ((keys
+               (if media-key
+                   (disco-chat-timeline-dependent-keys
+                    (list (list :media media-key)))
+                 (disco-chat-timeline-keys))))
+          (disco-chat-timeline-invalidate
+           keys :defer-while-mark-active t))))))
+
+(defun qq-chat--message-event-rekeys (event)
+  "Return explicit local-to-server row rekeys described by EVENT."
+  (let* ((message (plist-get event :message))
+         (new-key (and (listp message) (qq-chat--message-anchor message)))
+         (old-keys
+          (delete-dups
+           (delq nil
+                 (list (plist-get event :previous-anchor)
+                       (and (listp message) (alist-get 'local-id message))))))
+         (old-key
+          (seq-find (lambda (key)
+                      (and (not (equal key new-key))
+                           (disco-chat-timeline-node key)))
+                    old-keys)))
+    (and old-key new-key (list (cons old-key new-key)))))
+
+(defun qq-chat--apply-message-state-change (event)
+  "Synchronize one QQ message EVENT through the canonical projection."
+  (let* ((message (plist-get event :message))
+         (anchor (or (plist-get event :message-anchor)
+                     (and (listp message) (qq-chat--message-anchor message))))
+         (previous-anchor (plist-get event :previous-anchor))
+         (resources
+          (mapcar (lambda (key) (list :message key))
+                  (delete-dups (delq nil (list anchor previous-anchor)))))
+         (rekeys (qq-chat--message-event-rekeys event)))
+    (unless (or anchor previous-anchor)
+      (error "qq: message state event has no stable anchor: %S" event))
+    (qq-chat--header-line-update)
+    (qq-chat--sync-timeline
+     :changed-resources resources
+     :rekeys rekeys)
+    (when (or (qq-chat--message-affects-composer-context-p anchor)
+              (qq-chat--message-affects-composer-context-p previous-anchor))
+      (qq-chat--refresh-composer-context-for-message
+       (or anchor previous-anchor)))))
 
 (defun qq-chat--handle-state-change (event)
-  "Refresh affected chat buffers after state EVENT.
-
-Follow telega/disco-like update rules: patch single message changes in the
-persistent EWOC when possible, fall back to full render for broader timeline
-changes, and only update the composer frame for metadata changes.
-
-Prefer `qq-state' `:mutation' metadata when present:
-
-- message create/update → single-node partial patch (full render fallback)
-- history / reset → full render (batch timeline rebuild still coarse)
-- session read → header-line + local unread-divider patch
-- other session → header-line+header
-- action (typing) → footer only (telega updateChatAction → footer-ins-prompt-delim)
-- friends/groups refresh → header + timeline (sender titles may change)"
+  "Synchronize open QQ chats after state EVENT."
   (let ((event-session-key (plist-get event :session-key))
         (event-type (plist-get event :type))
-        (event-message (plist-get event :message))
         (event-mutation (plist-get event :mutation)))
     (when (memq event-type '(message history reset session action
                              sessions-refreshed friends-refreshed groups-refreshed))
       (dolist (buffer (buffer-list))
         (with-current-buffer buffer
           (when (derived-mode-p 'qq-chat-mode)
-            (cond
-             ((eq event-type 'message)
-              (when (equal event-session-key qq-chat--session-key)
-                (qq-chat--header-line-update)
-                (let* ((messages (qq-chat--timeline-messages))
-                       (anchor (or (plist-get event :message-anchor)
-                                   (qq-chat--message-anchor event-message)
-                                   (plist-get event :previous-anchor))))
-                  ;; Default hide recalled: filter drops row → EWOC node deleted.
-                  ;; show-recalled: stub stays and is redisplayed.
-                  (unless (qq-chat--apply-single-message-change-partially
-                           anchor messages)
-                    (qq-chat-render)))
-                (when (and qq-auto-mark-read
-                           (get-buffer-window buffer t))
-                  (qq-chat-read-all))))
-             ((eq event-type 'history)
-              (when (equal event-session-key qq-chat--session-key)
-                ;; Reconcile can prepend older anchors when order is compatible;
-                ;; still goes through partitioned timeline update (preserve point).
-                (qq-chat--chat-update 'header-line 'header 'timeline)))
-             ((eq event-type 'reset)
-              (qq-chat-render))
-             ((eq event-type 'session)
-              (when (equal event-session-key qq-chat--session-key)
-                (if (eq event-mutation 'read)
-                    (qq-chat--apply-read-state-change-partially)
-                  (qq-chat--chat-update 'header-line 'header))))
-             ((eq event-type 'action)
-              ;; telega: updateChatAction dirties footer prompt-delim only.
-              (when (equal event-session-key qq-chat--session-key)
-                (qq-chat--apply-frame-update)))
-             ((eq event-type 'sessions-refreshed)
-              (qq-chat--chat-update 'header-line 'header))
-             ((memq event-type '(friends-refreshed groups-refreshed))
-              (qq-chat--chat-update 'header-line 'header 'timeline)))))))))
+            (pcase event-type
+              ('message
+               (when (equal event-session-key qq-chat--session-key)
+                 (qq-chat--apply-message-state-change event)
+                 (when (and qq-auto-mark-read
+                            (get-buffer-window buffer t))
+                   (qq-chat-read-all))))
+              ('history
+               (when (equal event-session-key qq-chat--session-key)
+                 (qq-chat--header-line-update)
+                 (qq-chat--update-frame)
+                 (qq-chat--sync-timeline)))
+              ('reset
+               (qq-chat-render))
+              ('session
+               (when (equal event-session-key qq-chat--session-key)
+                 (if (eq event-mutation 'read)
+                     (qq-chat--apply-read-state-change)
+                   (qq-chat--header-line-update)
+                   (qq-chat--update-frame))))
+              ('action
+               (when (equal event-session-key qq-chat--session-key)
+                 (qq-chat--update-frame)))
+              ('sessions-refreshed
+               (qq-chat--header-line-update)
+               (qq-chat--update-frame))
+              ((or 'friends-refreshed 'groups-refreshed)
+               (qq-chat--header-line-update)
+               (qq-chat--update-frame)
+               (qq-chat--sync-timeline
+                :force-keys (disco-chat-timeline-keys))))))))))
 
 (add-hook 'qq-media-cache-update-hook #'qq-chat--rerender-open-chats)
 (add-hook 'qq-state-change-hook #'qq-chat--handle-state-change)

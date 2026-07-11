@@ -9,6 +9,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'json)
 (require 'seq)
 (require 'subr-x)
 (require 'qq-customize)
@@ -27,8 +28,8 @@ include:
 - `:message' / `:message-anchor' / `:previous-anchor' — when a single
   message is the subject (anchor prefers NT snowflake `server-id')
 
-Chat views should prefer `:mutation' + anchors for incremental EWOC patches
-and fall back to full render only for `history'/`reset' or failed patches.")
+Chat views project canonical state after every relevant mutation; anchors and
+resource identities let the shared timeline redraw only affected rows.")
 
 (defvar qq-state--connection-status 'disconnected)
 (defvar qq-state--last-heartbeat nil)
@@ -386,6 +387,17 @@ Values from NEW replace values in OLD."
          (equal (alist-get 'type segment) "poke"))
        (alist-get 'segments message))))
 
+(defun qq-state-gray-tip-message-p (message)
+  "Return non-nil when MESSAGE is a QQ JSON gray-tip notice row."
+  (or (and (listp message) (alist-get 'gray-tip-p message))
+      (let ((raw-event (and (listp message) (alist-get 'raw-event message))))
+        (and (listp raw-event)
+             (qq-state--gray-tip-notice-p raw-event)))
+      (seq-some
+       (lambda (segment)
+         (equal (alist-get 'type segment) "gray-tip"))
+       (and (listp message) (alist-get 'segments message)))))
+
 (defun qq-state-poke-message-data (message)
   "Return normalized visual data for poke MESSAGE.
 
@@ -593,6 +605,9 @@ reply chrome elsewhere).  Media becomes short placeholders like
                  (and action (concat action detail))
                  (and target (concat "戳了戳 " target))
                  "[poke]")))
+          ("gray-tip"
+           (or (qq-state--present-string (alist-get 'text data))
+               "QQ system notice"))
           ("dice" "[dice]")
           ("rps" "[rps]")
           ("share" "[share]")
@@ -793,6 +808,42 @@ in the UI — that is wire format, not display text."
        (equal (alist-get 'notice_type message) "notify")
        (equal (alist-get 'sub_type message) "poke")))
 
+(defun qq-state--gray-tip-notice-p (message)
+  "Return non-nil when MESSAGE is a NapCat JSON gray-tip notice."
+  (and (equal (alist-get 'post_type message) "notice")
+       (equal (alist-get 'notice_type message) "notify")
+       (equal (alist-get 'sub_type message) "gray_tip")))
+
+(defun qq-state--gray-tip-json (notice)
+  "Return decoded JSON payload from gray-tip NOTICE, or nil."
+  (or (let ((raw-info (alist-get 'raw_info notice)))
+        (and (listp raw-info) (alist-get 'json raw-info)))
+      (when-let* ((content (alist-get 'content notice))
+                  ((stringp content)))
+        (condition-case nil
+            (json-parse-string content
+                               :object-type 'alist
+                               :array-type 'list
+                               :null-object nil
+                               :false-object nil)
+          (json-parse-error nil)))))
+
+(defun qq-state--gray-tip-data (notice)
+  "Return stable visual data decoded from gray-tip NOTICE."
+  (let* ((json (qq-state--gray-tip-json notice))
+         (items (and (listp json) (alist-get 'items json)))
+         (texts
+          (delq nil
+                (mapcar
+                 (lambda (item)
+                   (and (listp item)
+                        (qq-state--present-string (alist-get 'txt item))))
+                 (if (listp items) items '()))))
+         (text (if texts (string-join texts "") "QQ system notice")))
+    `((text . ,text)
+      (busi-id . ,(qq-state--normalize-id (alist-get 'busi_id notice)))
+      (items . ,(copy-tree items)))))
+
 (defun qq-state--poke-user-name (user-id explicit-name)
   "Return a display name for POKE USER-ID, preferring EXPLICIT-NAME."
   (let* ((user-id (qq-state--normalize-id user-id))
@@ -927,6 +978,46 @@ the natural-language fragments.  The complete original notice remains in
             (order . ,(qq-state--next-message-order))
             (raw-event . ,(copy-tree notice)))))
     message))
+
+(defun qq-state--normalize-gray-tip-notice (notice)
+  "Normalize fork-native JSON gray-tip NOTICE into a timeline message."
+  (let* ((group-id (qq-state--normalize-id (alist-get 'group_id notice)))
+         (session-key (and group-id (qq-state-session-key 'group group-id)))
+         (server-id
+          (qq-protocol-optional-message-id
+           (alist-get 'message_id notice)
+           "gray-tip notice"))
+         (data (qq-state--gray-tip-data notice))
+         (text (alist-get 'text data))
+         (raw-info (alist-get 'raw_info notice))
+         (time
+          (qq-state--normalize-time
+           (or (alist-get 'time notice)
+               (and (listp raw-info) (alist-get 'msgTime raw-info)))))
+         (sender-id
+          (let ((id (qq-state--normalize-id (alist-get 'user_id notice))))
+            (and id (not (equal id "0")) id))))
+    (unless session-key
+      (error "qq: gray-tip notice requires group_id"))
+    (unless server-id
+      (error "qq: gray-tip notice requires NT message_id"))
+    `((id . ,server-id)
+      (server-id . ,server-id)
+      (session-key . ,session-key)
+      (time . ,time)
+      (sender-id . ,sender-id)
+      (sender-name . "QQ")
+      (self-p . nil)
+      (status . received)
+      (gray-tip-p . t)
+      (segments . (((type . "gray-tip") (data . ,data))))
+      (raw-message . ,text)
+      (preview . ,text)
+      (message-type . "group")
+      (group-id . ,group-id)
+      (user-id . ,sender-id)
+      (order . ,(qq-state--next-message-order))
+      (raw-event . ,(copy-tree notice)))))
 
 (defun qq-state--normalize-raw-message (message &optional fallback-session-key)
   "Normalize raw OneBot MESSAGE into local store shape."
@@ -1341,6 +1432,24 @@ valid poke participant."
                  (when previous-anchor
                    (list :previous-anchor previous-anchor)))
           merged)))))
+
+(defun qq-state-apply-gray-tip-notice (notice)
+  "Merge fork-native JSON gray-tip NOTICE into its group timeline."
+  (let* ((message (qq-state--normalize-gray-tip-notice notice))
+         (session-key (alist-get 'session-key message)))
+    (cl-multiple-value-bind (merged mutation previous-anchor)
+        (qq-state--merge-normalized-message session-key message nil)
+      (when merged
+        (apply #'qq-state--emit
+               'message
+               :session-key session-key
+               :message (copy-tree merged)
+               :message-anchor (qq-state-message-anchor merged)
+               :mutation mutation
+               :source 'notice
+               (when previous-anchor
+                 (list :previous-anchor previous-anchor)))
+        merged))))
 
 (defun qq-state-merge-history (session-key raw-messages)
   "Merge RAW-MESSAGES history batch into SESSION-KEY.
@@ -1917,9 +2026,6 @@ first live action's `text' (kernel status_text for QQ typing)."
     (and (stringp text)
          (not (string-empty-p text))
          text)))
-
-;; Backward-compatible alias used by early call sites / tests.
-(defalias 'qq-state-input-status-text #'qq-state-action-text)
 
 (defun qq-state-clear-session-actions (session-key &optional silent)
   "Clear all chat-actions for SESSION-KEY.

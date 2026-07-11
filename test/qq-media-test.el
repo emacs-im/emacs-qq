@@ -8,8 +8,7 @@
 
 (defmacro qq-media-test-with-reset (&rest body)
   "Run BODY with clean qq-media caches and rerender hooks disabled."
-  `(let ((qq-media-cache-update-hook nil)
-         (qq-media-rerender-function nil))
+  `(let ((qq-media-cache-update-hook nil))
      (qq-media-clear-cache)
      (unwind-protect
          (progn ,@body)
