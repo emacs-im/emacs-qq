@@ -803,6 +803,16 @@
             "[CQ:image,file=43DFE.png,url=http://example.com/a.png]")
            "[image]")))
 
+(ert-deftest qq-state-message-preview-collapses-multiline-content ()
+  (should (equal
+           "first second [markdown] line"
+           (qq-state-message-preview-from-segments
+            '(((type . "text") (data . ((text . "first\n second"))))
+              ((type . "markdown") (data . ((content . "[markdown]\nline"))))))))
+  (should (equal "plain text after"
+                 (qq-state-message-preview
+                  '((preview . "plain\n text\t after"))))))
+
 (ert-deftest qq-state-message-preview-falls-back-to-cq-when-no-segments ()
   (qq-test-with-reset
    (let ((message
@@ -833,6 +843,21 @@
                               (url . "http://e/x"))))))))))
    (let ((session (qq-state-session "private:10002")))
      (should (equal (alist-get 'last-message-preview session) "[image]")))))
+
+(ert-deftest qq-state-apply-recent-contacts-uses-server-preview-fallback ()
+  (qq-test-with-reset
+   (qq-state-apply-recent-contacts
+    '(((chatType . 2)
+       (peerUin . "20002")
+       (peerName . "Group")
+       (msgTime . "1710000002")
+       (msgId . "9007199254741004991")
+       (lastestMsg . nil)
+       (lastMessagePreview . "群通知第一行\n  第二行"))))
+   (should (equal
+            "群通知第一行 第二行"
+            (alist-get 'last-message-preview
+                       (qq-state-session "group:20002"))))))
 
 (ert-deftest qq-state-set-status-deduplicates-identical-events ()
   (qq-test-with-reset

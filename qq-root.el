@@ -224,8 +224,10 @@ priority over the last-message preview."
   (let* ((session-key (alist-get 'key session))
          (action-text (and qq-chat-show-peer-actions
                            session-key
-                           (qq-state-action-text session-key)))
-         (preview (string-trim (or (alist-get 'last-message-preview session) "")))
+                           (qq-state-preview-one-line
+                            (qq-state-action-text session-key))))
+         (preview (qq-state-preview-one-line
+                   (alist-get 'last-message-preview session)))
          (badge (qq-root--session-badge session)))
     (concat
      badge
@@ -233,7 +235,9 @@ priority over the last-message preview."
       ((and (stringp action-text) (not (string-empty-p action-text)))
        (concat (or qq-chat-action-prefix ".. ") action-text))
       ((string-empty-p preview)
-       "(no preview yet)")
+       (if (alist-get 'last-message-id session)
+           "[message]"
+         "(no messages yet)"))
       (t preview)))))
 
 (defun qq-root--session-one-line-row (session)

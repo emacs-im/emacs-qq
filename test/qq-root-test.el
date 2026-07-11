@@ -43,10 +43,20 @@
                 (disco-view-one-line-row-preview-leading-face row)))
     (should-not (disco-view-one-line-row-time-tail-face row))))
 
-(ert-deftest qq-root-shows-muted-state-without-unread-messages ()
-  (should (equal "[mute] (no preview yet)"
+(ert-deftest qq-root-shows-muted-state-without-messages ()
+  (should (equal "[mute] (no messages yet)"
                  (qq-root--session-preview-text
                   '((muted-p . t) (unread-count . 0))))))
+
+(ert-deftest qq-root-session-preview-is-always-one-line ()
+  (should (equal "first second third"
+                 (qq-root--session-preview-text
+                  '((last-message-preview . " first\nsecond\r\n  third "))))))
+
+(ert-deftest qq-root-known-message-without-preview-uses-generic-label ()
+  (should (equal "[message]"
+                 (qq-root--session-preview-text
+                  '((last-message-id . "9007199254741004991"))))))
 
 (ert-deftest qq-root-mentions-stay-important-through-muted-groups ()
   (let ((session '((muted-p . t)

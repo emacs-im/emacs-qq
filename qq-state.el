@@ -509,13 +509,23 @@ Prefer basename of local paths; drop http(s) URLs entirely."
           (truncate-string-to-width base 28 nil nil t))))
      (t (truncate-string-to-width (string-trim value) 28 nil nil t)))))
 
+(defun qq-state-preview-one-line (value)
+  "Return VALUE as a compact single-line message preview.
+
+Like telega's `telega-ins--one-lined', line breaks and repeated horizontal
+whitespace are presentation details rather than part of a root-row preview."
+  (if (stringp value)
+      (string-trim
+       (replace-regexp-in-string "[[:space:]\u00a0]+" " " value))
+    ""))
+
 (defun qq-state-message-preview-from-segments (segments)
   "Return a human-readable plain-text preview for message SEGMENTS.
 
 Never emit OneBot CQ strings.  Reply segments are omitted (shown via
 reply chrome elsewhere).  Media becomes short placeholders like
 `[image]' / `[face:178]'."
-  (string-trim
+  (qq-state-preview-one-line
    (mapconcat
     (lambda (segment)
       (let ((type (alist-get 'type segment))
@@ -595,7 +605,7 @@ reply chrome elsewhere).  Media becomes short placeholders like
                           "[markdown]"))
           (_ (format "[%s]" (or type "message"))))))
     (or segments '())
-    "")))
+    " ")))
 
 (defun qq-state--mention-kinds-from-segments (segments)
   "Return native QQ mention kinds found in SEGMENTS.
@@ -700,33 +710,35 @@ Strips reply tags and collapses media/face codes."
             (setq pos end))
         (push (substring s pos) parts)
         (setq pos len)))
-    (string-trim (mapconcat #'identity (nreverse parts) ""))))
+    (qq-state-preview-one-line
+     (mapconcat #'identity (nreverse parts) ""))))
 
 (defun qq-state-message-preview (message)
   "Return human-readable preview text for normalized MESSAGE.
 
 Prefer structured segment previews.  Never surface OneBot CQ `raw_message'
 in the UI — that is wire format, not display text."
-  (or (let ((stored (alist-get 'preview message)))
-        (and (stringp stored)
-             (not (string-empty-p (string-trim stored)))
-             (not (qq-state--cq-looks-p stored))
-             stored))
-      (let ((from-segments
-             (qq-state-message-preview-from-segments
-              (alist-get 'segments message))))
-        (and (stringp from-segments)
-             (not (string-empty-p from-segments))
-             from-segments))
-      (let ((raw (alist-get 'raw-message message)))
-        (cond
-         ((not (stringp raw)) nil)
-         ((string-empty-p (string-trim raw)) nil)
-         ((qq-state--cq-looks-p raw)
-          (let ((converted (qq-state-message-preview-from-cq raw)))
-            (and (not (string-empty-p converted)) converted)))
-         (t raw)))
-      ""))
+  (qq-state-preview-one-line
+   (or (let ((stored (alist-get 'preview message)))
+         (and (stringp stored)
+              (not (string-empty-p (string-trim stored)))
+              (not (qq-state--cq-looks-p stored))
+              stored))
+       (let ((from-segments
+              (qq-state-message-preview-from-segments
+               (alist-get 'segments message))))
+         (and (stringp from-segments)
+              (not (string-empty-p from-segments))
+              from-segments))
+       (let ((raw (alist-get 'raw-message message)))
+         (cond
+          ((not (stringp raw)) nil)
+          ((string-empty-p (string-trim raw)) nil)
+          ((qq-state--cq-looks-p raw)
+           (let ((converted (qq-state-message-preview-from-cq raw)))
+             (and (not (string-empty-p converted)) converted)))
+          (t raw)))
+       "")))
 
 (defun qq-state--message-chat-type (message)
   "Return raw backend chat type extracted from raw MESSAGE, or nil."
@@ -1722,24 +1734,28 @@ older/fallback notices without it are applied as a one-step delta."
                             (truncate (cdr unread-entry))
                           (string-to-number (format "%s" (or (cdr unread-entry) 0)))))))
            (last-message (alist-get 'lastestMsg contact))
+           (server-preview
+            (or (alist-get 'lastMessagePreview contact)
+                (alist-get 'last_message_preview contact)))
            (preview
-            (cond
-             ((not (listp last-message)) "")
-             (t
-              ;; Prefer structured segments; CQ raw_message is wire format only.
-              (let* ((from-segments
-                      (qq-state-message-preview-from-segments
-                       (alist-get 'message last-message)))
-                     (raw (alist-get 'raw_message last-message)))
-                (cond
-                 ((and (stringp from-segments)
-                       (not (string-empty-p from-segments)))
-                  from-segments)
-                 ((and (stringp raw) (qq-state--cq-looks-p raw))
-                  (qq-state-message-preview-from-cq raw))
-                 ((and (stringp raw) (not (string-empty-p raw)))
-                  raw)
-                 (t "")))))))
+            (qq-state-preview-one-line
+             (or
+              (and (consp last-message)
+                   ;; Prefer structured segments; CQ raw_message is wire format only.
+                   (let* ((from-segments
+                           (qq-state-message-preview-from-segments
+                            (alist-get 'message last-message)))
+                          (raw (alist-get 'raw_message last-message)))
+                     (cond
+                      ((and (stringp from-segments)
+                            (not (string-empty-p from-segments)))
+                       from-segments)
+                      ((and (stringp raw) (qq-state--cq-looks-p raw))
+                       (qq-state-message-preview-from-cq raw))
+                      ((and (stringp raw) (not (string-empty-p raw)))
+                       raw))))
+              server-preview
+              ""))))
       (qq-state-upsert-session
        session-key
        `((title . ,title)
@@ -1763,7 +1779,7 @@ older/fallback notices without it are applied as a one-step delta."
          ,@(when notify-mode-entry
              `((message-notify-mode . ,(intern (format "%s" (cdr notify-mode-entry)))))))
        nil)
-      (when (listp last-message)
+      (when (consp last-message)
         (let ((message-copy (copy-tree last-message)))
           (when (and msg-id
                      (not (alist-get 'message_id message-copy nil nil #'eq))
