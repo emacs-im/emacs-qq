@@ -7,6 +7,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'disco-mode-line)
 (require 'qq-customize)
 (require 'qq-state)
 (require 'qq-root)
@@ -61,45 +62,33 @@ sessions because native QQ mentions are priority activity."
 
 (defun qq-mode-line-icon ()
   "Return clickable QQ label for the mode line."
-  (propertize "QQ"
-              'face 'mode-line-emphasis
-              'local-map (make-mode-line-mouse-map
-                          'mouse-1 #'qq-mode-line-open-root)
-              'mouse-face 'mode-line-highlight
-              'help-echo "Open QQ"))
+  (disco-mode-line-indicator
+   "QQ" :face 'mode-line-emphasis
+   :command #'qq-mode-line-open-root :help-echo "Open QQ"))
 
 (defun qq-mode-line-unread-unmuted ()
   "Return mode-line text for unmuted unread messages."
   (let ((count (car (qq-mode-line--counts))))
     (unless (zerop count)
-      (concat
-       " "
-       (propertize (number-to-string count)
-                   'face 'qq-mode-line-unread
-                   'local-map (make-mode-line-mouse-map
-                               'mouse-1 #'qq-mode-line-open-unread)
-                   'mouse-face 'mode-line-highlight
-                   'help-echo "Open unread QQ chats")))))
+      (disco-mode-line-indicator
+       (number-to-string count) :prefix " " :face 'qq-mode-line-unread
+       :command #'qq-mode-line-open-unread
+       :help-echo "Open unread QQ chats"))))
 
 (defun qq-mode-line-mentions ()
   "Return mode-line text for sessions with unread native mentions."
   (let ((count (cdr (qq-mode-line--counts))))
     (unless (zerop count)
-      (concat
-       " "
-       (propertize (format "@%d" count)
-                   'face 'qq-mode-line-mention
-                   'local-map (make-mode-line-mouse-map
-                               'mouse-1 #'qq-mode-line-open-mention)
-                   'mouse-face 'mode-line-highlight
-                   'help-echo "Open QQ chats with unread mentions")))))
+      (disco-mode-line-indicator
+       (format "@%d" count) :prefix " " :face 'qq-mode-line-mention
+       :command #'qq-mode-line-open-mention
+       :help-echo "Open QQ chats with unread mentions"))))
 
 (defun qq-mode-line-update (&rest _ignored)
   "Refresh the cached QQ mode-line status."
   (when qq-mode-line-mode
-    (setq qq-mode-line-string
-          (format-mode-line qq-mode-line-string-format))
-    (force-mode-line-update t)))
+    (disco-mode-line-update-cache
+     'qq-mode-line-string qq-mode-line-string-format)))
 
 ;;;###autoload
 (define-minor-mode qq-mode-line-mode
@@ -109,14 +98,11 @@ sessions because native QQ mentions are priority activity."
   :group 'qq-modes
   (if qq-mode-line-mode
       (progn
-        (unless (member 'qq-mode-line-format mode-line-misc-info)
-          (setq mode-line-misc-info
-                (append mode-line-misc-info '(qq-mode-line-format))))
+        (disco-mode-line-install 'qq-mode-line-format)
         (add-hook 'qq-state-change-hook #'qq-mode-line-update)
         (qq-mode-line-update))
-    (setq mode-line-misc-info
-          (delete 'qq-mode-line-format mode-line-misc-info)
-          qq-mode-line-string "")
+    (disco-mode-line-uninstall 'qq-mode-line-format)
+    (setq qq-mode-line-string "")
     (remove-hook 'qq-state-change-hook #'qq-mode-line-update)
     (force-mode-line-update t)))
 
