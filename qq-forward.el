@@ -20,11 +20,15 @@
 (require 'qq-chat)
 (require 'qq-media)
 (require 'qq-state)
+(require 'qq-runtime)
+(require 'appkit-core)
+(require 'appkit-invalidation)
+(require 'appkit-chat-timeline)
 (require 'appkit-ui)
-(require 'appkit-position)
 
 (declare-function qq-api-get-forward
                   "qq-api" (source callback &optional errback))
+(declare-function qq-api-cancel-request "qq-api" (request-token))
 (declare-function qq-api--exact-object-keys-p
                   "qq-api" (object required &optional optional))
 (declare-function qq-api--signal-schema-error
@@ -42,7 +46,17 @@
                   "qq-api" (value &optional context protocol-p))
 (declare-function qq-chat--insert-message-body
                   "qq-chat" (message prefix-state properties))
-(declare-function qq-chat--message-reply-id "qq-chat" (message))
+(declare-function qq-chat--message-media-cache-keys "qq-chat" (message))
+(declare-function qq-chat--message-avatar-prefixes "qq-chat" (message))
+(declare-function qq-chat--message-title-face "qq-chat" (message))
+(declare-function qq-chat--insert-message-sender "qq-chat" (message face))
+(declare-function qq-chat--insert-right-aligned-time
+                  "qq-chat" (time &optional left-prefix-width overflow-newline-p))
+(declare-function qq-chat--format-time "qq-chat" (timestamp))
+(declare-function qq-chat--status-suffix "qq-chat" (message))
+(declare-function qq-chat--render-window "qq-chat" ())
+(declare-function qq-chat--compute-fill-column "qq-chat" (&optional window))
+(declare-function qq-chat--refresh-timeline-layout "qq-chat" ())
 
 (defvar-local qq-forward--buffer-key nil
   "Explicit remote reference or local inline identity for this viewer.")
@@ -56,9 +70,6 @@
 (defvar-local qq-forward--source nil
   "Validated fork-native remote source for this viewer, or nil inline.")
 
-(defvar-local qq-forward--raw-messages nil
-  "Raw fork-native snapshots currently displayed by this forward viewer.")
-
 (defvar-local qq-forward--messages nil
   "Viewer-local normalized messages rendered in the current buffer.")
 
@@ -71,8 +82,11 @@
 (defvar-local qq-forward--error nil
   "Last loading error string for this forward viewer, or nil.")
 
-(defvar-local qq-forward--generation 0
-  "Monotonic request/render generation for this forward viewer.")
+(defvar-local qq-forward--request nil
+  "Active native forward request token for this viewer.")
+
+(defvar-local qq-forward--request-owner nil
+  "Owner object identifying the active native forward request.")
 
 (defvar-local qq-forward--inline-content nil
   "Native inline snapshot array supplied by the parent forward segment.")
@@ -83,11 +97,8 @@
 This separate flag distinguishes an explicit empty inline message array from
 a remote reference that must be fetched.")
 
-(defvar-local qq-forward--media-indexes-by-key nil
-  "Hash table mapping media cache keys to lists of entry indexes.
-
-Rebuilt on full `qq-forward--render'.  Media cache ticks use this to redisplay
-only the affected entries (telega-msg-redisplay / qq-chat media-anchor style).")
+(defconst qq-forward--status-row-key :qq-forward-status
+  "Stable key for the synthetic loading, error, or empty timeline row.")
 
 (defun qq-forward--present-string (value)
   "Return VALUE when it is a non-empty string, else nil."
@@ -452,52 +463,15 @@ the fork-native forward action using an explicit locator-qualified reference."
   "Return forward viewer buffer name for display-only NAME-KEY."
   (format "*qq-forward:%s*" name-key))
 
-(defun qq-forward--buffer-for-key (buffer-key)
-  "Return live forward viewer whose canonical identity is BUFFER-KEY."
-  (cl-find-if
-   (lambda (buffer)
-     (with-current-buffer buffer
-       (and (derived-mode-p 'qq-forward-mode)
-            (equal qq-forward--buffer-key buffer-key))))
-   (buffer-list)))
+(defun qq-forward--view-id (buffer-key)
+  "Return the exact appkit view identity for canonical BUFFER-KEY."
+  (list 'forward buffer-key))
 
-(defun qq-forward--format-time (timestamp)
-  "Return display time for integer TIMESTAMP, or an empty string."
-  (if (and (integerp timestamp) (> timestamp 0))
-      (format-time-string "%Y-%m-%d %H:%M:%S"
-                          (seconds-to-time timestamp))
-    ""))
-
-(defun qq-forward--entry-properties (message index)
-  "Return text properties for normalized MESSAGE at INDEX."
+(defun qq-forward--entry-properties (message)
+  "Return text properties for normalized MESSAGE."
   (list 'qq-forward-message message
-        'qq-forward-entry-index index
-        'rear-nonsticky '(qq-forward-message qq-forward-entry-index)))
-
-(defun qq-forward--insert-message-body (message prefix-state properties)
-  "Insert viewer MESSAGE body while preserving nested forward subtrees."
-  (let ((ordinary nil))
-    (cl-labels
-        ((flush-ordinary
-          ()
-          (when ordinary
-            (let ((body-message (copy-tree message)))
-              (setf (alist-get 'segments body-message)
-                    (nreverse ordinary))
-              (qq-chat--insert-message-body
-               body-message prefix-state properties))
-            (setq ordinary nil))))
-      (dolist (segment (alist-get 'segments message))
-        (cond
-         ((qq-forward-segment-p segment)
-          (flush-ordinary)
-          (qq-forward-insert-segment
-           segment prefix-state properties))
-         (t
-          (push segment ordinary))))
-      (flush-ordinary)
-      (when (null (alist-get 'segments message))
-        (qq-chat--insert-message-body message prefix-state properties)))))
+        'qq-forward-entry-id (alist-get 'id message)
+        'rear-nonsticky '(qq-forward-message qq-forward-entry-id)))
 
 (defun qq-forward--message-reply-target (message)
   "Return native reply target cons from normalized MESSAGE, or nil."
@@ -519,35 +493,46 @@ the fork-native forward action using an explicit locator-qualified reference."
                qq-forward--messages))
     ('unresolved nil)))
 
-(defun qq-forward--insert-reply-preview-line
-    (target prefix-state properties)
-  "Insert viewer-local reply preview for native TARGET.
+(defun qq-forward--reply-view-model (message)
+  "Return a stable viewer-local reply presentation model for MESSAGE.
 
-The target is resolved only inside `qq-forward--messages'; no transient
-forwarded message is written to or looked up in `qq-state'."
-  (let* ((target-id (cdr target))
-         (source (qq-forward--message-by-target target))
-         (sender (and source
-                      (qq-forward--present-string
-                       (alist-get 'sender-name source))))
-         (preview (and source
-                       (string-trim
-                        (or (alist-get 'preview source)
-                            (qq-state-message-preview source)
-                            ""))))
-         (body (cond
-                ((and sender preview (not (string-empty-p preview)))
-                 (format "%s: %s" sender
-                         (truncate-string-to-width preview 56 nil nil t)))
-                ((and preview (not (string-empty-p preview)))
-                 (truncate-string-to-width preview 64 nil nil t))
-                ((and (eq (car target) 'entry) target-id)
-                 (format "entry %s" target-id))
-                (target-id (format "unresolved message %s" target-id))
-                (t "unresolved reply")))
-         (target-index (and source
-                            (cl-position source qq-forward--messages
-                                         :test #'eq)))
+The model snapshots the target sender and preview into the projected row
+context.  A target-content change therefore changes the reply row context and
+causes appkit to redraw that row without a global message-state dependency."
+  (when-let* ((target (qq-forward--message-reply-target message)))
+    (let* ((target-id (cdr target))
+           (source (qq-forward--message-by-target target))
+           (sender (and source
+                        (qq-forward--present-string
+                         (alist-get 'sender-name source))))
+           (preview (and source
+                         (string-trim
+                          (or (alist-get 'preview source)
+                              (qq-state-message-preview source)
+                              ""))))
+           (body (cond
+                  ((and sender preview (not (string-empty-p preview)))
+                   (format "%s: %s" sender
+                           (truncate-string-to-width preview 56 nil nil t)))
+                  ((and preview (not (string-empty-p preview)))
+                   (truncate-string-to-width preview 64 nil nil t))
+                  ((and (eq (car target) 'entry) target-id)
+                   (format "entry %s" target-id))
+                  (target-id (format "unresolved message %s" target-id))
+                  (t "unresolved reply"))))
+      (list :target-kind (car target)
+            :target-id target-id
+            :jump-entry-id (and source
+                                (eq (car target) 'entry)
+                                (alist-get 'id source))
+            :body body))))
+
+(defun qq-forward--insert-reply-preview-line
+    (view-model prefix-state properties)
+  "Insert reply preview VIEW-MODEL using PREFIX-STATE and PROPERTIES."
+  (let* ((target-id (plist-get view-model :target-id))
+         (jump-entry-id (plist-get view-model :jump-entry-id))
+         (body (plist-get view-model :body))
          (start (point)))
     (insert (format "↪ %s\n" body))
     (let ((reply-properties
@@ -555,10 +540,10 @@ forwarded message is written to or looked up in `qq-state'."
                    (list 'face 'qq-msg-inline-reply
                          'qq-forward-reply-id
                          target-id)
-                   (when target-index
+                   (when jump-entry-id
                      (let ((action
                             (lambda ()
-                              (qq-forward--goto-entry target-index)))
+                              (qq-forward--goto-entry-id jump-entry-id)))
                            (map (make-sparse-keymap)))
                        (set-keymap-parent map button-map)
                        (define-key map (kbd "RET")
@@ -576,209 +561,199 @@ forwarded message is written to or looked up in `qq-state'."
       (add-text-properties start (point) reply-properties))
     (appkit-ui-apply-line-prefix start (point) prefix-state)))
 
-(defun qq-forward--insert-message (message index)
-  "Insert normalized forward MESSAGE numbered INDEX.
+(defun qq-forward--insert-message (message context)
+  "Insert one normalized forward MESSAGE using projected CONTEXT.
 
-Header matches the official forward list and qq-chat: avatar (when the
-sender has a user id) + name + time.  Avatar image updates redisplay via
-the existing media-key index (`avatar:USER-ID')."
+The heading and two-line avatar geometry are the same primitives used by
+`qq-chat--render-message'."
   (let* ((start (point))
-         (properties (qq-forward--entry-properties message index))
-         (sender-id (alist-get 'sender-id message))
-         (sender (or (qq-forward--present-string
-                      (alist-get 'sender-name message))
-                     "unknown"))
-         (time (qq-forward--format-time (alist-get 'time message)))
-         (prefix-state (appkit-ui-make-prefix-state "  " "  ")))
+         (properties (qq-forward--entry-properties message))
+         (title-face (qq-chat--message-title-face message))
+         (avatar-prefixes (qq-chat--message-avatar-prefixes message))
+         (header-prefix (or (plist-get avatar-prefixes :header) ""))
+         (body-first-prefix
+          (or (plist-get avatar-prefixes :first-body) "  "))
+         (body-rest-prefix
+          (or (plist-get avatar-prefixes :rest-body) "  "))
+         (prefix-state
+          (appkit-ui-make-prefix-state body-first-prefix body-rest-prefix)))
     (let ((header-start (point)))
-      ;; Same gate as qq-chat: any non-nil sender-id (string or number).
-      ;; Anonymous / virtual senders keep sender-id nil and skip the glyph.
-      (when sender-id
-        (let ((avatar-start (point)))
-          (insert (qq-media-avatar-display-string sender-id) " ")
-          (add-text-properties
-           avatar-start (point)
-           '(mouse-face highlight
-             help-echo "Open sender avatar"))))
-      (insert sender)
-      (unless (string-empty-p time)
-        (insert "  ")
-        (let ((time-start (point)))
-          (insert time)
-          (add-text-properties time-start (point) '(face shadow))))
+      (qq-chat--insert-message-sender message title-face)
+      (insert (qq-chat--status-suffix message))
+      (qq-chat--insert-right-aligned-time
+       (qq-chat--format-time (alist-get 'time message))
+       (string-width header-prefix)
+       t)
       (insert "\n")
+      (appkit-ui-apply-line-prefix
+       header-start (point)
+       (appkit-ui-make-prefix-state header-prefix body-rest-prefix))
       (appkit-ui-append-face header-start (point) 'qq-msg-heading)
       (add-text-properties header-start (point) properties))
-    (when-let* ((target (qq-forward--message-reply-target message)))
+    (when-let* ((reply-view-model (plist-get context :reply-view-model)))
       (qq-forward--insert-reply-preview-line
-       target prefix-state properties))
-    (qq-forward--insert-message-body message prefix-state properties)
+       reply-view-model prefix-state properties))
+    (qq-chat--insert-message-body message prefix-state properties)
     (insert "\n")
     (add-text-properties start (point) properties)))
 
-(defun qq-forward--entry-positions ()
-  "Return an alist mapping rendered entry indexes to buffer positions."
-  (let ((position (point-min))
-        (limit (point-max))
-        (last-index :none)
-        positions)
-    (while (< position limit)
-      (let ((index (get-text-property position 'qq-forward-entry-index)))
-        (when (and (integerp index) (not (equal index last-index)))
-          (push (cons index position) positions))
-        (setq last-index index)
-        (setq position
-              (or (next-single-property-change
-                   position 'qq-forward-entry-index nil limit)
-                  limit))))
-    (nreverse positions)))
-
-(defun qq-forward--goto-entry (index)
-  "Move point to rendered forward entry INDEX and return non-nil on success."
-  (when-let* ((position (alist-get index (qq-forward--entry-positions))))
+(defun qq-forward--goto-entry-id (entry-id)
+  "Move point to the row keyed by native ENTRY-ID."
+  (when-let* ((position (appkit-chat-timeline-key-position entry-id)))
     (goto-char position)
     t))
 
-(defun qq-forward--current-entry-index ()
-  "Return entry index at point, accounting for point at buffer end."
-  (or (get-text-property (point) 'qq-forward-entry-index)
-      (and (> (point) (point-min))
-           (get-text-property (1- (point)) 'qq-forward-entry-index))))
+(defun qq-forward--message-dependency-keys (message)
+  "Return appkit resource dependencies for normalized MESSAGE."
+  (delete-dups
+   (mapcar (lambda (media-key) (list :media media-key))
+           (qq-chat--message-media-cache-keys message))))
 
-(defun qq-forward--mutate-preserving-view (mutator &optional after-restore)
-  "Run MUTATOR while preserving entry-relative point via appkit-position.
+(defun qq-forward--message-render-context (_previous message)
+  "Return stable render context for projected MESSAGE."
+  (let ((reply-view-model (qq-forward--reply-view-model message)))
+    (and reply-view-model
+         (list :reply-view-model (copy-tree reply-view-model)))))
 
-Uses the same semantic-position path as qq-chat, with
-`qq-forward-entry-index' as the semantic anchor.  Do not reimplement
-telega-save-cursor here."
-  (appkit-position-render-preserving
-   mutator
-   :anchor-property 'qq-forward-entry-index
-   :preserve-window-start t
-   :after-restore after-restore))
+(defun qq-forward--status-row (kind text)
+  "Return one synthetic status row of KIND displaying TEXT."
+  (appkit-chat-timeline-row-create
+   :key qq-forward--status-row-key
+   :payload (list :status kind :text text)
+   :context nil
+   :dependencies nil))
 
-(defun qq-forward--rebuild-media-index ()
-  "Rebuild media-key -> entry-index table for the current forward viewer."
-  (unless (hash-table-p qq-forward--media-indexes-by-key)
-    (setq qq-forward--media-indexes-by-key (make-hash-table :test #'equal)))
-  (clrhash qq-forward--media-indexes-by-key)
-  (cl-loop for message in qq-forward--messages
-           for index from 0
-           do (dolist (key (qq-chat--message-media-cache-keys message))
-                (puthash key
-                         (cons index
-                               (gethash key qq-forward--media-indexes-by-key))
-                         qq-forward--media-indexes-by-key))))
-
-(defun qq-forward--indexes-for-media-key (media-key)
-  "Return entry indexes affected by MEDIA-KEY in the current viewer."
-  (when (and (stringp media-key)
-             (hash-table-p qq-forward--media-indexes-by-key))
-    (delete-dups
-     (copy-sequence (gethash media-key qq-forward--media-indexes-by-key)))))
-
-(defun qq-forward--entry-bounds (index)
-  "Return (START . END) buffer bounds for rendered entry INDEX, or nil."
-  (let* ((positions (qq-forward--entry-positions))
-         (start (alist-get index positions)))
-    (when start
-      (let ((end
-             (or (cl-loop for i from (1+ index)
-                          below (1+ (length qq-forward--messages))
-                          for pos = (alist-get i positions)
-                          when pos return pos)
-                 (point-max))))
-        (cons start end)))))
-
-(defun qq-forward--redisplay-entry (index)
-  "Re-insert a single entry INDEX in place.
-
-This is the forward-viewer analogue of `telega-msg-redisplay' /
-`qq-chat--redisplay-node': mutate one message region, never erase the whole
-buffer."
-  (when-let* ((message (nth index qq-forward--messages))
-              (bounds (qq-forward--entry-bounds index)))
-    (let ((inhibit-read-only t)
-          (start (car bounds))
-          (end (cdr bounds)))
-      (goto-char start)
-      (delete-region start end)
-      (qq-forward--insert-message message index)
-      t)))
-
-(defun qq-forward--redisplay-entries (indexes)
-  "Redisplay entry INDEXES without a full buffer erase.
-
-High indexes are processed first so earlier entry bounds remain valid while
-regions are replaced.  Point/window are restored through appkit-position.
-After a real mutation, force-window-update like telega media
-callbacks."
-  (let* ((indexes (sort (delete-dups (delq nil (copy-sequence indexes))) #'<))
-         changed)
-    (when indexes
-      (qq-forward--mutate-preserving-view
-       (lambda ()
-         (let ((inhibit-read-only t))
-           (save-excursion
-             (dolist (index (reverse indexes))
-               (when (qq-forward--redisplay-entry index)
-                 (setq changed t))))))
-       (lambda ()
-         (when changed
-           (force-window-update (current-buffer)))))
-      changed)))
-
-(defun qq-forward--render-body ()
-  "Erase and redraw the current forward viewer from buffer-local state.
-
-Caller is responsible for view preservation via
-`qq-forward--mutate-preserving-view'."
-  (let ((inhibit-read-only t))
-    (erase-buffer)
-    (insert (propertize "Chat History\n" 'face 'bold))
-    (insert (propertize
-             (format "%s\n\n"
-                     (pcase qq-forward--lookup-kind
-                       ('message
-                        (format "message_id: %s" qq-forward--lookup-id))
-                       ('resource
-                        (format "resource_id: %s" qq-forward--lookup-id))
-                       ('context
-                        qq-forward--lookup-id)
-                       (_ "inline content")))
-             'face 'shadow))
+(defun qq-forward--project-timeline ()
+  "Project accepted messages and transient status into appkit rows."
+  (let ((message-rows
+         (appkit-chat-timeline-project
+          qq-forward--messages
+          (lambda (message) (alist-get 'id message))
+          :context-function #'qq-forward--message-render-context
+          :dependencies-function #'qq-forward--message-dependency-keys)))
     (cond
+     (message-rows
+      (if qq-forward--error
+          (append message-rows
+                  (list (qq-forward--status-row
+                         'error
+                         (format "Unable to refresh chat history: %s"
+                                 qq-forward--error))))
+        message-rows))
      (qq-forward--loading
-      (insert (propertize "Loading chat history…\n" 'face 'shadow)))
+      (list (qq-forward--status-row 'loading "Loading chat history…")))
      (qq-forward--error
-      (insert (propertize (format "Unable to load chat history: %s\n"
-                                  qq-forward--error)
-                          'face 'error)))
-     ((null qq-forward--messages)
-      (insert (propertize "(empty chat history)\n" 'face 'shadow)))
+      (list (qq-forward--status-row
+             'error
+             (format "Unable to load chat history: %s" qq-forward--error))))
+     (qq-forward--loaded-p
+      (list (qq-forward--status-row 'empty "(empty chat history)")))
      (t
-      (cl-loop for message in qq-forward--messages
-               for index from 0
-               do (qq-forward--insert-message message index))))
-    (qq-forward--rebuild-media-index)))
+      (list (qq-forward--status-row 'loading "Loading chat history…"))))))
 
-(defun qq-forward--render ()
-  "Render the current `qq-forward-mode' buffer from buffer-local state.
+(defun qq-forward--header-text ()
+  "Return the static EWOC header for the current viewer."
+  (concat
+   (propertize "Chat History\n" 'face 'bold)
+   (propertize
+    (format "%s\n\n"
+            (pcase qq-forward--lookup-kind
+              ('message (format "message_id: %s" qq-forward--lookup-id))
+              ('resource (format "resource_id: %s" qq-forward--lookup-id))
+              ('context qq-forward--lookup-id)
+              (_ "inline content")))
+    'face 'shadow)))
 
-Full erase is reserved for initial load, refresh, and structural state
-changes.  Media cache ticks must use `qq-forward--redisplay-entries'
-instead — full rebuilds are what made C-n/C-p feel hard-snapped.
+(defun qq-forward--row-printer (row)
+  "Render exactly one projected forward timeline ROW."
+  (let ((key (appkit-chat-timeline-row-key row))
+        (payload (appkit-chat-timeline-row-payload row))
+        (context (appkit-chat-timeline-row-context row)))
+    (if (eq key qq-forward--status-row-key)
+        (let* ((start (point))
+               (kind (plist-get payload :status))
+               (face (if (eq kind 'error) 'error 'shadow)))
+          (insert (propertize (concat (plist-get payload :text) "\n")
+                              'face face))
+          (add-text-properties
+           start (point)
+           (list 'qq-forward-entry-id qq-forward--status-row-key
+                 'rear-nonsticky '(qq-forward-entry-id))))
+      (qq-forward--insert-message payload context))))
 
-View preservation goes through appkit-position, not a local fork."
-  (qq-forward--mutate-preserving-view #'qq-forward--render-body))
+(defun qq-forward--ensure-view ()
+  "Return the live appkit view owning the current forward buffer."
+  (unless qq-forward--buffer-key
+    (error "qq: forward buffer has no canonical identity"))
+  (let* ((app (qq-runtime-app))
+         (id (qq-forward--view-id qq-forward--buffer-key))
+         (current (appkit-current-view)))
+    (cond
+     ((and (appkit-view-live-p current)
+           (eq app (appkit-view-app current))
+           (equal id (appkit-view-id current)))
+      (setf (appkit-view-state current) qq-forward--buffer-key
+            (appkit-view-sync-function current)
+            #'qq-forward--sync-invalidations
+            (appkit-view-parts current) '(timeline))
+      current)
+     ((appkit-view-live-p current)
+      (error "qq: forward buffer belongs to a different appkit view"))
+     (t
+      (appkit-attach-view
+       :app app
+       :id id
+       :state qq-forward--buffer-key
+       :mode 'qq-forward-mode
+       :sync-function #'qq-forward--sync-invalidations
+       :parts '(timeline))))))
 
-(defun qq-forward--request-valid-p (buffer source generation)
-  "Return non-nil when async result still belongs to BUFFER and GENERATION."
+(defun qq-forward--ensure-timeline ()
+  "Ensure the current forward view owns one projected appkit timeline."
+  (qq-forward--ensure-view)
+  (appkit-chat-timeline-ensure
+   :printer #'qq-forward--row-printer
+   :anchor-property 'qq-forward-entry-id
+   :header (qq-forward--header-text)
+   :footer nil))
+
+(cl-defun qq-forward--sync-timeline (&key force-keys changed-resources)
+  "Synchronize projected forward rows through appkit."
+  (force-mode-line-update)
+  (qq-forward--ensure-timeline)
+  (appkit-chat-timeline-sync
+   (qq-forward--project-timeline)
+   :force-keys force-keys
+   :changed-resources changed-resources))
+
+(defun qq-forward--sync-invalidations (view invalidations)
+  "Consume coalesced appkit INVALIDATIONS for forward VIEW."
+  (let ((resources (appkit-invalidations-resource-keys invalidations))
+        (entries (appkit-invalidations-entry-keys invalidations)))
+    (when (appkit-view-live-p view)
+      (if (or resources entries)
+          (qq-forward--sync-timeline
+           :force-keys entries
+           :changed-resources resources)
+        (when (or (appkit-invalidations-structure-p invalidations)
+                  (appkit-invalidations-parts invalidations)
+                  (appkit-invalidations-position-p invalidations))
+          (qq-forward--sync-timeline))))))
+
+(defun qq-forward--request-current-p (buffer source owner)
+  "Return non-nil when OWNER still owns SOURCE in forward BUFFER."
   (and (buffer-live-p buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-forward-mode)
               (equal qq-forward--source source)
-              (= qq-forward--generation generation)))))
+              (eq qq-forward--request-owner owner)))))
+
+(defun qq-forward--cancel-request ()
+  "Cancel and forget the active native forward request."
+  (when qq-forward--request
+    (qq-api-cancel-request qq-forward--request))
+  (setq qq-forward--request nil
+        qq-forward--request-owner nil))
 
 (defun qq-forward--error-text (response reason)
   "Return readable viewer error from RESPONSE and REASON."
@@ -790,54 +765,69 @@ View preservation goes through appkit-position, not a local fork."
               "unknown error")))
 
 (defun qq-forward--load-remote ()
-  "Start a generation-guarded remote load for the current viewer."
+  "Start an owner-scoped remote load for the current viewer."
   (let* ((buffer (current-buffer))
          (source (copy-tree qq-forward--source))
-         (generation (cl-incf qq-forward--generation)))
+         (owner (list 'forward-request source)))
     (unless source
       (user-error "qq: this viewer has no remote forward reference"))
+    (qq-forward--cancel-request)
     (setq qq-forward--loading t
-          qq-forward--error nil)
-    (qq-forward--render)
+          qq-forward--error nil
+          qq-forward--request-owner owner)
+    (qq-forward--sync-timeline)
     (condition-case error-data
-        (qq-api-get-forward
-         source
-         (lambda (raw-messages)
-           (when (qq-forward--request-valid-p
-                  buffer source generation)
-             (with-current-buffer buffer
-               (let ((messages (qq-forward--normalize-messages raw-messages)))
-                 (setq qq-forward--raw-messages (copy-tree raw-messages)
-                       qq-forward--messages messages
-                       qq-forward--loaded-p t
-                       qq-forward--loading nil
-                       qq-forward--error nil)
-                 (qq-forward--render)))))
-         (lambda (response reason)
-           (when (qq-forward--request-valid-p
-                  buffer source generation)
-             (with-current-buffer buffer
-               (setq qq-forward--loading nil
-                     qq-forward--error
-                     (qq-forward--error-text response reason))
-               (qq-forward--render)))))
+        (let ((request
+                (qq-api-get-forward
+                 source
+                 (lambda (raw-messages)
+                   (when (qq-forward--request-current-p buffer source owner)
+                     (with-current-buffer buffer
+                       (setq qq-forward--request nil
+                             qq-forward--request-owner nil)
+                       (condition-case error-data
+                           (let ((messages
+                                  (qq-forward--normalize-messages
+                                   raw-messages)))
+                             (setq qq-forward--messages messages
+                                   qq-forward--loaded-p t
+                                   qq-forward--loading nil
+                                   qq-forward--error nil)
+                             (qq-forward--sync-timeline))
+                         (error
+                          (setq qq-forward--loading nil
+                                qq-forward--error
+                                (error-message-string error-data))
+                          (qq-forward--sync-timeline))))))
+                 (lambda (response reason)
+                   (when (qq-forward--request-current-p buffer source owner)
+                     (with-current-buffer buffer
+                       (setq qq-forward--loading nil
+                             qq-forward--error
+                             (qq-forward--error-text response reason)
+                             qq-forward--request nil
+                             qq-forward--request-owner nil)
+                       (qq-forward--sync-timeline)))))))
+          ;; A synchronous callback may already have released OWNER.
+          (when (eq qq-forward--request-owner owner)
+            (setq qq-forward--request request)))
       (error
-       (when (qq-forward--request-valid-p
-              buffer source generation)
+       (when (qq-forward--request-current-p buffer source owner)
          (setq qq-forward--loading nil
-               qq-forward--error (error-message-string error-data))
-         (qq-forward--render))))))
+               qq-forward--error (error-message-string error-data)
+               qq-forward--request nil
+               qq-forward--request-owner nil)
+         (qq-forward--sync-timeline))))))
 
 (defun qq-forward--load-inline ()
   "Render the authoritative inline subtree in the current viewer."
-  (cl-incf qq-forward--generation)
-  (setq qq-forward--raw-messages (copy-tree qq-forward--inline-content)
-        qq-forward--messages
+  (qq-forward--cancel-request)
+  (setq qq-forward--messages
         (qq-forward--normalize-messages qq-forward--inline-content)
         qq-forward--loaded-p t
         qq-forward--loading nil
         qq-forward--error nil)
-  (qq-forward--render))
+  (qq-forward--sync-timeline))
 
 (defun qq-forward-refresh ()
   "Refresh the current merged-forward viewer.
@@ -853,15 +843,17 @@ records issue a fresh `emacs_get_forward' request."
 
 (defun qq-forward--move-message (count)
   "Move COUNT entries in the current forward viewer."
-  (let* ((positions (qq-forward--entry-positions))
-         (total (length positions))
-         (current (qq-forward--current-entry-index))
-         (base (if (integerp current)
-                   current
+  (let* ((keys (delete qq-forward--status-row-key
+                       (appkit-chat-timeline-keys)))
+         (total (length keys))
+         (current (appkit-chat-timeline-key-at-point))
+         (current-index (cl-position current keys :test #'equal))
+         (base (if current-index
+                   current-index
                  (if (> count 0) -1 total)))
          (target (+ base count)))
     (if (and (>= target 0) (< target total))
-        (qq-forward--goto-entry target)
+        (qq-forward--goto-entry-id (nth target keys))
       (message "qq: no %s forwarded message"
                (if (> count 0) "next" "previous")))))
 
@@ -903,15 +895,49 @@ records issue a fresh `emacs_get_forward' request."
     map)
   "Keymap for `qq-forward-mode'.")
 
+(defun qq-forward--on-window-size-change (&optional _frame)
+  "Refresh shared chat row geometry after this forward window resizes."
+  (when (eq major-mode 'qq-forward-mode)
+    (when-let* ((window (qq-chat--render-window))
+                (next (qq-chat--compute-fill-column window)))
+      (when (and (> next 15)
+                 (not (equal next qq-chat--fill-column)))
+        (setq-local qq-chat--fill-column next
+                    fill-column next)
+        (qq-chat--refresh-timeline-layout)))))
+
+(defun qq-forward--on-text-scale-change ()
+  "Refresh shared chat row geometry after text scaling changes."
+  (when (eq major-mode 'qq-forward-mode)
+    (setq-local qq-chat--fill-column nil)
+    (when-let* ((window (qq-chat--render-window))
+                (next (qq-chat--compute-fill-column window)))
+      (setq-local qq-chat--fill-column next
+                  fill-column next))
+    (qq-chat--refresh-timeline-layout)))
+
 (define-derived-mode qq-forward-mode special-mode "QQ-Forward"
   "Major mode for one QQ merged-forward message tree."
-  (setq-local truncate-lines nil)
-  (setq-local qq-forward--media-indexes-by-key (make-hash-table :test #'equal))
+  (setq-local truncate-lines nil
+              line-spacing 0
+              qq-chat--fill-column nil)
+  (add-hook 'window-size-change-functions
+            #'qq-forward--on-window-size-change nil t)
+  (add-hook 'display-line-numbers-mode-hook
+            #'qq-forward--on-window-size-change nil t)
+  (add-hook 'text-scale-mode-hook #'qq-forward--on-text-scale-change nil t)
+  (add-hook 'kill-buffer-hook #'qq-forward--cancel-request nil t)
+  (add-hook 'change-major-mode-hook #'qq-forward--cancel-request nil t)
   (setq-local header-line-format
               '(:eval
-                (format " QQ Chat History · %s%s"
-                        (or qq-forward--lookup-id "inline")
-                        (if qq-forward--loading " · loading" "")))))
+                (format
+                 " QQ Chat History · %s%s"
+                 (or qq-forward--lookup-id "inline")
+                 (cond
+                  (qq-forward--loading " · loading")
+                  (qq-forward--error
+                   (format " · error: %s" qq-forward--error))
+                  (t ""))))))
 
 (defun qq-forward--open-buffer (source inline-p inline-content)
   "Open a viewer for native SOURCE or authoritative INLINE-CONTENT."
@@ -936,39 +962,46 @@ records issue a fresh `emacs_get_forward' request."
             (format "%s:%s:%x"
                     (car reference) (cdr reference)
                     (sxhash-equal buffer-key))))
-         (buffer
-          (or (qq-forward--buffer-for-key buffer-key)
-              (generate-new-buffer (qq-forward--buffer-name name-key)))))
+         (app (qq-runtime-app))
+         (view-id (qq-forward--view-id buffer-key))
+         (existing (appkit-view-for-id app view-id))
+         (buffer (or (and existing (appkit-view-buffer existing))
+                     (generate-new-buffer (qq-forward--buffer-name name-key)))))
     (with-current-buffer buffer
-      (unless (derived-mode-p 'qq-forward-mode)
-        (qq-forward-mode))
-      (let ((changed (not (equal qq-forward--buffer-key buffer-key))))
+      (unless existing
+        (qq-forward-mode)
         (setq qq-forward--buffer-key buffer-key
               qq-forward--source (copy-tree source)
               qq-forward--lookup-id lookup-id
-              qq-forward--lookup-kind lookup-kind)
-        (when changed
-          (setq qq-forward--raw-messages nil
-                qq-forward--messages nil
-                qq-forward--loading nil
-                qq-forward--loaded-p nil
-                qq-forward--error nil
-                qq-forward--generation 0))
-        (if inline-p
-            (progn
-              (setq qq-forward--inline-p t
-                    qq-forward--inline-content (copy-tree inline-content))
-              (qq-forward--load-inline))
-          (let ((was-inline qq-forward--inline-p))
-            (setq qq-forward--inline-p nil
-                  qq-forward--inline-content nil)
-            (when was-inline
-              (setq qq-forward--loaded-p nil)))
-          (when (and (not qq-forward--loaded-p)
-                     (not qq-forward--loading)
-                     (null qq-forward--error))
-            (qq-forward--load-remote)))))
+              qq-forward--lookup-kind lookup-kind
+              qq-forward--messages nil
+              qq-forward--loading nil
+              qq-forward--loaded-p nil
+              qq-forward--error nil
+              qq-forward--request nil
+              qq-forward--request-owner nil
+              qq-forward--inline-p inline-p
+              qq-forward--inline-content (and inline-p
+                                              (copy-tree inline-content)))
+        (appkit-attach-view
+         :app app
+         :id view-id
+         :state buffer-key
+         :mode 'qq-forward-mode
+         :sync-function #'qq-forward--sync-invalidations
+         :parts '(timeline)))
+      (unless (equal qq-forward--buffer-key buffer-key)
+        (error "qq: appkit returned a mismatched forward view"))
+      (if inline-p
+          (unless qq-forward--loaded-p
+            (qq-forward--load-inline))
+        (when (and (not qq-forward--loaded-p)
+                   (not qq-forward--loading)
+                   (null qq-forward--error))
+          (qq-forward--load-remote))))
     (pop-to-buffer buffer)
+    (with-current-buffer buffer
+      (qq-forward--on-window-size-change))
     buffer))
 
 ;;;###autoload
@@ -1074,20 +1107,15 @@ records issue a fresh `emacs_get_forward' request."
     (point)))
 
 (defun qq-forward--handle-media-cache-update (&optional media-key)
-  "Refresh affected forward entries after MEDIA-KEY cache updates.
-
-Follow telega/qq-chat: never full-erase on media ticks.  Only redisplay
-entries that depend on MEDIA-KEY.  Unrelated keys and foreign cache events
-are no-ops so open forward viewers stop thrashing while the user navigates."
+  "Queue MEDIA-KEY invalidation for every live forward view."
   (when (stringp media-key)
     (dolist (buffer (buffer-list))
-      (when (buffer-live-p buffer)
-        (with-current-buffer buffer
-          (when (and (derived-mode-p 'qq-forward-mode)
-                     (not qq-forward--loading)
-                     qq-forward--messages)
-            (when-let* ((indexes (qq-forward--indexes-for-media-key media-key)))
-              (qq-forward--redisplay-entries indexes))))))))
+      (with-current-buffer buffer
+        (when (and (derived-mode-p 'qq-forward-mode)
+                   (appkit-view-live-p (appkit-current-view)))
+          (let ((view (appkit-current-view)))
+            (appkit-invalidate view :resource (list :media media-key))
+            (appkit-schedule-sync view)))))))
 
 (add-hook 'qq-media-cache-update-hook #'qq-forward--handle-media-cache-update)
 

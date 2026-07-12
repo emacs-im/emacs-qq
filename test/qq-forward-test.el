@@ -75,18 +75,30 @@
     (should (eq (lookup-key qq-forward-mode-map (kbd "p")) #'qq-forward-previous-message))
     (should (eq (lookup-key qq-forward-mode-map (kbd "RET")) #'qq-forward-activate))))
 
-(ert-deftest qq-forward-header-omits-static-keybinding-cheat-sheet ()
-  (with-temp-buffer
-    (qq-forward-mode)
-    (setq qq-forward--lookup-kind 'message
-          qq-forward--lookup-id "message-1"
-          qq-forward--messages nil
-          qq-forward--loading nil
-          qq-forward--error nil)
-    (qq-forward--render-body)
-    (should (string-match-p "message_id: message-1" (buffer-string)))
-    (should-not (string-match-p "n/p: navigate" (buffer-string)))
-    (should-not (string-match-p "RET: open" (buffer-string)))))
+(ert-deftest qq-forward-header-uses-a-live-timeline-only-view ()
+  (qq-forward-test--with-clean-viewers
+    (let ((source (qq-forward-test--message-source
+                   "9007199254742007001" "20001")))
+      (cl-letf (((symbol-function 'qq-api-get-forward)
+                 (lambda (_source callback &optional _errback)
+                   (funcall callback nil))))
+        (save-window-excursion
+          (let ((buffer (qq-forward-open source)))
+            (with-current-buffer buffer
+              (let ((view (appkit-current-view)))
+                (should (appkit-view-live-p view))
+                (should (equal (appkit-view-id view)
+                               (qq-forward--view-id
+                                (qq-forward--source-buffer-key source))))
+                (should (equal (appkit-view-parts view) '(timeline)))
+                (should-not (appkit-chatbuf-prompt-start-position))
+                (should-not (appkit-chatbuf-input-start-position)))
+              (should (string-match-p
+                       "message_id: 9007199254742007001"
+                                      (buffer-string)))
+              (should-not (string-match-p "n/p: navigate" (buffer-string)))
+              (should-not (string-match-p "RET: open"
+                                          (buffer-string))))))))))
 
 (ert-deftest qq-forward-recognizes-only-canonical-native-derived-segments ()
   (let* ((source (qq-forward-test--message-source
@@ -410,10 +422,17 @@ list are indistinguishable — both mean \"do not claim a count\"."
             (should-not (eq first second))
             (should-not (equal (buffer-name first) (buffer-name second)))
             (should (= requests 2))
-            (dolist (buffer (list first second))
-              (with-current-buffer buffer
-                (should qq-forward--loaded-p)
-                (should-not qq-forward--loading)))))))))
+            (cl-mapc
+             (lambda (buffer source)
+               (with-current-buffer buffer
+                 (should qq-forward--loaded-p)
+                 (should-not qq-forward--loading)
+                 (should
+                  (equal
+                   (appkit-view-id (appkit-current-view))
+                   (qq-forward--view-id
+                    (qq-forward--source-buffer-key source))))))
+             (list first second) (list source-a source-b))))))))
 
 (ert-deftest qq-forward-context-buffer-key-canonicalizes-object-order ()
   (qq-forward-test--with-clean-viewers
@@ -436,6 +455,11 @@ list are indistinguishable — both mean \"do not claim a count\"."
             (should (eq first second))
             (should (= requests 1))
             (with-current-buffer first
+              (should (eq (appkit-current-view)
+                          (appkit-view-for-id
+                           (qq-runtime-app)
+                           (qq-forward--view-id
+                            (qq-forward--source-buffer-key source)))))
               (should (equal qq-forward--source source))
               (should (equal qq-forward--buffer-key
                              (qq-forward--source-buffer-key source))))))))))
@@ -483,143 +507,324 @@ list are indistinguishable — both mean \"do not claim a count\"."
 
 (ert-deftest qq-forward-entry-header-includes-sender-avatar ()
   "Forward entries render user avatars like the official GUI / qq-chat."
-  (let* ((origin '((kind . "group") (group_id . "20001")))
-         (message
-          (qq-forward--normalized-message
-           nil
-           '(((type . "text") (data . ((text . "hello")))))
-           "1" "1" 1710000000
-           '("10001" "Alice" nil nil)
-           "live" origin))
-         (anon
-          (qq-forward--normalized-message
-           nil
-           '(((type . "text") (data . ((text . "ghost")))))
-           "2" "2" 1710000001
-           '(nil "anonymous" "anon" nil)
-           "live" origin))
-         avatar-calls)
-    (cl-letf (((symbol-function 'qq-media-avatar-display-string)
-               (lambda (user-id)
-                 (push user-id avatar-calls)
-                 (propertize "@" 'qq-test-avatar user-id))))
-      (with-temp-buffer
-        (qq-forward--insert-message message 0)
-        (qq-forward--insert-message anon 1)
-        (should (equal avatar-calls '("10001")))
-        (goto-char (point-min))
-        (should (get-text-property (point) 'qq-test-avatar))
-        (should (equal (get-text-property (point) 'qq-test-avatar) "10001"))
-        (should (string-match-p "Alice" (buffer-string)))
-        (should (string-match-p "anonymous" (buffer-string)))
-        ;; Anonymous entry has no avatar glyph from our stub.
-        (goto-char (point-min))
-        (search-forward "anonymous")
-        (let ((entry-start (car (qq-forward--entry-bounds 1))))
-          (should-not
-           (get-text-property entry-start 'qq-test-avatar)))))))
-
-(ert-deftest qq-forward-media-cache-update-redisplays-only-affected-entry ()
-  "Media ticks redisplay a single entry; other entries and header stay put."
   (qq-forward-test--with-clean-viewers
-    (let* ((origin '((kind . "group") (group_id . "20001")))
-           (sender-fields '("10001" "Alice" nil nil))
-           (media-key "preview:file-image:media-a.png")
-           (image-segment
-            '((type . "image")
-              (data . ((file . "media-a.png")
-                       (url . "https://example.test/a.png")))))
+    (let* ((messages
+            (list
+             (qq-forward-test--native-message "1" "hello")
+             (qq-forward-test--native-message
+              "2" "ghost"
+              :sender '((kind . "anonymous") (name . "anonymous")))))
+           avatar-calls)
+      (cl-letf (((symbol-function 'qq-media-avatar-display-string)
+                 (lambda (_user-id)
+                   (ert-fail "forward headings must use shared avatar slices")))
+                ((symbol-function 'qq-media-avatar-image)
+                 (lambda (user-id)
+                   (push user-id avatar-calls)
+                   nil))
+                ((symbol-function 'qq-chat--compute-fill-column)
+                 (lambda (&optional _window) 50)))
+        (save-window-excursion
+          (let ((buffer
+                 (qq-forward-open-segment
+                  (qq-forward-test--inline-segment messages))))
+            (with-current-buffer buffer
+              (should (equal (appkit-chat-timeline-keys) '("1" "2")))
+              (let ((first (appkit-chat-timeline-key-position "1"))
+                    (second (appkit-chat-timeline-key-position "2")))
+                (let ((first-prefix (get-text-property first 'line-prefix))
+                      (second-prefix (get-text-property second 'line-prefix)))
+                  (should (equal (substring-no-properties first-prefix 0 1)
+                                 "@"))
+                  (should (equal
+                           (get-text-property
+                            0 'qq-chat-avatar-sender-id first-prefix)
+                           "10001"))
+                  (should (equal (substring-no-properties second-prefix 0 1)
+                                 "@"))))
+              (should (equal avatar-calls '("10001")))
+              (should (string-match-p "Alice" (buffer-string)))
+              (should (string-match-p "anonymous"
+                                      (buffer-string)))
+              (goto-char (point-min))
+              (search-forward (qq-chat--format-time 1710000000))
+              (should (equal
+                       (get-text-property (1- (match-beginning 0)) 'display)
+                       `(space :align-to
+                               ,(- 50
+                                   (string-width
+                                    (qq-chat--format-time
+                                     1710000000)))))))))))))
+
+(ert-deftest qq-forward-timeline-keys-are-native-entry-ids ()
+  "Duplicate message_id metadata must never collapse forwarded entries."
+  (qq-forward-test--with-clean-viewers
+    (let* ((message-id "9007199254742007031")
            (messages
             (list
-             (qq-forward--normalized-message
-              nil
-              '(((type . "text") (data . ((text . "first-stable")))))
-              "1" "1" 1710000000 sender-fields "live" origin)
-             (qq-forward--normalized-message
-              nil (list image-segment)
-              "2" "2" 1710000001 sender-fields "live" origin)
-             (qq-forward--normalized-message
-              nil
-              '(((type . "text") (data . ((text . "third-stable")))))
-              "3" "3" 1710000002 sender-fields "live" origin))))
+             (qq-forward-test--native-message
+              "1.2" "first" :message-id message-id)
+             (qq-forward-test--native-message
+              "9" "second" :message-id message-id))))
+      (save-window-excursion
+        (let ((buffer
+               (qq-forward-open-segment
+                (qq-forward-test--inline-segment messages))))
+          (with-current-buffer buffer
+            (let ((view (appkit-current-view)))
+              (should (equal (appkit-view-parts view) '(timeline)))
+              (should (equal (appkit-chat-timeline-keys) '("1.2" "9")))
+              (should-not
+               (eq (appkit-chat-timeline-node "1.2")
+                   (appkit-chat-timeline-node "9")))
+              (should-not (appkit-chatbuf-prompt-start-position))
+              (should-not (appkit-chatbuf-input-start-position)))
+            (goto-char (point-min))
+            (qq-forward-next-message)
+            (should (equal (appkit-chat-timeline-key-at-point) "1.2"))
+            (qq-forward-next-message)
+            (should (equal (appkit-chat-timeline-key-at-point) "9"))
+            (qq-forward-previous-message)
+            (should (equal (appkit-chat-timeline-key-at-point)
+                           "1.2"))))))))
+
+(ert-deftest qq-forward-status-row-keeps-one-stable-timeline-node ()
+  (qq-forward-test--with-clean-viewers
+    (let ((source (qq-forward-test--message-source
+                   "9007199254742007040" "20001"))
+          success errback)
+      (cl-letf (((symbol-function 'qq-api-get-forward)
+                 (lambda (_source callback &optional error-callback)
+                   (setq success callback
+                         errback error-callback))))
+        (save-window-excursion
+          (let ((buffer (qq-forward-open source)))
+            (with-current-buffer buffer
+              (should (equal (appkit-chat-timeline-keys)
+                             (list qq-forward--status-row-key)))
+              (let ((status-node
+                     (appkit-chat-timeline-node qq-forward--status-row-key)))
+                (should (string-match-p "Loading chat history"
+                                        (buffer-string)))
+                (funcall success nil)
+                (should (eq status-node
+                            (appkit-chat-timeline-node
+                             qq-forward--status-row-key)))
+                (should (string-match-p "empty chat history"
+                                        (buffer-string)))
+                (qq-forward-refresh)
+                (should (eq status-node
+                            (appkit-chat-timeline-node
+                             qq-forward--status-row-key)))
+                (should (string-match-p "Loading chat history"
+                                        (buffer-string)))
+                (funcall errback nil "native failure")
+                (should (eq status-node
+                            (appkit-chat-timeline-node
+                             qq-forward--status-row-key)))
+                (should (string-match-p "native failure"
+                                        (buffer-string)))
+                (goto-char (point-min))
+                (let ((before (point)))
+                  (qq-forward-next-message)
+                  (should (= (point) before)))))))))))
+
+(ert-deftest qq-forward-refresh-keeps-accepted-rows-and-anchor ()
+  (qq-forward-test--with-clean-viewers
+    (let ((source (qq-forward-test--message-source
+                   "9007199254742007041" "20001"))
+          success errback)
+      (cl-letf (((symbol-function 'qq-api-get-forward)
+                 (lambda (_source callback &optional error-callback)
+                   (setq success callback
+                         errback error-callback))))
+        (save-window-excursion
+          (let ((buffer (qq-forward-open source)))
+            (funcall success
+                     (list (qq-forward-test--native-message "1" "a")
+                           (qq-forward-test--native-message "2" "b")))
+            (with-current-buffer buffer
+              (let* ((keys '("1" "2"))
+                     (nodes (mapcar #'appkit-chat-timeline-node keys)))
+                (goto-char (appkit-chat-timeline-key-position "2"))
+                (forward-char 2)
+                (let ((point-before (point)))
+                  (qq-forward-refresh)
+                  (should qq-forward--loading)
+                  (should (equal (appkit-chat-timeline-keys) keys))
+                  (should (cl-every
+                           #'identity
+                           (cl-mapcar
+                            #'eq nodes
+                            (mapcar #'appkit-chat-timeline-node keys))))
+                  (should (= (point) point-before))
+                  (should (equal (appkit-chat-timeline-key-at-point)
+                                 "2"))
+                  (funcall errback nil "refresh failure")
+                  (should-not qq-forward--loading)
+                  (should (equal (appkit-chat-timeline-keys)
+                                 (append keys
+                                         (list qq-forward--status-row-key))))
+                  (should (cl-every
+                           #'identity
+                           (cl-mapcar
+                            #'eq nodes
+                            (mapcar #'appkit-chat-timeline-node keys))))
+                  (should (= (point) point-before))
+                  (should (equal (appkit-chat-timeline-key-at-point)
+                                 "2")))))))))))
+
+(ert-deftest qq-forward-refresh-cancels-and-ignores-stale-request ()
+  (qq-forward-test--with-clean-viewers
+    (let ((source (qq-forward-test--message-source
+                   "9007199254742007043" "20001"))
+          callbacks canceled
+          (request-count 0))
+      (cl-letf (((symbol-function 'qq-api-get-forward)
+                 (lambda (_source callback &optional _errback)
+                   (push callback callbacks)
+                   (intern (format "request-%d" (cl-incf request-count)))))
+                ((symbol-function 'qq-api-cancel-request)
+                 (lambda (request)
+                   (push request canceled))))
+        (save-window-excursion
+          (let ((buffer (qq-forward-open source)))
+            (with-current-buffer buffer
+              (should (eq qq-forward--request 'request-1))
+              (qq-forward-refresh)
+              (should (equal canceled '(request-1)))
+              (should (eq qq-forward--request 'request-2))
+              ;; The callback owned by request-1 must not mutate request-2.
+              (funcall (cadr callbacks)
+                       (list (qq-forward-test--native-message "1" "stale")))
+              (should qq-forward--loading)
+              (should-not qq-forward--messages)
+              (should (eq qq-forward--request 'request-2))
+              (fundamental-mode)
+              (should (equal canceled '(request-2 request-1))))
+            (kill-buffer buffer)))))))
+
+(ert-deftest qq-forward-reply-context-updates-without-replacing-row ()
+  (qq-forward-test--with-clean-viewers
+    (let ((source (qq-forward-test--message-source
+                   "9007199254742007042" "20001"))
+          success)
+      (cl-labels
+          ((snapshot
+            (text)
+            (list
+             (qq-forward-test--native-message "1" text)
+             (qq-forward-test--native-message
+              "2" "answer"
+              :segments
+              '(((kind . "reply")
+                 (payload . ((target . ((kind . "entry")
+                                        (entry_id . "1"))))))
+                ((kind . "text") (payload . ((text . "answer")))))))))
+        (cl-letf (((symbol-function 'qq-api-get-forward)
+                   (lambda (_source callback &optional _errback)
+                     (setq success callback))))
+          (save-window-excursion
+            (let ((buffer (qq-forward-open source)))
+              (funcall success (snapshot "original"))
+              (with-current-buffer buffer
+                (let ((reply-node (appkit-chat-timeline-node "2")))
+                  (should (string-match-p "↪ Alice: original"
+                                          (buffer-string)))
+                  (qq-forward-refresh)
+                  (funcall success (snapshot "edited"))
+                  (should (eq reply-node
+                              (appkit-chat-timeline-node "2")))
+                  (should (string-match-p "↪ Alice: edited"
+                                          (buffer-string)))
+                  (should-not (string-match-p "↪ Alice: original"
+                                              (buffer-string)))
+                  (goto-char (appkit-chat-timeline-key-position "2"))
+                  (search-forward "↪")
+                  (goto-char (match-beginning 0))
+                  (should (button-at (point)))
+                  (push-button (point))
+                  (should (equal (appkit-chat-timeline-key-at-point)
+                                 "1")))))))))))
+
+(ert-deftest qq-forward-media-cache-update-redisplays-only-affected-entry ()
+  "Media invalidation redraws only its dependent keyed timeline row."
+  (qq-forward-test--with-clean-viewers
+    (let* ((media-key "preview:file-image:media-a.png")
+           (messages
+            (list
+             (qq-forward-test--native-message "1" "first-stable")
+             (qq-forward-test--native-message
+              "1.1" "image"
+              :segments
+              '(((kind . "image")
+                 (payload . ((file . "media-a.png")
+                             (url . "https://example.test/a.png"))))))
+             (qq-forward-test--native-message "2" "third-stable")))
+           (original-printer (symbol-function 'qq-forward--row-printer))
+           (fetching t)
+           printed-keys)
       (cl-letf (((symbol-function 'qq-media-segment-cache-keys)
                  (lambda (segment)
                    (when (equal (alist-get 'type segment) "image")
                      (list media-key))))
+                ((symbol-function 'qq-media-avatar-image)
+                 (lambda (_user-id) nil))
                 ((symbol-function 'qq-media-segment-preview-capable-p)
                  (lambda (_segment) t))
                 ((symbol-function 'qq-media-segment-preview-image)
                  (lambda (_segment) nil))
                 ((symbol-function 'qq-media-segment-preview-fetching-p)
-                 (lambda (_segment) t))
+                 (lambda (_segment) fetching))
                 ((symbol-function 'qq-media-segment-capabilities)
                  (lambda (_segment)
-                   (list :status "loading" :open nil :download nil
+                   (list :status (if fetching "loading" "unavailable")
+                         :open nil :download nil
                          :save nil :copy-url nil)))
-                ((symbol-function 'force-window-update)
-                 (lambda (&rest _) nil)))
-        (with-current-buffer (get-buffer-create "*qq-forward:test-media-partial*")
-          (qq-forward-mode)
-          (setq qq-forward--messages messages
-                qq-forward--loading nil
-                qq-forward--loaded-p t
-                qq-forward--error nil
-                qq-forward--lookup-kind 'resource
-                qq-forward--lookup-id "resource-test")
-          (let ((inhibit-read-only t))
-            (erase-buffer)
-            (insert (propertize "Chat History\n" 'face 'bold))
-            (cl-loop for message in qq-forward--messages
-                     for index from 0
-                     do (qq-forward--insert-message message index))
-            (qq-forward--rebuild-media-index))
-          (should (string-match-p "first-stable" (buffer-string)))
-          (should (string-match-p "third-stable" (buffer-string)))
-          (should (string-match-p "loading preview" (buffer-string)))
-          (should (equal (qq-forward--indexes-for-media-key media-key) '(1)))
-          (goto-char (point-min))
-          (search-forward "third-stable")
-          (let ((header-before
-                 (buffer-substring-no-properties
-                  (point-min)
-                  (or (next-single-property-change
-                       (point-min) 'qq-forward-entry-index)
-                      (point-max))))
-                (first-before
-                 (buffer-substring-no-properties
-                  (car (qq-forward--entry-bounds 0))
-                  (cdr (qq-forward--entry-bounds 0))))
-                (third-before
-                 (buffer-substring-no-properties
-                  (car (qq-forward--entry-bounds 2))
-                  (cdr (qq-forward--entry-bounds 2)))))
-            (cl-letf (((symbol-function 'qq-media-segment-preview-fetching-p)
-                       (lambda (_segment) nil)))
-              (qq-forward--handle-media-cache-update media-key)
-              (qq-forward--handle-media-cache-update "preview:other:x")
-              (qq-forward--handle-media-cache-update nil))
-            (should (equal
-                     (buffer-substring-no-properties
-                      (point-min)
-                      (or (next-single-property-change
-                           (point-min) 'qq-forward-entry-index)
-                          (point-max)))
-                     header-before))
-            (should (equal
-                     (buffer-substring-no-properties
-                      (car (qq-forward--entry-bounds 0))
-                      (cdr (qq-forward--entry-bounds 0)))
-                     first-before))
-            (should (equal
-                     (buffer-substring-no-properties
-                      (car (qq-forward--entry-bounds 2))
-                      (cdr (qq-forward--entry-bounds 2)))
-                     third-before))
-            (should (equal (qq-forward--current-entry-index) 2))
-            (should (string-match-p "third-stable"
-                                    (buffer-substring
-                                     (max (point-min) (- (point) 40))
-                                     (min (point-max) (+ (point) 40)))))))))))
+                ((symbol-function 'qq-forward--row-printer)
+                 (lambda (row)
+                   (push (appkit-chat-timeline-row-key row) printed-keys)
+                   (funcall original-printer row))))
+        (save-window-excursion
+          (let ((buffer
+                 (qq-forward-open-segment
+                  (qq-forward-test--inline-segment messages))))
+            (with-current-buffer buffer
+              (let* ((view (appkit-current-view))
+                     (keys '("1" "1.1" "2"))
+                     (nodes (mapcar #'appkit-chat-timeline-node keys))
+                     (first-position
+                      (appkit-chat-timeline-key-position "1"))
+                     (header-before
+                      (buffer-substring-no-properties
+                       (point-min) first-position)))
+                (should (equal (appkit-chat-timeline-keys) keys))
+                (goto-char (appkit-chat-timeline-key-position "2"))
+                (forward-char 3)
+                (let ((column-before (current-column)))
+                  (setq printed-keys nil
+                        fetching nil)
+                  (qq-forward--handle-media-cache-update media-key)
+                  (appkit-sync-invalidations view)
+                  (should (equal printed-keys '("1.1")))
+                  (should (equal (appkit-chat-timeline-key-at-point)
+                                 "2"))
+                  (should (= (current-column) column-before)))
+                (should
+                 (cl-every
+                  #'identity
+                  (cl-mapcar #'eq nodes
+                             (mapcar #'appkit-chat-timeline-node keys))))
+                (should (equal
+                         (buffer-substring-no-properties
+                          (point-min)
+                          (appkit-chat-timeline-key-position "1"))
+                         header-before))
+                (setq printed-keys nil)
+                (qq-forward--handle-media-cache-update "preview:other:x")
+                (appkit-sync-invalidations view)
+                (qq-forward--handle-media-cache-update nil)
+                (should-not printed-keys)))))))))
 
 (provide 'qq-forward-test)
 
