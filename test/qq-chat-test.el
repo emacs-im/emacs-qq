@@ -1011,6 +1011,52 @@
          (qq-chat-poke-sender))
        (should (equal call '("private:10002" "90001")))))))
 
+(ert-deftest qq-chat-recalls-pokes-with-their-closed-native-reference ()
+  (dolist (reference
+           '(((message_id . "9007199254741004001")
+              (peer . ((chat_type . 2)
+                       (peer_uid . "20001")
+                       (guild_id . ""))))
+             ((message_id . "9007199254741004002")
+              (peer . ((chat_type . 1)
+                       (peer_uid . "u_private-native-peer")
+                       (guild_id . ""))))))
+    (let ((message
+           `((server-id . ,(alist-get 'message_id reference))
+             (self-p . t)
+             (poke-recall-reference . ,reference)
+             (segments . (((type . "poke"))))))
+          recalled-reference
+          ordinary-delete-called)
+      (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+                ((symbol-function 'qq-api-recall-poke)
+                 (lambda (value &rest _)
+                   (setq recalled-reference value)))
+                ((symbol-function 'qq-api-delete-message)
+                 (lambda (&rest _)
+                   (setq ordinary-delete-called t))))
+        (qq-chat--delete-message-internal message))
+      (should (equal recalled-reference reference))
+      (should-not ordinary-delete-called))))
+
+(ert-deftest qq-chat-refuses-an-unaddressable-poke-before-confirmation ()
+  (let ((message
+         '((server-id . "9007199254741004001")
+           (self-p . t)
+           (segments . (((type . "poke"))))))
+        prompted
+        api-called)
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (&rest _)
+                 (setq prompted t)))
+              ((symbol-function 'qq-api-recall-poke)
+               (lambda (&rest _)
+                 (setq api-called t))))
+      (should-error (qq-chat--delete-message-internal message)
+                    :type 'user-error))
+    (should-not prompted)
+    (should-not api-called)))
+
 (ert-deftest qq-chat-send-poke-uses-explicit-member-chooser ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session

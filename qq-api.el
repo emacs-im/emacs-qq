@@ -1309,22 +1309,26 @@ websocket notice is deduplicated by its local second-level anchor."
    (lambda (_response)
      (qq-state-apply-recall message-id))))
 
-(defun qq-api-recall-poke (message-id &optional callback errback)
-  "Recall poke MESSAGE-ID via QQ's native recallNudge path.
+(defun qq-api-recall-poke (recall-reference &optional callback errback)
+  "Recall a poke through native RECALL-REFERENCE.
 
-Pokes are gray-tip records, so they must not be sent through `delete_msg'."
-  (setq message-id
-        (qq-api-validate-message-id message-id "recall_poke"))
-  (qq-api-call
-   "recall_poke"
-   `((message_id . ,message-id))
-   (lambda (response)
-     (qq-state-apply-recall message-id)
-     (when callback
-       (funcall callback response)))
-   (or errback
-       (lambda (response reason)
-         (qq-api--default-error response reason)))))
+Pokes are gray-tip records, so they must not be sent through `delete_msg'.
+The closed reference carries the exact native Peer and msgId expected by
+`recallNudge'; no session or message-cache lookup is permitted here."
+  (let* ((reference
+          (qq-protocol-validate-poke-recall-reference
+           recall-reference "recall_poke" 'user-error))
+         (message-id (alist-get 'message_id reference)))
+    (qq-api-call
+     "recall_poke"
+     `((recall_reference . ,reference))
+     (lambda (response)
+       (qq-state-apply-recall message-id)
+       (when callback
+         (funcall callback response)))
+     (or errback
+         (lambda (response reason)
+           (qq-api--default-error response reason))))))
 
 (defun qq-api-set-message-emoji-like
     (message-id emoji-id set &optional callback errback)

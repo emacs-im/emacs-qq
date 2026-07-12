@@ -507,7 +507,12 @@
                 :type 'user-error))
 
 (ert-deftest qq-api-recall-poke-uses-dedicated-action ()
-  (let (captured-action captured-params recalled-id)
+  (let* ((reference
+          '((message_id . "9007199254741007777")
+            (peer . ((chat_type . 2)
+                     (peer_uid . "20001")
+                     (guild_id . "")))))
+         captured-action captured-params recalled-id)
     (cl-letf (((symbol-function 'qq-state-apply-recall)
                (lambda (message-id)
                  (setq recalled-id message-id)))
@@ -517,12 +522,12 @@
                        captured-params params)
                  (funcall callback '((status . "ok")))
                  'sent)))
-      (qq-api-recall-poke "9007199254741007777")
+      (qq-api-recall-poke reference)
       (should (equal captured-action "recall_poke"))
-      (should (equal (alist-get 'message_id captured-params)
-                     "9007199254741007777"))
+      (should (equal captured-params
+                     `((recall_reference . ,reference))))
       (should (equal recalled-id "9007199254741007777"))
-      (should-error (qq-api-recall-poke 9007199254741007777)
+      (should-error (qq-api-recall-poke "9007199254741007777")
                     :type 'user-error))))
 
 (ert-deftest qq-api-fetch-older-history-passes-message-seq-for-older-page ()

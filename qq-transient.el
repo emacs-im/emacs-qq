@@ -87,6 +87,8 @@
     (or (null message)
         (null (alist-get 'server-id message))
         (not (alist-get 'self-p message))
+        (and (qq-state-poke-message-p message)
+             (null (qq-state-poke-recall-reference message)))
         (qq-state-message-recalled-p message))))
 
 (defun qq-transient--forward-inapt-p ()

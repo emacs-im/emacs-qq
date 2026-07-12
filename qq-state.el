@@ -437,6 +437,45 @@ their cached segment predates the richer poke renderer."
             (qq-state--normalize-poke-info
              notice actor-id target-id actor-name target-name))))))
 
+(defun qq-state-poke-recall-reference (message)
+  "Return a copy of MESSAGE's native poke recall reference, or nil."
+  (when (qq-state-poke-message-p message)
+    (copy-tree (alist-get 'poke-recall-reference message))))
+
+(defun qq-state--validate-poke-recall-context (reference session-key)
+  "Return REFERENCE when its native Peer belongs to SESSION-KEY.
+
+Group peers are their decimal group IDs.  Private peers are opaque NT UIDs;
+when the session cache already knows that UID, require an exact match."
+  (when reference
+    (unless session-key
+      (error "qq: poke recall reference has no conversation"))
+    (let* ((peer (alist-get 'peer reference))
+           (chat-type (alist-get 'chat_type peer))
+           (peer-uid (alist-get 'peer_uid peer))
+           (session-type (qq-state-session-key-type session-key))
+           (target-id (qq-state-session-key-target-id session-key))
+           (known-peer-uid
+            (alist-get 'peer-uid (gethash session-key qq-state--sessions))))
+      (pcase session-type
+        ('group
+         (unless (and (= chat-type 2)
+                      (equal peer-uid target-id))
+           (error "qq: group poke recall reference does not match %s"
+                  session-key)))
+        ('private
+         (unless (= chat-type 1)
+           (error "qq: private poke recall reference has non-private peer"))
+         (when (and (stringp known-peer-uid)
+                    (not (string-empty-p known-peer-uid))
+                    (not (equal peer-uid known-peer-uid)))
+           (error "qq: private poke recall reference does not match %s"
+                  session-key)))
+        (_
+         (error "qq: poke recall reference has unsupported conversation %s"
+                session-key)))))
+  reference)
+
 (defun qq-state--raw-message-recalled-p (message)
   "Return non-nil when raw OneBot MESSAGE is explicitly recalled.
 
@@ -911,7 +950,23 @@ the natural-language fragments.  The complete original notice remains in
 (defun qq-state--normalize-poke-notice (notice &optional fallback-session-key)
   "Normalize a live or historical POKE NOTICE into a timeline message."
   (let* ((group-id (qq-state--normalize-id (alist-get 'group_id notice)))
-         (local-poke-p (and (alist-get 'emacs_local_p notice) t))
+         (local-marker-cell (assq 'emacs_local_p notice))
+         (recall-reference-cell (assq 'recall_reference notice))
+         (legacy-message-id-cell (assq 'message_id notice))
+         (local-poke-p
+          (and local-marker-cell
+               (eq (cdr local-marker-cell) t)))
+         (unscoped-recall-reference
+          (cond
+           (legacy-message-id-cell
+            (error "qq: poke notice must not carry top-level message_id"))
+           ((and local-poke-p (null recall-reference-cell)) nil)
+           ((and (null local-marker-cell) recall-reference-cell)
+            (qq-protocol-validate-poke-recall-reference
+             (cdr recall-reference-cell) "poke notice"))
+           (t
+            (error
+             "qq: poke notice must be either local or carry recall_reference"))))
          ;; In a private poke, user_id is the peer and sender_id is the actor
          ;; (the fork emits sender_id for this case).  Group pokes use user_id
          ;; as the actor, matching the OneBot notice contract.
@@ -921,6 +976,9 @@ the natural-language fragments.  The complete original notice remains in
                           (cond
                            (group-id (qq-state-session-key 'group group-id))
                            (peer-id (qq-state-session-key 'private peer-id)))))
+         (recall-reference
+          (qq-state--validate-poke-recall-context
+           unscoped-recall-reference session-key))
          (actor-id (qq-state--normalize-id
                     (or (alist-get 'sender_id notice)
                         (alist-get 'user_id notice))))
@@ -937,26 +995,14 @@ the natural-language fragments.  The complete original notice remains in
                  "戳了戳"))
          (time (qq-state--normalize-time
                 (or (alist-get 'time notice) (float-time))))
-         ;; The stock OneBot notice has no message_id.  The emacs fork adds the
-         ;; underlying NT gray-tip snowflake when it is available, which is the
-         ;; identity required by the dedicated recall_poke action. Keep a
-         ;; deterministic local anchor for synthetic notices without it.
-         (server-id
-          (qq-protocol-optional-message-id
-           (alist-get 'message_id notice)
-           "poke notice"))
+         ;; The authoritative fork exposes one closed native recall reference;
+         ;; its msgId is also the timeline identity.  Optimistic local notices
+         ;; remain local-only until the matching authoritative event arrives.
+         (server-id (alist-get 'message_id recall-reference))
          (local-id
-          (and (null server-id)
-               (cond
-                (local-poke-p
-                 (format "local-poke-%d"
-                         (cl-incf qq-state--local-message-counter)))
-                ((> time 0)
-                 (format "local-poke-%s-%s-%s"
-                         time (or actor-id "0") (or target-id "0")))
-                (t
-                 (format "local-poke-%d"
-                         (cl-incf qq-state--local-message-counter))))))
+          (and local-poke-p
+               (format "local-poke-%d"
+                       (cl-incf qq-state--local-message-counter))))
          (anchor (or server-id local-id))
          (self-p (and actor-id
                       (equal actor-id (qq-state-self-user-id))))
@@ -974,6 +1020,7 @@ the natural-language fragments.  The complete original notice remains in
             (sender-remark . nil)
             (self-p . ,self-p)
             (local-poke-p . ,local-poke-p)
+            (poke-recall-reference . ,recall-reference)
             (status . ,(if self-p 'sent 'received))
             ;; Poke notices are gray-tip records, not ordinary text messages.
             ;; Keep their visual metadata as a dedicated segment so chat can
@@ -1422,10 +1469,9 @@ Return three values via `cl-values':
   "Append a local timeline message for OneBot NOTIFY/POKE NOTICE.
 
 NapCat reports pokes as notices rather than ordinary messages.  The notice has
-no sender display object; use the fork's NT message id when present, otherwise
-a local event anchor, and resolve names from the cached contacts.  Numeric IDs
-are a deliberate final fallback; never render the generic `unknown' label for a
-valid poke participant."
+no sender display object; use the fork's closed native recall reference for
+authoritative identity, and a local event anchor only for an optimistic local
+echo.  Numeric participant IDs remain display labels of last resort."
   (let* ((message (qq-state--normalize-poke-notice notice))
          (session-key (alist-get 'session-key message))
          (self-p (alist-get 'self-p message)))

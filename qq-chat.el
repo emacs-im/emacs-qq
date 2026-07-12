@@ -60,7 +60,7 @@
 (declare-function qq-api-send-poke
                   "qq-api" (session-key target-id &optional callback errback))
 (declare-function qq-api-recall-poke
-                  "qq-api" (message-id &optional callback errback))
+                  "qq-api" (recall-reference &optional callback errback))
 
 (defvar-local qq-chat--session-key nil
   "Session key associated with the current chat buffer.")
@@ -2585,12 +2585,17 @@ on the first inline line when the body is pure inline content."
 
 (defun qq-chat--delete-message-internal (message)
   "Recall MESSAGE after confirmation."
-  (let ((message-id (alist-get 'server-id message)))
+  (let* ((message-id (alist-get 'server-id message))
+         (poke-p (qq-state-poke-message-p message))
+         (recall-reference
+          (and poke-p (qq-state-poke-recall-reference message))))
     (unless message-id
       (user-error "qq: selected message has no server id"))
+    (when (and poke-p (null recall-reference))
+      (user-error "qq: poke has no native recall reference"))
     (when (y-or-n-p (format "Recall message %s? " message-id))
-      (if (qq-state-poke-message-p message)
-          (qq-api-recall-poke message-id)
+      (if poke-p
+          (qq-api-recall-poke recall-reference)
         (qq-api-delete-message message-id)))))
 
 (defun qq-chat--message-title-face (message)

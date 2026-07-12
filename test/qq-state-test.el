@@ -13,6 +13,14 @@
          (progn ,@body)
        (qq-state-reset))))
 
+(defun qq-state-test--poke-recall-reference
+    (message-id chat-type peer-uid)
+  "Return a strict native poke recall reference for tests."
+  `((message_id . ,message-id)
+    (peer . ((chat_type . ,chat-type)
+             (peer_uid . ,peer-uid)
+             (guild_id . "")))))
+
 (ert-deftest qq-state-session-key-normalizes-type-and-id ()
   (qq-test-with-reset
    (should (equal (qq-state-session-key 'private 12345)
@@ -96,12 +104,15 @@
        (nickname . "Alice Nick"))))
    (let ((message
           (qq-state-apply-poke-notice
-           '((post_type . "notice")
+           `((post_type . "notice")
              (notice_type . "notify")
              (sub_type . "poke")
              (user_id . "10001")
              (sender_id . "10001")
-             (target_id . "90001")))))
+             (target_id . "90001")
+             (recall_reference
+              . ,(qq-state-test--poke-recall-reference
+                  "9007199254741007701" 1 "u_private_alice"))))))
      (should (equal (alist-get 'session-key message) "private:10001"))
      (should (equal (alist-get 'sender-name message) "Alice"))
      (should (equal (alist-get 'preview message) "戳了戳 我"))
@@ -112,16 +123,128 @@
    (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
    (let ((message
           (qq-state-apply-poke-notice
-           '((post_type . "notice")
+           `((post_type . "notice")
              (notice_type . "notify")
              (sub_type . "poke")
              (group_id . "20001")
              (user_id . "10002")
-             (target_id . "90001")))))
+             (target_id . "90001")
+             (recall_reference
+              . ,(qq-state-test--poke-recall-reference
+                  "9007199254741007702" 2 "20001"))))))
      (should (equal (alist-get 'session-key message) "group:20001"))
      (should (equal (alist-get 'sender-name message) "10002"))
      (should (equal (alist-get 'preview message) "戳了戳 我"))
      (should-not (string-match-p "unknown" (alist-get 'preview message))))))
+
+(ert-deftest qq-state-authoritative-poke-requires-native-recall-reference ()
+  (qq-test-with-reset
+   (should-error
+    (qq-state-apply-poke-notice
+     '((post_type . "notice")
+       (notice_type . "notify")
+       (sub_type . "poke")
+       (group_id . "20001")
+       (user_id . "10002")
+       (target_id . "90001"))))
+   (should-error
+    (qq-state-apply-poke-notice
+     '((post_type . "notice")
+       (notice_type . "notify")
+       (sub_type . "poke")
+       (group_id . "20001")
+       (user_id . "10002")
+       (target_id . "90001")
+       (message_id . "9007199254741007702"))))
+   (should-error
+    (qq-state-apply-poke-notice
+     '((post_type . "notice")
+       (notice_type . "notify")
+       (sub_type . "poke")
+       (group_id . "20001")
+       (user_id . "10002")
+       (target_id . "90001")
+       (recall_reference
+        . ((message_id . 9007199254741007702)
+            (peer . ((chat_type . 2)
+                     (peer_uid . "20001")
+                     (guild_id . ""))))))))
+   (should-error
+    (qq-state-apply-poke-notice
+     '((post_type . "notice")
+       (notice_type . "notify")
+       (sub_type . "poke")
+       (group_id . "20001")
+       (user_id . "10002")
+       (target_id . "90001")
+       (emacs_local_p . :false))))
+   (should-error
+    (qq-state-apply-poke-notice
+     `((post_type . "notice")
+       (notice_type . "notify")
+       (sub_type . "poke")
+       (group_id . "20001")
+       (user_id . "10002")
+       (target_id . "90001")
+       (emacs_local_p . t)
+       (recall_reference
+        . ,(qq-state-test--poke-recall-reference
+            "9007199254741007702" 2 "20001")))))
+   (should-error
+    (qq-state-apply-poke-notice
+     `((post_type . "notice")
+       (notice_type . "notify")
+       (sub_type . "poke")
+       (group_id . "20001")
+       (user_id . "10002")
+       (target_id . "90001")
+       (message_id . "9007199254741007799")
+       (recall_reference
+        . ,(qq-state-test--poke-recall-reference
+            "9007199254741007702" 2 "20001")))))
+   (dolist (reference
+            (list
+             (qq-state-test--poke-recall-reference
+              "9007199254741007702" 1 "u_private")
+             (qq-state-test--poke-recall-reference
+              "9007199254741007702" 2 "99999")))
+     (should-error
+      (qq-state-apply-poke-notice
+       `((post_type . "notice")
+         (notice_type . "notify")
+         (sub_type . "poke")
+         (group_id . "20001")
+         (user_id . "10002")
+         (target_id . "90001")
+         (recall_reference . ,reference)))))
+   (should-error
+    (qq-state-apply-poke-notice
+     `((post_type . "notice")
+       (notice_type . "notify")
+       (sub_type . "poke")
+       (user_id . "10002")
+       (sender_id . "10002")
+       (target_id . "90001")
+       (recall_reference
+        . ,(qq-state-test--poke-recall-reference
+            "9007199254741007702" 2 "20001")))))
+   (qq-state-upsert-session
+    "private:10002"
+    '((type . private)
+      (target-id . "10002")
+      (peer-uid . "u_expected"))
+    nil)
+   (should-error
+    (qq-state-apply-poke-notice
+     `((post_type . "notice")
+       (notice_type . "notify")
+       (sub_type . "poke")
+       (user_id . "10002")
+       (sender_id . "10002")
+       (target_id . "90001")
+       (recall_reference
+        . ,(qq-state-test--poke-recall-reference
+            "9007199254741007702" 1 "u_wrong")))))))
 
 (ert-deftest qq-state-apply-gray-tip-notice-creates-group-system-row ()
   (qq-test-with-reset
@@ -158,43 +281,56 @@
    (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
    (qq-state-merge-history
     "group:20001"
-    '(((time . 1710000001)
+    `(((time . 1710000001)
        (post_type . "notice")
        (notice_type . "notify")
        (sub_type . "poke")
        (target_id . "90001")
        (user_id . "10002")
-       (group_id . "20001"))))
+       (group_id . "20001")
+       (recall_reference
+        . ,(qq-state-test--poke-recall-reference
+            "9007199254741007703" 2 "20001")))))
    (let ((message (car (qq-state-session-messages "group:20001"))))
-     (should (equal (alist-get 'local-id message)
-                    "local-poke-1710000001-10002-90001"))
+     (should (equal (alist-get 'server-id message)
+                    "9007199254741007703"))
+     (should-not (alist-get 'local-id message))
      (should (equal (alist-get 'preview message) "戳了戳 我"))
      (should (equal (alist-get 'raw-event message)
-                    '((time . 1710000001)
+                    `((time . 1710000001)
                       (post_type . "notice")
                       (notice_type . "notify")
                       (sub_type . "poke")
                       (target_id . "90001")
                       (user_id . "10002")
-                      (group_id . "20001")))))))
+                      (group_id . "20001")
+                      (recall_reference
+                       . ,(qq-state-test--poke-recall-reference
+                           "9007199254741007703" 2 "20001"))))))))
 
 (ert-deftest qq-state-poke-with-server-id-is-recallable ()
   (qq-test-with-reset
    (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
    (let ((message
           (qq-state-apply-poke-notice
-           '((time . 1710000001)
+           `((time . 1710000001)
              (post_type . "notice")
              (notice_type . "notify")
              (sub_type . "poke")
-             (message_id . "9007199254741007777")
              (group_id . "20001")
              (user_id . "90001")
-             (target_id . "10002")))))
+             (target_id . "10002")
+             (recall_reference
+              . ,(qq-state-test--poke-recall-reference
+                  "9007199254741007777" 2 "20001"))))))
      (should (equal (alist-get 'id message) "9007199254741007777"))
      (should (equal (alist-get 'server-id message) "9007199254741007777"))
      (should (qq-state-poke-message-p message))
      (should-not (alist-get 'local-id message))
+     (should (equal
+              (qq-state-poke-recall-reference message)
+              (qq-state-test--poke-recall-reference
+               "9007199254741007777" 2 "20001")))
      (should (equal (alist-get 'preview message) "戳了戳 10002")))))
 
 (ert-deftest qq-state-poke-preserves-native-decoration-data ()
@@ -202,14 +338,16 @@
    (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
    (let* ((message
            (qq-state-apply-poke-notice
-            '((time . 1710000001)
+            `((time . 1710000001)
               (post_type . "notice")
               (notice_type . "notify")
               (sub_type . "poke")
-              (message_id . "9007199254741007778")
               (group_id . "20001")
               (user_id . "10002")
               (target_id . "90001")
+              (recall_reference
+               . ,(qq-state-test--poke-recall-reference
+                   "9007199254741007778" 2 "20001"))
               (raw_info .
                (((type . "qq") (uid . "actor"))
                 ((type . "img")
@@ -243,14 +381,16 @@
                (user_id . "90001")
                (target_id . "10002")))))
      (qq-state-apply-poke-notice
-      '((time . 1710000001)
+      `((time . 1710000001)
         (post_type . "notice")
         (notice_type . "notify")
         (sub_type . "poke")
-        (message_id . "9007199254741007780")
         (group_id . "20001")
         (user_id . "90001")
-        (target_id . "10002")))
+        (target_id . "10002")
+        (recall_reference
+         . ,(qq-state-test--poke-recall-reference
+             "9007199254741007780" 2 "20001"))))
      (let ((messages (qq-state-session-messages "group:20001")))
        (should (= (length messages) 1))
        (should (equal (alist-get 'server-id (car messages))
@@ -262,14 +402,16 @@
   (qq-test-with-reset
    (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
    (qq-state-apply-poke-notice
-    '((time . 1710000000)
+    `((time . 1710000000)
       (post_type . "notice")
       (notice_type . "notify")
       (sub_type . "poke")
-      (message_id . "9007199254741007781")
       (group_id . "20001")
       (user_id . "90001")
       (target_id . "10002")
+      (recall_reference
+       . ,(qq-state-test--poke-recall-reference
+           "9007199254741007781" 2 "20001"))
       (raw_info . (((type . "nor") (txt . "喷了喷"))))))
    (qq-state-apply-poke-notice
     '((time . 1710000001)
