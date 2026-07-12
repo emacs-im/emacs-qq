@@ -75,6 +75,22 @@
     (should (eq (lookup-key qq-forward-mode-map (kbd "p")) #'qq-forward-previous-message))
     (should (eq (lookup-key qq-forward-mode-map (kbd "RET")) #'qq-forward-activate))))
 
+(ert-deftest qq-forward-layout-hooks-use-shared-chat-geometry ()
+  (with-temp-buffer
+    (qq-forward-mode)
+    (should (memq #'qq-forward--on-window-size-change
+                  window-size-change-functions))
+    (should (memq #'qq-forward--on-text-scale-change
+                  text-scale-mode-hook))
+    (let (calls)
+      (cl-letf (((symbol-function 'qq-chat-sync-timeline-geometry)
+                 (lambda (&rest keys)
+                   (push keys calls))))
+        (qq-forward--on-window-size-change)
+        (qq-forward--on-text-scale-change))
+      (should (equal (nreverse calls)
+                     '(nil (:reset t :force t)))))))
+
 (ert-deftest qq-forward-header-uses-a-live-timeline-only-view ()
   (qq-forward-test--with-clean-viewers
     (let ((source (qq-forward-test--message-source
@@ -298,20 +314,22 @@ list are indistinguishable — both mean \"do not claim a count\"."
           (qq-forward--normalize-messages
            (list first duplicate-message-id
                  entry-reply message-reply wrong-domain))))
-    (let ((entry-target
+    (let ((messages-by-entry
+           (qq-forward--messages-by-entry qq-forward--messages))
+          (entry-target
            (qq-forward--message-reply-target (nth 2 qq-forward--messages)))
           (unresolved-target
            (qq-forward--message-reply-target (nth 3 qq-forward--messages)))
           (wrong-target
            (qq-forward--message-reply-target (nth 4 qq-forward--messages))))
-      (should (eq (qq-forward--message-by-target entry-target)
+      (should (eq (gethash (cdr entry-target) messages-by-entry)
                   (car qq-forward--messages)))
       (should (equal unresolved-target
                      '(unresolved . "9007199254742007031")))
       ;; message_id is diagnostic metadata here.  Even when two snapshots
       ;; share it, unresolved must not guess the first row.
-      (should-not (qq-forward--message-by-target unresolved-target))
-      (should-not (qq-forward--message-by-target wrong-target)))))
+      (should-not (gethash (cdr unresolved-target) messages-by-entry))
+      (should-not (gethash (cdr wrong-target) messages-by-entry)))))
 
 (ert-deftest qq-forward-remote-viewer-passes-source-and-isolates-locators ()
   (qq-forward-test--with-clean-viewers

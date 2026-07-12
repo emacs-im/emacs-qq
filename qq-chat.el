@@ -1175,26 +1175,34 @@ Order (telega-inspired):
   (when (appkit-chat-timeline-live-p)
     (appkit-chat-timeline-refresh)))
 
+(cl-defun qq-chat-sync-timeline-geometry (&key reset force)
+  "Synchronize shared QQ timeline geometry in the current buffer.
+
+RESET discards the cached width before measuring.  FORCE refreshes projected
+rows even when the character width is unchanged, which is required after text
+scaling because pixel-aligned avatars can still change geometry."
+  (when reset
+    (setq-local qq-chat--fill-column nil))
+  (let* ((window (qq-chat--render-window))
+         (next (and window (qq-chat--compute-fill-column window)))
+         (valid (and (integerp next) (> next 15)))
+         (changed (and valid (not (equal next qq-chat--fill-column)))))
+    (when valid
+      (setq-local qq-chat--fill-column next
+                  fill-column next))
+    (when (or changed force)
+      (qq-chat--refresh-timeline-layout))
+    (and valid next)))
+
 (defun qq-chat--on-window-size-change (&optional _frame)
   "Recompute chat width and refresh rows after window resizing."
   (when (eq major-mode 'qq-chat-mode)
-    (when-let* ((window (qq-chat--render-window))
-                (next (qq-chat--compute-fill-column window)))
-      (when (and (> next 15)
-                 (not (equal next qq-chat--fill-column)))
-        (setq-local qq-chat--fill-column next
-                    fill-column next)
-        (qq-chat--refresh-timeline-layout)))))
+    (qq-chat-sync-timeline-geometry)))
 
 (defun qq-chat--on-text-scale-change ()
   "Recompute pixel alignment after `text-scale-mode' changes."
   (when (eq major-mode 'qq-chat-mode)
-    (setq-local qq-chat--fill-column nil)
-    (when-let* ((window (qq-chat--render-window))
-                (next (qq-chat--compute-fill-column window)))
-      (setq-local qq-chat--fill-column next
-                  fill-column next))
-    (qq-chat--refresh-timeline-layout)))
+    (qq-chat-sync-timeline-geometry :reset t :force t)))
 
 (defun qq-chat--request-row-redisplay (anchors)
   "Redisplay projected ANCHORS, deferring while a region is active."
@@ -2544,6 +2552,60 @@ on the first inline line when the body is pure inline content."
         (setq prefixes (plist-put prefixes key prefix))))
     prefixes))
 
+(cl-defun qq-chat-message-layout
+    (message &key compact (avatar-p t))
+  "Return shared presentation layout for MESSAGE.
+
+COMPACT makes the first body line use the ordinary continuation prefix.
+AVATAR-P controls whether the shared two-line avatar occupies the heading and
+first body line.  The returned plist owns a fresh mutable body prefix state."
+  (let* ((avatar-prefixes
+          (and avatar-p (qq-chat--message-avatar-prefixes message)))
+         (header-prefix (or (plist-get avatar-prefixes :header) ""))
+         (body-first-prefix
+          (or (plist-get avatar-prefixes :first-body) "  "))
+         (body-rest-prefix
+          (or (plist-get avatar-prefixes :rest-body) "  ")))
+    (list :header-prefix header-prefix
+          :body-rest-prefix body-rest-prefix
+          :body-prefix-state
+          (if compact
+              (appkit-ui-make-prefix-state
+               body-rest-prefix body-rest-prefix)
+            (appkit-ui-make-prefix-state
+             body-first-prefix body-rest-prefix)))))
+
+(cl-defun qq-chat-insert-message-heading
+    (message properties layout
+             &key (title-face nil title-face-p)
+             (status-suffix nil status-suffix-p))
+  "Insert the shared heading for MESSAGE and return its body prefix state.
+
+PROPERTIES cover the generated heading.  LAYOUT must come from
+`qq-chat-message-layout'.  TITLE-FACE and STATUS-SUFFIX default to the normal
+QQ message presentation when omitted."
+  (let* ((header-prefix (plist-get layout :header-prefix))
+         (body-rest-prefix (plist-get layout :body-rest-prefix))
+         (header-start (point)))
+    (qq-chat--insert-message-sender
+     message (if title-face-p
+                 title-face
+               (qq-chat--message-title-face message)))
+    (insert (if status-suffix-p
+                (or status-suffix "")
+              (qq-chat--status-suffix message)))
+    (qq-chat--insert-right-aligned-time
+     (qq-chat--format-time (alist-get 'time message))
+     (string-width header-prefix)
+     t)
+    (insert "\n")
+    (appkit-ui-apply-line-prefix
+     header-start (point)
+     (appkit-ui-make-prefix-state header-prefix body-rest-prefix))
+    (appkit-ui-append-face header-start (point) 'qq-msg-heading)
+    (add-text-properties header-start (point) properties)
+    (plist-get layout :body-prefix-state)))
+
 (defun qq-chat--render-message (message context)
   "Insert one formatted MESSAGE block using projected CONTEXT.
 
@@ -2566,18 +2628,12 @@ Visual model (telega-inspired; later appkit):
          (ordinary-message-p
           (not (or (qq-state-gray-tip-message-p message)
                    (qq-state-poke-message-p message))))
-         (avatar-prefixes
-          (and ordinary-message-p
-               (qq-chat--message-avatar-prefixes message)))
-         (header-prefix (or (plist-get avatar-prefixes :header) ""))
-         (body-first-prefix
-          (or (plist-get avatar-prefixes :first-body) "  "))
-         (body-rest-prefix
-          (or (plist-get avatar-prefixes :rest-body) "  "))
-         (body-prefix-state
-          (if compact
-              (appkit-ui-make-prefix-state body-rest-prefix body-rest-prefix)
-            (appkit-ui-make-prefix-state body-first-prefix body-rest-prefix)))
+         (layout
+          (qq-chat-message-layout
+           message :compact compact :avatar-p ordinary-message-p))
+         (header-prefix (plist-get layout :header-prefix))
+         (body-rest-prefix (plist-get layout :body-rest-prefix))
+         (body-prefix-state (plist-get layout :body-prefix-state))
          (short-time (qq-chat--format-time-short (alist-get 'time message))))
     (when (and (stringp insert-date) (not (string-empty-p insert-date)))
       (qq-chat--insert-date-separator-row (qq-chat--message-day-label insert-date)))
@@ -2624,19 +2680,10 @@ Visual model (telega-inspired; later appkit):
       (qq-chat--insert-compact-message-body
        message body-prefix-state properties short-time))
      (t
-      (let ((header-start (point)))
-        (qq-chat--insert-message-sender message title-face)
-        (insert status-suffix)
-        (qq-chat--insert-right-aligned-time
-         (qq-chat--format-time (alist-get 'time message))
-         (string-width header-prefix)
-         t)
-        (insert "\n")
-        (appkit-ui-apply-line-prefix
-         header-start (point)
-         (appkit-ui-make-prefix-state header-prefix body-rest-prefix))
-        (appkit-ui-append-face header-start (point) 'qq-msg-heading)
-        (add-text-properties header-start (point) properties))
+      (qq-chat-insert-message-heading
+       message properties layout
+       :title-face title-face
+       :status-suffix status-suffix)
       (when reply-id
         (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
       (qq-chat--insert-message-body message body-prefix-state properties)))
