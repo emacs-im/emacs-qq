@@ -19,7 +19,8 @@
   `((message_id . ,message-id)
     (peer . ((chat_type . ,chat-type)
              (peer_uid . ,peer-uid)
-             (guild_id . "")))))
+             (guild_id . "")))
+    (valid_before . 4102444800)))
 
 (ert-deftest qq-state-session-key-normalizes-type-and-id ()
   (qq-test-with-reset
@@ -168,7 +169,8 @@
         . ((message_id . 9007199254741007702)
             (peer . ((chat_type . 2)
                      (peer_uid . "20001")
-                     (guild_id . ""))))))))
+                     (guild_id . "")))
+            (valid_before . 4102444800))))))
    (should-error
     (qq-state-apply-poke-notice
      '((post_type . "notice")

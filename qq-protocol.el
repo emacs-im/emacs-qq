@@ -15,6 +15,9 @@
 (require 'seq)
 (require 'subr-x)
 
+(defconst qq-protocol--max-safe-integer 9007199254740991
+  "Largest integer represented exactly by a JSON/JavaScript number.")
+
 (defun qq-protocol-message-id-p (value)
   "Return non-nil when VALUE is an original NT message snowflake string."
   (and (stringp value)
@@ -46,17 +49,27 @@ CONTEXT is included in protocol errors."
                  (length (delete-dups (copy-sequence actual))))
               (null (seq-difference actual keys))))))
 
+(defun qq-protocol--positive-safe-integer-p (value)
+  "Return non-nil when VALUE is a positive JSON-safe integer."
+  (and (integerp value)
+       (> value 0)
+       (<= value qq-protocol--max-safe-integer)))
+
 (defun qq-protocol-poke-recall-reference-p (value)
   "Return non-nil when VALUE is a closed native poke recall reference.
 
 The native locator consists of the NT snowflake `message_id' and the exact
 QQ `Peer' used by `recallNudge'.  Private `peer_uid' values are opaque NT
-UIDs, not QQ numbers, and must therefore remain strings."
-  (and (qq-protocol--closed-object-p value '(message_id peer))
+UIDs, not QQ numbers, and must therefore remain strings.  `valid_before' is
+the positive, safe-integer epoch-second deadline supplied by the server."
+  (and (qq-protocol--closed-object-p value
+                                     '(message_id peer valid_before))
        (let ((message-id (alist-get 'message_id value))
-             (peer (alist-get 'peer value)))
+             (peer (alist-get 'peer value))
+             (valid-before (alist-get 'valid_before value)))
          (and (stringp message-id)
               (string-match-p "\\`[1-9][0-9]*\\'" message-id)
+              (qq-protocol--positive-safe-integer-p valid-before)
               (qq-protocol--closed-object-p
                peer '(chat_type peer_uid guild_id))
               (memq (alist-get 'chat_type peer) '(1 2))
@@ -77,6 +90,17 @@ callers validating interactive input may pass `user-error'."
              (format "qq: %s requires a closed native poke recall reference, got %S"
                      (or context "protocol payload") value))))
   (copy-tree value))
+
+(defun qq-protocol-poke-recall-reference-expired-p (reference &optional now)
+  "Return non-nil when poke recall REFERENCE has expired at NOW.
+
+REFERENCE must be a valid closed native poke recall reference.  NOW is an
+epoch-second number and defaults to the current time.  The deadline itself is
+already expired, so NOW equal to `valid_before' returns non-nil."
+  (unless (qq-protocol-poke-recall-reference-p reference)
+    (error "qq: cannot check an invalid poke recall reference: %S" reference))
+  (<= (alist-get 'valid_before reference)
+      (or now (float-time))))
 
 (defun qq-protocol-json-true-p (value)
   "Return non-nil only when wire VALUE explicitly represents JSON true."

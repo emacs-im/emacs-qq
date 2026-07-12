@@ -73,7 +73,9 @@
          '((server-id . "9007199254741004001")
            (self-p . t)
            (segments . (((type . "poke")))))))
-    (cl-letf (((symbol-function 'qq-transient--message-at-point)
+    (cl-letf (((symbol-function 'float-time)
+               (lambda (&optional _time) 200))
+              ((symbol-function 'qq-transient--message-at-point)
                (lambda () message)))
       (should (qq-transient--recall-inapt-p))
       (setq message
@@ -83,9 +85,15 @@
                . ((message_id . "9007199254741004001")
                   (peer . ((chat_type . 1)
                            (peer_uid . "u_private-native-peer")
-                           (guild_id . "")))))
+                           (guild_id . "")))
+                  (valid_before . 201)))
               (segments . (((type . "poke"))))))
-      (should-not (qq-transient--recall-inapt-p)))))
+      (should-not (qq-transient--recall-inapt-p))
+      (setf (alist-get
+             'valid_before
+             (alist-get 'poke-recall-reference message))
+            200)
+      (should (qq-transient--recall-inapt-p)))))
 
 (ert-deftest qq-transient-poke-is-inapt-in-service-session ()
   (qq-transient-test-with-reset

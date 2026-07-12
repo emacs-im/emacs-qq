@@ -1319,6 +1319,8 @@ The closed reference carries the exact native Peer and msgId expected by
           (qq-protocol-validate-poke-recall-reference
            recall-reference "recall_poke" 'user-error))
          (message-id (alist-get 'message_id reference)))
+    (when (qq-protocol-poke-recall-reference-expired-p reference)
+      (user-error "qq: 戳一戳已超过 2 分钟撤回期限"))
     (qq-api-call
      "recall_poke"
      `((recall_reference . ,reference))

@@ -20,6 +20,7 @@
 (require 'qq-api)
 (require 'qq-chat)
 (require 'qq-media)
+(require 'qq-protocol)
 (require 'qq-root)
 (require 'qq-state)
 (require 'qq-user)
@@ -83,12 +84,17 @@
 
 (defun qq-transient--recall-inapt-p ()
   "Return non-nil when recall is unavailable for the message at point."
-  (let ((message (qq-transient--message-at-point)))
+  (let* ((message (qq-transient--message-at-point))
+         (poke-p (and message (qq-state-poke-message-p message)))
+         (recall-reference
+          (and poke-p (qq-state-poke-recall-reference message))))
     (or (null message)
         (null (alist-get 'server-id message))
         (not (alist-get 'self-p message))
-        (and (qq-state-poke-message-p message)
-             (null (qq-state-poke-recall-reference message)))
+        (and poke-p
+             (or (null recall-reference)
+                 (qq-protocol-poke-recall-reference-expired-p
+                  recall-reference)))
         (qq-state-message-recalled-p message))))
 
 (defun qq-transient--forward-inapt-p ()

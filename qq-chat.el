@@ -2593,6 +2593,10 @@ on the first inline line when the body is pure inline content."
       (user-error "qq: selected message has no server id"))
     (when (and poke-p (null recall-reference))
       (user-error "qq: poke has no native recall reference"))
+    (when (and poke-p
+               (qq-protocol-poke-recall-reference-expired-p
+                recall-reference))
+      (user-error "qq: 戳一戳已超过 2 分钟撤回期限"))
     (when (y-or-n-p (format "Recall message %s? " message-id))
       (if poke-p
           (qq-api-recall-poke recall-reference)

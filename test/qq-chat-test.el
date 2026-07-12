@@ -1016,11 +1016,13 @@
            '(((message_id . "9007199254741004001")
               (peer . ((chat_type . 2)
                        (peer_uid . "20001")
-                       (guild_id . ""))))
+                       (guild_id . "")))
+              (valid_before . 4102444800))
              ((message_id . "9007199254741004002")
               (peer . ((chat_type . 1)
                        (peer_uid . "u_private-native-peer")
-                       (guild_id . ""))))))
+                       (guild_id . "")))
+              (valid_before . 4102444800))))
     (let ((message
            `((server-id . ,(alist-get 'message_id reference))
              (self-p . t)
@@ -1054,6 +1056,37 @@
                  (setq api-called t))))
       (should-error (qq-chat--delete-message-internal message)
                     :type 'user-error))
+    (should-not prompted)
+    (should-not api-called)))
+
+(ert-deftest qq-chat-refuses-an-expired-poke-before-confirmation ()
+  (let ((message
+         '((server-id . "9007199254741004001")
+           (self-p . t)
+           (poke-recall-reference
+            . ((message_id . "9007199254741004001")
+               (peer . ((chat_type . 2)
+                        (peer_uid . "20001")
+                        (guild_id . "")))
+               (valid_before . 200)))
+           (segments . (((type . "poke"))))))
+        prompted
+        api-called
+        failure)
+    (cl-letf (((symbol-function 'float-time)
+               (lambda (&optional _time) 200))
+              ((symbol-function 'y-or-n-p)
+               (lambda (&rest _)
+                 (setq prompted t)))
+              ((symbol-function 'qq-api-recall-poke)
+               (lambda (&rest _)
+                 (setq api-called t))))
+      (setq failure
+            (should-error (qq-chat--delete-message-internal message)
+                          :type 'user-error)))
+    (should (string-match-p
+             "qq: 戳一戳已超过 2 分钟撤回期限"
+             (error-message-string failure)))
     (should-not prompted)
     (should-not api-called)))
 
