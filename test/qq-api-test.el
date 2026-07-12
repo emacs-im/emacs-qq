@@ -20,6 +20,16 @@
     (segments
      . ,(or segments
             '(((kind . "text") (payload . ((text . "hello")))))))))
+
+(defun qq-api-test--context-source ()
+  "Return one strict fork-native context forward source."
+  '((kind . "context")
+    (peer . ((chat_type . 2)
+             (peer_uid . "u_group-peer")
+             (guild_id . "")))
+    (root_message_id . "9007199254742007001")
+    (parent_message_id . "9007199254742007002")))
+
 (ert-deftest qq-api-send-message-builds-send-msg-request ()
   (let (captured-action captured-params pending-call)
     (cl-letf (((symbol-function 'qq-state-insert-pending-message)
@@ -541,6 +551,72 @@
             '((kind . "resource") (resource_id . "resource-a"))))
     (should (equal values (list messages messages)))))
 
+(ert-deftest qq-api-native-get-forward-preserves-context-source-exactly ()
+  (let ((source (qq-api-test--context-source))
+        captured-action captured-params callback-called delivered)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (action params callback &optional _errback)
+                 (setq captured-action action
+                       captured-params params)
+                 (funcall callback '((data . ((messages . nil)))))
+                 'sent)))
+      (qq-api-get-forward
+       source
+       (lambda (messages)
+         (setq callback-called t
+               delivered messages))))
+    (should (equal captured-action "emacs_get_forward"))
+    (should (equal captured-params `((source . ,source))))
+    (should callback-called)
+    (should-not delivered)))
+
+(ert-deftest qq-api-forward-context-source-schema-is-closed ()
+  (let ((source (qq-api-test--context-source)))
+    (should (equal (qq-api-validate-forward-source source) source))
+    (dolist (invalid
+             (list
+              '((kind . "context")
+                (peer . ((chat_type . 2)
+                         (peer_uid . "u_group-peer")
+                         (guild_id . "")))
+                (root_message_id . "9007199254742007001"))
+              (append (copy-tree source) '((message_id . "legacy")))
+              (let ((value (copy-tree source)))
+                (setf (alist-get 'peer value)
+                      '((chat_type . 2) (peer_uid . "u_group-peer")))
+                value)
+              (let ((value (copy-tree source)))
+                (setf (alist-get 'legacy (alist-get 'peer value)) t)
+                value)
+              (let ((value (copy-tree source)))
+                (setf (alist-get 'chat_type (alist-get 'peer value)) 0)
+                value)
+              (let ((value (copy-tree source)))
+                (setf (alist-get 'chat_type (alist-get 'peer value)) 2.5)
+                value)
+              (let ((value (copy-tree source)))
+                (setf (alist-get 'peer_uid (alist-get 'peer value)) "")
+                value)
+              (let ((value (copy-tree source)))
+                (setf (alist-get 'guild_id (alist-get 'peer value)) nil)
+                value)
+              (let ((value (copy-tree source)))
+                (setf (alist-get 'root_message_id value) "000")
+                value)
+              (let ((value (copy-tree source)))
+                (setf (alist-get 'root_message_id value) "0001")
+                value)
+              (let ((value (copy-tree source)))
+                (setf (alist-get 'parent_message_id value)
+                      9007199254742007002)
+                value)))
+      (should-error
+       (qq-api-validate-forward-source invalid)
+       :type 'user-error))
+    (let ((integral-float (copy-tree source)))
+      (setf (alist-get 'chat_type (alist-get 'peer integral-float)) 2.0)
+      (should (equal (qq-api-validate-forward-source integral-float) source)))))
+
 (ert-deftest qq-api-native-get-forward-rejects-numeric-alias-and-bad-result ()
   (dolist (source
            '(((kind . "message")
@@ -595,6 +671,33 @@
     (should-error
      (qq-api-validate-native-forward-messages (list message))
      :type 'user-error)))
+
+(ert-deftest qq-api-native-forward-card-accepts-only-card-source-union ()
+  (dolist (source
+           (list
+            '((kind . "resource") (resource_id . "resource-a"))
+            (qq-api-test--context-source)))
+    (should
+     (qq-api-validate-native-forward-messages
+      (list
+       (qq-api-test--native-message
+        "1" nil
+        `(((kind . "forward-card")
+           (payload . ((reference . ,source)
+                       (presentation . nil))))))))))
+  (should-error
+   (qq-api-validate-native-forward-messages
+    (list
+     (qq-api-test--native-message
+      "1" nil
+      '(((kind . "forward-card")
+         (payload
+          . ((reference
+              . ((kind . "message")
+                 (message_id . "9007199254742007089")
+                 (chat . ((kind . "group") (group_id . "20001")))))
+             (presentation . nil))))))))
+   :type 'user-error))
 
 (ert-deftest qq-api-native-segment-payloads-match-closed-typebox-schemas ()
   (let ((valid

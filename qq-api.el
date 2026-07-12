@@ -266,11 +266,57 @@ and must not be retained as an `unsupported.raw' diagnostic payload."
           context))
        (qq-api-validate-resource-id
         (alist-get 'resource_id source) context protocol-p))
+      ("context"
+       (unless (qq-api--exact-object-keys-p
+                source '(kind peer root_message_id parent_message_id))
+         (qq-api--signal-schema-error
+          protocol-p
+          (concat "qq: %s context source requires only kind, peer, "
+                  "root_message_id, and parent_message_id")
+          context))
+       (let ((peer (alist-get 'peer source)))
+         (unless (qq-api--exact-object-keys-p
+                  peer '(chat_type peer_uid guild_id))
+           (qq-api--signal-schema-error
+            protocol-p
+            (concat "qq: %s context peer requires only chat_type, "
+                    "peer_uid, and guild_id")
+            context))
+         (let ((chat-type (alist-get 'chat_type peer)))
+           (unless (and (qq-api--finite-number-p chat-type)
+                        (> chat-type 0)
+                        (= chat-type (truncate chat-type)))
+             (qq-api--signal-schema-error
+              protocol-p
+              "qq: %s context peer.chat_type must be a positive integer"
+              context)))
+         (unless (qq-api-non-empty-string-p (alist-get 'peer_uid peer))
+           (qq-api--signal-schema-error
+            protocol-p
+            "qq: %s context peer.peer_uid must be a non-empty string"
+            context))
+         (unless (stringp (alist-get 'guild_id peer))
+           (qq-api--signal-schema-error
+            protocol-p "qq: %s context peer.guild_id must be a string"
+            context)))
+       (dolist (key '(root_message_id parent_message_id))
+         (let ((message-id (alist-get key source)))
+           (unless (and (stringp message-id)
+                        (string-match-p "\\`[1-9][0-9]*\\'" message-id))
+             (qq-api--signal-schema-error
+              protocol-p
+              (concat "qq: %s context %s must be a positive decimal string "
+                      "without leading zeros")
+              context key)))))
       (_
        (qq-api--signal-schema-error
         protocol-p "qq: %s has invalid kind %S"
         context (alist-get 'kind source))))
-    (copy-tree source)))
+    (let ((copy (copy-tree source)))
+      (when (equal (alist-get 'kind copy) "context")
+        (setf (alist-get 'chat_type (alist-get 'peer copy))
+              (truncate (alist-get 'chat_type (alist-get 'peer copy)))))
+      copy)))
 
 (defun qq-api-validate-message-reference
     (reference &optional context protocol-p)
@@ -475,10 +521,11 @@ and must not be retained as an `unsupported.raw' diagnostic payload."
               (qq-api-validate-forward-source
                (alist-get 'reference payload)
                (format "%s reference" context) protocol-p)))
-         (unless (equal (alist-get 'kind reference) "resource")
+         (when (equal (alist-get 'kind reference) "message")
            (qq-api--signal-schema-error
             protocol-p
-            "qq: %s forward-card reference must be kind=resource" context)))
+            "qq: %s forward-card reference must be resource or context"
+            context)))
        (let ((presentation (alist-get 'presentation payload)))
          (unless (qq-api--exact-object-keys-p
                   presentation nil

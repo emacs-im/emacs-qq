@@ -29,6 +29,15 @@
     (message_id . ,message-id)
     (chat . ((kind . "group") (group_id . ,chat-id)))))
 
+(defun qq-forward-test--context-source (&optional peer-uid)
+  "Return a native context source for PEER-UID."
+  `((kind . "context")
+    (peer . ((chat_type . 2)
+             (peer_uid . ,(or peer-uid "u_group-peer"))
+             (guild_id . "")))
+    (root_message_id . "9007199254742007001")
+    (parent_message_id . "9007199254742007002")))
+
 (defun qq-forward-test--remote-segment (source)
   "Return canonical internal remote forward segment for SOURCE."
   `((type . "forward")
@@ -354,6 +363,82 @@ list are indistinguishable — both mean \"do not claim a count\"."
         (save-window-excursion
           (qq-forward-open-segment segment))
         (should (equal captured source))))))
+
+(ert-deftest qq-forward-nested-card-context-sends-exact-native-source ()
+  (qq-forward-test--with-clean-viewers
+    (let* ((source (qq-forward-test--context-source))
+           (native
+            (qq-forward-test--native-message
+             "1" "outer" :segments
+             `(((kind . "forward-card")
+                (payload . ((reference . ,source)
+                            (presentation . nil)))))))
+           (internal (qq-forward-native-message-to-internal native))
+           (segment (car (alist-get 'segments internal)))
+           captured-action captured-params)
+      (cl-letf (((symbol-function 'qq-api-call)
+                 (lambda (action params callback &optional _errback)
+                   (setq captured-action action
+                         captured-params params)
+                   (funcall callback '((data . ((messages . nil)))))
+                   'sent)))
+        (save-window-excursion
+          (let ((buffer (qq-forward-open-segment segment)))
+            (with-current-buffer buffer
+              (should (eq qq-forward--lookup-kind 'context))
+              (should (equal qq-forward--lookup-id
+                             "Nested · u_group-peer · 9007199254742007002"))
+              (should (string-match-p
+                       (regexp-quote qq-forward--lookup-id)
+                       (buffer-string))))))
+      (should (equal captured-action "emacs_get_forward"))
+      (should (equal captured-params `((source . ,source))))))))
+
+(ert-deftest qq-forward-context-buffer-key-includes-complete-source ()
+  (qq-forward-test--with-clean-viewers
+    (let ((source-a (qq-forward-test--context-source "u_group-a"))
+          (source-b (qq-forward-test--context-source "u_group-b"))
+          (requests 0))
+      (cl-letf (((symbol-function 'qq-api-get-forward)
+                 (lambda (_source callback &optional _errback)
+                   (cl-incf requests)
+                   (funcall callback nil)))
+                ((symbol-function 'sxhash-equal) (lambda (_value) 1)))
+        (save-window-excursion
+          (let ((first (qq-forward-open source-a))
+                (second (qq-forward-open source-b)))
+            (should-not (eq first second))
+            (should-not (equal (buffer-name first) (buffer-name second)))
+            (should (= requests 2))
+            (dolist (buffer (list first second))
+              (with-current-buffer buffer
+                (should qq-forward--loaded-p)
+                (should-not qq-forward--loading)))))))))
+
+(ert-deftest qq-forward-context-buffer-key-canonicalizes-object-order ()
+  (qq-forward-test--with-clean-viewers
+    (let* ((source (qq-forward-test--context-source))
+           (reordered
+            `((parent_message_id . ,(alist-get 'parent_message_id source))
+              (root_message_id . ,(alist-get 'root_message_id source))
+              (peer . ((guild_id . "")
+                       (peer_uid . "u_group-peer")
+                       (chat_type . 2)))
+              (kind . "context")))
+           (requests 0))
+      (cl-letf (((symbol-function 'qq-api-get-forward)
+                 (lambda (_source callback &optional _errback)
+                   (cl-incf requests)
+                   (funcall callback nil))))
+        (save-window-excursion
+          (let ((first (qq-forward-open source))
+                (second (qq-forward-open reordered)))
+            (should (eq first second))
+            (should (= requests 1))
+            (with-current-buffer first
+              (should (equal qq-forward--source source))
+              (should (equal qq-forward--buffer-key
+                             (qq-forward--source-buffer-key source))))))))))
 
 (ert-deftest qq-forward-inline-nested-content-renders-locally ()
   (qq-forward-test--with-clean-viewers

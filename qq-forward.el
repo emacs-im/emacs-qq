@@ -51,7 +51,7 @@
   "Display identity from the native source represented by this viewer.")
 
 (defvar-local qq-forward--lookup-kind nil
-  "Native source kind: `message', `resource', or nil for local inline.")
+  "Native source kind: `message', `resource', `context', or nil inline.")
 
 (defvar-local qq-forward--source nil
   "Validated fork-native remote source for this viewer, or nil inline.")
@@ -105,13 +105,62 @@ only the affected entries (telega-msg-redisplay / qq-chat media-anchor style).")
   "Return identity string from validated native SOURCE."
   (pcase (alist-get 'kind source)
     ("message" (alist-get 'message_id source))
-    ("resource" (alist-get 'resource_id source))))
+    ("resource" (alist-get 'resource_id source))
+    ("context"
+     (format "%s/%s"
+             (alist-get 'root_message_id source)
+             (alist-get 'parent_message_id source)))))
+
+(defun qq-forward--canonical-source (source)
+  "Return validated SOURCE in one stable field order."
+  (setq source
+        (qq-api-validate-forward-source source "forward viewer source"))
+  (pcase (alist-get 'kind source)
+    ("message"
+     (let* ((chat (alist-get 'chat source))
+            (canonical-chat
+             (pcase (alist-get 'kind chat)
+               ("group"
+                (list (cons 'kind "group")
+                      (cons 'group_id (alist-get 'group_id chat))))
+               ("private"
+                (list (cons 'kind "private")
+                      (cons 'user_id (alist-get 'user_id chat)))))))
+       (list (cons 'kind "message")
+             (cons 'message_id (alist-get 'message_id source))
+             (cons 'chat canonical-chat))))
+    ("resource"
+     (list (cons 'kind "resource")
+           (cons 'resource_id (alist-get 'resource_id source))))
+    ("context"
+     (let ((peer (alist-get 'peer source)))
+       (list
+        (cons 'kind "context")
+        (cons 'peer
+              (list (cons 'chat_type (alist-get 'chat_type peer))
+                    (cons 'peer_uid (alist-get 'peer_uid peer))
+                    (cons 'guild_id (alist-get 'guild_id peer))))
+        (cons 'root_message_id (alist-get 'root_message_id source))
+        (cons 'parent_message_id (alist-get 'parent_message_id source)))))))
+
+(defun qq-forward--source-buffer-key (source)
+  "Return collision-free canonical buffer identity for SOURCE."
+  (list 'remote (qq-forward--canonical-source source)))
+
+(defun qq-forward--source-label (source)
+  "Return a concise user-facing label for SOURCE."
+  (if (equal (alist-get 'kind source) "context")
+      (format "Nested · %s · %s"
+              (alist-get 'peer_uid (alist-get 'peer source))
+              (alist-get 'parent_message_id source))
+    (qq-forward--source-id source)))
 
 (defun qq-forward--source-reference (source)
   "Return (KIND . ID) for validated native SOURCE."
   (pcase (alist-get 'kind source)
     ("message" (cons 'message (alist-get 'message_id source)))
-    ("resource" (cons 'resource (alist-get 'resource_id source)))))
+    ("resource" (cons 'resource (alist-get 'resource_id source)))
+    ("context" (cons 'context (qq-forward--source-id source)))))
 
 (defun qq-forward--validate-content (content &optional protocol-p)
   "Validate canonical nested forward CONTENT union."
@@ -173,13 +222,9 @@ only the affected entries (telega-msg-redisplay / qq-chat media-anchor style).")
             (qq-api-validate-forward-source
              (alist-get 'reference content)
              "forward segment reference")))
-      (let ((source
-             (qq-api-validate-forward-source
-              (alist-get 'reference data)
-              "forward-card reference")))
-        (unless (equal (alist-get 'kind source) "resource")
-          (user-error "qq: forward-card reference must be resource"))
-        source))))
+      (qq-api-validate-forward-source
+       (alist-get 'reference data)
+       "forward-card reference"))))
 
 ;;;###autoload
 (defun qq-forward-reference-id (segment)
@@ -403,13 +448,18 @@ the fork-native forward action using an explicit locator-qualified reference."
             (presentation . ,(qq-forward--legacy-presentation data)))))))
    (t nil)))
 
-(defun qq-forward--inline-buffer-key (segment)
-  "Return UI-only buffer key for inline SEGMENT."
-  (format "inline:%x" (sxhash-equal segment)))
+(defun qq-forward--buffer-name (name-key)
+  "Return forward viewer buffer name for display-only NAME-KEY."
+  (format "*qq-forward:%s*" name-key))
 
-(defun qq-forward--buffer-name (buffer-key)
-  "Return deterministic forward viewer buffer name for BUFFER-KEY."
-  (format "*qq-forward:%s*" buffer-key))
+(defun qq-forward--buffer-for-key (buffer-key)
+  "Return live forward viewer whose canonical identity is BUFFER-KEY."
+  (cl-find-if
+   (lambda (buffer)
+     (with-current-buffer buffer
+       (and (derived-mode-p 'qq-forward-mode)
+            (equal qq-forward--buffer-key buffer-key))))
+   (buffer-list)))
 
 (defun qq-forward--format-time (timestamp)
   "Return display time for integer TIMESTAMP, or an empty string."
@@ -693,6 +743,8 @@ Caller is responsible for view preservation via
                         (format "message_id: %s" qq-forward--lookup-id))
                        ('resource
                         (format "resource_id: %s" qq-forward--lookup-id))
+                       ('context
+                        qq-forward--lookup-id)
                        (_ "inline content")))
              'face 'shadow))
     (cond
@@ -861,23 +913,32 @@ records issue a fresh `emacs_get_forward' request."
                         (or qq-forward--lookup-id "inline")
                         (if qq-forward--loading " · loading" "")))))
 
-(defun qq-forward--open-buffer
-    (buffer-key source inline-p inline-content)
-  "Open BUFFER-KEY viewer for native SOURCE or INLINE-CONTENT."
+(defun qq-forward--open-buffer (source inline-p inline-content)
+  "Open a viewer for native SOURCE or authoritative INLINE-CONTENT."
   (when source
-    (setq source
-          (qq-api-validate-forward-source
-           source "forward viewer source")))
+    (setq source (qq-forward--canonical-source source)))
   (when inline-p
     (setq inline-content
           (qq-api-validate-native-forward-messages
            inline-content "native forward inline content")))
   (unless (or inline-p source)
     (user-error "qq: this chat history has neither inline content nor source"))
-  (let* ((reference (and source (qq-forward--source-reference source)))
+  (let* ((buffer-key
+          (if inline-p
+              (list 'inline (copy-tree inline-content))
+            (qq-forward--source-buffer-key source)))
+         (reference (and source (qq-forward--source-reference source)))
          (lookup-kind (car reference))
-         (lookup-id (cdr reference))
-         (buffer (get-buffer-create (qq-forward--buffer-name buffer-key))))
+         (lookup-id (and source (qq-forward--source-label source)))
+         (name-key
+          (if inline-p
+              (format "inline:%x" (sxhash-equal buffer-key))
+            (format "%s:%s:%x"
+                    (car reference) (cdr reference)
+                    (sxhash-equal buffer-key))))
+         (buffer
+          (or (qq-forward--buffer-for-key buffer-key)
+              (generate-new-buffer (qq-forward--buffer-name name-key)))))
     (with-current-buffer buffer
       (unless (derived-mode-p 'qq-forward-mode)
         (qq-forward-mode))
@@ -913,13 +974,7 @@ records issue a fresh `emacs_get_forward' request."
 ;;;###autoload
 (defun qq-forward-open (source)
   "Open a remote merged-forward viewer for explicit native SOURCE."
-  (let* ((source (qq-api-validate-forward-source
-                  source "forward viewer source"))
-         (reference (qq-forward--source-reference source))
-         (buffer-key
-          (format "%s:%s:%x"
-                  (car reference) (cdr reference) (sxhash-equal source))))
-    (qq-forward--open-buffer buffer-key source nil nil)))
+  (qq-forward--open-buffer source nil nil))
 
 ;;;###autoload
 (defun qq-forward-open-segment (segment)
@@ -934,17 +989,8 @@ records issue a fresh `emacs_get_forward' request."
           (and inline-cell
                (qq-api-validate-native-forward-messages
                 (cdr inline-cell) "native forward inline content")))
-         (source (qq-forward--segment-source segment))
-         (reference (and source (qq-forward--source-reference source)))
-         (buffer-key
-          (if inline-p
-              (qq-forward--inline-buffer-key segment)
-            (and source
-                 (format "%s:%s:%x"
-                         (car reference) (cdr reference)
-                         (sxhash-equal source))))))
-    (qq-forward--open-buffer
-     buffer-key source inline-p inline-content)))
+         (source (qq-forward--segment-source segment)))
+    (qq-forward--open-buffer source inline-p inline-content)))
 
 ;;;###autoload
 (defun qq-forward-insert-segment (segment prefix-state properties)
@@ -990,9 +1036,10 @@ records issue a fresh `emacs_get_forward' request."
                         'help-echo
                         (if reference
                             (format "Open merged chat history (%s %s)"
-                                    (if (eq (car reference) 'resource)
-                                        "resource_id"
-                                      "message_id")
+                                    (pcase (car reference)
+                                      ('resource "resource_id")
+                                      ('message "message_id")
+                                      ('context "context"))
                                     (cdr reference))
                           "Open inline merged chat history")
                         'follow-link t
