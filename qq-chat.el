@@ -461,6 +461,7 @@ available."
     (while (and segments (not found))
       (let ((segment (car segments)))
         (when (or (qq-chat--forward-segment-p segment)
+                  (qq-chat--animated-face-segment-p segment)
                   (qq-chat--poke-segment-p segment)
                   (qq-chat--gray-tip-segment-p segment)
                   (qq-chat--mail-segment-p segment)
@@ -1927,6 +1928,21 @@ via `qq-chat-goto-message'."
         (alist-get 'faceIndex data)
         (and (listp raw) (alist-get 'faceIndex raw)))))
 
+(defun qq-chat--animated-face-segment-p (segment)
+  "Return non-nil when face SEGMENT identifies an animated base face."
+  (when (equal (alist-get 'type segment) "face")
+    (let* ((data (alist-get 'data segment))
+           (raw (alist-get 'raw data))
+           (face-type (or (alist-get 'face_type data)
+                          (alist-get 'faceType data)
+                          (and (listp raw) (alist-get 'faceType raw))))
+           (sticker-id (or (alist-get 'sticker_id data)
+                           (alist-get 'stickerId data)
+                           (and (listp raw) (alist-get 'stickerId raw)))))
+      (or (equal face-type 3)
+          (and sticker-id
+               (not (equal (format "%s" sticker-id) "0")))))))
+
 (defun qq-chat--face-segment-description (segment)
   "Return the native display description from face SEGMENT, or nil."
   (let* ((data (alist-get 'data segment))
@@ -2306,6 +2322,22 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
            (appkit-ui-apply-line-prefix preview-start (point) card-prefix-state)
            (appkit-ui-append-face preview-start (point) 'shadow)))))))
 
+(defun qq-chat--insert-animated-face-segment (segment prefix-state properties)
+  "Insert animated face SEGMENT below the avatar's two-line header."
+  ;; Consume the avatar's normal-height first-body slice before inserting the
+  ;; tall animation.  Otherwise line-prefix stretches that slice to the media
+  ;; line and makes one avatar look like two vertically separated avatars.
+  (let ((avatar-tail-start (point)))
+    (insert " \n")
+    (appkit-ui-apply-line-prefix avatar-tail-start (point) prefix-state)
+    (add-text-properties avatar-tail-start (point) properties))
+  (let ((animation-start (point)))
+    (insert (or (qq-chat--segment-inline-string segment)
+                (qq-state-message-preview-from-segments (list segment))))
+    (insert "\n")
+    (appkit-ui-apply-line-prefix animation-start (point) prefix-state)
+    (add-text-properties animation-start (point) properties)))
+
 (defun qq-chat--insert-message-body (message prefix-state properties)
   "Insert MESSAGE content body using PREFIX-STATE and PROPERTIES."
   (let ((segments (alist-get 'segments message))
@@ -2338,6 +2370,10 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
                ((qq-chat--media-segment-p segment)
                 (flush-inline)
                 (qq-chat--insert-segment-media-line segment prefix-state properties))
+               ((qq-chat--animated-face-segment-p segment)
+                (flush-inline)
+                (qq-chat--insert-animated-face-segment
+                 segment prefix-state properties))
                ((qq-chat--segment-inline-string segment)
                 (push (qq-chat--segment-inline-string segment) inline-parts))
                (t

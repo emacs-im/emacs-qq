@@ -2167,3 +2167,11 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
 (provide (quote qq-chat-test))
 
 ;;; qq-chat-test.el ends here
+(ert-deftest qq-chat-animated-face-is-a-block-segment ()
+  (let ((segment '((type . "face")
+                   (data . ((id . "478")
+                            (raw . ((faceType . 3)
+                                    (stickerId . "80"))))))))
+    (should (qq-chat--animated-face-segment-p segment))
+    (should (qq-chat--message-has-block-segments-p
+             `((segments . (,segment)))))))
