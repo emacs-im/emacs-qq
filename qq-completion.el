@@ -37,6 +37,20 @@
 (defvar qq-completion--custom-face-history nil
   "History for shared QQ favorite-face completion readers.")
 
+(defvar qq-completion--poke-target-history nil
+  "History for strict poke-target candidate readers.")
+
+(defvar qq-completion--poke-search-history nil
+  "History for native group-member poke searches.")
+
+(defvar-local qq-completion--poke-request nil
+  "Active asynchronous poke-target search owner, or nil.
+
+The value is a private plist carrying the transport token, scheduled picker
+timer, and session identity.  It is deliberately separate from
+`qq-completion--member-pending', whose continuation reopens composer
+completion rather than choosing a command argument.")
+
 (defun qq-completion--group-id ()
   "Return current group id, or nil outside a group chat buffer."
   (let ((session (and qq-chat--session-key
@@ -222,6 +236,255 @@ When REOPEN is non-nil, reopen completion after a still-current response."
          :insert-function #'qq-completion--insert-protocol-candidate
          :sync-function #'qq-chat--sync-draft-from-buffer)))))
 
+(defun qq-completion--poke-user-id-p (value)
+  "Return non-nil when VALUE is a canonical nonzero poke user id."
+  (and (qq-api-user-id-p value)
+       (not (equal value "0"))))
+
+(defun qq-completion--poke-session-current-p
+    (buffer session-key type target-id)
+  "Return non-nil when BUFFER still owns canonical SESSION-KEY fields."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (let ((session (qq-state-session session-key)))
+           (and (derived-mode-p 'qq-chat-mode)
+                (equal qq-chat--session-key session-key)
+                (eq (alist-get 'type session) type)
+                (equal (alist-get 'target-id session) target-id))))))
+
+(defun qq-completion--poke-request-current-p (buffer owner)
+  "Return non-nil when OWNER still owns BUFFER's poke-target request."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and (eq qq-completion--poke-request owner)
+              (qq-completion--poke-session-current-p
+               buffer (plist-get owner :session-key)
+               'group (plist-get owner :group-id))))))
+
+(defun qq-completion--clear-poke-owner (buffer owner)
+  "Forget OWNER in BUFFER without disturbing a newer poke request."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (eq qq-completion--poke-request owner)
+        (setq qq-completion--poke-request nil)))))
+
+(defun qq-completion--cancel-poke-request ()
+  "Cancel and forget the current buffer's poke-target search."
+  (when qq-completion--poke-request
+    (when-let* ((timer (plist-get qq-completion--poke-request :timer)))
+      (when (timerp timer)
+        (cancel-timer timer)))
+    (when-let* ((token (plist-get qq-completion--poke-request :token)))
+      (qq-api-cancel-request token)))
+  (setq qq-completion--poke-request nil))
+
+(defun qq-completion--poke-candidate-user-id (candidate)
+  "Return canonical original user id carried by CANDIDATE."
+  (let* ((value (appkit-chat-completion-candidate-value candidate))
+         (member (plist-get value :member))
+         (user-id (or (plist-get value :user-id)
+                      (and (listp member) (alist-get 'user_id member)))))
+    (unless (qq-completion--poke-user-id-p user-id)
+      (error "qq: poke target candidate has invalid user id: %S" user-id))
+    user-id))
+
+(defun qq-completion--private-poke-candidate (user-id name relation)
+  "Return a rich private poke candidate for USER-ID, NAME, and RELATION."
+  (unless (qq-completion--poke-user-id-p user-id)
+    (error "qq: private poke candidate has invalid user id: %S" user-id))
+  (let ((user-id user-id)
+        (name name)
+        (relation relation))
+    (appkit-chat-completion-candidate-create
+     :label (format "%s · %s" relation name)
+     :value `(:kind poke-target :user-id ,user-id)
+     :search-terms (delete-dups (list relation name user-id))
+     :prefix (lambda (_candidate)
+               (concat (qq-media-avatar-display-string user-id) " "))
+     :annotation (format "  QQ %s" user-id))))
+
+(defun qq-completion--private-poke-candidates (session)
+  "Return the strict peer/self poke candidates for private SESSION."
+  (let* ((peer-id (alist-get 'target-id session))
+         (self-info (qq-state-self-info))
+         (self-id (qq-state-self-user-id))
+         (peer-name (or (alist-get 'title session) peer-id))
+         (self-name (or (alist-get 'nickname self-info) self-id)))
+    (unless (qq-completion--poke-user-id-p peer-id)
+      (user-error "qq: private poke requires a canonical peer id"))
+    (unless (qq-completion--poke-user-id-p self-id)
+      (user-error "qq: private poke requires loaded self identity"))
+    (if (equal peer-id self-id)
+        (list (qq-completion--private-poke-candidate
+               self-id self-name "Me"))
+      (list (qq-completion--private-poke-candidate
+             peer-id peer-name "Peer")
+            (qq-completion--private-poke-candidate
+             self-id self-name "Me")))))
+
+(defun qq-completion--read-private-poke-target
+    (buffer session-key session callback initial-user-id)
+  "Read a strict private poke target and call CALLBACK with its user id."
+  (let* ((candidates (qq-completion--private-poke-candidates session))
+         (initial-candidate
+          (and initial-user-id
+               (seq-find
+                (lambda (candidate)
+                  (equal (qq-completion--poke-candidate-user-id candidate)
+                         initial-user-id))
+                candidates))))
+    (when (and initial-user-id (null initial-candidate))
+      (user-error "qq: private poke target must be the peer or self"))
+    (let ((candidate
+           (appkit-chat-completion-read
+            "Poke target: " candidates
+            :history 'qq-completion--poke-target-history
+            :initial-input
+            (and initial-candidate
+                 (appkit-chat-completion-candidate-label initial-candidate)))))
+      (unless (qq-completion--poke-session-current-p
+               buffer session-key 'private (alist-get 'target-id session))
+        (user-error "qq: poke target belongs to a stale chat session"))
+      (funcall callback
+               (qq-completion--poke-candidate-user-id candidate)))))
+
+(defun qq-completion--group-poke-candidates (members)
+  "Return strict rich poke candidates for native group MEMBERS."
+  (dolist (member members)
+    (unless (qq-completion--poke-user-id-p (alist-get 'user_id member))
+      (error "qq: group poke search returned invalid user id: %S"
+             (alist-get 'user_id member))))
+  (qq-completion--member-candidates members))
+
+(defun qq-completion--present-group-poke-targets (buffer owner members)
+  "Present native MEMBERS for current group poke request OWNER in BUFFER."
+  (if (not (qq-completion--poke-request-current-p buffer owner))
+      (qq-completion--clear-poke-owner buffer owner)
+    (with-current-buffer buffer
+      (setf (plist-get owner :timer) nil)
+      (if (active-minibuffer-window)
+          (setf (plist-get owner :timer)
+                (run-at-time
+                 0.2 nil #'qq-completion--present-group-poke-targets
+                 buffer owner members))
+        (unwind-protect
+            (condition-case nil
+                (let* ((candidates
+                        (qq-completion--group-poke-candidates members))
+                       (candidate
+                        (appkit-chat-completion-read
+                         "Poke group member: " candidates
+                         :history 'qq-completion--poke-target-history))
+                       (user-id
+                        (qq-completion--poke-candidate-user-id candidate)))
+                  (when (qq-completion--poke-request-current-p buffer owner)
+                    (funcall (plist-get owner :callback) user-id)))
+              (quit nil))
+          (qq-completion--clear-poke-owner buffer owner))))))
+
+(defun qq-completion--group-poke-search-succeeded (buffer owner members)
+  "Accept native MEMBERS for current group poke request OWNER in BUFFER."
+  (if (not (qq-completion--poke-request-current-p buffer owner))
+      (qq-completion--clear-poke-owner buffer owner)
+    (with-current-buffer buffer
+      (setf (plist-get owner :completed-p) t
+            (plist-get owner :token) nil)
+      (if (null members)
+          (progn
+            (setq qq-completion--poke-request nil)
+            (message "qq: no matching group member"))
+        (setf (plist-get owner :timer)
+              (run-at-time
+               0 nil #'qq-completion--present-group-poke-targets
+               buffer owner (copy-tree members)))))))
+
+(defun qq-completion--group-poke-search-failed
+    (buffer owner _response reason)
+  "Finish failed group poke request OWNER in BUFFER with REASON."
+  (if (not (qq-completion--poke-request-current-p buffer owner))
+      (qq-completion--clear-poke-owner buffer owner)
+    (with-current-buffer buffer
+      (setf (plist-get owner :completed-p) t
+            (plist-get owner :token) nil)
+      (setq qq-completion--poke-request nil)
+      (message "qq: failed to search group members: %s" reason))))
+
+(defun qq-completion--read-group-poke-target
+    (buffer session-key session callback initial-user-id)
+  "Start a strict native group-member search and continue through CALLBACK."
+  (let* ((group-id (alist-get 'target-id session))
+         (query
+          (string-trim
+           (read-string "Search group member: " initial-user-id
+                        'qq-completion--poke-search-history))))
+    (unless (qq-api-group-id-p group-id)
+      (user-error "qq: group poke requires a canonical group id"))
+    (when (string-empty-p query)
+      (user-error "qq: group poke requires a non-empty member search"))
+    (let* ((owner
+            (list :session-key session-key
+                  :group-id group-id
+                  :callback callback
+                  :token nil
+                  :timer nil
+                  :completed-p nil))
+           token)
+      (setq qq-completion--poke-request owner)
+      (condition-case error-data
+          (setq token
+                (qq-api-search-group-members
+                 group-id query
+                 (lambda (members)
+                   (qq-completion--group-poke-search-succeeded
+                    buffer owner members))
+                 (lambda (response reason)
+                   (qq-completion--group-poke-search-failed
+                    buffer owner response reason))
+                 200))
+        (error
+         (when (eq qq-completion--poke-request owner)
+           (setq qq-completion--poke-request nil))
+         (signal (car error-data) (cdr error-data))))
+      ;; Test doubles and local transports may complete synchronously.
+      (when (and (qq-completion--poke-request-current-p buffer owner)
+                 (not (plist-get owner :completed-p)))
+        (setf (plist-get owner :token) token))
+      owner)))
+
+(defun qq-completion-read-poke-target
+    (session-key callback &optional initial-user-id)
+  "Choose a strict poke target for SESSION-KEY, then call CALLBACK.
+
+Private chats synchronously choose between the canonical peer and self.
+Group chats first read a non-empty native member-search query, then schedule a
+rich require-match picker after `qq-api-search-group-members' succeeds.
+INITIAL-USER-ID, when non-nil, must be an original decimal string and seeds the
+private selection or native group search.  No typed text is ever accepted as a
+target without a matching canonical candidate."
+  (unless (functionp callback)
+    (error "qq: poke target callback must be a function"))
+  (when (and initial-user-id
+             (not (qq-completion--poke-user-id-p initial-user-id)))
+    (user-error "qq: initial poke target must be an original QQ string"))
+  (let* ((buffer (current-buffer))
+         (session (qq-state-session session-key))
+         (type (and session (alist-get 'type session))))
+    (unless (and session
+                 (derived-mode-p 'qq-chat-mode)
+                 (equal qq-chat--session-key session-key))
+      (user-error "qq: poke target reader requires the current chat session"))
+    (qq-completion--cancel-poke-request)
+    (pcase type
+      ('private
+       (qq-completion--read-private-poke-target
+        buffer session-key session callback initial-user-id))
+      ('group
+       (qq-completion--read-group-poke-target
+        buffer session-key session callback initial-user-id))
+      (_
+       (user-error "qq: poke target selection is unsupported for %s sessions"
+                   type)))))
+
 (defun qq-completion--base-face-candidates ()
   "Return shared completion candidates for QQ base faces."
   (mapcar
@@ -320,8 +583,12 @@ only while buffer, session, and token still match."
 
 (defun qq-completion-setup ()
   "Initialize shared QQ composer completion in the current chat buffer."
+  (qq-completion--cancel-poke-request)
   (setq-local qq-completion--member-cache (make-hash-table :test #'equal))
   (setq-local qq-completion--member-pending (make-hash-table :test #'equal))
+  (setq-local qq-completion--poke-request nil)
+  (add-hook 'kill-buffer-hook #'qq-completion--cancel-poke-request nil t)
+  (add-hook 'change-major-mode-hook #'qq-completion--cancel-poke-request nil t)
   (appkit-chat-completion-setup
    :capf-functions '(qq-completion-member-capf qq-completion-face-capf)
    :append t))

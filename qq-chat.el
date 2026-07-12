@@ -58,7 +58,7 @@
                                                 callback &optional errback))
 (declare-function qq-api-cancel-request "qq-api" (request-token))
 (declare-function qq-api-send-poke
-                  "qq-api" (session-key &optional target-id callback errback))
+                  "qq-api" (session-key target-id &optional callback errback))
 (declare-function qq-api-recall-poke
                   "qq-api" (message-id &optional callback errback))
 
@@ -181,14 +181,15 @@ This mirrors telega's `telega-chatbuf--messages-pop-ring'.")
     (define-key map (kbd "h") #'qq-chat-open-peer-info)
     (define-key map (kbd "g") #'qq-chat-goto-reply)
     (define-key map (kbd "x") #'qq-chat-goto-pop-message)
-    (define-key map (kbd "P") #'qq-chat-send-poke)
+    (define-key map (kbd "P") #'qq-chat-poke-sender)
     (define-key map (kbd "!") #'qq-chat-react-to-message)
     (define-key map (kbd "m") #'qq-chat-message-transient)
     (define-key map (kbd "?") #'qq-chat-transient)
     map)
   "Timeline-only keymap active when point is outside the draft region.
 
-Single-key message actions (`r' reply, `d' recall, `!' react, `f' forward,
+Single-key message actions (`r' reply, `d' recall, `!' react, `P' poke sender,
+`f' forward,
 `M' mark, `F' forward marked, `o' open media, `a' avatar, `i' user,
 `g' goto replied-to, `x' pop jump) and menus (`m'/`?') apply on the timeline.
 They are inactive in the composer so typing is never stolen.")
@@ -3186,35 +3187,95 @@ Bound to `C-c C-k' (also ESC ESC / C-M-c).  Reply footer × is clickable."
     (user-error "qq: this buffer is not bound to a session"))
   (qq-api-mark-session-read qq-chat--session-key))
 
-(defun qq-chat-send-poke (&optional target-id)
-  "Send a poke in the current chat.
+(defun qq-chat--poke-session (session-key)
+  "Return poke-capable SESSION-KEY metadata, or signal `user-error'."
+  (unless session-key
+    (user-error "qq: this buffer is not bound to a session"))
+  (let ((session (qq-state-session session-key)))
+    (unless (memq (alist-get 'type session) '(private group))
+      (user-error "qq: this conversation does not support pokes"))
+    session))
 
-For a private chat, poke the peer.  In a group, use the message at point as
-the default target and prompt for a QQ number when point has no incoming
-sender."
+(defun qq-chat--poke-target-id-p (target-id)
+  "Return non-nil when TARGET-ID identifies a real QQ user."
+  (and (qq-api-user-id-p target-id)
+       (not (equal target-id "0"))))
+
+(defun qq-chat--validate-poke-target (session target-id)
+  "Return TARGET-ID when it is valid for poke-capable SESSION.
+
+A private conversation can only target its peer or the current user.  Group
+targets are established by the message-sender or native member-selection
+paths before reaching this validator."
+  (unless (qq-chat--poke-target-id-p target-id)
+    (user-error "qq: poke target is not a valid QQ user"))
+  (when (eq (alist-get 'type session) 'private)
+    (let ((peer-id (alist-get 'target-id session))
+          (self-id (qq-state-self-user-id)))
+      (unless (or (equal target-id peer-id)
+                  (and (qq-chat--poke-target-id-p self-id)
+                       (equal target-id self-id)))
+        (user-error "qq: private poke target must be the peer or self"))))
+  target-id)
+
+(defun qq-chat--send-poke-to (session-key target-id)
+  "Poke TARGET-ID in SESSION-KEY using the strict peer/target contract."
+  (qq-chat--validate-poke-target
+   (qq-chat--poke-session session-key) target-id)
+  (qq-api-send-poke
+   session-key target-id
+   (lambda (_response)
+     (message "qq: poke sent"))))
+
+(defun qq-chat--poke-sender-at-point ()
+  "Return the QQ user ID of the message sender at point.
+
+Only `sender-id' has this meaning.  In particular, a message's `target-id'
+denotes its conversation peer (or a poke decoration target), so it must not
+be used to infer the sender."
+  (let* ((message (or (qq-chat--message-at-point)
+                      (user-error "qq: no message at point")))
+         (sender-id (alist-get 'sender-id message)))
+    (unless (qq-chat--poke-target-id-p sender-id)
+      (user-error "qq: message sender cannot be poked"))
+    sender-id))
+
+(defun qq-chat-poke-sender ()
+  "Poke the sender of the message at point.
+
+This works for both another user and the current user's own messages."
   (interactive)
-  (let* ((session (qq-chat--session))
-         (type (and session (alist-get 'type session)))
-         (message (ignore-errors (qq-chat--message-at-point)))
-         (message-target
-          (and message
-               (or (alist-get 'target-id message)
-                   (and (not (alist-get 'self-p message))
-                        (alist-get 'sender-id message)))))
-         (target
-          (if (eq type 'group)
-              (or target-id message-target (read-string "Poke QQ: "))
-            target-id)))
-    (unless qq-chat--session-key
-      (user-error "qq: this buffer is not bound to a session"))
-    (when (and (eq type 'group)
-               (string-empty-p (string-trim (or target ""))))
-      (user-error "qq: group poke requires a target QQ"))
-    (qq-api-send-poke
-     qq-chat--session-key
-     target
-     (lambda (_response)
-       (message "qq: poke sent")))))
+  (qq-chat--send-poke-to
+   qq-chat--session-key
+   (qq-chat--poke-sender-at-point)))
+
+(defun qq-chat-send-poke (&optional target-id)
+  "Choose and poke TARGET-ID in the current chat.
+
+Interactive private chats offer the peer and the current user.  Interactive
+group chats search the native member directory and then require an explicit
+member choice.  A non-nil programmatic TARGET-ID bypasses the chooser but is
+still validated by the strict API contract."
+  (interactive)
+  (let* ((session-key qq-chat--session-key)
+         (session (qq-chat--poke-session session-key)))
+    (if target-id
+        (qq-chat--send-poke-to session-key target-id)
+      (let* ((buffer (current-buffer))
+             (message (ignore-errors (qq-chat--message-at-point)))
+             (sender-id (alist-get 'sender-id message))
+             (initial-user-id
+              (and (eq (alist-get 'type session) 'group)
+                   (qq-chat--poke-target-id-p sender-id)
+                   sender-id)))
+        (qq-completion-read-poke-target
+         session-key
+         (lambda (selected-user-id)
+           (when (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (when (equal qq-chat--session-key session-key)
+                 (qq-chat--send-poke-to session-key selected-user-id)))))
+         initial-user-id)))))
 
 (defvar qq-chat-mode-map
   (let ((map (make-sparse-keymap)))
@@ -3257,9 +3318,9 @@ sender."
 (define-derived-mode qq-chat-mode nil "QQ-Chat"
   "Major mode for emacs-qq chat buffers.
 
-Message actions use point + keys (`r'/`d'/`!'/`o'/`a' on the timeline) or
+Message actions use point + keys (`r'/`d'/`!'/`P'/`o'/`a' on the timeline) or
 `qq-chat-message-transient' (`C-c m' / timeline `m').  Chat-wide commands
-  are in `qq-chat-transient' (`C-c ?' / timeline `?').
+are in `qq-chat-transient' (`C-c ?' / timeline `?').
 Attach from clipboard with `C-c C-v' (telega-style)."
   (appkit-chatbuf-mode-setup)
   ;; Keep vertically sliced two-line avatars visually contiguous.

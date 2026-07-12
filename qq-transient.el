@@ -44,6 +44,23 @@
   "Return non-nil when there is no message under point."
   (null (qq-transient--message-at-point)))
 
+(defun qq-transient--poke-session-inapt-p ()
+  "Return non-nil when the current conversation cannot send pokes."
+  (condition-case nil
+      (progn
+        (qq-chat--poke-session qq-chat--session-key)
+        nil)
+    (user-error t)))
+
+(defun qq-transient--poke-sender-inapt-p ()
+  "Return non-nil when the message sender at point cannot be poked."
+  (or (qq-transient--poke-session-inapt-p)
+      (condition-case nil
+          (progn
+            (qq-chat--poke-sender-at-point)
+            nil)
+        (user-error t))))
+
 (defun qq-transient--reply-inapt-p ()
   "Return non-nil when reply is unavailable for the message at point."
   (let ((message (qq-transient--message-at-point)))
@@ -205,6 +222,8 @@ Prefer this over inline button rows."
      :inapt-if qq-transient--recall-inapt-p)
     ("!" "React…" qq-chat-react-to-message
      :inapt-if qq-transient--reaction-inapt-p)
+    ("P" "Poke sender" qq-chat-poke-sender
+     :inapt-if qq-transient--poke-sender-inapt-p)
     ("a" "Open avatar" qq-chat-open-avatar-at-point
      :inapt-if qq-transient--avatar-inapt-p)
     ("i" "User page" qq-chat-open-user-at-point
@@ -249,7 +268,8 @@ Prefer this over inline button rows."
     ("/" "Search" qq-chat-search)
     ("n" "Search next" qq-chat-search-next)
     ("p" "Search prev" qq-chat-search-prev)
-    ("P" "Poke" qq-chat-send-poke)
+    ("P" "Poke user…" qq-chat-send-poke
+     :inapt-if qq-transient--poke-session-inapt-p)
     ("R" "Mark read" qq-chat-read-all)
     ("v" "Forward marked" qq-chat-forward-marked-messages
      :inapt-if qq-transient--forward-marked-inapt-p)

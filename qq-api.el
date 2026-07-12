@@ -1236,57 +1236,67 @@ When REPLY-TO-MESSAGE-ID is non-nil, send the text as a reply."
    (qq-api--send-text-segments text reply-to-message-id)
    text))
 
-(defun qq-api-send-poke (session-key &optional target-id callback errback)
-  "Send a poke to SESSION-KEY, optionally targeting TARGET-ID.
+(defun qq-api--poke-id-p (value)
+  "Return non-nil when VALUE is a nonzero decimal poke identity."
+  (and (qq-api-user-id-p value)
+       (string-match-p "[1-9]" value)))
 
-Private chats poke the peer.  Group chats require TARGET-ID, normally the
-sender of the message at point.  A successful action is reflected locally as
-a poke notice; a matching websocket notice is deduplicated by its local
-second-level anchor."
-  (let* ((session (qq-state-session session-key))
-         (type (or (and session (alist-get 'type session))
-                   (qq-state-session-key-type session-key)))
-         (peer-id (qq-state-session-key-target-id session-key))
-         (target (if (eq type 'group)
-                     target-id
-                   (or target-id
-                       (and session (alist-get 'target-id session))
-                       peer-id)))
-         (params
-          (pcase type
-            ('group
-             (unless (qq-api-user-id-p target)
-               (user-error "qq: group poke requires a decimal target QQ"))
-             `((group_id . ,peer-id) (user_id . ,target)))
-            ('private
-             (unless (qq-api-user-id-p target)
-               (user-error "qq: private poke requires a decimal peer QQ"))
-             `((user_id . ,target)))
-            (_
-             (user-error "qq: poke is unsupported for %s sessions" type)))))
-    (qq-api-call
-     "send_poke"
-     params
-     (lambda (response)
-       (when-let* ((self-id (qq-state-self-user-id)))
-         (qq-state-apply-poke-notice
-          `((time . ,(truncate (float-time)))
-            (emacs_local_p . t)
-            (post_type . "notice")
-            (notice_type . "notify")
-            (sub_type . "poke")
-            ,@(if (eq type 'group)
-                  `((group_id . ,peer-id)
-                    (user_id . ,self-id)
-                    (target_id . ,target))
-                `((user_id . ,target)
-                  (sender_id . ,self-id)
-                  (target_id . ,target))))))
-       (when callback
-         (funcall callback response)))
-     (or errback
-         (lambda (response reason)
-           (qq-api--default-error response reason))))))
+(defun qq-api-send-poke (session-key target-id &optional callback errback)
+  "Send a poke in SESSION-KEY to TARGET-ID.
+
+SESSION-KEY must name an existing private or group session.  Its stored peer
+identity always determines the conversation; TARGET-ID only determines who is
+poked.  A successful action is reflected locally as a poke notice; a matching
+websocket notice is deduplicated by its local second-level anchor."
+  (let ((session (qq-state-session session-key)))
+    (unless session
+      (user-error "qq: poke requires an existing session"))
+    (unless (qq-api--poke-id-p target-id)
+      (user-error "qq: poke target must be a nonzero decimal QQ string"))
+    (let* ((type (alist-get 'type session))
+           (peer-id (alist-get 'target-id session))
+           (params
+            (pcase type
+              ('group
+               (unless (and (qq-api-group-id-p peer-id)
+                            (qq-api--poke-id-p peer-id))
+                 (user-error
+                  "qq: group poke requires a nonzero decimal session peer"))
+               `((group_id . ,peer-id)
+                 (user_id . ,target-id)
+                 (target_id . ,target-id)))
+              ('private
+               (unless (qq-api--poke-id-p peer-id)
+                 (user-error
+                  "qq: private poke requires a nonzero decimal session peer"))
+               `((user_id . ,peer-id)
+                 (target_id . ,target-id)))
+              (_
+               (user-error
+                "qq: poke is unsupported for %s sessions" type)))))
+      (qq-api-call
+       "send_poke"
+       params
+       (lambda (response)
+         (when-let* ((self-id (qq-state-self-user-id)))
+           (qq-state-apply-poke-notice
+            `((time . ,(truncate (float-time)))
+              (emacs_local_p . t)
+              (post_type . "notice")
+              (notice_type . "notify")
+              (sub_type . "poke")
+              ,@(if (eq type 'group)
+                    `((group_id . ,peer-id)
+                      (user_id . ,self-id)
+                      (target_id . ,target-id))
+                  `((user_id . ,peer-id)
+                    (sender_id . ,self-id)
+                    (target_id . ,target-id))))))
+         (when callback
+           (funcall callback response)))
+       (or errback
+           (lambda (response reason)
+             (qq-api--default-error response reason)))))))
 
 (defun qq-api-delete-message (message-id)
   "Recall MESSAGE-ID (NT snowflake string) via NapCat and mark it recalled."
@@ -1488,12 +1498,21 @@ between 1 and 200."
          (let ((members (qq-api--response-data response)))
            (unless (listp members)
              (error "qq: emacs_search_group_members returned a non-list"))
-           (funcall callback
-                    (cl-loop for member in members
-                             for index from 0
-                             collect
-                             (qq-api--normalize-group-member-search-result
-                              member index))))
+           (let ((seen-user-ids (make-hash-table :test #'equal)))
+             (funcall
+              callback
+              (cl-loop
+               for member in members
+               for index from 0
+               for normalized =
+               (qq-api--normalize-group-member-search-result member index)
+               for user-id = (alist-get 'user_id normalized)
+               do (when (gethash user-id seen-user-ids)
+                    (error
+                     "qq: emacs_search_group_members returned duplicate user_id %s"
+                     user-id))
+               do (puthash user-id t seen-user-ids)
+               collect normalized))))
        (error
         (funcall (or errback #'qq-api--default-error)
                  response (error-message-string error-data)))))

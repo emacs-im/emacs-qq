@@ -66,11 +66,15 @@
                          'qq-chat-forward-marked-messages))
              (should (eq (key-binding (kbd "!") t)
                          'qq-chat-react-to-message))
+             (should (eq (key-binding (kbd "P") t)
+                         'qq-chat-poke-sender))
              (should (eq (key-binding (kbd "m") t) 'qq-chat-message-transient))
              (should (eq (key-binding (kbd "?") t) 'qq-chat-transient))
              (should (eq (key-binding (kbd "C-c /") t) 'qq-chat-search))
              (should (eq (key-binding (kbd "C-c m") t) 'qq-chat-message-transient))
              (should (eq (key-binding (kbd "C-c ?") t) 'qq-chat-transient))
+             (should (eq (key-binding (kbd "C-c P") t)
+                         'qq-chat-send-poke))
              (should (eq (key-binding (kbd "C-c C-a") t) 'qq-chat-attach-transient))
              (should (eq (key-binding (kbd "C-c C-v") t) 'qq-chat-attach-clipboard)))
          (when (buffer-live-p buffer)
@@ -964,6 +968,109 @@
            (qq-chat-react-to-message "178" message))
          (should (equal called
                         '("9007199254741004001" "178" t))))))))
+
+(ert-deftest qq-chat-poke-sender-uses-sender-not-message-target ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let ((at-point '((sender-id . "10002")
+                       (target-id . "20001")
+                       (self-p . t)))
+           call)
+       (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                  (lambda () at-point))
+                 ((symbol-function 'qq-api-send-poke)
+                  (lambda (session-key target-id &optional callback _errback)
+                    (setq call (list session-key target-id))
+                    (when callback (funcall callback nil)))))
+         (qq-chat-poke-sender))
+       (should (equal call '("group:20001" "10002")))))))
+
+(ert-deftest qq-chat-poke-sender-can-target-self-in-private-chat ()
+  (qq-chat-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "Me")))
+   (qq-state-upsert-session
+    "private:10002"
+    '((type . private) (title . "Peer")
+      (target-id . "10002") (peer-uin . "10002"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10002")
+     (let (call)
+       (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                  (lambda () '((sender-id . "90001") (self-p . t))))
+                 ((symbol-function 'qq-api-send-poke)
+                  (lambda (session-key target-id &optional _callback _errback)
+                    (setq call (list session-key target-id)))))
+         (qq-chat-poke-sender))
+       (should (equal call '("private:10002" "90001")))))))
+
+(ert-deftest qq-chat-send-poke-uses-explicit-member-chooser ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let (chooser-call api-call)
+       (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                  (lambda () '((sender-id . "10002")
+                               (target-id . "20001"))))
+                 ((symbol-function 'qq-completion-read-poke-target)
+                  (lambda (session-key callback &optional initial-user-id)
+                    (setq chooser-call (list session-key initial-user-id))
+                    (funcall callback "10003")))
+                 ((symbol-function 'qq-api-send-poke)
+                  (lambda (session-key target-id &optional _callback _errback)
+                    (setq api-call (list session-key target-id)))))
+         (qq-chat-send-poke))
+       (should (equal chooser-call '("group:20001" "10002")))
+       (should (equal api-call '("group:20001" "10003")))))))
+
+(ert-deftest qq-chat-poke-rejects-service-and-invalid-senders ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "service:u_mail"
+    '((type . service) (title . "Mail") (target-id . "u_mail"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "service:u_mail")
+     (should-error (qq-chat-send-poke "10002") :type 'user-error))
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                (lambda () '((sender-id . "0")))))
+       (should-error (qq-chat-poke-sender) :type 'user-error)))))
+
+(ert-deftest qq-chat-private-poke-rejects-third-party-target-before-api ()
+  (qq-chat-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "Me")))
+   (qq-state-upsert-session
+    "private:10002"
+    '((type . private) (title . "Peer") (target-id . "10002"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10002")
+     (let ((api-called nil))
+       (cl-letf (((symbol-function 'qq-api-send-poke)
+                  (lambda (&rest _args) (setq api-called t))))
+         (should-error (qq-chat-send-poke "77777") :type 'user-error))
+       (should-not api-called)))))
 
 (ert-deftest qq-chat-media-cache-update-targets-affected-message-anchors ()
   (qq-chat-test-with-reset
