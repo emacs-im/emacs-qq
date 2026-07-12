@@ -14,11 +14,13 @@
 (require 'seq)
 (require 'subr-x)
 (require 'appkit-chat-completion)
+(require 'appkit-chat-emoji)
 (require 'qq-api)
 (require 'qq-media)
 (require 'qq-state)
 
-(declare-function qq-chat--insert-input-segment-object "qq-chat" (segment))
+(declare-function qq-chat--insert-input-segment-object
+                  "qq-chat" (segment &optional visible-label))
 (declare-function qq-chat--sync-draft-from-buffer "qq-chat" ())
 
 (defvar-local qq-chat--session-key)
@@ -30,6 +32,9 @@
 
 (defvar-local qq-completion--member-pending nil
   "Query -> request metadata for in-flight native member searches.")
+
+(defvar-local qq-completion--custom-face-pending nil
+  "Current room-owned favorite-face cache request, or nil.")
 
 (defvar qq-completion--face-history nil
   "History for shared QQ base-face completion readers.")
@@ -185,27 +190,38 @@ When REOPEN is non-nil, reopen completion after a still-current response."
             (puthash query (plist-put pending :reopen t)
                      qq-completion--member-pending))
         (let ((buffer (current-buffer))
-              (session-key qq-chat--session-key))
-          (puthash query (list :reopen reopen) qq-completion--member-pending)
+              (session-key qq-chat--session-key)
+              (owner (list :reopen reopen)))
+          (puthash query owner qq-completion--member-pending)
           (qq-api-search-group-members
            group-id query
            (lambda (members)
-             (when (qq-completion--request-current-p
-                    buffer session-key group-id)
+             (when (buffer-live-p buffer)
                (with-current-buffer buffer
-                 (let ((request (gethash query qq-completion--member-pending)))
+                 (when (and (hash-table-p qq-completion--member-pending)
+                            (eq owner
+                                (gethash query
+                                         qq-completion--member-pending)))
                    (remhash query qq-completion--member-pending)
-                   (puthash query members qq-completion--member-cache)
-                   (when (plist-get request :reopen)
-                     (run-at-time
-                      0 nil #'qq-completion--maybe-reopen-member-completion
-                      buffer session-key group-id query))))))
+                   (when (qq-completion--request-current-p
+                          buffer session-key group-id)
+                     (puthash query members qq-completion--member-cache)
+                     (when (plist-get owner :reopen)
+                       (run-at-time
+                        0 nil #'qq-completion--maybe-reopen-member-completion
+                        buffer session-key group-id query)))))))
            (lambda (_response reason)
-             (when (qq-completion--request-current-p
-                    buffer session-key group-id)
+             (when (buffer-live-p buffer)
                (with-current-buffer buffer
-                 (remhash query qq-completion--member-pending)
-                 (message "qq: failed to search group members: %s" reason))))
+                 (when (and (hash-table-p qq-completion--member-pending)
+                            (eq owner
+                                (gethash query
+                                         qq-completion--member-pending)))
+                   (remhash query qq-completion--member-pending)
+                   (when (qq-completion--request-current-p
+                          buffer session-key group-id)
+                     (message "qq: failed to search group members: %s"
+                              reason))))))
            200))))))
 
 (defun qq-completion--cached-members (query)
@@ -234,6 +250,7 @@ When REOPEN is non-nil, reopen completion after a still-current response."
          (plist-get token :end)
          (qq-completion--member-candidates members)
          :insert-function #'qq-completion--insert-protocol-candidate
+         :suffix " "
          :sync-function #'qq-chat--sync-draft-from-buffer)))))
 
 (defun qq-completion--poke-user-id-p (value)
@@ -499,31 +516,136 @@ target without a matching canonical candidate."
                   (qq-media--face-completion-prefix id)))))
    (qq-media-face-completion-candidates)))
 
+(defconst qq-completion--custom-face-query-prefixes
+  '("fav" "favorite" "sticker" "收藏" "表情包")
+  "Explicit `/PREFIX' values that open visual favorite-face completion.")
+
+(defun qq-completion--custom-face-token ()
+  "Return the current explicit `/fav' favorite-face token, or nil."
+  (when-let* ((token (appkit-chat-completion-token-bounds ?/))
+              (query (downcase (plist-get token :query)))
+              ((seq-some (lambda (prefix)
+                           (string-prefix-p prefix query))
+                         qq-completion--custom-face-query-prefixes)))
+    token))
+
+(defun qq-completion--custom-face-request-current-p (buffer owner)
+  "Return non-nil when BUFFER still owns favorite-face request OWNER."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and (eq qq-completion--custom-face-pending owner)
+              (derived-mode-p 'qq-chat-mode)
+              (equal qq-chat--session-key (plist-get owner :session-key))))))
+
+(defun qq-completion--custom-face-request-owner-p (buffer owner)
+  "Return non-nil when OWNER still owns BUFFER's favorite-face request."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (eq qq-completion--custom-face-pending owner))))
+
+(defun qq-completion--clear-custom-face-owner (buffer owner)
+  "Forget OWNER in BUFFER without disturbing a newer favorite-face request."
+  (when (qq-completion--custom-face-request-owner-p buffer owner)
+    (with-current-buffer buffer
+      (setq qq-completion--custom-face-pending nil))
+    t))
+
+(defun qq-completion--maybe-reopen-custom-face-completion
+    (buffer owner)
+  "Reopen `/fav' completion in BUFFER for request OWNER."
+  (let ((current-p
+         (qq-completion--custom-face-request-current-p buffer owner))
+        (query (plist-get owner :query)))
+    (when (qq-completion--clear-custom-face-owner buffer owner)
+      (when (and current-p
+                 (get-buffer-window buffer t))
+        (with-selected-window (get-buffer-window buffer t)
+          (when-let* ((token (qq-completion--custom-face-token)))
+            (when (equal query (plist-get token :query))
+              (completion-at-point))))))))
+
+(defun qq-completion--request-custom-faces (query &optional reopen)
+  "Load favorite faces for QUERY and optionally REOPEN completion."
+  (if qq-completion--custom-face-pending
+      (progn
+        (setf (plist-get qq-completion--custom-face-pending :query) query)
+        (when reopen
+          (setf (plist-get qq-completion--custom-face-pending :reopen) t)))
+    (let* ((buffer (current-buffer))
+           (owner (list :session-key qq-chat--session-key
+                        :query query
+                        :reopen reopen)))
+      (setq qq-completion--custom-face-pending owner)
+      (qq-media-ensure-custom-faces
+       (lambda (_faces)
+         (cond
+          ((not (qq-completion--custom-face-request-owner-p buffer owner)))
+          ((not (qq-completion--custom-face-request-current-p buffer owner))
+           (qq-completion--clear-custom-face-owner buffer owner))
+          ((plist-get owner :reopen)
+           (run-at-time
+            0 nil #'qq-completion--maybe-reopen-custom-face-completion
+            buffer owner))
+          (t
+           (qq-completion--clear-custom-face-owner buffer owner))))
+       (lambda (_response reason)
+         (let ((current-p
+                (qq-completion--custom-face-request-current-p buffer owner)))
+           (when (qq-completion--clear-custom-face-owner buffer owner)
+             (when current-p
+               (message "qq: failed to load favorite faces: %s"
+                        reason)))))))))
+
 (defun qq-completion-face-capf ()
-  "CAPF for `/名称' QQ base faces."
+  "CAPF for `/名称' base faces and explicit `/fav' favorite faces."
   (when-let* ((token (appkit-chat-completion-token-bounds ?/)))
-    (appkit-chat-completion-capf
-     (plist-get token :start)
-     (plist-get token :end)
-     (qq-completion--base-face-candidates)
-     :insert-function #'qq-completion--insert-protocol-candidate
-     :sync-function #'qq-chat--sync-draft-from-buffer)))
+    (let* ((custom-p (qq-completion--custom-face-token))
+           (query (plist-get token :query))
+           (candidates
+            (if custom-p
+                (when (qq-media-custom-faces-loaded-p)
+                  (qq-completion--custom-face-candidates
+                   (qq-media-custom-faces)))
+              (qq-completion--base-face-candidates))))
+      (when (and custom-p (not (qq-media-custom-faces-loaded-p)))
+        (qq-completion--request-custom-faces query))
+      (when candidates
+        (appkit-chat-completion-capf
+         (plist-get token :start)
+         (plist-get token :end)
+         candidates
+         :insert-function #'qq-completion--insert-protocol-candidate
+         :sync-function #'qq-chat--sync-draft-from-buffer)))))
+
+(defun qq-completion-unicode-emoji-capf ()
+  "CAPF for shared standard Unicode `:emoji_name:' completion."
+  (appkit-chat-emoji-capf
+   :sync-function #'qq-chat--sync-draft-from-buffer))
 
 (defun qq-completion--custom-face-candidates (faces)
   "Return shared completion candidates for favorite FACES."
-  (cl-loop for face in faces
+  (cl-loop for face in (seq-filter #'qq-media-custom-face-sendable-p faces)
            for index from 0
            collect
            (let ((current (copy-tree face)))
              (appkit-chat-completion-candidate-create
               :label (qq-media-custom-face-label current index)
-              :value `(:kind custom-face :face ,current
-                       :segment ,(qq-media-custom-face-to-segment current))
+              :value `(:kind custom-face :face ,current)
               :search-terms
-              (delq nil (list (alist-get 'desc current)
-                              (alist-get 'md5 current)
-                              (and (alist-get 'emo_id current)
-                                   (format "%s" (alist-get 'emo_id current)))))
+              (let* ((desc (alist-get 'desc current))
+                     (desc (and (stringp desc) (string-trim desc))))
+                (delq nil
+                      (append
+                       qq-completion--custom-face-query-prefixes
+                       (and (not (string-empty-p (or desc "")))
+                            (mapcar (lambda (prefix)
+                                      (concat prefix desc))
+                                    qq-completion--custom-face-query-prefixes))
+                       (list desc
+                             (alist-get 'md5 current)
+                             (and (alist-get 'emo_id current)
+                                  (format "%s"
+                                          (alist-get 'emo_id current)))))))
               :prefix (lambda (_candidate)
                         (qq-media--custom-face-completion-prefix current))))))
 
@@ -551,10 +673,16 @@ target without a matching canonical candidate."
 (defun qq-completion--insert-protocol-candidate (candidate)
   "Insert protocol segment carried by appkit CANDIDATE."
   (let* ((value (appkit-chat-completion-candidate-value candidate))
-         (segment (plist-get value :segment)))
+         (kind (plist-get value :kind))
+         (face (and (eq kind 'custom-face) (plist-get value :face)))
+         (segment (if face
+                      (qq-media-custom-face-to-segment face)
+                    (plist-get value :segment)))
+         (visible-label
+          (when face (qq-media-custom-face-display-string face))))
     (unless segment
       (error "qq: completion candidate has no protocol segment"))
-    (qq-chat--insert-input-segment-object segment)))
+    (qq-chat--insert-input-segment-object segment visible-label)))
 
 (defun qq-completion-complete ()
   "Complete the current QQ composer token.
@@ -563,16 +691,28 @@ Cold native member searches are started asynchronously and reopen completion
 only while buffer, session, and token still match."
   (interactive)
   (when (appkit-chatbuf-point-in-input-p)
-    (if-let* ((token (qq-completion--member-token))
-              (query (plist-get token :query))
-              ((eq (qq-completion--cached-members query)
-                   qq-completion--cache-miss))
-              ((null (qq-completion--member-fallback query))))
-        (progn
-          (qq-completion--request-members query t)
-          (message "qq: loading matching group members…")
-          t)
-      (appkit-chat-completion-complete))))
+    (cond
+     ((and (qq-completion--custom-face-token)
+           (not (qq-media-custom-faces-loaded-p)))
+      (qq-completion--request-custom-faces
+       (plist-get (qq-completion--custom-face-token) :query) t)
+      (message "qq: loading favorite faces…")
+      t)
+     ((and (qq-completion--custom-face-token)
+           (qq-media-custom-faces-loaded-p)
+           (null (qq-media-custom-faces)))
+      (message "qq: favorite faces are empty")
+      t)
+     ((if-let* ((token (qq-completion--member-token))
+                (query (plist-get token :query))
+                ((eq (qq-completion--cached-members query)
+                     qq-completion--cache-miss))
+                ((null (qq-completion--member-fallback query))))
+          (progn
+            (qq-completion--request-members query t)
+            (message "qq: loading matching group members…")
+            t)
+        (appkit-chat-completion-complete))))))
 
 (defun qq-completion-preload-members ()
   "Warm the broad native member cache for the current group chat."
@@ -586,11 +726,14 @@ only while buffer, session, and token still match."
   (qq-completion--cancel-poke-request)
   (setq-local qq-completion--member-cache (make-hash-table :test #'equal))
   (setq-local qq-completion--member-pending (make-hash-table :test #'equal))
+  (setq-local qq-completion--custom-face-pending nil)
   (setq-local qq-completion--poke-request nil)
   (add-hook 'kill-buffer-hook #'qq-completion--cancel-poke-request nil t)
   (add-hook 'change-major-mode-hook #'qq-completion--cancel-poke-request nil t)
   (appkit-chat-completion-setup
-   :capf-functions '(qq-completion-member-capf qq-completion-face-capf)
+   :capf-functions '(qq-completion-member-capf
+                     qq-completion-face-capf
+                     qq-completion-unicode-emoji-capf)
    :append t))
 
 (provide 'qq-completion)

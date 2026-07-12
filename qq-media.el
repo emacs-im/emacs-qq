@@ -1243,6 +1243,12 @@ Metadata:
 (defvar qq-media--custom-faces-fetched-at nil
   "Float time when `qq-media--custom-faces' was last fetched.")
 
+(defvar qq-media--custom-face-waiters nil
+  "Callbacks waiting for the shared favorite-face refresh.")
+
+(defvar qq-media--custom-face-refresh-owner nil
+  "Non-nil owner object while a favorite-face refresh is in flight.")
+
 (defun qq-media--json-truthy-p (value)
   "Return non-nil when JSON VALUE is a true-ish flag (not :false/:null)."
   (and value
@@ -1289,6 +1295,10 @@ With FORCE non-nil, ignore the cache (caller should still refresh via
   (unless force
     qq-media--custom-faces))
 
+(defun qq-media-custom-faces-loaded-p ()
+  "Return non-nil after the favorite-face cache has been fetched."
+  (numberp qq-media--custom-faces-fetched-at))
+
 (defun qq-media-refresh-custom-faces (&optional callback errback count)
   "Fetch favorite custom faces from NapCat and cache them.
 
@@ -1321,6 +1331,61 @@ favorites libraries are not silently truncated at 96/page-size."
              (funcall callback faces)))))
      errback
      req)))
+
+(defun qq-media--finish-custom-face-waiters (faces)
+  "Finish all shared favorite-face waiters successfully with FACES."
+  (let ((waiters (prog1 (nreverse qq-media--custom-face-waiters)
+                   (setq qq-media--custom-face-waiters nil
+                         qq-media--custom-face-refresh-owner nil))))
+    (dolist (waiter waiters)
+      (when-let* ((callback (car waiter)))
+        (condition-case err
+            (funcall callback faces)
+          (error
+           (message "qq: favorite-face callback failed: %s"
+                    (error-message-string err))))))))
+
+(defun qq-media--fail-custom-face-waiters (response reason)
+  "Fail all shared favorite-face waiters with RESPONSE and REASON."
+  (let ((waiters (prog1 (nreverse qq-media--custom-face-waiters)
+                   (setq qq-media--custom-face-waiters nil
+                         qq-media--custom-face-refresh-owner nil))))
+    (dolist (waiter waiters)
+      (when-let* ((errback (cdr waiter)))
+        (condition-case err
+            (funcall errback response reason)
+          (error
+           (message "qq: favorite-face errback failed: %s"
+                    (error-message-string err))))))))
+
+(defun qq-media-ensure-custom-faces (&optional callback errback force)
+  "Call CALLBACK with the authoritative favorite-face cache.
+
+Coalesce concurrent NapCat requests and notify every waiter.  ERRBACK receives
+the transport response and reason.  With FORCE non-nil, refresh even when the
+cache was already loaded."
+  (if (and (not force) (qq-media-custom-faces-loaded-p))
+      (progn
+        (when callback
+          (funcall callback (qq-media-custom-faces)))
+        t)
+    (push (cons callback errback) qq-media--custom-face-waiters)
+    (unless qq-media--custom-face-refresh-owner
+      (let ((owner (list :token nil)))
+        (setq qq-media--custom-face-refresh-owner owner)
+        (condition-case err
+            (let ((token
+                   (qq-media-refresh-custom-faces
+                    #'qq-media--finish-custom-face-waiters
+                    #'qq-media--fail-custom-face-waiters)))
+              ;; Test transports may complete synchronously and clear OWNER.
+              (when (eq qq-media--custom-face-refresh-owner owner)
+                (setf (plist-get owner :token) token)))
+          (error
+           (when (eq qq-media--custom-face-refresh-owner owner)
+             (qq-media--fail-custom-face-waiters
+              nil (error-message-string err)))))))
+    qq-media--custom-face-refresh-owner))
 
 (defun qq-media-custom-face-id (face)
   "Return a stable string id for favorite FACE alist."
@@ -1381,6 +1446,18 @@ even when several favorites share an empty `desc'."
          (fallback (qq-media-custom-face-label face)))
     (qq-media--image-display-string image fallback)))
 
+(defun qq-media-custom-face-sendable-p (face)
+  "Return non-nil when favorite FACE has a valid outbound resource."
+  (when (qq-media--face-alist-p face)
+    (let ((mark (qq-media--json-truthy-p (alist-get 'is_mark_face face)))
+          (e-id (alist-get 'e_id face))
+          (url (alist-get 'url face)))
+      (or (and mark
+               (stringp e-id)
+               (not (string-empty-p e-id)))
+          (qq-media-custom-face-file face)
+          (appkit-media-url-present-p url)))))
+
 (defvar qq-media--custom-face-completion-pairs nil
   "Active `(LABEL . FACE)' pairs for the favorite-face completing-read.")
 
@@ -1389,7 +1466,8 @@ even when several favorites share an empty `desc'."
 
 Each entry is `(LABEL . FACE)'.  Labels are unique (md5 + index).
 Order follows the NapCat favorites list (not re-sorted by string)."
-  (let ((faces (or faces qq-media--custom-faces))
+  (let ((faces (seq-filter #'qq-media-custom-face-sendable-p
+                           (or faces qq-media--custom-faces)))
         (candidates nil)
         (i 0))
     (dolist (face faces)

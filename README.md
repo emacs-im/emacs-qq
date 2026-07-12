@@ -25,9 +25,12 @@ Then run `M-x qq`.
 In a group composer, type `@` followed by a group card, nickname, QID, or QQ
 number and press `TAB`.  The selected row is stored as a real QQ `at` segment,
 so it notifies the member; plain typed text is never treated as a mention.
-Type `/` plus a QQ face name and press `TAB` for inline base-face completion.
-`C-c C-e` opens the image-annotated base-face picker, while
-`C-u C-c C-e` opens favorite faces.
+Type `/` plus a QQ face name and press `TAB` for inline base-face completion;
+type `/fav` (optionally followed by a description) for the visual favorite-face
+list.  Favorite selection inserts a real image/mface object while preserving
+its thumbnail in the composer.  `:unicode_name:` completes standard Unicode
+emoji through Appkit.  `C-c C-e` opens the image-annotated base-face picker,
+while `C-u C-c C-e` opens favorite faces directly.
 
 Desktop notifications follow telega's opt-in global minor-mode model:
 

@@ -76,6 +76,7 @@
                      (alist-get 'qq (alist-get 'data segment))))
       (should (equal "Alice Card"
                      (alist-get 'name (alist-get 'data segment)))))
+    (should (string-suffix-p " " (appkit-chatbuf-input-string)))
     (should (equal '(((type . "at")
                       (data . ((qq . "10001") (name . "Alice Card")))))
                    (qq-chat--current-input-segments)))))
@@ -409,8 +410,8 @@
       (should (equal "178" (alist-get 'id (alist-get 'data segment)))))))
 
 (ert-deftest qq-completion-custom-face-prefixes-keep-per-candidate-face ()
-  (let ((faces '(((md5 . "one") (file . "/tmp/one.png"))
-                 ((md5 . "two") (file . "/tmp/two.png")))))
+  (let ((faces '(((md5 . "one") (url . "https://example.invalid/one.png"))
+                 ((md5 . "two") (url . "https://example.invalid/two.png")))))
     (cl-letf (((symbol-function 'qq-media-custom-face-to-segment)
                (lambda (face)
                  `((type . "image") (data . ((name . ,(alist-get 'md5 face)))))))
@@ -426,6 +427,122 @@
                     candidate))
                  candidates)))))))
 
+(ert-deftest qq-completion-fav-capf-inserts-thumbnail-backed-segment ()
+  (qq-completion-test-with-group
+    (let ((old-faces qq-media--custom-faces)
+          (old-fetched-at qq-media--custom-faces-fetched-at)
+          (face '((md5 . "abcdef123456")
+                  (desc . "趴")
+                  (emo_id . 2)
+                  (is_mark_face . :false)
+                  (url . "https://example.invalid/favorite.png"))))
+      (unwind-protect
+          (cl-letf (((symbol-function 'qq-media-custom-face-display-string)
+                     (lambda (_face)
+                       (propertize "favorite" 'display 'favorite-image))))
+            (setq qq-media--custom-faces (list face)
+                  qq-media--custom-faces-fetched-at (float-time))
+            (insert "/fav趴")
+            (let* ((capf (qq-completion-face-capf))
+                   (table (nth 2 capf))
+                   (exit (plist-get (nthcdr 3 capf) :exit-function))
+                   (label (car (all-completions "/fav趴" table))))
+              (should (stringp label))
+              (delete-region (- (point) 5) (point))
+              (insert label)
+              (funcall exit label 'finished))
+            (goto-char (appkit-chatbuf-input-start-position))
+            (let* ((object (appkit-chatbuf-input-object-at-point))
+                   (segment (plist-get object :segment)))
+              (should (equal "image" (alist-get 'type segment)))
+              (should (= 1 (alist-get 'sub_type (alist-get 'data segment))))
+              (should (eq 'favorite-image
+                          (get-text-property 0 'display
+                                             (plist-get object :label))))))
+        (setq qq-media--custom-faces old-faces
+              qq-media--custom-faces-fetched-at old-fetched-at)))))
+
+(ert-deftest qq-completion-unicode-emoji-capf-inserts-plain-text ()
+  (qq-completion-test-with-group
+    (insert ":rocket:")
+    (let ((appkit-chat-emoji--candidates
+           (list
+            (appkit-chat-completion-candidate-create
+             :label ":rocket:"
+             :insert "🚀"))))
+      (let* ((capf (qq-completion-unicode-emoji-capf))
+             (exit (plist-get (nthcdr 3 capf) :exit-function)))
+        (should capf)
+        (funcall exit ":rocket:" 'finished)
+        (should (equal "🚀" (appkit-chatbuf-input-string)))))))
+
+(ert-deftest qq-completion-cold-fav-tab-owns-reopen-request ()
+  (qq-completion-test-with-group
+    (insert "/fav")
+    (let (success scheduled)
+      (cl-letf (((symbol-function 'qq-media-custom-faces-loaded-p)
+                 (lambda () nil))
+                ((symbol-function 'qq-media-refresh-custom-faces)
+                 (lambda (callback &optional _errback _count)
+                   (setq success callback)))
+                ((symbol-function 'run-at-time)
+                 (lambda (delay repeat function &rest args)
+                   (setq scheduled (list delay repeat function args))
+                   'timer)))
+        (should (qq-completion-complete))
+        (should qq-completion--custom-face-pending)
+        (funcall success '(((md5 . "one"))))
+        (should (eq #'qq-completion--maybe-reopen-custom-face-completion
+                    (nth 2 scheduled)))))))
+
+(ert-deftest qq-completion-favorite-request-tracks-latest-query ()
+  (qq-completion-test-with-group
+    (let (success scheduled)
+      (cl-letf (((symbol-function 'qq-media-ensure-custom-faces)
+                 (lambda (callback &optional _errback)
+                   (setq success callback)
+                   'request-token))
+                ((symbol-function 'run-at-time)
+                 (lambda (delay repeat function &rest args)
+                   (setq scheduled (list delay repeat function args))
+                   'timer)))
+        (qq-completion--request-custom-faces "fav" t)
+        (let ((owner qq-completion--custom-face-pending))
+          (qq-completion--request-custom-faces "fav趴" t)
+          (should (eq owner qq-completion--custom-face-pending))
+          (should (equal "fav趴" (plist-get owner :query)))
+          (funcall success nil)
+          (should (eq #'qq-completion--maybe-reopen-custom-face-completion
+                      (nth 2 scheduled)))
+          (should (equal (list (current-buffer) owner)
+                         (nth 3 scheduled))))))))
+
+(ert-deftest qq-completion-favorite-aliases-filter-by-description ()
+  (let* ((face '((md5 . "one")
+                 (desc . "趴")
+                 (url . "https://example.invalid/one.png")))
+         (candidate (car (qq-completion--custom-face-candidates (list face)))))
+    (dolist (alias qq-completion--custom-face-query-prefixes)
+      (should
+       (appkit-chat-completion--candidate-matches-p
+        candidate (concat "/" alias "趴"))))))
+
+(ert-deftest qq-completion-favorite-candidates-exclude-unsendable-faces ()
+  (let ((candidates
+         (qq-completion--custom-face-candidates
+          '("malformed"
+            ((md5 . "bad") (desc . "broken"))
+            ((md5 . "good")
+             (desc . "works")
+             (url . "https://example.invalid/good.png"))))))
+    (should (= 1 (length candidates)))
+    (should (equal "good"
+                   (alist-get
+                    'md5
+                    (plist-get
+                     (appkit-chat-completion-candidate-value (car candidates))
+                     :face))))))
+
 (ert-deftest qq-completion-cold-member-tab-owns-reopen-request ()
   (qq-completion-test-with-group
     (insert "@missing")
@@ -435,6 +552,34 @@
       (should (qq-completion-complete)))
     (should (plist-get (gethash "missing" qq-completion--member-pending)
                        :reopen))))
+
+(ert-deftest qq-completion-stale-member-response-clears-only-its-owner ()
+  (qq-completion-test-with-group
+    (let (success)
+      (cl-letf (((symbol-function 'qq-api-search-group-members)
+                 (lambda (_group-id _query callback &optional _errback _limit)
+                   (setq success callback)
+                   'request-token)))
+        (qq-completion--request-members "alice"))
+      (should (gethash "alice" qq-completion--member-pending))
+      (setq-local qq-chat--session-key "group:other")
+      (funcall success (list qq-completion-test--member))
+      (should-not (gethash "alice" qq-completion--member-pending))
+      (should (eq qq-completion--cache-miss
+                  (qq-completion--cached-members "alice"))))))
+
+(ert-deftest qq-completion-stale-favorite-response-clears-its-owner ()
+  (qq-completion-test-with-group
+    (let (success)
+      (cl-letf (((symbol-function 'qq-media-ensure-custom-faces)
+                 (lambda (callback &optional _errback)
+                   (setq success callback)
+                   'request-token)))
+        (qq-completion--request-custom-faces "fav"))
+      (should qq-completion--custom-face-pending)
+      (setq-local qq-chat--session-key "group:other")
+      (funcall success nil)
+      (should-not qq-completion--custom-face-pending))))
 
 (ert-deftest qq-completion-mode-binds-telega-style-completion-keys ()
   (should (eq (lookup-key qq-chat-mode-map (kbd "TAB")) #'qq-chat-complete))

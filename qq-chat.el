@@ -1445,8 +1445,8 @@ Bound via `qq-chat-attach-emoji' (`C-c C-e'); attach transient `e'."
 (defun qq-chat--pick-custom-face (faces)
   "Completing-read among FACES and insert the chosen favorite.
 
-Uses `qq-media-custom-face-completion-table' so candidates keep favorites
-order and show local thumb previews (same treatment as base faces)."
+Uses the shared Appkit candidate layer so favorites keep NapCat order and show
+local thumb previews with the same treatment as composer completion."
   (unless faces
     (user-error "qq: no favorite custom faces (收藏表情为空)"))
   (qq-chat--insert-custom-face (qq-completion-read-custom-face faces)))
@@ -1457,26 +1457,25 @@ order and show local thumb previews (same treatment as base faces)."
 Uses NapCat `fetch_custom_face_info'.  Personal favorites are sent as
 image segments with `sub_type' 1; market favorites as mface when possible.
 
-With prefix FORCE-REFRESH, re-fetch the list from NapCat.
+  With prefix FORCE-REFRESH, re-fetch the list from NapCat.
 Bound via `C-u C-c C-e' or attach transient `E'."
   (interactive "P")
-  (let ((cached (and (not force-refresh) (qq-media-custom-faces)))
-        (buffer (current-buffer))
+  (let ((buffer (current-buffer))
         (session-key qq-chat--session-key))
-    (if cached
-        (qq-chat--pick-custom-face cached)
-      (message "qq: loading favorite faces…")
-      (qq-media-refresh-custom-faces
-       (lambda (faces)
-         (when (and (buffer-live-p buffer)
-                    (with-current-buffer buffer
-                      (equal qq-chat--session-key session-key)))
-           (with-current-buffer buffer
-             (condition-case err
-                 (qq-chat--pick-custom-face faces)
-               (error (message "%s" (error-message-string err)))))))
-       (lambda (_response reason)
-         (message "qq: failed to load favorites: %s" reason))))))
+    (unless (and (not force-refresh) (qq-media-custom-faces-loaded-p))
+      (message "qq: loading favorite faces…"))
+    (qq-media-ensure-custom-faces
+     (lambda (faces)
+       (when (and (buffer-live-p buffer)
+                  (with-current-buffer buffer
+                    (equal qq-chat--session-key session-key)))
+         (with-current-buffer buffer
+           (condition-case err
+               (qq-chat--pick-custom-face faces)
+             (error (message "%s" (error-message-string err)))))))
+     (lambda (_response reason)
+       (message "qq: failed to load favorites: %s" reason))
+     force-refresh)))
 
 (defun qq-chat-attach-emoji (&optional custom-p)
   "Attach a QQ emoji into the composer.

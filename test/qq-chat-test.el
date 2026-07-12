@@ -1316,7 +1316,8 @@
                   (is_mark_face . :false)
                   (e_id . "")
                   (ep_id . "0")))
-          (qq-media--custom-faces (list face)))
+          (qq-media--custom-faces (list face))
+          (qq-media--custom-faces-fetched-at (float-time)))
      (unwind-protect
          (progn
            (with-temp-file file (insert "jpg"))
