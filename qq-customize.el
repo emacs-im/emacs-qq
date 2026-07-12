@@ -319,6 +319,11 @@ Chat timelines rescale these resources to the shared two-text-line geometry."
   :type 'integer
   :group 'qq)
 
+(defcustom qq-media-animated-face-image-height 64
+  "Pixel height used for animated QQ base faces in chat buffers."
+  :type 'integer
+  :group 'qq)
+
 (defcustom qq-media-poke-image-height 28
   "Maximum pixel height used for decorative poke action images."
   :type 'integer

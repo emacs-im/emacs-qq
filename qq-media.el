@@ -16,6 +16,8 @@
 (require 'qq-api)
 (require 'qq-customize)
 
+(defvar qq-media-animated-face-image-height)
+
 (defvar qq-media-cache-update-hook nil
   "Hook run after media resource/image cache updates.")
 
@@ -142,7 +144,17 @@ SPEC may be a numeric maximum height for compact decorative images."
 (defun qq-media--image-display-string (image fallback)
   "Return display string for IMAGE, or FALLBACK when IMAGE is nil."
   (if image
-      (propertize (or fallback " ") 'display image 'rear-nonsticky '(display))
+      (let ((render-image
+             (if (and (appkit-media-inline-animation-image-p image)
+                      (fboundp 'appkit-media--make-inline-animation-occurrence))
+                 (appkit-media--make-inline-animation-occurrence image)
+               image)))
+        (when (and (not (eq render-image image))
+                   (fboundp 'appkit-media--register-inline-animation-occurrence))
+          (appkit-media--register-inline-animation-occurrence render-image)
+          (appkit-media--install-inline-animation-discovery))
+        (propertize (or fallback " ") 'display render-image
+                    'rear-nonsticky '(display)))
     fallback))
 
 (defun qq-media--remote-image-cache-file-base (key)
@@ -1557,6 +1569,13 @@ cache; GIF is then handled by appkit's bounded inline-animation machinery."
                    (when (buffer-live-p (process-buffer process))
                      (kill-buffer (process-buffer process)))))))))))))
 
+(defun qq-media--face-image-from-file (file height)
+  "Create a base-face image from FILE, enlarging animated resources."
+  (let ((image (qq-media--image-from-file file height)))
+    (if (and image (appkit-media-inline-animation-image-p image))
+        (qq-media--image-from-file file qq-media-animated-face-image-height)
+      image)))
+
 (defun qq-media-face-image (emoji-id)
   "Return inline QQ base face image for EMOJI-ID.
 
@@ -1586,7 +1605,8 @@ Resolution order:
                 (setf (alist-get 'description resource) desc))
               (qq-media--prepare-animated-face-resource resource done)))
           error)))
-     qq-media-face-image-height)))
+     qq-media-face-image-height
+     #'qq-media--face-image-from-file)))
 
 (defun qq-media-face-display-string (emoji-id &optional description)
   "Return inline display string for QQ face EMOJI-ID.
