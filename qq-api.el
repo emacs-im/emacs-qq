@@ -1438,6 +1438,67 @@ reconciles it with the authoritative aggregate count."
                  response (error-message-string error-data)))))
    errback))
 
+(defun qq-api--normalize-group-member-search-result (member index)
+  "Validate and normalize native group MEMBER at INDEX."
+  (let ((context (format "emacs_search_group_members[%d]" index))
+        (keys '(user_id uid nickname card remark qid title role robot)))
+    (unless (qq-api--exact-object-keys-p member keys)
+      (error "qq: %s has invalid fields" context))
+    (unless (qq-api-user-id-p (alist-get 'user_id member))
+      (error "qq: %s.user_id must be an original decimal string" context))
+    (unless (qq-api-non-empty-string-p (alist-get 'uid member))
+      (error "qq: %s.uid must be a non-empty string" context))
+    (unless (stringp (alist-get 'nickname member))
+      (error "qq: %s.nickname must be a string" context))
+    (dolist (key '(card remark qid title))
+      (unless (or (null (alist-get key member))
+                  (stringp (alist-get key member)))
+        (error "qq: %s.%s must be a string or null" context key)))
+    (unless (member (alist-get 'role member)
+                    '("member" "admin" "owner" "stranger"))
+      (error "qq: %s.role is invalid" context))
+    (unless (memq (alist-get 'robot member) '(t :false))
+      (error "qq: %s.robot must be a boolean" context))
+    (let ((copy (copy-tree member)))
+      (setf (alist-get 'robot copy nil nil #'eq)
+            (eq (alist-get 'robot member) t))
+      copy)))
+
+(defun qq-api-search-group-members
+    (group-id query callback &optional errback limit)
+  "Search native members in GROUP-ID for QUERY and call CALLBACK.
+
+The fork-native action searches card, nickname, remark, QID and QQ number.
+Every returned identity is validated as an original string; there is no
+OneBot numeric member-list fallback.  LIMIT defaults server-side and may be
+between 1 and 200."
+  (unless (qq-api-group-id-p group-id)
+    (user-error "qq: group member search requires a decimal string group id"))
+  (unless (stringp query)
+    (user-error "qq: group member search query must be a string"))
+  (when (and limit (not (and (integerp limit) (<= 1 limit 200))))
+    (user-error "qq: group member search limit must be between 1 and 200"))
+  (qq-api-call
+   "emacs_search_group_members"
+   `((group_id . ,group-id)
+     (query . ,query)
+     ,@(when limit `((limit . ,limit))))
+   (lambda (response)
+     (condition-case error-data
+         (let ((members (qq-api--response-data response)))
+           (unless (listp members)
+             (error "qq: emacs_search_group_members returned a non-list"))
+           (funcall callback
+                    (cl-loop for member in members
+                             for index from 0
+                             collect
+                             (qq-api--normalize-group-member-search-result
+                              member index))))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   errback))
+
 (defun qq-api-get-base-emoji
     (emoji-id callback &optional errback emoji-type download hints)
   "Fetch QQ base emoji resource for EMOJI-ID and pass it to CALLBACK.

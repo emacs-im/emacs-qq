@@ -18,12 +18,14 @@
 (require 'appkit-invalidation)
 (require 'appkit-chat-avatar)
 (require 'appkit-chatbuf)
+(require 'appkit-chat-completion)
 (require 'appkit-chat-timeline)
 (require 'appkit-chat-ins)
 (require 'appkit-media)
 (require 'appkit-ui)
 (require 'appkit-view)
 (require 'qq-api)
+(require 'qq-completion)
 (require 'qq-customize)
 (require 'qq-media)
 (require 'qq-protocol)
@@ -1297,6 +1299,13 @@ Favorite stickers (`image' with sub_type 1, or mface) try local thumbs."
   (let* ((type (or (alist-get 'type segment) "segment"))
          (data (alist-get 'data segment)))
     (pcase type
+      ("at"
+       (let ((target (alist-get 'qq data))
+             (name (alist-get 'name data)))
+         (concat "@" (or name
+                          (and (equal target "all") "全体成员")
+                          target
+                          "mention"))))
       ("face"
        (let ((id (or (alist-get 'id data) "?")))
          (qq-media-face-display-string id)))
@@ -1352,8 +1361,11 @@ Favorite stickers (`image' with sub_type 1, or mface) try local thumbs."
   (when (eq (plist-get object :kind) 'qq-segment)
     (copy-tree (plist-get object :segment))))
 
-(defun qq-chat--insert-input-segment-object (segment)
-  "Insert outbound QQ SEGMENT into the current input region as one object."
+(defun qq-chat--insert-input-segment-object (segment &optional visible-label)
+  "Insert outbound QQ SEGMENT into the composer as one object.
+
+VISIBLE-LABEL overrides the segment-derived label, for example to retain a
+favorite face's local thumbnail alongside its sendable mface payload."
   (qq-chat--ensure-composer-visible)
   (unless (appkit-chatbuf-point-in-input-p)
     (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max))))
@@ -1363,6 +1375,9 @@ Favorite stickers (`image' with sub_type 1, or mface) try local thumbs."
                (and ch (not (memq ch '(32 9 10))))))
     (insert " "))
   (let* ((object (qq-chat--segment-input-object segment))
+         (object (if visible-label
+                     (plist-put object :label visible-label)
+                   object))
          (label (plist-get object :label)))
     (appkit-chatbuf-input-insert label :object object)
     (appkit-chatbuf-input-apply-text-properties)))
@@ -1386,21 +1401,12 @@ When SEGMENT-TYPE is nil, infer the most useful QQ segment type from PATH."
              (file-name-nondirectory path)
              type)))
 
-(defvar qq-chat--face-history nil
-  "Minibuffer history for `qq-chat-attach-face'.")
-
 (defun qq-chat--read-base-face-id (&optional prompt)
   "Prompt for and return one QQ base face id.
 
 PROMPT defaults to \"QQ face: \".  Completion uses the existing QQ face
 panel ordering, names, and local image affixation."
-  (let ((choice
-         (completing-read
-          (or prompt "QQ face: ")
-          (qq-media-face-completion-table)
-          nil t nil 'qq-chat--face-history)))
-    (or (qq-media-face-id-from-completion choice)
-        (user-error "qq: not a face candidate: %s" choice))))
+  (qq-completion-read-base-face-id prompt))
 
 (defun qq-chat-attach-face (&optional face-id)
   "Insert a QQ base face (system emoji) into the chat composer.
@@ -1427,13 +1433,11 @@ Bound via `qq-chat-attach-emoji' (`C-c C-e'); attach transient `e'."
              (or (qq-media-face-name id) id)
              id)))
 
-(defvar qq-chat--custom-face-history nil
-  "Minibuffer history for `qq-chat-attach-custom-face'.")
-
 (defun qq-chat--insert-custom-face (face)
   "Insert favorite FACE alist into the composer as a sendable segment."
   (let ((segment (qq-media-custom-face-to-segment face)))
-    (qq-chat--insert-input-segment-object segment)
+    (qq-chat--insert-input-segment-object
+     segment (qq-media-custom-face-display-string face))
     (qq-chat--sync-draft-from-buffer)
     (message "qq: favorite %s" (qq-media-custom-face-label face))))
 
@@ -1444,14 +1448,8 @@ Uses `qq-media-custom-face-completion-table' so candidates keep favorites
 order and show local thumb previews (same treatment as base faces)."
   (unless faces
     (user-error "qq: no favorite custom faces (收藏表情为空)"))
-  (let* ((choice (completing-read
-                  "Favorite face: "
-                  (qq-media-custom-face-completion-table faces)
-                  nil t nil 'qq-chat--custom-face-history))
-         (face (qq-media-custom-face-from-completion choice)))
-    (unless face
-      (user-error "qq: unknown favorite: %s" choice))
-    (qq-chat--insert-custom-face face)))
+  (qq-chat--insert-custom-face (qq-completion-read-custom-face faces)))
+
 (defun qq-chat-attach-custom-face (&optional force-refresh)
   "Insert a favorite custom face (收藏表情) into the chat composer.
 
@@ -1461,15 +1459,21 @@ image segments with `sub_type' 1; market favorites as mface when possible.
 With prefix FORCE-REFRESH, re-fetch the list from NapCat.
 Bound via `C-u C-c C-e' or attach transient `E'."
   (interactive "P")
-  (let ((cached (and (not force-refresh) (qq-media-custom-faces))))
+  (let ((cached (and (not force-refresh) (qq-media-custom-faces)))
+        (buffer (current-buffer))
+        (session-key qq-chat--session-key))
     (if cached
         (qq-chat--pick-custom-face cached)
       (message "qq: loading favorite faces…")
       (qq-media-refresh-custom-faces
        (lambda (faces)
-         (condition-case err
-             (qq-chat--pick-custom-face faces)
-           (error (message "%s" (error-message-string err)))))
+         (when (and (buffer-live-p buffer)
+                    (with-current-buffer buffer
+                      (equal qq-chat--session-key session-key)))
+           (with-current-buffer buffer
+             (condition-case err
+                 (qq-chat--pick-custom-face faces)
+               (error (message "%s" (error-message-string err)))))))
        (lambda (_response reason)
          (message "qq: failed to load favorites: %s" reason))))))
 
@@ -3031,6 +3035,14 @@ new rows or reports the cursor missing."
   (qq-chat--ensure-composer-visible)
   (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max))))
 
+(defun qq-chat-complete ()
+  "Complete at composer point, or move to the composer from the timeline."
+  (interactive)
+  (if (appkit-chatbuf-point-in-input-p)
+      (or (qq-completion-complete)
+          (message "qq: no completion at point"))
+    (qq-chat-edit-draft)))
+
 (defun qq-chat-draft-prev ()
   "Replace draft with previous entry from input history."
   (interactive)
@@ -3221,7 +3233,9 @@ sender."
     (define-key map (kbd "M-<") #'qq-chat-load-older-messages)
     (define-key map (kbd "M->") #'qq-chat-return-to-latest)
     (define-key map (kbd "RET") #'qq-chat-return-dwim)
-    (define-key map (kbd "TAB") #'qq-chat-edit-draft)
+    (define-key map (kbd "TAB") #'qq-chat-complete)
+    (define-key map (kbd "<tab>") #'qq-chat-complete)
+    (define-key map (kbd "C-M-i") #'qq-chat-complete)
     (define-key map (kbd "C-c '") #'qq-chat-edit-draft)
     (define-key map (kbd "M-p") #'qq-chat-draft-prev)
     (define-key map (kbd "M-n") #'qq-chat-draft-next)
@@ -3251,6 +3265,7 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   ;; Keep vertically sliced two-line avatars visually contiguous.
   (setq-local line-spacing 0)
   (appkit-chatbuf-reset-state 32)
+  (qq-completion-setup)
   (setq-local qq-chat--last-search-query nil)
   (setq-local qq-chat--marked-message-anchors nil)
   (setq-local qq-chat--forward-request-active-p nil)
@@ -3389,6 +3404,7 @@ first unread message."
          (buffer (appkit-view-buffer view)))
     (with-current-buffer buffer
       (setq qq-chat--session-key session-key)
+      (qq-completion-preload-members)
       (qq-chat-render)
       (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max)))
       (qq-chat--load-initial-history buffer session-key))

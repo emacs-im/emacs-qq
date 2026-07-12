@@ -9,6 +9,7 @@ Current scope:
 - use appkit's shared UI and chat runtime across root and chat buffers
 - keep chat keybindings closer to telega.el conventions
 - handle live message events, replies, QQ media resources, and basic recall notices
+- complete native group members and QQ faces directly in the composer
 
 Quick start:
 
@@ -20,6 +21,13 @@ Quick start:
 ```
 
 Then run `M-x qq`.
+
+In a group composer, type `@` followed by a group card, nickname, QID, or QQ
+number and press `TAB`.  The selected row is stored as a real QQ `at` segment,
+so it notifies the member; plain typed text is never treated as a mention.
+Type `/` plus a QQ face name and press `TAB` for inline base-face completion.
+`C-c C-e` opens the image-annotated base-face picker, while
+`C-u C-c C-e` opens favorite faces.
 
 Desktop notifications follow telega's opt-in global minor-mode model:
 
@@ -53,8 +61,9 @@ Use `eask link list` to inspect active Eask links and
 
 Architecture notes:
 
-- QQ depends only on appkit's view, presentation, media, chat-buffer, and
-  chat-timeline infrastructure; it has no runtime dependency on disco.el
+- QQ depends only on appkit's view, presentation, media, chat-buffer,
+  completion, and chat-timeline infrastructure; it has no runtime dependency
+  on disco.el
 - `qq-media.el` provides QQ-specific resource resolution for avatars, images, files, and base emojis
 - `qq-chat.el` adapts OneBot segments to appkit's compact media-card and action-context APIs
 - `qq-root.el` uses appkit's keyed one-line root layout

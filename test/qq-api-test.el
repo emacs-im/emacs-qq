@@ -848,6 +848,53 @@
     (should-not delivered)
     (should (stringp failure))))
 
+(ert-deftest qq-api-search-group-members-preserves-native-string-identities ()
+  (let (action params delivered)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (actual-action actual-params callback &optional _errback)
+                 (setq action actual-action
+                       params actual-params)
+                 (funcall callback
+                          '((data . (((user_id . "10001")
+                                     (uid . "uid-alice")
+                                     (nickname . "Alice")
+                                     (card . "Alice Card")
+                                     (remark . nil)
+                                     (qid . "alice")
+                                     (title . "管理员")
+                                     (role . "admin")
+                                     (robot . :false)))))))))
+      (qq-api-search-group-members
+       "20001" "Alice" (lambda (members) (setq delivered members)) nil 80))
+    (should (equal "emacs_search_group_members" action))
+    (should (equal '((group_id . "20001") (query . "Alice") (limit . 80))
+                   params))
+    (should (equal "10001" (alist-get 'user_id (car delivered))))
+    (should-not (alist-get 'robot (car delivered)))))
+
+(ert-deftest qq-api-search-group-members-rejects-lossy-or-open-results ()
+  (let (delivered failure)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional _errback)
+                 (funcall callback
+                          '((data . (((user_id . 10001)
+                                     (uid . "uid-alice")
+                                     (nickname . "Alice")
+                                     (card . nil)
+                                     (remark . nil)
+                                     (qid . nil)
+                                     (title . nil)
+                                     (role . "member")
+                                     (robot . :false)))))))))
+      (qq-api-search-group-members
+       "20001" "" (lambda (_) (setq delivered t))
+       (lambda (_response reason) (setq failure reason))))
+    (should-not delivered)
+    (should (string-match-p "original decimal string" failure)))
+  (should-error
+   (qq-api-search-group-members "20001" "" #'ignore nil 0)
+   :type 'user-error))
+
 (provide 'qq-api-test)
 
 ;;; qq-api-test.el ends here
