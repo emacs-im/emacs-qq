@@ -62,8 +62,8 @@ and ACTION is an alist:
 Preferred keys (callers should populate when applicable):
 
 `:type' (always)  event class: `message', `history', `session', `reset', …
-`:mutation'       coarse change kind for views:
-                  `create' | `update' | `delete' | `read' | `history' | `session'
+`:mutation'       coarse change kind for views: `create', `update', `delete',
+                  `read', `history', or `session'
 `:session-key'    QQ session key string
 `:source'         provenance: `local' | `event' | `response' | `notice'
 `:message'        normalized message alist (copy)

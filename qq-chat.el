@@ -45,6 +45,9 @@
                   "qq-forward" (segment session-key))
 (declare-function qq-user-open "qq-user" (user-id))
 (declare-function qq-group-open "qq-group" (group-id))
+(declare-function qq-chat-message-transient "qq-transient" (&rest args))
+(declare-function qq-chat-attach-transient "qq-transient" (&rest args))
+(declare-function qq-chat-transient "qq-transient" (&rest args))
 (declare-function qq-api-forward-message
                   "qq-api" (message-id source-session-key target-session-key
                                         callback &optional errback))
@@ -61,9 +64,10 @@
   "Session key associated with the current chat buffer.")
 
 (defvar-local qq-chat--my-action nil
-  "Local outgoing chat-action for this buffer (telega `telega-chatbuf--my-action').
+  "Local outgoing chat-action for this buffer.
 
-Non-nil means we currently advertise typing via `set_input_status'.")
+Non-nil means we currently advertise typing via `set_input_status'.  This
+mirrors telega's `telega-chatbuf--my-action'.")
 
 (defvar-local qq-chat--last-search-query nil
   "Last in-chat search query.")
@@ -150,7 +154,9 @@ Mirrors telega's async `telega-chatbuf--goto-msg' when the target is not yet
 loaded in the chatbuf.")
 
 (defvar-local qq-chat--messages-pop-ring nil
-  "Ring of message anchors for jump-back (telega `telega-chatbuf--messages-pop-ring').")
+  "Ring of message anchors for jump-back.
+
+This mirrors telega's `telega-chatbuf--messages-pop-ring'.")
 
 (defvar-local qq-chat--marked-message-anchors nil
   "Message anchors selected for one merged-forward operation.")
@@ -1838,10 +1844,11 @@ targets jump immediately; other targets use the fork-native
       (qq-chat--seek-history-for-jump session-key id buffer))))
 
 (defun qq-chat-goto-reply (&optional message)
-  "Goto the message that MESSAGE replies to (telega `telega-msg-goto-reply-to-message').
+  "Goto the message that MESSAGE replies to.
 
 MESSAGE defaults to the message at point.  Bound to timeline `g'.  The ↪
-reply preview line is also a button that calls this path."
+reply preview line is also a button that calls this path, corresponding to
+telega's `telega-msg-goto-reply-to-message'."
   (interactive)
   (let* ((msg (or message
                   (qq-chat--message-at-point)
@@ -1851,9 +1858,10 @@ reply preview line is also a button that calls this path."
     (qq-chat-goto-message reply-id)))
 
 (defun qq-chat-goto-pop-message ()
-  "Pop a message from the jump ring and goto it (telega `telega-chatbuf-goto-pop-message').
+  "Pop a message from the jump ring and goto it.
 
-Bound to timeline `x'."
+Bound to timeline `x', corresponding to telega's
+`telega-chatbuf-goto-pop-message'."
   (interactive)
   (unless (and (ring-p qq-chat--messages-pop-ring)
                (not (ring-empty-p qq-chat--messages-pop-ring)))
@@ -1868,9 +1876,9 @@ Bound to timeline `x'."
 (defun qq-chat--insert-reply-preview-line (reply-id properties prefix-state)
   "Insert one inline reply preview line for REPLY-ID.
 
-Telega uses `telega-ins--with-props' + `:action telega-msg-goto-reply-to-message'
-on the reply header.  Here the line is a button (RET / mouse-1) that jumps to
-REPLY-ID via `qq-chat-goto-message'."
+Telega uses `telega-ins--with-props' together with its goto-reply action on the
+reply header.  Here the line is a button (RET / mouse-1) that jumps to REPLY-ID
+via `qq-chat-goto-message'."
   (let* ((source (qq-chat--message-by-server-id reply-id))
          (sender (and source (car (qq-chat--message-sender-display-parts source))))
          (preview (and source (string-trim (or (qq-state-message-preview source) ""))))

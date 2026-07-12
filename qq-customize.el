@@ -62,10 +62,11 @@ Set to nil to disable telega-style automatic loading near the top."
   :group 'qq)
 
 (defcustom qq-chat-messages-pop-ring-size 50
-  "Size of the chatbuf messages pop ring (telega `telega-chat-messages-pop-ring-size').
+  "Size of the chatbuf messages pop ring.
 
 When jumping to a reply target (or any message), the previous message at
-point is pushed so `qq-chat-goto-pop-message' (`x') can jump back."
+point is pushed so `qq-chat-goto-pop-message' (`x') can jump back.  This
+corresponds to telega's `telega-chat-messages-pop-ring-size'."
   :type 'integer
   :group 'qq)
 
