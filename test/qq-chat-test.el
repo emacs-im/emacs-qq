@@ -1719,6 +1719,21 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
           (push-button (point))
           (should (equal opened-url "https://example.com/thread")))))))
 
+(ert-deftest qq-chat-renders-card-preview-image-without-an-open-label ()
+  (let ((segment '((type . "card")
+                   (data . ((kind . "share")
+                            (source . "QQ空间")
+                            (title . "一条说说")
+                            (image . "https://example.com/preview.png"))))))
+    (with-temp-buffer
+      (let ((inhibit-read-only t))
+        (cl-letf (((symbol-function 'qq-media-url-preview-display-string)
+                   (lambda (&rest _args) "PREVIEW")))
+          (qq-chat--insert-card-segment segment nil nil)
+          (should (string-match-p "Share · QQ空间" (buffer-string)))
+          (should (string-match-p "PREVIEW" (buffer-string)))
+          (should-not (string-match-p "\\[Open\\]" (buffer-string))))))))
+
 (ert-deftest qq-chat-renders-poke-as-a-distinct-gray-tip-row ()
   (let ((message
          '((server-id . "poke-1")

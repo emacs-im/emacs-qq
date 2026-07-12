@@ -2126,6 +2126,7 @@ with the timestamp."
          (source (qq-chat--present-string (alist-get 'source data)))
          (summary (qq-chat--present-string (alist-get 'summary data)))
          (url (qq-chat--present-string (alist-get 'url data)))
+         (image-url (qq-chat--present-string (alist-get 'image data)))
          (body (or content
                    (and (not title) prompt)))
          (open-action (and url (lambda () (browse-url url t))))
@@ -2159,6 +2160,15 @@ with the timestamp."
     (when title
       (appkit-ui-insert-prefixed-lines
        card-prefix-state title :properties card-properties))
+    (when image-url
+      (let ((image-start (point)))
+        (insert
+         (qq-media-url-preview-display-string
+          (format "card-image-url:%s" image-url)
+          image-url "" qq-media-preview-image-height))
+        (insert "\n")
+        (appkit-ui-apply-line-prefix image-start (point) card-prefix-state)
+        (add-text-properties image-start (point) card-properties)))
     (when body
       (appkit-ui-insert-prefixed-lines
        card-prefix-state body :face 'shadow :properties card-properties))
