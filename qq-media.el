@@ -1529,14 +1529,18 @@ Resolution order:
           error)))
      qq-media-face-image-height)))
 
-(defun qq-media-face-display-string (emoji-id)
+(defun qq-media-face-display-string (emoji-id &optional description)
   "Return inline display string for QQ face EMOJI-ID.
 
 Prefer the face image (local default-emojis first).  When the image is
-not ready yet, show the human face name (`/斜眼笑') rather than CQ."
+not ready yet, show DESCRIPTION or the known human face name
+(`/斜眼笑') rather than CQ."
   (qq-media--image-display-string
    (qq-media-face-image emoji-id)
-   (qq-media-face-text-fallback emoji-id)))
+   (or (and (stringp description)
+            (not (string-empty-p description))
+            description)
+       (qq-media-face-text-fallback emoji-id))))
 
 (defun qq-media-segment-preview-key (segment)
   "Return preview cache key for SEGMENT, or nil when unsupported."

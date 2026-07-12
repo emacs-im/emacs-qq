@@ -828,6 +828,25 @@
                    "[unsupported QQ element: mystery native element]"))
     (should-not (string-match-p "DO-NOT-RENDER" preview))))
 
+(ert-deftest qq-state-face-preview-uses-native-description ()
+  (should (equal
+           (qq-state-message-preview-from-segments
+            '(((type . "face")
+               (data . ((id . "478")
+                        (raw . ((faceIndex . 478)
+                                (faceText . "/对的对的")
+                                (faceType . 3))))))))
+           "/对的对的")))
+
+(ert-deftest qq-state-message-preview-prefers-native-face-description-over-stale-preview ()
+  (should (equal
+           (qq-state-message-preview
+            '((preview . "[face:478]")
+              (segments . (((type . "face")
+                            (data . ((id . "478")
+                                     (raw . ((faceText . "/对的对的"))))))))))
+           "/对的对的")))
+
 (ert-deftest qq-state-message-preview-from-cq-strips-reply-and-face ()
   ;; Prefer human face name when qq-media face table is available.
   (should (equal

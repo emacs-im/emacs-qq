@@ -1927,6 +1927,16 @@ via `qq-chat-goto-message'."
         (alist-get 'faceIndex data)
         (and (listp raw) (alist-get 'faceIndex raw)))))
 
+(defun qq-chat--face-segment-description (segment)
+  "Return the native display description from face SEGMENT, or nil."
+  (let* ((data (alist-get 'data segment))
+         (raw (alist-get 'raw data)))
+    (or (alist-get 'description data)
+        (alist-get 'faceText data)
+        (alist-get 'face_text data)
+        (and (listp raw) (alist-get 'faceText raw))
+        (and (listp raw) (alist-get 'face_text raw)))))
+
 (defun qq-chat--segment-inline-string (segment)
   "Return inline display string for SEGMENT, or nil for block-like segments.
 
@@ -1957,7 +1967,8 @@ base emoji), never as OneBot CQ text."
        (qq-state-message-preview-from-segments (list segment)))
       ("face"
        (qq-media-face-display-string
-        (or (qq-chat--face-segment-id segment) "?")))
+        (or (qq-chat--face-segment-id segment) "?")
+        (qq-chat--face-segment-description segment)))
       (_ nil))))
 
 (defun qq-chat--mail-segment-p (segment)

@@ -399,14 +399,23 @@ and must not be retained as an `unsupported.raw' diagnostic payload."
         payload context protocol-p nil))
       ("face"
        (unless (qq-api--exact-object-keys-p
-                payload '(id) '(resultId chainCount))
+                payload '(id)
+                '(description face_type sticker_id sticker_pack_id
+                  sticker_type resultId chainCount))
          (qq-api--signal-schema-error
           protocol-p "qq: %s face payload has invalid fields" context))
        (unless (stringp (alist-get 'id payload))
          (qq-api--signal-schema-error
           protocol-p "qq: %s face.id must be a string" context))
        (qq-api--validate-string-fields
-        payload '(resultId) context protocol-p)
+        payload '(description sticker_id sticker_pack_id resultId)
+        context protocol-p)
+       (dolist (key '(face_type sticker_type))
+         (when (and (assq key payload)
+                    (not (qq-api--finite-number-p (alist-get key payload))))
+           (qq-api--signal-schema-error
+            protocol-p "qq: %s face.%s must be a finite number"
+            context key)))
        (when (and (assq 'chainCount payload)
                   (not (qq-api--finite-number-p
                         (alist-get 'chainCount payload))))

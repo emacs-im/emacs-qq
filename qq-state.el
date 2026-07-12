@@ -565,10 +565,15 @@ reply chrome elsewhere).  Media becomes short placeholders like
              (format "[unsupported QQ element: %s]"
                      (truncate-string-to-width summary 80 nil nil t))))
           ("face"
-           (let* ((text (or (alist-get 'faceText data)
-                            (alist-get 'face_text data)))
+           (let* ((raw (alist-get 'raw data))
+                  (text (or (alist-get 'description data)
+                            (alist-get 'faceText data)
+                            (alist-get 'face_text data)
+                            (and (listp raw) (alist-get 'faceText raw))
+                            (and (listp raw) (alist-get 'face_text raw))))
                   (id (or (alist-get 'id data)
-                          (alist-get 'faceIndex data)))
+                          (alist-get 'faceIndex data)
+                          (and (listp raw) (alist-get 'faceIndex raw))))
                   (named (and id
                               (fboundp 'qq-media-face-text-fallback)
                               (qq-media-face-text-fallback id))))
@@ -741,17 +746,17 @@ Strips reply tags and collapses media/face codes."
 Prefer structured segment previews.  Never surface OneBot CQ `raw_message'
 in the UI — that is wire format, not display text."
   (qq-state-preview-one-line
-   (or (let ((stored (alist-get 'preview message)))
-         (and (stringp stored)
-              (not (string-empty-p (string-trim stored)))
-              (not (qq-state--cq-looks-p stored))
-              stored))
-       (let ((from-segments
+   (or (let ((from-segments
               (qq-state-message-preview-from-segments
                (alist-get 'segments message))))
          (and (stringp from-segments)
               (not (string-empty-p from-segments))
               from-segments))
+       (let ((stored (alist-get 'preview message)))
+         (and (stringp stored)
+              (not (string-empty-p (string-trim stored)))
+              (not (qq-state--cq-looks-p stored))
+              stored))
        (let ((raw (alist-get 'raw-message message)))
          (cond
           ((not (stringp raw)) nil)
