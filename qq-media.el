@@ -122,7 +122,11 @@ transfer callbacks can run outside a safe redisplay context; immediate
   "Create an Emacs image object from FILE at pixel HEIGHT, or nil."
   (when (appkit-media-file-present-p file)
     (condition-case _
-        (create-image file nil nil :height (max 1 height) :ascent 'center)
+        (let ((image (create-image file nil nil
+                                   :height (max 1 height) :ascent 'center)))
+          (if (fboundp 'appkit-media--mark-inline-animation-image)
+              (appkit-media--mark-inline-animation-image image file)
+            image))
       (error nil))))
 
 (defun qq-media--preview-image-from-file (file spec)
@@ -617,13 +621,22 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
           (t
            (funcall error-fn nil "record segment has no file id")))))
       ("face"
-       (cond
+       (let* ((raw (alist-get 'raw data))
+              (hints
+               `((sticker_id . ,(or (alist-get 'sticker_id data)
+                                    (and (listp raw) (alist-get 'stickerId raw))))
+                 (sticker_pack_id . ,(or (alist-get 'sticker_pack_id data)
+                                         (and (listp raw) (alist-get 'packId raw))))
+                 (description . ,(or (alist-get 'description data)
+                                     (alist-get 'faceText data)
+                                     (and (listp raw) (alist-get 'faceText raw)))))))
+         (cond
         ((not emoji-id)
          (funcall error-fn nil "face segment has no id"))
         ((qq-media--face-resource-from-local emoji-id)
          (funcall callback (qq-media--face-resource-from-local emoji-id)))
         (t
-         (qq-api-get-base-emoji emoji-id callback error-fn))))
+          (qq-api-get-base-emoji emoji-id callback error-fn nil t hints)))))
       ("mface"
        (qq-media--resolve-fileish-segment
         segment "get_image" callback error-fn
@@ -1498,6 +1511,52 @@ e_id is present."
       (emoji_id . ,(format "%s" emoji-id))
       (description . ,(qq-media-face-name emoji-id)))))
 
+(defun qq-media--prepare-animated-face-resource (resource callback)
+  "Pass RESOURCE to CALLBACK, converting native APNG to animated GIF.
+
+Emacs' PNG loader displays APNG as a single frame.  QQ's native base emoji
+service returns APNG resources, so convert those once into the existing media
+cache; GIF is then handled by appkit's bounded inline-animation machinery."
+  (let* ((resource (copy-tree resource))
+         (file (alist-get 'file resource))
+         (animated (qq-media--json-truthy-p (alist-get 'animated resource)))
+         (ffmpeg (and animated (executable-find "ffmpeg"))))
+    (if (not (and ffmpeg
+                  (appkit-media-file-present-p file)
+                  (string-match-p "\\.png\\'" (downcase file))))
+        (funcall callback resource)
+      (let* ((target (expand-file-name
+                      (format "face-animation-%s.gif" (md5 file))
+                      qq-media-cache-directory)))
+        (if (appkit-media-file-present-p target)
+            (progn
+              (setf (alist-get 'file resource) target)
+              (funcall callback resource))
+          (make-directory qq-media-cache-directory t)
+          (let ((buffer (generate-new-buffer " *qq-face-apng*")))
+            (make-process
+             :name (format "qq-face-apng-%s" (substring (md5 file) 0 8))
+             :buffer buffer
+             :noquery t
+             :command
+             (list ffmpeg "-nostdin" "-y" "-loglevel" "error"
+                   "-i" file "-filter_complex"
+                   (concat "[0:v]fps=20,scale=128:-1:flags=lanczos,split[a][b];"
+                           "[a]palettegen=max_colors=128[p];"
+                           "[b][p]paletteuse=dither=bayer:bayer_scale=3")
+                   "-loop" "0" target)
+             :sentinel
+             (lambda (process _event)
+               (when (memq (process-status process) '(exit signal))
+                 (unwind-protect
+                     (progn
+                       (when (and (= (process-exit-status process) 0)
+                                  (appkit-media-file-present-p target))
+                         (setf (alist-get 'file resource) target))
+                       (funcall callback resource))
+                   (when (buffer-live-p (process-buffer process))
+                     (kill-buffer (process-buffer process)))))))))))))
+
 (defun qq-media-face-image (emoji-id)
   "Return inline QQ base face image for EMOJI-ID.
 
@@ -1525,7 +1584,7 @@ Resolution order:
                              (qq-media-face-name id))))
               (when desc
                 (setf (alist-get 'description resource) desc))
-              (funcall done resource)))
+              (qq-media--prepare-animated-face-resource resource done)))
           error)))
      qq-media-face-image-height)))
 
