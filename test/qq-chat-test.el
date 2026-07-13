@@ -2680,6 +2680,79 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (qq-chat--maybe-auto-load-older)
         (should (eq called t))))))
 
+(ert-deftest qq-chat-read-position-follows-cursor-without-regressing ()
+  (qq-chat-test-with-reset
+   (let ((first "9007199254741004645")
+         (second "9007199254741004646")
+         (third "9007199254741004647")
+         calls)
+     (qq-state-upsert-session
+      "group:20001"
+      `((title . "Group")
+        (target-id . "20001")
+        (type . group)
+        (unread-count . 2)
+        (first-unread-message-id . ,second)
+        (read-latest-message-id . ,third))
+      nil)
+     (puthash
+      "group:20001"
+      `(((server-id . ,first) (time . 1) (raw-message . "first"))
+        ((server-id . ,second) (time . 2) (raw-message . "second"))
+        ((server-id . ,third) (time . 3) (raw-message . "third")))
+      qq-state--messages-by-session)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "group:20001")
+       (qq-chat-render)
+       (cl-letf (((symbol-function 'qq-api-mark-message-read)
+                  (lambda (session-key message-id)
+                    (setq calls (append calls (list (list session-key message-id)))))))
+         ;; An already-read row does not move the native boundary backward.
+         (goto-char (point-min))
+         (search-forward "first")
+         (qq-chat--manage-read-position)
+         (should-not calls)
+         ;; Point on the timeline reads exactly that row.
+         (search-forward "second")
+         (qq-chat--manage-read-position)
+         (search-forward "third")
+         (qq-chat--manage-read-position)
+         ;; Moving backward cannot submit an older target.
+         (goto-char (point-min))
+         (search-forward "second")
+         (qq-chat--manage-read-position)
+         ;; Point in the composer represents the newest loaded row and dedupes.
+         (goto-char (point-max))
+         (qq-chat--manage-read-position)
+         (should
+          (equal calls
+                 `(("group:20001" ,second)
+                   ("group:20001" ,third)))))))))
+
+(ert-deftest qq-chat-read-all-submits-latest-exact-message-when-auto-read-is-off ()
+  (qq-chat-test-with-reset
+   (let ((qq-auto-mark-read nil)
+         (latest "9007199254741004647")
+         call)
+     (qq-state-upsert-session
+      "private:10001"
+      '((title . "Alice") (target-id . "10001") (type . private))
+      nil)
+     (puthash
+      "private:10001"
+      `(((server-id . "9007199254741004645") (time . 1))
+        ((server-id . ,latest) (time . 2)))
+      qq-state--messages-by-session)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "private:10001")
+       (cl-letf (((symbol-function 'qq-api-mark-message-read)
+                  (lambda (session-key message-id)
+                    (setq call (list session-key message-id)))))
+         (qq-chat-read-all)
+         (should (equal call (list "private:10001" latest))))))))
+
 (ert-deftest qq-chat-initial-history-prefers-exact-read-position-window ()
   (with-temp-buffer
     (qq-chat-mode)

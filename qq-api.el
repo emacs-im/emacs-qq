@@ -21,8 +21,9 @@
 (defvar qq-api--read-operations (make-hash-table :test #'equal)
   "In-flight mark-read operations keyed by session key.
 
-An operation owns only a rerun intent.  It never owns or reconstructs unread
-counts; those come from authoritative Linux QQ observations.")
+Each operation owns the exact NT message id currently in flight and at most
+one newer cursor intent.  It never reconstructs unread counts; those come
+from authoritative Linux QQ observations.")
 
 (defvar qq-api--read-operation-counter 0
   "Monotonic token used to reject stale read callbacks.")
@@ -1152,52 +1153,59 @@ ERRBACK is called so the client can fall back to single-side seek."
   (equal token
          (plist-get (gethash session-key qq-api--read-operations) :token)))
 
-(defun qq-api--start-mark-session-read (session-key)
-  "Start one mark-read request for SESSION-KEY."
+(defun qq-api--start-mark-message-read (session-key message-id)
+  "Start one read-through request for MESSAGE-ID in SESSION-KEY."
   (let* ((token (cl-incf qq-api--read-operation-counter))
-         (operation (list :token token :rerun nil)))
+         (operation (list :token token
+                          :message-id message-id
+                          :next-message-id nil)))
     (puthash session-key operation qq-api--read-operations)
     (qq-api-call
      "emacs_mark_read"
-     (qq-api--session-emacs-params session-key)
+     (append (qq-api--session-emacs-params session-key)
+             `((message_id . ,message-id)))
      (lambda (_response)
        (when (qq-api--read-operation-current-p session-key token)
-         (let ((rerun
+         (let ((next-message-id
                 (plist-get (gethash session-key qq-api--read-operations)
-                           :rerun)))
+                           :next-message-id)))
            (remhash session-key qq-api--read-operations)
-           (when rerun
-             (qq-api--start-mark-session-read session-key)))))
+           (when next-message-id
+             (qq-api--start-mark-message-read session-key next-message-id)))))
      (lambda (response reason)
        (when (qq-api--read-operation-current-p session-key token)
-         (let ((rerun
+         (let ((next-message-id
                 (plist-get (gethash session-key qq-api--read-operations)
-                           :rerun)))
+                           :next-message-id)))
            (remhash session-key qq-api--read-operations)
            (qq-api--default-error response reason)
            (qq-api--refresh-session-read-state-after-failure session-key)
-           ;; A failed request does not consume a newer visible-message intent.
-           ;; Retry that intent once; the new operation starts clean, so a
-           ;; persistent error cannot create an automatic retry loop.
-           (when rerun
-             (qq-api--start-mark-session-read session-key))))))
+           ;; Failure does not consume a later cursor intent.  The later
+           ;; target starts clean, so persistent errors cannot self-loop.
+           (when next-message-id
+             (qq-api--start-mark-message-read session-key next-message-id))))))
     token))
 
-(defun qq-api-mark-session-read (session-key)
-  "Mark SESSION-KEY as read in NapCat without guessing unread counts.
+(defun qq-api-mark-message-read (session-key message-id)
+  "Advance SESSION-KEY's native read position through MESSAGE-ID.
 
-Concurrent calls coalesce behind one request and unconditionally request one
-rerun.  This handles a visible message arriving while the first request is in
-flight without relying on a locally incremented unread count.  Failure starts
-one authoritative read-state refresh."
+MESSAGE-ID remains the original decimal NT snowflake string.  Concurrent
+cursor movements coalesce behind one request and retain only the newest exact
+target.  Failure starts one authoritative read-state refresh."
   (interactive)
+  (setq message-id
+        (qq-api-validate-message-id message-id "mark read target"))
   (let ((operation (gethash session-key qq-api--read-operations)))
-    (if operation
-        (progn
-          (setq operation (plist-put operation :rerun t))
-          (puthash session-key operation qq-api--read-operations)
-          (plist-get operation :token))
-      (qq-api--start-mark-session-read session-key))))
+    (cond
+     ((null operation)
+      (qq-api--start-mark-message-read session-key message-id))
+     ((equal message-id (plist-get operation :message-id))
+      (plist-get operation :token))
+     (t
+      (setq operation
+            (plist-put operation :next-message-id message-id))
+      (puthash session-key operation qq-api--read-operations)
+      (plist-get operation :token)))))
 
 (defun qq-api--send-text-segments (text &optional reply-to-message-id)
   "Return send_msg segment list for TEXT and optional REPLY-TO-MESSAGE-ID."

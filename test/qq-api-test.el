@@ -213,7 +213,7 @@
       (should-not pending-called)
       (should-not api-called))))
 
-(ert-deftest qq-api-mark-session-read-does-not-guess-unread-state ()
+(ert-deftest qq-api-mark-message-read-sends-exact-id-without-guessing-state ()
   (let ((qq-state-change-hook nil)
         (qq-api--read-operations (make-hash-table :test #'equal))
         (qq-api--read-operation-counter 0)
@@ -233,10 +233,12 @@
                        captured-params params)
                  (setq success-fn callback)
                  'sent)))
-      (qq-api-mark-session-read "private:10001")
+      (qq-api-mark-message-read "private:10001" "9007199254741004645")
       (should (equal captured-action "emacs_mark_read"))
       (should (equal (alist-get 'chat captured-params)
                      '((kind . "private") (user_id . "10001"))))
+      (should (equal (alist-get 'message_id captured-params)
+                     "9007199254741004645"))
       (should (= 3 (alist-get 'unread-count
                               (qq-state-session "private:10001"))))
       (funcall success-fn '((status . ok)))
@@ -274,7 +276,7 @@
    (qq-api--emacs-session-key-from-locator
     '((kind . "private") (user_id . 10001)))))
 
-(ert-deftest qq-api-mark-session-read-failure-refreshes-authoritative-state ()
+(ert-deftest qq-api-mark-message-read-failure-refreshes-authoritative-state ()
   (let ((qq-state-change-hook nil)
         (qq-api--read-operations (make-hash-table :test #'equal))
         (qq-api--read-operation-counter 0)
@@ -298,7 +300,7 @@
                  'sent))
               ((symbol-function 'qq-api--default-error)
                (lambda (_response reason) (setq reported-error reason))))
-      (qq-api-mark-session-read "private:10001")
+      (qq-api-mark-message-read "private:10001" "9007199254741004645")
       (funcall mark-errback nil "network down")
       (should (equal actions '("emacs_mark_read" "emacs_get_read_state")))
       (should (equal reported-error "network down"))
@@ -311,31 +313,34 @@
       (should (= 7 (alist-get 'unread-count
                               (qq-state-session "private:10001")))))))
 
-(ert-deftest qq-api-mark-session-read-reruns-unconditionally-while-in-flight ()
+(ert-deftest qq-api-mark-message-read-coalesces-to-newest-exact-target ()
   (let ((qq-state-change-hook nil)
         (qq-api--read-operations (make-hash-table :test #'equal))
         (qq-api--read-operation-counter 0)
-        calls)
+        calls
+        params)
     (qq-state-reset)
     (qq-state-upsert-session
      "private:10001"
      '((type . private) (target-id . "10001") (unread-count . 2)) nil)
     (cl-letf (((symbol-function 'qq-api-call)
-               (lambda (_action _params callback &optional errback)
-                 (setq calls (append calls (list (cons callback errback))))
+               (lambda (_action call-params callback &optional errback)
+                 (setq calls (append calls (list (cons callback errback)))
+                       params (append params (list call-params)))
                  'sent)))
-      (qq-api-mark-session-read "private:10001")
-      ;; No local unread delta is required to request the follow-up.
-      (qq-api-mark-session-read "private:10001")
+      (qq-api-mark-message-read "private:10001" "9007199254741004645")
+      (qq-api-mark-message-read "private:10001" "9007199254741004646")
       (should (= (length calls) 1))
       (funcall (caar calls) '((status . "ok")))
       (should (= (length calls) 2))
+      (should (equal (mapcar (lambda (it) (alist-get 'message_id it)) params)
+                     '("9007199254741004645" "9007199254741004646")))
       (should (= 2 (alist-get 'unread-count
                               (qq-state-session "private:10001"))))
       (funcall (car (nth 1 calls)) '((status . "ok")))
       (should-not (gethash "private:10001" qq-api--read-operations)))))
 
-(ert-deftest qq-api-mark-session-read-failure-preserves-rerun-intent-once ()
+(ert-deftest qq-api-mark-message-read-failure-preserves-later-intent-once ()
   (let ((qq-api--read-operations (make-hash-table :test #'equal))
         (qq-api--read-operation-counter 0)
         callbacks
@@ -346,17 +351,17 @@
                        callbacks (append callbacks (list (cons callback errback))))
                  'sent))
               ((symbol-function 'qq-api--default-error) #'ignore))
-      (qq-api-mark-session-read "private:10001")
-      (qq-api-mark-session-read "private:10001")
+      (qq-api-mark-message-read "private:10001" "9007199254741004645")
+      (qq-api-mark-message-read "private:10001" "9007199254741004646")
       (funcall (cdr (nth 0 callbacks)) nil "network down")
       (should (equal actions
                      '("emacs_mark_read"
                        "emacs_get_read_state"
                        "emacs_mark_read")))
-      ;; The retry begins with no inherited rerun bit.  Its own failure only
+      ;; The later target begins with no inherited next target.  Its failure only
       ;; refreshes authoritative state and cannot recurse forever.
       (should-not (plist-get (gethash "private:10001" qq-api--read-operations)
-                             :rerun))
+                             :next-message-id))
       (funcall (cdr (nth 2 callbacks)) nil "still down")
       (should (= 4 (length actions)))
       (should (equal (car (last actions)) "emacs_get_read_state"))

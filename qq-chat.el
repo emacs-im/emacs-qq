@@ -172,6 +172,9 @@ This mirrors telega's `telega-chatbuf--messages-pop-ring'.")
 Any later composer edit, reply change, or send revokes this ownership so a
 stale network failure can never overwrite newer user input.")
 
+(defvar-local qq-chat--last-read-target-id nil
+  "Newest server message id submitted from this buffer's cursor.")
+
 (defvar qq-chat-timeline-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "q") #'quit-window)
@@ -549,15 +552,93 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
         'front-sticky '(read-only)
         'rear-nonsticky '(read-only)))
 
-(defun qq-chat--message-at-point ()
-  "Return message object under point in the current chat buffer, or nil."
-  (let* ((anchor (or (get-text-property (point) 'qq-chat-message-anchor)
-                     (get-text-property (line-beginning-position) 'qq-chat-message-anchor)))
+(defun qq-chat--message-at-point (&optional position)
+  "Return message object under POSITION or point, or nil."
+  (let* ((position (or position (point)))
+         (anchor (or (get-text-property position 'qq-chat-message-anchor)
+                     (save-excursion
+                       (goto-char position)
+                       (get-text-property (line-beginning-position)
+                                          'qq-chat-message-anchor))))
          (messages (qq-state-session-messages qq-chat--session-key)))
     (seq-find
      (lambda (message)
        (equal (qq-chat--message-anchor message) anchor))
      messages)))
+
+(defun qq-chat--latest-server-message ()
+  "Return the newest loaded message carrying a canonical server id."
+  (seq-find
+   (lambda (message)
+     (qq-api-message-id-p (alist-get 'server-id message)))
+   (reverse (qq-state-session-messages qq-chat--session-key))))
+
+(defun qq-chat--message-index (message-id messages)
+  "Return MESSAGE-ID's zero-based position in ordered MESSAGES, or nil."
+  (seq-position
+   messages message-id
+   (lambda (message candidate-id)
+     (equal (alist-get 'server-id message) candidate-id))))
+
+(defun qq-chat--message-id-after-p (candidate-id reference-id messages)
+  "Return non-nil when CANDIDATE-ID follows REFERENCE-ID in MESSAGES.
+
+Return nil when either id is absent, because an unknown timeline relation
+must not be guessed."
+  (let ((candidate-index (qq-chat--message-index candidate-id messages))
+        (reference-index (qq-chat--message-index reference-id messages)))
+    (and candidate-index reference-index
+         (> candidate-index reference-index))))
+
+(defun qq-chat--read-target-needed-p (message-id)
+  "Return non-nil when MESSAGE-ID can advance the known read position."
+  (let* ((messages (qq-state-session-messages qq-chat--session-key))
+         (session (qq-state-session qq-chat--session-key))
+         (unread-count (alist-get 'unread-count session))
+         (first-unread (alist-get 'first-unread-message-id session))
+         (read-latest (alist-get 'read-latest-message-id session)))
+    (and
+     (or (null qq-chat--last-read-target-id)
+         (qq-chat--message-id-after-p
+          message-id qq-chat--last-read-target-id messages))
+     (cond
+      ((and (integerp unread-count) (= unread-count 0) read-latest)
+       (qq-chat--message-id-after-p message-id read-latest messages))
+      ((and (integerp unread-count) (> unread-count 0) first-unread)
+       (or (equal message-id first-unread)
+           (qq-chat--message-id-after-p
+            message-id first-unread messages)))
+      (t t)))))
+
+(defun qq-chat--mark-message-viewed (message &optional force)
+  "Advance native read position through MESSAGE.
+
+With FORCE, submit even when this buffer already requested the same target."
+  (when-let* ((message-id (alist-get 'server-id message))
+              ((qq-api-message-id-p message-id))
+              ((or force (qq-chat--read-target-needed-p message-id))))
+    (setq qq-chat--last-read-target-id message-id)
+    (qq-api-mark-message-read qq-chat--session-key message-id)))
+
+(defun qq-chat--manage-read-position (&optional position)
+  "Advance read state to the message represented by POSITION.
+
+Point in the composer represents the newest loaded message, matching telega's
+prompt behavior.  Point on the timeline represents that exact message."
+  (when (and qq-auto-mark-read qq-chat--session-key)
+    (let ((position (or position (point))))
+      (qq-chat--mark-message-viewed
+       (if (appkit-chatbuf-point-in-input-p position)
+           (qq-chat--latest-server-message)
+         (qq-chat--message-at-point position))))))
+
+(defun qq-chat--window-scroll (window _display-start)
+  "Advance read state from WINDOW's cursor while scrolling it indirectly."
+  (when (and (window-live-p window)
+             (not (eq window (selected-window))))
+    (with-current-buffer (window-buffer window)
+      (when (derived-mode-p 'qq-chat-mode)
+        (qq-chat--manage-read-position (window-point window))))))
 
 (defun qq-chat--message-forwardable-p (message)
   "Return non-nil when MESSAGE can be forwarded by its server ID."
@@ -893,7 +974,8 @@ because its result is only `{kind:single}'."
       (appkit-chatbuf-input-prune-broken-objects))
     (qq-chat--flush-deferred-node-redisplay)
     (qq-chat--update-context-mode)
-    (qq-chat--maybe-auto-load-older)))
+    (qq-chat--maybe-auto-load-older)
+    (qq-chat--manage-read-position)))
 
 (defun qq-chat--prompt-text ()
   "Return visible prompt text for the current chat buffer."
@@ -1135,10 +1217,7 @@ Order (telega-inspired):
     (pcase event-type
       ('message
        (when (equal event-session-key qq-chat--session-key)
-         (qq-chat--apply-message-state-change event)
-         (when (and qq-auto-mark-read
-                    (get-buffer-window (current-buffer) t))
-           (qq-chat-read-all))))
+         (qq-chat--apply-message-state-change event)))
       ('history
        (when (equal event-session-key qq-chat--session-key)
          (qq-chat--header-line-update)
@@ -3397,7 +3476,9 @@ Bound to `C-c C-k' (also ESC ESC / C-M-c).  Reply footer × is clickable."
   (interactive)
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
-  (qq-api-mark-session-read qq-chat--session-key))
+  (if-let* ((message (qq-chat--latest-server-message)))
+      (qq-chat--mark-message-viewed message t)
+    (user-error "qq: this chat has no server message to mark as read")))
 
 (defun qq-chat--poke-session (session-key)
   "Return poke-capable SESSION-KEY metadata, or signal `user-error'."
@@ -3546,6 +3627,7 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (setq-local qq-chat--last-search-query nil)
   (setq-local qq-chat--marked-message-anchors nil)
   (setq-local qq-chat--forward-request-active-p nil)
+  (setq-local qq-chat--last-read-target-id nil)
   (setq-local qq-chat--fill-column nil)
   (setq-local appkit-media-card-fallback-context-function
               #'qq-chat--media-card-fallback-context)
@@ -3561,6 +3643,7 @@ Attach from clipboard with `C-c C-v' (telega-style)."
                (qq-chat--yank-media mime-type data nil))))
   (add-hook 'after-change-functions #'qq-chat--after-change nil t)
   (add-hook 'post-command-hook #'qq-chat--post-command nil t)
+  (add-hook 'window-scroll-functions #'qq-chat--window-scroll nil t)
   (add-hook 'window-size-change-functions
             #'qq-chat--on-window-size-change nil t)
   (add-hook 'display-line-numbers-mode-hook
@@ -3590,9 +3673,7 @@ first unread message."
             qq-chat--initial-history-request nil)
       (when (and target meta)
         (qq-chat--note-history-window meta)
-        (qq-chat--goto-loaded-message target nil))
-      (when qq-auto-mark-read
-        (qq-api-mark-session-read session-key)))))
+        (qq-chat--goto-loaded-message target nil)))))
 
 (defun qq-chat--fail-initial-history-load
     (buffer session-key owner response reason)

@@ -81,7 +81,11 @@ Nil means use `qq-history-fetch-count'.  NapCat `get_*_msg_history' with
   :group 'qq)
 
 (defcustom qq-auto-mark-read t
-  "When non-nil, mark a chat as read when its buffer is visible."
+  "When non-nil, advance a chat's read position with its cursor.
+
+The selected chat follows point.  Point in the composer means the newest
+loaded message; point on the timeline means that exact message.  Merely
+displaying a chat buffer does not mark the whole session as read."
   :type 'boolean
   :group 'qq)
 
