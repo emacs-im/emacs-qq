@@ -165,6 +165,8 @@
              (should (eq (key-binding (kbd "m") t) 'qq-chat-message-transient))
              (should (eq (key-binding (kbd "?") t) 'qq-chat-transient))
              (should (eq (key-binding (kbd "C-c /") t)
+                         'qq-chat-search))
+             (should (eq (key-binding (kbd "C-c M-/") t)
                          'qq-chat-search-results))
              (should (eq (key-binding (kbd "C-c C-r") t)
                          'qq-chat-search))
@@ -176,6 +178,10 @@
                          'qq-chat-search-next))
              (should (eq (key-binding (kbd "M-g p") t)
                          'qq-chat-search-prev))
+             (should (eq (key-binding (kbd "C-c C-c") t)
+                         'qq-chat-search-cancel))
+             (should (eq (key-binding (kbd "C-c RET") t)
+                         'qq-chat-send-message))
              (should (eq (key-binding (kbd "C-c m") t) 'qq-chat-message-transient))
              (should (eq (key-binding (kbd "C-c ?") t) 'qq-chat-transient))
              (should (eq (key-binding (kbd "C-c P") t)
@@ -184,6 +190,33 @@
              (should (eq (key-binding (kbd "C-c C-v") t) 'qq-chat-attach-clipboard)))
          (when (buffer-live-p buffer)
            (kill-buffer buffer)))))))
+
+(ert-deftest qq-chat-search-cancel-clears-owned-search-state ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq-local qq-chat--session-key "private:10001"
+                 qq-chat--last-search-query "needle"
+                 qq-chat--search-results '(((message_id . "11")))
+                 qq-chat--search-results-tail qq-chat--search-results
+                 qq-chat--search-index 0
+                 qq-chat--search-next-cursor "opaque-cursor"
+                 qq-chat--search-completed-p t)
+     (let ((canceled nil))
+       (cl-letf (((symbol-function 'qq-api-cancel-request)
+                  (lambda (token) (setq canceled token))))
+         (setq-local qq-chat--search-request 'request-token
+                     qq-chat--search-owner 'owner)
+         (qq-chat-search-cancel))
+       (should (eq canceled 'request-token)))
+     (should-not qq-chat--last-search-query)
+     (should-not qq-chat--search-results)
+     (should-not qq-chat--search-results-tail)
+     (should-not qq-chat--search-index)
+     (should-not qq-chat--search-next-cursor)
+     (should-not qq-chat--search-completed-p)
+     (should-not qq-chat--search-request)
+     (should-not qq-chat--search-owner))))
 
 (ert-deftest qq-chat-search-selects-nearest-result-by-exact-sequence ()
   (qq-chat-test-with-reset

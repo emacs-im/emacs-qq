@@ -46,10 +46,13 @@ selected on a focused frame.  Muted chats stay quiet except for native QQ
 the local notification history.
 
 Message search is authoritative and session-scoped: it never wraps over the
-currently rendered buffer.  In a chat, `C-c C-r`/`C-c C-s` search toward
-older/newer messages from point, and `M-g p`/`M-g n` continue in those
-directions.  `C-c /` opens the paginated `*qq-search*` result buffer; press
-`RET` on a row to load the exact message and its surrounding history.
+currently rendered buffer.  In a chat, `C-c /` starts the current-chat search,
+`C-c C-r`/`C-c C-s` search toward older/newer messages from point, and
+`M-g p`/`M-g n` continue in those directions; `C-c C-c` cancels that search.
+Unlike telega's materialized chat filter, the current QQ protocol navigates
+authoritative server hits in place.  `C-c M-/` opens the separate paginated
+`*qq-search*` result buffer; press `RET` on a row to load the exact message and
+its surrounding history.
 
 Development with Eask:
 
@@ -78,7 +81,9 @@ Architecture notes:
 - `qq-chat.el` adapts OneBot segments to appkit's compact media-card and action-context APIs
 - `qq-root.el` uses appkit's keyed one-line root layout
 - `qq-chat.el` projects QQ messages into the shared keyed chat timeline
-- chat keybindings currently center on telega-like habits (`RET`, `M-p`, `M-n`, `C-c C-c`, `C-c C-k`, `r`, `C-c C-r`, `C-c C-d`, `o`, `a`)
+- chat keybindings follow telega's native filter/search family (`C-c /`,
+  `C-c C-r`, `C-c C-s`, `C-c C-c`, `M-g s/n/p`) and keep QQ-only commands on
+  separate extension keys such as `C-c M-/` and `C-c RET`
 
 Recommended NapCat settings for development:
 

@@ -3428,6 +3428,37 @@ point; otherwise select the closest older result."
   (interactive)
   (qq-search-open qq-chat--session-key query))
 
+(defun qq-chat-search-cancel ()
+  "Cancel the active in-chat search and keep the normal timeline visible.
+
+This is the QQ counterpart of `telega-chatbuf-filter-cancel'.  QQ's current
+native search protocol navigates authoritative matches in place instead of
+materializing a separate filtered timeline, so cancellation clears its owned
+request, result cursor, header state, and match highlighting without replacing
+the messages already displayed."
+  (interactive)
+  (let ((active-p (or qq-chat--last-search-query
+                      qq-chat--search-request
+                      qq-chat--search-owner
+                      qq-chat--search-results
+                      qq-chat--search-highlight-overlays)))
+    (qq-chat--cancel-search-request)
+    (qq-chat--clear-search-highlights)
+    (setq qq-chat--last-search-query nil
+          qq-chat--search-results nil
+          qq-chat--search-results-tail nil
+          qq-chat--search-seen (make-hash-table :test #'equal)
+          qq-chat--search-consumed-cursors (make-hash-table :test #'equal)
+          qq-chat--search-index nil
+          qq-chat--search-direction 'older
+          qq-chat--search-anchor nil
+          qq-chat--search-completed-p nil
+          qq-chat--search-next-cursor nil)
+    (qq-chat--header-line-update)
+    (message (if active-p
+                 "qq: message search canceled"
+               "qq: no active message search"))))
+
 (defun qq-chat-render ()
   "Synchronize current chat frame and projected timeline from local state."
   (interactive)
@@ -3710,7 +3741,7 @@ happened."
 
 An unresolved @member, /face, /favorite, or :emoji: token always owns RET.
 This prevents a completion frontend with no preselected row from falling
-through and sending the query as plain text.  `C-c C-c' remains the explicit
+through and sending the query as plain text.  `C-c RET' remains the explicit
 way to send literal token text."
   (interactive "P")
   (qq-chat--ensure-composer-visible)
@@ -3721,7 +3752,7 @@ way to send literal token text."
       (insert "\n"))
      ((qq-completion-token-at-point)
       (or (qq-completion-complete)
-          (message "qq: no completion candidate; C-c C-c sends literally")))
+          (message "qq: no completion candidate; C-c RET sends literally")))
      (t
       (qq-chat-send-message)))))
 
@@ -3978,9 +4009,13 @@ still validated by the strict API contract."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-l") #'recenter-top-bottom)
     (define-key map (kbd "C-c g") #'qq-chat-refresh)
-    (define-key map (kbd "C-c /") #'qq-chat-search-results)
+    ;; Follow native telega's filtering/search key family.  The standalone
+    ;; paginated result page is an emacs-qq extension on `C-c M-/'.
+    (define-key map (kbd "C-c /") #'qq-chat-search)
+    (define-key map (kbd "C-c M-/") #'qq-chat-search-results)
     (define-key map (kbd "C-c C-r") #'qq-chat-search)
     (define-key map (kbd "C-c C-s") #'qq-chat-search-forward)
+    (define-key map (kbd "C-c C-c") #'qq-chat-search-cancel)
     (define-key map (kbd "C-c C-n") #'qq-chat-search-next)
     (define-key map (kbd "C-c C-p") #'qq-chat-search-prev)
     (define-key map (kbd "C-c r") #'qq-chat-read-all)
@@ -4010,7 +4045,7 @@ still validated by the strict API contract."
     (define-key map (kbd "M-g s") #'qq-chat-search)
     (define-key map (kbd "M-g n") #'qq-chat-search-next)
     (define-key map (kbd "M-g p") #'qq-chat-search-prev)
-    (define-key map (kbd "C-c C-c") #'qq-chat-send-message)
+    (define-key map (kbd "C-c RET") #'qq-chat-send-message)
     (define-key map (kbd "C-c C-k") #'qq-chat-cancel-dwim)
     ;; telega: ESC ESC / C-M-c also cancel reply-or-edit aux.
     (define-key map (kbd "\e\e") #'qq-chat-cancel-dwim)

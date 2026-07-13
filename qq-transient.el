@@ -273,7 +273,9 @@ Prefer this over inline button rows."
   [["Timeline"
     ("g" "Refresh" qq-chat-refresh)
     ("o" "Load older" qq-chat-load-older-messages)
-    ("/" "Search results" qq-chat-search-results)
+    ("/" "Search timeline" qq-chat-search)
+    ("M-/" "Search results" qq-chat-search-results)
+    ("x" "Cancel search" qq-chat-search-cancel)
     ("s" "Search older" qq-chat-search)
     ("S" "Search newer" qq-chat-search-forward)
     ("n" "Search next" qq-chat-search-next)
@@ -322,7 +324,8 @@ Prefer this over inline button rows."
     ("i" "Session info" qq-root-open-info-at-point
      :inapt-if qq-transient--root-info-inapt-p)
     ("I" "My profile" qq-root-open-self-user)
-    ("s" "Search session…" qq-root-search)
+    ("/" "Find session…" qq-root-open-session)
+    ("s" "Search messages…" qq-root-search)
     ("u" "Next unread" qq-root-next-unread)]
    ["Connection"
     ("c" "Connect" qq-connect)

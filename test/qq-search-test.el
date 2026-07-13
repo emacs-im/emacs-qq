@@ -57,7 +57,9 @@
    (beginning-of-line)
    (let ((button (button-at (point))))
      (should button)
-     (should (eq (button-type button) 'qq-search-result-button))
+     (should (eq (button-type button) 'appkit-ui-action-row-button))
+     (should (eq (button-get button 'appkit-ui-action-row-object)
+                 (qq-search--result-at-point)))
      (should (eq (key-binding [mouse-1]) #'push-button))
      ;; Mouse-1 must stay a direct button command instead of being
      ;; translated to the default Mouse-2 yank path.
@@ -70,8 +72,23 @@
      (let (call)
        (cl-letf (((symbol-function 'qq-chat-open-message)
                   (lambda (&rest args) (setq call args))))
-         (button-activate button)
-         (should (equal call '("group:20001" "11" "needle"))))))))
+       (button-activate button)
+       (should (equal call '("group:20001" "11" "needle"))))))))
+
+(ert-deftest qq-search-return-does-not-open-result-from-terminating-newline ()
+  (qq-search-test-with-buffer
+   (setq qq-search--query "needle"
+         qq-search--results
+         (list (qq-search-test--result "11" 100 "needle"))
+         qq-search--seen (make-hash-table :test #'equal)
+         qq-search--next-cursor nil
+         qq-search--status 'eof)
+   (qq-search--render)
+   (goto-char (point-min))
+   (should (qq-search-next-result))
+   (end-of-line)
+   (should-not (button-at (point)))
+   (should-error (qq-search-open-result) :type 'user-error)))
 
 (ert-deftest qq-search-result-button-dispatches-real-primary-click ()
   (save-window-excursion
@@ -162,7 +179,40 @@
                                (alist-get 'message_id result))
                              qq-search--results)
                       '("11" "10")))
+       (should (string-match-p "Loaded: 2" (buffer-string)))
        (should (string-match-p "End of results" (buffer-string)))))))
+
+(ert-deftest qq-search-next-result-consumes-pages-until-a-new-row-arrives ()
+  (qq-search-test-with-buffer
+   (let ((first (qq-search-test--result "11" 100 "first"))
+         (second (qq-search-test--result "10" 90 "second"))
+         cursors)
+     (cl-letf (((symbol-function 'qq-api-search-messages-start)
+                (lambda (_session _query callback &optional _errback _limit)
+                  (funcall callback
+                           `((results . (,first))
+                             (next_cursor . "cursor-1")))
+                  'start-token))
+               ((symbol-function 'qq-api-search-messages-next)
+                (lambda (cursor callback &optional _errback)
+                  (push cursor cursors)
+                  (if (equal cursor "cursor-1")
+                      (funcall callback
+                               `((results . (,first))
+                                 (next_cursor . "cursor-2")))
+                    (funcall callback
+                             `((results . (,second))
+                               (next_cursor))))
+                  'next-token)))
+       (qq-search-search "first")
+       (should (equal (alist-get 'message_id (qq-search--result-at-point))
+                      "11"))
+       (should (qq-search-next-result))
+       (should (equal (nreverse cursors) '("cursor-1" "cursor-2")))
+       (should (equal (alist-get 'message_id (qq-search--result-at-point))
+                      "10"))
+       (should-not qq-search--pending-next-key)
+       (should (eq qq-search--status 'eof))))))
 
 (ert-deftest qq-search-consumes-single-use-cursor-before-failure ()
   (qq-search-test-with-buffer

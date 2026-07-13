@@ -11,6 +11,7 @@
 
 (require 'cl-lib)
 (require 'ewoc)
+(require 'seq)
 (require 'subr-x)
 (require 'appkit-view)
 (require 'appkit-position)
@@ -22,8 +23,10 @@
 
 (autoload 'qq-user-open "qq-user" nil t)
 (autoload 'qq-group-open "qq-group" nil t)
+(autoload 'qq-search-open "qq-search" nil t)
 (declare-function qq-user-open "qq-user" (user-id))
 (declare-function qq-group-open "qq-group" (group-id))
+(declare-function qq-search-open "qq-search" (session-key &optional query))
 
 (defconst qq-root-buffer-name "*qq-root*"
   "Name of the emacs-qq root buffer.")
@@ -509,10 +512,14 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
            t)
     (message "qq: no unread sessions")))
 
-(defun qq-root-search ()
-  "Prompt for a session and open it."
-  (interactive)
-  (let* ((sessions (qq-state-sessions))
+(defun qq-root--read-session-key (prompt &optional predicate)
+  "Read and return a session key using PROMPT.
+
+When PREDICATE is non-nil, only sessions for which it returns non-nil are
+offered."
+  (let* ((sessions (if predicate
+                       (seq-filter predicate (qq-state-sessions))
+                     (qq-state-sessions)))
          (choices
           (mapcar (lambda (session)
                     (cons (format "%s  [%s]"
@@ -523,8 +530,22 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
                   sessions)))
     (unless choices
       (user-error "qq: no sessions available"))
-    (qq-chat-open
-     (cdr (assoc (completing-read "Session: " choices nil t) choices)))))
+    (cdr (assoc (completing-read prompt choices nil t) choices))))
+
+(defun qq-root-open-session ()
+  "Prompt for a session and open its chat buffer."
+  (interactive)
+  (qq-chat-open (qq-root--read-session-key "Open session: ")))
+
+(defun qq-root-search (&optional query)
+  "Choose a searchable session and open message results for optional QUERY."
+  (interactive)
+  (qq-search-open
+   (qq-root--read-session-key
+    "Search messages in: "
+    (lambda (session)
+      (memq (alist-get 'type session) '(group private))))
+   query))
 
 (defun qq-root-refresh ()
   "Request a fresh root snapshot from NapCat."
@@ -535,7 +556,7 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "g") #'qq-root-refresh)
     (define-key map (kbd "s") #'qq-root-search)
-    (define-key map (kbd "/") #'qq-root-search)
+    (define-key map (kbd "/") #'qq-root-open-session)
     (define-key map (kbd "RET") #'qq-root-open-at-point)
     (define-key map (kbd "a") #'qq-root-open-avatar-at-point)
     (define-key map (kbd "i") #'qq-root-open-info-at-point)

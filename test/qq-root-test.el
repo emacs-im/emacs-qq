@@ -125,6 +125,34 @@
     (qq-root-mode)
     (should (eq buffer-undo-list t))))
 
+(ert-deftest qq-root-search-chooses-session-before-message-search ()
+  (qq-root-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((type . private) (title . "Alice") (target-id . "10001"))
+    nil)
+   (qq-state-upsert-session
+    "service:mail"
+    '((type . service) (title . "QQ Mail"))
+    nil)
+   (let (call offered)
+     (cl-letf (((symbol-function 'completing-read)
+                (lambda (_prompt collection &rest _args)
+                  (setq offered collection)
+                  (caar collection)))
+               ((symbol-function 'qq-search-open)
+                (lambda (&rest args) (setq call args))))
+       (qq-root-search "needle"))
+     (should (= (length offered) 1))
+     (should (string-match-p "Alice" (caar offered)))
+     (should (equal call '("private:10001" "needle"))))))
+
+(ert-deftest qq-root-search-bindings-separate-session-find-and-message-search ()
+  (should (eq (lookup-key qq-root-mode-map (kbd "/"))
+              #'qq-root-open-session))
+  (should (eq (lookup-key qq-root-mode-map (kbd "s"))
+              #'qq-root-search)))
+
 (ert-deftest qq-root-projects-navigation-without-a-key-cheat-sheet ()
   (qq-root-test-with-reset
    (with-temp-buffer

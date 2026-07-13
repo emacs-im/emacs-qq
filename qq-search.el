@@ -13,6 +13,7 @@
 (require 'button)
 (require 'seq)
 (require 'subr-x)
+(require 'appkit-ui)
 (require 'qq-api)
 (require 'qq-state)
 
@@ -45,23 +46,8 @@
 (defvar-local qq-search--error nil)
 (defvar-local qq-search--request nil)
 (defvar-local qq-search--request-owner nil)
-
-(defvar qq-search-result-button-map
-  (let ((map (make-sparse-keymap)))
-    (set-keymap-parent map button-map)
-    ;; Unlike the Emacs default button map, make the expected primary click
-    ;; activate directly.  With no hover face this event is not translated
-    ;; through `mouse-1-click-follows-link'.
-    (define-key map [mouse-1] #'push-button)
-    map)
-  "Keymap for a message-search result button.")
-
-(define-button-type 'qq-search-result-button
-  'face nil
-  'mouse-face nil
-  'keymap qq-search-result-button-map
-  'action #'qq-search--activate-result-button
-  'help-echo "mouse-1 or RET: open this message")
+(defvar-local qq-search--pending-next-key nil
+  "Result key after which navigation should resume once a page arrives.")
 
 (defun qq-search--cancel-request ()
   "Cancel the current buffer's owned transport request, if any."
@@ -146,14 +132,13 @@ text in the results buffer can never receive search highlighting."
                 (qq-search--highlight-preview preview qq-search--query)))
          (start (point)))
     (insert line)
-    ;; Match telega's result layout: the message is a real text button and
-    ;; the terminating newline is outside it.  This keeps both button hit
-    ;; testing and any future button presentation away from trailing space.
-    (make-text-button
+    (add-text-properties
      start (point)
-     :type 'qq-search-result-button
-     'qq-search-result result
-     'qq-search-session-key qq-search--session-key)
+     (list 'qq-search-result result
+           'qq-search-session-key qq-search--session-key))
+    (appkit-ui-make-action-row
+     start (point) result #'qq-search--open-result
+     :help-echo "mouse-1 or RET: open this message")
     (insert "\n")))
 
 (defun qq-search--insert-status ()
@@ -173,6 +158,43 @@ text in the results buffer can never receive search highlighting."
     (_
      (insert (propertize "\nm: load more\n" 'face 'shadow)))))
 
+(defun qq-search--goto-result-key (key)
+  "Move point to the result identified by KEY and return non-nil."
+  (let ((found nil))
+    (goto-char (point-min))
+    (while (and (not found) (< (point) (point-max)))
+      (when-let* ((result (get-text-property (point) 'qq-search-result)))
+        (when (equal key (qq-search--result-key result))
+          (setq found t)))
+      (unless found (forward-line 1)))
+    found))
+
+(defun qq-search--next-local-result ()
+  "Move point to the next already loaded result and return non-nil."
+  (let ((origin (point)) found)
+    (when (qq-search--result-at-point) (forward-line 1))
+    (while (and (< (point) (point-max)) (not found))
+      (if (qq-search--result-at-point)
+          (setq found t)
+        (forward-line 1)))
+    (unless found (goto-char origin))
+    found))
+
+(defun qq-search--resume-pending-next ()
+  "Resume a pending next-result move, consuming empty pages if necessary."
+  (when qq-search--pending-next-key
+    (let ((anchor qq-search--pending-next-key))
+      (unless (qq-search--goto-result-key anchor)
+        (error "qq: search navigation lost its result anchor"))
+      (cond
+       ((qq-search--next-local-result)
+        (setq qq-search--pending-next-key nil))
+       (qq-search--next-cursor
+        (qq-search--start-request t))
+       (t
+        (setq qq-search--pending-next-key nil)
+        (message "qq: reached end of search results"))))))
+
 (defun qq-search--render ()
   "Render the current result list and paging state."
   (let ((inhibit-read-only t)
@@ -183,7 +205,8 @@ text in the results buffer can never receive search highlighting."
     (insert (propertize
              (format "Search in %s\n" (qq-search--session-title))
              'face 'bold))
-    (insert (format "Query: %s\n\n" qq-search--query))
+    (insert (format "Query: %s\nLoaded: %d\n\n"
+                    qq-search--query (length qq-search--results)))
     (dolist (result qq-search--results)
       (qq-search--insert-result result))
     (qq-search--insert-status)
@@ -211,10 +234,12 @@ text in the results buffer can never receive search highlighting."
             (setq qq-search--next-cursor (alist-get 'next_cursor page)
                   qq-search--status (if qq-search--next-cursor 'ready 'eof)
                   qq-search--error nil)
-            (qq-search--render))
+            (qq-search--render)
+            (qq-search--resume-pending-next))
         (error
          (setq qq-search--status 'error
-               qq-search--error (error-message-string error-data))
+               qq-search--error (error-message-string error-data)
+               qq-search--pending-next-key nil)
          (qq-search--render))))))
 
 (defun qq-search--page-failed (buffer session-key owner _response reason)
@@ -225,7 +250,8 @@ text in the results buffer can never receive search highlighting."
       (setq qq-search--request nil
             qq-search--request-owner nil
             qq-search--status 'error
-            qq-search--error reason)
+            qq-search--error reason
+            qq-search--pending-next-key nil)
       (qq-search--render))))
 
 (defun qq-search--start-request (next-p)
@@ -285,6 +311,7 @@ text in the results buffer can never receive search highlighting."
                qq-search--request-owner nil
                qq-search--next-cursor nil
                qq-search--status 'error
+               qq-search--pending-next-key nil
                qq-search--error
                (format "dispatch failed: %s; press g to restart"
                        (error-message-string error-data)))
@@ -311,7 +338,8 @@ text in the results buffer can never receive search highlighting."
         qq-search--consumed-cursors (make-hash-table :test #'equal)
         qq-search--next-cursor nil
         qq-search--status 'loading
-        qq-search--error nil)
+        qq-search--error nil
+        qq-search--pending-next-key nil)
   (qq-search--start-request nil))
 
 (defun qq-search-load-more ()
@@ -339,18 +367,24 @@ text in the results buffer can never receive search highlighting."
       (get-text-property (line-beginning-position) 'qq-search-result)))
 
 (defun qq-search-next-result ()
-  "Move point to the next result row without wrapping."
+  "Move to the next result, loading continuation pages when necessary."
   (interactive)
-  (let ((origin (point)) found)
-    (when (qq-search--result-at-point) (forward-line 1))
-    (while (and (< (point) (point-max)) (not found))
-      (if (qq-search--result-at-point)
-          (setq found t)
-        (forward-line 1)))
-    (unless found
-      (goto-char origin)
-      (message "qq: no next search result"))
-    found))
+  (or (qq-search--next-local-result)
+      (cond
+       (qq-search--request
+        (message "qq: message search is already loading")
+        nil)
+       (qq-search--next-cursor
+        (let ((anchor (or (qq-search--result-at-point)
+                          (car qq-search--results-tail))))
+          (unless anchor
+            (user-error "qq: cannot continue search navigation without an anchor"))
+          (setq qq-search--pending-next-key (qq-search--result-key anchor))
+          (qq-search--start-request t)
+          t))
+       (t
+        (message "qq: no next search result")
+        nil))))
 
 (defun qq-search-previous-result ()
   "Move point to the previous result row without wrapping."
@@ -369,10 +403,10 @@ text in the results buffer can never receive search highlighting."
     found))
 
 (defun qq-search-open-result ()
-  "Open the whole-line search result at point."
+  "Open the exact actionable search result at point."
   (interactive)
   (qq-search--open-result
-   (or (qq-search--result-at-point)
+   (or (get-text-property (point) 'qq-search-result)
        (user-error "qq: no search result at point"))))
 
 (defun qq-search--open-result (result)
@@ -381,12 +415,6 @@ text in the results buffer can never receive search highlighting."
          (qq-api-session-key-from-locator (alist-get 'chat result))))
     (qq-chat-open-message session-key (alist-get 'message_id result)
                           qq-search--query)))
-
-(defun qq-search--activate-result-button (button)
-  "Activate message-search result BUTTON at its exact clicked position."
-  (qq-search--open-result
-   (or (button-get button 'qq-search-result)
-       (error "qq: search result button has no result"))))
 
 (defvar qq-search-mode-map
   (let ((map (make-sparse-keymap)))
