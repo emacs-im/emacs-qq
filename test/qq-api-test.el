@@ -54,6 +54,15 @@
     (chat . ,chat)
     (read_state . ,(qq-api-test--read-state))))
 
+(defun qq-api-test--search-result (&optional message-id sent-at preview)
+  "Return one strict fork-native message-search result."
+  `((chat . ((kind . "group") (group_id . "20001")))
+    (message_id . ,(or message-id "9007199254742007089"))
+    (message_seq . "30001")
+    (sent_at . ,(or sent-at 1710000000))
+    (sender . ((user_id . "10001") (name . "Alice")))
+    (preview . ,(or preview "hello"))))
+
 (ert-deftest qq-api-send-message-builds-send-msg-request ()
   (let (captured-action captured-params pending-call)
     (cl-letf (((symbol-function 'qq-state-insert-pending-message)
@@ -275,6 +284,150 @@
   (should-error
    (qq-api--emacs-session-key-from-locator
     '((kind . "private") (user_id . 10001)))))
+
+(ert-deftest qq-api-session-key-from-locator-is-public-and-lossless ()
+  (should (equal (qq-api-session-key-from-locator
+                  '((kind . "group") (group_id . "20001")))
+                 "group:20001"))
+  (should-error
+   (qq-api-session-key-from-locator
+    '((kind . "group") (group_id . "20001") (extra . t)))))
+
+(ert-deftest qq-protocol-message-search-page-is-closed-and-chat-scoped ()
+  (let ((page `((results . (,(qq-api-test--search-result)))
+                (next_cursor . "opaque-1"))))
+    (should (qq-protocol-emacs-message-search-page-p page))
+    (should (equal (qq-protocol-validate-emacs-message-search-page page)
+                   page))
+    (should
+     (qq-protocol-emacs-message-search-page-p
+      '((results) (next_cursor . "opaque-empty"))))
+    (dolist
+        (invalid
+         (list
+          (let ((result (qq-api-test--search-result)))
+            (setf (alist-get 'message_id result) 9007199254742007089)
+            `((results . (,result)) (next_cursor)))
+          (let ((result (qq-api-test--search-result "09007199254742007089")))
+            `((results . (,result)) (next_cursor)))
+          (let ((result (qq-api-test--search-result)))
+            (setf (alist-get 'message_seq result) 30001)
+            `((results . (,result)) (next_cursor)))
+          (let ((result (qq-api-test--search-result)))
+            (setf (alist-get 'message_seq result) "030001")
+            `((results . (,result)) (next_cursor)))
+          `((results . (,(append (qq-api-test--search-result)
+                                 '((extra . t)))))
+            (next_cursor))
+          '((results . (((chat . ((kind . "service")
+                                  (peer_uid . "u_mail")))
+                         (message_id . "1") (message_seq . "1")
+                         (sent_at . 1)
+                         (sender . ((user_id . "1") (name . "QQ")))
+                         (preview . "mail"))))
+            (next_cursor))
+          '((results . (((chat . ((kind . "private") (user_id . "1")))
+                         (message_id . "0") (message_seq . "1")
+                         (sent_at . 1)
+                         (sender . ((user_id . "1") (name . "QQ")))
+                         (preview . "x"))))
+            (next_cursor))
+          '((results . (((chat . ((kind . "private") (user_id . "1")))
+                         (message_id . "1") (message_seq . "1")
+                         (sent_at . 1)
+                         (sender . ((user_id . "1") (name . "")))
+                         (preview . "x"))))
+            (next_cursor))
+          '((results . (((chat . ((kind . "private") (user_id . "1")))
+                         (message_id . "1") (message_seq . "1")
+                         (sent_at . 1)
+                         (sender . ((user_id . "1") (name . "QQ")))
+                         (preview . ""))))
+            (next_cursor))))
+      (should-not (qq-protocol-emacs-message-search-page-p invalid)))))
+
+(ert-deftest qq-protocol-decimal-string-compare-never-coerces-precision ()
+  (should (= -1 (qq-protocol-decimal-string-compare
+                 "90071992547409931234" "90071992547409931235")))
+  (should (= 1 (qq-protocol-decimal-string-compare
+                "100000000000000000000" "99999999999999999999")))
+  (should (= 0 (qq-protocol-decimal-string-compare "30001" "30001")))
+  (should-error (qq-protocol-decimal-string-compare 30001 "30002")))
+
+(ert-deftest qq-api-search-messages-start-trims-and-validates-closed-page ()
+  (let ((result (qq-api-test--search-result
+                 "900719925474099312345" 1710000000 "hello"))
+        action params value)
+    (setf (alist-get 'message_seq result) "900719925474099312346")
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (candidate-action candidate-params callback
+                        &optional _errback)
+                 (setq action candidate-action
+                       params candidate-params)
+                 (funcall callback
+                          `((data . ((results . (,result))
+                                     (next_cursor . "cursor-1")))))
+                 'request-1)))
+      (should (eq (qq-api-search-messages-start
+                   "group:20001" "  hello  "
+                   (lambda (page) (setq value page)))
+                  'request-1))
+      (should (equal action "emacs_search_messages"))
+      (should
+       (equal params
+              '((kind . "start")
+                (chat . ((kind . "group") (group_id . "20001")))
+                (query . "hello")
+                (limit . 50))))
+      (should (equal (alist-get 'next_cursor value) "cursor-1"))
+      (let ((returned (car (alist-get 'results value))))
+        (should (equal (alist-get 'message_id returned)
+                       "900719925474099312345"))
+        (should (equal (alist-get 'message_seq returned)
+                       "900719925474099312346"))))))
+
+(ert-deftest qq-api-search-messages-next-sends-opaque-cursor-directly ()
+  (let (params value)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action candidate-params callback &optional _errback)
+                 (setq params candidate-params)
+                 (funcall callback
+                          '((data . ((results) (next_cursor)))))
+                 'request-2)))
+      (qq-api-search-messages-next "opaque:cursor" (lambda (page)
+                                                          (setq value page)))
+      (should (equal params '((kind . "next")
+                              (cursor . "opaque:cursor"))))
+      (should (equal value '((results) (next_cursor)))))))
+
+(ert-deftest qq-api-search-messages-rejects-unsupported-or-invalid-input ()
+  (should-error
+   (qq-api-search-messages-start "service:u_mail" "mail" #'ignore)
+   :type 'user-error)
+  (should-error
+   (qq-api-search-messages-start "group:20001" "   " #'ignore)
+   :type 'user-error)
+  (should-error
+   (qq-api-search-messages-start
+    "group:20001" (make-string 513 ?x) #'ignore)
+   :type 'user-error)
+  (should-error
+   (qq-api-search-messages-next "" #'ignore)
+   :type 'user-error))
+
+(ert-deftest qq-api-search-messages-routes-schema-errors-to-errback ()
+  (let (reason)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional _errback)
+                 (funcall callback
+                          '((data . ((results)
+                                     (next_cursor)
+                                     (extra . t)))))
+                 'request)))
+      (qq-api-search-messages-start
+       "private:10001" "x" #'ignore
+       (lambda (_response error-reason) (setq reason error-reason)))
+      (should (string-match-p "closed message-search page" reason)))))
 
 (ert-deftest qq-api-mark-message-read-failure-refreshes-authoritative-state ()
   (let ((qq-state-change-hook nil)

@@ -929,14 +929,14 @@ NapCat throws when `message_seq' is unknown or the page is empty
   "Return native Emacs action params for SESSION-KEY."
   `((chat . ,(qq-api--session-emacs-locator session-key))))
 
-(defun qq-api--emacs-session-key-from-locator (locator)
+(defun qq-api-session-key-from-locator (locator)
   "Return the unique local session key represented by LOCATOR.
 
 LOCATOR must satisfy the fork's closed `EmacsSessionLocator' union.  Opaque
 peer UIDs stay strings and are never interpreted as QQ numbers."
   (setq locator
         (qq-protocol-validate-emacs-session-locator
-         locator "emacs_read_state.chat"))
+         locator "Emacs session locator"))
   (pcase (alist-get 'kind locator)
     ("group"
      (qq-state-session-key 'group (alist-get 'group_id locator)))
@@ -951,6 +951,11 @@ peer UIDs stay strings and are never interpreted as QQ numbers."
     ;; The validator makes this unreachable.  Keep the branch explicit so a
     ;; future locator kind cannot silently map to the wrong session namespace.
     (_ (error "qq: unsupported Emacs session locator %S" locator))))
+
+;; Kept for source compatibility with callers written before the conversion
+;; became part of the public protocol boundary.
+(defalias 'qq-api--emacs-session-key-from-locator
+  #'qq-api-session-key-from-locator)
 
 (defun qq-api-fetch-session-read-state (session-key &optional callback errback)
   "Fetch the official Linux QQ read position for SESSION-KEY.
@@ -1658,6 +1663,66 @@ reconciles it with the authoritative aggregate count."
                  response (error-message-string error-data)))))
    errback))
 
+(defun qq-api--message-search-session-locator (session-key)
+  "Return a supported message-search locator for SESSION-KEY."
+  (let* ((identity (qq-state-session-key-identity session-key))
+         (type (alist-get 'type identity))
+         (locator (qq-api--session-emacs-locator session-key)))
+    (unless (memq type '(group private))
+      (user-error "qq: message search is unsupported for %s sessions" type))
+    (unless (qq-protocol-emacs-chat-locator-p locator)
+      (user-error "qq: message search requires a nonzero decimal chat id"))
+    locator))
+
+(defun qq-api--message-search-page-callback (callback errback response)
+  "Validate search RESPONSE, then invoke CALLBACK or ERRBACK."
+  (condition-case error-data
+      (funcall
+       callback
+       (qq-protocol-validate-emacs-message-search-page
+        (qq-api--response-data response)
+        "emacs_search_messages response"))
+    (error
+     (funcall (or errback #'qq-api--default-error)
+              response (error-message-string error-data)))))
+
+(defun qq-api-search-messages-start
+    (session-key query callback &optional errback limit)
+  "Start authoritative message search in SESSION-KEY for QUERY.
+
+CALLBACK receives one validated closed page with `results' and an opaque
+`next_cursor'.  LIMIT defaults to 50 and must be between 1 and 100.  Only
+private and group chats are searchable; no loaded-buffer fallback exists."
+  (setq query (and (stringp query) (string-trim query)))
+  (unless (and query (not (string-empty-p query)))
+    (user-error "qq: message search query must be a non-empty string"))
+  (when (> (length query) 512)
+    (user-error "qq: message search query must be at most 512 characters"))
+  (setq limit (or limit 50))
+  (unless (and (integerp limit) (<= 1 limit 100))
+    (user-error "qq: message search limit must be between 1 and 100"))
+  (qq-api-call
+   "emacs_search_messages"
+   `((kind . "start")
+     (chat . ,(qq-api--message-search-session-locator session-key))
+     (query . ,query)
+     (limit . ,limit))
+   (apply-partially #'qq-api--message-search-page-callback callback errback)
+   errback))
+
+(defun qq-api-search-messages-next (cursor callback &optional errback)
+  "Continue authoritative message search at opaque CURSOR.
+
+CALLBACK receives the same validated page shape as
+`qq-api-search-messages-start'."
+  (unless (and (stringp cursor) (not (string-empty-p cursor)))
+    (user-error "qq: message search cursor must be a non-empty string"))
+  (qq-api-call
+   "emacs_search_messages"
+   `((kind . "next") (cursor . ,cursor))
+   (apply-partially #'qq-api--message-search-page-callback callback errback)
+   errback))
+
 (defun qq-api--normalize-group-member-search-result (member index)
   "Validate and normalize native group MEMBER at INDEX."
   (let ((context (format "emacs_search_group_members[%d]" index))
@@ -1797,7 +1862,7 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
               notice "websocket event"))
             (chat (alist-get 'chat event))
             (read-state (alist-get 'read_state event))
-            (session-key (qq-api--emacs-session-key-from-locator chat)))
+            (session-key (qq-api-session-key-from-locator chat)))
        (when (qq-api--accept-read-observation-p
               session-key (qq-api--next-read-observation-token))
          (qq-state-apply-session-read-state session-key read-state))))

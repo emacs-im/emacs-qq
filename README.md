@@ -10,6 +10,7 @@ Current scope:
 - keep chat keybindings closer to telega.el conventions
 - handle live message events, replies, QQ media resources, and basic recall notices
 - complete native group members and QQ faces directly in the composer
+- search private/group history through Linux QQ, including messages not loaded locally
 
 Quick start:
 
@@ -43,6 +44,12 @@ selected on a focused frame.  Muted chats stay quiet except for native QQ
 `@我`; `@全体成员` mute breakthrough is controlled by
 `qq-notifications-at-all-breaks-mute`.  `M-x qq-notifications-history` opens
 the local notification history.
+
+Message search is authoritative and session-scoped: it never wraps over the
+currently rendered buffer.  In a chat, `C-c C-r`/`C-c C-s` search toward
+older/newer messages from point, and `M-g p`/`M-g n` continue in those
+directions.  `C-c /` opens the paginated `*qq-search*` result buffer; press
+`RET` on a row to load the exact message and its surrounding history.
 
 Development with Eask:
 

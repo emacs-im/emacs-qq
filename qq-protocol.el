@@ -24,6 +24,27 @@
        (not (string-empty-p value))
        (string-match-p "\\`[0-9]+\\'" value)))
 
+(defun qq-protocol--nonzero-decimal-string-p (value)
+  "Return non-nil when VALUE is a positive decimal identity string."
+  (and (stringp value)
+       (string-match-p "\\`[1-9][0-9]*\\'" value)))
+
+(defun qq-protocol-decimal-string-compare (left right)
+  "Compare nonzero decimal strings LEFT and RIGHT without number coercion.
+
+Return -1, 0, or 1.  Length is compared before lexicographic order, which is
+exact for canonical decimal strings and cannot lose NT sequence precision."
+  (unless (qq-protocol--nonzero-decimal-string-p left)
+    (error "qq: decimal comparison requires nonzero LEFT string, got %S" left))
+  (unless (qq-protocol--nonzero-decimal-string-p right)
+    (error "qq: decimal comparison requires nonzero RIGHT string, got %S" right))
+  (cond
+   ((< (length left) (length right)) -1)
+   ((> (length left) (length right)) 1)
+   ((string-lessp left right) -1)
+   ((string-lessp right left) 1)
+   (t 0)))
+
 (defun qq-protocol-message-id-p (value)
   "Return non-nil when VALUE is an original NT message snowflake string."
   (qq-protocol--decimal-string-p value))
@@ -88,6 +109,19 @@ CONTEXT is included in protocol errors."
                  (not (string-empty-p peer-uid))))))
     (_ nil)))
 
+(defun qq-protocol-emacs-chat-locator-p (value)
+  "Return non-nil when VALUE is a searchable group/private locator."
+  (pcase (and (consp value) (alist-get 'kind value))
+    ("group"
+     (and (qq-protocol--closed-object-p value '(kind group_id))
+          (qq-protocol--nonzero-decimal-string-p
+           (alist-get 'group_id value))))
+    ("private"
+     (and (qq-protocol--closed-object-p value '(kind user_id))
+          (qq-protocol--nonzero-decimal-string-p
+           (alist-get 'user_id value))))
+    (_ nil)))
+
 (defun qq-protocol-validate-emacs-session-locator
     (value &optional context error-symbol)
   "Return a copy of closed Emacs session locator VALUE after validation.
@@ -97,6 +131,54 @@ CONTEXT is included in the diagnostic.  ERROR-SYMBOL defaults to `error'."
     (signal (or error-symbol 'error)
             (list
              (format "qq: %s requires a closed Emacs session locator, got %S"
+                     (or context "protocol payload") value))))
+  (copy-tree value))
+
+(defun qq-protocol--emacs-message-search-sender-p (value)
+  "Return non-nil when VALUE is a closed message-search sender."
+  (and (qq-protocol--closed-object-p value '(user_id name))
+       (qq-protocol--nonzero-decimal-string-p (alist-get 'user_id value))
+       (let ((name (alist-get 'name value)))
+         (and (stringp name) (not (string-empty-p name))))))
+
+(defun qq-protocol-emacs-message-search-result-p (value)
+  "Return non-nil when VALUE is one closed message-search result."
+  (and (qq-protocol--closed-object-p
+        value '(chat message_id message_seq sent_at sender preview))
+       (qq-protocol-emacs-chat-locator-p (alist-get 'chat value))
+       (qq-protocol--nonzero-decimal-string-p
+        (alist-get 'message_id value))
+       (qq-protocol--nonzero-decimal-string-p
+        (alist-get 'message_seq value))
+       (qq-protocol--positive-safe-integer-p (alist-get 'sent_at value))
+       (qq-protocol--emacs-message-search-sender-p
+        (alist-get 'sender value))
+       (let ((preview (alist-get 'preview value)))
+         (and (stringp preview) (not (string-empty-p preview))))))
+
+(defun qq-protocol-emacs-message-search-page-p (value)
+  "Return non-nil when VALUE is one closed message-search page.
+
+An empty result page may still carry `next_cursor'.  The cursor is an opaque
+server-owned continuation and is therefore validated only as a non-empty
+string; clients must never parse or synthesize it."
+  (and (qq-protocol--closed-object-p value '(results next_cursor))
+       (let ((results (alist-get 'results value)))
+         (and (listp results)
+              (cl-every #'qq-protocol-emacs-message-search-result-p results)))
+       (let ((cursor (alist-get 'next_cursor value)))
+         (or (null cursor)
+             (and (stringp cursor) (not (string-empty-p cursor)))))))
+
+(defun qq-protocol-validate-emacs-message-search-page
+    (value &optional context error-symbol)
+  "Return a copy of closed message-search page VALUE after validation.
+
+CONTEXT is included in the diagnostic.  ERROR-SYMBOL defaults to `error'."
+  (unless (qq-protocol-emacs-message-search-page-p value)
+    (signal (or error-symbol 'error)
+            (list
+             (format "qq: %s requires a closed message-search page, got %S"
                      (or context "protocol payload") value))))
   (copy-tree value))
 

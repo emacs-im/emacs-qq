@@ -21,6 +21,15 @@
   "Synchronously flush the current chat view's queued invalidations."
   (appkit-sync-invalidations (appkit-current-view)))
 
+(defun qq-chat-test--search-result (id sequence time &optional preview)
+  "Return one strict group search result."
+  `((chat . ((kind . "group") (group_id . "20001")))
+    (message_id . ,id)
+    (message_seq . ,sequence)
+    (sent_at . ,time)
+    (sender . ((user_id . "10001") (name . "Alice")))
+    (preview . ,(or preview "needle"))))
+
 (ert-deftest qq-chat-header-contains-state-not-a-key-cheat-sheet ()
   (with-temp-buffer
     (qq-chat-mode)
@@ -155,7 +164,18 @@
                          'qq-chat-poke-sender))
              (should (eq (key-binding (kbd "m") t) 'qq-chat-message-transient))
              (should (eq (key-binding (kbd "?") t) 'qq-chat-transient))
-             (should (eq (key-binding (kbd "C-c /") t) 'qq-chat-search))
+             (should (eq (key-binding (kbd "C-c /") t)
+                         'qq-chat-search-results))
+             (should (eq (key-binding (kbd "C-c C-r") t)
+                         'qq-chat-search))
+             (should (eq (key-binding (kbd "C-c C-s") t)
+                         'qq-chat-search-forward))
+             (should (eq (key-binding (kbd "M-g s") t)
+                         'qq-chat-search))
+             (should (eq (key-binding (kbd "M-g n") t)
+                         'qq-chat-search-next))
+             (should (eq (key-binding (kbd "M-g p") t)
+                         'qq-chat-search-prev))
              (should (eq (key-binding (kbd "C-c m") t) 'qq-chat-message-transient))
              (should (eq (key-binding (kbd "C-c ?") t) 'qq-chat-transient))
              (should (eq (key-binding (kbd "C-c P") t)
@@ -164,6 +184,348 @@
              (should (eq (key-binding (kbd "C-c C-v") t) 'qq-chat-attach-clipboard)))
          (when (buffer-live-p buffer)
            (kill-buffer buffer)))))))
+
+(ert-deftest qq-chat-search-selects-nearest-result-by-exact-sequence ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let* ((origin '((server-id . "8000")
+                      (time . 100)
+                      (raw-event . ((message_seq . "250")))))
+            (results (list (qq-chat-test--search-result "1000" "300" 100)
+                           (qq-chat-test--search-result "9000" "200" 100)
+                           (qq-chat-test--search-result "7000" "100" 100)))
+            opened)
+       (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                  (lambda (&optional _position) origin))
+                 ((symbol-function 'qq-api-search-messages-start)
+                  (lambda (_session _query callback &optional _errback _limit)
+                    (funcall callback `((results . ,results) (next_cursor)))
+                    'request))
+                 ((symbol-function 'qq-chat-open-message)
+                  (lambda (_session id &optional _query) (setq opened id))))
+         (qq-chat-search "needle")
+         (should (equal opened "9000"))
+         (should (= qq-chat--search-index 1))
+         (setq opened nil)
+         (qq-chat-search "needle" t)
+         (should (equal opened "1000"))
+         (should (= qq-chat--search-index 0)))))))
+
+(ert-deftest qq-chat-search-same-second-orders-by-string-sequence-not-id ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let* ((origin '((server-id . "500")
+                      (time . 100)
+                      (raw-event . ((message_seq . "90071992547409931235")))))
+            (results
+             (list
+              (qq-chat-test--search-result
+               "100" "90071992547409931236" 100)
+              (qq-chat-test--search-result
+               "900" "90071992547409931234" 100)))
+            opened)
+       (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                  (lambda (&optional _position) origin))
+                 ((symbol-function 'qq-api-search-messages-start)
+                  (lambda (_session _query callback &optional _errback _limit)
+                    (funcall callback `((results . ,results) (next_cursor)))
+                    'request))
+                 ((symbol-function 'qq-chat-open-message)
+                  (lambda (_session id &optional _query) (setq opened id))))
+         (qq-chat-search "needle")
+         (should (equal opened "900"))
+         (qq-chat-search "needle" t)
+         (should (equal opened "100")))))))
+
+(ert-deftest qq-chat-search-exact-anchor-id-skips-the-anchor-itself ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let* ((origin '((server-id . "500")
+                      (time . 100)
+                      (raw-event . ((message_seq . "20")))))
+            (results
+             (list (qq-chat-test--search-result "100" "21" 100)
+                   (qq-chat-test--search-result "500" "20" 100)
+                   (qq-chat-test--search-result "900" "19" 100)))
+            opened)
+       (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                  (lambda (&optional _position) origin))
+                 ((symbol-function 'qq-api-search-messages-start)
+                  (lambda (_session _query callback &optional _errback _limit)
+                    (funcall callback `((results . ,results) (next_cursor)))
+                    'request))
+                 ((symbol-function 'qq-chat-open-message)
+                  (lambda (_session id &optional _query) (setq opened id))))
+         (qq-chat-search "needle")
+         (should (equal opened "900"))
+         (qq-chat-search "needle" t)
+         (should (equal opened "100")))))))
+
+(ert-deftest qq-chat-search-follows-empty-pages-without-restarting ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let ((start-calls 0) (next-cursors nil) opened)
+       (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                  (lambda (&optional _position) nil))
+                 ((symbol-function 'qq-api-search-messages-start)
+                  (lambda (_session _query callback &optional _errback _limit)
+                    (cl-incf start-calls)
+                    (funcall callback
+                             '((results) (next_cursor . "cursor-1")))
+                    'start))
+                 ((symbol-function 'qq-api-search-messages-next)
+                  (lambda (cursor callback &optional _errback)
+                    (setq next-cursors (append next-cursors (list cursor)))
+                    (funcall
+                     callback
+                     (if (equal cursor "cursor-1")
+                         '((results) (next_cursor . "cursor-2"))
+                       `((results . (,(qq-chat-test--search-result
+                                      "123" "10" 10)))
+                         (next_cursor))))
+                    'next))
+                 ((symbol-function 'qq-chat-open-message)
+                  (lambda (_session id &optional _query) (setq opened id))))
+         (qq-chat-search "needle")
+         (should (= start-calls 1))
+         (should (equal next-cursors '("cursor-1" "cursor-2")))
+         (should (equal opened "123"))
+         (should-not qq-chat--search-owner))))))
+
+(ert-deftest qq-chat-search-continues-past-eight-empty-or-duplicate-pages ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let* ((origin '((server-id . "500")
+                      (time . 100)
+                      (raw-event . ((message_seq . "100")))))
+            (duplicate (qq-chat-test--search-result "501" "101" 101))
+            (target (qq-chat-test--search-result "499" "99" 99))
+            (expected-cursors
+             (mapcar (lambda (number) (format "cursor-%d" number))
+                     (number-sequence 1 10)))
+            (start-calls 0)
+            next-cursors
+            opened)
+       (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                  (lambda (&optional _position) origin))
+                 ((symbol-function 'qq-api-search-messages-start)
+                  (lambda (_session _query callback &optional _errback _limit)
+                    (cl-incf start-calls)
+                    (funcall callback
+                             `((results . (,duplicate))
+                               (next_cursor . "cursor-1")))
+                    'start-token))
+                 ((symbol-function 'qq-api-search-messages-next)
+                  (lambda (cursor callback &optional _errback)
+                    (setq next-cursors
+                          (append next-cursors (list cursor)))
+                    (let ((page-number (length next-cursors)))
+                      (funcall
+                       callback
+                       (if (= page-number 10)
+                           `((results . (,target)) (next_cursor))
+                         `((results . ,(if (cl-oddp page-number)
+                                           nil
+                                         (list duplicate)))
+                           (next_cursor
+                            . ,(format "cursor-%d" (1+ page-number)))))))
+                    (intern (format "next-token-%d" (length next-cursors)))))
+                 ((symbol-function 'qq-chat-open-message)
+                  (lambda (_session id &optional _query) (setq opened id))))
+         (qq-chat-search "needle")
+         (should (= start-calls 1))
+         (should (equal next-cursors expected-cursors))
+         (should (equal opened "499"))
+         (should (equal (mapcar (lambda (result)
+                                 (alist-get 'message_id result))
+                               qq-chat--search-results)
+                        '("501" "499")))
+         (should qq-chat--search-completed-p)
+         (should-not qq-chat--search-owner))))))
+
+(ert-deftest qq-chat-search-consumes-cursor-before-next-failure ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001"
+           qq-chat--last-search-query "needle"
+           qq-chat--search-results
+           (list (qq-chat-test--search-result "101" "10" 10))
+           qq-chat--search-results-tail qq-chat--search-results
+           qq-chat--search-seen (make-hash-table :test #'equal)
+           qq-chat--search-index 0
+           qq-chat--search-next-cursor "single-use")
+     (let ((next-calls 0))
+       (cl-letf (((symbol-function 'qq-api-search-messages-next)
+                  (lambda (_cursor _callback &optional errback)
+                    (cl-incf next-calls)
+                    (funcall errback nil "network")
+                    'request)))
+         (qq-chat-search-prev)
+         (should (= next-calls 1))
+         (should-not qq-chat--search-next-cursor)
+         (should-not qq-chat--search-owner)
+         (qq-chat-search-prev)
+         (should (= next-calls 1)))))))
+
+(ert-deftest qq-chat-search-cancels-and-ignores-stale-owner ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let (callbacks canceled opened (counter 0))
+       (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                  (lambda (&optional _position) nil))
+                 ((symbol-function 'qq-api-search-messages-start)
+                  (lambda (_session _query callback &optional _errback _limit)
+                    (cl-incf counter)
+                    (setq callbacks (append callbacks (list callback)))
+                    (intern (format "request-%d" counter))))
+                 ((symbol-function 'qq-api-cancel-request)
+                  (lambda (token) (setq canceled (append canceled (list token)))))
+                 ((symbol-function 'qq-chat-open-message)
+                  (lambda (_session id &optional _query) (setq opened id))))
+         (qq-chat-search "first")
+         (qq-chat-search "second")
+         (should (equal canceled '(request-1)))
+         (funcall (car callbacks)
+                  `((results . (,(qq-chat-test--search-result
+                                  "111" "20" 20)))
+                    (next_cursor)))
+         (should-not opened)
+         (funcall (cadr callbacks)
+                  `((results . (,(qq-chat-test--search-result
+                                  "222" "10" 10)))
+                    (next_cursor)))
+         (should (equal opened "222")))))))
+
+(ert-deftest qq-chat-open-message-cancels-pending-search-and-stale-callback ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let ((buffer (current-buffer))
+           search-callback
+           canceled
+           around-message-ids)
+       (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                  (lambda (&optional _position) nil))
+                 ((symbol-function 'qq-api-search-messages-start)
+                  (lambda (_session _query callback &optional _errback _limit)
+                    (setq search-callback callback)
+                    'search-token))
+                 ((symbol-function 'qq-api-cancel-request)
+                  (lambda (token) (push token canceled)))
+                 ((symbol-function 'qq-chat--open-buffer)
+                  (lambda (_session-key) buffer))
+                 ((symbol-function 'pop-to-buffer)
+                  (lambda (&rest _args) buffer))
+                 ((symbol-function 'qq-chat--on-window-size-change) #'ignore)
+                 ((symbol-function 'qq-chat--goto-loaded-message)
+                  (lambda (&rest _args) nil))
+                 ((symbol-function 'qq-api-fetch-history-around)
+                  (lambda (_session-key message-id _callback
+                           &optional _errback _count)
+                    (setq around-message-ids
+                          (append around-message-ids (list message-id)))
+                    (intern (format "around-%s" message-id)))))
+         (qq-chat-search "needle")
+         (should (eq qq-chat--search-request 'search-token))
+         (should qq-chat--search-owner)
+
+         (qq-chat-open-message "group:20001" "999" "needle")
+         (should (memq 'search-token canceled))
+         (should-not qq-chat--search-request)
+         (should-not qq-chat--search-owner)
+         (should (eq qq-chat--open-message-request 'around-999))
+         (should (equal around-message-ids '("999")))
+
+         (funcall search-callback
+                  `((results . (,(qq-chat-test--search-result
+                                  "111" "20" 20)))
+                    (next_cursor)))
+         (should (equal around-message-ids '("999")))
+         (should (eq qq-chat--open-message-request 'around-999))
+         (should-not (memq 'around-999 canceled))
+         (should-not qq-chat--search-results)
+         (should-not qq-chat--search-index))))))
+
+(ert-deftest qq-chat-open-message-cancels-initial-and-normal-open-cancels-around ()
+  (qq-chat-test-with-reset
+   (save-window-excursion
+     (let ((buffer (generate-new-buffer " *qq-open-message-race*"))
+           canceled around-call (initial-loads 0))
+       (unwind-protect
+           (progn
+             (with-current-buffer buffer
+               (qq-chat-mode)
+               (setq qq-chat--session-key "group:20001"
+                     qq-chat--initial-history-request 'initial-token
+                     qq-chat--initial-history-owner '(initial)))
+             (cl-letf (((symbol-function 'qq-chat--open-buffer)
+                        (lambda (_session) buffer))
+                       ((symbol-function 'qq-api-cancel-request)
+                        (lambda (token) (push token canceled)))
+                       ((symbol-function 'qq-chat--on-window-size-change)
+                        #'ignore)
+                       ((symbol-function 'qq-chat--goto-loaded-message)
+                        (lambda (&rest _) nil))
+                       ((symbol-function 'qq-api-fetch-history-around)
+                        (lambda (session id _callback &optional _errback count)
+                          (setq around-call (list session id count))
+                          'around-token))
+                       ((symbol-function 'qq-chat--load-initial-history)
+                        (lambda (&rest _args) (cl-incf initial-loads))))
+               (qq-chat-open-message "group:20001" "11" "needle")
+               (should (memq 'initial-token canceled))
+               (should (equal (car around-call) "group:20001"))
+               (should (equal (cadr around-call) "11"))
+               (should (zerop (or initial-loads 0)))
+               (qq-chat-open "group:20001")
+               (should (memq 'around-token canceled))
+               (should (= initial-loads 1))))
+         (when (buffer-live-p buffer) (kill-buffer buffer)))))))
+
+(ert-deftest qq-chat-header-line-shows-lightweight-search-state ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001"
+           qq-chat--last-search-query "a rather long search query"
+           qq-chat--search-index 0
+           qq-chat--search-next-cursor "cursor")
+     (let ((header (qq-chat--header-line)))
+       (should (string-match-p "search \\\"a rather long" header))
+       (should (string-match-p "1+" header)))
+     (setq qq-chat--search-index nil
+           qq-chat--search-next-cursor nil
+           qq-chat--search-completed-p t)
+     (should (string-match-p " 0" (qq-chat--header-line))))))
+
+(ert-deftest qq-chat-search-highlight-never-scans-heading-ui ()
+  (with-temp-buffer
+    (insert "needle sender heading\n")
+    (let ((body-start (point)))
+      (insert "actual needle body\n")
+      (add-text-properties body-start (point) '(qq-chat-search-text t))
+      (cl-letf (((symbol-function 'qq-chat--message-position)
+                 (lambda (_id) (point-min)))
+                ((symbol-function 'qq-chat--message-end-position)
+                 (lambda (_position) (point-max))))
+        (qq-chat--highlight-search-text "1" "needle")
+        (should (= (length qq-chat--search-highlight-overlays) 1))
+        (should (>= (overlay-start (car qq-chat--search-highlight-overlays))
+                    body-start))))))
 
 (ert-deftest qq-chat-deleted-tail-does-not-return-after-frame-refresh ()
   (qq-chat-test-with-reset
@@ -2777,6 +3139,66 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (should (equal around-call
                        '("group:20001" "9007199254742007089" 40)))
         (should (equal (nth 3 completed) "9007199254742007089"))))))
+
+(ert-deftest qq-chat-initial-unread-around-hands-off-request-token ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (setq qq-chat--session-key "group:20001")
+    (let ((buffer (current-buffer))
+          read-state-callback
+          initial-around-callback
+          canceled
+          around-message-ids
+          noted-windows)
+      (cl-letf (((symbol-function 'qq-api-fetch-session-read-state)
+                 (lambda (_session-key callback &optional _errback)
+                   (setq read-state-callback callback)
+                   'read-state-token))
+                ((symbol-function 'qq-api-fetch-history-around)
+                 (lambda (_session-key message-id callback
+                          &optional _errback _count)
+                   (setq around-message-ids
+                         (append around-message-ids (list message-id)))
+                   (if (equal message-id "9007199254742007089")
+                       (progn
+                         (setq initial-around-callback callback)
+                         'unread-around-token)
+                     'exact-around-token)))
+                ((symbol-function 'qq-api-cancel-request)
+                 (lambda (token) (push token canceled)))
+                ((symbol-function 'qq-chat--open-buffer)
+                 (lambda (_session-key) buffer))
+                ((symbol-function 'pop-to-buffer)
+                 (lambda (&rest _args) buffer))
+                ((symbol-function 'qq-chat--on-window-size-change) #'ignore)
+                ((symbol-function 'qq-chat--goto-loaded-message)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'qq-chat--note-history-window)
+                 (lambda (meta) (push meta noted-windows))))
+        (qq-chat--load-initial-history buffer "group:20001")
+        (should (eq qq-chat--initial-history-request 'read-state-token))
+
+        (funcall read-state-callback
+                 '((unread_count . 7)
+                   (first_unread
+                    . ((sequence . "30001")
+                       (message_id . "9007199254742007089")))
+                   (latest . nil)))
+        (should (eq qq-chat--initial-history-request 'unread-around-token))
+        (should initial-around-callback)
+
+        (qq-chat-open-message "group:20001" "9007199254742007999")
+        (should (memq 'unread-around-token canceled))
+        (should-not qq-chat--initial-history-request)
+        (should-not qq-chat--initial-history-owner)
+        (should (eq qq-chat--open-message-request 'exact-around-token))
+        (should (equal around-message-ids
+                       '("9007199254742007089" "9007199254742007999")))
+
+        (funcall initial-around-callback
+                 '(:batch-newest-message-id "9007199254742007090"))
+        (should-not noted-windows)
+        (should (eq qq-chat--open-message-request 'exact-around-token))))))
 
 (ert-deftest qq-chat-initial-history-ignores-stale-read-state-callback ()
   (with-temp-buffer

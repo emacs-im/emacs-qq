@@ -39,6 +39,7 @@
 (autoload 'qq-forward-event-segment-to-internal "qq-forward")
 (autoload 'qq-user-open "qq-user" nil t)
 (autoload 'qq-group-open "qq-group" nil t)
+(autoload 'qq-search-open "qq-search" nil t)
 
 (declare-function qq-forward-segment-p "qq-forward" (segment))
 (declare-function qq-forward-insert-segment
@@ -47,6 +48,7 @@
                   "qq-forward" (segment session-key))
 (declare-function qq-user-open "qq-user" (user-id))
 (declare-function qq-group-open "qq-group" (group-id))
+(declare-function qq-search-open "qq-search" (session-key &optional query))
 (declare-function qq-chat-message-transient "qq-transient" (&rest args))
 (declare-function qq-chat-attach-transient "qq-transient" (&rest args))
 (declare-function qq-chat-transient "qq-transient" (&rest args))
@@ -73,6 +75,42 @@ mirrors telega's `telega-chatbuf--my-action'.")
 
 (defvar-local qq-chat--last-search-query nil
   "Last in-chat search query.")
+
+(defvar-local qq-chat--search-results nil
+  "Newest-to-oldest authoritative results for the active in-chat search.")
+
+(defvar-local qq-chat--search-results-tail nil
+  "Last cons cell of `qq-chat--search-results' for constant-time append.")
+
+(defvar-local qq-chat--search-seen nil
+  "Persistent result-key set for the active in-chat search.")
+
+(defvar-local qq-chat--search-consumed-cursors nil
+  "Active-query set of single-use continuation cursors already dispatched.")
+
+(defvar-local qq-chat--search-index nil
+  "Index of the active item in `qq-chat--search-results'.")
+
+(defvar-local qq-chat--search-direction 'older
+  "Initial authoritative search direction, `older' or `newer'.")
+
+(defvar-local qq-chat--search-anchor nil
+  "Search origin plist with exact id/sequence and fallback time, or nil.")
+
+(defvar-local qq-chat--search-completed-p nil
+  "Non-nil after the active query has produced a terminal outcome.")
+
+(defvar-local qq-chat--search-next-cursor nil
+  "Opaque continuation for the active in-chat search.")
+
+(defvar-local qq-chat--search-request nil
+  "Transport token for the active in-chat search request.")
+
+(defvar-local qq-chat--search-owner nil
+  "Opaque identity owning the active in-chat search request.")
+
+(defvar-local qq-chat--search-highlight-overlays nil
+  "Overlays highlighting matched message text, never surrounding UI.")
 
 (defvar qq-chat-group-messages t
   "When non-nil, compact consecutive messages from the same sender.")
@@ -117,6 +155,12 @@ Keys are `:loading' (`older' or `newer'), `:older-loaded', `:newer-loaded',
 
 (defvar-local qq-chat--initial-history-request nil
   "Transport request token currently owned by initial-history loading.")
+
+(defvar-local qq-chat--open-message-owner nil
+  "Opaque owner for an around-fetch started by `qq-chat-open-message'.")
+
+(defvar-local qq-chat--open-message-request nil
+  "Transport token owned by `qq-chat-open-message'.")
 
 (defun qq-chat--reset-history-state ()
   "Reset current buffer history paging state."
@@ -249,8 +293,24 @@ of the default chrome."
          (marked-count (length qq-chat--marked-message-anchors))
          (marked-part (if (> marked-count 0)
                           (format "  · %d marked" marked-count)
-                        "")))
-    (format " %s%s%s%s" title status-part unread-part marked-part)))
+                        ""))
+         (search-part
+          (if (and qq-chat--last-search-query
+                   (not (string-empty-p qq-chat--last-search-query)))
+              (format "  · search \"%s\" %s%s"
+                      (truncate-string-to-width
+                       qq-chat--last-search-query 18 nil nil t)
+                      (if qq-chat--search-index
+                          (number-to-string (1+ qq-chat--search-index))
+                        (if qq-chat--search-completed-p "0" "…"))
+                      (if (or qq-chat--search-next-cursor
+                              qq-chat--search-request
+                              (and qq-chat--search-owner
+                                   (plist-get qq-chat--search-owner :pending)))
+                          "+" ""))
+            "")))
+    (format " %s%s%s%s%s" title status-part unread-part marked-part
+            search-part)))
 
 (defun qq-chat--insert-read-only (text &optional face properties)
   "Insert read-only TEXT with optional FACE and PROPERTIES."
@@ -2565,11 +2625,14 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
                     (appkit-ui-insert-prefixed-lines
                      prefix-state
                      (mapconcat #'identity (nreverse inline-parts) "")
-                     :properties properties)
+                     :properties (append properties
+                                         '(qq-chat-search-text t)))
                     (setq inline-parts nil))))
       (if (or (qq-state-message-recalled-p message)
               (null segments))
-          (appkit-ui-insert-prefixed-lines prefix-state (qq-chat--message-body message) :properties properties)
+          (appkit-ui-insert-prefixed-lines
+           prefix-state (qq-chat--message-body message)
+           :properties (append properties '(qq-chat-search-text t)))
         (dolist (segment segments)
           (let ((type (alist-get 'type segment)))
             (unless (equal type "reply")
@@ -2700,8 +2763,10 @@ on the first inline line when the body is pure inline content."
         ((flush-inline (&optional with-time)
            (when inline-parts
              (let* ((text (mapconcat #'identity (nreverse inline-parts) ""))
-                    (start (point)))
+                    (start (point))
+                    body-end)
                (insert (if (string-empty-p text) "(empty message)" text))
+               (setq body-end (point))
                (when (and with-time
                           (stringp short-time)
                           (not (string-empty-p short-time)))
@@ -2713,12 +2778,15 @@ on the first inline line when the body is pure inline content."
                (insert "\n")
                (appkit-ui-apply-line-prefix start (point) prefix-state)
                (add-text-properties start (point) properties)
+               (add-text-properties start body-end '(qq-chat-search-text t))
                (setq inline-parts nil)))))
       (cond
        ((or (qq-state-message-recalled-p message) (null segments))
         (let* ((text (qq-chat--message-body message))
-               (start (point)))
+               (start (point))
+               body-end)
           (insert (if (string-empty-p text) "(empty message)" text))
+          (setq body-end (point))
           (when (and (stringp short-time) (not (string-empty-p short-time)))
             (qq-chat--insert-right-aligned-time
              short-time
@@ -2727,7 +2795,8 @@ on the first inline line when the body is pure inline content."
              t))
           (insert "\n")
           (appkit-ui-apply-line-prefix start (point) prefix-state)
-          (add-text-properties start (point) properties)))
+          (add-text-properties start (point) properties)
+          (add-text-properties start body-end '(qq-chat-search-text t))))
        (t
         (dolist (segment segments)
           (let ((type (alist-get 'type segment)))
@@ -2976,53 +3045,388 @@ Visual model (telega-inspired; later appkit):
     (insert "\n")
     (add-text-properties start (point) properties)))
 
-(defun qq-chat--history-search (query forward)
-  "Search chat history for QUERY in FORWARD direction.
+(defun qq-chat--clear-search-highlights ()
+  "Remove in-chat search overlays owned by this buffer."
+  (mapc #'delete-overlay qq-chat--search-highlight-overlays)
+  (setq qq-chat--search-highlight-overlays nil))
 
-Return non-nil on success."
-  (let ((case-fold-search t)
-        (history-end
-         (max (point-min)
-              (1- (or (appkit-chatbuf-input-start-position) (point-max))))))
-    (save-restriction
-      (narrow-to-region (point-min) (max (point-min) history-end))
-      (if forward
-          (or (search-forward query nil t)
-              (progn
-                (goto-char (point-min))
-                (search-forward query nil t)))
-        (or (search-backward query nil t)
-            (progn
-              (goto-char (point-max))
-              (search-backward query nil t)))))))
+(defun qq-chat--highlight-search-text (message-id query)
+  "Highlight literal QUERY tokens in MESSAGE-ID's actual text only."
+  (qq-chat--clear-search-highlights)
+  (when-let* ((start (qq-chat--message-position message-id))
+              (end (qq-chat--message-end-position start))
+              (tokens (split-string query "[[:space:]]+" t))
+              (regexp (regexp-opt tokens)))
+    (let ((case-fold-search t))
+      (save-excursion
+        (goto-char start)
+        (while (re-search-forward regexp end t)
+          (let ((match-start (match-beginning 0))
+                (match-end (match-end 0)))
+            (when (and (get-text-property match-start 'qq-chat-search-text)
+                       (>= (or (next-single-property-change
+                                match-start 'qq-chat-search-text nil end)
+                               end)
+                           match-end))
+              (let ((overlay (make-overlay match-start match-end nil t nil)))
+                (overlay-put overlay 'face 'isearch)
+                (overlay-put overlay 'evaporate t)
+                (push overlay qq-chat--search-highlight-overlays)))))))))
 
-(defun qq-chat-search (query)
-  "Search current chat history for QUERY."
-  (interactive (list (read-string "Search chat: " qq-chat--last-search-query)))
-  (setq qq-chat--last-search-query query)
-  (unless (and (stringp query) (not (string-empty-p query)))
+(defun qq-chat--search-result-key (result)
+  "Return deduplication key for authoritative search RESULT."
+  (cons (qq-api-session-key-from-locator (alist-get 'chat result))
+        (alist-get 'message_id result)))
+
+(defun qq-chat--append-search-results (results session-key)
+  "Append unseen RESULTS for SESSION-KEY and return number added."
+  (let ((added 0))
+    (dolist (result results)
+      (let* ((key (qq-chat--search-result-key result))
+             (result-session (car key)))
+        (unless (equal result-session session-key)
+          (error "qq: message search returned %s while searching %s"
+                 result-session session-key))
+        (unless (gethash key qq-chat--search-seen)
+          (puthash key t qq-chat--search-seen)
+          (let ((cell (list result)))
+            (if qq-chat--search-results-tail
+                (setcdr qq-chat--search-results-tail cell)
+              (setq qq-chat--search-results cell))
+            (setq qq-chat--search-results-tail cell))
+          (cl-incf added))))
+    added))
+
+(defun qq-chat--search-request-current-p
+    (buffer session-key owner &optional call-owner)
+  "Return non-nil when OWNER still owns search in BUFFER/SESSION-KEY.
+
+When CALL-OWNER is non-nil, it must also own the currently executing page."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and (derived-mode-p 'qq-chat-mode)
+              (equal qq-chat--session-key session-key)
+              (eq qq-chat--search-owner owner)
+              (or (null call-owner)
+                  (eq (plist-get owner :call-owner) call-owner))))))
+
+(defun qq-chat--cancel-search-request ()
+  "Cancel the current in-chat search callback owner."
+  (when qq-chat--search-request
+    (qq-api-cancel-request qq-chat--search-request))
+  (setq qq-chat--search-request nil
+        qq-chat--search-owner nil)
+  (qq-chat--header-line-update))
+
+(defun qq-chat--show-search-result (index)
+  "Open and highlight authoritative search result at INDEX."
+  (let* ((result (nth index qq-chat--search-results))
+         (session-key (and result
+                           (qq-api-session-key-from-locator
+                            (alist-get 'chat result)))))
+    (unless result
+      (user-error "qq: no search result at index %s" index))
+    (unless (equal session-key qq-chat--session-key)
+      (error "qq: search result belongs to unexpected session %s" session-key))
+    (setq qq-chat--search-index index)
+    (qq-chat--header-line-update)
+    (qq-chat-open-message session-key (alist-get 'message_id result)
+                          qq-chat--last-search-query)))
+
+(defun qq-chat--search-result-origin-order (result anchor)
+  "Compare RESULT with search ANCHOR without coercing string identities.
+
+Return -1 when RESULT is older, 0 at the same fallback timestamp, and 1 when
+newer.  Exact kernel `message_seq' wins; `sent_at' is used only when the
+loaded origin did not retain an original decimal sequence string."
+  (let ((origin-seq (plist-get anchor :sequence))
+        (result-seq (alist-get 'message_seq result)))
+    (if (and (qq-protocol--nonzero-decimal-string-p origin-seq)
+             (qq-protocol--nonzero-decimal-string-p result-seq))
+        (qq-protocol-decimal-string-compare result-seq origin-seq)
+      (let ((origin-time (plist-get anchor :time))
+            (result-time (alist-get 'sent_at result)))
+        (cond ((< result-time origin-time) -1)
+              ((> result-time origin-time) 1)
+              (t 0))))))
+
+(defun qq-chat--initial-search-selection ()
+  "Return initial result index, `need-more', or nil.
+
+Search results are newest-to-oldest.  Message snowflakes are never compared;
+the origin is located by exact id when it is itself a match.  Otherwise the
+original decimal kernel sequence is compared as a string; second timestamps
+are only a fallback for older locally normalized messages lacking sequence."
+  (let* ((anchor qq-chat--search-anchor)
+         (anchor-id (plist-get anchor :message-id))
+         (anchor-index
+          (and anchor-id
+               (cl-position anchor-id qq-chat--search-results
+                            :test #'equal
+                            :key (lambda (result)
+                                   (alist-get 'message_id result)))))
+         (result-count (length qq-chat--search-results)))
+    (cond
+     ((null anchor)
+      (cond ((> result-count 0) 0)
+            (qq-chat--search-next-cursor 'need-more)))
+     ((eq qq-chat--search-direction 'older)
+      (cond
+       ((and anchor-index (< (1+ anchor-index) result-count))
+        (1+ anchor-index))
+       (anchor-index
+        (and qq-chat--search-next-cursor 'need-more))
+       ((cl-position-if
+         (lambda (result)
+           (< (qq-chat--search-result-origin-order result anchor) 0))
+         qq-chat--search-results))
+       (qq-chat--search-next-cursor 'need-more)))
+     (t
+      ;; A newer match is immediately before an anchor that matched the
+      ;; query.  Otherwise wait until the result stream crosses the origin,
+      ;; then choose the last (therefore closest) strictly newer timestamp.
+      (cond
+       (anchor-index (and (> anchor-index 0) (1- anchor-index)))
+       (t
+        (let ((newer-indices nil)
+              (crossed nil)
+              (index 0))
+          (dolist (result qq-chat--search-results)
+            (if (> (qq-chat--search-result-origin-order result anchor) 0)
+                (setq newer-indices (cons index newer-indices))
+              (setq crossed t))
+            (cl-incf index))
+          (cond
+           ((or crossed (null qq-chat--search-next-cursor))
+            (car newer-indices))
+           (qq-chat--search-next-cursor 'need-more)))))))))
+
+(defun qq-chat--finish-search-request (owner &optional message-text)
+  "Release search OWNER and optionally display MESSAGE-TEXT."
+  (when (eq qq-chat--search-owner owner)
+    (setq qq-chat--search-request nil
+          qq-chat--search-owner nil
+          qq-chat--search-completed-p t)
+    (qq-chat--header-line-update)
+    (when message-text (message "%s" message-text))))
+
+(defun qq-chat--continue-search-request (owner)
+  "Continue OWNER through an unconsumed server cursor."
+  (qq-chat--issue-search-request owner t))
+
+(defun qq-chat--search-page-succeeded
+    (buffer session-key owner call-owner page)
+  "Apply PAGE when exact OWNER and CALL-OWNER remain current."
+  (when (qq-chat--search-request-current-p
+         buffer session-key owner call-owner)
+    (with-current-buffer buffer
+      (setf (plist-get owner :pending) nil)
+      (setq qq-chat--search-request nil)
+      (condition-case error-data
+          (let ((purpose (plist-get owner :purpose)))
+            (qq-chat--append-search-results
+             (alist-get 'results page) session-key)
+            (setq qq-chat--search-next-cursor (alist-get 'next_cursor page))
+            (pcase purpose
+              ('initial
+               (let ((selection (qq-chat--initial-search-selection)))
+                 (cond
+                  ((integerp selection)
+                   (qq-chat--finish-search-request owner)
+                   (qq-chat--show-search-result selection))
+                  ((eq selection 'need-more)
+                   (qq-chat--continue-search-request owner))
+                  (t
+                   (qq-chat--finish-search-request
+                    owner
+                    (format "qq: no %s match for %s"
+                            (if (eq qq-chat--search-direction 'newer)
+                                "newer" "older")
+                            qq-chat--last-search-query))))))
+              ('older
+               (let ((desired-index (plist-get owner :desired-index)))
+                 (cond
+                  ((nth desired-index qq-chat--search-results)
+                   (qq-chat--finish-search-request owner)
+                   (qq-chat--show-search-result desired-index))
+                  (qq-chat--search-next-cursor
+                   (qq-chat--continue-search-request owner))
+                  (t
+                   (qq-chat--finish-search-request
+                    owner
+                    (format "qq: no older match for %s"
+                            qq-chat--last-search-query))))))))
+        (error
+         (setq qq-chat--search-next-cursor nil)
+         (qq-chat--finish-search-request
+          owner
+          (format "qq: invalid message-search result: %s"
+                  (error-message-string error-data))))))))
+
+(defun qq-chat--search-page-failed
+    (buffer session-key owner call-owner _response reason)
+  "Report failure REASON for exact OWNER and CALL-OWNER."
+  (when (qq-chat--search-request-current-p
+         buffer session-key owner call-owner)
+    (with-current-buffer buffer
+      (setf (plist-get owner :pending) nil)
+      ;; A next cursor is single-use and was removed before dispatch.  Never
+      ;; restore it after failure; an explicit new search is the only retry.
+      (setq qq-chat--search-next-cursor nil)
+      (qq-chat--finish-search-request
+       owner (format "qq: message search failed: %s; search again to retry"
+                     reason)))))
+
+(defun qq-chat--issue-search-request (owner next-p)
+  "Issue one page for overall search OWNER, continuing when NEXT-P."
+  (let* ((buffer (current-buffer))
+         (session-key qq-chat--session-key)
+         (call-owner (list 'message-search-page))
+         (cursor (and next-p qq-chat--search-next-cursor))
+         request)
+    (condition-case error-data
+        (progn
+          (when next-p
+            (unless cursor
+              (error "qq: message search has no continuation cursor"))
+            (when (gethash cursor qq-chat--search-consumed-cursors)
+              (setq qq-chat--search-next-cursor nil)
+              (error "qq: message search repeated an already consumed cursor"))
+            (puthash cursor t qq-chat--search-consumed-cursors)
+            ;; Cursor capabilities are single-use.  Consume before dispatch so
+            ;; a signal or errback cannot replay native searchMore.
+            (setq qq-chat--search-next-cursor nil))
+          (setf (plist-get owner :call-owner) call-owner
+                (plist-get owner :pending) t)
+          (setq qq-chat--search-request nil)
+          (qq-chat--header-line-update)
+          (message "qq: searching messages…")
+          (setq request
+                (if next-p
+                    (qq-api-search-messages-next
+                     cursor
+                     (lambda (page)
+                       (qq-chat--search-page-succeeded
+                        buffer session-key owner call-owner page))
+                     (lambda (response reason)
+                       (qq-chat--search-page-failed
+                        buffer session-key owner call-owner response reason)))
+                  (qq-api-search-messages-start
+                   session-key qq-chat--last-search-query
+                   (lambda (page)
+                     (qq-chat--search-page-succeeded
+                      buffer session-key owner call-owner page))
+                   (lambda (response reason)
+                     (qq-chat--search-page-failed
+                      buffer session-key owner call-owner response reason)))))
+          (when (and (qq-chat--search-request-current-p
+                      buffer session-key owner call-owner)
+                     (plist-get owner :pending))
+            (setq qq-chat--search-request request))
+          request)
+      (error
+       (setf (plist-get owner :pending) nil)
+       (setq qq-chat--search-next-cursor nil)
+       (qq-chat--finish-search-request
+        owner
+        (format "qq: message search dispatch failed: %s; search again to retry"
+                (error-message-string error-data)))
+       nil))))
+
+(defun qq-chat--start-search-request (purpose &optional desired-index)
+  "Start a search request for PURPOSE and optional DESIRED-INDEX."
+  (qq-chat--cancel-search-request)
+  (let ((owner (list :session-key qq-chat--session-key
+                     :purpose purpose
+                     :desired-index desired-index
+                     :call-owner nil
+                     :pending nil)))
+    (setq qq-chat--search-owner owner
+          qq-chat--search-completed-p nil)
+    (qq-chat--issue-search-request owner (eq purpose 'older))))
+
+(defun qq-chat-search (query &optional forward-p)
+  "Start authoritative in-place message search for QUERY.
+
+Results come from Linux QQ through NapCat, never from wrapping a local buffer
+text search.  FORWARD-P selects the closest newer result from the message at
+point; otherwise select the closest older result."
+  (interactive
+   (list (read-string "QQ search (backward): " qq-chat--last-search-query)))
+  (setq query (and (stringp query) (string-trim query)))
+  (unless (and query (not (string-empty-p query)))
     (user-error "qq: empty search query"))
-  (goto-char (point-min))
-  (unless (qq-chat--history-search query t)
-    (message "qq: no match for %s" query)))
+  (when (> (length query) 512)
+    (user-error "qq: search query must be at most 512 characters"))
+  (qq-chat--cancel-search-request)
+  (qq-chat--clear-search-highlights)
+  (let* ((origin (ignore-errors (qq-chat--message-at-point)))
+         (origin-id (alist-get 'server-id origin))
+         (origin-time (alist-get 'time origin))
+         (origin-sequence
+          (alist-get 'message_seq (alist-get 'raw-event origin)))
+         (origin-sequence
+          (and (qq-protocol--nonzero-decimal-string-p origin-sequence)
+               origin-sequence)))
+    (setq qq-chat--last-search-query query
+        qq-chat--search-results nil
+        qq-chat--search-results-tail nil
+        qq-chat--search-seen (make-hash-table :test #'equal)
+        qq-chat--search-consumed-cursors (make-hash-table :test #'equal)
+        qq-chat--search-index nil
+        qq-chat--search-next-cursor nil
+        qq-chat--search-direction (if forward-p 'newer 'older)
+        qq-chat--search-completed-p nil
+        qq-chat--search-anchor
+        (and (qq-api-message-id-p origin-id)
+             (or origin-sequence
+                 (and (numberp origin-time) (> origin-time 0)))
+             (list :message-id origin-id
+                   :sequence origin-sequence
+                   :time origin-time))))
+  (qq-chat--header-line-update)
+  (qq-chat--start-search-request 'initial))
+
+(defun qq-chat-search-forward (query)
+  "Start a telega-compatible forward invocation for QUERY."
+  (interactive
+   (list (read-string "QQ search (forward): " qq-chat--last-search-query)))
+  (qq-chat-search query t))
 
 (defun qq-chat-search-next ()
-  "Jump to the next match for the last chat search."
+  "Jump to the newer result of the authoritative in-chat search."
   (interactive)
-  (unless (and qq-chat--last-search-query
-               (not (string-empty-p qq-chat--last-search-query)))
-    (user-error "qq: no active chat search"))
-  (unless (qq-chat--history-search qq-chat--last-search-query t)
-    (message "qq: no further match for %s" qq-chat--last-search-query)))
+  (if (and (null qq-chat--search-index) qq-chat--search-owner)
+      (message "qq: message search is already loading")
+    (if (null qq-chat--search-index)
+      (call-interactively #'qq-chat-search)
+      (if (> qq-chat--search-index 0)
+          (qq-chat--show-search-result (1- qq-chat--search-index))
+        (message "qq: no newer match for %s" qq-chat--last-search-query)))))
 
 (defun qq-chat-search-prev ()
-  "Jump to the previous match for the last chat search."
+  "Continue the authoritative in-chat search toward older messages."
   (interactive)
-  (unless (and qq-chat--last-search-query
-               (not (string-empty-p qq-chat--last-search-query)))
-    (user-error "qq: no active chat search"))
-  (unless (qq-chat--history-search qq-chat--last-search-query nil)
-    (message "qq: no previous match for %s" qq-chat--last-search-query)))
+  (if (and (null qq-chat--search-index) qq-chat--search-owner)
+      (message "qq: message search is already loading")
+    (if (null qq-chat--search-index)
+      (call-interactively #'qq-chat-search)
+      (let ((next-index (1+ qq-chat--search-index)))
+        (cond
+         ((nth next-index qq-chat--search-results)
+          (qq-chat--show-search-result next-index))
+         (qq-chat--search-request
+          (message "qq: message search is already loading"))
+         (qq-chat--search-next-cursor
+          (qq-chat--start-search-request 'older next-index))
+         (t
+          (message "qq: no older match for %s"
+                   qq-chat--last-search-query)))))))
+
+(defun qq-chat-search-results (&optional query)
+  "Open paginated search results for the current chat and optional QUERY."
+  (interactive)
+  (qq-search-open qq-chat--session-key query))
 
 (defun qq-chat-render ()
   "Synchronize current chat frame and projected timeline from local state."
@@ -3574,7 +3978,9 @@ still validated by the strict API contract."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "C-l") #'recenter-top-bottom)
     (define-key map (kbd "C-c g") #'qq-chat-refresh)
-    (define-key map (kbd "C-c /") #'qq-chat-search)
+    (define-key map (kbd "C-c /") #'qq-chat-search-results)
+    (define-key map (kbd "C-c C-r") #'qq-chat-search)
+    (define-key map (kbd "C-c C-s") #'qq-chat-search-forward)
     (define-key map (kbd "C-c C-n") #'qq-chat-search-next)
     (define-key map (kbd "C-c C-p") #'qq-chat-search-prev)
     (define-key map (kbd "C-c r") #'qq-chat-read-all)
@@ -3601,8 +4007,9 @@ still validated by the strict API contract."
     (define-key map (kbd "C-c C-v") #'qq-chat-attach-clipboard)
     (define-key map (kbd "C-c C-e") #'qq-chat-attach-emoji)
     (define-key map (kbd "C-c C-a") #'qq-chat-attach-transient)
-    (define-key map (kbd "M-g n") #'qq-chat-next-message)
-    (define-key map (kbd "M-g p") #'qq-chat-previous-message)
+    (define-key map (kbd "M-g s") #'qq-chat-search)
+    (define-key map (kbd "M-g n") #'qq-chat-search-next)
+    (define-key map (kbd "M-g p") #'qq-chat-search-prev)
     (define-key map (kbd "C-c C-c") #'qq-chat-send-message)
     (define-key map (kbd "C-c C-k") #'qq-chat-cancel-dwim)
     ;; telega: ESC ESC / C-M-c also cancel reply-or-edit aux.
@@ -3625,6 +4032,19 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (appkit-chatbuf-reset-state 32)
   (qq-completion-setup)
   (setq-local qq-chat--last-search-query nil)
+  (setq-local qq-chat--search-results nil)
+  (setq-local qq-chat--search-results-tail nil)
+  (setq-local qq-chat--search-seen (make-hash-table :test #'equal))
+  (setq-local qq-chat--search-consumed-cursors
+              (make-hash-table :test #'equal))
+  (setq-local qq-chat--search-index nil)
+  (setq-local qq-chat--search-direction 'older)
+  (setq-local qq-chat--search-anchor nil)
+  (setq-local qq-chat--search-completed-p nil)
+  (setq-local qq-chat--search-next-cursor nil)
+  (setq-local qq-chat--search-request nil)
+  (setq-local qq-chat--search-owner nil)
+  (setq-local qq-chat--search-highlight-overlays nil)
   (setq-local qq-chat--marked-message-anchors nil)
   (setq-local qq-chat--forward-request-active-p nil)
   (setq-local qq-chat--last-read-target-id nil)
@@ -3633,6 +4053,8 @@ Attach from clipboard with `C-c C-v' (telega-style)."
               #'qq-chat--media-card-fallback-context)
   (qq-chat--reset-history-state)
   (setq-local qq-chat--pending-jump-id nil)
+  (setq-local qq-chat--open-message-owner nil)
+  (setq-local qq-chat--open-message-request nil)
   (setq-local qq-chat--messages-pop-ring
               (make-ring (max 1 qq-chat-messages-pop-ring-size)))
   ;; telega-style: M-x yank-media also drops images into the composer.
@@ -3649,6 +4071,9 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (add-hook 'display-line-numbers-mode-hook
             #'qq-chat--on-window-size-change nil t)
   (add-hook 'text-scale-mode-hook #'qq-chat--on-text-scale-change nil t)
+  (add-hook 'kill-buffer-hook #'qq-chat--cancel-search-request nil t)
+  (add-hook 'kill-buffer-hook #'qq-chat--cancel-open-message-request nil t)
+  (add-hook 'kill-buffer-hook #'qq-chat--cancel-initial-history-request nil t)
   (qq-chat--update-context-mode))
 
 (defun qq-chat--initial-history-request-current-p
@@ -3659,6 +4084,29 @@ Attach from clipboard with `C-c C-v' (telega-style)."
          (and (derived-mode-p 'qq-chat-mode)
               (equal qq-chat--session-key session-key)
               (eq qq-chat--initial-history-owner owner)))))
+
+(defun qq-chat--cancel-initial-history-request ()
+  "Cancel and forget this chat buffer's initial-history chain."
+  (when qq-chat--initial-history-request
+    (qq-api-cancel-request qq-chat--initial-history-request))
+  (setq qq-chat--initial-history-request nil
+        qq-chat--initial-history-owner nil))
+
+(defun qq-chat--cancel-open-message-request ()
+  "Cancel an around-fetch owned by `qq-chat-open-message'."
+  (when qq-chat--open-message-request
+    (qq-api-cancel-request qq-chat--open-message-request))
+  (setq qq-chat--open-message-request nil
+        qq-chat--open-message-owner nil))
+
+(defun qq-chat--open-message-request-current-p
+    (buffer session-key owner)
+  "Return non-nil when OWNER owns BUFFER's exact open-message request."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and (derived-mode-p 'qq-chat-mode)
+              (equal qq-chat--session-key session-key)
+              (eq qq-chat--open-message-owner owner)))))
 
 (defun qq-chat--complete-initial-history-load
     (buffer session-key owner &optional target meta)
@@ -3705,6 +4153,30 @@ first unread message."
         (setq qq-chat--initial-history-request request)))
     request))
 
+(defun qq-chat--load-unread-initial-history
+    (buffer session-key owner first-id)
+  "Load SESSION-KEY around FIRST-ID for initial-history OWNER.
+
+The around-fetch replaces the completed read-state request as the single
+cancelable request owned by BUFFER.  Synchronous callbacks may complete the
+owner before the API function returns, in which case its stale return token is
+never installed."
+  (let ((request
+         (qq-api-fetch-history-around
+          session-key first-id
+          (lambda (meta)
+            (qq-chat--complete-initial-history-load
+             buffer session-key owner first-id meta))
+          (lambda (response reason)
+            (qq-chat--fail-initial-history-load
+             buffer session-key owner response reason))
+          (max qq-history-fetch-count (* 2 qq-history-fetch-count)))))
+    (when (qq-chat--initial-history-request-current-p
+           buffer session-key owner)
+      (with-current-buffer buffer
+        (setq qq-chat--initial-history-request request)))
+    request))
+
 (defun qq-chat--load-initial-history (buffer session-key)
   "Load SESSION-KEY around its official QQ read position when available."
   (let ((owner (list 'initial-history session-key)))
@@ -3713,40 +4185,39 @@ first unread message."
         (qq-api-cancel-request qq-chat--initial-history-request))
       (setq qq-chat--initial-history-owner owner
             qq-chat--initial-history-request nil))
-    (let ((request
-           (qq-api-fetch-session-read-state
-            session-key
-            (lambda (read-state)
-              (when (qq-chat--initial-history-request-current-p
-                     buffer session-key owner)
-         (let* ((unread (or (alist-get 'unread_count read-state) 0))
-                (first (alist-get 'first_unread read-state))
-                (first-id (and (listp first)
-                               (alist-get 'message_id first))))
-           (if (and (> unread 0) first-id)
-               (qq-api-fetch-history-around
-                session-key first-id
-                (lambda (meta)
-                  (qq-chat--complete-initial-history-load
-                   buffer session-key owner first-id meta))
-                (lambda (response reason)
-                  (qq-chat--fail-initial-history-load
-                   buffer session-key owner response reason))
-                (max qq-history-fetch-count (* 2 qq-history-fetch-count)))
-             (qq-chat--load-latest-initial-history
-              buffer session-key owner)))))
-            (lambda (response reason)
-              (qq-chat--fail-initial-history-load
-               buffer session-key owner response reason)))))
-      (when (qq-chat--initial-history-request-current-p
-             buffer session-key owner)
+    (let ((read-pending t)
+          request)
+      (setq request
+            (qq-api-fetch-session-read-state
+             session-key
+             (lambda (read-state)
+               (setq read-pending nil)
+               (when (qq-chat--initial-history-request-current-p
+                      buffer session-key owner)
+                 (let* ((unread (or (alist-get 'unread_count read-state) 0))
+                        (first (alist-get 'first_unread read-state))
+                        (first-id (and (listp first)
+                                       (alist-get 'message_id first))))
+                   (if (and (> unread 0) first-id)
+                       (qq-chat--load-unread-initial-history
+                        buffer session-key owner first-id)
+                     (qq-chat--load-latest-initial-history
+                      buffer session-key owner)))))
+             (lambda (response reason)
+               (setq read-pending nil)
+               (qq-chat--fail-initial-history-load
+                buffer session-key owner response reason))))
+      ;; Only the still-pending read-state call owns this token.  A
+      ;; synchronous callback may already have installed its child token.
+      (when (and read-pending
+                 (qq-chat--initial-history-request-current-p
+                  buffer session-key owner))
         (with-current-buffer buffer
           (setq qq-chat--initial-history-request request)))
       request)))
 
-(defun qq-chat-open (session-key)
-  "Open chat for SESSION-KEY."
-  (interactive)
+(defun qq-chat--open-buffer (session-key)
+  "Create or reuse SESSION-KEY's chat view without loading history."
   (unless session-key
     (user-error "qq: session key is required"))
   (qq-state-upsert-session session-key nil nil)
@@ -3764,11 +4235,89 @@ first unread message."
       (setq qq-chat--session-key session-key)
       (qq-completion-preload-members)
       (qq-chat-render)
-      (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max)))
+      (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max))))
+    buffer))
+
+(defun qq-chat-open (session-key)
+  "Open chat for SESSION-KEY and load its official initial position."
+  (interactive)
+  (let ((buffer (qq-chat--open-buffer session-key)))
+    (with-current-buffer buffer
+      (qq-chat--cancel-open-message-request)
       (qq-chat--load-initial-history buffer session-key))
     (pop-to-buffer buffer)
     (with-current-buffer buffer
       (qq-chat--on-window-size-change))))
+
+(defun qq-chat--finish-open-message (target query)
+  "Jump to loaded TARGET and highlight its actual text matching QUERY."
+  (setq qq-chat--pending-jump-id nil)
+  (if (qq-chat--goto-loaded-message target nil)
+      (progn
+        (when (and (stringp query) (not (string-empty-p query)))
+          (qq-chat--highlight-search-text target query))
+        t)
+    nil))
+
+(defun qq-chat--open-message-succeeded
+    (buffer session-key owner target query meta)
+  "Finish TARGET around-fetch with META when OWNER remains current."
+  (when (qq-chat--open-message-request-current-p buffer session-key owner)
+    (with-current-buffer buffer
+      (setf (plist-get owner :pending) nil)
+      (setq qq-chat--open-message-request nil
+            qq-chat--open-message-owner nil)
+      (qq-chat--note-history-window meta)
+      (unless (qq-chat--finish-open-message target query)
+        (qq-chat--jump-fail target "around window omitted target")))))
+
+(defun qq-chat--open-message-failed
+    (buffer session-key owner target _response reason)
+  "Report TARGET around-fetch failure REASON for the current OWNER."
+  (when (qq-chat--open-message-request-current-p buffer session-key owner)
+    (with-current-buffer buffer
+      (setf (plist-get owner :pending) nil)
+      (setq qq-chat--open-message-request nil
+            qq-chat--open-message-owner nil)
+      (qq-chat--jump-fail target reason))))
+
+(defun qq-chat-open-message (session-key message-id &optional query)
+  "Open SESSION-KEY at exact MESSAGE-ID, optionally highlighting QUERY.
+
+Unlike `qq-chat-open', this entry point never starts an initial-history load.
+It cancels an existing initial load before using one owned around-fetch, so a
+search-result jump cannot race a latest/read-position request."
+  (setq message-id
+        (qq-api-validate-message-id message-id "open searched message"))
+  (let ((buffer (qq-chat--open-buffer session-key)))
+    (with-current-buffer buffer
+      (qq-chat--cancel-initial-history-request)
+      (qq-chat--cancel-open-message-request)
+      (qq-chat--cancel-search-request)
+      (qq-chat--clear-search-highlights)
+      (setq qq-chat--pending-jump-id message-id))
+    (pop-to-buffer buffer)
+    (with-current-buffer buffer
+      (qq-chat--on-window-size-change)
+      (unless (qq-chat--finish-open-message message-id query)
+        (let* ((owner (list :session-key session-key :pending t))
+               request)
+          (setq qq-chat--open-message-owner owner)
+          (setq request
+                (qq-api-fetch-history-around
+                 session-key message-id
+                 (lambda (meta)
+                   (qq-chat--open-message-succeeded
+                    buffer session-key owner message-id query meta))
+                 (lambda (response reason)
+                   (qq-chat--open-message-failed
+                    buffer session-key owner message-id response reason))
+                 (qq-chat--jump-history-count)))
+          (when (and (qq-chat--open-message-request-current-p
+                      buffer session-key owner)
+                     (plist-get owner :pending))
+            (setq qq-chat--open-message-request request)))))
+    buffer))
 
 (defun qq-chat--rerender-open-chats (&optional media-key)
   "Invalidate open chat rows affected by MEDIA-KEY."

@@ -24,6 +24,7 @@
 (require 'qq-transport)
 (require 'qq-api)
 (require 'qq-chat)
+(require 'qq-search)
 (require 'qq-forward)
 (require 'qq-user-photo)
 (require 'qq-user)

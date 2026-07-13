@@ -273,7 +273,9 @@ Prefer this over inline button rows."
   [["Timeline"
     ("g" "Refresh" qq-chat-refresh)
     ("o" "Load older" qq-chat-load-older-messages)
-    ("/" "Search" qq-chat-search)
+    ("/" "Search results" qq-chat-search-results)
+    ("s" "Search older" qq-chat-search)
+    ("S" "Search newer" qq-chat-search-forward)
     ("n" "Search next" qq-chat-search-next)
     ("p" "Search prev" qq-chat-search-prev)
     ("P" "Poke user…" qq-chat-send-poke
