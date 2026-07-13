@@ -798,9 +798,38 @@ because its result is only `{kind:single}'."
   "Return canonical draft as plain text."
   (appkit-chatbuf-string-plain-text (appkit-chatbuf-input-state)))
 
+(defun qq-chat--composer-boundary-valid-p ()
+  "Return non-nil when live input is wholly after the EWOC footer."
+  (let ((input (appkit-chatbuf-input-start-position)))
+    (or (not (appkit-chat-timeline-live-p))
+        (null input)
+        (let ((footer (appkit-chat-timeline-footer-start-position))
+              (prompt (appkit-chatbuf-prompt-start-position)))
+          (and footer prompt (<= footer prompt input))))))
+
+(defun qq-chat--canonical-input-contaminated-p ()
+  "Return non-nil when canonical input contains timeline-owned text."
+  (let ((state (appkit-chatbuf-input-state)))
+    (and (> (length state) 0)
+         (text-property-not-all
+          0 (length state) 'qq-chat-message-anchor nil state))))
+
+(defun qq-chat--assert-canonical-input-clean ()
+  "Reject canonical input polluted with rendered timeline rows."
+  (when (qq-chat--canonical-input-contaminated-p)
+    (error "qq: canonical input contains rendered message rows")))
+
 (defun qq-chat--sync-draft-from-buffer ()
   "Sync canonical draft from the editable buffer region."
-  (let ((result (appkit-chatbuf-input-state-sync)))
+  (let ((result
+         (if (qq-chat--composer-boundary-valid-p)
+             (appkit-chatbuf-input-state-sync)
+           ;; Never let a transient/corrupted marker turn the timeline into a
+           ;; canonical draft.  A later frame invariant will surface the bad
+           ;; boundary without multiplying message text on every rebuild.
+           (list :changed-p nil
+                 :value (appkit-chatbuf-input-state)
+                 :invalid-boundary-p t))))
     (when (plist-get result :changed-p)
       ;; Any real composer mutation revokes a cleared send's right to restore
       ;; its old draft after a late transport failure.
@@ -881,6 +910,7 @@ because its result is only `{kind:single}'."
 
 (defun qq-chat--bind-input-region-from-footer ()
   "Bind the shared persistent tail input to canonical draft state."
+  (qq-chat--assert-canonical-input-clean)
   (appkit-chatbuf-init-state 32)
   (appkit-chatbuf-bind-input-region
    :visible-p (qq-chat--composer-visible-p)
@@ -1128,11 +1158,9 @@ Order (telega-inspired):
        (when (equal event-session-key qq-chat--session-key)
          (qq-chat--update-frame)))
       ('sessions-refreshed
-       (qq-chat--header-line-update)
-       (qq-chat--update-frame))
+       (qq-chat--header-line-update))
       ((or 'friends-refreshed 'groups-refreshed)
        (qq-chat--header-line-update)
-       (qq-chat--update-frame)
        (qq-chat--sync-timeline
         :force-keys (appkit-chat-timeline-keys))))))
 
@@ -1154,8 +1182,6 @@ Order (telega-inspired):
                  (appkit-invalidations-position-p invalidations)))
         (qq-chat-render))
        ((or resources entries)
-        (qq-chat--header-line-update)
-        (qq-chat--update-frame)
         (qq-chat--sync-timeline
          :force-keys entries
          :changed-resources resources))))))
@@ -1197,7 +1223,8 @@ Order (telega-inspired):
   (appkit-chat-timeline-set-frame
    (qq-chat--header-text)
    (qq-chat--footer-text)
-   :bind-input-function #'qq-chat--bind-input-region-from-footer))
+   :bind-input-function #'qq-chat--bind-input-region-from-footer
+   :composer-visible-p (qq-chat--composer-visible-p)))
 
 (cl-defun qq-chat--sync-timeline
     (&key (messages nil messages-p) force-keys changed-resources rekeys)
@@ -1313,13 +1340,18 @@ scaling because pixel-aligned avatars can still change geometry."
    (t
     (qq-chat--render-message message context)))))
 
+(defun qq-chat--render-canonical-input ()
+  "Replace the live composer from canonical input state explicitly."
+  (qq-chat--assert-canonical-input-clean)
+  (appkit-chatbuf-with-generated-update
+    (appkit-chatbuf-input-replace (appkit-chatbuf-input-state))
+    (appkit-chatbuf-input-apply-text-properties)))
+
 (defun qq-chat--set-draft (text)
   "Set canonical draft TEXT and update the shared tail composer."
   (setq qq-chat--send-restore-owner nil)
   (appkit-chatbuf-input-state-set text :reset-history-p t)
-  (appkit-chatbuf-with-generated-update
-    (appkit-chatbuf-input-replace (appkit-chatbuf-input-state))
-    (appkit-chatbuf-input-apply-text-properties))
+  (qq-chat--render-canonical-input)
   (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max))))
 
 (defun qq-chat--push-input-history (text)
@@ -2922,8 +2954,11 @@ Return non-nil on success."
   (when (appkit-chatbuf-input-region-bounds)
     (appkit-chatbuf-input-state-sync :reset-history-p nil))
   (qq-chat--header-line-update)
-  (qq-chat--update-frame)
-  (qq-chat--sync-timeline))
+  ;; Establish the EWOC rows before the trailing composer.  On an empty EWOC
+  ;; the footer's tail boundary is not stable until first reconciliation;
+  ;; binding input first can leave the prompt inside the message region.
+  (qq-chat--sync-timeline)
+  (qq-chat--update-frame))
 
 (defun qq-chat-refresh ()
   "Refresh current chat contents from local state and NapCat history."
@@ -3117,6 +3152,7 @@ happened."
         (if aux-state
             (appkit-chatbuf-aux-set (copy-tree aux-state))
           (appkit-chatbuf-aux-reset))
+        (qq-chat--render-canonical-input)
         (qq-chat--update-frame)
         (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max)))
         (qq-chat--maybe-update-my-action-from-input)
@@ -3163,6 +3199,7 @@ happened."
             ;; This is the send transaction's own clear, not a later user
             ;; reply change, so retain restore ownership across it.
             (appkit-chatbuf-aux-reset)
+            (qq-chat--render-canonical-input)
             (qq-chat--update-frame)
             (qq-api-send-message
              session-key send-segments raw-message

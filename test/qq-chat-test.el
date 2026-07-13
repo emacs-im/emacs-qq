@@ -293,6 +293,32 @@
        (should (equal "updated body" (appkit-chatbuf-input-state)))
        (should (equal "updated body" (qq-chat--current-draft-string)))))))
 
+(ert-deftest qq-chat-refuses-to-sync-timeline-text-into-canonical-input ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (appkit-chatbuf-input-state-set "safe draft")
+    (cl-letf (((symbol-function 'appkit-chat-timeline-live-p) (lambda () t))
+              ((symbol-function 'appkit-chatbuf-input-start-position)
+               (lambda () 2))
+              ((symbol-function 'appkit-chatbuf-prompt-start-position)
+               (lambda () 1))
+              ((symbol-function 'appkit-chat-timeline-footer-start-position)
+               (lambda () 100))
+              ((symbol-function 'appkit-chatbuf-input-state-sync)
+               (lambda (&rest _args)
+                 (ert-fail "invalid boundary must not sync input"))))
+      (let ((result (qq-chat--sync-draft-from-buffer)))
+        (should (equal "safe draft" result))
+        (should (equal "safe draft" (appkit-chatbuf-input-state)))))))
+
+(ert-deftest qq-chat-refuses-canonical-input-containing-message-rows ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (appkit-chatbuf-input-state-set
+     (propertize "not a draft" 'qq-chat-message-anchor "m1"))
+    (should-error (qq-chat--render-canonical-input)
+                  :type 'error)))
+
 (ert-deftest qq-chat-mode-and-render-do-not-duplicate-prompt ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
@@ -317,6 +343,31 @@
            (setq count (1+ count)))
          (setq pos (1+ pos)))
        (should (= 1 count))))))
+
+(ert-deftest qq-chat-render-keeps-composer-after-timeline-footer ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice") (target-id . "10001"))
+    nil)
+   (puthash
+    "private:10001"
+    '(((server-id . "m1")
+       (sender-id . "10001")
+       (sender-name . "Alice")
+       (time . 100)
+       (raw-message . "hello")))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (let ((footer (appkit-chat-timeline-footer-start-position))
+           (prompt (appkit-chatbuf-prompt-start-position))
+           (input (appkit-chatbuf-input-start-position)))
+       (should (<= footer prompt input))
+       (should (appkit-chatbuf-prompt-button-live-p))
+       (should (string-suffix-p ">>> " (buffer-string)))))))
 
 (ert-deftest qq-chat-render-preserves-footer-position ()
   (qq-chat-test-with-reset
@@ -737,7 +788,7 @@
          (should (equal (mapcar (lambda (event)
                                   (if (consp event) (car event) event))
                                 events)
-                        '(timeline frame header))))))))
+                        '(timeline header))))))))
 
 (ert-deftest qq-chat-projected-sync-replaces-empty-timeline-placeholder ()
   (qq-chat-test-with-reset
@@ -1393,14 +1444,33 @@
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
-     (let (requested)
+     (let (requested frame-updated)
        (cl-letf (((symbol-function 'qq-chat--sync-timeline)
                   (lambda (&rest args)
                     (setq requested
-                          (plist-get args :changed-resources)))))
+                          (plist-get args :changed-resources))))
+                 ((symbol-function 'qq-chat--update-frame)
+                  (lambda () (setq frame-updated t))))
          (qq-chat--rerender-open-chats "face:88")
          (qq-chat-test-sync-invalidations)
-         (should (equal '((:media "face:88")) requested)))))))
+         (should (equal '((:media "face:88")) requested))
+         (should-not frame-updated))))))
+
+(ert-deftest qq-chat-sessions-refresh-does-not-rebuild-composer ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat--ensure-view)
+     (let (header-updated frame-updated)
+       (cl-letf (((symbol-function 'qq-chat--header-line-update)
+                  (lambda () (setq header-updated t)))
+                 ((symbol-function 'qq-chat--update-frame)
+                  (lambda () (setq frame-updated t))))
+         (qq-chat--handle-state-change '(:type sessions-refreshed :count 1))
+         (qq-chat-test-sync-invalidations)
+         (should header-updated)
+         (should-not frame-updated))))))
 
 (ert-deftest qq-chat-node-refresh-defers-while-mark-active ()
   (qq-chat-test-with-reset
