@@ -43,7 +43,7 @@
    (beginning-of-line)
    (should (equal (alist-get 'message_id (qq-search--result-at-point)) "11"))))
 
-(ert-deftest qq-search-result-row-has-mouse-1-keymap ()
+(ert-deftest qq-search-result-row-clicks-without-blanket-hover ()
   (qq-search-test-with-buffer
    (setq qq-search--query "needle"
          qq-search--results
@@ -55,12 +55,55 @@
    (goto-char (point-min))
    (should (qq-search-next-result))
    (beginning-of-line)
-   (let* ((map (get-text-property (point) 'keymap))
-          (mouse-command (and (keymapp map)
-                              (lookup-key map [mouse-1]))))
-     (should (keymapp map))
-     (should (commandp mouse-command))
-     (should-not (memq mouse-command '(ignore undefined))))))
+   (let ((button (button-at (point))))
+     (should button)
+     (should (eq (button-type button) 'qq-search-result-button))
+     (should (eq (key-binding [mouse-1]) #'push-button))
+     ;; Mouse-1 must stay a direct button command instead of being
+     ;; translated to the default Mouse-2 yank path.
+     (should-not (mouse-on-link-p (point)))
+     (should-not
+      (text-property-not-all
+       (line-beginning-position) (line-beginning-position 2)
+       'mouse-face nil))
+     (should-not (button-at (line-end-position)))
+     (let (call)
+       (cl-letf (((symbol-function 'qq-chat-open-message)
+                  (lambda (&rest args) (setq call args))))
+         (button-activate button)
+         (should (equal call '("group:20001" "11" "needle"))))))))
+
+(ert-deftest qq-search-result-button-dispatches-real-primary-click ()
+  (save-window-excursion
+    (qq-search-test-with-buffer
+     (let ((snowflake "900719925474099312345")
+           call)
+       (setq qq-search--query "needle"
+             qq-search--results
+             (list (qq-search-test--result "900719925474099300001"
+                                           101 "first needle")
+                   (qq-search-test--result snowflake 100 "clicked needle"))
+             qq-search--seen (make-hash-table :test #'equal)
+             qq-search--next-cursor nil
+             qq-search--status 'eof)
+       (qq-search--render)
+       (switch-to-buffer (current-buffer))
+       (goto-char (point-min))
+       (should (qq-search-next-result))
+       (should (qq-search-next-result))
+       (let* ((clicked-pos (point))
+              ;; The sixth POSN field is the buffer position consulted by
+              ;; Emacs when resolving text-property keymaps for mouse events.
+              (posn (list (selected-window) clicked-pos '(0 . 0)
+                          0 nil clicked-pos))
+              (down-event (list 'down-mouse-1 posn))
+              (up-event (list 'mouse-1 posn))
+              (mouse-1-click-follows-link 450))
+         (cl-letf (((symbol-function 'qq-chat-open-message)
+                    (lambda (&rest args) (setq call args))))
+           (execute-kbd-macro (vector down-event up-event)))
+         (should (equal call
+                        (list "group:20001" snowflake "needle"))))))))
 
 (ert-deftest qq-search-previous-at-point-min-is-bounded ()
   (qq-search-test-with-buffer

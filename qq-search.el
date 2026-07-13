@@ -10,6 +10,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'button)
 (require 'seq)
 (require 'subr-x)
 (require 'qq-api)
@@ -45,11 +46,22 @@
 (defvar-local qq-search--request nil)
 (defvar-local qq-search--request-owner nil)
 
-(defvar qq-search-result-map
+(defvar qq-search-result-button-map
   (let ((map (make-sparse-keymap)))
-    (define-key map [mouse-1] #'qq-search-open-result-mouse)
+    (set-keymap-parent map button-map)
+    ;; Unlike the Emacs default button map, make the expected primary click
+    ;; activate directly.  With no hover face this event is not translated
+    ;; through `mouse-1-click-follows-link'.
+    (define-key map [mouse-1] #'push-button)
     map)
-  "Keymap installed on each actionable message-search result row.")
+  "Keymap for a message-search result button.")
+
+(define-button-type 'qq-search-result-button
+  'face nil
+  'mouse-face nil
+  'keymap qq-search-result-button-map
+  'action #'qq-search--activate-result-button
+  'help-echo "mouse-1 or RET: open this message")
 
 (defun qq-search--cancel-request ()
   "Cancel the current buffer's owned transport request, if any."
@@ -131,21 +143,18 @@ text in the results buffer can never receive search highlighting."
                 "  "
                 (propertize name 'face 'bold)
                 "  "
-                (qq-search--highlight-preview preview qq-search--query)
-                "\n"))
+                (qq-search--highlight-preview preview qq-search--query)))
          (start (point)))
     (insert line)
-    (add-text-properties
+    ;; Match telega's result layout: the message is a real text button and
+    ;; the terminating newline is outside it.  This keeps both button hit
+    ;; testing and any future button presentation away from trailing space.
+    (make-text-button
      start (point)
-     (list 'qq-search-result result
-           'qq-search-session-key qq-search--session-key
-           'keymap qq-search-result-map
-           'mouse-face 'highlight
-           'follow-link t
-           'help-echo "mouse-1 or RET: open this message"
-           'rear-nonsticky '(qq-search-result qq-search-session-key
-                                              keymap mouse-face follow-link
-                                              help-echo)))))
+     :type 'qq-search-result-button
+     'qq-search-result result
+     'qq-search-session-key qq-search--session-key)
+    (insert "\n")))
 
 (defun qq-search--insert-status ()
   "Insert the explicit current paging status."
@@ -362,18 +371,22 @@ text in the results buffer can never receive search highlighting."
 (defun qq-search-open-result ()
   "Open the whole-line search result at point."
   (interactive)
-  (let* ((result (or (qq-search--result-at-point)
-                     (user-error "qq: no search result at point")))
-         (session-key
-          (qq-api-session-key-from-locator (alist-get 'chat result))))
+  (qq-search--open-result
+   (or (qq-search--result-at-point)
+       (user-error "qq: no search result at point"))))
+
+(defun qq-search--open-result (result)
+  "Open exact message-search RESULT from the current search buffer."
+  (let ((session-key
+         (qq-api-session-key-from-locator (alist-get 'chat result))))
     (qq-chat-open-message session-key (alist-get 'message_id result)
                           qq-search--query)))
 
-(defun qq-search-open-result-mouse (event)
-  "Open the whole-line message-search result clicked by mouse EVENT."
-  (interactive "e")
-  (mouse-set-point event)
-  (qq-search-open-result))
+(defun qq-search--activate-result-button (button)
+  "Activate message-search result BUTTON at its exact clicked position."
+  (qq-search--open-result
+   (or (button-get button 'qq-search-result)
+       (error "qq: search result button has no result"))))
 
 (defvar qq-search-mode-map
   (let ((map (make-sparse-keymap)))
