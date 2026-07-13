@@ -2024,6 +2024,47 @@ via `qq-chat-goto-message'."
         (and (listp raw) (alist-get 'faceText raw))
         (and (listp raw) (alist-get 'face_text raw)))))
 
+(defun qq-chat--open-mention-user (user-id)
+  "Open the profile for mentioned USER-ID."
+  (unless (and (qq-api-user-id-p user-id)
+               (not (equal user-id "0")))
+    (user-error "qq: mention has no user profile"))
+  (qq-user-open user-id))
+
+(defun qq-chat--mention-display-string (data)
+  "Return a telega-style interactive mention string from segment DATA."
+  (let* ((target (and (alist-get 'qq data)
+                      (format "%s" (alist-get 'qq data))))
+         (kind (cond
+                ((equal target "all") 'at-all)
+                ((and target
+                      (equal target (qq-state-self-user-id))) 'at-me)
+                (t 'ordinary)))
+         (label (or (alist-get 'name data)
+                    (and (eq kind 'at-all) "全体成员")
+                    target
+                    "mention"))
+         (text (concat "@" label))
+         (profile-p (and (qq-api-user-id-p target)
+                         (not (equal target "0"))))
+         (display
+          (if profile-p
+              (buttonize
+               text #'qq-chat--open-mention-user target
+               (format "Open %s's profile (QQ %s)" label target))
+            text)))
+    (add-text-properties
+     0 (length display)
+     (list 'face (if (memq kind '(at-me at-all))
+                     'qq-msg-mention-self
+                   'qq-msg-mention)
+           'qq-chat-mention-kind kind
+           'qq-chat-mention-user-id (and profile-p target)
+           'rear-nonsticky '(qq-chat-mention-kind
+                             qq-chat-mention-user-id))
+     display)
+    display))
+
 (defun qq-chat--segment-inline-string (segment)
   "Return inline display string for SEGMENT, or nil for block-like segments.
 
@@ -2034,22 +2075,7 @@ base emoji), never as OneBot CQ text."
     (pcase type
       ("text" (or (alist-get 'text data) ""))
       ("at"
-       (let* ((target (and (alist-get 'qq data)
-                           (format "%s" (alist-get 'qq data))))
-              (kind (cond
-                     ((equal target "all") 'at-all)
-                     ((and target
-                           (equal target (qq-state-self-user-id))) 'at-me)
-                     (t 'ordinary)))
-              (label (or (alist-get 'name data)
-                         (and (eq kind 'at-all) "全体成员")
-                         target
-                         "mention")))
-         (propertize (concat "@" label)
-                     'face (if (memq kind '(at-me at-all))
-                               'qq-msg-mention-self
-                             'qq-msg-mention)
-                     'qq-chat-mention-kind kind)))
+       (qq-chat--mention-display-string data))
       ("__unsupported"
        (qq-state-message-preview-from-segments (list segment)))
       ("face"

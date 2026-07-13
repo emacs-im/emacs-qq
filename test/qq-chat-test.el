@@ -1072,7 +1072,45 @@
       (should (eq 'ordinary (get-text-property 0 'qq-chat-mention-kind other)))
       (should (eq 'qq-msg-mention-self (get-text-property 0 'face self)))
       (should (eq 'qq-msg-mention-self (get-text-property 0 'face all)))
-      (should (eq 'qq-msg-mention (get-text-property 0 'face other))))))
+      (should (eq 'qq-msg-mention (get-text-property 0 'face other)))
+      (should (equal "90001"
+                     (get-text-property 0 'qq-chat-mention-user-id self)))
+      (should-not (get-text-property 0 'qq-chat-mention-user-id all))
+      (should (equal "10002"
+                     (get-text-property 0 'qq-chat-mention-user-id other))))))
+
+(ert-deftest qq-chat-historical-mention-opens-mentioned-user-profile ()
+  (let ((message
+         '((segments
+            . (((type . "text") (data . ((text . "你好，"))))
+               ((type . "at")
+                (data . ((qq . "10001") (name . "Alice Card"))))
+               ((type . "text") (data . ((text . "！"))))))))
+        opened-user-id)
+    (with-temp-buffer
+      (qq-chat--insert-message-body message nil nil)
+      (goto-char (point-min))
+      (should (search-forward "@Alice Card" nil t))
+      (let ((button (button-at (1- (point)))))
+        (should button)
+        (goto-char (button-start button))
+        (should (equal (key-binding (kbd "RET")) #'push-button))
+        (should (equal "10001"
+                       (get-text-property (point) 'qq-chat-mention-user-id)))
+        (cl-letf (((symbol-function 'qq-user-open)
+                   (lambda (user-id) (setq opened-user-id user-id))))
+          (button-activate button)))
+      (should (equal opened-user-id "10001")))))
+
+(ert-deftest qq-chat-at-all-is-emphasized-but-not-a-user-link ()
+  (let ((mention (qq-chat--segment-inline-string
+                  '((type . "at") (data . ((qq . "all")))))))
+    (with-temp-buffer
+      (insert mention)
+      (goto-char (point-min))
+      (should (equal (buffer-string) "@全体成员"))
+      (should-not (button-at (point)))
+      (should (eq (get-text-property (point) 'qq-chat-mention-kind) 'at-all)))))
 
 (ert-deftest qq-chat-renders-clickable-reaction-chips ()
   (qq-chat-test-with-reset
