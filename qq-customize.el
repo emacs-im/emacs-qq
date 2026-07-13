@@ -54,9 +54,11 @@ transport pending table and invokes its error callback exactly once."
   :group 'qq)
 
 (defcustom qq-chat-history-auto-load-threshold 2000
-  "Character distance from buffer top that triggers an older-history page.
+  "Character distance from a timeline edge that triggers history paging.
 
-Set to nil to disable telega-style automatic loading near the top."
+Near the top, load older messages.  Near the bottom of a partial around
+window, load newer messages while the composer is idle.  Set to nil to disable
+telega-style automatic edge paging."
   :type '(choice (const :tag "Disabled" nil)
                  (integer :tag "Characters"))
   :group 'qq)

@@ -272,7 +272,7 @@ Prefer this over inline button rows."
   "Chat command menu for emacs-qq."
   [["Timeline"
     ("g" "Refresh" qq-chat-refresh)
-    ("o" "Load older" qq-chat-load-older-messages)
+    (">" "Latest / mark read" qq-chat-read-all)
     ("/" "Search timeline" qq-chat-search)
     ("M-/" "Search results" qq-chat-search-results)
     ("x" "Cancel search" qq-chat-search-cancel)
@@ -282,7 +282,6 @@ Prefer this over inline button rows."
     ("p" "Search prev" qq-chat-search-prev)
     ("P" "Poke user…" qq-chat-send-poke
      :inapt-if qq-transient--poke-session-inapt-p)
-    ("R" "Mark read" qq-chat-read-all)
     ("v" "Forward marked" qq-chat-forward-marked-messages
      :inapt-if qq-transient--forward-marked-inapt-p)
     ("U" "Clear forward marks" qq-chat-clear-forward-marks

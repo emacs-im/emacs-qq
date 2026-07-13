@@ -50,6 +50,17 @@ earlier, without introducing a generic application-wide generation counter."
     (puthash session-key token qq-api--session-read-observation-tokens)
     t))
 
+(defun qq-api-read-observation-start ()
+  "Return a freshness token for a caller-owned read-state request."
+  (qq-api--next-read-observation-token))
+
+(defun qq-api-read-observation-accept-p (session-key token)
+  "Accept caller-owned read observation TOKEN for SESSION-KEY if current.
+
+Callers which fetch read state without asking `qq-api' to apply it use this
+barrier before mutating state or choosing a timeline position."
+  (qq-api--accept-read-observation-p session-key token))
+
 (defun qq-api--response-data (response)
   "Extract `data' payload from RESPONSE alist."
   (alist-get 'data response nil nil #'eq))

@@ -57,6 +57,7 @@
    (with-temp-buffer
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001")
+     (qq-chat--set-history-window "9007199254742007089" nil)
      (qq-chat-render)
      (goto-char (point-min))
      (search-forward "hello")
