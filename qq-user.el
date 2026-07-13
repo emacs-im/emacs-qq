@@ -72,6 +72,9 @@
 (defvar-local qq-user--send-like-request-owner nil
   "Owner object for the active profile-like mutation.")
 
+(defvar-local qq-user--like-limit-date nil
+  "Local date on which QQ reported the current target's daily like limit.")
+
 (defvar-local qq-user--photos nil
   "Native photo-wall entries shown inline on the user page.")
 
@@ -107,6 +110,10 @@
   "Return non-nil when the current profile belongs to this account."
   (and qq-user--user-id
        (equal qq-user--user-id (qq-state-self-user-id))))
+
+(defun qq-user--like-limit-reached-p ()
+  "Return non-nil when QQ reported today's limit for the current profile."
+  (equal qq-user--like-limit-date (format-time-string "%Y-%m-%d")))
 
 (defun qq-user--header-line ()
   "Return dynamic header line for the current user buffer."
@@ -240,9 +247,14 @@
   (unless (qq-user--self-p)
     (insert "  ")
     (appkit-ui-insert-action-button
-     (if qq-user--send-like-request-owner " 点赞中… " " 点赞 ")
+     (cond (qq-user--send-like-request-owner " 点赞中… ")
+           ((qq-user--like-limit-reached-p) " 今日已达上限 ")
+           (t " 点赞 "))
      #'qq-user-like
-     :face 'qq-user-action-button :help-echo "给资料卡点赞 (l)"))
+     :face 'qq-user-action-button
+     :help-echo (if (qq-user--like-limit-reached-p)
+                    "今日对该用户的资料点赞已达上限"
+                  "给资料卡点赞 (l)")))
   (insert "  ")
   (appkit-ui-insert-action-button
    " 查看头像 " #'qq-user-open-avatar
@@ -292,7 +304,10 @@
          (qq-user--insert-action-buttons)
          (appkit-view-insert-note-line
           (concat "g 刷新 · m 私聊"
-                  (unless (qq-user--self-p) " · l 点赞")
+                  (unless (qq-user--self-p)
+                    (if (qq-user--like-limit-reached-p)
+                        " · l 今日已达上限"
+                      " · l 点赞"))
                   " · a 头像 · p 照片墙 · w 复制 · q 退出"))
          (insert "\n")
          (appkit-view-insert-heading-line "资料" :face 'bold)
@@ -515,6 +530,8 @@
     (user-error "qq: this buffer has no user identity"))
   (when (qq-user--self-p)
     (user-error "qq: cannot like your own profile"))
+  (when (qq-user--like-limit-reached-p)
+    (user-error "qq: 今日对该用户的资料点赞已达上限"))
   (when qq-user--send-like-request-owner
     (user-error "qq: profile like is already in progress"))
   (let ((buffer (current-buffer))
@@ -526,16 +543,24 @@
     (let ((request
            (qq-api-like-user
             user-id
-            (lambda (added-count)
+            (lambda (result)
               (when (qq-user--send-like-request-current-p
                      buffer user-id owner)
                 (with-current-buffer buffer
                   (setq qq-user--send-like-request nil
                         qq-user--send-like-request-owner nil)
-                  (qq-user--refresh-like)
-                  (qq-user-render)
-                  (message "qq: 已给 %s 的资料新增 %d 个赞"
-                           (qq-user--display-name) added-count))))
+                  (pcase (alist-get 'outcome result)
+                    ("liked"
+                     (qq-user--refresh-like)
+                     (qq-user-render)
+                     (message "qq: 已给 %s 的资料新增 1 个赞"
+                              (qq-user--display-name)))
+                    ("daily_limit"
+                     (setq qq-user--like-limit-date
+                           (format-time-string "%Y-%m-%d"))
+                     (qq-user-render)
+                     (message "qq: 今日对 %s 的资料点赞已达上限"
+                              (qq-user--display-name)))))))
             (lambda (response reason)
               (when (qq-user--send-like-request-current-p
                      buffer user-id owner)
@@ -604,6 +629,7 @@
           qq-user--like-count nil
           qq-user--like-loading nil
           qq-user--like-error nil
+          qq-user--like-limit-date nil
           qq-user--photos nil
           qq-user--photo-loading nil
           qq-user--photo-loaded nil))

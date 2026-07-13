@@ -200,7 +200,9 @@
                     ("emacs_get_user_like"
                      '((data . ((user_id . "10001") (total_count . 42)))))
                     ("emacs_like_user"
-                     '((data . ((user_id . "10001") (added_count . 1)))))
+                     '((data . ((user_id . "10001")
+                                (outcome . "liked")
+                                (added_count . 1)))))
                     ("emacs_get_user_photo_wall"
                      '((data . ((user_id . "10001")
                                 (photos . (((id . "p1")
@@ -211,11 +213,24 @@
       (qq-api-like-user "10001" (lambda (count) (setq added count)))
       (qq-api-get-user-photo-wall "10001" (lambda (value) (setq photos value))))
     (should (= like 42))
-    (should (= added 1))
+    (should (equal (alist-get 'outcome added) "liked"))
     (should (equal (alist-get 'id (car photos)) "p1"))
     (should (member '("emacs_get_user_like" ((user_id . "10001"))) calls))
     (should (member '("emacs_like_user" ((user_id . "10001"))) calls))
     (should (member '("emacs_get_user_photo_wall" ((user_id . "10001"))) calls))))
+
+(ert-deftest qq-api-like-user-rejects-unknown-domain-outcomes ()
+  (let (failure)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional _errback)
+                 (funcall callback
+                          '((data . ((user_id . "10001")
+                                     (outcome . "mystery")))))
+                 'request)))
+      (qq-api-like-user
+       "10001" #'ignore
+       (lambda (_response reason) (setq failure reason))))
+    (should (string-match-p "unknown outcome" failure))))
 
 (ert-deftest qq-user-like-refreshes-the-exact-profile-after-success ()
   (with-temp-buffer
@@ -230,13 +245,32 @@
                 ((symbol-function 'qq-api-like-user)
                  (lambda (user-id callback &optional _errback)
                    (setq liked-user-id user-id)
-                   (funcall callback 1)
+                   (funcall callback
+                            '((user_id . "10001")
+                              (outcome . "liked")
+                              (added_count . 1)))
                    'request)))
         (qq-user-like))
       (should (equal liked-user-id "10001"))
       (should refreshed)
       (should-not qq-user--send-like-request)
       (should-not qq-user--send-like-request-owner))))
+
+(ert-deftest qq-user-like-renders-the-daily-limit-as-domain-state ()
+  (with-temp-buffer
+    (qq-user-mode)
+    (setq qq-user--user-id "10001"
+          qq-user--profile (copy-tree qq-user-test--profile))
+    (cl-letf (((symbol-function 'qq-state-self-user-id) (lambda () "99999"))
+              ((symbol-function 'qq-api-like-user)
+               (lambda (_user-id callback &optional _errback)
+                 (funcall callback
+                          '((user_id . "10001") (outcome . "daily_limit")))
+                 'request)))
+      (qq-user-like))
+    (should (qq-user--like-limit-reached-p))
+    (should (string-match-p "今日已达上限" (buffer-string)))
+    (should-error (qq-user-like) :type 'user-error)))
 
 (ert-deftest qq-user-like-rejects-the-current-account ()
   (with-temp-buffer

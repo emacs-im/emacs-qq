@@ -1470,7 +1470,7 @@ reconciles it with the authoritative aggregate count."
    errback))
 
 (defun qq-api-like-user (user-id callback &optional errback)
-  "Add one profile like to USER-ID and call CALLBACK with the added count."
+  "Add one profile like to USER-ID and call CALLBACK with its domain result."
   (unless (qq-api-user-id-p user-id)
     (user-error "qq: user likes require a decimal string user id"))
   (qq-api-call
@@ -1479,13 +1479,21 @@ reconciles it with the authoritative aggregate count."
    (lambda (response)
      (condition-case error-data
          (let* ((data (qq-api--response-data response))
-                (response-user-id (alist-get 'user_id data))
-                (added-count (alist-get 'added_count data)))
-           (unless (equal response-user-id user-id)
+                (outcome (alist-get 'outcome data)))
+           (unless (equal (alist-get 'user_id data) user-id)
              (error "qq: emacs_like_user returned a different user identity"))
-           (unless (and (integerp added-count) (= added-count 1))
-             (error "qq: emacs_like_user returned an invalid added count"))
-           (funcall callback added-count))
+           (pcase outcome
+             ("liked"
+              (unless (and (qq-api--exact-object-keys-p
+                            data '(user_id outcome added_count))
+                           (equal (alist-get 'added_count data) 1))
+                (error "qq: emacs_like_user returned an invalid liked result")))
+             ("daily_limit"
+              (unless (qq-api--exact-object-keys-p data '(user_id outcome))
+                (error "qq: emacs_like_user returned an invalid daily-limit result")))
+             (_
+              (error "qq: emacs_like_user returned an unknown outcome")))
+           (funcall callback (copy-tree data)))
        (error
         (funcall (or errback #'qq-api--default-error)
                  response (error-message-string error-data)))))
