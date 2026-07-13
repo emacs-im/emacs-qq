@@ -853,6 +853,178 @@
        (when (file-directory-p qq-media-cache-directory)
          (delete-directory qq-media-cache-directory t))))))
 
+(ert-deftest qq-media-video-poster-never-becomes-playable-local-source ()
+  (qq-media-test-with-reset
+   (let* ((qq-media-cache-directory (make-temp-file "qq-video-cache" t))
+          (poster (make-temp-file "qq-video-poster" nil ".jpg"))
+          (segment '((type . "video")
+                     (data . ((file . "video-handle")
+                              (path . "/missing/video.mp4")
+                              (remote_status . "unavailable")))))
+          (preview-key (qq-media-segment-preview-key segment))
+          (disk-poster
+           (format "%s.jpg"
+                   (qq-media--remote-image-cache-file-base preview-key))))
+     (unwind-protect
+         (progn
+           (qq-media--cache-resource preview-key `((file . ,poster)))
+           (should-not (qq-media-segment-local-file segment))
+           (remhash preview-key qq-media--resource-cache)
+           (with-temp-file disk-poster
+             (insert "poster bytes"))
+           (should-not (qq-media-segment-local-file segment))
+           (let ((capabilities (qq-media-segment-capabilities segment)))
+             (should-not (plist-get capabilities :local-file))
+             (should-not (plist-get capabilities :open))))
+       (when (file-exists-p poster) (delete-file poster))
+       (when (file-directory-p qq-media-cache-directory)
+         (delete-directory qq-media-cache-directory t))))))
+
+(ert-deftest qq-media-resolvable-video-identities-use-the-complete-resolver ()
+  (qq-media-test-with-reset
+   (let* ((resolver-a
+           '((kind . "message")
+             (peer . ((chat_type . 2)
+                      (peer_uid . "20001")
+                      (guild_id . "")))
+             (message_id . "9007199254745006083")
+             (element_id . "9007199254745006082")))
+          (resolver-b (copy-tree resolver-a))
+          (first `((type . "video")
+                   (data . ((file . "same-name.mp4")
+                            (remote_status . "resolvable")
+                            (resolver . ,resolver-a)))))
+          (same-resolver `((type . "video")
+                           (data . ((file . "renamed.mp4")
+                                    (remote_status . "resolvable")
+                                    (resolver . ,resolver-a)))))
+          (reordered-resolver
+           '((type . "video")
+             (data . ((file . "renamed-again.mp4")
+                      (remote_status . "resolvable")
+                      (resolver
+                       . ((element_id . "9007199254745006082")
+                          (message_id . "9007199254745006083")
+                          (peer . ((guild_id . "")
+                                   (peer_uid . "20001")
+                                   (chat_type . 2)))
+                          (kind . "message")))))))
+          different-resolver)
+     (setf (alist-get 'element_id resolver-b) "9007199254745006000")
+     (setq different-resolver
+           `((type . "video")
+             (data . ((file . "same-name.mp4")
+                      (remote_status . "resolvable")
+                      (resolver . ,resolver-b)))))
+     ;; Presentation names do not split one native resource.
+     (should (equal (qq-media--segment-resource-key first)
+                    (qq-media--segment-resource-key same-resolver)))
+     (should (equal (qq-media-segment-download-key first)
+                    (qq-media-segment-download-key same-resolver)))
+     (should (equal (qq-media-segment-preview-key first)
+                    (qq-media-segment-preview-key same-resolver)))
+     (should (equal (qq-media--segment-resource-key first)
+                    (qq-media--segment-resource-key reordered-resolver)))
+     ;; Conversely, the same filename cannot merge distinct message elements.
+     (should-not (equal (qq-media--segment-resource-key first)
+                        (qq-media--segment-resource-key different-resolver)))
+     (should-not (equal (qq-media-segment-download-key first)
+                        (qq-media-segment-download-key different-resolver)))
+     (should-not (equal (qq-media-segment-preview-key first)
+                        (qq-media-segment-preview-key different-resolver))))))
+
+(ert-deftest qq-media-relative-data-file-remains-an-opaque-remote-handle ()
+  (qq-media-test-with-reset
+   (let* ((directory (make-temp-file "qq-relative-file" t))
+          (default-directory directory)
+          (name "opaque.mp4")
+          (file (expand-file-name name directory))
+          (segment `((type . "file")
+                     (data . ((file . ,name)
+                              (name . ,name))))))
+     (unwind-protect
+         (progn
+           (with-temp-file file (insert "not the protocol resource"))
+           (should-not (qq-media--segment-existing-path segment))
+           (should-not (qq-media-segment-local-file segment))
+           (should (equal (qq-media--segment-remote-file-keys segment)
+                          (list name))))
+       (delete-directory directory t)))))
+
+(ert-deftest qq-media-main-video-cache-rejects-image-preview-artifacts ()
+  (qq-media-test-with-reset
+   (let* ((resolver
+           '((kind . "snapshot")
+             (peer . ((chat_type . 2)
+                      (peer_uid . "20001")
+                      (guild_id . "")))
+             (file_uuid . "native-file-uuid")))
+          (segment `((type . "video")
+                     (data . ((file . "clip.mp4")
+                              (remote_status . "resolvable")
+                              (resolver . ,resolver)))))
+          (resource-key (qq-media--segment-resource-key segment))
+          (directory (make-temp-file "qq-video-main-cache" t))
+          called resolved)
+     (unwind-protect
+         (progn
+           (dolist (extension '("jpg" "gif"))
+             (let ((artifact (expand-file-name
+                              (format "preview.%s" extension) directory)))
+               (with-temp-file artifact (insert "preview bytes"))
+               (qq-media--cache-resource resource-key `((file . ,artifact)))
+               (should-not (qq-media-segment-local-file segment))
+               (should-not (plist-get (qq-media-segment-capabilities segment)
+                                      :local-file))))
+           (cl-letf (((symbol-function 'qq-api-resolve-video)
+                      (lambda (called-resolver callback &optional _errback)
+                        (setq called called-resolver)
+                        (funcall callback
+                                 '((state . "available")
+                                   (url . "https://video.example/fresh"))))))
+             (qq-media-resolve-segment-resource
+              segment (lambda (resource) (setq resolved resource))))
+           (should (equal called resolver))
+           (should (equal resolved
+                          '((url . "https://video.example/fresh")))))
+       (delete-directory directory t)))))
+
+(ert-deftest qq-media-real-download-invalidates-negative-video-preview ()
+  (qq-media-test-with-reset
+   (let* ((file (make-temp-file "qq-downloaded-video" nil ".mp4"))
+          (segment '((type . "video")
+                     (data . ((file . "clip.mp4")
+                              (remote_status . "available")
+                              (url . "https://video.example/clip")))))
+          (preview-key (qq-media-segment-preview-key segment)))
+     (unwind-protect
+         (progn
+           (puthash preview-key t qq-media--preview-missing-cache)
+           (qq-media--put-segment-download-state
+            segment `(:status downloaded :path ,file))
+           (should-not (gethash preview-key qq-media--preview-missing-cache)))
+       (delete-file file)))))
+
+(ert-deftest qq-media-video-play-provides-an-asynchronous-error-callback ()
+  (let ((segment '((type . "video") (data . nil)))
+        supplied-error
+        displayed)
+    (cl-letf (((symbol-function 'qq-media-segment-playable-p)
+               (lambda (_segment) t))
+              ((symbol-function 'qq-media-segment-local-file)
+               (lambda (_segment) nil))
+              ((symbol-function 'qq-media-resolve-segment-resource)
+               (lambda (_segment _success &optional error)
+                 (setq supplied-error error)
+                 (funcall error nil "manual resolution failed")))
+              ((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (setq displayed (apply #'format format-string args)))))
+      (qq-media-segment-play segment))
+    (should (functionp supplied-error))
+    (should (equal displayed
+                   "qq: failed to play video: manual resolution failed"))))
+
 ;; Strict video remote-status model overrides for the pre-wire-model fixtures.
 
 (ert-deftest qq-media-expired-video-does-not-resolve-a-remote-resource ()
@@ -905,7 +1077,7 @@
     (should (equal (plist-get caps :status) "Invalid remote status"))
     (should-not (plist-get caps :open))))
 
-(ert-deftest qq-media-video-remote-status-four-state-capabilities ()
+(ert-deftest qq-media-video-terminal-remote-status-capabilities ()
   (dolist (case
            '(("unavailable" "Unavailable" "video resource is unavailable")
              ("unresolved" "Unresolved" "video resource is unresolved")))
@@ -925,6 +1097,95 @@
            (lambda (_response text) (setq failure text))))
         (should-not api-called)
         (should (equal failure reason))))))
+
+(ert-deftest qq-media-resolvable-video-uses-only-exact-manual-capability ()
+  (qq-media-test-with-reset
+   (let* ((resolver
+           '((kind . "message")
+             (peer . ((chat_type . 2)
+                      (peer_uid . "20001")
+                      (guild_id . "")))
+             (message_id . "9007199254745006083")
+             (element_id . "9007199254745006082")))
+          (segment
+           `((type . "video")
+             (data . ((file . "must-not-go-to-get-file")
+                      (remote_status . "resolvable")
+                      (resolver . ,resolver)))))
+          calls resources generic-called)
+     (let ((caps (qq-media-segment-capabilities segment)))
+       (should (eq (plist-get caps :remote-status) 'resolvable))
+       (dolist (key '(:open :download :save :resolve-remote))
+         (should (plist-get caps key)))
+       (should-not (plist-get caps :copy-url))
+       (should-not (plist-get caps :status)))
+     (cl-letf (((symbol-function 'qq-api-resolve-video)
+                (lambda (called-resolver callback &optional _errback)
+                  (push (copy-tree called-resolver) calls)
+                  (funcall callback
+                           '((state . "available")
+                             (url . "https://video.example/manual")))))
+               ((symbol-function 'qq-media--fetch-segment-resource)
+                (lambda (&rest _)
+                  (setq generic-called t))))
+       ;; Every explicit operation requests a fresh signed URL rather than
+       ;; persisting one and guessing its expiry.
+       (dotimes (_ 2)
+         (qq-media-resolve-segment-resource
+          segment (lambda (resource) (push resource resources)))))
+     (should-not generic-called)
+     (should (equal calls (list resolver resolver)))
+     (should
+      (equal resources
+             '(((url . "https://video.example/manual"))
+               ((url . "https://video.example/manual"))))))))
+
+(ert-deftest qq-media-resolvable-video-propagates-native-terminal-state ()
+  (let* ((resolver
+          '((kind . "snapshot")
+            (peer . ((chat_type . 2)
+                     (peer_uid . "20001")
+                     (guild_id . "")))
+            (file_uuid . "native-file-uuid")))
+         (segment
+          `((type . "video")
+            (data . ((file . "video.mp4")
+                     (remote_status . "resolvable")
+                     (resolver . ,resolver)))))
+         resolved failure)
+    (cl-letf (((symbol-function 'qq-api-resolve-video)
+               (lambda (_resolver callback &optional _errback)
+                 (funcall callback '((state . "expired"))))))
+      (qq-media-resolve-segment-resource
+       segment
+       (lambda (resource) (setq resolved resource))
+       (lambda (_response reason) (setq failure reason))))
+    (should-not resolved)
+    (should (equal failure "video resource has expired"))))
+
+(ert-deftest qq-media-resolvable-video-prefers-a-real-local-file ()
+  (qq-media-test-with-reset
+   (let* ((file (make-temp-file "qq-local-video" nil ".mp4"))
+          (segment
+           `((type . "video")
+             (data . ((file . "video.mp4")
+                      (path . ,file)
+                      (remote_status . "resolvable")
+                      (resolver
+                       . ((kind . "snapshot")
+                          (peer . ((chat_type . 2)
+                                   (peer_uid . "20001")
+                                   (guild_id . "")))
+                          (file_uuid . "native-file-uuid")))))))
+          api-called resolved)
+     (unwind-protect
+         (cl-letf (((symbol-function 'qq-api-resolve-video)
+                    (lambda (&rest _args) (setq api-called t))))
+           (qq-media-resolve-segment-resource
+            segment (lambda (resource) (setq resolved resource)))
+           (should-not api-called)
+           (should (equal (alist-get 'file resolved) file)))
+       (when (file-exists-p file) (delete-file file))))))
 
 (ert-deftest qq-media-available-video-uses-only-wire-url ()
   (qq-media-test-with-reset

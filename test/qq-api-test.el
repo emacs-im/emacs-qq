@@ -1036,6 +1036,81 @@
     (should callback-called)
     (should-not delivered)))
 
+(ert-deftest qq-api-resolve-video-sends-only-the-exact-native-resolver ()
+  (let* ((resolver
+          '((kind . "message")
+            (peer . ((chat_type . 2)
+                     (peer_uid . "20001")
+                     (guild_id . "")))
+            (message_id . "9007199254745006083")
+            (element_id . "9007199254745006082")))
+         action params delivered)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (called-action called-params callback &optional _errback)
+                 (setq action called-action params called-params)
+                 (funcall callback
+                          '((data . ((state . "available")
+                                     (url . "https://video.example/manual")))))
+                 'sent)))
+      (should
+       (eq 'sent
+           (qq-api-resolve-video
+            resolver (lambda (remote) (setq delivered remote))))))
+    (should (equal action "emacs_resolve_video"))
+    (should (equal params `((resolver . ,resolver))))
+    (should
+     (equal delivered
+            '((state . "available")
+              (url . "https://video.example/manual"))))))
+
+(ert-deftest qq-api-video-resolver-and-result-unions-are-closed ()
+  (let ((snapshot
+         '((kind . "snapshot")
+           (peer . ((chat_type . 2)
+                    (peer_uid . "20001")
+                    (guild_id . "")))
+           (file_uuid . "native-file-uuid"))))
+    (should (equal (qq-api-validate-video-resolver snapshot) snapshot))
+    (dolist (invalid
+             (list
+              (append (copy-tree snapshot) '((message_id . "1")))
+              '((kind . "message")
+                (peer . ((chat_type . 2)
+                         (peer_uid . "20001")
+                         (guild_id . "")))
+                (message_id . 9007199254745006083)
+                (element_id . "9007199254745006082"))
+              '((kind . "message")
+                (peer . ((chat_type . 2)
+                         (peer_uid . "20001")
+                         (guild_id . "")))
+                (message_id . "9007199254745006083")
+                (element_id . "0"))
+              '((kind . "snapshot")
+                (peer . ((chat_type . 2)
+                         (peer_uid . "")
+                         (guild_id . "")))
+                (file_uuid . "native-file-uuid"))))
+      (should-error
+       (qq-api-validate-video-resolver invalid)
+       :type 'user-error)))
+  (let (delivered failure)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional _errback)
+                 (funcall callback
+                          '((data . ((state . "resolvable")
+                                     (resolver . nil))))))))
+      (qq-api-resolve-video
+       '((kind . "snapshot")
+         (peer . ((chat_type . 2)
+                  (peer_uid . "20001")
+                  (guild_id . "")))
+         (file_uuid . "native-file-uuid"))
+       (lambda (remote) (setq delivered remote))
+       (lambda (_response reason) (setq failure reason))))
+    (should-not delivered)
+    (should (string-match-p "cannot remain resolvable" failure))))
+
 (ert-deftest qq-api-forward-context-source-schema-is-closed ()
   (let ((source (qq-api-test--context-source)))
     (should (equal (qq-api-validate-forward-source source) source))
@@ -1187,6 +1262,17 @@
             (payload . ((emoji_package_id . 1) (emoji_id . "2")
                         (key . "key") (summary . "sticker"))))
            ((kind . "mail") (payload . nil))
+           ((kind . "video")
+            (payload
+             . ((file . "video.mp4")
+                (remote
+                 . ((state . "resolvable")
+                    (resolver
+                     . ((kind . "snapshot")
+                        (peer . ((chat_type . 2)
+                                 (peer_uid . "20001")
+                                 (guild_id . "")))
+                        (file_uuid . "native-file-uuid"))))))))
            ((kind . "music")
             (payload . ((provider . "qq") (nested . [1 "two"])))))))
     (dolist (segment valid)

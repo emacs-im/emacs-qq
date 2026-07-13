@@ -310,7 +310,9 @@ snapshot is remote-only."
           `((thumb . ,(alist-get 'thumb payload))))
       (remote_status . ,state)
       ,@(when (equal state "available")
-          `((url . ,(alist-get 'url remote)))))))
+          `((url . ,(alist-get 'url remote))))
+      ,@(when (equal state "resolvable")
+          `((resolver . ,(copy-tree (alist-get 'resolver remote))))))))
 
 (defun qq-forward-native-segment-to-internal (segment)
   "Validate native SEGMENT and map it to one internal timeline segment."

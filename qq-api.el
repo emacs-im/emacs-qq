@@ -359,8 +359,85 @@ and must not be retained as an `unsupported.raw' diagnostic payload."
      (alist-get 'chat reference) (format "%s chat" context) protocol-p)
     (copy-tree reference)))
 
-(defun qq-api--validate-native-video-remote (remote context protocol-p)
-  "Validate native video REMOTE discriminant for CONTEXT."
+(defun qq-api--validate-native-peer (peer context protocol-p)
+  "Validate and copy exact Linux QQ PEER for CONTEXT."
+  (unless (qq-api--exact-object-keys-p
+           peer '(chat_type peer_uid guild_id))
+    (qq-api--signal-schema-error
+     protocol-p
+     (concat "qq: %s peer requires only chat_type, peer_uid, and "
+             "guild_id")
+     context))
+  (let ((chat-type (alist-get 'chat_type peer)))
+    (unless (and (integerp chat-type) (> chat-type 0))
+      (qq-api--signal-schema-error
+       protocol-p "qq: %s peer.chat_type must be a positive integer"
+       context)))
+  (unless (qq-api-non-empty-string-p (alist-get 'peer_uid peer))
+    (qq-api--signal-schema-error
+     protocol-p "qq: %s peer.peer_uid must be a non-empty string"
+     context))
+  (unless (stringp (alist-get 'guild_id peer))
+    (qq-api--signal-schema-error
+     protocol-p "qq: %s peer.guild_id must be a string" context))
+  (copy-tree peer))
+
+(defun qq-api-validate-video-resolver
+    (resolver &optional context protocol-p)
+  "Validate and copy exact fork-native video RESOLVER.
+
+The two locator domains are deliberately disjoint: live messages use their
+own native peer/message/element identity, while forward snapshots use their
+own peer/file UUID.  No parent id or generic file token is accepted."
+  (let ((context (or context "video resolver")))
+    (unless (qq-api--single-alist-p resolver)
+      (qq-api--signal-schema-error
+       protocol-p "qq: %s must be an object" context))
+    (pcase (alist-get 'kind resolver)
+      ("message"
+       (unless (qq-api--exact-object-keys-p
+                resolver '(kind peer message_id element_id))
+         (qq-api--signal-schema-error
+          protocol-p
+          (concat "qq: %s message resolver requires only kind, peer, "
+                  "message_id, and element_id")
+          context))
+       (qq-api--validate-native-peer
+        (alist-get 'peer resolver) context protocol-p)
+       (dolist (key '(message_id element_id))
+         (let ((value (alist-get key resolver)))
+           (unless (and (stringp value)
+                        (string-match-p "\\`[1-9][0-9]*\\'" value))
+             (qq-api--signal-schema-error
+              protocol-p
+              "qq: %s.%s must be a positive decimal identity string"
+              context key)))))
+      ("snapshot"
+       (unless (qq-api--exact-object-keys-p
+                resolver '(kind peer file_uuid))
+         (qq-api--signal-schema-error
+          protocol-p
+          (concat "qq: %s snapshot resolver requires only kind, peer, "
+                  "and file_uuid")
+          context))
+       (qq-api--validate-native-peer
+        (alist-get 'peer resolver) context protocol-p)
+       (unless (qq-api-non-empty-string-p (alist-get 'file_uuid resolver))
+         (qq-api--signal-schema-error
+          protocol-p "qq: %s.file_uuid must be a non-empty string"
+          context)))
+      (_
+       (qq-api--signal-schema-error
+        protocol-p "qq: %s has invalid kind %S"
+        context (alist-get 'kind resolver))))
+    (copy-tree resolver)))
+
+(defun qq-api--validate-native-video-remote
+    (remote context protocol-p &optional allow-resolvable-p)
+  "Validate native video REMOTE discriminant for CONTEXT.
+
+ALLOW-RESOLVABLE-P permits the wire capability carried by forward video
+segments.  A resolve action result itself must be terminal or available."
   (unless (qq-api--single-alist-p remote)
     (qq-api--signal-schema-error
      protocol-p "qq: %s video remote must be an object" context))
@@ -372,6 +449,17 @@ and must not be retained as an `unsupported.raw' diagnostic payload."
         protocol-p
         "qq: %s available video remote requires only non-empty string url"
         context)))
+    ("resolvable"
+     (unless allow-resolvable-p
+       (qq-api--signal-schema-error
+        protocol-p "qq: %s resolve result cannot remain resolvable" context))
+     (unless (qq-api--exact-object-keys-p remote '(state resolver))
+       (qq-api--signal-schema-error
+        protocol-p
+        "qq: %s resolvable video remote requires only state and resolver"
+        context))
+     (qq-api-validate-video-resolver
+      (alist-get 'resolver remote) (format "%s resolver" context) protocol-p))
     ((or "expired" "unavailable" "unresolved")
      (unless (qq-api--exact-object-keys-p remote '(state))
        (qq-api--signal-schema-error
@@ -493,7 +581,7 @@ and must not be retained as an `unsupported.raw' diagnostic payload."
            (qq-api--signal-schema-error
             protocol-p "qq: %s video %s must be a string" context key)))
        (qq-api--validate-native-video-remote
-        (alist-get 'remote payload) context protocol-p))
+        (alist-get 'remote payload) context protocol-p t))
       ("reply"
        (unless (qq-api--exact-object-keys-p payload '(target))
          (qq-api--signal-schema-error
@@ -975,6 +1063,31 @@ BEFORE-MESSAGE-ID is the optional older-page cursor."
                    "emacs_get_forward response messages" t)))
              (when callback
                (funcall callback messages))))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   errback))
+
+(defun qq-api-resolve-video (resolver callback &optional errback)
+  "Resolve an exact fork-native video RESOLVER on explicit user demand.
+
+CALLBACK receives the validated remote result object.  The server owns the
+two disjoint resolution routes; this client never substitutes a file token,
+parent message id, or a different interface."
+  (setq resolver
+        (qq-api-validate-video-resolver
+         resolver "emacs_resolve_video resolver"))
+  (qq-api-call
+   "emacs_resolve_video"
+   `((resolver . ,resolver))
+   (lambda (response)
+     (condition-case error-data
+         (let ((remote
+                (qq-api--validate-native-video-remote
+                 (qq-api--response-data response)
+                 "emacs_resolve_video response" t)))
+           (when callback
+             (funcall callback (copy-tree remote))))
        (error
         (funcall (or errback #'qq-api--default-error)
                  response (error-message-string error-data)))))

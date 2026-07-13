@@ -340,6 +340,56 @@ alist returned by NapCat."
   "Return best file key from SEGMENT."
   (car (qq-media--segment-file-keys segment)))
 
+(defun qq-media--video-resolver-cache-identity (segment)
+  "Return a stable cache identity derived from SEGMENT's complete resolver.
+
+The native resolver, rather than a display filename or opaque `data.file',
+is the authoritative identity of a resolvable video.  Hash the complete
+  validated object so cache, download, and preview state cannot collide merely
+  because two messages use the same filename."
+  (when-let* ((resolver (qq-media--video-resolver segment))
+              (peer (alist-get 'peer resolver)))
+    ;; Build an explicit field-order-independent tuple.  JSON object member
+    ;; order is not semantic and must not split one native resource identity.
+    (let ((identity
+           (pcase (alist-get 'kind resolver)
+             ("message"
+              (list "message"
+                    (alist-get 'chat_type peer)
+                    (alist-get 'peer_uid peer)
+                    (alist-get 'guild_id peer)
+                    (alist-get 'message_id resolver)
+                    (alist-get 'element_id resolver)))
+             ("snapshot"
+              (list "snapshot"
+                    (alist-get 'chat_type peer)
+                    (alist-get 'peer_uid peer)
+                    (alist-get 'guild_id peer)
+                    (alist-get 'file_uuid resolver))))))
+      (format "resolver:%s"
+              (secure-hash 'sha256 (prin1-to-string identity))))))
+
+(defun qq-media--absolute-local-file-present-p (file)
+  "Return non-nil when FILE is an existing absolute local path.
+
+Protocol `file' values are often opaque names or handles.  Even when such a
+relative string happens to exist below `default-directory', it is not proof
+that the server designated that local file."
+  (and (stringp file)
+       (file-name-absolute-p file)
+       (appkit-media-file-present-p file)))
+
+(defun qq-media--video-local-file-present-p (file &optional resource)
+  "Return non-nil when FILE is a plausible playable video local file.
+
+RESOURCE may provide MIME metadata.  Image artifacts are video posters or
+bounded GIF previews and must never be promoted to the playable video source."
+  (and (qq-media--absolute-local-file-present-p file)
+       (not (appkit-media-image-file-name-p file))
+       (let ((mime-type (and resource (alist-get 'mime-type resource))))
+         (not (and (stringp mime-type)
+                   (string-prefix-p "image/" (downcase mime-type)))))))
+
 (defun qq-media--segment-existing-path (segment)
   "Return an existing local filesystem path from SEGMENT, or nil.
 
@@ -351,7 +401,7 @@ local-first rendering)."
                            (alist-get 'file data))))
     (catch 'found
       (dolist (candidate candidates)
-        (when (appkit-media-file-present-p candidate)
+        (when (qq-media--absolute-local-file-present-p candidate)
           (throw 'found candidate)))
       nil)))
 
@@ -361,7 +411,7 @@ local-first rendering)."
 Only these keys are safe to pass to NapCat `get_image'/`get_file'."
   (let (remote)
     (dolist (key (qq-media--segment-file-keys segment))
-      (unless (appkit-media-file-present-p key)
+      (unless (qq-media--absolute-local-file-present-p key)
         (push key remote)))
     (nreverse remote)))
 
@@ -458,16 +508,27 @@ ERRBACK with FINAL-ERROR or the last backend reason."
 (defun qq-media--video-remote-status (segment)
   "Return normalized remote status symbol for video SEGMENT.
 
-The wire values are `available', `expired', `unavailable', and `unresolved'.
-A missing or otherwise unknown value is an invalid protocol state and must
-not enable a remote operation."
+The wire values are `available', `resolvable', `expired', `unavailable', and
+`unresolved'.  A missing or otherwise unknown value is an invalid protocol
+state and must not enable a remote operation."
   (let ((value (alist-get 'remote_status (alist-get 'data segment))))
     (cond
      ((equal value "available") 'available)
+     ((equal value "resolvable") 'resolvable)
      ((equal value "expired") 'expired)
      ((equal value "unavailable") 'unavailable)
      ((equal value "unresolved") 'unresolved)
      (t 'invalid))))
+
+(defun qq-media--video-resolver (segment)
+  "Return validated exact resolver carried by video SEGMENT, or nil."
+  (when (and (equal (alist-get 'type segment) "video")
+             (eq (qq-media--video-remote-status segment) 'resolvable))
+    (condition-case nil
+        (qq-api-validate-video-resolver
+         (alist-get 'resolver (alist-get 'data segment))
+         "video segment resolver" t)
+      (error nil))))
 
 (defun qq-media--transfer-status-text (state)
   "Return compact user-visible transfer status for download STATE."
@@ -494,9 +555,9 @@ The result is a plist with `:open', `:download', `:save', `:copy-url',
 `:status', `:local-file', `:remote-status', `:resolve-remote', `:remote-url',
 and `:remote-error'.  Video remote state comes exclusively from
 `remote_status'; a real local file remains usable independently of that
-state.  Only `available' with a non-empty URL permits a remote operation.
-`expired', `unavailable', `unresolved', and invalid/missing states never
-probe a second interface such as get_file."
+state.  `available' uses its non-empty URL, while `resolvable' invokes only
+its explicit fork-native resolver on user demand.  Terminal and invalid
+states never probe a second interface such as get_file."
   (let* ((type (alist-get 'type segment))
          (data (alist-get 'data segment))
          (supported (member type
@@ -505,8 +566,8 @@ probe a second interface such as get_file."
          (remote-status (if video-p
                             (qq-media--video-remote-status segment)
                           'not-applicable))
-         (local-file (or (qq-media--segment-existing-path segment)
-                         (qq-media-segment-local-file segment)))
+         (video-resolver (and video-p (qq-media--video-resolver segment)))
+         (local-file (qq-media-segment-local-file segment))
          (url (qq-media--segment-url segment))
          (url-p (appkit-media-url-present-p url))
          (usable-url-p (and url-p
@@ -515,12 +576,12 @@ probe a second interface such as get_file."
          (remote-keys (qq-media--segment-remote-file-keys segment))
          (face-id (and (equal type "face") (alist-get 'id data)))
          (remote-source-p (if video-p
-                              usable-url-p
+                              (or usable-url-p video-resolver)
                             (or remote-keys usable-url-p face-id)))
          (resolve-remote
           (and supported remote-source-p
                (or (not video-p)
-                   (eq remote-status 'available))))
+                   (memq remote-status '(available resolvable)))))
          (remote-url
           (and usable-url-p
                url))
@@ -539,6 +600,9 @@ probe a second interface such as get_file."
                  ('unavailable "video resource is unavailable")
                  ('invalid "video resource has invalid remote_status")
                  ('unresolved "video resource is unresolved")
+                 ('resolvable
+                  (unless video-resolver
+                    "video resource has an invalid resolver"))
                  ('available
                   (unless usable-url-p
                     "available video resource has no URL")))))
@@ -548,6 +612,8 @@ probe a second interface such as get_file."
                 ('expired "Expired")
                 ('unavailable "Unavailable")
                 ('unresolved "Unresolved")
+                ('resolvable
+                 (qq-media--transfer-status-text download-state))
                 ('invalid "Invalid remote status")
                 (_ (qq-media--transfer-status-text download-state)))
             (qq-media--transfer-status-text download-state))))
@@ -566,6 +632,9 @@ probe a second interface such as get_file."
 (defun qq-media--segment-resource-key (segment)
   "Return logical resource cache key for SEGMENT, or nil."
   (let* ((type (alist-get 'type segment))
+         (resolver-identity (and (equal type "video")
+                                 (qq-media--video-resolver-cache-identity
+                                  segment)))
          (file-key (qq-media--segment-file-key segment))
          (url (qq-media--segment-url segment))
          (data (alist-get 'data segment))
@@ -573,7 +642,13 @@ probe a second interface such as get_file."
     (pcase type
       ("image" (or (and file-key (format "image:%s" file-key))
                    (and (appkit-media-url-present-p url) (format "image-url:%s" url))))
-      ((or "file" "video")
+      ("video"
+       (or (and resolver-identity
+                (format "video:%s" resolver-identity))
+           (and file-key (format "video:%s" file-key))
+           (and (appkit-media-url-present-p url)
+                (format "video-url:%s" url))))
+      ("file"
        (or (and file-key (format "%s:%s" type file-key))
            (and (appkit-media-url-present-p url) (format "%s-url:%s" type url))))
       ("record" (and file-key (format "record:%s" file-key)))
@@ -653,7 +728,8 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
 (defun qq-media-resolve-segment-resource (segment callback &optional errback)
   "Resolve media resource for SEGMENT and pass it to CALLBACK."
   (let ((cache-key (qq-media--segment-resource-key segment))
-        (capabilities (qq-media-segment-capabilities segment)))
+        (capabilities (qq-media-segment-capabilities segment))
+        (video-resolver (qq-media--video-resolver segment)))
     (let ((url (plist-get capabilities :remote-url))
           (local (plist-get capabilities :local-file))
           (remote-error (plist-get capabilities :remote-error)))
@@ -676,6 +752,29 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
           (qq-media--cache-resource cache-key resource)
           (qq-media--note-cache-updated cache-key))
         (funcall callback resource)))
+     ;; A live-message or forward-snapshot resolver is a complete native
+     ;; capability, not a fallback.  Resolve it afresh for each operation so
+     ;; an old signed URL is never treated as permanently valid.
+     ((and (equal (alist-get 'type segment) "video") video-resolver)
+      (qq-api-resolve-video
+       video-resolver
+       (lambda (remote)
+         (pcase (alist-get 'state remote)
+           ("available"
+            (funcall callback `((url . ,(alist-get 'url remote)))))
+           ("expired"
+            (if errback
+                (funcall errback nil "video resource has expired")
+              (user-error "qq: video resource has expired")))
+           ("unavailable"
+            (if errback
+                (funcall errback nil "video resource is unavailable")
+              (user-error "qq: video resource is unavailable")))
+           ("unresolved"
+            (if errback
+                (funcall errback nil "video resource is unresolved")
+              (user-error "qq: video resource is unresolved")))))
+       errback))
      ((and cache-key (qq-media--cached-resource cache-key))
       (funcall callback (qq-media--cached-resource cache-key)))
      (cache-key
@@ -799,26 +898,53 @@ CACHE-KEY also records the resolved local resource in QQ's logical cache."
   "Store download-state ENTRY for SEGMENT and notify UI."
   (let ((key (qq-media-segment-download-key segment)))
     (puthash key entry qq-media--download-state-table)
-    (qq-media--note-cache-updated key))
+    (qq-media--note-cache-updated key)
+    ;; A previous preview attempt may have had only a poster or no source at
+    ;; all.  Once the actual media exists, allow preview extraction to retry.
+    (when (and (eq (plist-get entry :status) 'downloaded)
+               (qq-media--absolute-local-file-present-p
+                (plist-get entry :path)))
+      (when-let* ((preview-key (qq-media-segment-preview-key segment)))
+        (when (gethash preview-key qq-media--preview-missing-cache)
+          (remhash preview-key qq-media--preview-missing-cache)
+          (qq-media--note-cache-updated preview-key)))))
   entry)
 
 (defun qq-media-segment-local-file (segment)
   "Return best local file path for SEGMENT, or nil."
-  (let* ((segment-file (qq-media--segment-existing-path segment))
+  (let* ((video-p (qq-media-videoish-segment-p segment))
+         (segment-file (qq-media--segment-existing-path segment))
          (download-state (qq-media-segment-download-state segment))
          (download-path (plist-get download-state :path))
          (cached-resource (qq-media--cached-resource (qq-media--segment-resource-key segment)))
          (cached-file (and cached-resource (alist-get 'file cached-resource)))
          (preview-key (qq-media-segment-preview-key segment))
-         (preview-resource (and preview-key (qq-media--cached-resource preview-key)))
-         (preview-file (or (and preview-resource (alist-get 'file preview-resource))
-                           (and preview-key
-                                (qq-media--remote-image-cache-existing-file preview-key)))))
+         ;; An image preview is itself a usable local image.  A video preview
+         ;; is only a poster or a bounded GIF and must never become the source
+         ;; handed to the video player.
+         (preview-resource (and (not video-p)
+                                preview-key
+                                (qq-media--cached-resource preview-key)))
+         (preview-file (and (not video-p)
+                            (or (and preview-resource
+                                     (alist-get 'file preview-resource))
+                                (and preview-key
+                                     (qq-media--remote-image-cache-existing-file
+                                      preview-key))))))
     (cond
-     ((appkit-media-file-present-p segment-file) segment-file)
-     ((appkit-media-file-present-p download-path) download-path)
-     ((appkit-media-file-present-p cached-file) cached-file)
-     ((appkit-media-file-present-p preview-file) preview-file)
+     ((if video-p
+          (qq-media--video-local-file-present-p segment-file)
+        (qq-media--absolute-local-file-present-p segment-file))
+      segment-file)
+     ((if video-p
+          (qq-media--video-local-file-present-p download-path)
+        (qq-media--absolute-local-file-present-p download-path))
+      download-path)
+     ((if video-p
+          (qq-media--video-local-file-present-p cached-file cached-resource)
+        (qq-media--absolute-local-file-present-p cached-file))
+      cached-file)
+     ((qq-media--absolute-local-file-present-p preview-file) preview-file)
      (t nil))))
 
 (defun qq-media-segment-start-download (segment &optional open-after)
@@ -945,17 +1071,23 @@ CACHE-KEY also records the resolved local resource in QQ's logical cache."
     (qq-media-resolve-segment-resource
      segment
      (lambda (resource)
-       (let ((resolved-file (alist-get 'file resource))
-             (url (or (alist-get 'url resource)
-                      (plist-get (qq-media-segment-capabilities segment)
-                                 :remote-url))))
-         (cond
-          ((appkit-media-file-present-p resolved-file)
-           (appkit-media-play-video-source resolved-file "qq"))
-          ((appkit-media-url-present-p url)
-           (appkit-media-play-video-source url "qq"))
-          (t
-           (user-error "qq: video segment has no playable source"))))))))
+       (condition-case err
+           (let ((resolved-file (alist-get 'file resource))
+                 (url (or (alist-get 'url resource)
+                          (plist-get (qq-media-segment-capabilities segment)
+                                     :remote-url))))
+             (cond
+              ((qq-media--video-local-file-present-p resolved-file resource)
+               (appkit-media-play-video-source resolved-file "qq"))
+              ((appkit-media-url-present-p url)
+               (appkit-media-play-video-source url "qq"))
+              (t
+               (error "video segment has no playable source"))))
+         ((error quit)
+          (message "qq: failed to play video: %s"
+                   (error-message-string err)))))
+     (lambda (_response reason)
+       (message "qq: failed to play video: %s" reason)))))
 
 (defun qq-media-message-primary-segment (message)
   "Return the most useful openable segment from MESSAGE, or nil."
@@ -1697,6 +1829,9 @@ not ready yet, show DESCRIPTION or the known human face name
   "Return preview cache key for SEGMENT, or nil when unsupported."
   (when (qq-media-segment-preview-capable-p segment)
     (let* ((type (alist-get 'type segment))
+           (resolver-identity
+            (and (equal type "video")
+                 (qq-media--video-resolver-cache-identity segment)))
            (preview-type (cond
                           ((qq-media-imageish-file-segment-p segment)
                            "file-image")
@@ -1706,6 +1841,8 @@ not ready yet, show DESCRIPTION or the known human face name
            (file-key (qq-media--segment-file-key segment))
            (url (qq-media--segment-url segment)))
       (cond
+       (resolver-identity
+        (format "preview:%s:%s" preview-type resolver-identity))
        (file-key
         (format "preview:%s:%s" preview-type file-key))
        ((appkit-media-url-present-p url)

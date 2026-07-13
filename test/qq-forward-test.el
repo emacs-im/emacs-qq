@@ -225,16 +225,24 @@ list are indistinguishable — both mean \"do not claim a count\"."
     (should (equal (alist-get 'preview message) "[message recalled]"))
     (should (equal (alist-get 'origin message) '((kind . "unknown"))))))
 
-(ert-deftest qq-forward-video-mapper-preserves-four-remote-states ()
+(ert-deftest qq-forward-video-mapper-preserves-remote-state-and-resolver ()
   (dolist (case
-           '(("available" "https://example.test/video.mp4")
-             ("expired" nil)
-             ("unavailable" nil)
-             ("unresolved" nil)))
-    (pcase-let ((`(,state ,url) case))
-      (let* ((remote (if url
-                         `((state . ,state) (url . ,url))
-                       `((state . ,state))))
+           '(("available" "https://example.test/video.mp4" nil)
+             ("resolvable" nil
+              ((kind . "snapshot")
+               (peer . ((chat_type . 2)
+                        (peer_uid . "20001")
+                        (guild_id . "")))
+               (file_uuid . "native-file-uuid")))
+             ("expired" nil nil)
+             ("unavailable" nil nil)
+             ("unresolved" nil nil)))
+    (pcase-let ((`(,state ,url ,resolver) case))
+      (let* ((remote (cond
+                      (url `((state . ,state) (url . ,url)))
+                      (resolver `((state . ,state)
+                                  (resolver . ,resolver)))
+                      (t `((state . ,state)))))
              (internal
               (qq-forward-native-segment-to-internal
                `((kind . "video")
@@ -250,7 +258,10 @@ list are indistinguishable — both mean \"do not claim a count\"."
         (should (equal (alist-get 'remote_status data) state))
         (if url
             (should (equal (alist-get 'url data) url))
-          (should-not (assq 'url data)))))))
+          (should-not (assq 'url data)))
+        (if resolver
+            (should (equal (alist-get 'resolver data) resolver))
+          (should-not (assq 'resolver data)))))))
 
 (ert-deftest qq-forward-ordinary-file-id-is-preserved-verbatim ()
   (let* ((segment
