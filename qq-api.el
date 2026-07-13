@@ -1457,10 +1457,35 @@ reconciles it with the authoritative aggregate count."
    `((user_id . ,user-id))
    (lambda (response)
      (condition-case error-data
-         (let ((data (qq-api--response-data response)))
+         (let* ((data (qq-api--response-data response))
+                (total-count (alist-get 'total_count data)))
            (unless (equal (alist-get 'user_id data) user-id)
              (error "qq: emacs_get_user_like returned a different user identity"))
-           (funcall callback (alist-get 'total_count data)))
+           (unless (and (integerp total-count) (>= total-count 0))
+             (error "qq: emacs_get_user_like returned an invalid total count"))
+           (funcall callback total-count))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   errback))
+
+(defun qq-api-like-user (user-id callback &optional errback)
+  "Add one profile like to USER-ID and call CALLBACK with the added count."
+  (unless (qq-api-user-id-p user-id)
+    (user-error "qq: user likes require a decimal string user id"))
+  (qq-api-call
+   "emacs_like_user"
+   `((user_id . ,user-id))
+   (lambda (response)
+     (condition-case error-data
+         (let* ((data (qq-api--response-data response))
+                (response-user-id (alist-get 'user_id data))
+                (added-count (alist-get 'added_count data)))
+           (unless (equal response-user-id user-id)
+             (error "qq: emacs_like_user returned a different user identity"))
+           (unless (and (integerp added-count) (= added-count 1))
+             (error "qq: emacs_like_user returned an invalid added count"))
+           (funcall callback added-count))
        (error
         (funcall (or errback #'qq-api--default-error)
                  response (error-message-string error-data)))))

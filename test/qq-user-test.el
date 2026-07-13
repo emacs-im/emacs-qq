@@ -79,6 +79,8 @@
       (goto-char (point-min))
       (search-forward "发消息")
       (should (button-at (1- (point))))
+      (search-forward "点赞")
+      (should (button-at (1- (point))))
       (search-forward "照片 1")
       (should (button-at (1- (point)))))))
 
@@ -107,6 +109,21 @@
       (should-not (string-match-p "等级:" text))
       (should-not (string-match-p "会员:" text))
       (should-not (string-match-p "注册:" text)))))
+
+(ert-deftest qq-user-render-exposes-profile-like-loading-and-errors ()
+  (with-temp-buffer
+    (qq-user-mode)
+    (setq qq-user--user-id "10001"
+          qq-user--profile (copy-tree qq-user-test--profile)
+          qq-user--like-loading t)
+    (cl-letf (((symbol-function 'qq-media-avatar-display-string)
+               (lambda (_user-id) "@")))
+      (qq-user-render))
+    (should (string-match-p "获赞:[[:space:]]+加载中" (buffer-string)))
+    (setq qq-user--like-loading nil
+          qq-user--like-error "native query failed")
+    (qq-user-render)
+    (should (string-match-p "获赞:[[:space:]]+获取失败" (buffer-string)))))
 
 (ert-deftest qq-user-refresh-handles-synchronous-response-ownership ()
   (with-temp-buffer
@@ -163,6 +180,8 @@
               #'qq-root-open-info-at-point))
   (should (eq (lookup-key qq-user-mode-map (kbd "m"))
               #'qq-user-open-chat))
+  (should (eq (lookup-key qq-user-mode-map (kbd "l"))
+              #'qq-user-like))
   (should (eq (lookup-key qq-user-mode-map (kbd "p"))
               #'qq-user-open-photo-wall)))
 
@@ -171,7 +190,7 @@
   (should (equal (qq-user--buffer-name "10002") "*qq-user*")))
 
 (ert-deftest qq-api-get-user-social-actions-preserve-string-identity ()
-  (let (calls like photos)
+  (let (calls like added photos)
     (cl-letf (((symbol-function 'qq-api-call)
                (lambda (action params callback &optional _errback)
                  (push (list action params) calls)
@@ -180,6 +199,8 @@
                   (pcase action
                     ("emacs_get_user_like"
                      '((data . ((user_id . "10001") (total_count . 42)))))
+                    ("emacs_like_user"
+                     '((data . ((user_id . "10001") (added_count . 1)))))
                     ("emacs_get_user_photo_wall"
                      '((data . ((user_id . "10001")
                                 (photos . (((id . "p1")
@@ -187,11 +208,42 @@
                                             (thumbnail_url))))))))))
                  'request)))
       (qq-api-get-user-like "10001" (lambda (count) (setq like count)))
+      (qq-api-like-user "10001" (lambda (count) (setq added count)))
       (qq-api-get-user-photo-wall "10001" (lambda (value) (setq photos value))))
     (should (= like 42))
+    (should (= added 1))
     (should (equal (alist-get 'id (car photos)) "p1"))
     (should (member '("emacs_get_user_like" ((user_id . "10001"))) calls))
+    (should (member '("emacs_like_user" ((user_id . "10001"))) calls))
     (should (member '("emacs_get_user_photo_wall" ((user_id . "10001"))) calls))))
+
+(ert-deftest qq-user-like-refreshes-the-exact-profile-after-success ()
+  (with-temp-buffer
+    (qq-user-mode)
+    (setq qq-user--user-id "10001"
+          qq-user--profile (copy-tree qq-user-test--profile))
+    (let (liked-user-id refreshed)
+      (cl-letf (((symbol-function 'qq-state-self-user-id) (lambda () "99999"))
+                ((symbol-function 'qq-user-render) #'ignore)
+                ((symbol-function 'qq-user--refresh-like)
+                 (lambda () (setq refreshed t)))
+                ((symbol-function 'qq-api-like-user)
+                 (lambda (user-id callback &optional _errback)
+                   (setq liked-user-id user-id)
+                   (funcall callback 1)
+                   'request)))
+        (qq-user-like))
+      (should (equal liked-user-id "10001"))
+      (should refreshed)
+      (should-not qq-user--send-like-request)
+      (should-not qq-user--send-like-request-owner))))
+
+(ert-deftest qq-user-like-rejects-the-current-account ()
+  (with-temp-buffer
+    (qq-user-mode)
+    (setq qq-user--user-id "10001")
+    (cl-letf (((symbol-function 'qq-state-self-user-id) (lambda () "10001")))
+      (should-error (qq-user-like) :type 'user-error))))
 
 (ert-deftest qq-user-photo-render-has-no-inline-open-button ()
   (with-temp-buffer
