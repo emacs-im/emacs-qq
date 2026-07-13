@@ -29,24 +29,24 @@
      (should (= 1 (plist-get metrics :important)))
      (should (= 1 (plist-get metrics :muted))))))
 
-(ert-deftest qq-root-renders-muted-session-badge-without-warning-face ()
+(ert-deftest qq-root-renders-muted-unread-in-title-trail ()
   (let* ((session '((key . "group:muted")
                     (type . group)
                     (unread-count . 9)
                     (muted-p . t)
                     (last-message-preview . "quiet message")))
-         (row (qq-root--session-one-line-row session)))
-    (should (equal "[mute:9] quiet message"
+         (row (qq-root--session-one-line-row session))
+         (trail (appkit-view-one-line-row-context-trail row)))
+    (should (equal "9" (substring-no-properties trail)))
+    (should (eq 'qq-root-muted-count (get-text-property 0 'face trail)))
+    (should (equal "quiet message"
                    (appkit-view-one-line-row-preview row)))
-    (should (= 9 (appkit-view-one-line-row-preview-leading-length row)))
-    (should (eq 'shadow
-                (appkit-view-one-line-row-preview-leading-face row)))
     (should-not (appkit-view-one-line-row-time-tail-face row))))
 
-(ert-deftest qq-root-shows-muted-state-without-messages ()
-  (should (equal "[mute]"
-                 (qq-root--session-preview-text
-                  '((muted-p . t) (unread-count . 0))))))
+(ert-deftest qq-root-muted-session-without-unread-has-no-activity-trail ()
+  (let ((session '((muted-p . t) (unread-count . 0))))
+    (should (equal "" (qq-root--session-unread-trail session)))
+    (should (equal "" (qq-root--session-preview-text session)))))
 
 (ert-deftest qq-root-session-preview-is-always-one-line ()
   (should (equal "first second third"
@@ -64,8 +64,30 @@
                    (unread-at-me-message-seq . "10001")
                    (unread-at-all-message-seq . "10002"))))
     (should (qq-root--session-important-unread-p session))
-    (should (equal "[@] [@all] [mute:9] "
-                   (qq-root--session-badge session)))))
+    (let ((trail (qq-root--session-unread-trail session)))
+      (should (equal "9 @ @all" (substring-no-properties trail)))
+      (should (eq 'qq-root-muted-count
+                  (get-text-property 0 'face trail)))
+      (should (eq 'qq-root-mention-count
+                  (get-text-property 2 'face trail)))
+      (should (eq 'qq-root-mention-count
+                  (get-text-property 4 'face trail))))))
+
+(ert-deftest qq-root-inserts-unread-count-inside-title-brackets ()
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'qq-media-session-avatar-display-string)
+               (lambda (_session) "#"))
+              ((symbol-function 'qq-root--buffer-width) (lambda () 80)))
+      (qq-root--insert-session-line
+       '((key . "group:1")
+         (type . group)
+         (title . "Example Group")
+         (unread-count . 3)
+         (muted-p . t)
+         (last-message-preview . "[image]"))))
+    (should (string-match-p
+             "\\[Example Group +3\\] \\[image\\]"
+             (buffer-substring-no-properties (point-min) (point-max))))))
 
 (ert-deftest qq-root-session-row-keeps-help-without-blanket-hover ()
   (with-temp-buffer

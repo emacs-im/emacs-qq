@@ -178,6 +178,24 @@ This mirrors `telega-root-auto-fill-margin-columns'."
   "Face for the unread mention count in the mode line."
   :group 'qq-modes)
 
+(defface qq-root-unmuted-count
+  '((((class color) (background dark))
+     :foreground "DeepSkyBlue")
+    (((class color) (background light))
+     :foreground "blue"))
+  "Face for unread counts from unmuted root sessions."
+  :group 'qq)
+
+(defface qq-root-muted-count
+  '((t :inherit shadow))
+  "Face for unread counts from muted root sessions."
+  :group 'qq)
+
+(defface qq-root-mention-count
+  '((t :inherit qq-root-unmuted-count :weight bold))
+  "Face for unread mention markers in root sessions."
+  :group 'qq)
+
 (defcustom qq-notifications-delay 0.5
   "Seconds to delay a message notification before rechecking visibility."
   :type 'number

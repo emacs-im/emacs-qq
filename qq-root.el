@@ -190,21 +190,27 @@ of accidentally borrowing the selected chat window."
        (or (not (qq-root--session-muted-p session))
            (qq-root--session-mention-kinds session))))
 
-(defun qq-root--session-badge (session)
-  "Return root activity badge for SESSION, including trailing space."
+(defun qq-root--session-unread-trail (session)
+  "Return SESSION's propertized unread trail for the title brackets.
+
+Like telega's chat unread trail, ordinary unread count follows the title and
+uses a muted or unmuted face.  Native mention kinds remain independently
+prominent even when the session is muted."
   (let* ((unread (or (alist-get 'unread-count session) 0))
          (mentions (qq-root--session-mention-kinds session))
-         (mention-badge
-          (concat (when (memq 'at-me mentions) "[@] ")
-                  (when (memq 'at-all mentions) "[@all] ")))
-         (unread-badge
-          (cond
-           ((and (qq-root--session-muted-p session) (> unread 0))
-            (format "[mute:%d] " unread))
-           ((qq-root--session-muted-p session) "[mute] ")
-           ((> unread 0) (format "[%d] " unread))
-           (t ""))))
-    (concat mention-badge unread-badge)))
+         (count-face (if (qq-root--session-muted-p session)
+                         'qq-root-muted-count
+                       'qq-root-unmuted-count)))
+    (string-join
+     (delq nil
+           (list (and (> unread 0)
+                      (propertize (number-to-string unread)
+                                  'face count-face))
+                 (and (memq 'at-me mentions)
+                      (propertize "@" 'face 'qq-root-mention-count))
+                 (and (memq 'at-all mentions)
+                      (propertize "@all" 'face 'qq-root-mention-count))))
+     " ")))
 
 (defun qq-root--session-icon-face (session)
   "Return the icon face for SESSION."
@@ -237,35 +243,25 @@ priority over the last-message preview."
                            (qq-state-preview-one-line
                             (qq-state-action-text session-key))))
          (preview (qq-state-preview-one-line
-                   (alist-get 'last-message-preview session)))
-         (badge (qq-root--session-badge session))
-         (content
-          (if (and (stringp action-text) (not (string-empty-p action-text)))
-              (concat (or qq-chat-action-prefix ".. ") action-text)
-            preview)))
-    (if (string-empty-p content)
-        (string-trim-right badge)
-      (concat badge content))))
+                   (alist-get 'last-message-preview session))))
+    (if (and (stringp action-text) (not (string-empty-p action-text)))
+        (concat (or qq-chat-action-prefix ".. ") action-text)
+      preview)))
 
 (defun qq-root--session-one-line-row (session)
   "Return one-line row model for SESSION."
   (let* ((session-key (alist-get 'key session))
          (unread (or (alist-get 'unread-count session) 0))
          (muted (qq-root--session-muted-p session))
-         (important (qq-root--session-important-unread-p session))
-         (badge (qq-root--session-badge session)))
+         (important (qq-root--session-important-unread-p session)))
     (appkit-view-one-line-row-create
      :icon-inserter (lambda ()
                       (qq-root--insert-session-icon session))
      :context (qq-root--session-context-label session)
+     :context-trail (qq-root--session-unread-trail session)
      :preview (qq-root--session-preview-text session)
-     :preview-leading-length (length badge)
-     :preview-leading-face (cond (important 'warning)
-                                 (muted 'shadow))
-     ;; Plain timestamp only.  Unread is already shown by the leading
-     ;; badge ([n] / [mute:n]); keep a dedicated time-tail face
-     ;; (meant for a trailing status glyph) or the last time digit
-     ;; gets a spurious warning color.
+     ;; Unread activity lives in the title trail.  Keep a dedicated time-tail
+     ;; face (meant for a trailing status glyph) off the plain timestamp.
      :time (qq-root--format-time (alist-get 'last-message-time session))
      :time-face 'shadow
      :time-tail-face nil
