@@ -921,6 +921,18 @@ in the UI — that is wire format, not display text."
          (not (string-empty-p peer-uid))
          peer-uid)))
 
+(defun qq-state--message-peer-uin (message)
+  "Return the native decimal peer UIN carried by raw MESSAGE, or nil.
+
+Unlike display and participant fields, `peer_uin' is the conversation
+identity for ordinary private and group messages.  The fork exposes it as a
+string so accepting another representation here would reintroduce an
+ambiguous identity source."
+  (let ((peer-uin (alist-get 'peer_uin message)))
+    (and (stringp peer-uin)
+         (not (string-empty-p peer-uin))
+         peer-uin)))
+
 (defun qq-state--message-self-p (message)
   "Return non-nil when raw MESSAGE belongs to the logged in account."
   (let ((sender-id (qq-state--normalize-id
@@ -940,28 +952,18 @@ identity.  The request context is an assertion, never a substitute for
 missing or contradictory wire identity."
   (let* ((raw-chat-type (qq-state--message-chat-type message))
          (chat-type (qq-state--normalize-id raw-chat-type))
+         (peer-uin (qq-state--message-peer-uin message))
          (peer-uid (qq-state--message-peer-uid message))
          (derived
           (pcase chat-type
             ("1"
-             (when-let* ((target-id
-                          (or (alist-get 'target_id message)
-                              (let ((user-id
-                                     (qq-state--normalize-id
-                                      (alist-get 'user_id message)))
-                                    (self-id
-                                     (qq-state--normalize-id
-                                      (or (alist-get 'self_id message)
-                                          (alist-get 'user_id
-                                                     qq-state--self-info)))))
-                                (and user-id
-                                     (not (equal user-id self-id))
-                                     user-id))
-                              (alist-get 'user_id message))))
-               (qq-state-session-key 'private target-id)))
+             (unless peer-uin
+               (error "qq: private message requires native peer_uin string"))
+             (qq-state-session-key 'private peer-uin))
             ("2"
-             (when-let* ((group-id (alist-get 'group_id message)))
-               (qq-state-session-key 'group group-id)))
+             (unless peer-uin
+               (error "qq: group message requires native peer_uin string"))
+             (qq-state-session-key 'group peer-uin))
             ((or "8" "134")
              (when peer-uid
                (qq-state-session-key
@@ -1221,11 +1223,11 @@ the natural-language fragments.  The complete original notice remains in
       (qq-state--normalize-poke-notice message expected-session-key)
     (let* ((chat-type (qq-state--normalize-id (qq-state--message-chat-type message)))
          (peer-uid (qq-state--message-peer-uid message))
-         (peer-uin (qq-state--normalize-id
-                    (or (alist-get 'peer_uin message)
-                        (alist-get 'peerUin message))))
+         (peer-uin (qq-state--message-peer-uin message))
          (session-key (qq-state--raw-message-session-key
                        message expected-session-key))
+         (session-identity
+          (and session-key (qq-state-session-key-identity session-key)))
          (sender (alist-get 'sender message))
          (sender-id (qq-state--normalize-id
                      (or (alist-get 'user_id sender)
@@ -1256,10 +1258,7 @@ the natural-language fragments.  The complete original notice remains in
                   (self-p 'sent)
                   (t 'received)))
          (time (qq-state--normalize-time (alist-get 'time message)))
-         (target-id (or (and (or (qq-state--dataline-chat-type-p chat-type)
-                                 (qq-state--service-chat-type-p chat-type))
-                             peer-uid)
-                        (qq-state--normalize-id (alist-get 'target_id message)))))
+         (target-id (alist-get 'target-id session-identity)))
     `((id . ,server-id)
       (server-id . ,server-id)
       (session-key . ,session-key)
