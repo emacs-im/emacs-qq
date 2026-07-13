@@ -3,7 +3,7 @@
 ;; Author: emacs-qq contributors
 ;; Keywords: comm
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1") (websocket "1.16") (transient "0.3") (appkit "0.1"))
+;; Package-Requires: ((emacs "27.1") (websocket "1.16") (transient "0.3") (appkit "0.2.0"))
 
 ;;; Commentary:
 

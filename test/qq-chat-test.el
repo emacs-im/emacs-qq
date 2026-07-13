@@ -133,6 +133,10 @@
              (should (eq (key-binding (kbd "s") t)
                          'self-insert-command))
              (should (eq (key-binding (kbd "RET") t) 'qq-chat-return-dwim))
+             (should (eq (key-binding (kbd "DEL") t)
+                         'appkit-chatbuf-input-backward-delete))
+             (should (eq (key-binding (kbd "C-d") t)
+                         'appkit-chatbuf-input-forward-delete))
              (execute-kbd-macro "qs")
              (should (equal (qq-chat--current-draft-string) "qs"))
              (goto-char (point-min))
@@ -160,6 +164,94 @@
              (should (eq (key-binding (kbd "C-c C-v") t) 'qq-chat-attach-clipboard)))
          (when (buffer-live-p buffer)
            (kill-buffer buffer)))))))
+
+(ert-deftest qq-chat-deleted-tail-does-not-return-after-frame-refresh ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((type . private) (title . "Alice") (target-id . "10001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (qq-chat-edit-draft)
+     (insert "abc")
+     (delete-backward-char 1)
+     (should (equal "ab" (qq-chat--current-draft-string)))
+     (qq-chat--update-frame)
+     (should (equal "ab" (appkit-chatbuf-input-string)))
+     (should (equal "ab" (qq-chat--current-draft-string))))))
+
+(ert-deftest qq-chat-return-completes-unresolved-token-without-sending ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat-render)
+     (qq-chat-edit-draft)
+     (dolist (token '("@green" "/斜眼" "/fav" ":rocket:"))
+       (qq-chat--set-draft token)
+       (qq-chat-edit-draft)
+       (let (completed sent)
+         (cl-letf (((symbol-function 'qq-completion-complete)
+                    (lambda () (setq completed t) nil))
+                   ((symbol-function 'qq-api-send-message)
+                    (lambda (&rest _args) (setq sent t))))
+           (qq-chat-return-dwim nil))
+         (should completed)
+         (should-not sent)
+         (should (equal token (appkit-chatbuf-input-string))))))))
+
+(ert-deftest qq-chat-prefixed-return-inserts-newline-without-completion-or-send ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat-render)
+     (qq-chat-edit-draft)
+     (insert "@green")
+     (cl-letf (((symbol-function 'qq-completion-complete)
+                (lambda () (ert-fail "prefix RET must not complete")))
+               ((symbol-function 'qq-api-send-message)
+                (lambda (&rest _args) (ert-fail "prefix RET must not send"))))
+       (qq-chat-return-dwim '(4)))
+     (should (equal "@green\n" (appkit-chatbuf-input-string))))))
+
+(ert-deftest qq-chat-return-sends-non-completion-path-and-colon-text ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat-render)
+     (cl-letf (((symbol-function 'qq-completion--base-face-candidates)
+                (lambda () nil))
+               ((symbol-function 'appkit-chat-emoji-candidates)
+                (lambda (&optional _force) nil)))
+       (dolist (text '("/tmp/foo" "https://example.com" ":unknown" ":)"))
+         (qq-chat--set-draft text)
+         (qq-chat-edit-draft)
+         (let (sent)
+           (cl-letf (((symbol-function 'qq-completion-complete)
+                      (lambda ()
+                        (ert-fail "ordinary text must not enter completion")))
+                     ((symbol-function 'qq-api-send-message)
+                      (lambda (_session segments &rest _args)
+                        (setq sent segments))))
+             (qq-chat-return-dwim nil))
+           (should sent)))))))
 
 (ert-deftest qq-chat-service-session-has-no-composer ()
   (qq-chat-test-with-reset
@@ -555,9 +647,10 @@
      (qq-state-merge-live-message
       '((post_type . "message_sent")
         (message_type . "private")
+        (chat_type . 1)
         (message_id . "9007199254741007777")
-        (user_id . 90001)
-        (target_id . 10001)
+        (user_id . "90001")
+        (target_id . "10001")
         (time . 1710000001)
         (sender . ((user_id . 90001)
                    (nickname . "Me")))
@@ -596,9 +689,10 @@
      (qq-state-merge-live-message
       '((post_type . "message_sent")
         (message_type . "private")
+        (chat_type . 1)
         (message_id . "9007199254741008888")
-        (user_id . 90001)
-        (target_id . 10001)
+        (user_id . "90001")
+        (target_id . "10001")
         (time . 1710000001)
         (sender . ((user_id . 90001)
                    (nickname . "Me")))
@@ -1441,6 +1535,60 @@
          (should (file-readable-p
                   (alist-get 'file (alist-get 'data (car segments))))))))))
 
+(ert-deftest qq-chat-image-object-label-uses-one-line-preview-and-file-metadata ()
+  (let ((path (make-temp-file "qq-composer-preview" nil ".png")))
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert "123456"))
+          (cl-letf (((symbol-function 'qq-media-composer-image-preview)
+                     (lambda (file)
+                       (should (equal file path))
+                       '(:composer-preview)))
+                    ((symbol-function 'qq-media--image-display-string)
+                     (lambda (image fallback)
+                       (propertize fallback 'display image))))
+            (let ((label
+                   (qq-chat--segment-object-label
+                    `((type . "image")
+                      (data . ((file . ,path) (name . "preview.png")))))))
+              (should (string-match-p "\\[image\\]" label))
+              (should (string-match-p "preview.png" label))
+              (should (string-match-p "(6)" label))
+              (should (equal '(:composer-preview)
+                             (get-text-property
+                              (string-match "▧" label) 'display label))))))
+      (ignore-errors (delete-file path)))))
+
+(ert-deftest qq-chat-equal-adjacent-input-objects-send-as-two-segments ()
+  (with-temp-buffer
+    (appkit-chatbuf-install-prompt "> ")
+    (let* ((segment '((type . "at")
+                      (data . ((qq . "10001") (name . "Alice Card")))))
+           (object (qq-chat--segment-input-object segment))
+           (label (plist-get object :label)))
+      (insert (appkit-chatbuf-input-object-string label object))
+      (insert (appkit-chatbuf-input-object-string label object))
+      (should (equal (list segment segment)
+                     (qq-chat--current-input-segments))))))
+
+(ert-deftest qq-chat-segment-insertion-inside-object-keeps-both-atomic ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001" '((title . "Alice") (target-id . "10001")) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (let ((first '((type . "at")
+                    (data . ((qq . "10001") (name . "Alice Card")))))
+           (second '((type . "face") (data . ((id . "178"))))))
+       (qq-chat--insert-input-segment-object first)
+       (goto-char (1+ (appkit-chatbuf-input-start-position)))
+       (qq-chat--insert-input-segment-object second)
+       (appkit-chatbuf-input-prune-broken-objects)
+       (should (equal (list first second)
+                      (qq-chat--current-input-segments)))))))
+
 (ert-deftest qq-chat-attach-face-inserts-face-segment ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
@@ -1579,7 +1727,8 @@
                 (segments . (((type . "text")
                               (data . ((text . "source"))))))))
              (cl-letf (((symbol-function 'qq-api-send-message)
-                        (lambda (session-key segments &optional raw-message)
+                        (lambda (session-key segments &optional raw-message
+                                             _callback _errback)
                           (setq sent-session session-key)
                           (setq sent-segments segments)
                           (setq sent-raw raw-message))))
@@ -1596,6 +1745,178 @@
                             (alist-get 'name (alist-get 'data (nth 1 sent-segments))))))
          (ignore-errors (delete-file path)))))))
 
+(ert-deftest qq-chat-send-failure-restores-rich-draft-and-reply ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice") (target-id . "10001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (let* ((reply '((server-id . "9007199254742007094")
+                     (raw-message . "source")))
+            error-fn)
+       (qq-chat--insert-input-segment-object
+        '((type . "at")
+          (data . ((qq . "10001") (name . "Alice Card")))))
+       (qq-chat--set-reply-message reply)
+       (cl-letf (((symbol-function 'qq-api-send-message)
+                  (lambda (_session _segments &optional _raw _callback errback)
+                    (setq error-fn errback)))
+                 ((symbol-function 'qq-api--default-error) #'ignore))
+         (qq-chat-send-message)
+         (should (equal "" (appkit-chatbuf-input-string)))
+         (should-not (appkit-chatbuf-aux-state))
+         (funcall error-fn nil "network failed"))
+       (should (appkit-chatbuf-input-has-objects-p))
+       (should (equal '("at")
+                      (mapcar (lambda (segment) (alist-get 'type segment))
+                              (qq-chat--current-input-segments))))
+       (should (equal "9007199254742007094"
+                      (alist-get 'server-id (qq-chat--reply-message))))))))
+
+(ert-deftest qq-chat-synchronous-send-error-restores-rich-draft-and-reply ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001" '((title . "Alice") (target-id . "10001")) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (let ((reply '((server-id . "9007199254742007094")
+                    (raw-message . "source"))))
+       (qq-chat--insert-input-segment-object
+        '((type . "at")
+          (data . ((qq . "10001") (name . "Alice Card")))))
+       (qq-chat--set-reply-message reply)
+       (cl-letf (((symbol-function 'qq-api-send-message)
+                  (lambda (&rest _args) (error "transport exploded"))))
+         (should-error (qq-chat-send-message) :type 'error))
+       (should (appkit-chatbuf-input-has-objects-p))
+       (should (equal "9007199254742007094"
+                      (alist-get 'server-id (qq-chat--reply-message))))))))
+
+(ert-deftest qq-chat-frame-error-during-send-restores-canonical-state ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001" '((title . "Alice") (target-id . "10001")) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (qq-chat-edit-draft)
+     (insert "keep me")
+     (qq-chat--set-reply-message
+      '((server-id . "9007199254742007094") (raw-message . "source")))
+     (let ((updates 0))
+       (cl-letf (((symbol-function 'qq-chat--update-frame)
+                  (lambda ()
+                    (cl-incf updates)
+                    (when (= updates 1)
+                      (error "frame exploded"))))
+                 ((symbol-function 'qq-api-send-message)
+                  (lambda (&rest _args)
+                    (ert-fail "frame error must happen before API send"))))
+         (should-error (qq-chat-send-message) :type 'error))
+       (should (= updates 2)))
+     (should (equal "keep me" (qq-chat--current-draft-string)))
+     (should (equal "9007199254742007094"
+                    (alist-get 'server-id (qq-chat--reply-message)))))))
+
+(ert-deftest qq-chat-send-rejects-numeric-reply-id-before-clearing-draft ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001" '((title . "Alice") (target-id . "10001")) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (qq-chat-edit-draft)
+     (insert "keep me")
+     (qq-chat--set-reply-message '((server-id . 42) (raw-message . "source")))
+     (cl-letf (((symbol-function 'qq-api-send-message)
+                (lambda (&rest _args)
+                  (ert-fail "invalid reply id must fail before API send"))))
+       (should-error (qq-chat-send-message) :type 'user-error))
+     (should (equal "keep me" (qq-chat--current-draft-string)))
+     (should (= 42 (alist-get 'server-id (qq-chat--reply-message)))))))
+
+(ert-deftest qq-chat-stale-send-failure-never-overwrites-new-draft ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice") (target-id . "10001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (qq-chat-edit-draft)
+     (insert "old draft")
+     (let (error-fn)
+       (cl-letf (((symbol-function 'qq-api-send-message)
+                  (lambda (_session _segments &optional _raw _callback errback)
+                    (setq error-fn errback)))
+                 ((symbol-function 'qq-api--default-error) #'ignore))
+         (qq-chat-send-message)
+         (insert "new draft")
+         (funcall error-fn nil "late failure"))
+       (should (equal "new draft" (appkit-chatbuf-input-string)))
+       (should (equal "new draft" (qq-chat--current-draft-string)))))))
+
+(ert-deftest qq-chat-stale-send-failure-never-overwrites-new-object ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice") (target-id . "10001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (qq-chat-edit-draft)
+     (insert "old draft")
+     (let (error-fn)
+       (cl-letf (((symbol-function 'qq-api-send-message)
+                  (lambda (_session _segments &optional _raw _callback errback)
+                    (setq error-fn errback)))
+                 ((symbol-function 'qq-api--default-error) #'ignore))
+         (qq-chat-send-message)
+         (qq-chat--insert-input-segment-object
+          '((type . "face") (data . ((id . "178")))))
+         (funcall error-fn nil "late failure"))
+       (should (equal '("face")
+                      (mapcar (lambda (segment) (alist-get 'type segment))
+                              (qq-chat--current-input-segments))))))))
+
+(ert-deftest qq-chat-stale-send-failure-never-overwrites-new-reply ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice") (target-id . "10001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (qq-chat-edit-draft)
+     (insert "old draft")
+     (let ((new-reply '((server-id . "9007199254742007095")
+                        (raw-message . "new source")))
+           error-fn)
+       (cl-letf (((symbol-function 'qq-api-send-message)
+                  (lambda (_session _segments &optional _raw _callback errback)
+                    (setq error-fn errback)))
+                 ((symbol-function 'qq-api--default-error) #'ignore))
+         (qq-chat-send-message)
+         (qq-chat--set-reply-message new-reply)
+         (funcall error-fn nil "late failure"))
+       (should (equal "" (appkit-chatbuf-input-string)))
+       (should (equal "9007199254742007095"
+                      (alist-get 'server-id (qq-chat--reply-message))))))))
+
 (ert-deftest qq-chat-load-older-messages-uses-oldest-cursor-and-guards ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
@@ -1610,6 +1931,8 @@
     (list
      '((message_id . "200")
        (message_type . "private")
+       (chat_type . 1)
+       (target_id . "10001")
        (user_id . 10001)
        (time . 1710000200)
        (sender . ((user_id . 10001) (nickname . "Alice")))
@@ -1672,6 +1995,8 @@
     (list
      (list (cons (quote message_id) "100")
            (cons (quote message_type) "private")
+           (cons (quote chat_type) 1)
+           (cons (quote target_id) "10001")
            (cons (quote user_id) 10001)
            (cons (quote time) 1710000100)
            (cons (quote sender)
@@ -1684,6 +2009,8 @@
                                    (list (cons (quote text) "source")))))))
      (list (cons (quote message_id) "200")
            (cons (quote message_type) "private")
+           (cons (quote chat_type) 1)
+           (cons (quote target_id) "10001")
            (cons (quote user_id) 10001)
            (cons (quote time) 1710000200)
            (cons (quote sender)
@@ -1747,6 +2074,8 @@
     (list
      (list (cons (quote message_id) "900")
            (cons (quote message_type) "private")
+           (cons (quote chat_type) 1)
+           (cons (quote target_id) "10001")
            (cons (quote user_id) 10001)
            (cons (quote time) 1710000900)
            (cons (quote sender)
@@ -1768,10 +2097,12 @@
                     (should (equal session-key "private:10001"))
                     (qq-state-merge-history
                      "private:10001"
-                     (list
-                      (list (cons (quote message_id) "100")
-                            (cons (quote message_type) "private")
-                            (cons (quote user_id) 10001)
+                      (list
+                       (list (cons (quote message_id) "100")
+                             (cons (quote message_type) "private")
+                             (cons (quote chat_type) 1)
+                             (cons (quote target_id) "10001")
+                             (cons (quote user_id) 10001)
                             (cons (quote time) 1710000100)
                             (cons (quote sender)
                                   (list (cons (quote user_id) 10001)

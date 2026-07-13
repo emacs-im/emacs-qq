@@ -18,4 +18,5 @@
 
 (script "refresh-appkit" "eask -f install-file ../appkit.el")
 (script "test" "eask test ert test/*.el")
-(script "test-local" "eask -f install-file ../appkit.el && eask test ert test/*.el")
+(script "test-local"
+        "eask -f install-file ../appkit.el && eask recompile && eask test ert test/*.el")

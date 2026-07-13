@@ -553,6 +553,7 @@
       (unread-count . 6)
       (first-unread-message-id . "9007199254742007089")
       (first-unread-message-seq . "30001")
+      (read-latest-message-id . "9007199254742007094")
       (read-position-available . t))
     nil)
    (qq-state-apply-recent-contacts
@@ -562,6 +563,7 @@
      (should (= 4 (alist-get 'unread-count session)))
      (should-not (alist-get 'first-unread-message-id session))
      (should-not (alist-get 'first-unread-message-seq session))
+     (should-not (alist-get 'read-latest-message-id session))
      (should-not (alist-get 'read-position-available session)))))
 
 (ert-deftest qq-state-apply-recent-contacts-can-reject-stale-unread-only ()
@@ -824,6 +826,168 @@
        (should (equal (or (alist-get 'server-id message)
                           (alist-get 'local-id message))
                       snowflake))))))
+
+(ert-deftest qq-state-late-send-failure-does-not-downgrade-server-backed-message ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . 90001) (nickname . "Me")))
+   (qq-state-upsert-session "private:10001" '((title . "Alice")) nil)
+   (let* ((pending (qq-state-insert-pending-text-message
+                    "private:10001" "ping"))
+          (local-id (alist-get 'local-id pending))
+          (snowflake "9007199254741004645"))
+     (qq-state-mark-pending-message-sent
+      "private:10001" local-id snowflake)
+     (should-not
+      (qq-state-mark-pending-message-failed
+       "private:10001" local-id "late timeout"))
+     (let ((message (car (qq-state-session-messages "private:10001"))))
+       (should (eq (alist-get 'status message) 'sent))
+       (should (equal (alist-get 'server-id message) snowflake))
+       (should-not (alist-get 'error message))))))
+
+(ert-deftest qq-state-rich-self-event-rekeys-pending-before-late-failure ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "Me")))
+   (qq-state-upsert-session
+    "private:10001" '((type . private) (target-id . "10001")) nil)
+   (let* ((segments '(((type . "at")
+                       (data . ((qq . "10001") (name . "Alice Card"))))))
+          (pending (qq-state-insert-pending-message
+                    "private:10001" segments))
+          (local-id (alist-get 'local-id pending))
+          (snowflake "9007199254741004646")
+          (now (truncate (float-time))))
+     ;; NapCat's authoritative self event uses CQ raw_message while the local
+     ;; rich pending row uses its readable preview.  Segment identity, not
+     ;; those incompatible strings, must reconcile the one timeline row.
+     (qq-state-merge-live-message
+      `((post_type . "message_sent")
+        (message_type . "private")
+        (chat_type . 1)
+        (message_id . ,snowflake)
+        (self_id . "90001")
+        (user_id . "90001")
+        (target_id . "10001")
+        (time . ,now)
+        (sender . ((user_id . "90001") (nickname . "Me")))
+        (raw_message . "[CQ:at,qq=10001]")
+        (message . ,segments)))
+     (let ((messages (qq-state-session-messages "private:10001")))
+       (should (= 1 (length messages)))
+       (should (equal (alist-get 'local-id (car messages)) local-id))
+       (should (equal (alist-get 'server-id (car messages)) snowflake))
+       (should (eq (alist-get 'status (car messages)) 'sent)))
+     (should-not
+      (qq-state-mark-pending-message-failed
+       "private:10001" local-id "late timeout")))))
+
+(ert-deftest qq-state-equal-media-self-events-reconcile-pending-fifo ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "Me")))
+   (qq-state-upsert-session
+    "private:10001" '((type . private) (target-id . "10001")) nil)
+   (let* ((first (qq-state-insert-pending-message
+                  "private:10001"
+                  '(((type . "image") (data . ((file . "/tmp/a.png")))))))
+          (second (qq-state-insert-pending-message
+                   "private:10001"
+                   '(((type . "image") (data . ((file . "/tmp/b.png")))))))
+          (first-local (alist-get 'local-id first))
+          (second-local (alist-get 'local-id second))
+          (first-server "9007199254741004647")
+          (second-server "9007199254741004648")
+          (now (truncate (float-time))))
+     (cl-labels
+         ((merge-image
+           (server-id remote-file)
+           (qq-state-merge-live-message
+            `((post_type . "message_sent")
+              (message_type . "private")
+              (chat_type . 1)
+              (message_id . ,server-id)
+              (self_id . "90001")
+              (user_id . "90001")
+              (target_id . "10001")
+              (time . ,now)
+              (sender . ((user_id . "90001") (nickname . "Me")))
+              (raw_message . ,(format "[CQ:image,file=%s]" remote-file))
+              (message . (((type . "image")
+                           (data . ((file . ,remote-file)
+                                    (sub_type . 0))))))))))
+       (merge-image first-server "remote-a")
+       (merge-image second-server "remote-b"))
+     (let* ((messages (qq-state-session-messages "private:10001"))
+            (first-row (seq-find
+                        (lambda (message)
+                          (equal (alist-get 'local-id message) first-local))
+                        messages))
+            (second-row (seq-find
+                         (lambda (message)
+                           (equal (alist-get 'local-id message) second-local))
+                         messages)))
+       (should (= 2 (length messages)))
+       (should (equal (alist-get 'server-id first-row) first-server))
+       (should (equal (alist-get 'server-id second-row) second-server))
+       (should-not (seq-some
+                    (lambda (message)
+                      (eq (alist-get 'status message) 'pending))
+                    messages))))))
+
+(ert-deftest qq-state-rich-signature-outranks-equal-readable-preview ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "Me")))
+   (qq-state-upsert-session
+    "private:10001" '((type . private) (target-id . "10001")) nil)
+   (let* ((first (qq-state-insert-pending-message
+                  "private:10001"
+                  '(((type . "at")
+                     (data . ((qq . "10011") (name . "Alex")))))))
+          (second (qq-state-insert-pending-message
+                   "private:10001"
+                   '(((type . "at")
+                      (data . ((qq . "10012") (name . "Alex")))))))
+          (first-local (alist-get 'local-id first))
+          (second-local (alist-get 'local-id second))
+          (first-server "9007199254741004649")
+          (second-server "9007199254741004650")
+          (now (truncate (float-time))))
+     (cl-labels
+         ((merge-at
+           (server-id target)
+           (qq-state-merge-live-message
+            `((post_type . "message_sent")
+              (message_type . "private")
+              (chat_type . 1)
+              (message_id . ,server-id)
+              (self_id . "90001")
+              (user_id . "90001")
+              (target_id . "10001")
+              (time . ,now)
+              (sender . ((user_id . "90001") (nickname . "Me")))
+              ;; Both targets deliberately have the same visible name.
+              (raw_message . "@Alex")
+              (message . (((type . "at")
+                           (data . ((qq . ,target) (name . "Alex"))))))))))
+       ;; Even an out-of-order event can select the stable @target rather than
+       ;; the first row with the same readable preview.
+       (merge-at second-server "10012")
+       (merge-at first-server "10011"))
+     (let ((messages (qq-state-session-messages "private:10001")))
+       (should (= 2 (length messages)))
+       (should
+        (equal first-server
+               (alist-get
+                'server-id
+                (seq-find (lambda (message)
+                            (equal (alist-get 'local-id message) first-local))
+                          messages))))
+       (should
+        (equal second-server
+               (alist-get
+                'server-id
+                (seq-find (lambda (message)
+                            (equal (alist-get 'local-id message) second-local))
+                          messages))))))))
 
 (ert-deftest qq-state-live-message-leaves-unread-to-kernel-and-supports-recall ()
   (qq-test-with-reset

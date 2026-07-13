@@ -69,6 +69,22 @@ completion rather than choosing a command argument.")
   (and (qq-completion--group-id)
        (appkit-chat-completion-token-bounds ?@)))
 
+(defun qq-completion-member-token-at-point ()
+  "Return unresolved native group @mention token at point, or nil.
+
+Accepted mentions are structured composer objects and therefore never match
+this function.  It is intended for submit guards such as
+`qq-chat-return-dwim'."
+  (qq-completion--member-token))
+
+(defun qq-completion--face-token ()
+  "Return the current `/face' composer token, or nil."
+  (appkit-chat-completion-token-bounds ?/))
+
+(defun qq-completion--unicode-emoji-token ()
+  "Return the current `:emoji:' composer token, or nil."
+  (appkit-chat-completion-delimited-token-bounds ?:))
+
 (defun qq-completion--member-field-values (member)
   "Return searchable non-empty values from native MEMBER."
   (seq-filter
@@ -522,12 +538,60 @@ target without a matching canonical candidate."
 
 (defun qq-completion--custom-face-token ()
   "Return the current explicit `/fav' favorite-face token, or nil."
-  (when-let* ((token (appkit-chat-completion-token-bounds ?/))
+  (when-let* ((token (qq-completion--face-token))
               (query (downcase (plist-get token :query)))
               ((seq-some (lambda (prefix)
                            (string-prefix-p prefix query))
                          qq-completion--custom-face-query-prefixes)))
     token))
+
+(defun qq-completion--candidate-matches-token-query-p (candidate token)
+  "Return non-nil when CANDIDATE can satisfy TOKEN's current query.
+
+The match deliberately includes protocol candidate search terms, so numeric QQ
+face ids and normalized Unicode names remain actionable while arbitrary paths,
+URLs, colon prose, and emoticons do not capture RET."
+  (let* ((query (downcase (or (plist-get token :query) "")))
+         (terms (appkit-chat-completion-candidate-search-terms candidate))
+         (values
+          (cons (appkit-chat-completion-candidate-label candidate)
+                (cond
+                 ((stringp terms) (list terms))
+                 ((listp terms) terms)
+                 (t nil)))))
+    (seq-some
+     (lambda (value)
+       (and (stringp value)
+            (string-match-p (regexp-quote query) (downcase value))))
+     values)))
+
+(defun qq-completion-token-at-point ()
+  "Return the unresolved QQ composer token at point, or nil.
+
+The result includes a `:kind' of `member', `favorite-face', `face', or
+`unicode-emoji'.  Submit dispatchers use syntax ownership rather than frontend
+popup state, so a completion with no preselected candidate cannot fall through
+and send literal token text accidentally."
+  (let (token kind)
+    (cond
+     ((setq token (qq-completion--member-token))
+      (setq kind 'member))
+     ((setq token (qq-completion--custom-face-token))
+      (setq kind 'favorite-face))
+     ((and (setq token (qq-completion--face-token))
+           (seq-some
+            (lambda (candidate)
+              (qq-completion--candidate-matches-token-query-p candidate token))
+            (qq-completion--base-face-candidates)))
+      (setq kind 'face))
+     ((and (setq token (qq-completion--unicode-emoji-token))
+           (seq-some
+            (lambda (candidate)
+              (qq-completion--candidate-matches-token-query-p candidate token))
+            (appkit-chat-emoji-candidates)))
+      (setq kind 'unicode-emoji)))
+    (when (and token kind)
+      (plist-put token :kind kind))))
 
 (defun qq-completion--custom-face-request-current-p (buffer owner)
   "Return non-nil when BUFFER still owns favorite-face request OWNER."
@@ -598,7 +662,7 @@ target without a matching canonical candidate."
 
 (defun qq-completion-face-capf ()
   "CAPF for `/名称' base faces and explicit `/fav' favorite faces."
-  (when-let* ((token (appkit-chat-completion-token-bounds ?/)))
+  (when-let* ((token (qq-completion--face-token)))
     (let* ((custom-p (qq-completion--custom-face-token))
            (query (plist-get token :query))
            (candidates

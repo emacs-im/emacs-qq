@@ -143,19 +143,13 @@ SPEC may be a numeric maximum height for compact decorative images."
 
 (defun qq-media--image-display-string (image fallback)
   "Return display string for IMAGE, or FALLBACK when IMAGE is nil."
-  (if image
-      (let ((render-image
-             (if (and (appkit-media-inline-animation-image-p image)
-                      (fboundp 'appkit-media--make-inline-animation-occurrence))
-                 (appkit-media--make-inline-animation-occurrence image)
-               image)))
-        (when (and (not (eq render-image image))
-                   (fboundp 'appkit-media--register-inline-animation-occurrence))
-          (appkit-media--register-inline-animation-occurrence render-image)
-          (appkit-media--install-inline-animation-discovery))
-        (propertize (or fallback " ") 'display render-image
-                    'rear-nonsticky '(display)))
-    fallback))
+  (appkit-media-image-display-string image fallback))
+
+(defun qq-media-composer-image-preview (file)
+  "Return a telega-style one-line composer preview for local image FILE."
+  (when (appkit-media-file-present-p file)
+    (appkit-media-one-line-preview-image-from-file
+     file qq-media-preview-image-max-width)))
 
 (defun qq-media--remote-image-cache-file-base (key)
   "Return disk cache file base for remote image KEY."

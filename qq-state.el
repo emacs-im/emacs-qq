@@ -1366,10 +1366,46 @@ pending message model."
        (or (and server-id (equal (alist-get 'server-id it) server-id))
            (and local-id (equal (alist-get 'local-id it) local-id)))))))
 
+(defun qq-state--pending-segment-signature (segment)
+  "Return stable optimistic reconciliation signature for one SEGMENT.
+
+Only fields preserved across send payloads and self websocket events are used.
+Media resource ids and paths are deliberately excluded because the kernel
+rewrites them during upload; equal media-only sends are reconciled FIFO by the
+surrounding message matcher."
+  (let* ((type (alist-get 'type segment))
+         (data (alist-get 'data segment)))
+    (pcase type
+      ("text"
+       (let ((text (alist-get 'text data)))
+         (and (stringp text) (list type text))))
+      ("at"
+       (when-let* ((target (qq-state--normalize-id (alist-get 'qq data))))
+         (list type target)))
+      ("reply"
+       (when-let* ((message-id (alist-get 'id data)))
+         (list type message-id)))
+      ("face"
+       (when-let* ((face-id (qq-state--normalize-id (alist-get 'id data))))
+         (list type face-id)))
+      ("image"
+       (list type (and (member (alist-get 'sub_type data) '(1 "1")) t)))
+      ((or "mface" "video" "record" "file")
+       (list type))
+      (_ nil))))
+
+(defun qq-state--pending-message-signature (message)
+  "Return stable segment signature for optimistic reconciliation of MESSAGE."
+  (when-let* ((segments (alist-get 'segments message))
+              ((listp segments)))
+    (let ((signature (mapcar #'qq-state--pending-segment-signature segments)))
+      (and (not (memq nil signature)) signature))))
+
 (defun qq-state--weak-pending-match (messages message)
   "Return weak pending match in MESSAGES for self-sent MESSAGE."
   (let ((self-p (alist-get 'self-p message))
         (raw-message (alist-get 'raw-message message))
+        (signature (qq-state--pending-message-signature message))
         (time (qq-state--normalize-time (alist-get 'time message))))
     (when self-p
       (qq-state--find-message
@@ -1377,8 +1413,20 @@ pending message model."
        (lambda (it)
          (and (alist-get 'self-p it)
               (alist-get 'local-id it)
-              (memq (alist-get 'status it) '(pending sent))
-              (equal (alist-get 'raw-message it) raw-message)
+              ;; Weak matching is FIFO ownership among unresolved local rows.
+              ;; A settled row is matched directly by server-id; admitting it
+              ;; here lets the next equal media event overwrite the first.
+              (eq (alist-get 'status it) 'pending)
+              (null (alist-get 'server-id it))
+              (let ((pending-signature
+                     (qq-state--pending-message-signature it)))
+                ;; Stable structure wins whenever both sides expose it.  Raw
+                ;; preview text is only a compatibility path for unsupported
+                ;; segment kinds; equal display names must not merge distinct
+                ;; @targets, replies, or base faces.
+                (if (and signature pending-signature)
+                    (equal pending-signature signature)
+                  (equal (alist-get 'raw-message it) raw-message)))
               (<= (abs (- time (qq-state--normalize-time (alist-get 'time it))))
                   qq-self-message-dedupe-window)))))))
 
@@ -1756,13 +1804,19 @@ hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor."
         updated))))
 
 (defun qq-state-mark-pending-message-failed (session-key local-id reason)
-  "Mark local pending message LOCAL-ID as failed with REASON in SESSION-KEY."
+  "Mark a still-pending LOCAL-ID as failed with REASON in SESSION-KEY.
+
+Return the updated message only when a transition happened.  A server-backed
+or otherwise settled row is authoritative and must not be downgraded by a late
+transport timeout."
   (let* ((messages (copy-tree (or (gethash session-key qq-state--messages-by-session) '())))
          (existing (qq-state--find-message
                     messages
                     (lambda (it)
                       (equal (alist-get 'local-id it) local-id)))))
-    (when existing
+    (when (and existing
+               (eq (alist-get 'status existing) 'pending)
+               (null (alist-get 'server-id existing)))
       (let ((updated (qq-state--merge-alists
                       existing
                       `((status . failed)
@@ -2113,6 +2167,7 @@ authoritative zero and therefore never writes the unread projection."
                (first-unread-message-id . nil)
                (first-unread-message-seq . nil)
                (read-position-available . nil)
+               (read-latest-message-id . nil)
                (unread-at-me-message-id . nil)
                (unread-at-me-message-seq . ,(and (> unread-count 0) at-me-seq))
                (unread-at-all-message-id . nil)

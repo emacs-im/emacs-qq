@@ -166,6 +166,12 @@ This mirrors telega's `telega-chatbuf--messages-pop-ring'.")
 (defvar-local qq-chat--forward-request-active-p nil
   "Non-nil while one merged-forward request from this chat is in flight.")
 
+(defvar-local qq-chat--send-restore-owner nil
+  "Opaque owner allowed to restore the most recently cleared failed send.
+
+Any later composer edit, reply change, or send revokes this ownership so a
+stale network failure can never overwrite newer user input.")
+
 (defvar qq-chat-timeline-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "q") #'quit-window)
@@ -796,6 +802,9 @@ because its result is only `{kind:single}'."
   "Sync canonical draft from the editable buffer region."
   (let ((result (appkit-chatbuf-input-state-sync)))
     (when (plist-get result :changed-p)
+      ;; Any real composer mutation revokes a cleared send's right to restore
+      ;; its old draft after a late transport failure.
+      (setq qq-chat--send-restore-owner nil)
       (qq-chat--maybe-update-my-action-from-input))
     (plist-get result :value)))
 
@@ -807,6 +816,7 @@ because its result is only `{kind:single}'."
 
 (defun qq-chat--set-reply-message (message)
   "Set shared reply aux state to MESSAGE, or clear it when nil."
+  (setq qq-chat--send-restore-owner nil)
   (if message
       (appkit-chatbuf-aux-set
        (list :aux-type 'reply
@@ -814,10 +824,11 @@ because its result is only `{kind:single}'."
              :message-id (alist-get 'server-id message)))
     (appkit-chatbuf-aux-reset)))
 
-(defun qq-chat--after-change (beg end _old-len)
+(defun qq-chat--after-change (beg end old-len)
   "Keep draft state synced after editable-region changes from BEG to END."
   (appkit-chatbuf-after-change
    beg end
+   :old-length old-len
    :rendering-p (appkit-chatbuf-rendering-p)
    :sync-function #'qq-chat--sync-draft-from-buffer
    :prune-broken-objects t))
@@ -848,6 +859,9 @@ because its result is only `{kind:single}'."
   "Keep point inside the logical draft area when editing input."
   (unless (appkit-chatbuf-rendering-p)
     (appkit-chatbuf-post-command-clamp-point)
+    (when (and (appkit-chatbuf-point-in-input-p)
+               (appkit-chatbuf-input-has-objects-p))
+      (appkit-chatbuf-input-prune-broken-objects))
     (qq-chat--flush-deferred-node-redisplay)
     (qq-chat--update-context-mode)
     (qq-chat--maybe-auto-load-older)))
@@ -1301,6 +1315,7 @@ scaling because pixel-aligned avatars can still change geometry."
 
 (defun qq-chat--set-draft (text)
   "Set canonical draft TEXT and update the shared tail composer."
+  (setq qq-chat--send-restore-owner nil)
   (appkit-chatbuf-input-state-set text :reset-history-p t)
   (appkit-chatbuf-with-generated-update
     (appkit-chatbuf-input-replace (appkit-chatbuf-input-state))
@@ -1357,21 +1372,34 @@ Favorite stickers (`image' with sub_type 1, or mface) try local thumbs."
               (sticker-p (member sub '(1 "1")))
               (image (and file
                           (appkit-media-file-present-p file)
-                          (qq-media--image-from-file
-                           file
-                           (if sticker-p
-                               (max qq-media-face-image-height 32)
-                             qq-media-face-image-height)))))
-         (if (or sticker-p image)
+                          (if sticker-p
+                              (qq-media--image-from-file
+                               file (max qq-media-face-image-height 32))
+                            (qq-media-composer-image-preview file))))
+              (name (or (alist-get 'name data)
+                        (and file (file-name-nondirectory file))
+                        summary
+                        "image"))
+              (size (and file
+                         (file-exists-p file)
+                         (file-size-human-readable
+                          (file-attribute-size (file-attributes file)))))
+              (preview (and image
+                            (qq-media--image-display-string image "▧"))))
+         (cond
+          (sticker-p
              (qq-media--image-display-string
               image
               (or summary
-                  (and file (file-name-nondirectory file))
-                  "[image]"))
-           (format "[image:%s]"
-                   (or summary
-                       (and file (file-name-nondirectory file))
-                       "item")))))
+                  name
+                  "[image]")))
+          ((or preview file)
+           (concat "[image] "
+                   (if preview (concat preview " ") "")
+                   (propertize name 'help-echo file)
+                   (if size (format " (%s)" size) "")))
+          (t
+           (format "[image:%s]" (or summary "item"))))))
       (_
        (let* ((path (or (alist-get 'path data)
                         (alist-get 'file data)
@@ -1396,9 +1424,19 @@ Favorite stickers (`image' with sub_type 1, or mface) try local thumbs."
 
 VISIBLE-LABEL overrides the segment-derived label, for example to retain a
 favorite face's local thumbnail alongside its sendable mface payload."
+  ;; Structured insertion inhibits ordinary modification hooks inside Appkit,
+  ;; so revoke stale send restoration explicitly before changing the draft.
+  (setq qq-chat--send-restore-owner nil)
   (qq-chat--ensure-composer-visible)
   (unless (appkit-chatbuf-point-in-input-p)
     (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max))))
+  ;; Appkit preserves the exact object start as a boundary-before position,
+  ;; but an unexpected point inside an intangible object belongs after it.
+  ;; Normalize before adding a leading separator so we never edit the old
+  ;; object's protected interior on the way to inserting the new one.
+  (when-let* ((bounds (appkit-chatbuf-input-object-bounds-at-point)))
+    (unless (= (point) (car bounds))
+      (goto-char (cdr bounds))))
   (when (and (appkit-chatbuf-point-in-input-p)
              (> (point) (or (appkit-chatbuf-input-start-position) (point-min)))
              (let ((ch (char-before)))
@@ -3028,16 +3066,56 @@ new rows or reports the cursor missing."
                  (qq-chat--update-frame)
                  (qq-api--default-error response reason)))))))))))
 
+(defun qq-chat--restore-failed-send
+    (buffer session-key owner draft-state aux-state &optional allow-partial-p)
+  "Restore one failed send when OWNER still owns pristine BUFFER composer.
+
+SESSION-KEY prevents a reused buffer from receiving another chat's draft.
+DRAFT-STATE preserves rich input properties and AUX-STATE preserves its reply.
+Normally the cleared composer must still be pristine.  ALLOW-PARTIAL-P is for
+rolling back synchronous errors inside the destructive clear transaction; its
+opaque OWNER must still be current.  Return non-nil only when restoration
+happened."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and (equal qq-chat--session-key session-key)
+                 (eq qq-chat--send-restore-owner owner)
+                 (or allow-partial-p
+                     (and (equal-including-properties
+                           (appkit-chatbuf-input-state) "")
+                          (null (appkit-chatbuf-aux-state)))))
+        ;; Revoke before rendering so restoration cannot be mistaken for a
+        ;; still-pristine send slot by a reentrant callback.
+        (setq qq-chat--send-restore-owner nil)
+        (appkit-chatbuf-input-state-set draft-state :reset-history-p t)
+        (if aux-state
+            (appkit-chatbuf-aux-set (copy-tree aux-state))
+          (appkit-chatbuf-aux-reset))
+        (qq-chat--update-frame)
+        (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max)))
+        (qq-chat--maybe-update-my-action-from-input)
+        t))))
+
 (defun qq-chat-send-message ()
   "Send current chat draft."
   (interactive)
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
   (qq-chat--ensure-composer-visible)
-  (let* ((text (qq-chat--current-draft-string))
+  ;; Never submit a stale canonical cache or a partially edited rich object.
+  (appkit-chatbuf-input-prune-broken-objects)
+  (qq-chat--sync-draft-from-buffer)
+  (let* ((buffer (current-buffer))
+         (session-key qq-chat--session-key)
+         (draft-state (appkit-chatbuf-input-state))
+         (aux-state (copy-tree (appkit-chatbuf-aux-state)))
+         (restore-owner (make-symbol "qq-chat-send-restore"))
+         (text (qq-chat--current-draft-string))
          (reply-message (qq-chat--reply-message))
          (reply-id (and reply-message
-                        (alist-get 'server-id reply-message)))
+                        (qq-api-validate-message-id
+                         (alist-get 'server-id reply-message)
+                         "reply draft")))
          (content-segments (qq-chat--current-input-segments))
          (send-segments (append
                          (when reply-id
@@ -3050,22 +3128,56 @@ new rows or reports the cursor missing."
              (string-empty-p (string-trim text)))
         (message "qq: draft is empty")
       (qq-chat--push-input-history text)
-      (appkit-chatbuf-input-state-clear :reset-history-p t)
-      ;; telega: empty input after send → chatActionCancel
-      (qq-chat--set-my-action 'cancel)
-      (qq-chat--set-reply-message nil)
-      (qq-chat--update-frame)
-      (qq-api-send-message qq-chat--session-key send-segments raw-message))))
+      (setq qq-chat--send-restore-owner restore-owner)
+      (condition-case err
+          (progn
+            (appkit-chatbuf-input-state-clear :reset-history-p t)
+            ;; telega: empty input after send → chatActionCancel
+            (qq-chat--set-my-action 'cancel)
+            ;; This is the send transaction's own clear, not a later user
+            ;; reply change, so retain restore ownership across it.
+            (appkit-chatbuf-aux-reset)
+            (qq-chat--update-frame)
+            (qq-api-send-message
+             session-key send-segments raw-message
+             (lambda (_response)
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (when (eq qq-chat--send-restore-owner restore-owner)
+                     (setq qq-chat--send-restore-owner nil)))))
+             (lambda (response reason)
+               (let ((restored
+                      (qq-chat--restore-failed-send
+                       buffer session-key restore-owner draft-state aux-state)))
+                 (qq-api--default-error
+                  response
+                  (if restored
+                      (format "%s (draft restored)" (or reason "send failed"))
+                    reason))))))
+        (error
+         (qq-chat--restore-failed-send
+          buffer session-key restore-owner draft-state aux-state t)
+         (signal (car err) (cdr err)))))))
 
 (defun qq-chat-return-dwim (arg)
-  "Send current draft, or insert newline with prefix ARG."
+  "Complete an unresolved token, send draft, or insert newline with ARG.
+
+An unresolved @member, /face, /favorite, or :emoji: token always owns RET.
+This prevents a completion frontend with no preselected row from falling
+through and sending the query as plain text.  `C-c C-c' remains the explicit
+way to send literal token text."
   (interactive "P")
   (qq-chat--ensure-composer-visible)
   (if (not (appkit-chatbuf-point-in-input-p))
       (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max)))
-    (if arg
-        (insert "\n")
-      (qq-chat-send-message))))
+    (cond
+     (arg
+      (insert "\n"))
+     ((qq-completion-token-at-point)
+      (or (qq-completion-complete)
+          (message "qq: no completion candidate; C-c C-c sends literally")))
+     (t
+      (qq-chat-send-message)))))
 
 (defun qq-chat-edit-draft ()
   "Move point to the editable draft area."
@@ -3331,6 +3443,10 @@ still validated by the strict API contract."
     (define-key map (kbd "M-<") #'qq-chat-load-older-messages)
     (define-key map (kbd "M->") #'qq-chat-return-to-latest)
     (define-key map (kbd "RET") #'qq-chat-return-dwim)
+    (define-key map (kbd "DEL") #'appkit-chatbuf-input-backward-delete)
+    (define-key map (kbd "<backspace>") #'appkit-chatbuf-input-backward-delete)
+    (define-key map (kbd "C-d") #'appkit-chatbuf-input-forward-delete)
+    (define-key map (kbd "<delete>") #'appkit-chatbuf-input-forward-delete)
     (define-key map (kbd "TAB") #'qq-chat-complete)
     (define-key map (kbd "<tab>") #'qq-chat-complete)
     (define-key map (kbd "C-M-i") #'qq-chat-complete)

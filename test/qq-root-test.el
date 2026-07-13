@@ -17,11 +17,11 @@
 (ert-deftest qq-root-distinguishes-important-and-muted-unread-sessions ()
   (qq-root-test-with-reset
    (qq-state-upsert-session
-    "group:important"
+    "group:10001"
     '((unread-count . 3) (muted-p . nil))
     nil)
    (qq-state-upsert-session
-    "group:muted"
+    "group:10002"
     '((unread-count . 9) (muted-p . t))
     nil)
    (let ((metrics (qq-root--activity-metrics)))

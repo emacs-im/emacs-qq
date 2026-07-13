@@ -85,7 +85,84 @@
                      '(((type . "reply")
                         (data . ((id . "42"))))
                        ((type . "text")
-                        (data . ((text . "hello"))))))))))
+                         (data . ((text . "hello"))))))))))
+
+(ert-deftest qq-api-send-message-calls-owner-after-pending-success ()
+  (let (success-fn events)
+    (cl-letf (((symbol-function 'qq-state-insert-pending-message)
+               (lambda (&rest _args) '((local-id . "local-1"))))
+              ((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional _errback)
+                 (setq success-fn callback)))
+              ((symbol-function 'qq-state-mark-pending-message-sent)
+               (lambda (&rest _args) (push 'promoted events))))
+      (qq-api-send-message
+       "private:10001"
+       '(((type . "text") (data . ((text . "hello")))))
+       "hello"
+       (lambda (_response) (push 'callback events)))
+      (funcall success-fn
+               '((data . ((message_id . "9007199254742007094")))))
+      (should (equal '(promoted callback) (nreverse events))))))
+
+(ert-deftest qq-api-send-message-calls-owner-after-pending-failure ()
+  (let (error-fn events)
+    (cl-letf (((symbol-function 'qq-state-insert-pending-message)
+               (lambda (&rest _args) '((local-id . "local-1"))))
+              ((symbol-function 'qq-api-call)
+               (lambda (_action _params _callback &optional errback)
+                 (setq error-fn errback)))
+              ((symbol-function 'qq-state-mark-pending-message-failed)
+               (lambda (&rest _args) (push 'failed events))))
+      (qq-api-send-message
+       "private:10001"
+       '(((type . "text") (data . ((text . "hello")))))
+       "hello" nil
+       (lambda (_response _reason) (push 'errback events)))
+      (funcall error-fn nil "network failed")
+      (should (equal '(failed errback) (nreverse events))))))
+
+(ert-deftest qq-api-send-message-ignores-late-failure-after-authoritative-event ()
+  (let (error-fn called)
+    (cl-letf (((symbol-function 'qq-state-insert-pending-message)
+               (lambda (&rest _args) '((local-id . "local-1"))))
+              ((symbol-function 'qq-api-call)
+               (lambda (_action _params _callback &optional errback)
+                 (setq error-fn errback)))
+              ((symbol-function 'qq-state-mark-pending-message-failed)
+               (lambda (&rest _args) nil)))
+      (qq-api-send-message
+       "private:10001"
+       '(((type . "text") (data . ((text . "hello")))))
+       "hello" nil
+       (lambda (&rest _args) (setq called t)))
+      (funcall error-fn nil "late timeout")
+      (should-not called))))
+
+(ert-deftest qq-api-send-message-malformed-success-enters-failure-path ()
+  (let (success-fn failed-reason error-reason callback-called)
+    (cl-letf (((symbol-function 'qq-state-insert-pending-message)
+               (lambda (&rest _args) '((local-id . "local-1"))))
+              ((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional _errback)
+                 (setq success-fn callback)))
+              ((symbol-function 'qq-state-mark-pending-message-sent)
+               (lambda (&rest _args)
+                 (ert-fail "malformed response must not promote pending")))
+              ((symbol-function 'qq-state-mark-pending-message-failed)
+               (lambda (_session _local-id reason)
+                 (setq failed-reason reason)
+                 '((status . failed)))))
+      (qq-api-send-message
+       "private:10001"
+       '(((type . "text") (data . ((text . "hello")))))
+       "hello"
+       (lambda (&rest _args) (setq callback-called t))
+       (lambda (_response reason) (setq error-reason reason)))
+      (funcall success-fn '((data . ((message_id . 42)))))
+      (should-not callback-called)
+      (should (string-match-p "original string" failed-reason))
+      (should (equal failed-reason error-reason)))))
 
 (ert-deftest qq-api-send-message-builds-dataline-send-msg-request ()
   (let (captured-action captured-params pending-call)

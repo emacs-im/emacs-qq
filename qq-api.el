@@ -1210,33 +1210,69 @@ one authoritative read-state refresh."
    `(((type . "text")
       (data . ((text . ,text)))))))
 
-(defun qq-api-send-message (session-key segments &optional raw-message)
+(defun qq-api-send-message
+    (session-key segments &optional raw-message callback errback)
   "Send SEGMENTS to SESSION-KEY.
 
 Insert a local pending message immediately and update it after the response.
 RAW-MESSAGE, when non-nil, overrides the optimistic raw-message field used for
-local pending rendering.
+local pending rendering.  CALLBACK receives the raw response after the pending
+message is promoted.  ERRBACK receives RESPONSE and REASON after the optimistic
+message actually transitions from pending to failed; it defaults to
+`qq-api--default-error'.  A late failure for an already server-backed message is
+ignored so callers cannot restore and resend an authoritative delivery.
 
 The NapCat hard-cut returns `message_id' as the NT snowflake string; that value
 is stored as the message `server-id' and becomes the timeline anchor."
   (unless (qq-state-session-sendable-p session-key)
     (user-error "qq: this session is read-only"))
   (let* ((segments (copy-tree (or segments '())))
-         (pending (qq-state-insert-pending-message session-key segments raw-message))
-         (local-id (alist-get 'local-id pending))
          (params (append
                   (qq-api--session-request-params session-key)
-                  `((message . ,segments)))))
-    (qq-api-call
-     "send_msg"
-     params
-     (lambda (response)
-       (let* ((data (qq-api--response-data response))
-              (message-id (alist-get 'message_id data nil nil #'eq)))
-         (qq-state-mark-pending-message-sent session-key local-id message-id)))
-     (lambda (response reason)
-       (qq-state-mark-pending-message-failed session-key local-id reason)
-       (qq-api--default-error response reason)))))
+                  `((message . ,segments))))
+         ;; Build and validate request parameters before adding timeline state:
+         ;; a synchronous caller error must not leave a permanent pending row.
+         (pending (qq-state-insert-pending-message session-key segments raw-message))
+         (local-id (alist-get 'local-id pending))
+         (failure-callback (or errback #'qq-api--default-error)))
+    (cl-labels
+        ((fail-pending
+          (response reason)
+          (when (qq-state-mark-pending-message-failed
+                 session-key local-id reason)
+            (funcall failure-callback response reason))))
+      (condition-case err
+          (qq-api-call
+           "send_msg"
+           params
+           (lambda (response)
+             ;; Protocol decoding and state promotion belong to the send
+             ;; transaction.  The caller callback does not: never reinterpret
+             ;; a client callback error as a failed network delivery.
+             (when
+                 (condition-case promote-error
+                     (let* ((data (qq-api--response-data response))
+                            (message-id
+                             (qq-api-validate-message-id
+                              (alist-get 'message_id data nil nil #'eq)
+                              "send_msg response" t)))
+                       (qq-state-mark-pending-message-sent
+                        session-key local-id message-id)
+                       t)
+                   (error
+                    (fail-pending
+                     response (error-message-string promote-error))
+                    nil))
+               (when callback
+                 (funcall callback response))))
+           #'fail-pending)
+        (error
+         ;; A synchronous transport failure happens after optimistic insertion.
+         ;; Settle that row, then let the caller restore its rich draft and
+         ;; retain the original error type/backtrace.
+         (qq-state-mark-pending-message-failed
+          session-key local-id (error-message-string err))
+         (signal (car err) (cdr err)))))))
 
 (defun qq-api-send-text (session-key text &optional reply-to-message-id)
   "Send TEXT to SESSION-KEY.

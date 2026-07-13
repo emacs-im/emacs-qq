@@ -53,6 +53,41 @@
     (role . "admin")
     (robot . nil)))
 
+(ert-deftest qq-completion-token-at-point-classifies-all-composer-syntax ()
+  (qq-completion-test-with-group
+    (cl-letf (((symbol-function 'qq-completion--base-face-candidates)
+               (lambda ()
+                 (list
+                  (appkit-chat-completion-candidate-create
+                   :label "/斜眼笑  (178)" :search-terms '("斜眼笑" "178")))))
+              ((symbol-function 'appkit-chat-emoji-candidates)
+               (lambda (&optional _force)
+                 (list
+                  (appkit-chat-completion-candidate-create
+                   :label ":rocket:" :search-terms '("rocket" "🚀"))))))
+      (dolist (case '(("@green" member "green")
+                      ("/斜眼" face "斜眼")
+                      ("/178" face "178")
+                      ("/fav" favorite-face "fav")
+                      (":rocket" unicode-emoji "rocket")
+                      (":rocket:" unicode-emoji "rocket")))
+        (appkit-chatbuf-input-set-text (car case))
+        (goto-char (point-max))
+        (let ((token (qq-completion-token-at-point)))
+          (should (eq (plist-get token :kind) (nth 1 case)))
+          (should (equal (plist-get token :query) (nth 2 case)))))
+      (dolist (text '("hello@example.com" "12:30" "plain"
+                      "https://example.com" "/tmp/foo" ":unknown" ":)"))
+        (appkit-chatbuf-input-set-text text)
+        (goto-char (point-max))
+        (should-not (qq-completion-token-at-point))))))
+
+(ert-deftest qq-completion-member-token-is-group-only ()
+  (qq-completion-test-with-private
+    (appkit-chatbuf-input-set-text "@alice")
+    (goto-char (point-max))
+    (should-not (qq-completion-token-at-point))))
+
 (ert-deftest qq-completion-member-capf-inserts-real-at-segment ()
   (qq-completion-test-with-group
     (puthash "alice" (list qq-completion-test--member)
@@ -79,7 +114,11 @@
     (should (string-suffix-p " " (appkit-chatbuf-input-string)))
     (should (equal '(((type . "at")
                       (data . ((qq . "10001") (name . "Alice Card")))))
-                   (qq-chat--current-input-segments)))))
+                   (qq-chat--current-input-segments)))
+    (goto-char (point-max))
+    (appkit-chatbuf-input-backward-delete 1)
+    (should (equal "" (appkit-chatbuf-input-string)))
+    (should-not (qq-chat--current-input-segments))))
 
 (ert-deftest qq-completion-member-candidates-search-aliases-and-disambiguate ()
   (let* ((second (copy-tree qq-completion-test--member))
