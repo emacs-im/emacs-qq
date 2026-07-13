@@ -28,6 +28,87 @@
       (should-not (string-match-p "M-<" header))
       (should-not (string-match-p "C-c" header)))))
 
+(ert-deftest qq-chat-header-line-is-cached-between-redisplays ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice") (target-id . "10001"))
+    nil)
+   (puthash
+    "private:10001"
+    '(((server-id . "9007199254743009336")
+       (sender-id . "10001")
+       (time . 100)
+       (raw-message . "marked")))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001"
+           qq-chat--marked-message-anchors '("9007199254743009336"))
+     (let ((original-getter (symbol-function 'qq-state-session-messages))
+           (getter-calls 0))
+       (cl-letf (((symbol-function 'qq-state-session-messages)
+                  (lambda (session-key)
+                    (cl-incf getter-calls)
+                    (funcall original-getter session-key))))
+         (qq-chat--header-line-update)
+         (should (= getter-calls 1))
+         (should (stringp header-line-format))
+         (should (string-match-p "1 marked" header-line-format))
+         (dotimes (_ 5)
+           (format-mode-line header-line-format))
+         (should (= getter-calls 1)))))))
+
+(ert-deftest qq-chat-header-line-prunes-recalled-forward-marks ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice") (target-id . "10001"))
+    nil)
+   (puthash
+    "private:10001"
+    '(((server-id . "9007199254743009336")
+       (sender-id . "10001")
+       (status . recalled)
+       (time . 100)
+       (raw-message . "[message recalled]")))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001"
+           qq-chat--marked-message-anchors '("9007199254743009336"))
+     (qq-chat--header-line-update)
+     (should-not qq-chat--marked-message-anchors)
+     (should-not (string-match-p "marked" header-line-format)))))
+
+(ert-deftest qq-chat-header-line-recognizes-ready-connection-state ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice") (target-id . "10001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-state-set-connection-status 'ready)
+     (should-not (string-match-p "\\[ready\\]" (qq-chat--header-line)))
+     (qq-state-set-connection-status 'reconnecting)
+     (should (string-match-p "\\[reconnecting\\]"
+                            (qq-chat--header-line))))))
+
+(ert-deftest qq-chat-connection-state-change-refreshes-header-line ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat--ensure-view)
+     (let ((updates 0))
+       (cl-letf (((symbol-function 'qq-chat--header-line-update)
+                  (lambda () (cl-incf updates))))
+         (qq-chat--handle-state-change '(:type connection :status ready))
+         (qq-chat-test-sync-invalidations)
+         (should (= updates 1)))))))
+
 (ert-deftest qq-chat-input-region-uses-editing-keymap ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
@@ -756,6 +837,7 @@
        (let ((node (appkit-chat-timeline-node local-id)))
          (should node)
          (should (equal (appkit-chat-timeline-keys) (list local-id)))
+         (setq qq-chat--marked-message-anchors (list local-id))
          (puthash "private:10001" sent qq-state--messages-by-session)
          (qq-chat--apply-message-state-change
           (list :type 'message
@@ -763,7 +845,8 @@
                 :previous-anchor local-id
                 :message (car sent)))
          (should-not (appkit-chat-timeline-node local-id))
-         (should (eq node (appkit-chat-timeline-node snowflake))))
+         (should (eq node (appkit-chat-timeline-node snowflake)))
+         (should (equal qq-chat--marked-message-anchors (list snowflake))))
        (should (equal (appkit-chat-timeline-keys) (list snowflake)))
        (goto-char (point-min))
        (should (search-forward "hi" nil t))))))

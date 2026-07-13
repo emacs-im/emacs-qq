@@ -221,7 +221,7 @@ They are inactive in the composer so typing is never stolen.")
   (max 72 (window-body-width (get-buffer-window (current-buffer) t))))
 
 (defun qq-chat--header-line ()
-  "Return dynamic header line for the active chat buffer.
+  "Return the formatted header line for the active chat buffer.
 
 Telega-like: title first, connection only when not connected, unread as a
 compact badge.  Peer typing/actions live in the footer prompt delimiter
@@ -231,13 +231,13 @@ of the default chrome."
          (title (or (alist-get 'title session) qq-chat--session-key))
          (status (qq-state-connection-status))
          (unread (or (alist-get 'unread-count session) 0))
-         (status-part (if (eq status 'connected)
+         (status-part (if (memq status '(connected ready))
                           ""
                         (format "  [%s]" status)))
          (unread-part (if (> unread 0)
                           (format "  · %d unread" unread)
                         ""))
-         (marked-count (length (qq-chat-marked-messages)))
+         (marked-count (length qq-chat--marked-message-anchors))
          (marked-part (if (> marked-count 0)
                           (format "  · %d marked" marked-count)
                         "")))
@@ -570,6 +570,32 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
      (and (qq-chat--message-forwardable-p message)
           (qq-chat--message-marked-p message)))
    (qq-state-session-messages qq-chat--session-key)))
+
+(defun qq-chat--prune-forward-marks ()
+  "Drop marked anchors that no longer name forwardable messages.
+
+The state accessor intentionally returns a defensive deep copy, so only pay
+that cost while a non-empty forwarding selection needs validation.  Header
+formatting then reads the buffer-local list in constant time, and redisplay
+uses the cached header string."
+  (when qq-chat--marked-message-anchors
+    (setq qq-chat--marked-message-anchors
+          (mapcar #'qq-chat--message-anchor
+                  (qq-chat-marked-messages)))))
+
+(defun qq-chat--rekey-forward-mark (previous-anchor anchor)
+  "Move a forward mark from PREVIOUS-ANCHOR to canonical ANCHOR."
+  (when (and previous-anchor
+             anchor
+             (not (equal previous-anchor anchor))
+             (member previous-anchor qq-chat--marked-message-anchors))
+    (setq qq-chat--marked-message-anchors
+          (delete-dups
+           (mapcar (lambda (marked-anchor)
+                     (if (equal marked-anchor previous-anchor)
+                         anchor
+                       marked-anchor))
+                   qq-chat--marked-message-anchors)))))
 
 (defun qq-chat--forwardable-target-sessions ()
   "Return all private/group targets known from sessions and contact caches."
@@ -1074,6 +1100,8 @@ Order (telega-inspired):
          (qq-chat--header-line-update)
          (qq-chat--update-frame)
          (qq-chat--sync-timeline)))
+      ('connection
+       (qq-chat--header-line-update))
       ('reset
        (qq-chat-render))
       ('session
@@ -1145,7 +1173,8 @@ Order (telega-inspired):
 (defun qq-chat--header-line-update ()
   "Update chat header line and buffer name."
   (qq-chat--ensure-buffer-name)
-  (setq-local header-line-format '(:eval (qq-chat--header-line)))
+  (qq-chat--prune-forward-marks)
+  (setq-local header-line-format (qq-chat--header-line))
   (force-mode-line-update))
 
 (defun qq-chat--update-frame ()
@@ -3521,6 +3550,7 @@ first unread message."
          (rekeys (qq-chat--message-event-rekeys event)))
     (unless (or anchor previous-anchor)
       (error "qq: message state event has no stable anchor: %S" event))
+    (qq-chat--rekey-forward-mark previous-anchor anchor)
     (qq-chat--header-line-update)
     (qq-chat--sync-timeline
      :changed-resources resources
@@ -3534,20 +3564,21 @@ first unread message."
   "Queue state EVENT invalidations for open QQ chats."
   (let ((event-session-key (plist-get event :session-key))
         (event-type (plist-get event :type)))
-    (when (memq event-type '(message history reset session action
+    (when (memq event-type '(message history reset session action connection
                              sessions-refreshed friends-refreshed groups-refreshed))
       (dolist (buffer (buffer-list))
         (with-current-buffer buffer
           (when (and (derived-mode-p 'qq-chat-mode)
                      (appkit-view-live-p (appkit-current-view))
                      (or (memq event-type
-                               '(reset sessions-refreshed
+                               '(reset connection sessions-refreshed
                                  friends-refreshed groups-refreshed))
                          (equal event-session-key qq-chat--session-key)))
             (let ((view (appkit-current-view)))
               (appkit-view-enqueue-event view event)
               (appkit-invalidate
-               view :part (if (memq event-type '(session action sessions-refreshed))
+               view :part (if (memq event-type
+                                    '(session action connection sessions-refreshed))
                               'frame
                             'timeline))
               (appkit-schedule-sync view))))))))
