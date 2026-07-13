@@ -1357,10 +1357,12 @@ Return the local message object."
   "Return MESSAGES with EXISTING replaced by REPLACEMENT."
   (mapcar (lambda (it) (if (eq it existing) replacement it)) messages))
 
-(defun qq-state--merge-normalized-message (session-key message &optional count-unread)
+(defun qq-state--merge-normalized-message (session-key message)
   "Merge normalized MESSAGE into SESSION-KEY.
 
-When COUNT-UNREAD is non-nil and MESSAGE is not self-sent, increment unread.
+Unread state is deliberately not inferred from message delivery.  The Linux QQ
+kernel's authoritative read-state snapshot is the only source of unread count
+and position, including updates caused by another logged-in client.
 
 Return three values via `cl-values':
 1. merged local message object
@@ -1423,23 +1425,6 @@ Return three values via `cl-values':
      nil)
     (qq-state--index-message merged)
     (qq-state--sync-session-summary session-key)
-    (when (and count-unread
-               (not existing)
-               (not (alist-get 'self-p merged))
-               (not (qq-state-message-recalled-p merged)))
-      (let* ((session (or (gethash session-key qq-state--sessions)
-                          (qq-state--session-template session-key)))
-             (current (or (alist-get 'unread-count session) 0))
-             (anchor (qq-state-message-anchor merged))
-             (kinds (qq-state-message-mention-kinds merged)))
-        (qq-state-upsert-session
-         session-key
-         `((unread-count . ,(1+ current))
-           ,@(when (memq 'at-me kinds)
-               `((unread-at-me-message-id . ,anchor)))
-           ,@(when (memq 'at-all kinds)
-               `((unread-at-all-message-id . ,anchor))))
-         nil)))
     (cl-values merged mutation previous-anchor)))
 
 (defun qq-state-merge-live-message (message)
@@ -1450,9 +1435,7 @@ Return three values via `cl-values':
       (cl-multiple-value-bind (merged mutation previous-anchor)
           (qq-state--merge-normalized-message
            session-key
-           normalized
-           (and (not (alist-get 'self-p normalized))
-                (not (qq-state-message-recalled-p normalized))))
+           normalized)
         (when merged
           (apply #'qq-state--emit
                  'message
@@ -1473,12 +1456,10 @@ no sender display object; use the fork's closed native recall reference for
 authoritative identity, and a local event anchor only for an optimistic local
 echo.  Numeric participant IDs remain display labels of last resort."
   (let* ((message (qq-state--normalize-poke-notice notice))
-         (session-key (alist-get 'session-key message))
-         (self-p (alist-get 'self-p message)))
+         (session-key (alist-get 'session-key message)))
     (when session-key
       (cl-multiple-value-bind (merged mutation previous-anchor)
-          (qq-state--merge-normalized-message
-           session-key message (not self-p))
+          (qq-state--merge-normalized-message session-key message)
         (when merged
           (apply #'qq-state--emit
                  'message
@@ -1496,7 +1477,7 @@ echo.  Numeric participant IDs remain display labels of last resort."
   (let* ((message (qq-state--normalize-gray-tip-notice notice))
          (session-key (alist-get 'session-key message)))
     (cl-multiple-value-bind (merged mutation previous-anchor)
-        (qq-state--merge-normalized-message session-key message nil)
+        (qq-state--merge-normalized-message session-key message)
       (when merged
         (apply #'qq-state--emit
                'message
@@ -1957,8 +1938,7 @@ older/fallback notices without it are applied as a one-step delta."
             (push (cons 'time msg-time) message-copy))
           (qq-state--merge-normalized-message
            session-key
-           (qq-state--normalize-raw-message message-copy session-key)
-           nil)))))
+           (qq-state--normalize-raw-message message-copy session-key))))))
   (qq-state--emit 'sessions-refreshed :count (length contacts))
   (qq-state-sessions))
 

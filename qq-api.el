@@ -833,6 +833,27 @@ NapCat throws when `message_seq' is unknown or the page is empty
   "Return native Emacs action params for SESSION-KEY."
   `((chat . ,(qq-api--session-emacs-locator session-key))))
 
+(defun qq-api--emacs-session-key-from-locator (locator)
+  "Return the unique local session key represented by LOCATOR.
+
+LOCATOR must satisfy the fork's closed `EmacsSessionLocator' union.  Opaque
+peer UIDs stay strings and are never interpreted as QQ numbers."
+  (setq locator
+        (qq-protocol-validate-emacs-session-locator
+         locator "emacs_read_state.chat"))
+  (pcase (alist-get 'kind locator)
+    ("group"
+     (qq-state-session-key 'group (alist-get 'group_id locator)))
+    ("private"
+     (qq-state-session-key 'private (alist-get 'user_id locator)))
+    ("dataline"
+     (qq-state-session-key 'dataline (alist-get 'peer_uid locator)))
+    ("service"
+     (qq-state-session-key 'service (alist-get 'peer_uid locator)))
+    ;; The validator makes this unreachable.  Keep the branch explicit so a
+    ;; future locator kind cannot silently map to the wrong session namespace.
+    (_ (error "qq: unsupported Emacs session locator %S" locator))))
+
 (defun qq-api-fetch-session-read-state (session-key &optional callback errback)
   "Fetch the official Linux QQ read position for SESSION-KEY.
 
@@ -843,7 +864,10 @@ payload after it has been applied to `qq-state'."
    "emacs_get_read_state"
    (qq-api--session-emacs-params session-key)
    (lambda (response)
-     (let ((read-state (qq-api--response-data response)))
+     (let ((read-state
+            (qq-protocol-validate-emacs-read-state
+             (qq-api--response-data response)
+             "emacs_get_read_state response")))
        (qq-state-apply-session-read-state session-key read-state)
        (when callback
          (funcall callback read-state))))
@@ -1587,6 +1611,14 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
 (defun qq-api--handle-notice (notice)
   "Handle websocket NOTICE event."
   (pcase (alist-get 'notice_type notice)
+    ("emacs_read_state"
+     (let* ((event
+             (qq-protocol-validate-emacs-read-state-notice
+              notice "websocket event"))
+            (chat (alist-get 'chat event))
+            (read-state (alist-get 'read_state event))
+            (session-key (qq-api--emacs-session-key-from-locator chat)))
+       (qq-state-apply-session-read-state session-key read-state)))
     ((or "friend_recall" "group_recall")
      (qq-state-apply-recall (alist-get 'message_id notice)))
     ("group_msg_emoji_like"

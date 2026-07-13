@@ -18,6 +18,144 @@
   (dolist (value '(nil :false :null 0 "false" "0" "no"))
     (should-not (qq-protocol-json-true-p value))))
 
+(defun qq-protocol-test--read-state ()
+  "Return one complete strict authoritative read-state payload."
+  '((unread_count . 3)
+    (first_unread
+     . ((sequence . "30001")
+        (message_id . "9007199254742007089")))
+    (mentions
+     . ((at_me
+         . ((sequence . "30003")
+            (message_id . "9007199254742007091")))
+        (at_all . nil)))
+    (latest
+     . ((message_id . "9007199254742007094")
+        (sequence . "30005")))))
+
+(ert-deftest qq-protocol-emacs-session-locator-is-a-closed-union ()
+  (dolist
+      (locator
+       '(((kind . "group") (group_id . "20001"))
+         ((kind . "private") (user_id . "10001"))
+         ((kind . "dataline")
+          (peer_uid . "device-1") (variant . "desktop"))
+         ((kind . "dataline")
+          (peer_uid . "device-2") (variant . "mobile"))
+         ((kind . "service") (peer_uid . "u_mail"))))
+    (let ((validated
+           (qq-protocol-validate-emacs-session-locator locator "event.chat")))
+      (should (equal validated locator))
+      (should-not (eq validated locator))))
+  (dolist
+      (locator
+       '(nil
+         ((kind . "group") (group_id . 20001))
+         ((kind . "group") (group_id . "20001") (extra . t))
+         ((kind . "private") (user_id . ""))
+         ((kind . "dataline") (peer_uid . "device-1"))
+         ((kind . "dataline")
+          (peer_uid . "device-1") (variant . "tablet"))
+         ((kind . "service") (peer_uid . ""))
+         ((kind . "channel") (peer_uid . "opaque"))))
+    (should-not (qq-protocol-emacs-session-locator-p locator))
+    (should-error
+     (qq-protocol-validate-emacs-session-locator locator "event.chat"))))
+
+(ert-deftest qq-protocol-emacs-read-state-is-closed-and-lossless ()
+  (let* ((read-state (qq-protocol-test--read-state))
+         (validated
+          (qq-protocol-validate-emacs-read-state read-state "event.read_state")))
+    (should (equal validated read-state))
+    (should-not (eq validated read-state))
+    (should (equal "9007199254742007089"
+                   (alist-get 'message_id
+                              (alist-get 'first_unread validated)))))
+  (should
+   (qq-protocol-emacs-read-state-p
+    '((unread_count . 0)
+      (first_unread . nil)
+      (mentions . ((at_me . nil) (at_all . nil)))
+      (latest . ((message_id . "9"))))))
+  (dolist
+      (read-state
+       '(((unread_count . -1)
+          (first_unread . nil)
+          (mentions . ((at_me . nil) (at_all . nil)))
+          (latest . nil))
+         ((unread_count . 1.0)
+          (first_unread . nil)
+          (mentions . ((at_me . nil) (at_all . nil)))
+          (latest . nil))
+         ((unread_count . 9007199254740992)
+          (first_unread . nil)
+          (mentions . ((at_me . nil) (at_all . nil)))
+          (latest . nil))
+         ((unread_count . 1)
+          (first_unread . ((sequence . "10") (message_id . 11)))
+          (mentions . ((at_me . nil) (at_all . nil)))
+          (latest . nil))
+         ((unread_count . 1)
+          (first_unread . ((sequence . 10) (message_id . "11")))
+          (mentions . ((at_me . nil) (at_all . nil)))
+          (latest . nil))
+         ((unread_count . 1)
+          (first_unread . ((sequence . "10")))
+          (mentions . ((at_me . nil) (at_all . nil)))
+          (latest . nil))
+         ((unread_count . 1)
+          (first_unread . nil)
+          (mentions . ((at_me . nil)))
+          (latest . nil))
+         ((unread_count . 1)
+          (first_unread . nil)
+          (mentions . ((at_me . nil) (at_all . nil) (extra . t)))
+          (latest . nil))
+         ((unread_count . 1)
+          (first_unread . nil)
+          (mentions . ((at_me . nil) (at_all . nil)))
+          (latest . ((message_id . 12))))
+         ((unread_count . 1)
+          (first_unread . nil)
+          (mentions . ((at_me . nil) (at_all . nil)))
+          (latest . ((message_id . "12") (sequence . nil))))
+         ((unread_count . 1)
+          (first_unread . nil)
+          (mentions . ((at_me . nil) (at_all . nil)))
+          (latest . nil)
+          (extra . t))))
+    (should-not (qq-protocol-emacs-read-state-p read-state))
+    (should-error
+     (qq-protocol-validate-emacs-read-state read-state "event.read_state"))))
+
+(ert-deftest qq-protocol-emacs-read-state-notice-requires-exact-envelope ()
+  (let* ((notice
+          `((time . 1710000200)
+            (self_id . 90001)
+            (post_type . "notice")
+            (notice_type . "emacs_read_state")
+            (chat . ((kind . "group") (group_id . "20001")))
+            (read_state . ,(qq-protocol-test--read-state))))
+         (validated
+          (qq-protocol-validate-emacs-read-state-notice notice "event")))
+    (should (equal validated notice))
+    (should-not (eq validated notice))
+    (dolist
+        (invalid
+         (list
+          (append notice '((extra . t)))
+          (assq-delete-all 'time (copy-tree notice))
+          (cons '(time . 0) (assq-delete-all 'time (copy-tree notice)))
+          (cons '(self_id . "90001")
+                (assq-delete-all 'self_id (copy-tree notice)))
+          (cons '(post_type . "meta_event")
+                (assq-delete-all 'post_type (copy-tree notice)))
+          (cons '(notice_type . "read_state")
+                (assq-delete-all 'notice_type (copy-tree notice)))))
+      (should-not (qq-protocol-emacs-read-state-notice-p invalid))
+      (should-error
+       (qq-protocol-validate-emacs-read-state-notice invalid "event")))))
+
 (ert-deftest qq-protocol-poke-recall-reference-is-closed-and-lossless ()
   (let* ((reference
           '((message_id . "9007199254742007089")

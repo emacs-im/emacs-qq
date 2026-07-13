@@ -672,7 +672,7 @@
                           (alist-get 'local-id message))
                       snowflake))))))
 
-(ert-deftest qq-state-live-message-increments-unread-and-supports-recall ()
+(ert-deftest qq-state-live-message-leaves-unread-to-kernel-and-supports-recall ()
   (qq-test-with-reset
    (qq-state-set-self-info '((user_id . 90001)
                              (nickname . "Me")))
@@ -688,7 +688,7 @@
       (message . (((type . "text")
                    (data . ((text . "hello"))))))))
    (let ((session (qq-state-session "private:10001")))
-     (should (= (alist-get 'unread-count session) 1)))
+     (should (= (alist-get 'unread-count session) 0)))
    (qq-state-apply-recall "9007199254741004123")
    (let ((message (car (qq-state-session-messages "private:10001"))))
      (should (qq-state-message-recalled-p message))
@@ -714,10 +714,29 @@
                     (qq-state-message-mention-kinds message)))
      (should (qq-state-message-mentions-self-p message))
      (should (qq-state-message-mentions-all-p message))
-     (should (equal "9007199254741004991"
-                    (alist-get 'unread-at-me-message-id session)))
-     (should (equal "9007199254741004991"
-                    (alist-get 'unread-at-all-message-id session))))))
+     ;; Mention classification belongs to the message.  Session-level unread
+     ;; anchors come only from the authoritative kernel read-state event.
+     (should-not (alist-get 'unread-at-me-message-id session))
+     (should-not (alist-get 'unread-at-all-message-id session))
+     (should (= 0 (alist-get 'unread-count session))))))
+
+(ert-deftest qq-state-live-message-does-not-change-authoritative-unread-count ()
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . 90001) (nickname . "Me")))
+   (qq-state-upsert-session
+    "private:10001"
+    '((type . private) (target-id . "10001") (unread-count . 5))
+    nil)
+   (qq-state-merge-live-message
+    '((post_type . "message")
+      (message_type . "private")
+      (message_id . "9007199254741004992")
+      (user_id . 10001)
+      (time . 1710000002)
+      (sender . ((user_id . 10001) (nickname . "Alice")))
+      (message . (((type . "text") (data . ((text . "next"))))))))
+   (should (= 5 (alist-get 'unread-count
+                           (qq-state-session "private:10001"))))))
 
 (ert-deftest qq-state-apply-recall-keeps-stub-in-store ()
   (qq-test-with-reset
@@ -812,7 +831,7 @@
      (should (equal (alist-get 'title session) "我的手机"))
      (should (equal (alist-get 'sender-name message) "我的手机"))
      (should-not (alist-get 'self-p message))
-     (should (= (alist-get 'unread-count session) 1)))))
+     (should (= (alist-get 'unread-count session) 0)))))
 
 (ert-deftest qq-state-live-service-message-routes-by-peer-uid ()
   (qq-test-with-reset
@@ -838,7 +857,7 @@
      (should (equal (alist-get 'title session) "QQ邮箱提醒"))
      (should (equal (alist-get 'preview message)
                     "Henrik Lissner: Re: Doom Emacs"))
-     (should (= (alist-get 'unread-count session) 1)))))
+     (should (= (alist-get 'unread-count session) 0)))))
 
 (ert-deftest qq-state-mail-segment-preview-prefers-protocol-prompt ()
   (should

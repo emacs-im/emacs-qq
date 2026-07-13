@@ -30,6 +30,30 @@
     (root_message_id . "9007199254742007001")
     (parent_message_id . "9007199254742007002")))
 
+(defun qq-api-test--read-state ()
+  "Return one complete fork-native authoritative read state."
+  '((unread_count . 5)
+    (first_unread
+     . ((sequence . "30001")
+        (message_id . "9007199254742007089")))
+    (mentions
+     . ((at_me
+         . ((sequence . "30003")
+            (message_id . "9007199254742007091")))
+        (at_all . nil)))
+    (latest
+     . ((message_id . "9007199254742007094")
+        (sequence . "30005")))))
+
+(defun qq-api-test--read-state-notice (chat)
+  "Return one strict read-state notice for CHAT."
+  `((time . 1710000200)
+    (self_id . 90001)
+    (post_type . "notice")
+    (notice_type . "emacs_read_state")
+    (chat . ,chat)
+    (read_state . ,(qq-api-test--read-state))))
+
 (ert-deftest qq-api-send-message-builds-send-msg-request ()
   (let (captured-action captured-params pending-call)
     (cl-letf (((symbol-function 'qq-state-insert-pending-message)
@@ -179,6 +203,24 @@
             '((kind . "service")
               (peer_uid . "u_mail"))))))
 
+(ert-deftest qq-api-emacs-session-locator-generates-one-session-key ()
+  (dolist
+      (case
+       '((((kind . "group") (group_id . "20001")) . "group:20001")
+         (((kind . "private") (user_id . "10001")) . "private:10001")
+         (((kind . "dataline")
+           (peer_uid . "device-1") (variant . "desktop"))
+          . "dataline:device-1")
+         (((kind . "dataline")
+           (peer_uid . "device-2") (variant . "mobile"))
+          . "dataline:device-2")
+         (((kind . "service") (peer_uid . "u_mail")) . "service:u_mail")))
+    (should (equal (qq-api--emacs-session-key-from-locator (car case))
+                   (cdr case))))
+  (should-error
+   (qq-api--emacs-session-key-from-locator
+    '((kind . "private") (user_id . 10001)))))
+
 (ert-deftest qq-api-mark-session-read-coalesces-and-restores-new-arrivals ()
   (let ((qq-state-change-hook nil)
         (qq-api--read-operations (make-hash-table :test #'equal))
@@ -295,6 +337,8 @@
                                      (first_unread
                                       . ((sequence . "30001")
                                          (message_id . "9007199254742007089")))
+                                     (mentions
+                                      . ((at_me . nil) (at_all . nil)))
                                      (latest . nil)))))
                  'sent)))
       (qq-api-fetch-session-read-state
@@ -305,6 +349,31 @@
                      (alist-get 'chat captured-params)))
       (should (equal (car applied) "group:20001"))
       (should (equal callback-value (cadr applied))))))
+
+(ert-deftest qq-api-fetch-session-read-state-rejects-lossy-wire-id ()
+  (let (applied callback-called)
+    (cl-letf (((symbol-function 'qq-state-session)
+               (lambda (_session-key)
+                 '((type . group) (target-id . "20001"))))
+              ((symbol-function 'qq-state-apply-session-read-state)
+               (lambda (&rest _args) (setq applied t)))
+              ((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional _errback)
+                 (funcall
+                  callback
+                  '((data
+                     . ((unread_count . 1)
+                        (first_unread
+                         . ((sequence . "30001")
+                            (message_id . 9007199254742007089)))
+                        (mentions . ((at_me . nil) (at_all . nil)))
+                        (latest . nil)))))
+                 'sent)))
+      (should-error
+       (qq-api-fetch-session-read-state
+        "group:20001" (lambda (_state) (setq callback-called t))))
+      (should-not applied)
+      (should-not callback-called))))
 
 (ert-deftest qq-api-fetch-older-history-uses-peer-history-for-service-sessions ()
   (let (captured-action captured-params)
@@ -376,6 +445,54 @@
          (message_id . "9007199254750003456")
          (busi_id . "19366")))
       (should (equal (alist-get 'busi_id received) "19366")))))
+
+(ert-deftest qq-api-handle-read-state-notice-applies-authoritative-state ()
+  (let (applications)
+    (cl-letf (((symbol-function 'qq-state-apply-session-read-state)
+               (lambda (session-key read-state)
+                 (push (list session-key read-state) applications))))
+      (dolist
+          (case
+           '((((kind . "group") (group_id . "20001")) . "group:20001")
+             (((kind . "private") (user_id . "10001")) . "private:10001")
+             (((kind . "dataline")
+               (peer_uid . "device-1") (variant . "desktop"))
+              . "dataline:device-1")
+             (((kind . "service") (peer_uid . "u_mail")) . "service:u_mail")))
+        (qq-api-handle-event
+         (qq-api-test--read-state-notice (car case)))
+        (let ((application (car applications)))
+          (should (equal (car application) (cdr case)))
+          (should (equal (cadr application) (qq-api-test--read-state)))
+          (should (equal
+                   "9007199254742007089"
+                   (alist-get 'message_id
+                              (alist-get 'first_unread (cadr application)))))))
+      (should (= 4 (length applications))))))
+
+(ert-deftest qq-api-handle-read-state-notice-rejects-old-or-lossy-shapes ()
+  (let ((base
+         (qq-api-test--read-state-notice
+          '((kind . "private") (user_id . "10001"))))
+        applied)
+    (cl-letf (((symbol-function 'qq-state-apply-session-read-state)
+               (lambda (&rest _args) (setq applied t))))
+      (let* ((numeric (copy-tree base))
+             (read-state (alist-get 'read_state numeric))
+             (first (alist-get 'first_unread read-state)))
+        (setf (alist-get 'message_id first) 9007199254742007089)
+        (dolist
+            (invalid
+             (list
+              numeric
+              (append (copy-tree base) '((extra . t)))
+              (assq-delete-all 'read_state (copy-tree base))
+              `((post_type . "notice")
+                (notice_type . "emacs_read_state")
+                (chat . ((kind . "private") (user_id . "10001")))
+                (read_state . ,(qq-api-test--read-state)))))
+          (should-error (qq-api-handle-event invalid))
+          (should-not applied))))))
 
 (ert-deftest qq-api-handle-notice-dispatches-emoji-like ()
   (let (received)
