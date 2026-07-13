@@ -95,29 +95,29 @@
                  '((local-id . "local-1"))))
               ((symbol-function 'qq-state-session)
                (lambda (_session-key)
-                 '((key . "dataline:device-1")
+                 '((key . "dataline:desktop:wrong")
                    (type . dataline)
-                   (target-id . "device-1")
+                   (target-id . "wrong")
                    (chat-type . "8")
-                   (peer-uid . "device-1"))))
+                   (peer-uid . "wrong"))))
               ((symbol-function 'qq-api-call)
                (lambda (action params _callback &optional _errback)
                  (setq captured-action action)
                  (setq captured-params params)
                  'sent)))
       (qq-api-send-message
-       "dataline:device-1"
+       "dataline:mobile:dev:a"
        '(((type . "text")
           (data . ((text . "hello phone")))))
        "hello phone")
       (should (equal pending-call
-                     '("dataline:device-1"
+                     '("dataline:mobile:dev:a"
                        (((type . "text")
                          (data . ((text . "hello phone")))))
                        "hello phone")))
       (should (equal captured-action "send_msg"))
-      (should (equal (alist-get 'chat_type captured-params) "8"))
-      (should (equal (alist-get 'peer_uid captured-params) "device-1"))
+      (should (equal (alist-get 'chat_type captured-params) "134"))
+      (should (equal (alist-get 'peer_uid captured-params) "dev:a"))
       (should-not (alist-get 'user_id captured-params)))))
 
 (ert-deftest qq-api-send-message-rejects-read-only-service-session ()
@@ -168,28 +168,15 @@
       (should-not (gethash "private:10001" qq-api--read-operations)))))
 
 (ert-deftest qq-api-session-emacs-locator-tags-kernel-only-session-kinds ()
-  (cl-letf (((symbol-function 'qq-state-session)
-             (lambda (session-key)
-               (pcase session-key
-                 ("dataline:device-1"
-                  '((type . dataline)
-                    (target-id . "device-1")
-                    (chat-type . "134")
-                    (peer-uid . "device-1")))
-                 ("service:u_mail"
-                  '((type . service)
-                    (target-id . "u_mail")
-                    (chat-type . "103")
-                    (peer-uid . "u_mail")))))))
-    (should
-     (equal (qq-api--session-emacs-locator "dataline:device-1")
-            '((kind . "dataline")
-              (peer_uid . "device-1")
-              (variant . "mobile"))))
-    (should
-     (equal (qq-api--session-emacs-locator "service:u_mail")
-            '((kind . "service")
-              (peer_uid . "u_mail"))))))
+  (should
+   (equal (qq-api--session-emacs-locator "dataline:mobile:dev:a")
+          '((kind . "dataline")
+            (peer_uid . "dev:a")
+            (variant . "mobile"))))
+  (should
+   (equal (qq-api--session-emacs-locator "service:u:mail:x")
+          '((kind . "service")
+            (peer_uid . "u:mail:x")))))
 
 (ert-deftest qq-api-emacs-session-locator-generates-one-session-key ()
   (dolist
@@ -197,12 +184,13 @@
        '((((kind . "group") (group_id . "20001")) . "group:20001")
          (((kind . "private") (user_id . "10001")) . "private:10001")
          (((kind . "dataline")
-           (peer_uid . "device-1") (variant . "desktop"))
-          . "dataline:device-1")
+           (peer_uid . "dev:a") (variant . "desktop"))
+          . "dataline:desktop:dev:a")
          (((kind . "dataline")
-           (peer_uid . "device-2") (variant . "mobile"))
-          . "dataline:device-2")
-         (((kind . "service") (peer_uid . "u_mail")) . "service:u_mail")))
+           (peer_uid . "dev:a") (variant . "mobile"))
+          . "dataline:mobile:dev:a")
+         (((kind . "service") (peer_uid . "u:mail:x"))
+          . "service:u:mail:x")))
     (should (equal (qq-api--emacs-session-key-from-locator (car case))
                    (cdr case))))
   (should-error
@@ -318,11 +306,11 @@
   (let (captured-action captured-params merged done-meta)
     (cl-letf (((symbol-function 'qq-state-session)
                (lambda (_session-key)
-                 '((key . "dataline:device-1")
+                 '((key . "dataline:desktop:wrong")
                    (type . dataline)
-                   (target-id . "device-1")
+                   (target-id . "wrong")
                    (chat-type . "8")
-                   (peer-uid . "device-1"))))
+                   (peer-uid . "wrong"))))
               ((symbol-function 'qq-state-merge-history)
                (lambda (session-key messages)
                  (setq merged (list session-key messages))
@@ -335,13 +323,25 @@
                  (setq captured-params params)
                  (funcall callback '((data . ((messages . (((message_id . 1))))))) )
                  'sent)))
-      (qq-api-fetch-older-history "dataline:device-1" nil
+      (qq-api-fetch-older-history "dataline:mobile:dev:a" nil
                             (lambda (meta) (setq done-meta meta)))
       (should (equal captured-action "get_peer_msg_history"))
-      (should (equal (alist-get 'chat_type captured-params) "8"))
-      (should (equal (alist-get 'peer_uid captured-params) "device-1"))
-      (should (equal merged '("dataline:device-1" (((message_id . 1))))))
+      (should (equal (alist-get 'chat_type captured-params) "134"))
+      (should (equal (alist-get 'peer_uid captured-params) "dev:a"))
+      (should (equal merged
+                     '("dataline:mobile:dev:a" (((message_id . 1))))))
       (should (= (plist-get done-meta :added-count) 1)))))
+
+(ert-deftest qq-api-history-around-preserves-mobile-colon-peer-identity ()
+  (let ((params
+         (qq-api--history-around-params
+          "dataline:mobile:dev:a" "9007199254742007089" 17)))
+    (should
+     (equal params
+            '((message_id . "9007199254742007089")
+              (count . 17)
+              (chat_type . "134")
+              (peer_uid . "dev:a"))))))
 
 (ert-deftest qq-api-fetch-session-read-state-returns-validated-raw-result ()
   (let (captured-action captured-params applied callback-value)
@@ -530,11 +530,11 @@
   (let (captured-action captured-params)
     (cl-letf (((symbol-function 'qq-state-session)
                (lambda (_session-key)
-                 '((key . "service:u_mail")
+                 '((key . "service:wrong")
                    (type . service)
-                   (target-id . "u_mail")
+                   (target-id . "wrong")
                    (chat-type . "103")
-                   (peer-uid . "u_mail"))))
+                   (peer-uid . "wrong"))))
               ((symbol-function 'qq-state-merge-history)
                (lambda (&rest _) (list :added-count 0 :message-count 0)))
               ((symbol-function 'qq-api-call)
@@ -543,10 +543,10 @@
                        captured-params params)
                  (funcall callback '((data . ((messages . nil)))))
                  'sent)))
-      (qq-api-fetch-older-history "service:u_mail")
+      (qq-api-fetch-older-history "service:u:mail:x")
       (should (equal captured-action "get_peer_msg_history"))
       (should (equal (alist-get 'chat_type captured-params) "103"))
-      (should (equal (alist-get 'peer_uid captured-params) "u_mail"))
+      (should (equal (alist-get 'peer_uid captured-params) "u:mail:x"))
       (should-not (alist-get 'user_id captured-params)))))
 
 (ert-deftest qq-api-bootstrap-normalizes-contacts-after-identity-and-names ()
@@ -610,9 +610,10 @@
            '((((kind . "group") (group_id . "20001")) . "group:20001")
              (((kind . "private") (user_id . "10001")) . "private:10001")
              (((kind . "dataline")
-               (peer_uid . "device-1") (variant . "desktop"))
-              . "dataline:device-1")
-             (((kind . "service") (peer_uid . "u_mail")) . "service:u_mail")))
+               (peer_uid . "dev:a") (variant . "mobile"))
+              . "dataline:mobile:dev:a")
+             (((kind . "service") (peer_uid . "u:mail:x"))
+              . "service:u:mail:x")))
         (qq-api-handle-event
          (qq-api-test--read-state-notice (car case)))
         (let ((application (car applications)))
@@ -624,6 +625,32 @@
                               (alist-get 'first_unread (cadr application)))))))
       (should (= 4 (length applications)))
       (should (= 4 qq-api--read-observation-clock)))))
+
+(ert-deftest qq-api-read-notice-first-creates-lossless-mobile-session ()
+  (let ((qq-state-change-hook nil)
+        (qq-api--read-observation-clock 0)
+        (qq-api--session-read-observation-tokens
+         (make-hash-table :test #'equal))
+        (locator '((kind . "dataline")
+                   (peer_uid . "dev:a")
+                   (variant . "mobile"))))
+    (qq-state-reset)
+    (unwind-protect
+        (progn
+          (qq-api-handle-event (qq-api-test--read-state-notice locator))
+          (let ((session (qq-state-session "dataline:mobile:dev:a")))
+            (should session)
+            (should (eq (alist-get 'type session) 'dataline))
+            (should (equal (alist-get 'target-id session) "dev:a"))
+            (should (equal (alist-get 'chat-type session) "134"))
+            (should (equal (alist-get 'peer-uid session) "dev:a"))
+            (should (equal (alist-get 'variant session) "mobile"))
+            (should (= (alist-get 'unread-count session) 5))
+            (should (equal
+                     (qq-api--session-emacs-locator
+                      "dataline:mobile:dev:a")
+                     locator))))
+      (qq-state-reset))))
 
 (ert-deftest qq-api-handle-read-state-notice-rejects-old-or-lossy-shapes ()
   (let ((base
@@ -769,10 +796,9 @@
   (qq-state-reset)
   (should-error (qq-api-send-poke "private:10002" "10002")
                 :type 'user-error)
-  (qq-state-upsert-session
-   "private:invalid" '((type . private) (target-id . "invalid")))
-  (should-error (qq-api-send-poke "private:invalid" "10002")
-                :type 'user-error)
+  (should-error
+   (qq-state-upsert-session
+    "private:invalid" '((type . private) (target-id . "invalid"))))
   (qq-state-upsert-session
    "group:0" '((type . group) (target-id . "0")))
   (should-error (qq-api-send-poke "group:0" "10002")

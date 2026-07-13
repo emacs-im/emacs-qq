@@ -786,25 +786,20 @@ self message as incoming or store a weaker sender display name."
 
 (defun qq-api--session-request-params (session-key)
   "Return base request params for SESSION-KEY."
-  (let* ((session (qq-state-session session-key))
-         (type (or (alist-get 'type session)
-                   (qq-state-session-key-type session-key)))
-         (target-id (or (alist-get 'target-id session)
-                        (qq-state-session-key-target-id session-key))))
+  (let* ((identity (qq-state-session-key-identity session-key))
+         (type (alist-get 'type identity))
+         (target-id (alist-get 'target-id identity)))
     (pcase type
       ('group
        `((group_id . ,target-id)))
       ('dataline
-       `((chat_type . ,(or (alist-get 'chat-type session) 8))
-         (peer_uid . ,(or (alist-get 'peer-uid session)
-                          target-id))))
+       `((chat_type . ,(alist-get 'chat-type identity))
+         (peer_uid . ,(alist-get 'peer-uid identity))))
       ('service
-       `((chat_type . ,(or (alist-get 'chat-type session) 103))
-         (peer_uid . ,(or (alist-get 'peer-uid session)
-                          target-id))))
+       `((chat_type . ,(alist-get 'chat-type identity))
+         (peer_uid . ,(alist-get 'peer-uid identity))))
       ('private
-       `((user_id . ,(or (alist-get 'peer-uin session)
-                         target-id))))
+       `((user_id . ,target-id)))
       (_
        (user-error "qq: unsupported session key %S" session-key)))))
 
@@ -824,38 +819,21 @@ NapCat throws when `message_seq' is unknown or the page is empty
 
 (defun qq-api--session-emacs-locator (session-key)
   "Return the closed Emacs protocol locator for SESSION-KEY."
-  (let* ((session (qq-state-session session-key))
-         (raw-type (or (alist-get 'type session)
-                       (qq-state-session-key-type session-key)))
-         (type (pcase raw-type
-                 ((or 'group "group") 'group)
-                 ((or 'private "private") 'private)
-                 ((or 'dataline "dataline") 'dataline)
-                 ((or 'service "service") 'service)
-                 (_ raw-type)))
-         (target-id (or (alist-get 'target-id session)
-                        (qq-state-session-key-target-id session-key))))
+  (let* ((identity (qq-state-session-key-identity session-key))
+         (type (alist-get 'type identity))
+         (target-id (alist-get 'target-id identity)))
     (pcase type
-      ((or 'group 'private)
-       (qq-api-chat-locator session-key))
+      ('group
+       `((kind . "group") (group_id . ,target-id)))
+      ('private
+       `((kind . "private") (user_id . ,target-id)))
       ('dataline
-       (let ((peer-uid (or (alist-get 'peer-uid session) target-id))
-             (chat-type (alist-get 'chat-type session)))
-         (unless peer-uid
-           (error "qq: dataline session %s has no peer uid" session-key))
-         `((kind . "dataline")
-           (peer_uid . ,(format "%s" peer-uid))
-           (variant . ,(pcase (and chat-type (format "%s" chat-type))
-                         ("8" "desktop")
-                         ("134" "mobile")
-                         (_ (error "qq: unsupported dataline chat type %s"
-                                   chat-type)))))))
+       `((kind . "dataline")
+         (peer_uid . ,(alist-get 'peer-uid identity))
+         (variant . ,(alist-get 'variant identity))))
       ('service
-       (let ((peer-uid (or (alist-get 'peer-uid session) target-id)))
-         (unless peer-uid
-           (error "qq: service session %s has no peer uid" session-key))
-         `((kind . "service")
-           (peer_uid . ,(format "%s" peer-uid)))))
+       `((kind . "service")
+         (peer_uid . ,(alist-get 'peer-uid identity))))
       (_ (error "qq: unsupported Emacs session type %s" type)))))
 
 (defun qq-api--session-emacs-params (session-key)
@@ -876,7 +854,9 @@ peer UIDs stay strings and are never interpreted as QQ numbers."
     ("private"
      (qq-state-session-key 'private (alist-get 'user_id locator)))
     ("dataline"
-     (qq-state-session-key 'dataline (alist-get 'peer_uid locator)))
+     (qq-state-session-key 'dataline
+                           (alist-get 'peer_uid locator)
+                           (alist-get 'variant locator)))
     ("service"
      (qq-state-session-key 'service (alist-get 'peer_uid locator)))
     ;; The validator makes this unreachable.  Keep the branch explicit so a
@@ -927,9 +907,8 @@ COUNT overrides `qq-history-fetch-count' when non-nil (used by jump seek).
 CALLBACK receives the merge-history plist
 \(`:added-count', `:message-count', `:oldest-message-id', …).
 ERRBACK receives (RESPONSE REASON)."
-  (let* ((session (qq-state-session session-key))
-         (type (or (alist-get 'type session)
-                   (qq-state-session-key-type session-key)))
+  (let* ((type (alist-get 'type
+                          (qq-state-session-key-identity session-key)))
          (action (pcase type
                    ('group "get_group_msg_history")
                    ('dataline "get_peer_msg_history")
@@ -963,29 +942,16 @@ BEFORE-MESSAGE-ID is the optional older-page cursor."
 
 (defun qq-api-chat-locator (session-key)
   "Return strict fork-native ChatLocator for SESSION-KEY."
-  (let* ((session (qq-state-session session-key))
-         (raw-type (or (alist-get 'type session)
-                       (qq-state-session-key-type session-key)))
-         (type (pcase raw-type
-                 ((or 'group "group") "group")
-                 ((or 'private "private") "private")
-                 ((or 'dataline "dataline") "dataline")
-                 ((or 'service "service") "service")
-                 (_ raw-type)))
-         (target-id
-          (if (equal type "private")
-              (or (alist-get 'peer-uin session)
-                  (alist-get 'target-id session)
-                  (qq-state-session-key-target-id session-key))
-            (or (alist-get 'target-id session)
-                (qq-state-session-key-target-id session-key)))))
-    (unless (member type '("group" "private"))
+  (let* ((identity (qq-state-session-key-identity session-key))
+         (type (alist-get 'type identity))
+         (target-id (alist-get 'target-id identity)))
+    (unless (memq type '(group private))
       (user-error "qq: forwarding to %s sessions is not supported" type))
     (unless (qq-api-user-id-p target-id)
       (user-error
        "qq: forward session %s requires a decimal string target id"
        session-key))
-    (if (equal type "group")
+    (if (eq type 'group)
         `((kind . "group") (group_id . ,target-id))
       `((kind . "private") (user_id . ,target-id)))))
 
@@ -1139,11 +1105,9 @@ BEFORE-MESSAGE-ID is the optional older-page cursor."
   "Build `get_msg_history_around' params for SESSION-KEY centered on MESSAGE-ID."
   (setq message-id
         (qq-api-validate-message-id message-id "get_msg_history_around"))
-  (let* ((session (qq-state-session session-key))
-         (type (or (alist-get 'type session)
-                   (qq-state-session-key-type session-key)))
-         (target-id (or (alist-get 'target-id session)
-                        (qq-state-session-key-target-id session-key)))
+  (let* ((identity (qq-state-session-key-identity session-key))
+         (type (alist-get 'type identity))
+         (target-id (alist-get 'target-id identity))
          (params `((message_id . ,message-id)
                    (count . ,(max 1 count)))))
     (pcase type
@@ -1151,19 +1115,15 @@ BEFORE-MESSAGE-ID is the optional older-page cursor."
        (append params `((group_id . ,(format "%s" target-id)))))
       ('dataline
        (append params
-               `((chat_type . ,(or (alist-get 'chat-type session) 8))
-                 (peer_uid . ,(or (alist-get 'peer-uid session)
-                                  target-id)))))
+               `((chat_type . ,(alist-get 'chat-type identity))
+                 (peer_uid . ,(alist-get 'peer-uid identity)))))
       ('service
        (append params
-               `((chat_type . ,(or (alist-get 'chat-type session) 103))
-                 (peer_uid . ,(or (alist-get 'peer-uid session)
-                                  target-id)))))
+               `((chat_type . ,(alist-get 'chat-type identity))
+                 (peer_uid . ,(alist-get 'peer-uid identity)))))
       (_
        (append params
-               `((user_id . ,(format "%s"
-                                     (or (alist-get 'peer-uin session)
-                                         target-id)))))))))
+               `((user_id . ,target-id)))))))
 
 (defun qq-api-fetch-history-around (session-key message-id callback &optional errback count)
   "Fetch a history window around MESSAGE-ID (NapCat `get_msg_history_around').
@@ -1306,8 +1266,9 @@ websocket notice is deduplicated by its local second-level anchor."
       (user-error "qq: poke requires an existing session"))
     (unless (qq-api--poke-id-p target-id)
       (user-error "qq: poke target must be a nonzero decimal QQ string"))
-    (let* ((type (alist-get 'type session))
-           (peer-id (alist-get 'target-id session))
+    (let* ((identity (qq-state-session-key-identity session-key))
+           (type (alist-get 'type identity))
+           (peer-id (alist-get 'target-id identity))
            (params
             (pcase type
               ('group

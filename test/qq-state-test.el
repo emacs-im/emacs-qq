@@ -28,16 +28,75 @@
                   "private:12345"))
    (should (equal (qq-state-session-key 'group "67890")
                   "group:67890"))
-   (should (equal (qq-state-session-key 'dataline "device-1")
-                  "dataline:device-1"))
+   (should (equal (qq-state-session-key 'dataline "device-1" 'desktop)
+                  "dataline:desktop:device-1"))
    (should (equal (qq-state-session-key 'service "u_mail")
                   "service:u_mail"))
+   (should-error (qq-state-session-key 'private "12345" 'desktop))
    (should-error (qq-state-session-key 'unknown "target"))))
+
+(ert-deftest qq-state-session-key-round-trips-lossless-native-identities ()
+  (let* ((desktop-key
+          (qq-state-session-key 'dataline "dev:a" "desktop"))
+         (mobile-key
+          (qq-state-session-key 'dataline "dev:a" "mobile"))
+         (desktop (qq-state-session-key-identity desktop-key))
+         (mobile (qq-state-session-key-identity mobile-key))
+         (service-key (qq-state-session-key 'service "u:mail:x"))
+         (service (qq-state-session-key-identity service-key)))
+    (should (equal desktop-key "dataline:desktop:dev:a"))
+    (should (equal mobile-key "dataline:mobile:dev:a"))
+    (should-not (equal desktop-key mobile-key))
+    (should (equal desktop
+                   '((type . dataline)
+                     (target-id . "dev:a")
+                     (chat-type . "8")
+                     (peer-uid . "dev:a")
+                     (variant . "desktop"))))
+    (should (equal mobile
+                   '((type . dataline)
+                     (target-id . "dev:a")
+                     (chat-type . "134")
+                     (peer-uid . "dev:a")
+                     (variant . "mobile"))))
+    (should (equal service-key "service:u:mail:x"))
+    (should (equal service
+                   '((type . service)
+                     (target-id . "u:mail:x")
+                     (chat-type . "103")
+                     (peer-uid . "u:mail:x")
+                     (variant . nil))))))
+
+(ert-deftest qq-state-session-key-rejects-incomplete-or-legacy-identities ()
+  (should-error (qq-state-session-key 'dataline "dev:a"))
+  (should-error (qq-state-session-key 'dataline "" 'desktop))
+  (should-error (qq-state-session-key 'service ""))
+  (should-error (qq-state-session-key-identity "dataline:dev:a"))
+  (should-error (qq-state-session-key-identity "dataline:mobile:"))
+  (should-error (qq-state-session-key-identity "service:"))
+  (should-error (qq-state-session-key-identity "private:not-a-number")))
+
+(ert-deftest qq-state-upsert-keeps-key-identity-and-private-native-uid ()
+  (qq-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((type . group)
+      (target-id . "99999")
+      (chat-type . "2")
+      (peer-uid . "u:native:alice")
+      (variant . "mobile"))
+    nil)
+   (let ((session (qq-state-session "private:10001")))
+     (should (eq (alist-get 'type session) 'private))
+     (should (equal (alist-get 'target-id session) "10001"))
+     (should (equal (alist-get 'chat-type session) "1"))
+     (should (equal (alist-get 'peer-uid session) "u:native:alice"))
+     (should-not (alist-get 'variant session)))))
 
 (ert-deftest qq-state-session-sendable-p-is-an-explicit-capability ()
   (should (qq-state-session-sendable-p "private:10001"))
   (should (qq-state-session-sendable-p "group:20001"))
-  (should (qq-state-session-sendable-p "dataline:device-1"))
+  (should (qq-state-session-sendable-p "dataline:desktop:device-1"))
   (should-not (qq-state-session-sendable-p "service:u_mail"))
   (should-not (qq-state-session-sendable-p "unknown:target"))
   (should-not (qq-state-session-sendable-p nil)))
@@ -445,6 +504,7 @@
        (lastestMsg
         (time . 1710000000)
         (message_type . "private")
+        (chat_type . 1)
         (user_id . 10001)
         (raw_message . "hello from napcat")
         (message . (((type . "text")
@@ -642,6 +702,7 @@
     (qq-state-merge-live-message
      '((post_type . "message")
        (message_type . "group")
+       (chat_type . 2)
        (message_id . 9007199254742007089)
        (group_id . "20001")
        (user_id . "10001")
@@ -685,7 +746,7 @@
   (qq-test-with-reset
    (qq-state-apply-recent-contacts
     '(((chatType . 8)
-       (peerUid . "device-1")
+       (peerUid . "dev:a")
        (peerUin . "0")
        (remark . "")
        (peerName . "")
@@ -695,7 +756,7 @@
         (time . 1710000000)
         (message_type . "private")
         (chat_type . 8)
-        (peer_uid . "device-1")
+        (peer_uid . "dev:a")
         (peer_uin . "0")
         (user_id . 0)
         (sender . ((user_id . 0)
@@ -703,8 +764,8 @@
         (raw_message . "hello from phone")
         (message . (((type . "text")
                      (data . ((text . "hello from phone"))))))))
-      ((chatType . 8)
-       (peerUid . "device-2")
+      ((chatType . 134)
+       (peerUid . "dev:a")
        (peerUin . "0")
        (remark . "")
        (peerName . "")
@@ -713,8 +774,8 @@
        (lastestMsg
         (time . 1710000001)
         (message_type . "private")
-        (chat_type . 8)
-        (peer_uid . "device-2")
+        (chat_type . 134)
+        (peer_uid . "dev:a")
         (peer_uin . "0")
         (user_id . 0)
         (sender . ((user_id . 0)
@@ -722,14 +783,27 @@
         (raw_message . "second device")
         (message . (((type . "text")
                      (data . ((text . "second device"))))))))))
-   (let ((session-1 (qq-state-session "dataline:device-1"))
-         (session-2 (qq-state-session "dataline:device-2")))
+   (let ((session-1 (qq-state-session "dataline:desktop:dev:a"))
+         (session-2 (qq-state-session "dataline:mobile:dev:a")))
      (should (equal (alist-get 'title session-1) "我的手机"))
      (should (equal (alist-get 'title session-2) "我的手机"))
-     (should (equal (alist-get 'peer-uid session-1) "device-1"))
-     (should (equal (alist-get 'peer-uid session-2) "device-2"))
+     (should (equal (alist-get 'peer-uid session-1) "dev:a"))
+     (should (equal (alist-get 'peer-uid session-2) "dev:a"))
+     (should (equal (alist-get 'variant session-1) "desktop"))
+     (should (equal (alist-get 'variant session-2) "mobile"))
+     (should (equal (alist-get 'chat-type session-1) "8"))
+     (should (equal (alist-get 'chat-type session-2) "134"))
      (should (equal (alist-get 'last-message-preview session-1) "hello from phone"))
      (should (equal (alist-get 'last-message-preview session-2) "second device")))))
+
+(ert-deftest qq-state-recent-contacts-require-exact-native-identity ()
+  (qq-test-with-reset
+   (qq-state-apply-recent-contacts
+    '(((chatType . 8) (peerUid . "") (peerUin . "90001"))
+      ((chatType . 134) (peerUin . "90002"))
+      ((chatType . 103) (peerUid . "") (peerUin . "90003"))
+      ((chatType . 999) (peerUid . "u:unknown") (peerUin . "90004"))))
+   (should-not (qq-state-sessions))))
 
 (ert-deftest qq-state-send-pending-message-transitions-to-sent ()
   (qq-test-with-reset
@@ -758,6 +832,7 @@
    (qq-state-merge-live-message
     '((post_type . "message")
       (message_type . "private")
+      (chat_type . 1)
       (message_id . "9007199254741004123")
       (user_id . 10001)
       (time . 1710000001)
@@ -779,6 +854,7 @@
    (qq-state-merge-live-message
     '((post_type . "message")
       (message_type . "group")
+      (chat_type . 2)
       (group_id . 20001)
       (message_id . "9007199254741004991")
       (user_id . 10001)
@@ -809,6 +885,7 @@
    (qq-state-merge-live-message
     '((post_type . "message")
       (message_type . "private")
+      (chat_type . 1)
       (message_id . "9007199254741004992")
       (user_id . 10001)
       (time . 1710000002)
@@ -824,6 +901,7 @@
    (qq-state-merge-live-message
     '((post_type . "message_sent")
       (message_type . "private")
+      (chat_type . 1)
       (message_id . "9007199254741005555")
       (user_id . 90001)
       (target_id . 10001)
@@ -844,6 +922,7 @@
    (qq-state-merge-live-message
     '((post_type . "message")
       (message_type . "private")
+      (chat_type . 1)
       (message_id . "9007199254741006666")
       (user_id . 10001)
       (time . 1710000001)
@@ -863,6 +942,7 @@
    (qq-state-merge-live-message
     '((post_type . "message_sent")
       (message_type . "private")
+      (chat_type . 1)
       (message_id . "9007199254741005555")
       (user_id . 90001)
       (target_id . 10001)
@@ -876,6 +956,7 @@
     (list
      '((post_type . "message_sent")
        (message_type . "private")
+       (chat_type . 1)
        (message_id . "9007199254741005555")
        (user_id . 90001)
        (target_id . 10001)
@@ -886,15 +967,15 @@
    (should (qq-state-message-recalled-p
             (car (qq-state-session-messages "private:10001"))))))
 
-(ert-deftest qq-state-live-dataline-message-routes-by-peer-uid ()
+(ert-deftest qq-state-live-mobile-dataline-preserves-colon-peer-uid ()
   (qq-test-with-reset
    (qq-state-set-self-info '((user_id . 90001)
                              (nickname . "Me")))
    (qq-state-merge-live-message
     '((post_type . "message")
       (message_type . "private")
-      (chat_type . 8)
-      (peer_uid . "device-1")
+      (chat_type . 134)
+      (peer_uid . "dev:a")
       (peer_uin . "0")
       (peer_name . "我的手机")
       (message_id . "123")
@@ -905,12 +986,62 @@
       (raw_message . "hello")
       (message . (((type . "text")
                    (data . ((text . "hello"))))))))
-   (let* ((session (qq-state-session "dataline:device-1"))
-          (message (car (qq-state-session-messages "dataline:device-1"))))
+   (let* ((session (qq-state-session "dataline:mobile:dev:a"))
+          (message (car (qq-state-session-messages
+                         "dataline:mobile:dev:a"))))
      (should (equal (alist-get 'title session) "我的手机"))
+     (should (equal (alist-get 'peer-uid session) "dev:a"))
+     (should (equal (alist-get 'variant session) "mobile"))
      (should (equal (alist-get 'sender-name message) "我的手机"))
      (should-not (alist-get 'self-p message))
      (should (= (alist-get 'unread-count session) 0)))))
+
+(ert-deftest qq-state-live-missing-or-unknown-chat-type-is-not-routed ()
+  (qq-test-with-reset
+   (should-not
+    (qq-state-merge-live-message
+     '((post_type . "message")
+       (message_type . "private")
+       (message_id . "125")
+       (user_id . 10001)
+       (time . 1710000001)
+       (sender . ((user_id . 10001) (nickname . "Unknown")))
+       (message . (((type . "text") (data . ((text . "ignored")))))))))
+   (should-not
+    (qq-state-merge-live-message
+     '((post_type . "message")
+       (message_type . "private")
+       (chat_type . 999)
+       (peer_uid . "u:unknown")
+       (message_id . "124")
+       (user_id . 10001)
+       (time . 1710000001)
+       (sender . ((user_id . 10001) (nickname . "Unknown")))
+       (message . (((type . "text") (data . ((text . "ignored")))))))))
+   (should-not (qq-state-sessions))))
+
+(ert-deftest qq-state-history-requires-the-requested-native-identity ()
+  (qq-test-with-reset
+   (should-error
+    (qq-state-merge-history
+     "private:10001"
+     '(((message_id . "125")
+        (message_type . "private")
+        (user_id . 10001)
+        (time . 1710000001)
+        (sender . ((user_id . 10001) (nickname . "Alice")))
+        (message . ())))))
+   (should-error
+    (qq-state-merge-history
+     "dataline:desktop:dev:a"
+     '(((message_id . "126")
+        (message_type . "private")
+        (chat_type . 134)
+        (peer_uid . "dev:a")
+        (user_id . 0)
+        (time . 1710000002)
+        (sender . ((user_id . 0) (nickname . "我的手机")))
+        (message . ())))))))
 
 (ert-deftest qq-state-live-service-message-routes-by-peer-uid ()
   (qq-test-with-reset
@@ -963,6 +1094,7 @@
    (qq-state-merge-live-message
     '((post_type . "message")
       (message_type . "group")
+      (chat_type . 2)
       (message_id . "123")
       (group_id . 20001)
       (user_id . 10001)
@@ -982,6 +1114,7 @@
    (qq-state-merge-live-message
     '((post_type . "message")
       (message_type . "group")
+      (chat_type . 2)
       (message_id . "123")
       (group_id . 20001)
       (user_id . 10001)
@@ -1007,6 +1140,7 @@
    (qq-state-merge-live-message
     '((post_type . "message")
       (message_type . "private")
+      (chat_type . 1)
       (message_id . "123")
       (user_id . 10001)
       (time . 1710000001)
@@ -1136,6 +1270,7 @@
        (lastestMsg
         (time . 1710000001)
         (message_type . "private")
+        (chat_type . 1)
         (user_id . 10002)
         (raw_message . "[CQ:image,file=x.png,url=http://e/x]")
         (message . (((type . "image")
@@ -1200,6 +1335,7 @@
        (qq-state-merge-live-message
         '((post_type . "message")
           (message_type . "private")
+          (chat_type . 1)
           (message_id . "9007199254741004999")
           (user_id . 10001)
           (time . 1710000099)
@@ -1226,6 +1362,7 @@
         (list
          '((message_id . "9007199254741004001")
            (message_type . "private")
+           (chat_type . 1)
            (user_id . 10001)
            (time . 1710000001)
            (sender . ((user_id . 10001)
@@ -1266,6 +1403,7 @@
      (list
       '((message_id . "100")
         (message_type . "private")
+        (chat_type . 1)
         (user_id . 10001)
         (time . 1710000001)
         (sender . ((user_id . 10001) (nickname . "A")))
@@ -1277,6 +1415,7 @@
            (list
             '((message_id . "100")
               (message_type . "private")
+              (chat_type . 1)
               (user_id . 10001)
               (time . 1710000001)
               (sender . ((user_id . 10001) (nickname . "A")))
@@ -1284,6 +1423,7 @@
               (message . (((type . "text") (data . ((text . "a")))))))
             '((message_id . "90")
               (message_type . "private")
+              (chat_type . 1)
               (user_id . 10001)
               (time . 1710000000)
               (sender . ((user_id . 10001) (nickname . "A")))
@@ -1305,13 +1445,13 @@
        (qq-state-merge-history
         "group:20001"
         '(((message_id . "9007199254741004001")
-           (message_type . "group") (group_id . "20001")
+           (message_type . "group") (chat_type . 2) (group_id . "20001")
            (user_id . "10001") (time . 1710000001) (message . ()))
           ((message_id . "9007199254741004002")
-           (message_type . "group") (group_id . "20001")
+           (message_type . "group") (chat_type . 2) (group_id . "20001")
            (user_id . "10001") (time . 1710000002) (message . ()))
           ((message_id . "9007199254741004003")
-           (message_type . "group") (group_id . "20001")
+           (message_type . "group") (chat_type . 2) (group_id . "20001")
            (user_id . "10001") (time . 1710000003) (message . ()))))
        (should (= sort-count 1))))))
 
@@ -1321,6 +1461,7 @@
     "group:20001"
     '(((message_id . "9007199254741004001")
        (message_type . "group")
+       (chat_type . 2)
        (group_id . "20001")
        (user_id . "10001")
        (time . 1710000001)
@@ -1344,6 +1485,7 @@
     "group:20001"
     '(((message_id . "9007199254741004001")
        (message_type . "group")
+       (chat_type . 2)
        (group_id . "20001")
        (user_id . "10001")
        (time . 1710000001)

@@ -265,46 +265,133 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   "Return non-nil when CHAT-TYPE denotes a 移动设备 / DataLine 会话."
   (member (qq-state--normalize-id chat-type) '("8" "134")))
 
+(defun qq-state--dataline-variant-from-chat-type (chat-type)
+  "Return the canonical DataLine variant for exact CHAT-TYPE, or nil."
+  (pcase (qq-state--normalize-id chat-type)
+    ("8" "desktop")
+    ("134" "mobile")
+    (_ nil)))
+
 (defun qq-state--service-chat-type-p (chat-type)
   "Return non-nil when CHAT-TYPE is a public/service-account peer session."
   (equal (qq-state--normalize-id chat-type) "103"))
 
-(defun qq-state--session-type-from-chat-type (chat-type)
-  "Return session type symbol inferred from raw CHAT-TYPE."
-  (cond
-   ((equal (qq-state--normalize-id chat-type) "2") 'group)
-   ((qq-state--dataline-chat-type-p chat-type) 'dataline)
-   ((qq-state--service-chat-type-p chat-type) 'service)
-   (t 'private)))
+(defun qq-state--canonical-decimal-id (value context)
+  "Return VALUE as a canonical decimal string for CONTEXT."
+  (let ((id (qq-state--normalize-id value)))
+    (unless (qq-protocol--decimal-string-p id)
+      (error "qq: %s requires a decimal identity, got %S" context value))
+    id))
 
-(defun qq-state-session-key (type target-id)
-  "Build a stable session key from TYPE and TARGET-ID."
-  (format "%s:%s"
-          (pcase type
-            ((or 'private "private") "private")
-            ((or 'group "group") "group")
-            ((or 'dataline "dataline") "dataline")
-            ((or 'service "service") "service")
-            (_ (error "qq: unsupported session type %S" type)))
-          (qq-state--normalize-id target-id)))
+(defun qq-state--canonical-peer-uid (value context)
+  "Return opaque peer UID VALUE unchanged after validating CONTEXT."
+  (unless (and (stringp value) (not (string-empty-p value)))
+    (error "qq: %s requires a non-empty native peer UID, got %S"
+           context value))
+  value)
+
+(defun qq-state--canonical-dataline-variant (variant)
+  "Return canonical DataLine VARIANT string, or signal an error."
+  (pcase variant
+    ((or 'desktop "desktop") "desktop")
+    ((or 'mobile "mobile") "mobile")
+    (_ (error "qq: dataline session requires desktop or mobile variant, got %S"
+              variant))))
+
+(defun qq-state-session-key (type target-id &optional variant)
+  "Build a canonical session key from TYPE, TARGET-ID, and VARIANT.
+
+DataLine keys require VARIANT to be `desktop' or `mobile'.  TARGET-ID is an
+opaque native peer UID for DataLine and service sessions; it is preserved
+byte-for-byte, including any colon characters."
+  (pcase type
+    ((or 'private "private")
+     (when variant
+       (error "qq: private session does not accept a variant"))
+     (format "private:%s"
+             (qq-state--canonical-decimal-id target-id "private session")))
+    ((or 'group "group")
+     (when variant
+       (error "qq: group session does not accept a variant"))
+     (format "group:%s"
+             (qq-state--canonical-decimal-id target-id "group session")))
+    ((or 'dataline "dataline")
+     (format "dataline:%s:%s"
+             (qq-state--canonical-dataline-variant variant)
+             (qq-state--canonical-peer-uid target-id "dataline session")))
+    ((or 'service "service")
+     (when variant
+       (error "qq: service session does not accept a variant"))
+     (format "service:%s"
+             (qq-state--canonical-peer-uid target-id "service session")))
+    (_ (error "qq: unsupported session type %S" type))))
+
+(defun qq-state-session-key-identity (session-key)
+  "Decode canonical SESSION-KEY into its complete immutable identity.
+
+The result contains `type', `target-id', `chat-type', `peer-uid', and
+`variant'.  Opaque peer UIDs are decoded only by removing their fixed prefix;
+they are never split, normalized, escaped, or reconstructed from metadata."
+  (unless (stringp session-key)
+    (error "qq: session key must be a string, got %S" session-key))
+  (let (type target-id chat-type peer-uid variant)
+    (cond
+     ((string-prefix-p "private:" session-key)
+      (setq type 'private
+            target-id (substring session-key (length "private:"))
+            chat-type "1"))
+     ((string-prefix-p "group:" session-key)
+      (setq type 'group
+            target-id (substring session-key (length "group:"))
+            chat-type "2"))
+     ((string-prefix-p "dataline:desktop:" session-key)
+      (setq type 'dataline
+            target-id (substring session-key (length "dataline:desktop:"))
+            chat-type "8"
+            peer-uid target-id
+            variant "desktop"))
+     ((string-prefix-p "dataline:mobile:" session-key)
+      (setq type 'dataline
+            target-id (substring session-key (length "dataline:mobile:"))
+            chat-type "134"
+            peer-uid target-id
+            variant "mobile"))
+     ((string-prefix-p "service:" session-key)
+      (setq type 'service
+            target-id (substring session-key (length "service:"))
+            chat-type "103"
+            peer-uid target-id))
+     (t
+      (error "qq: unsupported canonical session key %S" session-key)))
+    (pcase type
+      ((or 'private 'group)
+       (unless (qq-protocol--decimal-string-p target-id)
+         (error "qq: malformed canonical %s session key %S"
+                type session-key)))
+      ((or 'dataline 'service)
+       (unless (and (stringp peer-uid) (not (string-empty-p peer-uid)))
+         (error "qq: malformed canonical %s session key %S"
+                type session-key))))
+    `((type . ,type)
+      (target-id . ,target-id)
+      (chat-type . ,chat-type)
+      (peer-uid . ,peer-uid)
+      (variant . ,variant))))
 
 (defun qq-state-session-key-type (session-key)
   "Return session type symbol extracted from SESSION-KEY."
-  (when (stringp session-key)
-    (cond
-     ((string-prefix-p "private:" session-key) 'private)
-     ((string-prefix-p "group:" session-key) 'group)
-     ((string-prefix-p "dataline:" session-key) 'dataline)
-     ((string-prefix-p "service:" session-key) 'service))))
+  (alist-get 'type (qq-state-session-key-identity session-key)))
 
 (defun qq-state-session-sendable-p (session-key)
   "Return non-nil when SESSION-KEY supports outbound messages."
-  (memq (qq-state-session-key-type session-key)
-        '(private group dataline)))
+  (condition-case nil
+      (memq (qq-state-session-key-type session-key)
+            '(private group dataline))
+    (error nil)))
 
 (defun qq-state-session-key-target-id (session-key)
   "Return target id extracted from SESSION-KEY."
-  (cadr (split-string session-key ":" t)))
+  (alist-get 'target-id (qq-state-session-key-identity session-key)))
 
 (defun qq-state--cached-private-title (target-id)
   "Return best cached title for private TARGET-ID."
@@ -350,25 +437,26 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
 
 (defun qq-state--session-template (session-key)
   "Return base session object for SESSION-KEY."
-  `((key . ,session-key)
-    (type . ,(qq-state-session-key-type session-key))
-    (target-id . ,(qq-state-session-key-target-id session-key))
-    (title . ,(qq-state-session-key-target-id session-key))
-    (unread-count . 0)
-    (unread-at-me-message-id . nil)
-    (unread-at-me-message-seq . nil)
-    (unread-at-all-message-id . nil)
-    (unread-at-all-message-seq . nil)
-    (muted-p . nil)
-    (message-notify-mode . unspecified)
-    (first-unread-message-id . nil)
-    (first-unread-message-seq . nil)
-    (read-position-available . nil)
-    (read-latest-message-id . nil)
-    (last-message-time . 0)
-    (last-message-preview . "")
-    (last-message-id . nil)
-    (oldest-message-id . nil)))
+  (let* ((identity (qq-state-session-key-identity session-key))
+         (target-id (alist-get 'target-id identity)))
+    `((key . ,session-key)
+      ,@identity
+      (title . ,target-id)
+      (unread-count . 0)
+      (unread-at-me-message-id . nil)
+      (unread-at-me-message-seq . nil)
+      (unread-at-all-message-id . nil)
+      (unread-at-all-message-seq . nil)
+      (muted-p . nil)
+      (message-notify-mode . unspecified)
+      (first-unread-message-id . nil)
+      (first-unread-message-seq . nil)
+      (read-position-available . nil)
+      (read-latest-message-id . nil)
+      (last-message-time . 0)
+      (last-message-preview . "")
+      (last-message-id . nil)
+      (oldest-message-id . nil))))
 
 (defun qq-state--merge-alists (old new)
   "Return OLD merged with NEW by symbol key.
@@ -520,9 +608,25 @@ Empty bodies alone are not treated as recalled."
   "Insert or update SESSION-KEY with FIELDS.
 
 When EMIT is non-nil, fire one session mutation event (`:mutation' `session')."
-  (let* ((existing (or (copy-tree (gethash session-key qq-state--sessions))
+  (let* ((identity (qq-state-session-key-identity session-key))
+         (canonical-fields
+          (seq-filter
+           (lambda (field)
+             (or (memq (car field) '(type target-id chat-type variant))
+                 (cdr field)))
+           identity))
+         (existing (or (copy-tree (gethash session-key qq-state--sessions))
                        (qq-state--session-template session-key)))
          (session (qq-state--merge-alists existing fields)))
+    ;; The key is the sole source of routing identity.  Metadata refreshes and
+    ;; message payloads may enrich display fields, but may never retarget an
+    ;; existing session.
+    ;; A private/group key cannot derive the kernel peer UID; retain that UID
+    ;; when a native payload later supplies it as capability metadata.  All
+    ;; encoded routing fields (including a nil non-DataLine variant) still
+    ;; overwrite mutable payload metadata.
+    (setq session (qq-state--merge-alists session canonical-fields))
+    (setf (alist-get 'key session nil nil #'eq) session-key)
     (setq session (qq-state--hydrate-session session))
     (puthash session-key session qq-state--sessions)
     (when emit
@@ -812,7 +916,10 @@ in the UI — that is wire format, not display text."
 
 (defun qq-state--message-peer-uid (message)
   "Return raw backend peer uid extracted from raw MESSAGE, or nil."
-  (qq-state--normalize-id (alist-get 'peer_uid message)))
+  (let ((peer-uid (alist-get 'peer_uid message)))
+    (and (stringp peer-uid)
+         (not (string-empty-p peer-uid))
+         peer-uid)))
 
 (defun qq-state--message-self-p (message)
   "Return non-nil when raw MESSAGE belongs to the logged in account."
@@ -825,33 +932,53 @@ in the UI — that is wire format, not display text."
     (or (equal (alist-get 'post_type message) "message_sent")
         (and sender-id self-id (equal sender-id self-id)))))
 
-(defun qq-state--raw-message-session-key (message &optional fallback-session-key)
-  "Return session key for raw MESSAGE, or FALLBACK-SESSION-KEY when given."
-  (or fallback-session-key
-      (when-let* ((chat-type (qq-state--message-chat-type message))
-                  ((qq-state--dataline-chat-type-p chat-type))
-                  (peer-uid (qq-state--message-peer-uid message)))
-        (qq-state-session-key 'dataline peer-uid))
-      (when-let* ((chat-type (qq-state--message-chat-type message))
-                  ((qq-state--service-chat-type-p chat-type))
-                  (peer-uid (qq-state--message-peer-uid message)))
-        (qq-state-session-key 'service peer-uid))
-      (pcase (alist-get 'message_type message)
-        ("group"
-         (qq-state-session-key 'group (alist-get 'group_id message)))
-        ("private"
-         (qq-state-session-key
-          'private
-          (or (alist-get 'target_id message)
-              (let ((user-id (qq-state--normalize-id (alist-get 'user_id message)))
-                    (self-id (qq-state--normalize-id
-                              (or (alist-get 'self_id message)
-                                  (alist-get 'user_id qq-state--self-info)))))
-                (and user-id
-                     (not (equal user-id self-id))
-                     user-id))
-              (alist-get 'user_id message))))
-        (_ nil))))
+(defun qq-state--raw-message-session-key (message &optional expected-session-key)
+  "Return the exact canonical session key carried by raw MESSAGE.
+
+When EXPECTED-SESSION-KEY is non-nil, require MESSAGE to carry that same
+identity.  The request context is an assertion, never a substitute for
+missing or contradictory wire identity."
+  (let* ((raw-chat-type (qq-state--message-chat-type message))
+         (chat-type (qq-state--normalize-id raw-chat-type))
+         (peer-uid (qq-state--message-peer-uid message))
+         (derived
+          (pcase chat-type
+            ("1"
+             (when-let* ((target-id
+                          (or (alist-get 'target_id message)
+                              (let ((user-id
+                                     (qq-state--normalize-id
+                                      (alist-get 'user_id message)))
+                                    (self-id
+                                     (qq-state--normalize-id
+                                      (or (alist-get 'self_id message)
+                                          (alist-get 'user_id
+                                                     qq-state--self-info)))))
+                                (and user-id
+                                     (not (equal user-id self-id))
+                                     user-id))
+                              (alist-get 'user_id message))))
+               (qq-state-session-key 'private target-id)))
+            ("2"
+             (when-let* ((group-id (alist-get 'group_id message)))
+               (qq-state-session-key 'group group-id)))
+            ((or "8" "134")
+             (when peer-uid
+               (qq-state-session-key
+                'dataline peer-uid
+                (qq-state--dataline-variant-from-chat-type chat-type))))
+            ("103"
+             (when peer-uid
+               (qq-state-session-key 'service peer-uid)))
+            (_ nil))))
+    (when expected-session-key
+      (qq-state-session-key-identity expected-session-key)
+      (unless derived
+        (error "qq: message is missing a supported native session identity"))
+      (unless (equal derived expected-session-key)
+        (error "qq: message session %S contradicts expected session %S"
+               derived expected-session-key)))
+    derived))
 
 (defun qq-state--poke-notice-p (message)
   "Return non-nil when MESSAGE is a NapCat poke notice."
@@ -947,7 +1074,7 @@ the natural-language fragments.  The complete original notice remains in
       (detail . ,(and (cdr texts) (string-join (cdr texts) "")))
       (texts . ,texts))))
 
-(defun qq-state--normalize-poke-notice (notice &optional fallback-session-key)
+(defun qq-state--normalize-poke-notice (notice &optional expected-session-key)
   "Normalize a live or historical POKE NOTICE into a timeline message."
   (let* ((group-id (qq-state--normalize-id (alist-get 'group_id notice)))
          (local-marker-cell (assq 'emacs_local_p notice))
@@ -972,10 +1099,20 @@ the natural-language fragments.  The complete original notice remains in
          ;; as the actor, matching the OneBot notice contract.
          (peer-id (and (null group-id)
                        (qq-state--normalize-id (alist-get 'user_id notice))))
-         (session-key (or fallback-session-key
-                          (cond
-                           (group-id (qq-state-session-key 'group group-id))
-                           (peer-id (qq-state-session-key 'private peer-id)))))
+         (derived-session-key
+          (cond
+           (group-id (qq-state-session-key 'group group-id))
+           (peer-id (qq-state-session-key 'private peer-id))))
+         (session-key
+          (progn
+            (when expected-session-key
+              (qq-state-session-key-identity expected-session-key)
+              (unless derived-session-key
+                (error "qq: poke notice is missing its session identity"))
+              (unless (equal derived-session-key expected-session-key)
+                (error "qq: poke session %S contradicts expected session %S"
+                       derived-session-key expected-session-key)))
+            derived-session-key))
          (recall-reference
           (qq-state--validate-poke-recall-context
            unscoped-recall-reference session-key))
@@ -1078,16 +1215,17 @@ the natural-language fragments.  The complete original notice remains in
       (order . ,(qq-state--next-message-order))
       (raw-event . ,(copy-tree notice)))))
 
-(defun qq-state--normalize-raw-message (message &optional fallback-session-key)
+(defun qq-state--normalize-raw-message (message &optional expected-session-key)
   "Normalize raw OneBot MESSAGE into local store shape."
   (if (qq-state--poke-notice-p message)
-      (qq-state--normalize-poke-notice message fallback-session-key)
+      (qq-state--normalize-poke-notice message expected-session-key)
     (let* ((chat-type (qq-state--normalize-id (qq-state--message-chat-type message)))
          (peer-uid (qq-state--message-peer-uid message))
          (peer-uin (qq-state--normalize-id
                     (or (alist-get 'peer_uin message)
                         (alist-get 'peerUin message))))
-         (session-key (qq-state--raw-message-session-key message fallback-session-key))
+         (session-key (qq-state--raw-message-session-key
+                       message expected-session-key))
          (sender (alist-get 'sender message))
          (sender-id (qq-state--normalize-id
                      (or (alist-get 'user_id sender)
@@ -1876,6 +2014,33 @@ older/fallback notices without it are applied as a one-step delta."
         (qq-state--default-session-title (qq-state--session-template session-key))
         (qq-state-session-key-target-id session-key))))
 
+(defun qq-state--recent-contact-session-key (contact)
+  "Return CONTACT's canonical session key, or nil when unsupported.
+
+Only exact native chat types are accepted.  DataLine and service identities
+require the original non-empty `peerUid'; `peerUin' is never a substitute."
+  (let ((chat-type (qq-state--normalize-id (alist-get 'chatType contact))))
+    (pcase chat-type
+      ("1"
+       (when-let* ((peer-uin (alist-get 'peerUin contact)))
+         (qq-state-session-key 'private peer-uin)))
+      ("2"
+       (when-let* ((peer-uin (alist-get 'peerUin contact)))
+         (qq-state-session-key 'group peer-uin)))
+      ((or "8" "134")
+       (when-let* ((peer-uid (alist-get 'peerUid contact))
+                   ((stringp peer-uid))
+                   ((not (string-empty-p peer-uid))))
+         (qq-state-session-key
+          'dataline peer-uid
+          (qq-state--dataline-variant-from-chat-type chat-type))))
+      ("103"
+       (when-let* ((peer-uid (alist-get 'peerUid contact))
+                   ((stringp peer-uid))
+                   ((not (string-empty-p peer-uid))))
+         (qq-state-session-key 'service peer-uid)))
+      (_ nil))))
+
 (defun qq-state-apply-recent-contacts (contacts &optional read-state-writable-p)
   "Apply recent CONTACTS snapshot to local session store.
 
@@ -1884,55 +2049,53 @@ that contact's unread projection only when it returns non-nil.  Other contact
 metadata is always refreshed.  A missing or null `unreadCount' is not an
 authoritative zero and therefore never writes the unread projection."
   (dolist (contact (or contacts '()))
-    (let* ((chat-type (alist-get 'chatType contact))
-           (type (qq-state--session-type-from-chat-type chat-type))
-           (peer-uid (qq-state--normalize-id (alist-get 'peerUid contact)))
-           (peer-uin (qq-state--normalize-id (alist-get 'peerUin contact)))
-           (target-id (if (memq type '(dataline service))
-                          (or peer-uid peer-uin)
-                        peer-uin))
-           (session-key (qq-state-session-key type target-id))
-           (title (qq-state--recent-contact-title contact session-key))
-           (msg-time (qq-state--normalize-time (alist-get 'msgTime contact)))
-           (msg-id (qq-state--normalize-id (alist-get 'msgId contact)))
-           (unread-entry (assq 'unreadCount contact))
-           (unread-count (and unread-entry (cdr unread-entry)))
-           (valid-unread-count-p
-            (and unread-entry
-                 (qq-protocol--nonnegative-safe-integer-p unread-count)))
-           (write-read-state
-            (and valid-unread-count-p
-                 (or (null read-state-writable-p)
-                     (funcall read-state-writable-p session-key))))
-           (disturb-entry (assq 'isMsgDisturb contact))
-           (notify-mode-entry (assq 'messageNotifyMode contact))
-           (at-me-seq (qq-state--normalize-id
-                       (alist-get 'firstUnreadAtMeSeq contact)))
-           (at-all-seq (qq-state--normalize-id
-                        (alist-get 'firstUnreadAtAllSeq contact)))
-           (last-message (alist-get 'lastestMsg contact))
-           (server-preview
-            (or (alist-get 'lastMessagePreview contact)
-                (alist-get 'last_message_preview contact)))
-           (preview
-            (qq-state-preview-one-line
-             (or
-              (and (consp last-message)
-                   ;; Prefer structured segments; CQ raw_message is wire format only.
-                   (let* ((from-segments
-                           (qq-state-message-preview-from-segments
-                            (alist-get 'message last-message)))
-                          (raw (alist-get 'raw_message last-message)))
-                     (cond
-                      ((and (stringp from-segments)
-                            (not (string-empty-p from-segments)))
-                       from-segments)
-                      ((and (stringp raw) (qq-state--cq-looks-p raw))
-                       (qq-state-message-preview-from-cq raw))
-                      ((and (stringp raw) (not (string-empty-p raw)))
-                       raw))))
-              server-preview
-              ""))))
+    (when-let* ((session-key (qq-state--recent-contact-session-key contact)))
+      (let* ((identity (qq-state-session-key-identity session-key))
+             (chat-type (alist-get 'chat-type identity))
+             (peer-uid (alist-get 'peer-uid identity))
+             (peer-uin (qq-state--normalize-id (alist-get 'peerUin contact)))
+             (target-id (alist-get 'target-id identity))
+             (title (qq-state--recent-contact-title contact session-key))
+             (msg-time (qq-state--normalize-time (alist-get 'msgTime contact)))
+             (msg-id (qq-state--normalize-id (alist-get 'msgId contact)))
+             (unread-entry (assq 'unreadCount contact))
+             (unread-count (and unread-entry (cdr unread-entry)))
+             (valid-unread-count-p
+              (and unread-entry
+                   (qq-protocol--nonnegative-safe-integer-p unread-count)))
+             (write-read-state
+              (and valid-unread-count-p
+                   (or (null read-state-writable-p)
+                       (funcall read-state-writable-p session-key))))
+             (disturb-entry (assq 'isMsgDisturb contact))
+             (notify-mode-entry (assq 'messageNotifyMode contact))
+             (at-me-seq (qq-state--normalize-id
+                         (alist-get 'firstUnreadAtMeSeq contact)))
+             (at-all-seq (qq-state--normalize-id
+                          (alist-get 'firstUnreadAtAllSeq contact)))
+             (last-message (alist-get 'lastestMsg contact))
+             (server-preview
+              (or (alist-get 'lastMessagePreview contact)
+                  (alist-get 'last_message_preview contact)))
+             (preview
+              (qq-state-preview-one-line
+               (or
+                (and (consp last-message)
+                     ;; Prefer structured segments; CQ raw_message is wire format only.
+                     (let* ((from-segments
+                             (qq-state-message-preview-from-segments
+                              (alist-get 'message last-message)))
+                            (raw (alist-get 'raw_message last-message)))
+                       (cond
+                        ((and (stringp from-segments)
+                              (not (string-empty-p from-segments)))
+                         from-segments)
+                        ((and (stringp raw) (qq-state--cq-looks-p raw))
+                         (qq-state-message-preview-from-cq raw))
+                        ((and (stringp raw) (not (string-empty-p raw)))
+                         raw))))
+                server-preview
+                ""))))
       (qq-state-upsert-session
        session-key
        `((title . ,title)
@@ -1970,7 +2133,7 @@ authoritative zero and therefore never writes the unread projection."
             (push (cons 'time msg-time) message-copy))
           (qq-state--merge-normalized-message
            session-key
-           (qq-state--normalize-raw-message message-copy session-key))))))
+           (qq-state--normalize-raw-message message-copy session-key)))))))
   (qq-state--emit 'sessions-refreshed :count (length contacts))
   (qq-state-sessions))
 
