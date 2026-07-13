@@ -468,6 +468,64 @@
    (should (= 17 (alist-get 'unread-count
                             (qq-state-session "group:20001"))))))
 
+(ert-deftest qq-state-apply-recent-contacts-null-unread-preserves-read-state ()
+  (qq-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (target-id . "20001")
+      (title . "Old") (unread-count . 6))
+    nil)
+   (qq-state-apply-recent-contacts
+    '(((chatType . 2)
+       (peerUid . "20001")
+       (peerUin . "20001")
+       (peerName . "Fresh title")
+       (unreadCount))))
+   (let ((session (qq-state-session "group:20001")))
+     (should (= 6 (alist-get 'unread-count session)))
+     (should (equal "Fresh title" (alist-get 'title session))))))
+
+(ert-deftest qq-state-apply-recent-unread-invalidates-older-exact-position ()
+  (qq-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (target-id . "20001")
+      (unread-count . 6)
+      (first-unread-message-id . "9007199254742007089")
+      (first-unread-message-seq . "30001")
+      (read-position-available . t))
+    nil)
+   (qq-state-apply-recent-contacts
+    '(((chatType . 2) (peerUid . "20001") (peerUin . "20001")
+       (unreadCount . 4))))
+   (let ((session (qq-state-session "group:20001")))
+     (should (= 4 (alist-get 'unread-count session)))
+     (should-not (alist-get 'first-unread-message-id session))
+     (should-not (alist-get 'first-unread-message-seq session))
+     (should-not (alist-get 'read-position-available session)))))
+
+(ert-deftest qq-state-apply-recent-contacts-can-reject-stale-unread-only ()
+  (qq-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (target-id . "20001")
+      (title . "Old") (unread-count . 6))
+    nil)
+   (let (checked-key)
+     (qq-state-apply-recent-contacts
+      '(((chatType . 2)
+         (peerUid . "20001")
+         (peerUin . "20001")
+         (peerName . "Fresh title")
+         (unreadCount . 9)))
+      (lambda (session-key)
+        (setq checked-key session-key)
+        nil))
+     (let ((session (qq-state-session "group:20001")))
+       (should (equal checked-key "group:20001"))
+       (should (= 6 (alist-get 'unread-count session)))
+       (should (equal "Fresh title" (alist-get 'title session)))))))
+
 (ert-deftest qq-state-apply-recent-contacts-calibrates-native-mentions ()
   (qq-test-with-reset
    (qq-state-apply-recent-contacts
@@ -543,7 +601,7 @@
      (should (equal "30004"
                     (alist-get 'unread-at-all-message-seq session))))))
 
-(ert-deftest qq-state-read-position-keeps-unresolved-sequence-unavailable ()
+(ert-deftest qq-state-read-position-preserves-sequence-without-exact-anchor ()
   (qq-test-with-reset
    (qq-state-upsert-session "group:20001" nil nil)
    (qq-state-apply-session-read-state
@@ -554,8 +612,29 @@
           (message_id)))))
    (let ((session (qq-state-session "group:20001")))
      (should-not (alist-get 'first-unread-message-id session))
-     (should-not (alist-get 'first-unread-message-seq session))
+     (should (equal "30001"
+                    (alist-get 'first-unread-message-seq session)))
      (should-not (alist-get 'read-position-available session)))))
+
+(ert-deftest qq-state-identical-authoritative-read-state-is-a-no-op ()
+  (qq-test-with-reset
+   (qq-state-upsert-session "group:20001" nil nil)
+   (let ((read-state
+          '((unread_count . 5)
+            (first_unread
+             . ((sequence . "30001")
+                (message_id . "9007199254742007089")))
+            (mentions . ((at_me . nil) (at_all . nil)))
+            (latest . nil)))
+         events)
+     (add-hook 'qq-state-change-hook
+               (lambda (event)
+                 (when (and (eq (plist-get event :type) 'session)
+                            (eq (plist-get event :mutation) 'read))
+                   (push event events))))
+     (qq-state-apply-session-read-state "group:20001" read-state)
+     (qq-state-apply-session-read-state "group:20001" read-state)
+     (should (= 1 (length events))))))
 
 (ert-deftest qq-state-rejects-numeric-message-id-from-wire ()
   (qq-test-with-reset

@@ -1666,6 +1666,19 @@ timeline rebuild."
   "Reset unread count for SESSION-KEY."
   (qq-state-set-session-unread session-key 0))
 
+(defconst qq-state--session-read-projection-keys
+  '(unread-count
+    first-unread-message-id first-unread-message-seq
+    unread-at-me-message-id unread-at-me-message-seq
+    unread-at-all-message-id unread-at-all-message-seq
+    read-position-available read-latest-message-id)
+  "Session fields written by an authoritative kernel read state.")
+
+(defun qq-state--session-read-projection (session)
+  "Return the authoritative read projection of SESSION."
+  (mapcar (lambda (key) (cons key (alist-get key session)))
+          qq-state--session-read-projection-keys))
+
 (defun qq-state-apply-session-read-state (session-key read-state)
   "Apply kernel READ-STATE to SESSION-KEY and emit a read mutation.
 
@@ -1691,23 +1704,31 @@ coerced to an Emacs number."
          (mentions (alist-get 'mentions read-state))
          (at-me (and (listp mentions) (alist-get 'at_me mentions)))
          (at-all (and (listp mentions) (alist-get 'at_all mentions)))
-         (available (and (> count 0) first-id)))
-    (qq-state-upsert-session
-     session-key
-     `((unread-count . ,count)
-       (first-unread-message-id . ,(and available first-id))
-       (first-unread-message-seq . ,(and available first-seq))
-       (unread-at-me-message-id . ,(and (> count 0) (alist-get 'message_id at-me)))
-       (unread-at-me-message-seq . ,(and (> count 0) (alist-get 'sequence at-me)))
-       (unread-at-all-message-id . ,(and (> count 0) (alist-get 'message_id at-all)))
-       (unread-at-all-message-seq . ,(and (> count 0) (alist-get 'sequence at-all)))
-       (read-position-available . ,(and available t))
-       (read-latest-message-id . ,latest-id))
-     nil)
-    (qq-state--emit 'session
-                    :session-key session-key
-                    :session (qq-state-session session-key)
-                    :mutation 'read)
+         (has-unread (> count 0))
+         (available (and has-unread first-id))
+         (projection
+          `((unread-count . ,count)
+            (first-unread-message-id . ,(and has-unread first-id))
+            (first-unread-message-seq . ,(and has-unread first-seq))
+            (unread-at-me-message-id
+             . ,(and has-unread (alist-get 'message_id at-me)))
+            (unread-at-me-message-seq
+             . ,(and has-unread (alist-get 'sequence at-me)))
+            (unread-at-all-message-id
+             . ,(and has-unread (alist-get 'message_id at-all)))
+            (unread-at-all-message-seq
+             . ,(and has-unread (alist-get 'sequence at-all)))
+            (read-position-available . ,(and available t))
+            (read-latest-message-id . ,latest-id)))
+         (existing (qq-state-session session-key)))
+    (unless (and existing
+                 (equal (qq-state--session-read-projection existing)
+                        projection))
+      (qq-state-upsert-session session-key projection nil)
+      (qq-state--emit 'session
+                      :session-key session-key
+                      :session (qq-state-session session-key)
+                      :mutation 'read))
     (qq-state-session session-key)))
 
 (defun qq-state-apply-recall (message-id)
@@ -1855,8 +1876,13 @@ older/fallback notices without it are applied as a one-step delta."
         (qq-state--default-session-title (qq-state--session-template session-key))
         (qq-state-session-key-target-id session-key))))
 
-(defun qq-state-apply-recent-contacts (contacts)
-  "Apply recent CONTACTS snapshot to local session store."
+(defun qq-state-apply-recent-contacts (contacts &optional read-state-writable-p)
+  "Apply recent CONTACTS snapshot to local session store.
+
+When READ-STATE-WRITABLE-P is non-nil, call it with each session key and apply
+that contact's unread projection only when it returns non-nil.  Other contact
+metadata is always refreshed.  A missing or null `unreadCount' is not an
+authoritative zero and therefore never writes the unread projection."
   (dolist (contact (or contacts '()))
     (let* ((chat-type (alist-get 'chatType contact))
            (type (qq-state--session-type-from-chat-type chat-type))
@@ -1870,17 +1896,20 @@ older/fallback notices without it are applied as a one-step delta."
            (msg-time (qq-state--normalize-time (alist-get 'msgTime contact)))
            (msg-id (qq-state--normalize-id (alist-get 'msgId contact)))
            (unread-entry (assq 'unreadCount contact))
+           (unread-count (and unread-entry (cdr unread-entry)))
+           (valid-unread-count-p
+            (and unread-entry
+                 (qq-protocol--nonnegative-safe-integer-p unread-count)))
+           (write-read-state
+            (and valid-unread-count-p
+                 (or (null read-state-writable-p)
+                     (funcall read-state-writable-p session-key))))
            (disturb-entry (assq 'isMsgDisturb contact))
            (notify-mode-entry (assq 'messageNotifyMode contact))
            (at-me-seq (qq-state--normalize-id
                        (alist-get 'firstUnreadAtMeSeq contact)))
            (at-all-seq (qq-state--normalize-id
                         (alist-get 'firstUnreadAtAllSeq contact)))
-           (unread-count
-            (and unread-entry
-                 (max 0 (if (numberp (cdr unread-entry))
-                            (truncate (cdr unread-entry))
-                          (string-to-number (format "%s" (or (cdr unread-entry) 0)))))))
            (last-message (alist-get 'lastestMsg contact))
            (server-preview
             (or (alist-get 'lastMessagePreview contact)
@@ -1916,8 +1945,11 @@ older/fallback notices without it are applied as a one-step delta."
          (last-message-time . ,msg-time)
          (last-message-id . ,msg-id)
          (last-message-preview . ,preview)
-         ,@(when unread-entry
+         ,@(when write-read-state
              `((unread-count . ,unread-count)
+               (first-unread-message-id . nil)
+               (first-unread-message-seq . nil)
+               (read-position-available . nil)
                (unread-at-me-message-id . nil)
                (unread-at-me-message-seq . ,(and (> unread-count 0) at-me-seq))
                (unread-at-all-message-id . nil)

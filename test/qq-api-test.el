@@ -136,14 +136,12 @@
       (should-not pending-called)
       (should-not api-called))))
 
-(ert-deftest qq-api-mark-session-read-clears-unread-optimistically ()
+(ert-deftest qq-api-mark-session-read-does-not-guess-unread-state ()
   (let ((qq-state-change-hook nil)
         (qq-api--read-operations (make-hash-table :test #'equal))
         (qq-api--read-operation-counter 0)
-        cleared-before-call
         captured-action
         captured-params
-        errback-fn
         success-fn)
     (qq-state-reset)
     (qq-state-upsert-session
@@ -153,31 +151,21 @@
        (unread-count . 3))
      nil)
     (cl-letf (((symbol-function 'qq-api-call)
-               (lambda (action params callback &optional errback)
+               (lambda (action params callback &optional _errback)
                  (setq captured-action action
                        captured-params params)
-                 (setq cleared-before-call
-                       (= 0 (alist-get 'unread-count
-                                       (qq-state-session "private:10001"))))
                  (setq success-fn callback)
-                 (setq errback-fn errback)
                  'sent)))
       (qq-api-mark-session-read "private:10001")
-      (should cleared-before-call)
       (should (equal captured-action "emacs_mark_read"))
       (should (equal (alist-get 'chat captured-params)
                      '((kind . "private") (user_id . "10001"))))
-      (should (= 0 (alist-get 'unread-count
-                              (qq-state-session "private:10001"))))
-      ;; Failure restores previous unread.
-      (funcall errback-fn nil "network down")
       (should (= 3 (alist-get 'unread-count
                               (qq-state-session "private:10001"))))
-      ;; Success path after another optimistic clear stays at 0.
-      (qq-api-mark-session-read "private:10001")
       (funcall success-fn '((status . ok)))
-      (should (= 0 (alist-get 'unread-count
-                              (qq-state-session "private:10001")))))))
+      (should (= 3 (alist-get 'unread-count
+                              (qq-state-session "private:10001"))))
+      (should-not (gethash "private:10001" qq-api--read-operations)))))
 
 (ert-deftest qq-api-session-emacs-locator-tags-kernel-only-session-kinds ()
   (cl-letf (((symbol-function 'qq-state-session)
@@ -221,32 +209,44 @@
    (qq-api--emacs-session-key-from-locator
     '((kind . "private") (user_id . 10001)))))
 
-(ert-deftest qq-api-mark-session-read-coalesces-and-restores-new-arrivals ()
+(ert-deftest qq-api-mark-session-read-failure-refreshes-authoritative-state ()
   (let ((qq-state-change-hook nil)
         (qq-api--read-operations (make-hash-table :test #'equal))
         (qq-api--read-operation-counter 0)
-        calls)
+        (qq-api--read-observation-clock 0)
+        (qq-api--session-read-observation-tokens
+         (make-hash-table :test #'equal))
+        mark-errback
+        fetch-success
+        actions
+        reported-error)
     (qq-state-reset)
     (qq-state-upsert-session
      "private:10001"
      '((type . private) (target-id . "10001") (unread-count . 5)) nil)
     (cl-letf (((symbol-function 'qq-api-call)
-               (lambda (_action _params callback &optional errback)
-                 (push (cons callback errback) calls)
+               (lambda (action _params callback &optional errback)
+                 (setq actions (append actions (list action)))
+                 (pcase action
+                   ("emacs_mark_read" (setq mark-errback errback))
+                   ("emacs_get_read_state" (setq fetch-success callback)))
                  'sent))
-              ((symbol-function 'qq-api--default-error) #'ignore))
+              ((symbol-function 'qq-api--default-error)
+               (lambda (_response reason) (setq reported-error reason))))
       (qq-api-mark-session-read "private:10001")
-      ;; A live message arrives after the request was sent and is immediately
-      ;; cleared by the visible chat's second mark-read call.
-      (qq-state-set-session-unread "private:10001" 1)
-      (qq-api-mark-session-read "private:10001")
-      (should (= (length calls) 1))
-      (funcall (cdar calls) nil "network down")
-      (should (= (alist-get 'unread-count
-                            (qq-state-session "private:10001"))
-                 6)))))
+      (funcall mark-errback nil "network down")
+      (should (equal actions '("emacs_mark_read" "emacs_get_read_state")))
+      (should (equal reported-error "network down"))
+      ;; A failure never reconstructs unread with local arithmetic.
+      (should (= 5 (alist-get 'unread-count
+                              (qq-state-session "private:10001"))))
+      (let ((state (copy-tree (qq-api-test--read-state))))
+        (setf (alist-get 'unread_count state) 7)
+        (funcall fetch-success `((data . ,state))))
+      (should (= 7 (alist-get 'unread-count
+                              (qq-state-session "private:10001")))))))
 
-(ert-deftest qq-api-mark-session-read-follows-up-for-coalesced-arrivals ()
+(ert-deftest qq-api-mark-session-read-reruns-unconditionally-while-in-flight ()
   (let ((qq-state-change-hook nil)
         (qq-api--read-operations (make-hash-table :test #'equal))
         (qq-api--read-operation-counter 0)
@@ -260,14 +260,41 @@
                  (setq calls (append calls (list (cons callback errback))))
                  'sent)))
       (qq-api-mark-session-read "private:10001")
-      (qq-state-set-session-unread "private:10001" 1)
+      ;; No local unread delta is required to request the follow-up.
       (qq-api-mark-session-read "private:10001")
       (should (= (length calls) 1))
       (funcall (caar calls) '((status . "ok")))
       (should (= (length calls) 2))
-      (should (= 0 (alist-get 'unread-count
+      (should (= 2 (alist-get 'unread-count
                               (qq-state-session "private:10001"))))
       (funcall (car (nth 1 calls)) '((status . "ok")))
+      (should-not (gethash "private:10001" qq-api--read-operations)))))
+
+(ert-deftest qq-api-mark-session-read-failure-preserves-rerun-intent-once ()
+  (let ((qq-api--read-operations (make-hash-table :test #'equal))
+        (qq-api--read-operation-counter 0)
+        callbacks
+        actions)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (action _params callback &optional errback)
+                 (setq actions (append actions (list action))
+                       callbacks (append callbacks (list (cons callback errback))))
+                 'sent))
+              ((symbol-function 'qq-api--default-error) #'ignore))
+      (qq-api-mark-session-read "private:10001")
+      (qq-api-mark-session-read "private:10001")
+      (funcall (cdr (nth 0 callbacks)) nil "network down")
+      (should (equal actions
+                     '("emacs_mark_read"
+                       "emacs_get_read_state"
+                       "emacs_mark_read")))
+      ;; The retry begins with no inherited rerun bit.  Its own failure only
+      ;; refreshes authoritative state and cannot recurse forever.
+      (should-not (plist-get (gethash "private:10001" qq-api--read-operations)
+                             :rerun))
+      (funcall (cdr (nth 2 callbacks)) nil "still down")
+      (should (= 4 (length actions)))
+      (should (equal (car (last actions)) "emacs_get_read_state"))
       (should-not (gethash "private:10001" qq-api--read-operations)))))
 
 (ert-deftest qq-api-send-text-builds-reply-segments ()
@@ -316,7 +343,7 @@
       (should (equal merged '("dataline:device-1" (((message_id . 1))))))
       (should (= (plist-get done-meta :added-count) 1)))))
 
-(ert-deftest qq-api-fetch-session-read-state-uses-native-locator-and-applies-result ()
+(ert-deftest qq-api-fetch-session-read-state-returns-validated-raw-result ()
   (let (captured-action captured-params applied callback-value)
     (cl-letf (((symbol-function 'qq-state-session)
                (lambda (_session-key)
@@ -347,11 +374,14 @@
       (should (equal "emacs_get_read_state" captured-action))
       (should (equal '((kind . "group") (group_id . "20001"))
                      (alist-get 'chat captured-params)))
-      (should (equal (car applied) "group:20001"))
-      (should (equal callback-value (cadr applied))))))
+      (should-not applied)
+      (should (= 5 (alist-get 'unread_count callback-value)))
+      (should (equal "9007199254742007089"
+                     (alist-get 'message_id
+                                (alist-get 'first_unread callback-value)))))))
 
-(ert-deftest qq-api-fetch-session-read-state-rejects-lossy-wire-id ()
-  (let (applied callback-called)
+(ert-deftest qq-api-fetch-session-read-state-routes-lossy-wire-id-to-errback ()
+  (let (applied callback-called error-response error-reason)
     (cl-letf (((symbol-function 'qq-state-session)
                (lambda (_session-key)
                  '((type . group) (target-id . "20001"))))
@@ -369,11 +399,132 @@
                         (mentions . ((at_me . nil) (at_all . nil)))
                         (latest . nil)))))
                  'sent)))
-      (should-error
-       (qq-api-fetch-session-read-state
-        "group:20001" (lambda (_state) (setq callback-called t))))
+      (qq-api-fetch-session-read-state
+       "group:20001"
+       (lambda (_state) (setq callback-called t))
+       (lambda (response reason)
+         (setq error-response response
+               error-reason reason)))
       (should-not applied)
-      (should-not callback-called))))
+      (should-not callback-called)
+      (should error-response)
+      (should (string-match-p "authoritative read state" error-reason)))))
+
+(ert-deftest qq-api-fetch-session-read-state-routes-consumer-error-to-errback ()
+  (let (error-response error-reason)
+    (cl-letf (((symbol-function 'qq-state-session)
+               (lambda (_session-key)
+                 '((type . group) (target-id . "20001"))))
+              ((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional _errback)
+                 (funcall callback `((data . ,(qq-api-test--read-state))))
+                 'sent)))
+      (qq-api-fetch-session-read-state
+       "group:20001"
+       (lambda (_state) (error "consumer exploded"))
+       (lambda (response reason)
+         (setq error-response response
+               error-reason reason)))
+      (should error-response)
+      (should (equal error-reason "consumer exploded")))))
+
+(ert-deftest qq-api-read-observation-newer-fetch-supersedes-older-recent ()
+  (let ((qq-state-change-hook nil)
+        (qq-api--read-observation-clock 0)
+        (qq-api--session-read-observation-tokens
+         (make-hash-table :test #'equal))
+        recent-success
+        fetch-success)
+    (qq-state-reset)
+    (qq-state-upsert-session
+     "group:20001"
+     '((type . group) (target-id . "20001")
+       (title . "Old") (unread-count . 4))
+     nil)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (action _params callback &optional _errback)
+                 (pcase action
+                   ("get_recent_contact" (setq recent-success callback))
+                   ("emacs_get_read_state" (setq fetch-success callback)))
+                 'sent)))
+      (qq-api-refresh-recent-contacts)
+      (qq-api--refresh-session-read-state-after-failure "group:20001")
+      (let ((state (copy-tree (qq-api-test--read-state))))
+        (setf (alist-get 'unread_count state) 2)
+        (funcall fetch-success `((data . ,state))))
+      ;; The older recent request may still refresh metadata, but its unread
+      ;; snapshot cannot overwrite the newer accepted read observation.
+      (funcall recent-success
+               '((data . (((chatType . 2)
+                            (peerUid . "20001")
+                            (peerUin . "20001")
+                            (peerName . "Fresh title")
+                            (unreadCount . 9))))))
+      (let ((session (qq-state-session "group:20001")))
+        (should (= 2 (alist-get 'unread-count session)))
+        (should (equal "Fresh title" (alist-get 'title session))))
+      (should (= 2 (gethash "group:20001"
+                            qq-api--session-read-observation-tokens))))))
+
+(ert-deftest qq-api-read-observation-notice-supersedes-older-recent ()
+  (let ((qq-state-change-hook nil)
+        (qq-api--read-observation-clock 0)
+        (qq-api--session-read-observation-tokens
+         (make-hash-table :test #'equal))
+        recent-success)
+    (qq-state-reset)
+    (qq-state-upsert-session
+     "group:20001"
+     '((type . group) (target-id . "20001")
+       (title . "Old") (unread-count . 4))
+     nil)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (action _params callback &optional _errback)
+                 (when (equal action "get_recent_contact")
+                   (setq recent-success callback))
+                 'sent)))
+      (qq-api-refresh-recent-contacts)
+      (let* ((notice
+              (qq-api-test--read-state-notice
+               '((kind . "group") (group_id . "20001"))))
+             (state (alist-get 'read_state notice)))
+        (setf (alist-get 'unread_count state) 0
+              (alist-get 'first_unread state) nil
+              (alist-get 'mentions state) '((at_me . nil) (at_all . nil)))
+        (qq-api-handle-event notice))
+      (funcall recent-success
+               '((data . (((chatType . 2)
+                            (peerUid . "20001")
+                            (peerUin . "20001")
+                            (peerName . "Fresh title")
+                            (unreadCount . 9))))))
+      (let ((session (qq-state-session "group:20001")))
+        (should (= 0 (alist-get 'unread-count session)))
+        (should (equal "Fresh title" (alist-get 'title session))))
+      (should (= 2 (gethash "group:20001"
+                            qq-api--session-read-observation-tokens))))))
+
+(ert-deftest qq-api-read-observation-newer-recent-supersedes-older-recent ()
+  (let ((qq-state-change-hook nil)
+        (qq-api--read-observation-clock 0)
+        (qq-api--session-read-observation-tokens
+         (make-hash-table :test #'equal))
+        callbacks)
+    (qq-state-reset)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional _errback)
+                 (setq callbacks (append callbacks (list callback)))
+                 'sent)))
+      (qq-api-refresh-recent-contacts)
+      (qq-api-refresh-recent-contacts)
+      (funcall (nth 1 callbacks)
+               '((data . (((chatType . 2) (peerUid . "20001")
+                            (peerUin . "20001") (unreadCount . 2))))))
+      (funcall (nth 0 callbacks)
+               '((data . (((chatType . 2) (peerUid . "20001")
+                            (peerUin . "20001") (unreadCount . 9))))))
+      (should (= 2 (alist-get 'unread-count
+                              (qq-state-session "group:20001")))))))
 
 (ert-deftest qq-api-fetch-older-history-uses-peer-history-for-service-sessions ()
   (let (captured-action captured-params)
@@ -447,7 +598,10 @@
       (should (equal (alist-get 'busi_id received) "19366")))))
 
 (ert-deftest qq-api-handle-read-state-notice-applies-authoritative-state ()
-  (let (applications)
+  (let ((qq-api--read-observation-clock 0)
+        (qq-api--session-read-observation-tokens
+         (make-hash-table :test #'equal))
+        applications)
     (cl-letf (((symbol-function 'qq-state-apply-session-read-state)
                (lambda (session-key read-state)
                  (push (list session-key read-state) applications))))
@@ -468,7 +622,8 @@
                    "9007199254742007089"
                    (alist-get 'message_id
                               (alist-get 'first_unread (cadr application)))))))
-      (should (= 4 (length applications))))))
+      (should (= 4 (length applications)))
+      (should (= 4 qq-api--read-observation-clock)))))
 
 (ert-deftest qq-api-handle-read-state-notice-rejects-old-or-lossy-shapes ()
   (let ((base

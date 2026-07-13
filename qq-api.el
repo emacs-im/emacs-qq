@@ -19,10 +19,35 @@
 (declare-function qq-state-apply-poke-notice "qq-state" (notice))
 
 (defvar qq-api--read-operations (make-hash-table :test #'equal)
-  "In-flight optimistic read operations keyed by session key.")
+  "In-flight mark-read operations keyed by session key.
+
+An operation owns only a rerun intent.  It never owns or reconstructs unread
+counts; those come from authoritative Linux QQ observations.")
 
 (defvar qq-api--read-operation-counter 0
   "Monotonic token used to reject stale read callbacks.")
+
+(defvar qq-api--read-observation-clock 0
+  "Monotonic clock for read-state writers and observations.")
+
+(defvar qq-api--session-read-observation-tokens
+  (make-hash-table :test #'equal)
+  "Last accepted read-state token keyed by session key.")
+
+(defun qq-api--next-read-observation-token ()
+  "Allocate a token for one read-state request or observation."
+  (cl-incf qq-api--read-observation-clock))
+
+(defun qq-api--accept-read-observation-p (session-key token)
+  "Accept TOKEN for SESSION-KEY unless a newer observation already won.
+
+Accepted tokens are recorded before returning non-nil.  This makes a newer
+request response or notice supersede responses from requests that started
+earlier, without introducing a generic application-wide generation counter."
+  (when (< (gethash session-key qq-api--session-read-observation-tokens 0)
+           token)
+    (puthash session-key token qq-api--session-read-observation-tokens)
+    t))
 
 (defun qq-api--response-data (response)
   "Extract `data' payload from RESPONSE alist."
@@ -687,14 +712,18 @@ and must not be retained as an `unsupported.raw' diagnostic payload."
 (defun qq-api-refresh-recent-contacts (&optional callback errback)
   "Refresh recent contacts, then call CALLBACK with the contact list."
   (interactive)
-  (qq-api-call
-   "get_recent_contact"
-   `((count . ,(max 1 qq-recent-contact-count)))
-   (lambda (response)
-     (let ((contacts (qq-api--response-data response)))
-       (qq-state-apply-recent-contacts contacts)
-       (when callback (funcall callback contacts))))
-   errback))
+  (let ((token (qq-api--next-read-observation-token)))
+    (qq-api-call
+     "get_recent_contact"
+     `((count . ,(max 1 qq-recent-contact-count)))
+     (lambda (response)
+       (let ((contacts (qq-api--response-data response)))
+         (qq-state-apply-recent-contacts
+          contacts
+          (lambda (session-key)
+            (qq-api--accept-read-observation-p session-key token)))
+         (when callback (funcall callback contacts))))
+     errback)))
 
 (defun qq-api-refresh-friend-list (&optional callback errback)
   "Refresh friend list, then call CALLBACK with it."
@@ -858,20 +887,33 @@ peer UIDs stay strings and are never interpreted as QQ numbers."
   "Fetch the official Linux QQ read position for SESSION-KEY.
 
 NapCat resolves the kernel first-unread sequence to the hard-cut NT snowflake
-in `first_unread.message_id'.  CALLBACK receives the raw read-state
-payload after it has been applied to `qq-state'."
-  (qq-api-call
-   "emacs_get_read_state"
-   (qq-api--session-emacs-params session-key)
-   (lambda (response)
-     (let ((read-state
-            (qq-protocol-validate-emacs-read-state
-             (qq-api--response-data response)
-             "emacs_get_read_state response")))
-       (qq-state-apply-session-read-state session-key read-state)
-       (when callback
-         (funcall callback read-state))))
-   errback))
+in `first_unread.message_id'.  CALLBACK receives the validated raw read-state
+payload.  Fetching alone does not mutate local unread state: callers that own a
+freshness barrier decide whether the response may be applied."
+  (let ((handle-error (or errback #'qq-api--default-error)))
+    (qq-api-call
+     "emacs_get_read_state"
+     (qq-api--session-emacs-params session-key)
+     (lambda (response)
+       (condition-case err
+           (let ((read-state
+                  (qq-protocol-validate-emacs-read-state
+                   (qq-api--response-data response)
+                   "emacs_get_read_state response")))
+             (when callback
+               (funcall callback read-state)))
+         (error
+          (funcall handle-error response (error-message-string err)))))
+     errback)))
+
+(defun qq-api--refresh-session-read-state-after-failure (session-key)
+  "Refresh SESSION-KEY after a failed mark-read without guessing counts."
+  (let ((token (qq-api--next-read-observation-token)))
+    (qq-api-fetch-session-read-state
+     session-key
+     (lambda (read-state)
+       (when (qq-api--accept-read-observation-p session-key token)
+         (qq-state-apply-session-read-state session-key read-state))))))
 
 (defun qq-api-fetch-history-page (session-key cursor direction
                                               &optional callback errback count)
@@ -1150,65 +1192,52 @@ ERRBACK is called so the client can fall back to single-side seek."
   (equal token
          (plist-get (gethash session-key qq-api--read-operations) :token)))
 
-(defun qq-api--start-mark-session-read (session-key cleared-count)
-  "Start one read request for SESSION-KEY owning CLEARED-COUNT unread rows."
+(defun qq-api--start-mark-session-read (session-key)
+  "Start one mark-read request for SESSION-KEY."
   (let* ((token (cl-incf qq-api--read-operation-counter))
-         (operation (list :token token
-                          :cleared (max 0 cleared-count)
-                          :queued 0)))
+         (operation (list :token token :rerun nil)))
     (puthash session-key operation qq-api--read-operations)
     (qq-api-call
      "emacs_mark_read"
      (qq-api--session-emacs-params session-key)
      (lambda (_response)
        (when (qq-api--read-operation-current-p session-key token)
-         (let* ((current (gethash session-key qq-api--read-operations))
-                (queued (or (plist-get current :queued) 0)))
+         (let ((rerun
+                (plist-get (gethash session-key qq-api--read-operations)
+                           :rerun)))
            (remhash session-key qq-api--read-operations)
-           ;; Rows cleared while the first request was already in flight need
-           ;; their own server acknowledgement.  They stay locally clear, but
-           ;; remain owned by the follow-up operation for rollback purposes.
-           (when (> queued 0)
-             (qq-api--start-mark-session-read session-key queued)))))
+           (when rerun
+             (qq-api--start-mark-session-read session-key)))))
      (lambda (response reason)
        (when (qq-api--read-operation-current-p session-key token)
-         (let* ((current-operation
-                 (gethash session-key qq-api--read-operations))
-                (owned (+ (or (plist-get current-operation :cleared) 0)
-                          (or (plist-get current-operation :queued) 0)))
-                (session (qq-state-session session-key))
-                (current-unread
-                 (or (and session (alist-get 'unread-count session)) 0)))
+         (let ((rerun
+                (plist-get (gethash session-key qq-api--read-operations)
+                           :rerun)))
            (remhash session-key qq-api--read-operations)
-           (when (and session (> owned 0))
-             (qq-state-set-session-unread
-              session-key (+ current-unread owned)))
-           (qq-api--default-error response reason)))))
+           (qq-api--default-error response reason)
+           (qq-api--refresh-session-read-state-after-failure session-key)
+           ;; A failed request does not consume a newer visible-message intent.
+           ;; Retry that intent once; the new operation starts clean, so a
+           ;; persistent error cannot create an automatic retry loop.
+           (when rerun
+             (qq-api--start-mark-session-read session-key))))))
     token))
 
 (defun qq-api-mark-session-read (session-key)
-  "Mark SESSION-KEY as read locally and in NapCat without losing races.
+  "Mark SESSION-KEY as read in NapCat without guessing unread counts.
 
-Concurrent calls coalesce behind one request.  Unread rows that arrive while
-that request is in flight are cleared optimistically, then acknowledged by a
-follow-up request.  A failure restores exactly the rows owned by the failed
-operation in addition to any newer unread rows."
+Concurrent calls coalesce behind one request and unconditionally request one
+rerun.  This handles a visible message arriving while the first request is in
+flight without relying on a locally incremented unread count.  Failure starts
+one authoritative read-state refresh."
   (interactive)
-  (let* ((session (qq-state-session session-key))
-         (unread (or (and session (alist-get 'unread-count session)) 0))
-         (operation (gethash session-key qq-api--read-operations)))
-    (when (> unread 0)
-      (qq-state-clear-session-unread session-key))
+  (let ((operation (gethash session-key qq-api--read-operations)))
     (if operation
         (progn
-          (when (> unread 0)
-            (setq operation
-                  (plist-put operation :queued
-                             (+ (or (plist-get operation :queued) 0)
-                                unread)))
-            (puthash session-key operation qq-api--read-operations))
+          (setq operation (plist-put operation :rerun t))
+          (puthash session-key operation qq-api--read-operations)
           (plist-get operation :token))
-      (qq-api--start-mark-session-read session-key unread))))
+      (qq-api--start-mark-session-read session-key))))
 
 (defun qq-api--send-text-segments (text &optional reply-to-message-id)
   "Return send_msg segment list for TEXT and optional REPLY-TO-MESSAGE-ID."
@@ -1618,7 +1647,9 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
             (chat (alist-get 'chat event))
             (read-state (alist-get 'read_state event))
             (session-key (qq-api--emacs-session-key-from-locator chat)))
-       (qq-state-apply-session-read-state session-key read-state)))
+       (when (qq-api--accept-read-observation-p
+              session-key (qq-api--next-read-observation-token))
+         (qq-state-apply-session-read-state session-key read-state))))
     ((or "friend_recall" "group_recall")
      (qq-state-apply-recall (alist-get 'message_id notice)))
     ("group_msg_emoji_like"
