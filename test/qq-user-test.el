@@ -189,6 +189,301 @@
   (should (equal (qq-user--buffer-name "10001") "*qq-user*"))
   (should (equal (qq-user--buffer-name "10002") "*qq-user*")))
 
+(ert-deftest qq-user-global-search-result-is-strict-and-closed ()
+  (let ((result
+         `((user_id . "9007199254740993")
+           (uid . "u_synthetic_candidate")
+           (nickname . "Synthetic User")
+           (avatar_url . "https://example.invalid/avatar")
+           (candidate . ,(make-string 43 ?C)))))
+    (should (qq-user--global-search-result-p result))
+    (should-not
+     (qq-user--global-search-result-p
+      (append (copy-tree result) '((native . "must not escape")))))
+    (setf (alist-get 'user_id result) 9007199254740993)
+    (should-not (qq-user--global-search-result-p result))))
+
+(ert-deftest qq-user-friend-add-prepare-settles-synchronous-callback ()
+  (with-temp-buffer
+    (qq-user-mode)
+    (let* ((candidate (make-string 43 ?C))
+           (preparation (make-string 43 ?P))
+           (state
+            (qq-user--friend-add-state-create
+             :user-id "9007199254740993"
+             :candidate candidate
+             :status 'candidate)))
+      (setq qq-user--user-id "9007199254740993"
+            qq-user--friend-add-state state)
+      (cl-letf (((symbol-function 'qq-user-render) #'ignore)
+                ((symbol-function 'qq-api-friend-add-prepare)
+                 (lambda (user-id token callback &optional _errback)
+                   (should (equal user-id "9007199254740993"))
+                   (should (equal token candidate))
+                   (funcall callback
+                            `((kind . "prepared")
+                              (user_id . "9007199254740993")
+                              (verification . "message")
+                              (questions)
+                              (preparation . ,preparation)))
+                   'already-finished)))
+        (qq-user--prepare-friend-add state))
+      (should (eq (qq-user--friend-add-state-status state) 'prepared))
+      (should-not (qq-user--friend-add-state-candidate state))
+      (should (equal (qq-user--friend-add-state-preparation state)
+                     preparation))
+      (should-not (qq-user--friend-add-state-request state)))))
+
+(ert-deftest qq-user-friend-add-prepare-failure-is-terminal-and-tokenless ()
+  (with-temp-buffer
+    (qq-user-mode)
+    (let ((state
+           (qq-user--friend-add-state-create
+            :user-id "9007199254740993"
+            :candidate (make-string 43 ?C)
+            :status 'candidate)))
+      (setq qq-user--user-id "9007199254740993"
+            qq-user--friend-add-state state)
+      (cl-letf (((symbol-function 'qq-user-render) #'ignore)
+                ((symbol-function 'qq-api-friend-add-prepare)
+                 (lambda (_user-id _token _callback &optional errback)
+                   (funcall errback nil "synthetic protocol failure")
+                   'already-finished)))
+        (qq-user--prepare-friend-add state))
+      (should (eq (qq-user--friend-add-state-status state) 'error))
+      (should-not (qq-user--friend-add-state-candidate state))
+      (should-not (qq-user--friend-add-state-preparation state))
+      (should-not (qq-user--friend-add-state-request state))
+      (should (equal (qq-user--friend-add-state-error state)
+                     "synthetic protocol failure")))))
+
+(ert-deftest qq-user-friend-add-stale-callback-cannot-mutate-new-state ()
+  (with-temp-buffer
+    (qq-user-mode)
+    (let* ((user-id "9007199254740993")
+           (old
+            (qq-user--friend-add-state-create
+             :user-id user-id :candidate (make-string 43 ?O)
+             :status 'candidate))
+           (new
+            (qq-user--friend-add-state-create
+             :user-id user-id :candidate (make-string 43 ?N)
+             :status 'candidate))
+           callback)
+      (setq qq-user--user-id user-id
+            qq-user--friend-add-state old)
+      (cl-letf (((symbol-function 'qq-user-render) #'ignore)
+                ((symbol-function 'qq-api-friend-add-prepare)
+                 (lambda (_user-id _token success &optional _errback)
+                   (setq callback success)
+                   'pending-request)))
+        (qq-user--prepare-friend-add old)
+        (setq qq-user--friend-add-state new)
+        (funcall callback
+                 `((kind . "prepared")
+                   (user_id . ,user-id)
+                   (verification . "none")
+                   (questions)
+                   (preparation . ,(make-string 43 ?P)))))
+      (should (eq (qq-user--friend-add-state-status new) 'candidate))
+      (should (qq-user--friend-add-state-candidate new))
+      (should-not (qq-user--friend-add-state-preparation new)))))
+
+(ert-deftest qq-user-friend-add-state-must-own-its-exact-user ()
+  (with-temp-buffer
+    (qq-user-mode)
+    (let ((state
+           (qq-user--friend-add-state-create
+            :user-id "9007199254740993" :status 'candidate)))
+      (setq qq-user--user-id "9007199254740994"
+            qq-user--friend-add-state state)
+      (should-not
+       (qq-user--friend-add-current-p state "9007199254740994")))))
+
+(ert-deftest qq-user-friend-add-message-reads-only-verification-message ()
+  (let ((state
+         (qq-user--friend-add-state-create
+          :verification "message" :questions nil)))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (prompt &rest _args)
+                 (should (equal prompt "验证留言: "))
+                 "Synthetic verification message")))
+      (should
+       (equal (qq-user--read-friend-verification state)
+              '((verification_message . "Synthetic verification message")
+                (answers)))))))
+
+(ert-deftest qq-user-friend-add-question-answer-reads-every-answer ()
+  (let ((state
+         (qq-user--friend-add-state-create
+          :verification "question_answer"
+          :questions '("Synthetic question one?"
+                       "Synthetic question two?")))
+        (responses '("Synthetic answer one" "Synthetic answer two"))
+        prompts)
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (prompt &rest _args)
+                 (push prompt prompts)
+                 (prog1 (car responses)
+                   (setq responses (cdr responses))))))
+      (should
+       (equal (qq-user--read-friend-verification state)
+              '((verification_message . "")
+                (answers . ("Synthetic answer one"
+                            "Synthetic answer two"))))))
+    (should-not responses)
+    (should
+     (equal (nreverse prompts)
+            '("问题 1/2（Synthetic question one?）答案: "
+              "问题 2/2（Synthetic question two?）答案: ")))))
+
+(ert-deftest qq-user-friend-add-none-does-not-prompt-or-invent-answers ()
+  (let ((state (qq-user--friend-add-state-create :verification "none")))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (&rest _args) (ert-fail "must not prompt"))))
+      (should
+       (equal (qq-user--read-friend-verification state)
+              '((verification_message . "") (answers)))))))
+
+(ert-deftest qq-user-friend-add-rejects-old-question-mode ()
+  (let ((state
+         (qq-user--friend-add-state-create
+          :verification "question" :questions '("Legacy question"))))
+    (should-error (qq-user--read-friend-verification state) :type 'error)))
+
+(ert-deftest qq-user-friend-add-verification-uses-utf-16-code-units ()
+  (let ((astral #x1f600)
+        (message-state
+         (qq-user--friend-add-state-create :verification "message"))
+        (answer-state
+         (qq-user--friend-add-state-create
+          :verification "question_answer" :questions '("Question?"))))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (&rest _args) (make-string 150 astral))))
+      (should (qq-user--read-friend-verification message-state))
+      (should (qq-user--read-friend-verification answer-state)))
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (&rest _args) (make-string 151 astral))))
+      (should-error (qq-user--read-friend-verification message-state)
+                    :type 'user-error)
+      (should-error (qq-user--read-friend-verification answer-state)
+                    :type 'user-error))))
+
+(ert-deftest qq-user-friend-add-prevalidates-options-before-consuming-token ()
+  (with-temp-buffer
+    (qq-user-mode)
+    (let* ((astral #x1f600)
+           (user-id "9007199254740993")
+           (preparation (make-string 43 ?P))
+           (state
+            (qq-user--friend-add-state-create
+             :user-id user-id :preparation preparation
+             :verification "none" :status 'prepared))
+           confirmed dispatched)
+      (setq qq-user--user-id user-id
+            qq-user--friend-add-state state)
+      (cl-letf (((symbol-function 'qq-user--read-friend-verification)
+                 (lambda (_state)
+                   '((verification_message . "") (answers))))
+                ((symbol-function 'read-string)
+                 (lambda (&rest _args) (make-string 51 astral)))
+                ((symbol-function 'qq-user--read-friend-group-id)
+                 (lambda () 0))
+                ((symbol-function 'qq-user--read-friend-permissions)
+                 (lambda ()
+                   '((only_chat) (qzone_not_watch) (qzone_not_watched))))
+                ((symbol-function 'yes-or-no-p)
+                 (lambda (&rest _args) (setq confirmed t)))
+                ((symbol-function 'qq-api-friend-add-submit)
+                 (lambda (&rest _args) (setq dispatched t))))
+        (should-error (qq-user--submit-friend-add state) :type 'user-error))
+      (should-not confirmed)
+      (should-not dispatched)
+      (should (equal (qq-user--friend-add-state-preparation state)
+                     preparation))
+      (should (eq (qq-user--friend-add-state-status state) 'prepared)))))
+
+(ert-deftest qq-user-friend-add-submit-sends-closed-explicit-options ()
+  (with-temp-buffer
+    (qq-user-mode)
+    (let* ((user-id "9007199254740993")
+           (preparation (make-string 43 ?P))
+           (state
+            (qq-user--friend-add-state-create
+             :user-id user-id
+             :preparation preparation
+             :verification "message"
+             :status 'prepared))
+           (permission-answers '(t nil t))
+           permission-prompts
+           submitted-options
+           submitted-preparation)
+      (setq qq-user--user-id user-id
+            qq-user--friend-add-state state)
+      (cl-letf (((symbol-function 'qq-user-render) #'ignore)
+                ((symbol-function 'qq-user--read-friend-verification)
+                 (lambda (candidate-state)
+                   (should (eq candidate-state state))
+                   '((verification_message . "Synthetic verification")
+                     (answers))))
+                ((symbol-function 'read-string)
+                 (lambda (prompt &rest _args)
+                   (should (equal prompt "好友备注（可空）: "))
+                   "Synthetic remark"))
+                ((symbol-function 'qq-user--read-friend-group-id)
+                 (lambda () 7))
+                ((symbol-function 'y-or-n-p)
+                 (lambda (prompt)
+                   (push prompt permission-prompts)
+                   (prog1 (car permission-answers)
+                     (setq permission-answers (cdr permission-answers)))))
+                ((symbol-function 'yes-or-no-p)
+                 (lambda (prompt)
+                   (should (string-match-p "确认向" prompt))
+                   t))
+                ((symbol-function 'qq-api-friend-add-submit)
+                 (lambda (target-user-id token options callback
+                          &optional _errback)
+                   (should (equal target-user-id user-id))
+                   (setq submitted-preparation token
+                         submitted-options (copy-tree options))
+                   ;; The one-use capability must leave UI state before any
+                   ;; mutating transport dispatch can observe it.
+                   (should-not
+                    (qq-user--friend-add-state-preparation state))
+                   (should (eq (qq-user--friend-add-state-status state)
+                               'submitting))
+                   (funcall callback
+                            `((kind . "submitted") (user_id . ,user-id)))
+                   'already-finished)))
+        (qq-user--submit-friend-add state))
+      (should (equal submitted-preparation preparation))
+      (should
+       (equal submitted-options
+              '((verification_message . "Synthetic verification")
+                (answers)
+                (remark . "Synthetic remark")
+                (friend_group_id . 7)
+                (only_chat . t)
+                (qzone_not_watch)
+                (qzone_not_watched . t))))
+      (should (equal (nreverse permission-prompts)
+                     '("权限：仅聊天？ "
+                       "权限：不看对方的 QQ 空间？ "
+                       "权限：不让对方看我的 QQ 空间？ ")))
+      (should-not permission-answers)
+      (should (eq (qq-user--friend-add-state-status state) 'submitted))
+      (should-not (qq-user--friend-add-state-request state))
+      (should-not (qq-user--friend-add-state-preparation state)))))
+
+(ert-deftest qq-user-friend-group-selection-has-no-guessed-default ()
+  (cl-letf (((symbol-function 'qq-state-friend-categories) (lambda () nil))
+            ((symbol-function 'completing-read)
+             (lambda (&rest _args)
+               (ert-fail "must not prompt without authoritative categories"))))
+    (should-not (qq-user--friend-group-choices))
+    (should-error (qq-user--read-friend-group-id) :type 'user-error)))
+
 (ert-deftest qq-api-get-user-social-actions-preserve-string-identity ()
   (let (calls like added photos)
     (cl-letf (((symbol-function 'qq-api-call)

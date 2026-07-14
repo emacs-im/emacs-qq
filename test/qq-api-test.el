@@ -165,6 +165,10 @@ The authoritative post-state reports UNREAD-COUNT."
   "Return one canonical UUIDv4 cursor for API tests."
   "123e4567-e89b-42d3-a456-426614174000")
 
+(defun qq-api-test--capability-token (&optional character)
+  "Return one synthetic exact capability token filled with CHARACTER."
+  (make-string 43 (or character ?A)))
+
 (defun qq-api-test--message-reference (kind target-id message-id)
   "Return one closed mutation reference for KIND, TARGET-ID and MESSAGE-ID."
   `((message_id . ,message-id)
@@ -3190,6 +3194,371 @@ The authoritative post-state reports UNREAD-COUNT."
        (lambda (_response reason) (setq failure reason))))
     (should-not delivered)
     (should (string-match-p "duplicate user_id 10001" failure))))
+
+(ert-deftest qq-api-search-strangers-start-trims-owner-and-validates-copy ()
+  (let* ((candidate (qq-api-test--capability-token ?B))
+         (cursor (qq-api-test--capability-token ?C))
+         (native-page
+          `((results
+             . (((user_id . "9007199254740993")
+                 (uid . "u_synthetic_candidate")
+                 (nickname . "Synthetic User")
+                 (avatar_url . "https://example.invalid/avatar")
+                 (candidate . ,candidate))))
+            (next_cursor . ,cursor)))
+         action params delivered)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (wire-action wire-params callback &optional _errback)
+                 (setq action wire-action params wire-params)
+                 (funcall callback `((data . ,native-page)))
+                 'stranger-search-request)))
+      (should
+       (eq (qq-api-search-strangers-start
+            "  Synthetic User  " (lambda (page) (setq delivered page))
+            nil 17)
+           'stranger-search-request)))
+    (should (equal action "emacs_search_strangers"))
+    (should (equal params
+                   '((kind . "start")
+                     (query . "Synthetic User")
+                     (limit . 17))))
+    (should (equal delivered native-page))
+    (setf (alist-get 'nickname (car (alist-get 'results native-page)))
+          "Mutated")
+    (should (equal (alist-get 'nickname
+                              (car (alist-get 'results delivered)))
+                   "Synthetic User"))))
+
+(ert-deftest qq-api-search-strangers-next-repeats-exact-owner ()
+  (let ((cursor (qq-api-test--capability-token ?D)) action params delivered)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (wire-action wire-params callback &optional _errback)
+                 (setq action wire-action params wire-params)
+                 (funcall callback '((data . ((results) (next_cursor)))))
+                 'stranger-next-request)))
+      (should
+       (eq (qq-api-search-strangers-next
+            cursor "  Exact Owner " (lambda (page) (setq delivered page))
+            nil 50)
+           'stranger-next-request)))
+    (should (equal action "emacs_search_strangers"))
+    (should (equal params
+                   `((kind . "next")
+                     (cursor . ,cursor)
+                     (query . "Exact Owner")
+                     (limit . 50))))
+    (should (equal delivered '((results) (next_cursor))))))
+
+(ert-deftest qq-api-search-strangers-rejects-invalid-input-before-transport ()
+  (let (called)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (&rest _args) (setq called t))))
+      (dolist (form
+               `((qq-api-search-strangers-start "   " #'ignore)
+                 (qq-api-search-strangers-start "x" #'ignore nil 0)
+                 (qq-api-search-strangers-start "x" #'ignore nil 51)
+                 (qq-api-search-strangers-next
+                  "short" "x" #'ignore nil 10)))
+        (should-error (eval form) :type 'user-error)))
+    (should-not called)))
+
+(ert-deftest qq-api-stranger-and-friend-add-limits-use-utf-16-code-units ()
+  (let ((astral #x1f600))
+    (should (= (qq-api--utf-16-code-unit-length
+                (concat "a" (string astral)))
+               3))
+    (should
+     (equal (alist-get 'query
+                       (qq-api--stranger-search-owner-params
+                        (make-string 64 astral) 20))
+            (make-string 64 astral)))
+    (should-error
+     (qq-api--stranger-search-owner-params (make-string 65 astral) 20)
+     :type 'user-error)
+    (let ((boundary
+           `((verification_message . ,(make-string 150 astral))
+             (answers . (,(make-string 150 astral)))
+             (remark . ,(make-string 50 astral))
+             (friend_group_id . 0)
+             (only_chat . nil)
+             (qzone_not_watch . nil)
+             (qzone_not_watched . nil))))
+      (should (equal (qq-api--normalize-friend-add-options boundary)
+                     boundary))
+      (dolist (field '(verification_message answers remark))
+        (let ((too-long (copy-tree boundary)))
+          (setf (alist-get field too-long)
+                (if (eq field 'answers)
+                    (list (make-string 151 astral))
+                  (make-string (if (eq field 'remark) 51 151) astral)))
+          (should-error (qq-api--normalize-friend-add-options too-long)
+                        :type 'user-error))))))
+
+(ert-deftest qq-api-search-strangers-page-is-closed-and-lossless ()
+  (let ((candidate (qq-api-test--capability-token ?E)))
+    (should-error
+     (qq-api--validate-stranger-search-page
+      `((results
+         . (((user_id . 9007199254740993)
+             (uid)
+             (nickname . "Synthetic")
+             (avatar_url . "https://example.invalid/avatar")
+             (candidate . ,candidate))))
+        (next_cursor))))
+    (should-error
+     (qq-api--validate-stranger-search-page
+      `((results
+         . (((user_id . "9007199254740993")
+             (uid)
+             (nickname . "Synthetic")
+             (avatar_url . "https://example.invalid/avatar")
+             (candidate . ,candidate)
+             (native . "leak"))))
+        (next_cursor))))
+    (should-error
+     (qq-api--validate-stranger-search-page
+      `((results
+         . (((user_id . "9007199254740993")
+             (uid)
+             (nickname . "Synthetic")
+             (avatar_url . "")
+             (candidate . ,candidate))))
+        (next_cursor))))
+    (should-error
+     (qq-api--validate-stranger-search-page
+      '((results) (next_cursor . "not-a-capability"))))))
+
+(ert-deftest qq-api-search-strangers-page-requires-unique-nonnull-uids ()
+  (let ((candidate (qq-api-test--capability-token ?U)))
+    (should-error
+     (qq-api--validate-stranger-search-page
+      `((results
+         . (((user_id . "9007199254740993")
+             (uid . "native-shared") (nickname . "First")
+             (avatar_url . "https://example.invalid/first")
+             (candidate . ,candidate))
+            ((user_id . "9007199254740994")
+             (uid . "native-shared") (nickname . "Second")
+             (avatar_url . "https://example.invalid/second")
+             (candidate . ,candidate))))
+        (next_cursor))))
+    (let ((validated
+           (qq-api--validate-stranger-search-page
+            `((results
+               . (((user_id . "9007199254740993")
+                   (uid) (nickname . "First")
+                   (avatar_url . "https://example.invalid/first")
+                   (candidate . ,candidate))
+                  ((user_id . "9007199254740994")
+                   (uid) (nickname . "Second")
+                   (avatar_url . "https://example.invalid/second")
+                   (candidate . ,candidate))))
+              (next_cursor)))))
+      (should (= (length (alist-get 'results validated)) 2)))))
+
+(ert-deftest qq-api-search-strangers-does-not-reinterpret-consumer-errors ()
+  (let (errback-called)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional _errback)
+                 (funcall callback '((data . ((results) (next_cursor))))))))
+      (should-error
+       (qq-api-search-strangers-start
+        "Synthetic"
+        (lambda (_page) (error "consumer failure"))
+        (lambda (&rest _args) (setq errback-called t)))
+       :type 'error))
+    (should-not errback-called)))
+
+(ert-deftest qq-api-friend-add-prepare-validates-multi-question-result ()
+  (let* ((candidate (qq-api-test--capability-token ?F))
+         (preparation (qq-api-test--capability-token ?G))
+         (native-result
+          `((kind . "prepared")
+            (user_id . "9007199254740993")
+            (verification . "question_and_audit")
+            (questions . ("Synthetic question one?"
+                          "Synthetic question two?"))
+            (preparation . ,preparation)))
+         action params delivered)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (wire-action wire-params callback &optional _errback)
+                 (setq action wire-action params wire-params)
+                 (funcall callback `((data . ,native-result)))
+                 'friend-prepare-request)))
+      (should
+       (eq (qq-api-friend-add-prepare
+            "9007199254740993" candidate
+            (lambda (result) (setq delivered result)))
+           'friend-prepare-request)))
+    (should (equal action "emacs_friend_add"))
+    (should (equal params
+                   `((kind . "prepare")
+                     (user_id . "9007199254740993")
+                     (candidate . ,candidate))))
+    (should (equal delivered native-result))
+    (setf (car (alist-get 'questions native-result)) "Mutated")
+    (should (equal (alist-get 'questions delivered)
+                   '("Synthetic question one?"
+                     "Synthetic question two?")))))
+
+(ert-deftest qq-api-friend-add-prepared-verification-modes-are-exact ()
+  (let ((preparation (qq-api-test--capability-token ?M))
+        (user-id "9007199254740993"))
+    (dolist (result
+             `(((kind . "prepared") (user_id . ,user-id)
+                (verification . "message")
+                (questions . ("Unexpected question"))
+                (preparation . ,preparation))
+               ((kind . "prepared") (user_id . ,user-id)
+                (verification . "question_answer") (questions . (""))
+                (preparation . ,preparation))
+               ((kind . "prepared") (user_id . ,user-id)
+                (verification . "question_answer") (questions)
+                (preparation . ,preparation))
+               ((kind . "prepared") (user_id . ,user-id)
+                (verification . "question_and_audit") (questions)
+                (preparation . ,preparation))
+               ((kind . "prepared") (user_id . ,user-id)
+                (verification . "question_and_audit")
+                (questions . ("Question one" "   "))
+                (preparation . ,preparation))
+               ((kind . "prepared") (user_id . ,user-id)
+                (verification . "single_question")
+                (questions . ("Legacy question"))
+                (preparation . ,preparation))
+               ((kind . "prepared") (user_id . ,user-id)
+                (verification . "question")
+                (questions . ("Legacy question"))
+                (preparation . ,preparation))))
+      (should-error (qq-api--validate-friend-add-result result user-id)))
+    (should
+     (equal
+      (alist-get
+       'verification
+       (qq-api--validate-friend-add-result
+        `((kind . "prepared") (user_id . ,user-id)
+          (verification . "question_answer")
+          (questions . ("Synthetic question one" "Synthetic question two"))
+          (preparation . ,preparation))
+        user-id))
+      "question_answer"))))
+
+(ert-deftest qq-api-friend-add-submit-encodes-json-false-and-validates-result ()
+  (let ((preparation (qq-api-test--capability-token ?H))
+        action params delivered)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (wire-action wire-params callback &optional _errback)
+                 (setq action wire-action params wire-params)
+                 (funcall
+                  callback
+                  '((data . ((kind . "submitted")
+                             (user_id . "9007199254740993")))))
+                 'friend-submit-request)))
+      (should
+       (eq (qq-api-friend-add-submit
+            "9007199254740993" preparation
+            '((verification_message . "Synthetic hello")
+              (answers)
+              (remark . "")
+              (friend_group_id . 0)
+              (only_chat . nil)
+              (qzone_not_watch . t)
+              (qzone_not_watched . nil))
+            (lambda (result) (setq delivered result)))
+           'friend-submit-request)))
+    (should (equal action "emacs_friend_add"))
+    (should (equal params
+                   `((kind . "submit")
+                     (user_id . "9007199254740993")
+                     (preparation . ,preparation)
+                     (verification_message . "Synthetic hello")
+                     (answers . [])
+                     (remark . "")
+                     (friend_group_id . 0)
+                     (only_chat . :false)
+                     (qzone_not_watch . t)
+                     (qzone_not_watched . :false))))
+    (should (equal delivered
+                   '((kind . "submitted")
+                     (user_id . "9007199254740993"))))))
+
+(ert-deftest qq-api-friend-add-rejects-invalid-input-before-transport ()
+  (let ((token (qq-api-test--capability-token ?I)) called)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (&rest _args) (setq called t))))
+      (should-error
+       (qq-api-friend-add-prepare "0" token #'ignore) :type 'user-error)
+      (should-error
+       (qq-api-friend-add-prepare "9007199254740993" "short" #'ignore)
+       :type 'user-error)
+      (dolist
+          (options
+           (list
+            `((verification_message . ,(make-string 301 ?x)) (answers)
+              (remark . "") (friend_group_id . 0)
+              (only_chat . nil) (qzone_not_watch . nil)
+              (qzone_not_watched . nil))
+            '((message . "Legacy mixed verification")
+              (remark . "") (friend_group_id . 0)
+              (only_chat . nil) (qzone_not_watch . nil)
+              (qzone_not_watched . nil))
+            `((verification_message . "")
+              (answers . (,(make-string 301 ?x)))
+              (remark . "") (friend_group_id . 0)
+              (only_chat . nil) (qzone_not_watch . nil)
+              (qzone_not_watched . nil))
+            '((verification_message . "") (answers)
+              (remark . "") (friend_group_id . 4294967296)
+              (only_chat . nil) (qzone_not_watch . nil)
+              (qzone_not_watched . nil))
+            '((verification_message . "") (answers)
+              (remark . "") (friend_group_id . 0)
+              (only_chat . :false) (qzone_not_watch . nil)
+              (qzone_not_watched . nil))
+            '((verification_message . "") (answers)
+              (remark . "") (friend_group_id . 0)
+              (only_chat . nil) (qzone_not_watch . nil))))
+        (should-error
+         (qq-api-friend-add-submit
+          "9007199254740993" token options #'ignore)
+         :type 'user-error)))
+    (should-not called)))
+
+(ert-deftest qq-api-friend-add-routes-closed-phase-errors-to-errback ()
+  (let ((candidate (qq-api-test--capability-token ?J)) delivered failure)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional _errback)
+                 (funcall
+                  callback
+                  '((data . ((kind . "submitted")
+                             (user_id . "9007199254740993")
+                             (extra . :false))))))))
+      (qq-api-friend-add-prepare
+       "9007199254740993" candidate
+       (lambda (_result) (setq delivered t))
+       (lambda (_response reason) (setq failure reason))))
+    (should-not delivered)
+    (should (string-match-p "invalid submitted result" failure))))
+
+(ert-deftest qq-api-friend-add-does-not-reinterpret-consumer-errors ()
+  (let ((candidate (qq-api-test--capability-token ?K)) errback-called)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional _errback)
+                 (funcall
+                  callback
+                  `((data . ((kind . "prepared")
+                             (user_id . "9007199254740993")
+                             (verification . "none")
+                             (questions)
+                             (preparation
+                              . ,(qq-api-test--capability-token ?L)))))))))
+      (should-error
+       (qq-api-friend-add-prepare
+        "9007199254740993" candidate
+        (lambda (_result) (error "consumer failure"))
+        (lambda (&rest _args) (setq errback-called t)))
+       :type 'error))
+    (should-not errback-called)))
 
 (provide 'qq-api-test)
 

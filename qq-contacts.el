@@ -33,6 +33,8 @@
 (declare-function qq-group-open "qq-group" (group-id))
 (declare-function qq-root-open "qq-root" ())
 (declare-function qq-user-open "qq-user" (user-id))
+(declare-function qq-user-open-search-result "qq-user" (result))
+(declare-function qq-user-add-friend "qq-user" ())
 
 (defgroup qq-contacts nil
   "Native friend and joined-group directory for emacs-qq."
@@ -86,11 +88,15 @@
 (defvar qq-contacts-search-history nil
   "Minibuffer history for native QQ directory searches.")
 
+(defvar qq-contacts-search-scope-history nil
+  "Minibuffer history for QQ directory search scopes.")
+
 (defvar-local qq-contacts--ewoc nil)
 (defvar-local qq-contacts--node-table nil)
 (defvar-local qq-contacts--view 'friends)
 (defvar-local qq-contacts--previous-view 'friends)
 (defvar-local qq-contacts--query nil)
+(defvar-local qq-contacts--search-scope 'all)
 (defvar-local qq-contacts--collapsed-categories nil)
 (defvar-local qq-contacts--fill-column nil)
 (defvar-local qq-contacts--header-line-cache "")
@@ -110,13 +116,16 @@
 (defvar-local qq-contacts--search-errors nil)
 (defvar-local qq-contacts--search-friends nil)
 (defvar-local qq-contacts--search-groups nil)
+(defvar-local qq-contacts--search-strangers nil)
 (defvar-local qq-contacts--search-members nil)
 (defvar-local qq-contacts--member-group-id nil)
 (defvar-local qq-contacts--search-friend-cursor nil)
 (defvar-local qq-contacts--search-group-cursor nil)
+(defvar-local qq-contacts--search-stranger-cursor nil)
 (defvar-local qq-contacts--search-member-cursor nil)
 (defvar-local qq-contacts--search-friend-request nil)
 (defvar-local qq-contacts--search-group-request nil)
+(defvar-local qq-contacts--search-stranger-request nil)
 (defvar-local qq-contacts--search-member-request nil)
 
 (defun qq-contacts--present-string (value)
@@ -180,6 +189,14 @@
    :key (cons 'member (alist-get 'user_id member))
    :type 'member
    :object member
+   :width qq-contacts--fill-column))
+
+(defun qq-contacts--stranger-entry (stranger)
+  "Return one global QQ user search entry for STRANGER."
+  (qq-contacts--entry-create
+   :key (cons 'stranger (alist-get 'user_id stranger))
+   :type 'stranger
+   :object stranger
    :width qq-contacts--fill-column))
 
 (defun qq-contacts--section-entry (key title count)
@@ -275,9 +292,10 @@
     (nreverse entries)))
 
 (defun qq-contacts--project-search ()
-  "Project exact native friend and group-chat search results."
+  "Project exact native friend, group-chat, and global-user results."
   (let ((friends qq-contacts--search-friends)
         (groups qq-contacts--search-groups)
+        (strangers qq-contacts--search-strangers)
         entries)
     (push (qq-contacts--navigation-entry) entries)
     (when friends
@@ -302,13 +320,34 @@
             entries))
     (when qq-contacts--search-group-cursor
       (push (qq-contacts--load-more-entry 'groups "加载更多群聊") entries))
-    (unless (or friends groups qq-contacts--search-pending
+    (when strangers
+      (push (qq-contacts--section-entry
+             'strangers "全网 QQ 用户" (length strangers))
+            entries)
+      (dolist (stranger strangers)
+        (push (qq-contacts--stranger-entry stranger) entries)))
+    (when (memq 'strangers qq-contacts--search-pending)
+      (push (qq-contacts--note-entry 'searching-strangers
+                                     "正在搜索全网 QQ 用户…")
+            entries))
+    (when-let* ((reason (qq-contacts--search-error 'strangers)))
+      (push (qq-contacts--note-entry 'search-strangers-error
+                                     reason 'error-note)
+            entries))
+    (when qq-contacts--search-stranger-cursor
+      (push (qq-contacts--load-more-entry
+             'strangers "加载更多全网 QQ 用户")
+            entries))
+    (unless (or friends groups strangers qq-contacts--search-pending
                 qq-contacts--search-errors
                 qq-contacts--search-friend-cursor
-                qq-contacts--search-group-cursor)
+                qq-contacts--search-group-cursor
+                qq-contacts--search-stranger-cursor)
       (push (qq-contacts--note-entry
              'empty-search
-             (format "没有与 “%s” 匹配的好友或群聊。"
+             (format "%s中没有与 “%s” 匹配的结果。"
+                     (qq-contacts--search-scope-label
+                      qq-contacts--search-scope)
                      (or qq-contacts--query "")))
             entries))
     (nreverse entries)))
@@ -389,7 +428,7 @@
   (qq-contacts--insert-navigation-button
    " 搜索… " 'search
    (lambda () (call-interactively #'qq-contacts-search))
-   "搜索好友和群聊 (/)")
+   "选择范围并搜索好友、群聊或全网 QQ 用户 (/)")
   (insert "  ")
   (appkit-ui-insert-action-button
    " 刷新 " #'qq-contacts-refresh
@@ -611,6 +650,40 @@
      :help-echo "mouse-1 or RET: 打开私聊"
      :mouse-face 'highlight)))
 
+(defun qq-contacts--stranger-name (stranger)
+  "Return the best display name for global user STRANGER."
+  (or (qq-contacts--present-string (alist-get 'nickname stranger))
+      (alist-get 'user_id stranger)))
+
+(defun qq-contacts--insert-stranger (entry)
+  "Insert actionable global QQ user ENTRY."
+  (let* ((stranger (qq-contacts--entry-object entry))
+         (user-id (alist-get 'user_id stranger))
+         (start (point)))
+    (appkit-view-insert-one-line-row
+     (appkit-view-one-line-row-create
+      :icon-inserter (lambda ()
+                       (insert
+                        (qq-media-avatar-cached-display-string user-id)))
+      :context (qq-contacts--stranger-name stranger)
+      :context-trail "全网用户"
+      :context-trail-face 'shadow
+      :preview (format "QQ %s · 打开资料页后可添加好友" user-id)
+      :line-properties
+      (list 'qq-contacts-key (qq-contacts--entry-key entry)
+            'qq-contacts-row-type 'stranger
+            'qq-contacts-object stranger
+            'qq-contacts-item-id user-id)
+      :help-echo "mouse-1 or RET: 打开用户资料")
+     :indent 2
+     :width (or (qq-contacts--entry-width entry) 80)
+     :icon-slot-width qq-contacts--icon-slot-width
+     :context-width-spec '(0.45 18 42))
+    (appkit-ui-make-action-row
+     start (point) entry #'qq-contacts--activate-entry
+     :help-echo "mouse-1 or RET: 打开用户资料"
+     :mouse-face 'highlight)))
+
 (defun qq-contacts--insert-section (entry)
   "Insert search section ENTRY."
   (let ((start (point)))
@@ -641,6 +714,7 @@
      (pcase kind
        ('friends #'qq-contacts-load-more-friends)
        ('groups #'qq-contacts-load-more-groups)
+       ('strangers #'qq-contacts-load-more-strangers)
        ('members #'qq-contacts-load-more-members)
        (_ (error "qq: unknown contacts pagination kind %S" kind)))
      :face 'qq-contacts-navigation-button
@@ -658,6 +732,7 @@
     ('friend (qq-contacts--insert-friend entry))
     ('group (qq-contacts--insert-group entry))
     ('member (qq-contacts--insert-member entry))
+    ('stranger (qq-contacts--insert-stranger entry))
     ('section (qq-contacts--insert-section entry))
     ('load-more (qq-contacts--insert-load-more entry))
     ((or 'note 'error-note) (qq-contacts--insert-note entry))
@@ -682,11 +757,46 @@
     ('friends "好友分组")
     ('groups "全部已加入群")
     ('not-recent "未在近期会话中的群")
-    ('search (format "搜索 “%s”" (or qq-contacts--query "")))
+    ('search (format "%s · “%s”"
+                     (qq-contacts--search-scope-label
+                      qq-contacts--search-scope)
+                     (or qq-contacts--query "")))
     ('members (format "群 %s 的成员 · “%s”"
                       (or qq-contacts--member-group-id "")
                       (or qq-contacts--query "")))
     (_ "通讯录")))
+
+(defconst qq-contacts--search-scope-choices
+  '(("全部" . all)
+    ("通讯录（好友＋已加入群）" . contacts)
+    ("仅好友" . friends)
+    ("仅群聊" . groups)
+    ("全网 QQ 用户" . strangers))
+  "User-facing search range names and their internal scopes.")
+
+(defun qq-contacts--search-scope-label (scope)
+  "Return the user-facing label for search SCOPE."
+  (or (car (rassq scope qq-contacts--search-scope-choices))
+      (error "qq: unknown contacts search scope %S" scope)))
+
+(defun qq-contacts--read-search-scope ()
+  "Read and return one explicit directory search scope."
+  (let* ((labels (mapcar #'car qq-contacts--search-scope-choices))
+         (label (completing-read "搜索范围: " labels nil t nil
+                                 'qq-contacts-search-scope-history
+                                 (car labels))))
+    (or (cdr (assoc label qq-contacts--search-scope-choices))
+        (user-error "qq: unknown directory search scope"))))
+
+(defun qq-contacts--search-kinds (scope)
+  "Return independent native search kinds selected by SCOPE."
+  (pcase scope
+    ('all '(friends groups strangers))
+    ('contacts '(friends groups))
+    ('friends '(friends))
+    ('groups '(groups))
+    ('strangers '(strangers))
+    (_ (user-error "qq: invalid directory search scope %S" scope))))
 
 (defun qq-contacts--refresh-header-line ()
   "Refresh cached directory header text."
@@ -783,13 +893,20 @@
                (object (get-text-property position 'qq-contacts-object))
                (identity
                 (pcase row-type
-                  ((or 'friend 'member) (alist-get 'user_id object))
+                  ((or 'friend 'member 'stranger)
+                   (alist-get 'user_id object))
                   ('group (alist-get 'group_id object)))))
           (when (and identity (not (gethash (cons row-type identity) seen)))
             (puthash (cons row-type identity) t seen)
             (condition-case error-data
                 (pcase row-type
-                  ((or 'friend 'member) (qq-media-avatar-image identity))
+                  ((or 'friend 'member)
+                   (qq-media-avatar-image identity))
+                  ('stranger
+                   (qq-media-url-preview-image
+                    (format "avatar:%s" identity)
+                    (alist-get 'avatar_url object)
+                    qq-media-avatar-image-height))
                   ('group (qq-media-group-avatar-image identity)))
               (error
                (message "qq: failed to prepare directory avatar %s: %s"
@@ -865,10 +982,12 @@
   (setq qq-contacts--search-errors nil
         qq-contacts--search-friends nil
         qq-contacts--search-groups nil
+        qq-contacts--search-strangers nil
         qq-contacts--search-members nil
         qq-contacts--member-group-id nil
         qq-contacts--search-friend-cursor nil
         qq-contacts--search-group-cursor nil
+        qq-contacts--search-stranger-cursor nil
         qq-contacts--search-member-cursor nil))
 
 (defun qq-contacts--cancel-search ()
@@ -879,10 +998,13 @@
     (qq-api-cancel-request qq-contacts--search-friend-request))
   (when qq-contacts--search-group-request
     (qq-api-cancel-request qq-contacts--search-group-request))
+  (when qq-contacts--search-stranger-request
+    (qq-api-cancel-request qq-contacts--search-stranger-request))
   (when qq-contacts--search-member-request
     (qq-api-cancel-request qq-contacts--search-member-request))
   (setq qq-contacts--search-friend-request nil
         qq-contacts--search-group-request nil
+        qq-contacts--search-stranger-request nil
         qq-contacts--search-member-request nil))
 
 (defun qq-contacts--search-current-p (buffer owner kind)
@@ -897,7 +1019,8 @@
   '((kind user_id) (kind uid))
   "Independent exact identities carried by each native contact result.")
 
-(defun qq-contacts--append-search-items (old new identity-fields)
+(defun qq-contacts--append-search-items
+    (old new identity-fields &optional nullable-identity-fields)
   "Append NEW search items to OLD using unique IDENTITY-FIELDS.
 
 An opaque native continuation must never repeat an identity already returned
@@ -906,7 +1029,9 @@ row, because replacement would conceal a broken cursor snapshot.
 
 Each element of IDENTITY-FIELDS is a field tuple that independently identifies
 an item.  Contact pages therefore prove both `(kind,user_id)' and `(kind,uid)',
-while group pages prove `(group_id)'."
+while group pages prove `(group_id)'.  A tuple listed in
+NULLABLE-IDENTITY-FIELDS is skipped when any of its fields is nil; non-nil
+values still have to be unique."
   (let ((identities
          (mapcar (lambda (fields)
                    (list fields
@@ -916,32 +1041,36 @@ while group pages prove `(group_id)'."
     (cl-labels
         ((identity-key (item fields source)
            (let ((key (mapcar (lambda (field) (alist-get field item)) fields)))
-             (unless (cl-every #'identity key)
-               (error "qq: %s search result lacks identity fields %s"
-                      source (mapconcat #'symbol-name fields ",")))
-             key)))
+             (if (cl-every #'identity key)
+                 key
+               (unless (member fields nullable-identity-fields)
+                 (error "qq: %s search result lacks identity fields %s"
+                        source (mapconcat #'symbol-name fields ",")))
+               nil))))
       (dolist (item old)
         (dolist (identity identities)
           (let* ((fields (nth 0 identity))
                  (seen-old (nth 1 identity))
                  (key (identity-key item fields "existing")))
-            (when (gethash key seen-old)
-              (error "qq: existing search results duplicate %s identity %S"
-                     (mapconcat #'symbol-name fields ",") key))
-            (puthash key t seen-old))))
+            (when key
+              (when (gethash key seen-old)
+                (error "qq: existing search results duplicate %s identity %S"
+                       (mapconcat #'symbol-name fields ",") key))
+              (puthash key t seen-old)))))
       (dolist (item new)
         (dolist (identity identities)
           (let* ((fields (nth 0 identity))
                  (seen-old (nth 1 identity))
                  (seen-new (nth 2 identity))
                  (key (identity-key item fields "continuation")))
-            (when (gethash key seen-old)
-              (error "qq: search continuation repeated %s identity %S across pages"
-                     (mapconcat #'symbol-name fields ",") key))
-            (when (gethash key seen-new)
-              (error "qq: search continuation duplicated %s identity %S"
-                     (mapconcat #'symbol-name fields ",") key))
-            (puthash key t seen-new)))))
+            (when key
+              (when (gethash key seen-old)
+                (error "qq: search continuation repeated %s identity %S across pages"
+                       (mapconcat #'symbol-name fields ",") key))
+              (when (gethash key seen-new)
+                (error "qq: search continuation duplicated %s identity %S"
+                       (mapconcat #'symbol-name fields ",") key))
+              (puthash key t seen-new))))))
     (append (copy-sequence old) (copy-tree new))))
 
 (defun qq-contacts--finish-search-page (buffer owner kind append-p page)
@@ -971,6 +1100,10 @@ When APPEND-P is non-nil, merge PAGE after prior pages by exact identity."
                         (and append-p qq-contacts--search-groups)
                         (mapcar #'qq-contacts--search-group-object items)
                         '((group_id))))
+                      ('strangers
+                       (qq-contacts--append-search-items
+                        (and append-p qq-contacts--search-strangers)
+                        items '((user_id) (uid)) '((uid))))
                       ('members
                        (qq-contacts--append-search-items
                         (and append-p qq-contacts--search-members)
@@ -991,6 +1124,10 @@ When APPEND-P is non-nil, merge PAGE after prior pages by exact identity."
              (setq qq-contacts--search-groups prepared
                    qq-contacts--search-group-cursor cursor
                    qq-contacts--search-group-request nil))
+            ('strangers
+             (setq qq-contacts--search-strangers prepared
+                   qq-contacts--search-stranger-cursor cursor
+                   qq-contacts--search-stranger-request nil))
             ('members
              (setq qq-contacts--search-members prepared
                    qq-contacts--search-member-cursor cursor
@@ -1012,6 +1149,9 @@ When APPEND-P is non-nil, merge PAGE after prior pages by exact identity."
         ('groups
          (setq qq-contacts--search-group-request nil
                qq-contacts--search-group-cursor nil))
+        ('strangers
+         (setq qq-contacts--search-stranger-request nil
+               qq-contacts--search-stranger-cursor nil))
         ('members
          (setq qq-contacts--search-member-request nil
                qq-contacts--search-member-cursor nil)))
@@ -1048,6 +1188,12 @@ APPEND-P controls whether the resulting page extends existing entries."
                        cursor query success failure 'default 50 nil)
                     (qq-api-search-group-chats-start
                      query success failure 'default 50 nil)))
+                 ('strangers
+                  (if cursor
+                      (qq-api-search-strangers-next
+                       cursor query success failure 50)
+                    (qq-api-search-strangers-start
+                     query success failure 50)))
                  ('members
                   (if cursor
                       (qq-api-search-contacts-next
@@ -1061,31 +1207,47 @@ APPEND-P controls whether the resulting page extends existing entries."
             (pcase kind
               ('friends (setq qq-contacts--search-friend-request request))
               ('groups (setq qq-contacts--search-group-request request))
+              ('strangers
+               (setq qq-contacts--search-stranger-request request))
               ('members (setq qq-contacts--search-member-request request)))))
       (error
        (qq-contacts--fail-search-page
         buffer owner kind nil (error-message-string error-data))))))
 
-(defun qq-contacts-search (query)
-  "Search exact native friends and group chats for QUERY."
+(defun qq-contacts-search (query &optional scope)
+  "Search exact native directory SCOPE for QUERY.
+
+SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
   (interactive
-   (list (read-string "搜索好友和群聊: " qq-contacts--query
-                      'qq-contacts-search-history)))
-  (setq query (string-trim (or query "")))
-  (if (string-empty-p query)
-      (when (memq qq-contacts--view '(search members))
-        (qq-contacts-clear-search))
-    (unless (memq qq-contacts--view '(search members))
-      (setq qq-contacts--previous-view qq-contacts--view))
-    (qq-contacts--cancel-search)
-    (qq-contacts--clear-search-results)
-    (setq qq-contacts--query query
-          qq-contacts--view 'search
-          qq-contacts--search-owner (list 'native-directory-search query)
-          qq-contacts--search-pending '(friends groups))
-    (qq-contacts--request-reconcile)
-    (qq-contacts--issue-search-request 'friends nil nil)
-    (qq-contacts--issue-search-request 'groups nil nil)))
+   (let ((selected (qq-contacts--read-search-scope)))
+     (list (read-string
+            (format "在%s中搜索: "
+                    (qq-contacts--search-scope-label selected))
+            qq-contacts--query 'qq-contacts-search-history)
+           selected)))
+  (setq scope (or scope 'all))
+  (let ((kinds (qq-contacts--search-kinds scope)))
+    (setq query (string-trim (or query "")))
+    ;; Validate the strictest selected owner before cancelling or replacing the
+    ;; current search.  The API repeats this check at the transport boundary.
+    (when (and (not (string-empty-p query)) (memq 'strangers kinds))
+      (qq-api--stranger-search-owner-params query 50))
+    (if (string-empty-p query)
+        (when (memq qq-contacts--view '(search members))
+          (qq-contacts-clear-search))
+      (unless (memq qq-contacts--view '(search members))
+        (setq qq-contacts--previous-view qq-contacts--view))
+      (qq-contacts--cancel-search)
+      (qq-contacts--clear-search-results)
+      (setq qq-contacts--query query
+            qq-contacts--search-scope scope
+            qq-contacts--view 'search
+            qq-contacts--search-owner
+            (list 'native-directory-search scope query)
+            qq-contacts--search-pending (copy-sequence kinds))
+      (qq-contacts--request-reconcile)
+      (dolist (kind kinds)
+        (qq-contacts--issue-search-request kind nil nil)))))
 
 (defun qq-contacts--load-more (kind)
   "Load the next exact native search page for KIND."
@@ -1095,6 +1257,7 @@ APPEND-P controls whether the resulting page extends existing entries."
   (let ((cursor (pcase kind
                   ('friends qq-contacts--search-friend-cursor)
                   ('groups qq-contacts--search-group-cursor)
+                  ('strangers qq-contacts--search-stranger-cursor)
                   ('members qq-contacts--search-member-cursor))))
     (unless (qq-api-non-empty-string-p cursor)
       (user-error "qq: this search section has no next page"))
@@ -1107,6 +1270,7 @@ APPEND-P controls whether the resulting page extends existing entries."
     (pcase kind
       ('friends (setq qq-contacts--search-friend-cursor nil))
       ('groups (setq qq-contacts--search-group-cursor nil))
+      ('strangers (setq qq-contacts--search-stranger-cursor nil))
       ('members (setq qq-contacts--search-member-cursor nil)))
     (qq-contacts--request-reconcile)
     (qq-contacts--issue-search-request kind cursor t)))
@@ -1120,6 +1284,11 @@ APPEND-P controls whether the resulting page extends existing entries."
   "Load the next native group-chat-search page."
   (interactive)
   (qq-contacts--load-more 'groups))
+
+(defun qq-contacts-load-more-strangers ()
+  "Load the next native global-user search page."
+  (interactive)
+  (qq-contacts--load-more 'strangers))
 
 (defun qq-contacts-load-more-members ()
   "Load the next native group-member-search page."
@@ -1163,6 +1332,7 @@ APPEND-P controls whether the resulting page extends existing entries."
     (qq-contacts--cancel-search)
     (qq-contacts--clear-search-results)
     (setq qq-contacts--query nil
+          qq-contacts--search-scope 'all
           qq-contacts--view
           (if (memq qq-contacts--previous-view '(search members))
               'friends
@@ -1196,6 +1366,8 @@ APPEND-P controls whether the resulting page extends existing entries."
      (qq-chat-open
       (qq-state-session-key
        'private (alist-get 'user_id (qq-contacts--entry-object entry)))))
+    ('stranger
+     (qq-user-open-search-result (qq-contacts--entry-object entry)))
     ('group
      (qq-chat-open
       (qq-state-session-key
@@ -1213,6 +1385,8 @@ APPEND-P controls whether the resulting page extends existing entries."
        (let ((friend (qq-contacts--object-at-point)))
          (qq-chat-open
           (qq-state-session-key 'private (alist-get 'user_id friend)))))
+      ('stranger
+       (qq-user-open-search-result (qq-contacts--object-at-point)))
       ('group
        (let ((group (qq-contacts--object-at-point)))
          (qq-chat-open
@@ -1226,9 +1400,9 @@ APPEND-P controls whether the resulting page extends existing entries."
   (qq-contacts-open-at-point))
 
 (defun qq-contacts--object-at-point ()
-  "Return exact friend/member/group object represented at point."
+  "Return the exact directory object represented at point."
   (or (qq-contacts--line-property 'qq-contacts-object)
-      (user-error "qq: point is not on a friend or group")))
+      (user-error "qq: point is not on a directory item")))
 
 (defun qq-contacts-open-info-at-point ()
   "Open native user or group details for the item at point."
@@ -1236,6 +1410,7 @@ APPEND-P controls whether the resulting page extends existing entries."
   (let ((object (qq-contacts--object-at-point)))
     (pcase (qq-contacts--line-property 'qq-contacts-row-type)
       ((or 'friend 'member) (qq-user-open (alist-get 'user_id object)))
+      ('stranger (qq-user-open-search-result object))
       ('group (qq-group-open (alist-get 'group_id object)))
       (_ (user-error "qq: point has no profile page")))))
 
@@ -1246,6 +1421,10 @@ APPEND-P controls whether the resulting page extends existing entries."
     (pcase (qq-contacts--line-property 'qq-contacts-row-type)
       ((or 'friend 'member)
        (qq-media-open-user-avatar (alist-get 'user_id object)))
+      ('stranger
+       (qq-media-open-image-url
+        (format "avatar:%s" (alist-get 'user_id object))
+        (alist-get 'avatar_url object)))
       ('group (qq-media-open-group-avatar (alist-get 'group_id object)))
       (_ (user-error "qq: point has no avatar")))))
 
@@ -1254,15 +1433,24 @@ APPEND-P controls whether the resulting page extends existing entries."
   (interactive)
   (let* ((object (qq-contacts--object-at-point))
          (id (pcase (qq-contacts--line-property 'qq-contacts-row-type)
-               ((or 'friend 'member) (alist-get 'user_id object))
+               ((or 'friend 'member 'stranger)
+                (alist-get 'user_id object))
                ('group (alist-get 'group_id object)))))
     (unless (stringp id)
       (user-error "qq: point has no exact identity"))
     (kill-new id)
     (message "qq: copied %s" id)))
 
+(defun qq-contacts-add-friend-at-point ()
+  "Open the global user at point and begin its add-friend flow."
+  (interactive)
+  (unless (eq (qq-contacts--line-property 'qq-contacts-row-type) 'stranger)
+    (user-error "qq: point is not on a global QQ user result"))
+  (qq-user-open-search-result (qq-contacts--object-at-point))
+  (qq-user-add-friend))
+
 (defun qq-contacts--item-positions ()
-  "Return ordered buffer positions of friend and group rows."
+  "Return ordered buffer positions of actionable directory rows."
   (let ((position (point-min)) positions)
     (while (< position (point-max))
       (when (get-text-property position 'qq-contacts-item-id)
@@ -1410,7 +1598,8 @@ APPEND-P controls whether the resulting page extends existing entries."
       (cond
        ((string-match "\\`avatar:\\([1-9][0-9]*\\)\\'" media-key)
         (setq keys (list (cons 'friend (match-string 1 media-key))
-                         (cons 'member (match-string 1 media-key)))))
+                         (cons 'member (match-string 1 media-key))
+                         (cons 'stranger (match-string 1 media-key)))))
       ((string-match "\\`group-avatar:\\([1-9][0-9]*\\)\\'" media-key)
         (setq keys (list (cons 'group (match-string 1 media-key))))))
       (when keys
@@ -1432,6 +1621,7 @@ APPEND-P controls whether the resulting page extends existing entries."
     (define-key map (kbd "RET") #'qq-contacts-open-at-point)
     (define-key map (kbd "m") #'qq-contacts-open-at-point)
     (define-key map (kbd "i") #'qq-contacts-open-info-at-point)
+    (define-key map (kbd "+") #'qq-contacts-add-friend-at-point)
     (define-key map (kbd "a") #'qq-contacts-open-avatar-at-point)
     (define-key map (kbd "w") #'qq-contacts-copy-id-at-point)
     (define-key map (kbd "t") #'qq-contacts-toggle-category)
@@ -1458,6 +1648,7 @@ APPEND-P controls whether the resulting page extends existing entries."
   (setq-local qq-contacts--view 'friends)
   (setq-local qq-contacts--previous-view 'friends)
   (setq-local qq-contacts--query nil)
+  (setq-local qq-contacts--search-scope 'all)
   (setq-local qq-contacts--fill-column nil)
   (setq-local qq-contacts--header-line-cache "")
   (setq-local qq-contacts--rendering nil)
@@ -1476,13 +1667,16 @@ APPEND-P controls whether the resulting page extends existing entries."
   (setq-local qq-contacts--search-errors nil)
   (setq-local qq-contacts--search-friends nil)
   (setq-local qq-contacts--search-groups nil)
+  (setq-local qq-contacts--search-strangers nil)
   (setq-local qq-contacts--search-members nil)
   (setq-local qq-contacts--member-group-id nil)
   (setq-local qq-contacts--search-friend-cursor nil)
   (setq-local qq-contacts--search-group-cursor nil)
+  (setq-local qq-contacts--search-stranger-cursor nil)
   (setq-local qq-contacts--search-member-cursor nil)
   (setq-local qq-contacts--search-friend-request nil)
   (setq-local qq-contacts--search-group-request nil)
+  (setq-local qq-contacts--search-stranger-request nil)
   (setq-local qq-contacts--search-member-request nil)
   (setq-local header-line-format 'qq-contacts--header-line-cache)
   (setq-local revert-buffer-function

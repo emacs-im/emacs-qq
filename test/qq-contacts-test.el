@@ -178,7 +178,7 @@
 (ert-deftest qq-contacts-native-search-survives-synchronous-callbacks ()
   (with-temp-buffer
     (qq-contacts-mode)
-    (let (contact-call group-call)
+    (let (contact-call group-call stranger-call)
       (cl-letf
           (((symbol-function 'qq-contacts--request-reconcile) #'ignore)
            ((symbol-function 'qq-api-search-contacts-start)
@@ -206,19 +206,37 @@
                               (recall_reason . ""))))
                          (multi_user_keywords)
                          (next_cursor)))
-              'finished-group)))
+              'finished-group))
+           ((symbol-function 'qq-api-search-strangers-start)
+            (lambda (query callback &optional _errback limit)
+              (setq stranger-call (list query limit))
+              (funcall
+               callback
+               `((results
+                  . (((user_id . "9007199254740993")
+                      (uid . "u_synthetic_stranger")
+                      (nickname . "Synthetic Stranger")
+                      (avatar_url . "https://example.invalid/avatar")
+                      (candidate . ,(make-string 43 ?S)))))
+                 (next_cursor)))
+              'finished-stranger)))
         (qq-contacts-search " Emacs ")
         (should (equal contact-call '(friends "Emacs" nil 50)))
         (should (equal group-call '("Emacs" default 50 nil)))
+        (should (equal stranger-call '("Emacs" 50)))
         (should-not qq-contacts--search-pending)
         (should-not qq-contacts--search-friend-request)
         (should-not qq-contacts--search-group-request)
+        (should-not qq-contacts--search-stranger-request)
         (should (equal (alist-get 'user_id
                                   (car qq-contacts--search-friends))
                        "10001"))
         (should (equal (alist-get 'group_id
                                   (car qq-contacts--search-groups))
                        "20002"))
+        (should (equal (alist-get 'user_id
+                                  (car qq-contacts--search-strangers))
+                       "9007199254740993"))
         (should (equal qq-contacts--search-friend-cursor "friend-next"))))))
 
 (ert-deftest qq-contacts-load-more-repeats-native-search-owner ()
@@ -253,6 +271,45 @@
                         qq-contacts--search-friends)
                 '("10001" "10002")))
         (should-not qq-contacts--search-friend-cursor)
+        (should-not qq-contacts--search-pending)))))
+
+(ert-deftest qq-contacts-load-more-strangers-consumes-exact-capability ()
+  (with-temp-buffer
+    (qq-contacts-mode)
+    (let ((cursor (make-string 43 ?Q)))
+      (setq qq-contacts--view 'search
+            qq-contacts--query "Synthetic"
+            qq-contacts--search-owner '(synthetic-owner)
+            qq-contacts--search-strangers
+            `(((user_id . "9007199254740993")
+               (uid . "u_synthetic_first")
+               (nickname . "Synthetic First")
+               (avatar_url . "https://example.invalid/first")
+               (candidate . ,(make-string 43 ?A))))
+            qq-contacts--search-stranger-cursor cursor)
+      (let (call)
+        (cl-letf (((symbol-function 'qq-contacts--request-reconcile) #'ignore)
+                  ((symbol-function 'qq-api-search-strangers-next)
+                   (lambda (token query callback &optional _errback limit)
+                     (setq call (list token query limit))
+                     (funcall
+                      callback
+                      `((results
+                         . (((user_id . "9007199254740994")
+                             (uid . "u_synthetic_second")
+                             (nickname . "Synthetic Second")
+                             (avatar_url . "https://example.invalid/second")
+                             (candidate . ,(make-string 43 ?B)))))
+                        (next_cursor)))
+                     'already-finished)))
+          (qq-contacts-load-more-strangers))
+        (should (equal call (list cursor "Synthetic" 50)))
+        (should
+         (equal (mapcar (lambda (result) (alist-get 'user_id result))
+                        qq-contacts--search-strangers)
+                '("9007199254740993" "9007199254740994")))
+        (should-not qq-contacts--search-stranger-cursor)
+        (should-not qq-contacts--search-stranger-request)
         (should-not qq-contacts--search-pending)))))
 
 (ert-deftest qq-contacts-navigation-buttons-are-real-and-switch-view ()
@@ -338,7 +395,8 @@
                      (lambda (&optional keys) (setq forced keys))))
             (qq-contacts--handle-media-cache-update "avatar:10001")
             (should (equal forced '((friend . "10001")
-                                    (member . "10001"))))
+                                    (member . "10001")
+                                    (stranger . "10001"))))
             (setq forced nil)
             (qq-contacts--handle-media-cache-update "forward-image:x")
             (should-not forced)))
@@ -443,9 +501,37 @@
    (qq-contacts--append-search-items
     '(((kind . "friend") (user_id . "synthetic-user-a")
        (uid . "synthetic-native-shared")))
-    '(((kind . "friend") (user_id . "synthetic-user-b")
+   '(((kind . "friend") (user_id . "synthetic-user-b")
        (uid . "synthetic-native-shared")))
     qq-contacts--contact-search-identities)))
+
+(ert-deftest qq-contacts-stranger-append-validates-nonnull-uid-identity ()
+  (should-error
+   (qq-contacts--append-search-items
+    '(((user_id . "synthetic-user-a") (uid . "native-shared")))
+    '(((user_id . "synthetic-user-b") (uid . "native-shared")))
+    '((user_id) (uid)) '((uid))))
+  (should
+   (= (length
+       (qq-contacts--append-search-items
+        '(((user_id . "synthetic-user-a") (uid)))
+        '(((user_id . "synthetic-user-b") (uid)))
+        '((user_id) (uid)) '((uid))))
+      2)))
+
+(ert-deftest qq-contacts-stranger-query-prevalidates-utf-16-before-state-change ()
+  (with-temp-buffer
+    (qq-contacts-mode)
+    (let ((owner '(existing-owner)) cancelled)
+      (setq qq-contacts--view 'search
+            qq-contacts--search-owner owner)
+      (cl-letf (((symbol-function 'qq-contacts--cancel-search)
+                 (lambda () (setq cancelled t))))
+        (should-error
+         (qq-contacts-search (make-string 65 #x1f600) 'strangers)
+         :type 'user-error))
+      (should-not cancelled)
+      (should (eq qq-contacts--search-owner owner)))))
 
 (ert-deftest qq-contacts-duplicate-continuation-settles-pending-section ()
   (with-temp-buffer

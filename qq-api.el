@@ -2901,6 +2901,304 @@ SCOPE, QUERY, GROUP-ID, and LIMIT must describe the original start request."
       #'qq-api--contact-search-callback owner callback errback)
      errback)))
 
+(defun qq-api--directory-capability-token-p (value)
+  "Return non-nil when VALUE is an exact directory capability token."
+  (let ((case-fold-search nil))
+    (and (stringp value)
+         (string-match-p "\\`[A-Za-z0-9_-]\\{43\\}\\'" value))))
+
+(defun qq-api--utf-16-code-unit-length (value)
+  "Return the number of UTF-16 code units in string VALUE.
+
+JavaScript and TypeBox string limits count one unit for BMP characters and
+two units for characters outside the BMP."
+  (unless (stringp value)
+    (signal 'wrong-type-argument (list 'stringp value)))
+  (cl-loop for character across value
+           sum (if (> character #xffff) 2 1)))
+
+(defun qq-api--stranger-search-owner-params (query limit)
+  "Validate and return stranger-search owner parameters QUERY and LIMIT."
+  (unless (stringp query)
+    (user-error "qq: stranger search query must be a string"))
+  (setq query (string-trim query))
+  (when (or (string-empty-p query)
+            (> (qq-api--utf-16-code-unit-length query) 128))
+    (user-error
+     "qq: stranger search query must contain 1 to 128 UTF-16 code units"))
+  (setq limit (or limit 20))
+  (unless (and (integerp limit) (<= 1 limit 50))
+    (user-error "qq: stranger search limit must be between 1 and 50"))
+  `((query . ,query) (limit . ,limit)))
+
+(defun qq-api--validate-stranger-search-result (result index)
+  "Validate and copy stranger search RESULT at INDEX."
+  (let ((context (format "emacs_search_strangers.results[%d]" index)))
+    (unless (qq-api--exact-object-keys-p
+             result '(user_id uid nickname avatar_url candidate))
+      (error "qq: %s has invalid fields" context))
+    (unless (qq-protocol--nonzero-decimal-string-p
+             (alist-get 'user_id result))
+      (error "qq: %s.user_id must be an original nonzero decimal string"
+             context))
+    (let ((uid (alist-get 'uid result)))
+      (unless (or (null uid) (qq-api-non-empty-string-p uid))
+        (error "qq: %s.uid must be null or a non-empty native string"
+               context)))
+    (unless (stringp (alist-get 'nickname result))
+      (error "qq: %s.nickname must be a string" context))
+    (unless (qq-api-non-empty-string-p (alist-get 'avatar_url result))
+      (error "qq: %s.avatar_url must be a non-empty string" context))
+    (unless (qq-api--directory-capability-token-p
+             (alist-get 'candidate result))
+      (error "qq: %s.candidate must be an exact capability token" context))
+    (copy-tree result)))
+
+(defun qq-api--validate-stranger-search-page (data)
+  "Validate and copy a closed stranger-search page DATA."
+  (unless (qq-api--exact-object-keys-p data '(results next_cursor))
+    (error "qq: emacs_search_strangers returned an invalid page"))
+  (let ((results (alist-get 'results data))
+        (cursor (alist-get 'next_cursor data))
+        (seen-user-ids (make-hash-table :test #'equal))
+        (seen-uids (make-hash-table :test #'equal))
+        validated)
+    (unless (and (listp results) (proper-list-p results))
+      (error "qq: emacs_search_strangers.results must be an array"))
+    (setq validated
+          (cl-loop
+           for result in results
+           for index from 0
+           for item = (qq-api--validate-stranger-search-result result index)
+           for user-id = (alist-get 'user_id item)
+           for uid = (alist-get 'uid item)
+           do (when (gethash user-id seen-user-ids)
+                (error "qq: stranger search page duplicated user_id %s"
+                       user-id))
+           do (puthash user-id t seen-user-ids)
+           do (when (and uid (gethash uid seen-uids))
+                (error "qq: stranger search page duplicated uid %s" uid))
+           do (when uid (puthash uid t seen-uids))
+           collect item))
+    (unless (or (null cursor) (qq-api--directory-capability-token-p cursor))
+      (error "qq: emacs_search_strangers.next_cursor must be an exact capability token or null"))
+    `((results . ,validated) (next_cursor . ,cursor))))
+
+(defun qq-api--stranger-search-callback (callback errback response)
+  "Validate stranger-search RESPONSE before invoking CALLBACK."
+  (let (page valid-p)
+    (condition-case error-data
+        (setq page
+              (qq-api--validate-stranger-search-page
+               (qq-api--response-data response))
+              valid-p t)
+      (error
+       (funcall (or errback #'qq-api--default-error)
+                response (error-message-string error-data))))
+    (when valid-p
+      (funcall callback page))))
+
+(defun qq-api-search-strangers-start
+    (query callback &optional errback limit)
+  "Start native stranger search for QUERY and invoke CALLBACK with its page.
+
+LIMIT defaults to 20 and must be between 1 and 50."
+  (let ((owner (qq-api--stranger-search-owner-params query limit)))
+    (qq-api-call
+     "emacs_search_strangers"
+     (cons '(kind . "start") owner)
+     (apply-partially #'qq-api--stranger-search-callback callback errback)
+     errback)))
+
+(defun qq-api-search-strangers-next
+    (cursor query callback &optional errback limit)
+  "Continue exact stranger-search CURSOR owned by QUERY and LIMIT."
+  (unless (qq-api--directory-capability-token-p cursor)
+    (user-error "qq: stranger search cursor must be an exact capability token"))
+  (let ((owner (qq-api--stranger-search-owner-params query limit)))
+    (qq-api-call
+     "emacs_search_strangers"
+     (append `((kind . "next") (cursor . ,cursor)) owner)
+     (apply-partially #'qq-api--stranger-search-callback callback errback)
+     errback)))
+
+(defun qq-api--validate-friend-add-user-id (user-id context)
+  "Return USER-ID when it is a nonzero decimal identity for CONTEXT."
+  (unless (qq-protocol--nonzero-decimal-string-p user-id)
+    (user-error "qq: %s requires an original nonzero decimal user id" context))
+  user-id)
+
+(defun qq-api--friend-add-string-input (value maximum context)
+  "Return VALUE after validating its type and MAXIMUM UTF-16 length.
+
+CONTEXT names the friend-add field for diagnostics."
+  (unless (stringp value)
+    (user-error "qq: %s must be a string" context))
+  (when (> (qq-api--utf-16-code-unit-length value) maximum)
+    (user-error "qq: %s must contain at most %d UTF-16 code units"
+                context maximum))
+  value)
+
+(defun qq-api--normalize-friend-add-options (options)
+  "Validate and copy closed friend-add OPTIONS.
+
+The returned alist retains Lisp booleans and a proper answer list.  Wire-only
+JSON array and false encodings remain the responsibility of
+`qq-api-friend-add-submit'."
+  (unless (qq-api--exact-object-keys-p
+           options
+           '(verification_message answers remark friend_group_id
+                     only_chat qzone_not_watch qzone_not_watched))
+    (user-error "qq: friend add options must be a closed options object"))
+  (let ((verification-message
+         (qq-api--friend-add-string-input
+          (alist-get 'verification_message options) 300
+          "friend add verification message"))
+        (answers (alist-get 'answers options))
+        (remark (qq-api--friend-add-string-input
+                 (alist-get 'remark options) 100 "friend add remark"))
+        (friend-group-id (alist-get 'friend_group_id options))
+        (permission-keys '(only_chat qzone_not_watch qzone_not_watched)))
+    (unless (and (listp answers) (proper-list-p answers)
+                 (cl-every
+                  (lambda (answer)
+                    (and (stringp answer)
+                         (<= (qq-api--utf-16-code-unit-length answer) 300)))
+                  answers))
+      (user-error
+       "qq: friend add answers must be a string array whose entries contain at most 300 UTF-16 code units"))
+    (unless (qq-api--uint32-p friend-group-id)
+      (user-error "qq: friend add group id must be an unsigned 32-bit integer"))
+    (dolist (key permission-keys)
+      (unless (memq (alist-get key options) '(nil t))
+        (user-error "qq: friend add permission %s must be a Lisp boolean" key)))
+    `((verification_message . ,verification-message)
+      (answers . ,(copy-sequence answers))
+      (remark . ,remark)
+      (friend_group_id . ,friend-group-id)
+      ,@(mapcar (lambda (key) (cons key (alist-get key options)))
+                permission-keys))))
+
+(defun qq-api--validate-friend-add-result (data expected-user-id)
+  "Validate and copy closed friend-add DATA for EXPECTED-USER-ID."
+  (let ((kind (and (consp data) (alist-get 'kind data))))
+    (pcase kind
+      ("prepared"
+       (unless (qq-api--exact-object-keys-p
+                data '(kind user_id verification questions preparation))
+         (error "qq: emacs_friend_add returned an invalid prepared result"))
+       (unless (equal (alist-get 'user_id data) expected-user-id)
+         (error "qq: emacs_friend_add prepared a different user identity"))
+       (unless (member (alist-get 'verification data)
+                       '("none" "message"
+                         "question_answer" "question_and_audit"))
+         (error "qq: emacs_friend_add returned an invalid verification kind"))
+       (let ((verification (alist-get 'verification data))
+             (questions (alist-get 'questions data)))
+         (unless (and (listp questions) (proper-list-p questions)
+                      (cl-every #'stringp questions))
+           (error "qq: emacs_friend_add.questions must be a string array"))
+         (pcase verification
+           ((or "none" "message")
+            (when questions
+              (error
+               "qq: emacs_friend_add %s verification cannot carry questions"
+               verification)))
+           ((or "question_answer" "question_and_audit")
+            (unless (and questions
+                         (cl-every
+                          (lambda (question)
+                            (not (string-empty-p (string-trim question))))
+                          questions))
+              (error
+               "qq: emacs_friend_add %s requires non-empty questions"
+               verification)))))
+       (unless (qq-api--directory-capability-token-p
+                (alist-get 'preparation data))
+         (error "qq: emacs_friend_add.preparation must be an exact capability token")))
+      ("submitted"
+       (unless (qq-api--exact-object-keys-p data '(kind user_id))
+         (error "qq: emacs_friend_add returned an invalid submitted result"))
+       (unless (equal (alist-get 'user_id data) expected-user-id)
+         (error "qq: emacs_friend_add submitted a different user identity")))
+      (_
+       (error "qq: emacs_friend_add returned an invalid result kind")))
+    (copy-tree data)))
+
+(defun qq-api--friend-add-callback
+    (expected-kind expected-user-id callback errback response)
+  "Validate friend-add RESPONSE before invoking CALLBACK.
+
+EXPECTED-KIND is the result discriminant required by the request phase."
+  (let (result valid-p)
+    (condition-case error-data
+        (progn
+          (setq result
+                (qq-api--validate-friend-add-result
+                 (qq-api--response-data response) expected-user-id))
+          (unless (equal (alist-get 'kind result) expected-kind)
+            (error "qq: emacs_friend_add returned the wrong phase result"))
+          (setq valid-p t))
+      (error
+       (funcall (or errback #'qq-api--default-error)
+                response (error-message-string error-data))))
+    (when valid-p
+      (funcall callback result))))
+
+(defun qq-api-friend-add-prepare
+    (user-id candidate callback &optional errback)
+  "Prepare adding USER-ID using exact search CANDIDATE capability."
+  (setq user-id
+        (qq-api--validate-friend-add-user-id user-id "friend add prepare"))
+  (unless (qq-api--directory-capability-token-p candidate)
+    (user-error "qq: friend add candidate must be an exact capability token"))
+  (qq-api-call
+   "emacs_friend_add"
+   `((kind . "prepare") (user_id . ,user-id) (candidate . ,candidate))
+   (apply-partially
+    #'qq-api--friend-add-callback "prepared" user-id callback errback)
+   errback))
+
+(defun qq-api-friend-add-submit
+    (user-id preparation options callback &optional errback)
+  "Submit a prepared request to add USER-ID as a friend.
+
+PREPARATION is the exact one-use capability returned by
+`qq-api-friend-add-prepare'.  OPTIONS is a closed alist containing
+`verification_message', `answers', `remark', `friend_group_id', `only_chat',
+`qzone_not_watch', and `qzone_not_watched'.  `answers' is a proper list of
+strings; NapCat owns its native encoding.  All three permission values must be
+Lisp booleans and are encoded as JSON true or `:false'."
+  (setq user-id
+        (qq-api--validate-friend-add-user-id user-id "friend add submit"))
+  (unless (qq-api--directory-capability-token-p preparation)
+    (user-error "qq: friend add preparation must be an exact capability token"))
+  (setq options (qq-api--normalize-friend-add-options options))
+  (let ((verification-message
+         (alist-get 'verification_message options))
+        (answers (alist-get 'answers options))
+        (remark (alist-get 'remark options))
+        (friend-group-id (alist-get 'friend_group_id options))
+        (permission-keys '(only_chat qzone_not_watch qzone_not_watched)))
+    (qq-api-call
+     "emacs_friend_add"
+     `((kind . "submit")
+       (user_id . ,user-id)
+       (preparation . ,preparation)
+       (verification_message . ,verification-message)
+       ;; `json-encode' maps nil to null; a vector preserves the required
+       ;; JSON array shape even when ANSWERS is empty.
+       (answers . ,(vconcat answers))
+       (remark . ,remark)
+       (friend_group_id . ,friend-group-id)
+       ,@(mapcar
+          (lambda (key)
+            (cons key (if (alist-get key options) t :false)))
+          permission-keys))
+     (apply-partially
+      #'qq-api--friend-add-callback "submitted" user-id callback errback)
+     errback)))
+
 (defun qq-api-get-base-emoji
     (emoji-id callback &optional errback emoji-type download hints)
   "Fetch QQ base emoji resource for EMOJI-ID and pass it to CALLBACK.

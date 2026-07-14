@@ -90,6 +90,23 @@
 (defvar-local qq-user--photo-loaded nil
   "Non-nil when inline photo-wall data was loaded successfully.")
 
+(cl-defstruct (qq-user--friend-add-state
+               (:constructor qq-user--friend-add-state-create))
+  user-id
+  candidate
+  preparation
+  verification
+  questions
+  status
+  error
+  request)
+
+(defvar-local qq-user--search-result nil
+  "Validated global-search result used only as profile-page context.")
+
+(defvar-local qq-user--friend-add-state nil
+  "One-use friend-add workflow attached to the current search result.")
+
 (defun qq-user--buffer-name (user-id)
   "Return profile buffer name for USER-ID."
   (ignore user-id)
@@ -103,8 +120,18 @@
   "Return the best title for the current profile."
   (or (qq-user--present-string (alist-get 'remark qq-user--profile))
       (qq-user--present-string (alist-get 'nickname qq-user--profile))
+      (qq-user--present-string (alist-get 'nickname qq-user--search-result))
       qq-user--user-id
       "QQ user"))
+
+(defun qq-user--avatar-display-string ()
+  "Return the current user's avatar, honoring exact search context."
+  (if-let* ((url (qq-user--present-string
+                  (alist-get 'avatar_url qq-user--search-result))))
+      (qq-media-url-preview-display-string
+       (format "avatar:%s" qq-user--user-id)
+       url "@" qq-media-avatar-image-height)
+    (qq-media-avatar-display-string qq-user--user-id)))
 
 (defun qq-user--self-p ()
   "Return non-nil when the current profile belongs to this account."
@@ -238,12 +265,267 @@
              start (point) qq-user--user-id photo)))
         (insert "\n")))))
 
+(defun qq-user--friend-p ()
+  "Return non-nil when the authoritative profile says user is a friend."
+  (equal (alist-get 'kind (alist-get 'relationship qq-user--profile))
+         "friend"))
+
+(defun qq-user--friend-add-current-p (state user-id)
+  "Return non-nil when STATE still owns USER-ID in this user buffer."
+  (and (derived-mode-p 'qq-user-mode)
+       (eq state qq-user--friend-add-state)
+       (equal (qq-user--friend-add-state-user-id state) user-id)
+       (equal user-id qq-user--user-id)))
+
+(defun qq-user--friend-add-button-label ()
+  "Return the action label for the current friend-add state."
+  (when-let* ((state qq-user--friend-add-state))
+    (pcase (qq-user--friend-add-state-status state)
+      ('candidate " 加好友 ")
+      ('preparing " 获取申请设置中… ")
+      ('prepared " 填写并发送申请 ")
+      ('submitting " 正在发送… ")
+      (_ nil))))
+
+(defun qq-user--insert-friend-add-status ()
+  "Insert current friend-add questions, progress, or terminal result."
+  (when-let* ((state qq-user--friend-add-state))
+    (pcase (qq-user--friend-add-state-status state)
+      ('preparing
+       (appkit-view-insert-note-line "正在获取好友验证设置…" :face 'shadow))
+      ('prepared
+       (let ((questions (qq-user--friend-add-state-questions state)))
+         (when questions
+           (appkit-view-insert-heading-line "好友验证问题" :face 'bold)
+           (dolist (question questions)
+             (insert "  • " question "\n")))
+         (appkit-view-insert-note-line
+          "申请设置已就绪；点击“填写并发送申请”继续。"
+          :face 'shadow)))
+      ('submitting
+       (appkit-view-insert-note-line "正在发送好友申请…" :face 'shadow))
+      ('submitted
+       (appkit-view-insert-note-line "好友申请已发送" :face 'success))
+      ('error
+       (appkit-view-insert-note-line
+        (format "好友申请流程已失效：%s。请重新搜索该用户。"
+                (or (qq-user--friend-add-state-error state) "未知错误"))
+        :face 'error)))))
+
+(defun qq-user--friend-add-fail (buffer state user-id _response reason)
+  "Finish STATE in BUFFER for USER-ID with terminal failure REASON."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (qq-user--friend-add-current-p state user-id)
+        (setf (qq-user--friend-add-state-request state) nil
+              (qq-user--friend-add-state-candidate state) nil
+              (qq-user--friend-add-state-preparation state) nil
+              (qq-user--friend-add-state-status state) 'error
+              (qq-user--friend-add-state-error state)
+              (or reason "未知错误"))
+        (qq-user-render)))))
+
+(defun qq-user--friend-add-prepared (buffer state user-id result)
+  "Apply prepared friend-add RESULT to STATE in BUFFER for USER-ID."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (qq-user--friend-add-current-p state user-id)
+        (setf (qq-user--friend-add-state-request state) nil
+              (qq-user--friend-add-state-preparation state)
+              (alist-get 'preparation result)
+              (qq-user--friend-add-state-verification state)
+              (alist-get 'verification result)
+              (qq-user--friend-add-state-questions state)
+              (copy-sequence (alist-get 'questions result))
+              (qq-user--friend-add-state-status state) 'prepared
+              (qq-user--friend-add-state-error state) nil)
+        (qq-user-render)))))
+
+(defun qq-user--prepare-friend-add (state)
+  "Consume STATE's candidate and request exact friend verification settings."
+  (unless (eq (qq-user--friend-add-state-status state) 'candidate)
+    (user-error "qq: this friend request is not awaiting preparation"))
+  (let ((candidate (qq-user--friend-add-state-candidate state))
+        (user-id qq-user--user-id)
+        (buffer (current-buffer)))
+    (unless candidate
+      (user-error "qq: friend-search candidate is unavailable"))
+    ;; Remove the one-use capability before dispatch.  No error path may retry it.
+    (setf (qq-user--friend-add-state-candidate state) nil
+          (qq-user--friend-add-state-status state) 'preparing
+          (qq-user--friend-add-state-error state) nil)
+    (qq-user-render)
+    (condition-case error-data
+        (let ((request
+               (qq-api-friend-add-prepare
+                user-id candidate
+                (apply-partially #'qq-user--friend-add-prepared
+                                 buffer state user-id)
+                (apply-partially #'qq-user--friend-add-fail
+                                 buffer state user-id))))
+          (when (and (qq-user--friend-add-current-p state user-id)
+                     (eq (qq-user--friend-add-state-status state) 'preparing))
+            (setf (qq-user--friend-add-state-request state) request)))
+      (error
+       (qq-user--friend-add-fail
+        buffer state user-id nil (error-message-string error-data))))))
+
+(defun qq-user--friend-group-choices ()
+  "Return display-name to native category-id pairs for friend placement."
+  (let (choices)
+    (dolist (category (qq-state-friend-categories))
+      (let ((id (alist-get 'category_id category))
+            (name (or (qq-user--present-string (alist-get 'name category))
+                      "未命名分组")))
+        (when (and (integerp id) (<= 0 id #xffffffff))
+          (push (cons (format "%s · %d" name id) id) choices))))
+    (nreverse choices)))
+
+(defun qq-user--read-friend-group-id ()
+  "Read one native friend category id from current authoritative state."
+  (let ((choices (qq-user--friend-group-choices)))
+    (unless choices
+      (user-error
+       "qq: friend categories are unavailable; refresh contacts first"))
+    (let ((selected (completing-read "好友分组: " choices nil t nil nil
+                                     (caar choices))))
+      (or (cdr (assoc selected choices))
+          (user-error "qq: invalid friend category selection")))))
+
+(defun qq-user--read-friend-verification (state)
+  "Read exact verification fields required by prepared STATE.
+
+Return a closed alist containing `verification_message' and `answers'."
+  (let* ((verification (qq-user--friend-add-state-verification state))
+         (questions (qq-user--friend-add-state-questions state))
+         verification-message
+         answers)
+    (pcase verification
+      ("none")
+      ("message"
+       (setq verification-message (read-string "验证留言: "))
+       (when (string-empty-p (string-trim verification-message))
+         (user-error "qq: 好友验证留言不能为空"))
+       (when (> (qq-api--utf-16-code-unit-length verification-message) 300)
+         (user-error "qq: 好友验证留言不能超过 300 个 UTF-16 code units")))
+      ((or "question_answer" "question_and_audit")
+       (let ((count (length questions)))
+         (setq answers
+               (cl-loop
+                for question in questions
+                for index from 1
+                for answer =
+                (read-string
+                 (format "问题 %d/%d（%s）答案: " index count question))
+                do (when (string-empty-p (string-trim answer))
+                     (user-error "qq: 好友验证答案不能为空"))
+                do (when (> (qq-api--utf-16-code-unit-length answer) 300)
+                     (user-error
+                      "qq: 好友验证答案不能超过 300 个 UTF-16 code units"))
+                collect answer))))
+      (kind (error "qq: invalid friend verification kind %S" kind)))
+    `((verification_message . ,(or verification-message ""))
+      (answers . ,answers))))
+
+(defun qq-user--read-friend-permissions ()
+  "Read every permission exposed by the official friend-add form."
+  `((only_chat . ,(y-or-n-p "权限：仅聊天？ "))
+    (qzone_not_watch . ,(y-or-n-p "权限：不看对方的 QQ 空间？ "))
+    (qzone_not_watched . ,(y-or-n-p "权限：不让对方看我的 QQ 空间？ "))))
+
+(defun qq-user--friend-add-submitted (buffer state user-id _result)
+  "Mark STATE in BUFFER as submitted for USER-ID."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (qq-user--friend-add-current-p state user-id)
+        (setf (qq-user--friend-add-state-request state) nil
+              (qq-user--friend-add-state-preparation state) nil
+              (qq-user--friend-add-state-status state) 'submitted
+              (qq-user--friend-add-state-error state) nil)
+        (qq-user-render)
+        (message "qq: 好友申请已发送")))))
+
+(defun qq-user--submit-friend-add (state)
+  "Collect fields for prepared STATE and submit its one-use capability."
+  (unless (eq (qq-user--friend-add-state-status state) 'prepared)
+    (user-error "qq: this friend request is not prepared"))
+  (let* ((verification-options
+          (qq-user--read-friend-verification state))
+         (remark (read-string "好友备注（可空）: "))
+         (group-id (qq-user--read-friend-group-id))
+         (permissions (qq-user--read-friend-permissions))
+         (user-id qq-user--user-id)
+         (buffer (current-buffer))
+         (options
+          (qq-api--normalize-friend-add-options
+           `((verification_message
+              . ,(alist-get 'verification_message verification-options))
+             (answers . ,(alist-get 'answers verification-options))
+             (remark . ,remark)
+             (friend_group_id . ,group-id)
+             ,@permissions))))
+    (when (yes-or-no-p (format "确认向 %s 发送好友申请？ "
+                               (qq-user--display-name)))
+      (let ((preparation (qq-user--friend-add-state-preparation state)))
+        (unless preparation
+          (user-error "qq: friend-add preparation is unavailable"))
+        ;; Keep preparation through all user prompts, then remove it immediately
+        ;; before the mutating dispatch.  Cancellation above remains retryable.
+        (setf (qq-user--friend-add-state-preparation state) nil
+              (qq-user--friend-add-state-status state) 'submitting
+              (qq-user--friend-add-state-error state) nil)
+        (qq-user-render)
+        (condition-case error-data
+            (let ((request
+                   (qq-api-friend-add-submit
+                    user-id preparation options
+                    (apply-partially #'qq-user--friend-add-submitted
+                                     buffer state user-id)
+                    (apply-partially #'qq-user--friend-add-fail
+                                     buffer state user-id))))
+              (when (and (qq-user--friend-add-current-p state user-id)
+                         (eq (qq-user--friend-add-state-status state)
+                             'submitting))
+                (setf (qq-user--friend-add-state-request state) request)))
+          (error
+           (qq-user--friend-add-fail
+            buffer state user-id nil (error-message-string error-data))))))))
+
+(defun qq-user-add-friend ()
+  "Advance the exact add-friend flow for the current search result."
+  (interactive)
+  (when (qq-user--self-p)
+    (user-error "qq: cannot add yourself as a friend"))
+  (when (qq-user--friend-p)
+    (user-error "qq: this user is already a friend"))
+  (let ((state (or qq-user--friend-add-state
+                   (user-error
+                    "qq: add friends from an exact global search result"))))
+    (pcase (qq-user--friend-add-state-status state)
+      ('candidate (qq-user--prepare-friend-add state))
+      ('prepared (qq-user--submit-friend-add state))
+      ((or 'preparing 'submitting)
+       (user-error "qq: friend request is already in progress"))
+      ('submitted (message "qq: 好友申请已发送"))
+      ('error
+       (user-error "qq: friend request expired; search this user again"))
+      (status (error "qq: invalid friend-add UI state %S" status)))))
+
 (defun qq-user--insert-action-buttons ()
   "Insert the primary Telega-style user action row."
   (insert "  ")
   (appkit-ui-insert-action-button
    " 发消息 " #'qq-user-open-chat
    :face 'qq-user-action-button :help-echo "打开私聊 (m)")
+  (when (and (not (qq-user--self-p))
+             (not (qq-user--friend-p))
+             (qq-user--friend-add-button-label))
+    (insert "  ")
+    (appkit-ui-insert-action-button
+     (qq-user--friend-add-button-label)
+     #'qq-user-add-friend
+     :face 'qq-user-action-button
+     :help-echo "准备或提交好友申请 (+)"))
   (unless (qq-user--self-p)
     (insert "  ")
     (appkit-ui-insert-action-button
@@ -278,15 +560,15 @@
        (erase-buffer)
        (setq-local header-line-format '(:eval (qq-user--header-line)))
        (cond
-        (qq-user--loading
+        ((and qq-user--loading (null qq-user--search-result))
          (appkit-view-insert-note-line "Loading user profile…"))
-        (qq-user--error
+        ((and qq-user--error (null qq-user--search-result))
          (appkit-view-insert-note-line qq-user--error :face 'error))
-        ((null qq-user--profile)
+        ((and (null qq-user--profile) (null qq-user--search-result))
          (appkit-view-insert-note-line "No user profile loaded."))
         (t
          (let ((avatar-start (point)))
-           (insert (qq-media-avatar-display-string qq-user--user-id))
+           (insert (qq-user--avatar-display-string))
            (make-text-button
             avatar-start (point)
             'follow-link t
@@ -302,8 +584,16 @@
              (insert "   " (propertize status 'face 'shadow) "\n")))
          (insert "\n")
          (qq-user--insert-action-buttons)
+         (qq-user--insert-friend-add-status)
+         (when qq-user--loading
+           (appkit-view-insert-note-line "正在加载完整用户资料…" :face 'shadow))
+         (when qq-user--error
+           (appkit-view-insert-note-line qq-user--error :face 'error))
          (appkit-view-insert-note-line
           (concat "g 刷新 · m 私聊"
+                  (when (and qq-user--friend-add-state
+                             (not (qq-user--friend-p)))
+                    " · + 加好友")
                   (unless (qq-user--self-p)
                     (if (qq-user--like-limit-reached-p)
                         " · l 今日已达上限"
@@ -575,7 +865,10 @@
 (defun qq-user-open-avatar ()
   "Open the current profile user's avatar."
   (interactive)
-  (qq-media-open-user-avatar qq-user--user-id))
+  (if-let* ((url (qq-user--present-string
+                  (alist-get 'avatar_url qq-user--search-result))))
+      (qq-media-open-image-url (format "avatar:%s" qq-user--user-id) url)
+    (qq-media-open-user-avatar qq-user--user-id)))
 
 (defun qq-user-copy-id ()
   "Copy the current profile user's QQ number."
@@ -610,6 +903,9 @@
     (qq-api-cancel-request qq-user--send-like-request))
   (when qq-user--photo-request
     (qq-api-cancel-request qq-user--photo-request))
+  (when-let* ((state qq-user--friend-add-state)
+              (request (qq-user--friend-add-state-request state)))
+    (qq-api-cancel-request request))
   (setq qq-user--request nil
         qq-user--request-owner nil
         qq-user--like-request nil
@@ -617,7 +913,9 @@
         qq-user--send-like-request nil
         qq-user--send-like-request-owner nil
         qq-user--photo-request nil
-        qq-user--photo-request-owner nil))
+        qq-user--photo-request-owner nil
+        qq-user--search-result nil
+        qq-user--friend-add-state nil))
 
 (defun qq-user--select-user (user-id)
   "Prepare the shared user buffer to display USER-ID."
@@ -645,6 +943,7 @@
     (define-key map (kbd "g") #'qq-user-refresh)
     (define-key map (kbd "m") #'qq-user-open-chat)
     (define-key map (kbd "l") #'qq-user-like)
+    (define-key map (kbd "+") #'qq-user-add-friend)
     (define-key map (kbd "a") #'qq-user-open-avatar)
     (define-key map (kbd "p") #'qq-user-open-photo-wall)
     (define-key map (kbd "RET") #'qq-user-open-photo-at-point)
@@ -672,6 +971,57 @@
       (unless (derived-mode-p 'qq-user-mode)
         (qq-user-mode))
       (qq-user--select-user user-id)
+      (qq-user-render)
+      (when (and (null qq-user--profile)
+                 (not qq-user--loading))
+        (qq-user-refresh)))
+    (pop-to-buffer buffer)
+    buffer))
+
+(defun qq-user--global-search-result-p (result)
+  "Return non-nil when RESULT is an exact validated global-user row."
+  (and (listp result)
+       (proper-list-p result)
+       (= (length result) 5)
+       (cl-every (lambda (cell)
+                   (and (consp cell)
+                        (memq (car cell)
+                              '(user_id uid nickname avatar_url candidate))))
+                 result)
+       (= (length (delete-dups (mapcar #'car result))) 5)
+       (let ((user-id (alist-get 'user_id result))
+             (uid (alist-get 'uid result))
+             (candidate (alist-get 'candidate result)))
+         (and (stringp user-id)
+              (string-match-p "\\`[1-9][0-9]*\\'" user-id)
+              (or (null uid) (qq-api-non-empty-string-p uid))
+              (stringp (alist-get 'nickname result))
+              (qq-api-non-empty-string-p (alist-get 'avatar_url result))
+              (stringp candidate)
+              (string-match-p
+               "\\`[A-Za-z0-9_-]\\{43\\}\\'" candidate)))))
+
+;;;###autoload
+(defun qq-user-open-search-result (result)
+  "Open the exact global-user search RESULT with its one-use candidate."
+  (unless (qq-user--global-search-result-p result)
+    (error "qq: invalid global-user search result"))
+  (let* ((copy (copy-tree result))
+         (user-id (alist-get 'user_id copy))
+         (buffer (get-buffer-create (qq-user--buffer-name user-id))))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'qq-user-mode)
+        (qq-user-mode))
+      (qq-user--select-user user-id)
+      (when-let* ((old qq-user--friend-add-state)
+                  (request (qq-user--friend-add-state-request old)))
+        (qq-api-cancel-request request))
+      (setq qq-user--search-result copy
+            qq-user--friend-add-state
+            (qq-user--friend-add-state-create
+             :user-id user-id
+             :candidate (alist-get 'candidate copy)
+             :status 'candidate))
       (qq-user-render)
       (when (and (null qq-user--profile)
                  (not qq-user--loading))
