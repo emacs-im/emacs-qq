@@ -162,6 +162,12 @@
     '(((user_id . "10001")
        (remark . "Alice")
        (nickname . "Alice Nick"))))
+   (qq-state-upsert-session
+    "private:10001"
+    '((type . private)
+      (target-id . "10001")
+      (peer-uid . "u_private_alice"))
+    nil)
    (let ((message
           (qq-state-apply-poke-notice
            `((post_type . "notice")
@@ -177,6 +183,18 @@
      (should (equal (alist-get 'sender-name message) "Alice"))
      (should (equal (alist-get 'preview message) "戳了戳 我"))
      (should-not (string-match-p "unknown" (alist-get 'preview message))))))
+
+(ert-deftest qq-state-private-poke-recall-requires-exact-stored-peer-uid ()
+  (qq-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((type . private) (target-id . "10001"))
+    nil)
+   (should-error
+    (qq-state-validate-poke-recall-reference
+     "private:10001"
+     (qq-state-test--poke-recall-reference
+      "9007199254741007701" 1 "u_private_alice")))))
 
 (ert-deftest qq-state-apply-poke-notice-uses-id-fallback-in-group ()
   (qq-test-with-reset
@@ -1041,7 +1059,7 @@
                    (data . ((text . "hello"))))))))
    (let ((session (qq-state-session "private:10001")))
      (should (= (alist-get 'unread-count session) 0)))
-   (qq-state-apply-recall "9007199254741004123")
+   (qq-state-apply-recall "private:10001" "9007199254741004123")
    (let ((message (car (qq-state-session-messages "private:10001"))))
      (should (qq-state-message-recalled-p message))
      (should (equal (alist-get 'preview message) "[message recalled]")))))
@@ -1112,7 +1130,7 @@
       (raw_message . "will recall")
       (message . (((type . "text")
                    (data . ((text . "will recall"))))))))
-   (qq-state-apply-recall "9007199254741005555")
+   (qq-state-apply-recall "private:10001" "9007199254741005555")
    (let ((message (car (qq-state-session-messages "private:10001"))))
      (should (qq-state-message-recalled-p message))
      (should (equal (alist-get 'server-id message) "9007199254741005555")))))
@@ -1153,7 +1171,7 @@
       (sender . ((user_id . 90001) (nickname . "Me")))
       (raw_message . "x")
       (message . (((type . "text") (data . ((text . "x"))))))))
-   (qq-state-apply-recall "9007199254741005555")
+   (qq-state-apply-recall "private:10001" "9007199254741005555")
    (qq-state-merge-history
     "private:10001"
     (list
@@ -1613,7 +1631,7 @@
          (should (equal (plist-get live-event :message-anchor)
                         "9007199254741004999")))
        (setq events nil)
-       (qq-state-apply-recall "9007199254741004999")
+       (qq-state-apply-recall "private:10001" "9007199254741004999")
        (let ((recall-event (car events)))
          (should (eq (plist-get recall-event :mutation) 'update))
          (should (eq (plist-get recall-event :source) 'notice))
@@ -1656,6 +1674,132 @@
          (should (eq (plist-get restore-event :mutation) 'read))
          (should (= 4 (alist-get 'unread-count
                                  (qq-state-session "private:10001")))))))))
+
+(ert-deftest qq-state-filter-only-recall-emits-exact-message-patch ()
+  (qq-test-with-reset
+   (let ((message-id "9007199254741004881")
+         events)
+     (add-hook 'qq-state-change-hook
+               (lambda (event)
+                 (when (eq (plist-get event :type) 'message)
+                   (push event events))))
+     (should-not (qq-state-session-messages "private:10001"))
+     (should-not (qq-state-apply-recall "private:10001" message-id))
+     (let ((event (car events)))
+       (should (equal (plist-get event :session-key) "private:10001"))
+       (should (equal (plist-get event :message-anchor) message-id))
+       (should (eq (plist-get event :mutation) 'update))
+       (should (eq (plist-get event :source) 'notice))
+       (should (equal (plist-get event :message-patch) '(:kind recall)))
+       (should-not (plist-member event :message)))
+     (should-not (qq-state-session-messages "private:10001")))))
+
+(ert-deftest qq-state-filter-only-emoji-like-emits-exact-message-patch ()
+  (qq-test-with-reset
+   (let* ((message-id "9007199254741004882")
+          (notice
+           `((notice_type . "group_msg_emoji_like")
+             (group_id . "20001")
+             (user_id . "10002")
+             (message_id . ,message-id)
+             (is_add . t)
+             (likes . (((emoji_id . "178") (count . 2))))))
+          events)
+     (add-hook 'qq-state-change-hook
+               (lambda (event)
+                 (when (eq (plist-get event :type) 'message)
+                   (push event events))))
+     (should-not (qq-state-session-messages "group:20001"))
+     (should-not
+      (qq-state-apply-emoji-like-notice "group:20001" notice))
+     (let* ((event (car events))
+            (patch (plist-get event :message-patch)))
+       (should (equal (plist-get event :session-key) "group:20001"))
+       (should (equal (plist-get event :message-anchor) message-id))
+       (should (eq (plist-get event :mutation) 'update))
+       (should (eq (plist-get event :source) 'notice))
+       (should (eq (plist-get patch :kind) 'emoji-like))
+       (should (equal (plist-get patch :notice) notice))
+       (should-not (plist-member event :message)))
+     (should-not (qq-state-session-messages "group:20001")))))
+
+(ert-deftest qq-state-message-patches-reject-identity-contradictions ()
+  (qq-test-with-reset
+   (let ((message-id "9007199254741004883"))
+     (qq-state-merge-live-message
+      `((post_type . "message")
+        (message_type . "private")
+        (chat_type . 1)
+        (peer_uin . "10001")
+        (message_id . ,message-id)
+        (user_id . "10001")
+        (time . 1710000001)
+        (sender . ((user_id . "10001") (nickname . "Alice")))
+        (raw_message . "owned")
+        (message . (((type . "text") (data . ((text . "owned"))))))))
+     (let ((index-error
+            (should-error
+             (qq-state-apply-recall "group:20001" message-id))))
+       (should (string-match-p "contradicts indexed session"
+                               (error-message-string index-error))))
+     (let ((group-error
+            (should-error
+             (qq-state-apply-emoji-like-notice
+              "group:20001"
+              `((notice_type . "group_msg_emoji_like")
+                (group_id . "20002")
+                (user_id . "10002")
+                (message_id . ,message-id)
+                (is_add . t)
+                (likes . (((emoji_id . "178") (count . 1)))))))))
+       (should (string-match-p "requires the explicit session group"
+                               (error-message-string group-error)))))))
+
+(ert-deftest qq-state-normalize-message-snapshot-does-not-consume-global-order ()
+  (qq-test-with-reset
+   (setq qq-state--message-order-counter 41)
+   (let ((snapshot
+          (qq-state-normalize-message-snapshot
+           "group:20001"
+           '((chat . ((kind . "group") (group_id . "20001")))
+             (message_id . "9007199254741004884")
+             (message_seq . "10001")
+             (sent_at . 1710000001)
+             (sender . ((user_id . "10001") (name . "Alice")))
+             (outgoing . :false)
+             (state . "live")
+             (segments . (((kind . "text")
+                           (payload . ((text . "snapshot"))))))
+             (reactions . (((emoji_id . "178")
+                            (emoji_type . "1")
+                            (count . 2)
+                            (chosen . t))))))))
+     (should (= (alist-get 'order snapshot) 42))
+     (should (= qq-state--message-order-counter 41))
+     (should (equal (alist-get 'message-seq snapshot) "10001"))
+     (should (equal (alist-get 'preview snapshot) "snapshot"))
+     (should (equal (alist-get 'segments snapshot)
+                    '(((type . "text") (data . ((text . "snapshot")))))))
+     (should (equal (car (alist-get 'reactions snapshot))
+                    '((emoji-id . "178") (emoji-type . "1")
+                      (count . 2) (chosen-p . t))))
+     (should-not (assq 'raw-event snapshot))
+     (should-not (qq-state-session-messages "group:20001")))))
+
+(ert-deftest qq-state-message-snapshot-rejects-contradictory-session ()
+  (qq-test-with-reset
+   (should-error
+    (qq-state-normalize-message-snapshot
+     "group:20001"
+     '((chat . ((kind . "group") (group_id . "20002")))
+       (message_id . "9007199254741004884")
+       (message_seq . "10001")
+       (sent_at . 1710000001)
+       (sender . ((user_id . "10001") (name . "Alice")))
+       (outgoing . :false)
+       (state . "live")
+       (segments)
+       (reactions))))))
 
 (ert-deftest qq-state-merge-history-added-count-skips-duplicates ()
   (let ((qq-state-change-hook nil)
@@ -1769,6 +1913,7 @@
             (is_clicked . "0")))))))
    ;; Another member adds one; packet count is the aggregate.
    (qq-state-apply-emoji-like-notice
+    "group:20001"
     '((notice_type . "group_msg_emoji_like")
       (group_id . "20001")
       (user_id . "10002")
@@ -1781,6 +1926,7 @@
      (should-not (alist-get 'chosen-p reaction)))
    ;; Our own add without a count is the optimistic one-step delta.
    (qq-state-apply-emoji-like-notice
+    "group:20001"
     '((notice_type . "group_msg_emoji_like")
       (group_id . "20001")
       (user_id . "90001")
@@ -1793,6 +1939,7 @@
      (should (eq (alist-get 'chosen-p reaction) t)))
    ;; A late action callback after the authoritative event is idempotent.
    (qq-state-apply-emoji-like-notice
+    "group:20001"
     '((notice_type . "group_msg_emoji_like")
       (group_id . "20001")
       (user_id . "90001")
@@ -1808,6 +1955,7 @@
           (car (qq-state-session-messages "group:20001")))))))
    ;; An authoritative remove-to-zero deletes the chip.
    (qq-state-apply-emoji-like-notice
+    "group:20001"
     '((notice_type . "group_msg_emoji_like")
       (group_id . "20001")
       (user_id . "90001")

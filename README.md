@@ -46,13 +46,14 @@ selected on a focused frame.  Muted chats stay quiet except for native QQ
 the local notification history.
 
 Message search is authoritative and session-scoped: it never wraps over the
-currently rendered buffer.  In a chat, `C-c /` starts the current-chat search,
-`C-c C-r`/`C-c C-s` search toward older/newer messages from point, and
-`M-g p`/`M-g n` continue in those directions; `C-c C-c` cancels that search.
-Unlike telega's materialized chat filter, the current QQ protocol navigates
-authoritative server hits in place.  `C-c M-/` opens the separate paginated
-`*qq-search*` result buffer; press `RET` on a row to load the exact message and
-its surrounding history.
+currently rendered buffer.  Like telega, `C-c /` opens a require-match filter
+chooser; `search` and `hashtag` replace the current chat timeline with native
+server hits.  Scrolling to the top loads older filtered pages, `C-c g` refreshes
+the filter, and `C-c C-c` restores the unchanged normal history window.
+`C-c C-r`/`C-c C-s` remain the in-place older/newer search commands, with
+`M-g p`/`M-g n` continuing those results.  `C-c M-/` opens the separate
+paginated `*qq-search*` result buffer; press `RET` on a row to load the exact
+message and its surrounding history.
 
 Development with Eask:
 

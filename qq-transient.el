@@ -273,9 +273,10 @@ Prefer this over inline button rows."
   [["Timeline"
     ("g" "Refresh" qq-chat-refresh)
     (">" "Latest / mark read" qq-chat-read-all)
-    ("/" "Search timeline" qq-chat-search)
+    ("/" "Filter messages" qq-chat-filter)
     ("M-/" "Search results" qq-chat-search-results)
-    ("x" "Cancel search" qq-chat-search-cancel)
+    ("x" "Cancel filter" qq-chat-filter-cancel)
+    ("X" "Cancel search" qq-chat-search-cancel)
     ("s" "Search older" qq-chat-search)
     ("S" "Search newer" qq-chat-search-forward)
     ("n" "Search next" qq-chat-search-next)

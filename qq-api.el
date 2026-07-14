@@ -963,11 +963,6 @@ peer UIDs stay strings and are never interpreted as QQ numbers."
     ;; future locator kind cannot silently map to the wrong session namespace.
     (_ (error "qq: unsupported Emacs session locator %S" locator))))
 
-;; Kept for source compatibility with callers written before the conversion
-;; became part of the public protocol boundary.
-(defalias 'qq-api--emacs-session-key-from-locator
-  #'qq-api-session-key-from-locator)
-
 (defun qq-api-fetch-session-read-state (session-key &optional callback errback)
   "Fetch the official Linux QQ read position for SESSION-KEY.
 
@@ -1051,10 +1046,10 @@ BEFORE-MESSAGE-ID is the optional older-page cursor."
          (type (alist-get 'type identity))
          (target-id (alist-get 'target-id identity)))
     (unless (memq type '(group private))
-      (user-error "qq: forwarding to %s sessions is not supported" type))
+      (user-error "qq: chat locators do not support %s sessions" type))
     (unless (qq-api-user-id-p target-id)
       (user-error
-       "qq: forward session %s requires a decimal string target id"
+       "qq: session %s requires a decimal string target id"
        session-key))
     (if (eq type 'group)
         `((kind . "group") (group_id . ,target-id))
@@ -1485,19 +1480,36 @@ websocket notice is deduplicated by its local second-level anchor."
            (lambda (response reason)
              (qq-api--default-error response reason)))))))
 
-(defun qq-api-delete-message (message-id)
-  "Recall MESSAGE-ID (NT snowflake string) via NapCat and mark it recalled."
-  (interactive)
-  (setq message-id
-        (qq-api-validate-message-id message-id "delete_msg"))
-  (qq-api-call
-   "delete_msg"
-   `((message_id . ,message-id))
-   (lambda (_response)
-     (qq-state-apply-recall message-id))))
+(defun qq-api--message-mutation-context (reference context)
+  "Return validated mutation context for closed REFERENCE and CONTEXT.
 
-(defun qq-api-recall-poke (recall-reference &optional callback errback)
-  "Recall a poke through native RECALL-REFERENCE.
+The message id and chat travel as one identity object.  A known canonical
+index contradiction is rejected before any remote side effect."
+  (let* ((reference
+          (qq-api-validate-message-reference reference context))
+         (message-id (alist-get 'message_id reference))
+         (session-key
+          (qq-api-session-key-from-locator (alist-get 'chat reference))))
+    (qq-state-validate-message-session session-key message-id)
+    (list :reference reference
+          :message-id message-id
+          :session-key session-key)))
+
+(defun qq-api-delete-message (reference)
+  "Recall the exact message in closed locator-qualified REFERENCE."
+  (let* ((context
+          (qq-api--message-mutation-context reference "delete_msg reference"))
+         (message-id (plist-get context :message-id))
+         (session-key (plist-get context :session-key)))
+    (qq-api-call
+     "delete_msg"
+     `((message_id . ,message-id))
+     (lambda (_response)
+       (qq-state-apply-recall session-key message-id)))))
+
+(defun qq-api-recall-poke
+    (session-key recall-reference &optional callback errback)
+  "Recall a poke in SESSION-KEY through native RECALL-REFERENCE.
 
 Pokes are gray-tip records, so they must not be sent through `delete_msg'.
 The closed reference carries the exact native Peer and msgId expected by
@@ -1505,6 +1517,8 @@ The closed reference carries the exact native Peer and msgId expected by
   (let* ((reference
           (qq-protocol-validate-poke-recall-reference
            recall-reference "recall_poke" 'user-error))
+         (reference
+          (qq-state-validate-poke-recall-reference session-key reference))
          (message-id (alist-get 'message_id reference)))
     (when (qq-protocol-poke-recall-reference-expired-p reference)
       (user-error "qq: 戳一戳已超过 2 分钟撤回期限"))
@@ -1512,7 +1526,7 @@ The closed reference carries the exact native Peer and msgId expected by
      "recall_poke"
      `((recall_reference . ,reference))
      (lambda (response)
-       (qq-state-apply-recall message-id)
+       (qq-state-apply-recall session-key message-id)
        (when callback
          (funcall callback response)))
      (or errback
@@ -1520,34 +1534,44 @@ The closed reference carries the exact native Peer and msgId expected by
            (qq-api--default-error response reason))))))
 
 (defun qq-api-set-message-emoji-like
-    (message-id emoji-id set &optional callback errback)
-  "Add or remove EMOJI-ID on MESSAGE-ID according to SET.
+    (reference emoji-id set &optional callback errback)
+  "Add or remove EMOJI-ID on the group message in closed REFERENCE.
 
-MESSAGE-ID remains the original NapCat NT snowflake string.  On success,
-optimistically apply one local reaction delta; the subsequent NapCat notice
-reconciles it with the authoritative aggregate count."
-  (setq message-id
-        (qq-api-validate-message-id message-id "set_msg_emoji_like"))
-  (setq emoji-id (format "%s" emoji-id))
-  (unless (string-match-p "\\`[0-9]+\\'" emoji-id)
-    (user-error "qq: reaction emoji_id must be a decimal string"))
-  (let ((set (and set t)))
-    (qq-api-call
-     "set_msg_emoji_like"
-     `((message_id . ,message-id)
-       (emoji_id . ,emoji-id)
-       (set . ,(if set t :false)))
-     (lambda (response)
-       (when-let* ((self-id (qq-state-self-user-id)))
-         (qq-state-apply-emoji-like-notice
-          `((notice_type . "group_msg_emoji_like")
-            (message_id . ,message-id)
-            (user_id . ,self-id)
-            (is_add . ,(if set t :false))
-            (likes . (((emoji_id . ,emoji-id)))))))
-       (when callback
-         (funcall callback response)))
-     (or errback #'qq-api--default-error))))
+REFERENCE's `message_id' remains the original NapCat NT snowflake string.  On
+success, optimistically apply one local reaction delta; the subsequent NapCat
+notice reconciles it with the authoritative aggregate count."
+  (let* ((context
+          (qq-api--message-mutation-context
+           reference "set_msg_emoji_like reference"))
+         (reference (plist-get context :reference))
+         (message-id (plist-get context :message-id))
+         (session-key (plist-get context :session-key))
+         (chat (alist-get 'chat reference)))
+    (unless (equal (alist-get 'kind chat) "group")
+      (user-error "qq: reactions require a group message reference"))
+    (setq emoji-id (format "%s" emoji-id))
+    (unless (string-match-p "\\`[0-9]+\\'" emoji-id)
+      (user-error "qq: reaction emoji_id must be a decimal string"))
+    (let* ((set (and set t))
+           (group-id (qq-state-session-key-target-id session-key)))
+      (qq-api-call
+       "set_msg_emoji_like"
+       `((message_id . ,message-id)
+         (emoji_id . ,emoji-id)
+         (set . ,(if set t :false)))
+       (lambda (response)
+         (when-let* ((self-id (qq-state-self-user-id)))
+           (qq-state-apply-emoji-like-notice
+            session-key
+            `((notice_type . "group_msg_emoji_like")
+              (message_id . ,message-id)
+              (group_id . ,group-id)
+              (user_id . ,self-id)
+              (is_add . ,(if set t :false))
+              (likes . (((emoji_id . ,emoji-id)))))))
+         (when callback
+           (funcall callback response)))
+       (or errback #'qq-api--default-error)))))
 
 (defun qq-api-get-avatar (user-id callback &optional errback no-cache)
   "Fetch avatar resource for USER-ID and pass it to CALLBACK."
@@ -1685,17 +1709,40 @@ reconciles it with the authoritative aggregate count."
       (user-error "qq: message search requires a nonzero decimal chat id"))
     locator))
 
-(defun qq-api--message-search-page-callback (callback errback response)
-  "Validate search RESPONSE, then invoke CALLBACK or ERRBACK."
+(defun qq-api--message-search-page-callback
+    (projection expected-chat callback errback response)
+  "Validate search RESPONSE for PROJECTION and EXPECTED-CHAT.
+
+Invoke CALLBACK only after every result proves the same closed chat identity;
+otherwise route the protocol error to ERRBACK."
   (condition-case error-data
-      (funcall
-       callback
-       (qq-protocol-validate-emacs-message-search-page
-        (qq-api--response-data response)
-        "emacs_search_messages response"))
+      (let* ((page
+              (qq-protocol-validate-emacs-message-search-page
+               (qq-api--response-data response)
+               "emacs_search_messages response" nil projection))
+             (results (alist-get 'results page)))
+        (when (eq projection 'message)
+          (qq-api--validate-message-search-segments page))
+        (dolist (result results)
+          (unless (equal (alist-get 'chat result) expected-chat)
+            (error "qq: message search returned a different chat")))
+        (funcall callback page))
     (error
      (funcall (or errback #'qq-api--default-error)
               response (error-message-string error-data)))))
+
+(defun qq-api--validate-message-search-segments (page)
+  "Validate every discriminated native segment in message-projection PAGE."
+  (dolist (result (alist-get 'results page))
+    (cl-loop
+     for segment in (alist-get 'segments result)
+     for index from 0
+     do (qq-api--validate-native-forward-segment
+         segment
+         (format "message search result %s segment %d"
+                 (alist-get 'message_id result) index)
+         t)))
+  page)
 
 (defun qq-api-search-messages-start
     (session-key query callback &optional errback limit)
@@ -1712,27 +1759,79 @@ private and group chats are searchable; no loaded-buffer fallback exists."
   (setq limit (or limit 50))
   (unless (and (integerp limit) (<= 1 limit 100))
     (user-error "qq: message search limit must be between 1 and 100"))
-  (qq-api-call
-   "emacs_search_messages"
-   `((kind . "start")
-     (chat . ,(qq-api--message-search-session-locator session-key))
-     (query . ,query)
-     (limit . ,limit))
-   (apply-partially #'qq-api--message-search-page-callback callback errback)
-   errback))
+  (let ((chat (qq-api--message-search-session-locator session-key)))
+    (qq-api-call
+     "emacs_search_messages"
+     `((kind . "start")
+       (projection . "summary")
+       (chat . ,chat)
+       (query . ,query)
+       (limit . ,limit))
+     (apply-partially
+      #'qq-api--message-search-page-callback
+      'summary chat callback errback)
+     errback)))
 
-(defun qq-api-search-messages-next (cursor callback &optional errback)
-  "Continue authoritative message search at opaque CURSOR.
+(defun qq-api-search-messages-next
+    (session-key cursor projection callback &optional errback)
+  "Continue SESSION-KEY's authoritative search at opaque CURSOR.
 
-CALLBACK receives the same validated page shape as
-`qq-api-search-messages-start'."
-  (unless (and (stringp cursor) (not (string-empty-p cursor)))
-    (user-error "qq: message search cursor must be a non-empty string"))
-  (qq-api-call
-   "emacs_search_messages"
-   `((kind . "next") (cursor . ,cursor))
-   (apply-partially #'qq-api--message-search-page-callback callback errback)
-   errback))
+PROJECTION must be the cursor's explicit `summary' or `message' result
+projection.  CALLBACK receives a page validated against that discriminator."
+  (let ((chat (qq-api--message-search-session-locator session-key)))
+    (unless (and (stringp cursor) (not (string-empty-p cursor)))
+      (user-error "qq: message search cursor must be a non-empty string"))
+    (unless (memq projection '(summary message))
+      (user-error "qq: invalid message search projection"))
+    (qq-api-call
+     "emacs_search_messages"
+     `((kind . "next") (cursor . ,cursor))
+     (apply-partially
+      #'qq-api--message-search-page-callback
+      projection chat callback errback)
+     errback)))
+
+(defun qq-api-filter-messages-start
+    (session-key query callback &optional errback limit)
+  "Start a rendering-snapshot filter search in SESSION-KEY for QUERY.
+
+Unlike summary search, CALLBACK receives a `message' projection whose exact
+hits remain filter-owned closed snapshots.  The normal history cache and
+continuous window remain untouched."
+  (setq query (and (stringp query) (string-trim query)))
+  (unless (and query (not (string-empty-p query)))
+    (user-error "qq: message filter query must be a non-empty string"))
+  (when (> (length query) 512)
+    (user-error "qq: message filter query must be at most 512 characters"))
+  (setq limit (or limit 50))
+  (unless (and (integerp limit) (<= 1 limit 100))
+    (user-error "qq: message filter limit must be between 1 and 100"))
+  (let ((chat (qq-api--message-search-session-locator session-key)))
+    (qq-api-call
+     "emacs_search_messages"
+     `((kind . "start")
+       (projection . "message")
+       (chat . ,chat)
+       (query . ,query)
+       (limit . ,limit))
+     (apply-partially
+      #'qq-api--message-search-page-callback
+      'message chat callback errback)
+     errback)))
+
+(defun qq-api-filter-messages-next
+    (session-key cursor callback &optional errback)
+  "Continue SESSION-KEY's rendering-snapshot filter at opaque CURSOR."
+  (let ((chat (qq-api--message-search-session-locator session-key)))
+    (unless (and (stringp cursor) (not (string-empty-p cursor)))
+      (user-error "qq: message filter cursor must be a non-empty string"))
+    (qq-api-call
+     "emacs_search_messages"
+     `((kind . "next") (cursor . ,cursor))
+     (apply-partially
+      #'qq-api--message-search-page-callback
+      'message chat callback errback)
+     errback)))
 
 (defun qq-api--normalize-group-member-search-result (member index)
   "Validate and normalize native group MEMBER at INDEX."
@@ -1877,10 +1976,18 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
        (when (qq-api--accept-read-observation-p
               session-key (qq-api--next-read-observation-token))
          (qq-state-apply-session-read-state session-key read-state))))
-    ((or "friend_recall" "group_recall")
-     (qq-state-apply-recall (alist-get 'message_id notice)))
+    ("friend_recall"
+     (qq-state-apply-recall
+      (qq-state-session-key 'private (alist-get 'user_id notice))
+      (alist-get 'message_id notice)))
+    ("group_recall"
+     (qq-state-apply-recall
+      (qq-state-session-key 'group (alist-get 'group_id notice))
+      (alist-get 'message_id notice)))
     ("group_msg_emoji_like"
-     (qq-state-apply-emoji-like-notice notice))
+     (qq-state-apply-emoji-like-notice
+      (qq-state-session-key 'group (alist-get 'group_id notice))
+      notice))
     ("notify"
      (pcase (alist-get 'sub_type notice)
        ("input_status"

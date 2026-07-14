@@ -141,8 +141,8 @@ CONTEXT is included in the diagnostic.  ERROR-SYMBOL defaults to `error'."
        (let ((name (alist-get 'name value)))
          (and (stringp name) (not (string-empty-p name))))))
 
-(defun qq-protocol-emacs-message-search-result-p (value)
-  "Return non-nil when VALUE is one closed message-search result."
+(defun qq-protocol--emacs-message-search-summary-p (value)
+  "Return non-nil when VALUE is one closed message-search summary."
   (and (qq-protocol--closed-object-p
         value '(chat message_id message_seq sent_at sender preview))
        (qq-protocol-emacs-chat-locator-p (alist-get 'chat value))
@@ -156,26 +156,105 @@ CONTEXT is included in the diagnostic.  ERROR-SYMBOL defaults to `error'."
        (let ((preview (alist-get 'preview value)))
          (and (stringp preview) (not (string-empty-p preview))))))
 
-(defun qq-protocol-emacs-message-search-page-p (value)
+(defun qq-protocol--emacs-message-search-segment-p (value)
+  "Return non-nil when VALUE has the closed native segment envelope.
+
+The API layer validates each discriminated payload in detail.  This protocol
+module only owns the common JSON object boundary so it stays independent from
+the recursive media/forward decoder."
+  (and (qq-protocol--closed-object-p value '(kind payload))
+       (let ((kind (alist-get 'kind value)))
+         (and (stringp kind) (not (string-empty-p kind))))
+       (let ((payload (alist-get 'payload value)))
+         (or (null payload)
+             (and (proper-list-p payload)
+                  (cl-every (lambda (cell)
+                              (and (consp cell) (symbolp (car cell))))
+                            payload))))))
+
+(defun qq-protocol--emacs-message-search-reaction-p (value)
+  "Return non-nil when VALUE is one closed normalized reaction snapshot."
+  (and (qq-protocol--closed-object-p
+        value '(emoji_id emoji_type count chosen))
+       (qq-protocol--nonzero-decimal-string-p (alist-get 'emoji_id value))
+       (let ((emoji-type (alist-get 'emoji_type value)))
+         (and (stringp emoji-type) (not (string-empty-p emoji-type))))
+       (qq-protocol--positive-safe-integer-p (alist-get 'count value))
+       (memq (alist-get 'chosen value) '(t :false))))
+
+(defun qq-protocol--emacs-message-search-message-p (value)
+  "Return non-nil when VALUE is one flat closed rendering snapshot."
+  (and (qq-protocol--closed-object-p
+        value '(chat message_id message_seq sent_at sender outgoing state
+                     segments reactions))
+       (qq-protocol-emacs-chat-locator-p (alist-get 'chat value))
+       (qq-protocol--nonzero-decimal-string-p
+        (alist-get 'message_id value))
+       (qq-protocol--nonzero-decimal-string-p
+        (alist-get 'message_seq value))
+       (qq-protocol--positive-safe-integer-p (alist-get 'sent_at value))
+       (qq-protocol--emacs-message-search-sender-p
+        (alist-get 'sender value))
+       (memq (alist-get 'outgoing value) '(t :false))
+       (member (alist-get 'state value) '("live" "recalled"))
+       (let ((segments (alist-get 'segments value)))
+         (and (proper-list-p segments)
+              (cl-every #'qq-protocol--emacs-message-search-segment-p
+                        segments)
+              (or (equal (alist-get 'state value) "live")
+                  (null segments))))
+       (let ((reactions (alist-get 'reactions value)))
+         (and (proper-list-p reactions)
+              (cl-every #'qq-protocol--emacs-message-search-reaction-p
+                        reactions)))))
+
+(defun qq-protocol-emacs-message-search-result-p (value &optional projection)
+  "Return non-nil when VALUE is one closed result for PROJECTION.
+
+PROJECTION is `summary' or `message'.  A message projection retains the exact
+identity fields but is a flat, fork-native rendering snapshot rather than an
+OB11 message wrapper."
+  (pcase (or projection 'summary)
+    ('summary
+     (qq-protocol--emacs-message-search-summary-p value))
+    ('message
+     (qq-protocol--emacs-message-search-message-p value))
+    (_ nil)))
+
+(defun qq-protocol-emacs-message-search-page-p (value &optional projection)
   "Return non-nil when VALUE is one closed message-search page.
 
 An empty result page may still carry `next_cursor'.  The cursor is an opaque
 server-owned continuation and is therefore validated only as a non-empty
-string; clients must never parse or synthesize it."
-  (and (qq-protocol--closed-object-p value '(results next_cursor))
-       (let ((results (alist-get 'results value)))
-         (and (listp results)
-              (cl-every #'qq-protocol-emacs-message-search-result-p results)))
+string; clients must never parse or synthesize it.  PROJECTION, when non-nil,
+also requires the server to return that exact projection."
+  (and (memq projection '(nil summary message))
+       (qq-protocol--closed-object-p value '(projection results next_cursor))
+       (let ((actual (alist-get 'projection value)))
+         (and (member actual '("summary" "message"))
+              (or (null projection)
+                  (equal actual (symbol-name projection)))))
+       (let* ((actual (intern (alist-get 'projection value)))
+              (results (alist-get 'results value)))
+         (and (proper-list-p results)
+              (cl-every
+               (lambda (result)
+                 (qq-protocol-emacs-message-search-result-p result actual))
+               results)))
        (let ((cursor (alist-get 'next_cursor value)))
          (or (null cursor)
              (and (stringp cursor) (not (string-empty-p cursor)))))))
 
 (defun qq-protocol-validate-emacs-message-search-page
-    (value &optional context error-symbol)
+    (value &optional context error-symbol projection)
   "Return a copy of closed message-search page VALUE after validation.
 
-CONTEXT is included in the diagnostic.  ERROR-SYMBOL defaults to `error'."
-  (unless (qq-protocol-emacs-message-search-page-p value)
+CONTEXT is included in the diagnostic.  ERROR-SYMBOL defaults to `error'.
+When PROJECTION is non-nil it must be `summary' or `message' and match the
+wire discriminator exactly."
+  (unless (memq projection '(nil summary message))
+    (error "qq: invalid message-search projection %S" projection))
+  (unless (qq-protocol-emacs-message-search-page-p value projection)
     (signal (or error-symbol 'error)
             (list
              (format "qq: %s requires a closed message-search page, got %S"

@@ -27,6 +27,7 @@ include:
 - `:source' — `local', `event', `response', `notice', when known
 - `:message' / `:message-anchor' / `:previous-anchor' — when a single
   message is the subject (anchor prefers NT snowflake `server-id')
+- `:message-patch' — a pure ID-scoped patch when the subject is not cached
 
 Chat views project canonical state after every relevant mutation; anchors and
 resource identities let the shared timeline redraw only affected rows.")
@@ -534,7 +535,7 @@ their cached segment predates the richer poke renderer."
   "Return REFERENCE when its native Peer belongs to SESSION-KEY.
 
 Group peers are their decimal group IDs.  Private peers are opaque NT UIDs;
-when the session cache already knows that UID, require an exact match."
+the session must already own that exact UID before a recall can be sent."
   (when reference
     (unless session-key
       (error "qq: poke recall reference has no conversation"))
@@ -554,15 +555,21 @@ when the session cache already knows that UID, require an exact match."
         ('private
          (unless (= chat-type 1)
            (error "qq: private poke recall reference has non-private peer"))
-         (when (and (stringp known-peer-uid)
-                    (not (string-empty-p known-peer-uid))
-                    (not (equal peer-uid known-peer-uid)))
+         (unless (and (stringp known-peer-uid)
+                      (not (string-empty-p known-peer-uid)))
+           (error "qq: private poke recall requires the session's exact peer UID"))
+         (unless (equal peer-uid known-peer-uid)
            (error "qq: private poke recall reference does not match %s"
                   session-key)))
         (_
          (error "qq: poke recall reference has unsupported conversation %s"
                 session-key)))))
   reference)
+
+(defun qq-state-validate-poke-recall-reference (session-key reference)
+  "Return a copy of REFERENCE after validating explicit SESSION-KEY."
+  (qq-state-session-key-identity session-key)
+  (copy-tree (qq-state--validate-poke-recall-context reference session-key)))
 
 (defun qq-state--raw-message-recalled-p (message)
   "Return non-nil when raw OneBot MESSAGE is explicitly recalled.
@@ -1263,6 +1270,9 @@ the natural-language fragments.  The complete original notice remains in
       (server-id . ,server-id)
       (session-key . ,session-key)
       (time . ,time)
+      (message-seq . ,(let ((sequence (alist-get 'message_seq message)))
+                        (and (qq-protocol--nonzero-decimal-string-p sequence)
+                             sequence)))
       (sender-id . ,sender-id)
       (sender-name . ,(alist-get 'sender-name sender-fields))
       (sender-secondary-name . ,(alist-get 'sender-secondary-name sender-fields))
@@ -1291,6 +1301,142 @@ the natural-language fragments.  The complete original notice remains in
                            (alist-get 'emoji_likes_list message)))))
       (order . ,(qq-state--next-message-order))
       (raw-event . ,(copy-tree message))))))
+
+(defun qq-state--emacs-search-chat-session-key (chat)
+  "Return canonical group/private session key represented by closed CHAT."
+  (unless (qq-protocol-emacs-chat-locator-p chat)
+    (error "qq: message snapshot has invalid chat locator"))
+  (pcase (alist-get 'kind chat)
+    ("group" (qq-state-session-key 'group (alist-get 'group_id chat)))
+    ("private" (qq-state-session-key 'private (alist-get 'user_id chat)))
+    (_ (error "qq: message snapshot has unsupported chat locator"))))
+
+(defun qq-state--emacs-video-segment-data (payload)
+  "Map closed fork-native video PAYLOAD to the internal media shape."
+  (let* ((remote (alist-get 'remote payload))
+         (state (alist-get 'state remote)))
+    `((file . ,(alist-get 'file payload))
+      ,@(when (assq 'local_path payload)
+          `((path . ,(alist-get 'local_path payload))))
+      ,@(when (assq 'size payload)
+          `((file_size . ,(alist-get 'size payload))))
+      ,@(when (assq 'name payload)
+          `((name . ,(alist-get 'name payload))))
+      ,@(when (assq 'thumb payload)
+          `((thumb . ,(alist-get 'thumb payload))))
+      (remote_status . ,state)
+      ,@(when (equal state "available")
+          `((url . ,(alist-get 'url remote))))
+      ,@(when (equal state "resolvable")
+          `((resolver . ,(copy-tree (alist-get 'resolver remote))))))))
+
+(defun qq-state--emacs-search-segment-to-internal (segment)
+  "Map one validated fork-native search SEGMENT to the timeline model."
+  (let ((kind (alist-get 'kind segment))
+        (payload (alist-get 'payload segment)))
+    (pcase kind
+      ("video"
+       `((type . "video")
+         (data . ,(qq-state--emacs-video-segment-data payload))))
+      ("reply"
+       (let ((target (alist-get 'target payload)))
+         (unless (equal (alist-get 'kind target) "unresolved")
+           (error "qq: search snapshot reply must use an unresolved target"))
+         `((type . "reply")
+           (data
+            . ,(if-let* ((message-id (alist-get 'message_id target)))
+                   `((message_id . ,message-id))
+                 nil)))))
+      ("forward"
+       `((type . "forward")
+         (data . ((content . ,(copy-tree (alist-get 'content payload)))))))
+      ("forward-card"
+       `((type . "card")
+         (data . ((kind . "forward")
+                  (reference . ,(copy-tree (alist-get 'reference payload)))
+                  (presentation . ,(copy-tree
+                                     (alist-get 'presentation payload)))))))
+      ("unsupported"
+       `((type . "__unsupported")
+         (data . ((native_keys . ,(copy-tree
+                                    (alist-get 'native_keys payload)))
+                  (summary . ,(alist-get 'summary payload))))))
+      (_
+       `((type . ,kind) (data . ,(copy-tree payload)))))))
+
+(defun qq-state--emacs-search-reaction-to-internal (reaction)
+  "Map one validated fork-native search REACTION to the local model."
+  `((emoji-id . ,(alist-get 'emoji_id reaction))
+    (emoji-type . ,(alist-get 'emoji_type reaction))
+    (count . ,(alist-get 'count reaction))
+    (chosen-p . ,(eq (alist-get 'chosen reaction) t))))
+
+(defun qq-state-normalize-message-snapshot (session-key snapshot)
+  "Return normalized flat search SNAPSHOT for SESSION-KEY without storing it.
+
+SNAPSHOT is the fork-native rendering projection, not an OB11 event.  This
+decoder has one exact shape, emits no state event, and cannot widen the
+canonical history cache."
+  (qq-state-session-key-identity session-key)
+  (unless (qq-protocol-emacs-message-search-result-p snapshot 'message)
+    (error "qq: invalid closed message snapshot"))
+  (let ((derived-session
+         (qq-state--emacs-search-chat-session-key
+          (alist-get 'chat snapshot))))
+    (unless (equal derived-session session-key)
+      (error "qq: message snapshot session %S contradicts expected session %S"
+             derived-session session-key)))
+  (let* ((server-id (alist-get 'message_id snapshot))
+         (sequence (alist-get 'message_seq snapshot))
+         (time (alist-get 'sent_at snapshot))
+         (sender (alist-get 'sender snapshot))
+         (sender-id (alist-get 'user_id sender))
+         (sender-name (alist-get 'name sender))
+         (self-p (eq (alist-get 'outgoing snapshot) t))
+         (recalled-p (equal (alist-get 'state snapshot) "recalled"))
+         (segments
+          (if recalled-p
+              nil
+            (mapcar #'qq-state--emacs-search-segment-to-internal
+                    (alist-get 'segments snapshot))))
+         (mention-kinds (qq-state--mention-kinds-from-segments segments))
+         (preview (if recalled-p
+                      "[message recalled]"
+                    (qq-state-message-preview-from-segments segments)))
+         (identity (qq-state-session-key-identity session-key))
+         (session-type (alist-get 'type identity)))
+    ;; `order' only breaks ties inside the canonical cache.  Run the ordinary
+    ;; allocator under a dynamic copy so private snapshots cannot consume it.
+    (let ((qq-state--message-order-counter qq-state--message-order-counter))
+      `((id . ,server-id)
+        (server-id . ,server-id)
+        (session-key . ,session-key)
+        (time . ,time)
+        (message-seq . ,sequence)
+        (sender-id . ,sender-id)
+        (sender-name . ,sender-name)
+        (sender-secondary-name . nil)
+        (sender-card . nil)
+        (sender-nickname . ,sender-name)
+        (sender-remark . nil)
+        (self-p . ,self-p)
+        (status . ,(cond (recalled-p 'recalled)
+                         (self-p 'sent)
+                         (t 'received)))
+        (segments . ,segments)
+        (mention-kinds . ,mention-kinds)
+        (contains-mention-p . ,(and mention-kinds t))
+        (raw-message . ,preview)
+        (preview . ,preview)
+        (message-type . ,(symbol-name session-type))
+        (group-id . ,(and (eq session-type 'group)
+                          (alist-get 'target-id identity)))
+        (user-id . ,sender-id)
+        (target-id . ,(alist-get 'target-id identity))
+        (reactions
+         . ,(mapcar #'qq-state--emacs-search-reaction-to-internal
+                    (alist-get 'reactions snapshot)))
+        (order . ,(qq-state--next-message-order))))))
 
 (defun qq-state--pending-message (session-key segments &optional raw-message)
   "Return a local pending message for SESSION-KEY with SEGMENTS.
@@ -1922,23 +2068,43 @@ coerced to an Emacs number."
                       :mutation 'read))
     (qq-state-session session-key)))
 
-(defun qq-state-apply-recall (message-id)
-  "Mark MESSAGE-ID as recalled in local state when present.
+(defun qq-state-validate-message-session (session-key message-id)
+  "Reject known SESSION-KEY contradictions for exact MESSAGE-ID.
+
+Return the validated NT snowflake string.  This cache-index check is not an
+ownership proof for an unknown id; outbound mutations must carry a closed
+locator-qualified message reference."
+  (qq-state-session-key-identity session-key)
+  (setq message-id
+        (or (qq-protocol-optional-message-id
+             message-id "message/session validation")
+            (error "qq: message/session validation requires message_id")))
+  (let ((indexed (gethash message-id qq-state--message-session-index)))
+    (when (and indexed (not (equal indexed session-key)))
+      (error "qq: message patch session %s contradicts indexed session %s"
+             session-key indexed)))
+  message-id)
+
+(defun qq-state-apply-recall (session-key message-id)
+  "Mark exact MESSAGE-ID in explicit SESSION-KEY as recalled.
 
 Keeps the row so the chat view can hide it (default) or show a stub when
-`qq-chat-show-recalled-messages' is non-nil.  Return the updated message."
-  (let* ((normalized-id (qq-state--normalize-id message-id))
-         (session-key (and normalized-id
-                           (gethash normalized-id qq-state--message-session-index)))
+`qq-chat-show-recalled-messages' is non-nil.  The explicit session lets an
+ID-only patch also update a materialized snapshot outside canonical history.
+Return the updated canonical message, if one was present."
+  (let* ((normalized-id
+          (qq-state-validate-message-session session-key message-id))
          (messages (and session-key
                         (copy-tree (or (gethash session-key qq-state--messages-by-session) '()))))
          (existing (and messages
                         (qq-state--find-message
                          messages
                          (lambda (it)
-                           (equal (alist-get 'server-id it) normalized-id))))))
-    (when (and session-key existing)
-      (let ((updated (qq-state--as-recalled-message existing)))
+                           (equal (alist-get 'server-id it) normalized-id)))))
+         (patch '(:kind recall)))
+    (cond
+     ((and session-key existing)
+      (let ((updated (qq-state-message-apply-patch existing patch)))
         (setq messages (qq-state--replace-message messages existing updated))
         (puthash session-key messages qq-state--messages-by-session)
         (qq-state--index-message updated)
@@ -1948,8 +2114,20 @@ Keeps the row so the chat view can hide it (default) or show a stub when
                         :message (copy-tree updated)
                         :message-anchor (qq-state-message-anchor updated)
                         :mutation 'update
-                        :source 'notice)
-        updated))))
+                        :source 'notice
+                        :message-patch patch)
+        updated))
+     ((and session-key normalized-id)
+      ;; Filter projections deliberately do not register in the canonical
+      ;; message index.  Still publish the exact patch so their owner can
+      ;; update its private snapshot without manufacturing a cache island.
+      (qq-state--emit 'message
+                      :session-key session-key
+                      :message-anchor normalized-id
+                      :mutation 'update
+                      :source 'notice
+                      :message-patch patch)
+      nil))))
 
 (defun qq-state--reaction-with-notice (reactions like is-add own-operation-p)
   "Return REACTIONS after applying one emoji LIKE notice.
@@ -2007,20 +2185,61 @@ IS-ADD identifies add versus remove.  OWN-OPERATION-P updates the local
           (push next-item next))
         (nreverse next)))))
 
-(defun qq-state-apply-emoji-like-notice (notice)
-  "Apply OneBot group emoji-like NOTICE to one cached message.
+(defun qq-state--message-with-emoji-like-notice (message notice)
+  "Return a copy of MESSAGE after applying emoji-like NOTICE."
+  (let* ((is-add (qq-protocol-json-true-p (alist-get 'is_add notice)))
+         (operator-id (qq-state--normalize-id (alist-get 'user_id notice)))
+         (own-operation-p
+          (and operator-id
+               (equal operator-id (qq-state-self-user-id))))
+         (reactions (copy-tree (qq-state-message-reactions message))))
+    (dolist (like (or (alist-get 'likes notice) '()))
+      (setq reactions
+            (qq-state--reaction-with-notice
+             reactions like is-add own-operation-p)))
+    (let ((updated (copy-tree message)))
+      (setf (alist-get 'reactions updated nil nil #'eq) reactions)
+      updated)))
+
+(defun qq-state-message-apply-patch (message patch)
+  "Return a copy of normalized MESSAGE after applying closed PATCH.
+
+This pure boundary is shared by canonical storage and buffer-owned filtered
+snapshots.  PATCH is a plist whose `:kind' is `recall' or `emoji-like'."
+  (unless (listp message)
+    (error "qq: message patch requires a normalized message"))
+  (pcase (plist-get patch :kind)
+    ('recall (qq-state--as-recalled-message message))
+    ('emoji-like
+     (let ((notice (plist-get patch :notice)))
+       (unless (listp notice)
+         (error "qq: emoji-like message patch requires a notice"))
+       (qq-state--message-with-emoji-like-notice message notice)))
+    (kind (error "qq: unsupported message patch kind %S" kind))))
+
+(defun qq-state-apply-emoji-like-notice (session-key notice)
+  "Apply group emoji-like NOTICE in explicit SESSION-KEY.
 
 The notice `count' is treated as the authoritative aggregate when present;
-older/fallback notices without it are applied as a one-step delta."
+notices without an aggregate count are applied as a one-step delta.  The
+explicit session scopes filter-owned snapshots when the message is absent from
+canonical history."
   (let* ((message-id
-          (qq-protocol-optional-message-id
-           (alist-get 'message_id notice)
-           "group_msg_emoji_like notice"))
+          (or (qq-protocol-optional-message-id
+               (alist-get 'message_id notice)
+               "group_msg_emoji_like notice")
+              (error "qq: emoji-like notice requires an exact message_id")))
          (group-id (qq-state--normalize-id (alist-get 'group_id notice)))
-         (session-key
-          (or (and message-id
-                   (gethash message-id qq-state--message-session-index))
-              (and group-id (qq-state-session-key 'group group-id))))
+         (identity (qq-state-session-key-identity session-key))
+         (_group-session
+          (unless (eq (alist-get 'type identity) 'group)
+            (error "qq: emoji-like patch requires a group session")))
+         (_group-id
+          (unless (and group-id
+                       (equal group-id (alist-get 'target-id identity)))
+            (error "qq: emoji-like notice requires the explicit session group")))
+         (message-id
+          (qq-state-validate-message-session session-key message-id))
          (messages (and session-key
                         (copy-tree
                          (or (gethash session-key qq-state--messages-by-session)
@@ -2031,30 +2250,30 @@ older/fallback notices without it are applied as a one-step delta."
                 messages
                 (lambda (message)
                   (equal (alist-get 'server-id message) message-id)))))
-         (is-add (qq-protocol-json-true-p (alist-get 'is_add notice)))
-         (operator-id (qq-state--normalize-id (alist-get 'user_id notice)))
-         (own-operation-p
-          (and operator-id
-               (equal operator-id (qq-state-self-user-id)))))
-    (when (and session-key existing)
-      (let ((reactions (copy-tree (qq-state-message-reactions existing))))
-        (dolist (like (or (alist-get 'likes notice) '()))
-          (setq reactions
-                (qq-state--reaction-with-notice
-                 reactions like is-add own-operation-p)))
-        (let ((updated (copy-tree existing)))
-          (setf (alist-get 'reactions updated nil nil #'eq) reactions)
-          (setq messages (qq-state--replace-message messages existing updated))
-          (puthash session-key messages qq-state--messages-by-session)
-          (qq-state--index-message updated)
-          (qq-state--sync-session-summary session-key)
-          (qq-state--emit 'message
-                          :session-key session-key
-                          :message (copy-tree updated)
-                          :message-anchor message-id
-                          :mutation 'update
-                          :source 'notice)
-          updated)))))
+         (patch (list :kind 'emoji-like :notice (copy-tree notice))))
+    (cond
+     ((and session-key existing)
+      (let ((updated (qq-state-message-apply-patch existing patch)))
+        (setq messages (qq-state--replace-message messages existing updated))
+        (puthash session-key messages qq-state--messages-by-session)
+        (qq-state--index-message updated)
+        (qq-state--sync-session-summary session-key)
+        (qq-state--emit 'message
+                        :session-key session-key
+                        :message (copy-tree updated)
+                        :message-anchor message-id
+                        :mutation 'update
+                        :source 'notice
+                        :message-patch patch)
+        updated))
+     ((and session-key message-id)
+      (qq-state--emit 'message
+                      :session-key session-key
+                      :message-anchor message-id
+                      :mutation 'update
+                      :source 'notice
+                      :message-patch patch)
+      nil))))
 
 (defun qq-state--recent-contact-title (contact session-key)
   "Return display title for recent CONTACT in SESSION-KEY."

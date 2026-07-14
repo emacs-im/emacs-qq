@@ -282,7 +282,7 @@ text in the results buffer can never receive search highlighting."
           (setq request
                 (if next-p
                     (qq-api-search-messages-next
-                     cursor
+                     session-key cursor 'summary
                      (lambda (page)
                        (qq-search--page-succeeded
                         buffer session-key owner page))
