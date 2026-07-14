@@ -38,6 +38,14 @@ resource identities let the shared timeline redraw only affected rows.")
 (defvar qq-state--status nil)
 (defvar qq-state--sessions (make-hash-table :test #'equal))
 (defvar qq-state--messages-by-session (make-hash-table :test #'equal))
+(defvar qq-state--message-patch-journal (make-hash-table :test #'equal)
+  "Notice state keyed by (SESSION-KEY . MESSAGE-ID).
+
+Recall tombstones remain authoritative for the lifetime of the state store.
+Emoji notices received before their message are queued in arrival order.  On
+first materialization they are folded into an exact reaction overlay, making
+subsequent stale history/live snapshots idempotent instead of reapplying
+reaction deltas.")
 (defvar qq-state--friends-by-id (make-hash-table :test #'equal))
 (defvar qq-state--groups-by-id (make-hash-table :test #'equal))
 (defvar qq-state--requests nil)
@@ -210,6 +218,7 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   (clrhash qq-state--actions)
   (clrhash qq-state--sessions)
   (clrhash qq-state--messages-by-session)
+  (clrhash qq-state--message-patch-journal)
   (clrhash qq-state--friends-by-id)
   (clrhash qq-state--groups-by-id)
   (clrhash qq-state--message-session-index)
@@ -1688,6 +1697,88 @@ Return the local message object."
   "Return MESSAGES with EXISTING replaced by REPLACEMENT."
   (mapcar (lambda (it) (if (eq it existing) replacement it)) messages))
 
+(defun qq-state--message-patch-journal-key (session-key message-id)
+  "Return the journal key for exact MESSAGE-ID in SESSION-KEY."
+  (cons session-key message-id))
+
+(defun qq-state--remember-unmaterialized-message-patch
+    (session-key message-id patch)
+  "Remember closed PATCH for an absent MESSAGE-ID in SESSION-KEY.
+
+Recall is stored as a tombstone.  Emoji deltas stay ordered until a message
+snapshot provides their base reaction counts."
+  (let* ((key (qq-state--message-patch-journal-key session-key message-id))
+         (entry (copy-tree (gethash key qq-state--message-patch-journal))))
+    (pcase (plist-get patch :kind)
+      ('recall
+       (setq entry (plist-put entry :recalled-p t)))
+      ('emoji-like
+       (if (plist-get entry :reaction-overlay-p)
+           (let* ((base `((reactions . ,(copy-tree
+                                         (plist-get entry :reactions)))))
+                  (updated (qq-state-message-apply-patch base patch)))
+             (setq entry
+                   (plist-put entry :reactions
+                              (copy-tree (alist-get 'reactions updated)))))
+         (setq entry
+               (plist-put
+                entry :pending-reaction-patches
+                (append (plist-get entry :pending-reaction-patches)
+                        (list (copy-tree patch)))))))
+      (kind (error "qq: unsupported message patch kind %S" kind)))
+    (puthash key entry qq-state--message-patch-journal)))
+
+(defun qq-state--record-materialized-message-patch
+    (session-key message-id patch message)
+  "Record the exact result of applying PATCH to materialized MESSAGE."
+  (let* ((key (qq-state--message-patch-journal-key session-key message-id))
+         (entry (copy-tree (gethash key qq-state--message-patch-journal))))
+    (pcase (plist-get patch :kind)
+      ('recall
+       (setq entry (plist-put entry :recalled-p t)))
+      ('emoji-like
+       (setq entry (plist-put entry :reaction-overlay-p t))
+       (setq entry
+             (plist-put entry :reactions
+                        (copy-tree (qq-state-message-reactions message))))
+       (setq entry (plist-put entry :pending-reaction-patches nil)))
+      (kind (error "qq: unsupported message patch kind %S" kind)))
+    (puthash key entry qq-state--message-patch-journal)))
+
+(defun qq-state--materialize-message-patches (session-key message)
+  "Apply journaled notice state to normalized MESSAGE in SESSION-KEY.
+
+Pending emoji deltas are consumed once and replaced by their exact resulting
+reaction projection.  That projection and a recall tombstone are then safe to
+overlay repeatedly on stale snapshots."
+  (let* ((message-id (alist-get 'server-id message))
+         (key (and message-id
+                   (qq-state--message-patch-journal-key
+                    session-key message-id)))
+         (entry (and key
+                     (copy-tree
+                      (gethash key qq-state--message-patch-journal)))))
+    (if (null entry)
+        message
+      (let ((updated (copy-tree message))
+            (pending (plist-get entry :pending-reaction-patches)))
+        (cond
+         ((plist-get entry :reaction-overlay-p)
+          (setf (alist-get 'reactions updated nil nil #'eq)
+                (copy-tree (plist-get entry :reactions))))
+         (pending
+          (dolist (patch pending)
+            (setq updated (qq-state-message-apply-patch updated patch)))
+          (setq entry (plist-put entry :reaction-overlay-p t))
+          (setq entry
+                (plist-put entry :reactions
+                           (copy-tree (qq-state-message-reactions updated))))
+          (setq entry (plist-put entry :pending-reaction-patches nil))
+          (puthash key entry qq-state--message-patch-journal)))
+        (when (plist-get entry :recalled-p)
+          (setq updated (qq-state--as-recalled-message updated)))
+        updated))))
+
 (defun qq-state--merge-normalized-message (session-key message)
   "Merge normalized MESSAGE into SESSION-KEY.
 
@@ -1739,6 +1830,7 @@ Return three values via `cl-values':
                (qq-state-message-recalled-p existing)
                (not (qq-state-message-recalled-p merged)))
       (setq merged (qq-state--as-recalled-message merged)))
+    (setq merged (qq-state--materialize-message-patches session-key merged))
     (if existing
         (setq messages (qq-state--replace-message messages existing merged))
       (push merged messages))
@@ -1877,6 +1969,8 @@ Return a plist:
                    (qq-state-message-recalled-p existing)
                    (not (qq-state-message-recalled-p merged)))
           (setq merged (qq-state--as-recalled-message merged)))
+        (setq merged
+              (qq-state--materialize-message-patches session-key merged))
         (if cell
             (setcar cell merged)
           (push merged messages)
@@ -1934,6 +2028,8 @@ hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor."
                         (server-id . ,normalized-id)
                         (status . sent)
                         (error . nil)))))
+        (setq updated
+              (qq-state--materialize-message-patches session-key updated))
         (setq messages (qq-state--replace-message messages existing updated))
         (setq messages (qq-state--sort-messages messages))
         (puthash session-key messages qq-state--messages-by-session)
@@ -2104,7 +2200,12 @@ Return the updated canonical message, if one was present."
          (patch '(:kind recall)))
     (cond
      ((and session-key existing)
-      (let ((updated (qq-state-message-apply-patch existing patch)))
+      (let* ((materialized
+              (qq-state--materialize-message-patches
+               session-key existing))
+             (updated (qq-state-message-apply-patch materialized patch)))
+        (qq-state--record-materialized-message-patch
+         session-key normalized-id patch updated)
         (setq messages (qq-state--replace-message messages existing updated))
         (puthash session-key messages qq-state--messages-by-session)
         (qq-state--index-message updated)
@@ -2119,8 +2220,10 @@ Return the updated canonical message, if one was present."
         updated))
      ((and session-key normalized-id)
       ;; Filter projections deliberately do not register in the canonical
-      ;; message index.  Still publish the exact patch so their owner can
-      ;; update its private snapshot without manufacturing a cache island.
+      ;; message index.  Journal the patch for later canonical materialization
+      ;; and publish it so the private projection updates immediately.
+      (qq-state--remember-unmaterialized-message-patch
+       session-key normalized-id patch)
       (qq-state--emit 'message
                       :session-key session-key
                       :message-anchor normalized-id
@@ -2253,7 +2356,11 @@ canonical history."
          (patch (list :kind 'emoji-like :notice (copy-tree notice))))
     (cond
      ((and session-key existing)
-      (let ((updated (qq-state-message-apply-patch existing patch)))
+      (let* ((materialized
+              (qq-state--materialize-message-patches session-key existing))
+             (updated (qq-state-message-apply-patch materialized patch)))
+        (qq-state--record-materialized-message-patch
+         session-key message-id patch updated)
         (setq messages (qq-state--replace-message messages existing updated))
         (puthash session-key messages qq-state--messages-by-session)
         (qq-state--index-message updated)
@@ -2267,6 +2374,8 @@ canonical history."
                         :message-patch patch)
         updated))
      ((and session-key message-id)
+      (qq-state--remember-unmaterialized-message-patch
+       session-key message-id patch)
       (qq-state--emit 'message
                       :session-key session-key
                       :message-anchor message-id

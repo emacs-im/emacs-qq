@@ -508,8 +508,12 @@
       (qq-api-search-messages-next
        "group:20001" "opaque:cursor" 'summary
        (lambda (page) (setq value page)))
-      (should (equal params '((kind . "next")
-                              (cursor . "opaque:cursor"))))
+      (should
+       (equal params
+              '((kind . "next")
+                (cursor . "opaque:cursor")
+                (chat . ((kind . "group") (group_id . "20001")))
+                (projection . "summary"))))
       (should (equal value '((projection . "summary")
                              (results)
                              (next_cursor)))))))
@@ -581,8 +585,12 @@
                  'filter-next-request)))
       (qq-api-filter-messages-next
        "private:10001" "opaque:filter" (lambda (page) (setq value page)))
-      (should (equal params '((kind . "next")
-                              (cursor . "opaque:filter"))))
+      (should
+       (equal params
+              '((kind . "next")
+                (cursor . "opaque:filter")
+                (chat . ((kind . "private") (user_id . "10001")))
+                (projection . "message"))))
       (should (equal (alist-get 'projection value) "message")))))
 
 (ert-deftest qq-api-filter-next-validates-session-before-consuming-cursor ()
@@ -592,6 +600,20 @@
       (should-error
        (qq-api-filter-messages-next
         "service:u_mail" "single-use" #'ignore)
+       :type 'user-error)
+      (should-not transport-called))))
+
+(ert-deftest qq-api-search-next-rejects-session-and-projection-before-transport ()
+  (let (transport-called)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (&rest _args) (setq transport-called t))))
+      (should-error
+       (qq-api-search-messages-next
+        "service:u_mail" "single-use" 'summary #'ignore)
+       :type 'user-error)
+      (should-error
+       (qq-api-search-messages-next
+        "group:20001" "single-use" "summary" #'ignore)
        :type 'user-error)
       (should-not transport-called))))
 

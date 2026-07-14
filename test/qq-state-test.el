@@ -1723,6 +1723,118 @@
        (should-not (plist-member event :message)))
      (should-not (qq-state-session-messages "group:20001")))))
 
+(ert-deftest qq-state-recall-before-history-remains-authoritative ()
+  "A notice must survive an older snapshot materializing the message later."
+  (qq-test-with-reset
+   (let ((message-id "9007199254741004885"))
+     (should-not (qq-state-apply-recall "private:10001" message-id))
+     (qq-state-merge-history
+      "private:10001"
+      `(((message_id . ,message-id)
+         (message_type . "private")
+         (chat_type . 1)
+         (peer_uin . "10001")
+         (user_id . "10001")
+         (time . 1710000001)
+         (sender . ((user_id . "10001") (nickname . "Alice")))
+         (raw_message . "stale history")
+         (message . (((type . "text")
+                      (data . ((text . "stale history")))))))))
+     (let ((message (car (qq-state-session-messages "private:10001"))))
+       (should (qq-state-message-recalled-p message))
+       (should (equal (alist-get 'preview message) "[message recalled]")))
+     ;; A duplicate live snapshot is another stale materialization boundary.
+     (qq-state-merge-live-message
+      `((post_type . "message")
+        (message_type . "private")
+        (chat_type . 1)
+        (peer_uin . "10001")
+        (message_id . ,message-id)
+        (user_id . "10001")
+        (time . 1710000001)
+        (sender . ((user_id . "10001") (nickname . "Alice")))
+        (raw_message . "stale live")
+        (message . (((type . "text")
+                     (data . ((text . "stale live"))))))))
+     (should (qq-state-message-recalled-p
+              (car (qq-state-session-messages "private:10001")))))))
+
+(ert-deftest qq-state-emoji-before-history-folds-delta-once ()
+  "Queued reaction deltas become an idempotent overlay after materialization."
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "Me")))
+   (let* ((message-id "9007199254741004886")
+          (notice
+           `((notice_type . "group_msg_emoji_like")
+             (group_id . "20001")
+             (user_id . "10002")
+             (message_id . ,message-id)
+             (is_add . t)
+             (likes . (((emoji_id . "178") (emoji_type . "1"))))))
+          (stale-snapshot
+           `((message_id . ,message-id)
+             (message_type . "group")
+             (chat_type . 2)
+             (peer_uin . "20001")
+             (group_id . "20001")
+             (user_id . "10001")
+             (time . 1710000001)
+             (sender . ((user_id . "10001") (nickname . "Alice")))
+             (message . ())
+             (emoji_likes_list
+              . (((emoji_id . "178")
+                  (emoji_type . "1")
+                  (likes_cnt . "2")
+                  (is_clicked . "0")))))))
+     (should-not
+      (qq-state-apply-emoji-like-notice "group:20001" notice))
+     (qq-state-merge-history "group:20001" (list stale-snapshot))
+     (should
+      (= 3
+         (alist-get
+          'count
+          (car (qq-state-message-reactions
+                (car (qq-state-session-messages "group:20001")))))))
+     ;; The same stale page must not apply the queued +1 a second time.
+     (qq-state-merge-history "group:20001" (list stale-snapshot))
+     (should
+      (= 3
+         (alist-get
+          'count
+          (car (qq-state-message-reactions
+                (car (qq-state-session-messages "group:20001")))))))
+     ;; A newer aggregate notice updates the overlay; stale history cannot
+     ;; overwrite it afterwards.
+     (qq-state-apply-emoji-like-notice
+      "group:20001"
+      `((notice_type . "group_msg_emoji_like")
+        (group_id . "20001")
+        (user_id . "10002")
+        (message_id . ,message-id)
+        (is_add . t)
+        (likes . (((emoji_id . "178") (emoji_type . "1") (count . 4))))))
+     (qq-state-merge-history "group:20001" (list stale-snapshot))
+     (should
+      (= 4
+         (alist-get
+          'count
+          (car (qq-state-message-reactions
+                (car (qq-state-session-messages "group:20001"))))))))))
+
+(ert-deftest qq-state-pending-promotion-materializes-earlier-recall ()
+  "The send response is a materialization boundary for a known snowflake."
+  (qq-test-with-reset
+   (let* ((message-id "9007199254741004887")
+          (pending
+           (qq-state-insert-pending-text-message "private:10001" "race"))
+          (local-id (alist-get 'local-id pending)))
+     (should-not (qq-state-apply-recall "private:10001" message-id))
+     (qq-state-mark-pending-message-sent
+      "private:10001" local-id message-id)
+     (let ((message (car (qq-state-session-messages "private:10001"))))
+       (should (equal (alist-get 'server-id message) message-id))
+       (should (qq-state-message-recalled-p message))))))
+
 (ert-deftest qq-state-message-patches-reject-identity-contradictions ()
   (qq-test-with-reset
    (let ((message-id "9007199254741004883"))

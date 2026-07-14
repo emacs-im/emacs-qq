@@ -1785,7 +1785,10 @@ projection.  CALLBACK receives a page validated against that discriminator."
       (user-error "qq: invalid message search projection"))
     (qq-api-call
      "emacs_search_messages"
-     `((kind . "next") (cursor . ,cursor))
+     `((kind . "next")
+       (cursor . ,cursor)
+       (chat . ,chat)
+       (projection . ,(symbol-name projection)))
      (apply-partially
       #'qq-api--message-search-page-callback
       projection chat callback errback)
@@ -1827,7 +1830,10 @@ continuous window remain untouched."
       (user-error "qq: message filter cursor must be a non-empty string"))
     (qq-api-call
      "emacs_search_messages"
-     `((kind . "next") (cursor . ,cursor))
+     `((kind . "next")
+       (cursor . ,cursor)
+       (chat . ,chat)
+       (projection . "message"))
      (apply-partially
       #'qq-api--message-search-page-callback
       'message chat callback errback)
