@@ -1052,7 +1052,7 @@ missing or contradictory wire identity."
        (equal (alist-get 'sub_type message) "poke")))
 
 (defun qq-state--gray-tip-notice-p (message)
-  "Return non-nil when MESSAGE is a NapCat JSON gray-tip notice."
+  "Return non-nil when MESSAGE is a NapCat gray-tip notice."
   (and (equal (alist-get 'post_type message) "notice")
        (equal (alist-get 'notice_type message) "notify")
        (equal (alist-get 'sub_type message) "gray_tip")))
@@ -1246,10 +1246,25 @@ the natural-language fragments.  The complete original notice remains in
             (raw-event . ,(copy-tree notice)))))
     message))
 
-(defun qq-state--normalize-gray-tip-notice (notice)
-  "Normalize fork-native JSON gray-tip NOTICE into a timeline message."
+(defun qq-state--normalize-gray-tip-notice
+    (notice &optional expected-session-key)
+  "Normalize fork-native gray-tip NOTICE into a timeline message.
+
+When EXPECTED-SESSION-KEY is non-nil, require NOTICE's native `group_id' to
+identify that exact group session."
   (let* ((group-id (qq-state--normalize-id (alist-get 'group_id notice)))
-         (session-key (and group-id (qq-state-session-key 'group group-id)))
+         (derived-session-key
+          (and group-id (qq-state-session-key 'group group-id)))
+         (session-key
+          (progn
+            (when expected-session-key
+              (qq-state-session-key-identity expected-session-key)
+              (unless derived-session-key
+                (error "qq: gray-tip notice is missing its group identity"))
+              (unless (equal derived-session-key expected-session-key)
+                (error "qq: gray-tip session %S contradicts expected session %S"
+                       derived-session-key expected-session-key)))
+            derived-session-key))
          (server-id
           (qq-protocol-optional-message-id
            (alist-get 'message_id notice)
@@ -1288,8 +1303,12 @@ the natural-language fragments.  The complete original notice remains in
 
 (defun qq-state--normalize-raw-message (message &optional expected-session-key)
   "Normalize raw OneBot MESSAGE into local store shape."
-  (if (qq-state--poke-notice-p message)
-      (qq-state--normalize-poke-notice message expected-session-key)
+  (cond
+   ((qq-state--poke-notice-p message)
+    (qq-state--normalize-poke-notice message expected-session-key))
+   ((qq-state--gray-tip-notice-p message)
+    (qq-state--normalize-gray-tip-notice message expected-session-key))
+   (t
     (let* ((chat-type (qq-state--normalize-id (qq-state--message-chat-type message)))
          (peer-uid (qq-state--message-peer-uid message))
          (peer-uin (qq-state--message-peer-uin message))
@@ -1362,7 +1381,7 @@ the natural-language fragments.  The complete original notice remains in
           `((reactions . ,(qq-state--normalize-reactions
                            (alist-get 'emoji_likes_list message)))))
       (order . ,(qq-state--next-message-order))
-      (raw-event . ,(copy-tree message))))))
+      (raw-event . ,(copy-tree message)))))))
 
 (defun qq-state--emacs-search-chat-session-key (chat)
   "Return canonical group/private session key represented by closed CHAT."

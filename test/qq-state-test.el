@@ -528,6 +528,30 @@
                        . ,(qq-state-test--poke-recall-reference
                            "9007199254741007703" 2 "20001"))))))))
 
+(ert-deftest qq-state-merge-history-normalizes-gray-tip-notice ()
+  (qq-test-with-reset
+   (let ((event
+          '((post_type . "notice")
+            (notice_type . "notify")
+            (sub_type . "gray_tip")
+            (group_id . 20001)
+            (user_id . 0)
+            (message_id . "9007199254750003458")
+            (busi_id . "group-member-add")
+            (gray_tip_kind . "member-add")
+            (text . "新同学加入群聊")
+            (content . "新同学加入群聊")
+            (raw_info . ((msgTime . "1710000002"))))))
+     (qq-state-merge-history "group:20001" (list event))
+     (let ((message (car (qq-state-session-messages "group:20001"))))
+       (should (qq-state-gray-tip-message-p message))
+       (should (equal (alist-get 'session-key message) "group:20001"))
+       (should (equal (alist-get 'preview message) "新同学加入群聊"))
+       (should (equal (alist-get 'raw-event message) event)))
+     (should-error
+      (qq-state-merge-history "group:20002" (list event))
+      :type 'error))))
+
 (ert-deftest qq-state-poke-with-server-id-is-recallable ()
   (qq-test-with-reset
    (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
