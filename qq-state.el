@@ -540,7 +540,7 @@ Values from NEW replace values in OLD."
        (alist-get 'segments message))))
 
 (defun qq-state-gray-tip-message-p (message)
-  "Return non-nil when MESSAGE is a QQ JSON gray-tip notice row."
+  "Return non-nil when MESSAGE is a QQ gray-tip notice row."
   (or (and (listp message) (alist-get 'gray-tip-p message))
       (let ((raw-event (and (listp message) (alist-get 'raw-event message))))
         (and (listp raw-event)
@@ -549,6 +549,21 @@ Values from NEW replace values in OLD."
        (lambda (segment)
          (equal (alist-get 'type segment) "gray-tip"))
        (and (listp message) (alist-get 'segments message)))))
+
+(defun qq-state-gray-tip-message-data (message)
+  "Return normalized visual data for gray-tip MESSAGE."
+  (when (qq-state-gray-tip-message-p message)
+    (let* ((segment
+            (seq-find
+             (lambda (candidate)
+               (equal (alist-get 'type candidate) "gray-tip"))
+             (alist-get 'segments message)))
+           (segment-data (and segment (alist-get 'data segment))))
+      (or segment-data
+          (let ((notice (if (qq-state--gray-tip-notice-p message)
+                            message
+                          (alist-get 'raw-event message))))
+            (and notice (qq-state--gray-tip-data notice)))))))
 
 (defun qq-state-poke-message-data (message)
   "Return normalized visual data for poke MESSAGE.
@@ -1071,6 +1086,37 @@ missing or contradictory wire identity."
                                :false-object nil)
           (json-parse-error nil)))))
 
+(defun qq-state--normalize-gray-tip-parts (notice)
+  "Return strict interactive presentation parts carried by NOTICE."
+  (mapcar
+   (lambda (part)
+     (unless (listp part)
+       (error "qq: gray-tip presentation part is not an object"))
+     (pcase (alist-get 'type part)
+       ("text"
+        (let ((text (qq-state--present-string (alist-get 'text part))))
+          (unless text
+            (error "qq: gray-tip text part is empty"))
+          `((type . "text") (text . ,text))))
+       ("user"
+        (let ((user-id (qq-state--normalize-id (alist-get 'user_id part)))
+              (name (qq-state--present-string (alist-get 'name part)))
+              (role (alist-get 'role part)))
+          (unless (qq-protocol--nonzero-decimal-string-p user-id)
+            (error "qq: gray-tip user part requires an exact QQ number"))
+          (unless name
+            (error "qq: gray-tip user part requires a display name"))
+          (unless (member role '("member" "inviter"))
+            (error "qq: gray-tip user part has invalid role %S" role))
+          `((type . "user")
+            (role . ,role)
+            (user-id . ,user-id)
+            (name . ,name))))
+       (_
+        (error "qq: unsupported gray-tip presentation part %S"
+               (alist-get 'type part)))))
+   (or (alist-get 'gray_tip_parts notice) '())))
+
 (defun qq-state--gray-tip-data (notice)
   "Return stable visual data decoded from gray-tip NOTICE."
   (let* ((direct-text
@@ -1091,6 +1137,7 @@ missing or contradictory wire identity."
       (kind . ,(qq-state--present-string
                 (alist-get 'gray_tip_kind notice)))
       (busi-id . ,(qq-state--normalize-id (alist-get 'busi_id notice)))
+      (parts . ,(qq-state--normalize-gray-tip-parts notice))
       (items . ,(copy-tree items)))))
 
 (defun qq-state--poke-user-name (user-id explicit-name)

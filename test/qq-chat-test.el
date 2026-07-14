@@ -4064,6 +4064,55 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
      (should
       (string-prefix-p "▌ " (get-text-property (point) 'line-prefix))))))
 
+(ert-deftest qq-chat-renders-member-add-user-as-avatar-profile-button ()
+  (qq-chat-test-with-reset
+   (let* ((message
+           (qq-state-apply-gray-tip-notice
+            '((post_type . "notice")
+              (notice_type . "notify")
+              (sub_type . "gray_tip")
+              (group_id . "20001")
+              (user_id . 0)
+              (message_id . "9007199254750003460")
+              (busi_id . "group-member-add")
+              (gray_tip_kind . "member-add")
+              (text . "新同学加入群聊")
+              (gray_tip_parts
+               . (((type . "user")
+                   (role . "member")
+                   (user_id . "10002")
+                   (name . "新同学"))
+                  ((type . "text") (text . "加入群聊")))))))
+          opened-user)
+     (should (member "avatar:10002"
+                     (qq-chat--message-media-cache-keys message)))
+     (with-temp-buffer
+       (let ((inhibit-read-only t)
+             (fill-column 80))
+         (cl-letf (((symbol-function 'qq-media-avatar-display-string)
+                    (lambda (user-id)
+                      (should (equal user-id "10002"))
+                      "AV"))
+                   ((symbol-function 'qq-user-open)
+                    (lambda (user-id) (setq opened-user user-id))))
+           (qq-chat--insert-gray-tip-message message nil)
+           (should (string-match-p
+                    (regexp-quote "( AV 新同学加入群聊 )")
+                    (buffer-string)))
+           (goto-char (point-min))
+           (search-forward "新同学")
+           (backward-char)
+           (let ((button (button-at (point))))
+             (should button)
+             (should (equal (button-get button 'qq-chat-gray-tip-user-id)
+                            "10002"))
+             (should (equal
+                      (buffer-substring-no-properties
+                       (button-start button) (button-end button))
+                      "AV 新同学"))
+             (push-button button)
+             (should (equal opened-user "10002")))))))))
+
 (ert-deftest qq-chat-history-header-right-aligns-time-through-appkit ()
   (with-temp-buffer
     (let ((inhibit-read-only t)

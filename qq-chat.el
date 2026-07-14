@@ -1723,6 +1723,10 @@ Order (telega-inspired):
         keys)
     (when sender-id
       (push (format "avatar:%s" sender-id) keys))
+    (dolist (part (alist-get 'parts
+                             (qq-state-gray-tip-message-data message)))
+      (when (equal (alist-get 'type part) "user")
+        (push (format "avatar:%s" (alist-get 'user-id part)) keys)))
     (dolist (segment (alist-get 'segments message))
       (setq keys (nconc (qq-media-segment-cache-keys segment) keys)))
     (delete-dups (delq nil keys))))
@@ -2897,14 +2901,43 @@ base emoji), never as OneBot CQ text."
   (equal (alist-get 'type segment) "poke"))
 
 (defun qq-chat--gray-tip-segment-p (segment)
-  "Return non-nil when SEGMENT is a QQ JSON gray-tip notice."
+  "Return non-nil when SEGMENT is a QQ gray-tip notice."
   (equal (alist-get 'type segment) "gray-tip"))
 
+(defun qq-chat--insert-gray-tip-user (part)
+  "Insert the telega-style interactive user represented by gray-tip PART."
+  (let* ((user-id (alist-get 'user-id part))
+         (name (alist-get 'name part))
+         (label (concat (qq-media-avatar-display-string user-id) " " name))
+         (action (lambda () (qq-user-open user-id))))
+    (appkit-ui-insert-action-button
+     label action
+     :face 'qq-msg-user-title
+     :help-echo (format "Open %s's profile" name)
+     :properties
+     (list 'read-only t
+           'front-sticky t
+           'rear-nonsticky '(read-only)
+           'qq-chat-gray-tip-user-id user-id))))
+
+(defun qq-chat--gray-tip-label (message)
+  "Return MESSAGE's structured, interactive gray-tip label."
+  (let ((parts (alist-get 'parts (qq-state-gray-tip-message-data message))))
+    (if (null parts)
+        (qq-chat--message-body message)
+      (with-temp-buffer
+        (let ((inhibit-read-only t))
+          (dolist (part parts)
+            (pcase (alist-get 'type part)
+              ("text" (insert (alist-get 'text part)))
+              ("user" (qq-chat--insert-gray-tip-user part))))
+          (buffer-string))))))
+
 (defun qq-chat--insert-gray-tip-message (message properties)
-  "Insert centered JSON gray-tip MESSAGE using PROPERTIES."
+  "Insert centered gray-tip MESSAGE using PROPERTIES."
   (let ((start (point)))
     (appkit-chat-ins-insert-divider-row
-     (qq-chat--message-body message)
+     (qq-chat--gray-tip-label message)
      'qq-msg-poke
      (qq-chat--line-fill-column))
     (add-text-properties start (point) properties)))
@@ -5062,16 +5095,21 @@ Clicking an existing reaction chip performs add/remove toggle instead."
 (defun qq-chat-open-avatar-at-point ()
   "Open sender avatar for the message at point."
   (interactive)
-  (qq-media-open-message-avatar
-   (or (qq-chat--message-at-point)
-       (user-error "qq: no message at point"))))
+  (if-let* ((user-id (get-text-property
+                      (point) 'qq-chat-gray-tip-user-id)))
+      (qq-media-open-user-avatar user-id)
+    (qq-media-open-message-avatar
+     (or (qq-chat--message-at-point)
+         (user-error "qq: no message at point")))))
 
 (defun qq-chat-open-user-at-point ()
   "Open the sender user page for the message at point."
   (interactive)
   (let* ((message (or (qq-chat--message-at-point)
                       (user-error "qq: no message at point")))
-         (user-id (alist-get 'sender-id message)))
+         (user-id (or (get-text-property
+                       (point) 'qq-chat-gray-tip-user-id)
+                      (alist-get 'sender-id message))))
     (unless (and (qq-api-user-id-p user-id) (not (equal user-id "0")))
       (user-error "qq: message sender has no user profile"))
     (qq-user-open user-id)))

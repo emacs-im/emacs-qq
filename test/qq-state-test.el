@@ -486,6 +486,12 @@
              (busi_id . "group-member-add")
              (gray_tip_kind . "member-add")
              (text . "新同学加入群聊")
+             (gray_tip_parts
+              . (((type . "user")
+                  (role . "member")
+                  (user_id . "10002")
+                  (name . "新同学"))
+                 ((type . "text") (text . "加入群聊"))))
              (content . "新同学加入群聊")
              (raw_info . ((msgTime . "1710000001")))))))
      (should (equal (alist-get 'preview message) "新同学加入群聊"))
@@ -494,7 +500,16 @@
       (equal
        (alist-get 'kind
                   (alist-get 'data (car (alist-get 'segments message))))
-       "member-add")))))
+       "member-add"))
+     (should
+      (equal
+       (alist-get 'parts
+                  (alist-get 'data (car (alist-get 'segments message))))
+       '(((type . "user")
+          (role . "member")
+          (user-id . "10002")
+          (name . "新同学"))
+         ((type . "text") (text . "加入群聊"))))))))
 
 (ert-deftest qq-state-merge-history-normalizes-poke-notice ()
   (qq-test-with-reset
@@ -551,6 +566,18 @@
      (should-error
       (qq-state-merge-history "group:20002" (list event))
       :type 'error))))
+
+(ert-deftest qq-state-gray-tip-user-parts-require-exact-qq-numbers ()
+  (qq-test-with-reset
+   (should-error
+    (qq-state--normalize-gray-tip-parts
+     (list
+      (cons 'gray_tip_parts
+            (list '((type . "user")
+                    (role . "member")
+                    (user_id . "0")
+                    (name . "新同学"))))))
+    :type 'error)))
 
 (ert-deftest qq-state-poke-with-server-id-is-recallable ()
   (qq-test-with-reset
