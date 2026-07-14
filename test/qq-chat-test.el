@@ -3944,6 +3944,28 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
           (insert footer))
         (should-not (next-button (point-min)))))))
 
+(ert-deftest qq-chat-history-batch-bounds-require-canonical-batch-members ()
+  (qq-chat-test-with-reset
+   (puthash
+    "group:20001"
+    '(((server-id . "m10") (time . 10))
+      ((server-id . "m20") (time . 20))
+      ((server-id . "m30") (time . 30)))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     ;; Batch wire order carries no chronology; canonical timeline order does.
+     (should
+      (equal (qq-chat--history-batch-bounds
+              '(:batch-message-ids ("m30" "m10")))
+             '("m10" . "m30")))
+     ;; An empty batch has no boundary, irrespective of cached session rows.
+     (should
+      (equal (qq-chat--history-batch-bounds
+              '(:batch-message-ids nil))
+             (cons nil nil))))))
+
 (ert-deftest qq-chat-load-newer-does-not-guess-eof-from-short-page ()
   (qq-chat-test-with-reset
    (puthash
@@ -4133,12 +4155,17 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                    (should (appkit-chat-history-request-owner))
                    (setq loading-during-request
                          (appkit-chat-history-loading))
+                   ;; Real history callbacks run after the transport has
+                   ;; merged the batch into canonical session order.
+                   (puthash
+                    "group:20001"
+                    '(((server-id . "m19") (time . 19))
+                      ((server-id . "m20") (time . 20)))
+                    qq-state--messages-by-session)
                    (funcall callback
                             '(:added-count 2
                               :message-count 2
-                              :batch-message-ids ("m19" "m20")
-                              :batch-oldest-message-id "m19"
-                              :batch-newest-message-id "m20"))
+                              :batch-message-ids ("m19" "m20")))
                    'around-request))
                 ((symbol-function 'qq-chat--finish-jump-if-loaded)
                  (lambda (_target) t))
@@ -4258,12 +4285,18 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                  (lambda (session-key &optional before callback _errback _count)
                    (setq fetches
                          (append fetches (list (list session-key before))))
+                   ;; Mirror `qq-api-fetch-older-history': canonical merge
+                   ;; precedes the metadata callback.
+                   (puthash
+                    "group:20001"
+                    '(((server-id . "latest-first") (time . 1))
+                      ((server-id . "latest-last") (time . 2)))
+                    qq-state--messages-by-session)
                    (funcall callback
                             '(:added-count 2
                               :message-count 2
-                              :batch-message-ids ("latest-first" "latest-last")
-                              :batch-oldest-message-id "latest-first"
-                              :batch-newest-message-id "latest-last"))
+                              :batch-message-ids
+                              ("latest-first" "latest-last")))
                    'latest-request))
                 ((symbol-function 'qq-chat--goto-latest-window-end)
                  (lambda (&optional preferred-id) (setq goto-id preferred-id)))
@@ -4707,12 +4740,16 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (should (eq qq-chat--initial-history-request 'history-token))
         (should (eq (appkit-chat-history-loading) 'initial))
 
+        ;; The API installs normalized history before invoking its callback.
+        (puthash
+         "group:20001"
+         '(((server-id . "m10") (time . 10))
+           ((server-id . "m20") (time . 20)))
+         qq-state--messages-by-session)
         (funcall history-callback
                  '(:added-count 2
                    :message-count 2
-                   :batch-message-ids ("m10" "m20")
-                   :batch-oldest-message-id "m10"
-                   :batch-newest-message-id "m20"))
+                   :batch-message-ids ("m10" "m20")))
         (should (qq-chat--history-window-known-p))
         (should (equal (appkit-chat-history-window-first-key) "m10"))
         (should-not (appkit-chat-history-window-last-key))

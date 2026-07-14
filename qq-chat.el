@@ -640,7 +640,8 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
 
 Derive ordering from the already normalized session timeline instead of the
 wire array: native batch direction is not part of the client identity
-contract.  Fallback fields keep test doubles and empty batches explicit."
+contract.  An empty batch, or one not present in canonical state, has no
+bounds."
   (let ((ids (plist-get meta :batch-message-ids))
         oldest
         newest)
@@ -655,8 +656,7 @@ contract.  Fallback fields keep test doubles and empty batches explicit."
             (unless oldest
               (setq oldest id))
             (setq newest id)))))
-    (cons (or oldest (plist-get meta :batch-oldest-message-id))
-          (or newest (plist-get meta :batch-newest-message-id)))))
+    (cons oldest newest)))
 
 (defun qq-chat--message-reply-id (message)
   "Return reply target message id extracted from MESSAGE segments, or nil."
