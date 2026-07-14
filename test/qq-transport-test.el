@@ -20,6 +20,8 @@
   (let* ((wire (qq-transport--json-encode
                 '((top . :false)
                   (nested . ((enabled . t) (disabled . :false)))
+                  (literal . "false")
+                  (nothing)
                   (items . [:false t]))))
          (decoded (json-parse-string
                    wire
@@ -31,8 +33,11 @@
     (should (eq (alist-get 'enabled (alist-get 'nested decoded)) t))
     (should (eq (alist-get 'disabled (alist-get 'nested decoded))
                 'wire-false))
+    (should (equal (alist-get 'literal decoded) "false"))
+    (should (eq (alist-get 'nothing decoded) 'wire-null))
     (should (equal (alist-get 'items decoded) '(wire-false t)))
-    (should-not (string-match-p "\\\"false\\\"" wire))))
+    (should-not (string-match-p "\\\"top\\\":\\\"false\\\"" wire))
+    (should-not (string-match-p "\\\"disabled\\\":\\\"false\\\"" wire))))
 
 (ert-deftest qq-transport-response-completes-request-exactly-once ()
   (qq-transport-test-with-state

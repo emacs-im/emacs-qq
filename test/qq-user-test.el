@@ -508,6 +508,25 @@
               '(("Synthetic · 0 位好友 · 分组 7" . 7)
                 ("Synthetic · 0 位好友 · 分组 9" . 9)))))))
 
+(ert-deftest qq-user-friend-group-selection-uses-native-default-group ()
+  (let ((categories
+         '(((category_id . 9999) (name . "Special") (friends))
+           ((category_id . 0) (name . "Default")
+            (friends . (((user_id . "10001")))))))
+        completion-default
+        completion-require-match)
+    (cl-letf (((symbol-function 'qq-state-friend-categories)
+               (lambda () categories))
+              ((symbol-function 'completing-read)
+               (lambda (_prompt _collection _predicate require-match
+                        _initial _history default)
+                 (setq completion-default default
+                       completion-require-match require-match)
+                 default)))
+      (should (= (qq-user--read-friend-group-id) 0))
+      (should completion-require-match)
+      (should (equal completion-default "Default · 1 位好友")))))
+
 (ert-deftest qq-api-get-user-social-actions-preserve-string-identity ()
   (let (calls like added photos)
     (cl-letf (((symbol-function 'qq-api-call)

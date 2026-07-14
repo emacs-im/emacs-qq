@@ -397,8 +397,11 @@
     (unless choices
       (user-error
        "qq: friend categories are unavailable; refresh contacts first"))
-    (let ((selected (completing-read "好友分组: " choices nil t nil nil
-                                     (caar choices))))
+    ;; QQ's native add-friend default is category 0.  Do not derive a default
+    ;; from display order: category 9999 (special care) is commonly first.
+    (let* ((default (car (rassq 0 choices)))
+           (selected (completing-read "好友分组: " choices nil t nil nil
+                                      default)))
       (or (cdr (assoc selected choices))
           (user-error "qq: invalid friend category selection")))))
 

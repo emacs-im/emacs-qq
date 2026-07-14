@@ -41,11 +41,13 @@
 
 (defun qq-transport--json-encode (obj)
   "Encode OBJ into compact JSON text."
-  ;; The protocol uses `:false' as its decoded and in-memory JSON false
-  ;; sentinel.  Emacs defaults `json-false' to `:json-false'; without this
-  ;; binding `json-encode' serializes `:false' as the string "false".
+  ;; Keep the encoder aligned with the sentinels used by
+  ;; `qq-transport--json-decode'.  Emacs defaults `json-false' to
+  ;; `:json-false'; without this binding `json-encode' serializes `:false'
+  ;; as the string "false".
   (let ((json-encoding-pretty-print nil)
-        (json-false :false))
+        (json-false :false)
+        (json-null nil))
     (json-encode obj)))
 
 (defun qq-transport--json-decode (text)
