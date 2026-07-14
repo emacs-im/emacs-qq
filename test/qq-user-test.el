@@ -484,6 +484,30 @@
     (should-not (qq-user--friend-group-choices))
     (should-error (qq-user--read-friend-group-id) :type 'user-error)))
 
+(ert-deftest qq-user-friend-group-choices-show-member-count-not-native-id ()
+  (let ((categories
+         '(((category_id . 9999) (name . "特别关心") (friends))
+           ((category_id . 7) (name . "Synthetic peers")
+            (friends . (((user_id . "10001"))
+                        ((user_id . "10002"))))))))
+    (cl-letf (((symbol-function 'qq-state-friend-categories)
+               (lambda () categories)))
+      (should
+       (equal (qq-user--friend-group-choices)
+              '(("特别关心 · 0 位好友" . 9999)
+                ("Synthetic peers · 2 位好友" . 7)))))))
+
+(ert-deftest qq-user-friend-group-choices-disambiguate-duplicate-labels ()
+  (let ((categories
+         '(((category_id . 7) (name . "Synthetic") (friends))
+           ((category_id . 9) (name . "Synthetic") (friends)))))
+    (cl-letf (((symbol-function 'qq-state-friend-categories)
+               (lambda () categories)))
+      (should
+       (equal (qq-user--friend-group-choices)
+              '(("Synthetic · 0 位好友 · 分组 7" . 7)
+                ("Synthetic · 0 位好友 · 分组 9" . 9)))))))
+
 (ert-deftest qq-api-get-user-social-actions-preserve-string-identity ()
   (let (calls like added photos)
     (cl-letf (((symbol-function 'qq-api-call)

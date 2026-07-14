@@ -372,14 +372,24 @@
 
 (defun qq-user--friend-group-choices ()
   "Return display-name to native category-id pairs for friend placement."
-  (let (choices)
+  (let ((label-counts (make-hash-table :test #'equal)) rows)
     (dolist (category (qq-state-friend-categories))
       (let ((id (alist-get 'category_id category))
             (name (or (qq-user--present-string (alist-get 'name category))
-                      "未命名分组")))
+                      "未命名分组"))
+            (count (length (alist-get 'friends category))))
         (when (and (integerp id) (<= 0 id #xffffffff))
-          (push (cons (format "%s · %d" name id) id) choices))))
-    (nreverse choices)))
+          (let ((label (format "%s · %d 位好友" name count)))
+            (puthash label (1+ (gethash label label-counts 0)) label-counts)
+            (push (list id label) rows)))))
+    (mapcar
+     (lambda (row)
+       (let ((id (car row)) (label (cadr row)))
+         (cons (if (> (gethash label label-counts) 1)
+                   (format "%s · 分组 %d" label id)
+                 label)
+               id)))
+     (nreverse rows))))
 
 (defun qq-user--read-friend-group-id ()
   "Read one native friend category id from current authoritative state."
