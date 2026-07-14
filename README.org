@@ -1,4 +1,5 @@
 #+title: emacs-qq
+#+author: 0WD0
 #+language: zh-CN
 #+options: toc:2 num:nil
 

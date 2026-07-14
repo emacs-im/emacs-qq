@@ -1,6 +1,6 @@
 ;;; qq.el --- NapCat-backed QQ client for Emacs -*- lexical-binding: t; -*-
 
-;; Author: emacs-qq contributors
+;; Author: 0WD0 <wd.1105848296@gmail.com>
 ;; Keywords: comm
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "27.1") (websocket "1.16") (transient "0.3") (appkit "0.2.0"))

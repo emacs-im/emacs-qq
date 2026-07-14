@@ -1,6 +1,6 @@
 ;;; qq-search.el --- Authoritative QQ message search results -*- lexical-binding: t; -*-
 
-;; Author: emacs-qq contributors
+;; Author: 0WD0 <wd.1105848296@gmail.com>
 
 ;;; Commentary:
 
