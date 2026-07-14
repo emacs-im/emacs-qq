@@ -482,6 +482,7 @@ they are never split, normalized, escaped, or reconstructed from metadata."
       (last-message-summary-token . 0)
       (last-message-local-id . nil)
       (last-message-order . nil)
+      (last-message-seq . nil)
       (last-message-id . nil)
       (oldest-message-id . nil))))
 
@@ -1655,24 +1656,30 @@ leaving repeated pokes as distinct timeline records."
     (fields session &optional current-local-resolved-p)
   "Compare candidate summary FIELDS with current SESSION position.
 
-Return -1, 0, or 1.  Exact snowflake ordering wins when both summaries carry
-server ids; otherwise use their normalized timestamps.  Freshness tokens break
-ties and unknown positions at the acceptance boundary."
+Return -1, 0, or 1.  Compare server timestamps first and exact per-session
+message sequences inside the same second.  NT message ids are identities, not
+ordering keys: self and incoming messages can occupy incomparable id ranges.
+Local insertion order and freshness tokens break otherwise unknown ties."
   (let ((candidate-id (alist-get 'last-message-id fields))
         (candidate-local-id (alist-get 'last-message-local-id fields))
+        (candidate-seq (alist-get 'last-message-seq fields))
         (candidate-order (or (alist-get 'last-message-order fields) 0))
         (current-id (alist-get 'last-message-id session))
+        (current-seq (alist-get 'last-message-seq session))
         (current-order (or (alist-get 'last-message-order session) 0))
         (candidate-time
          (qq-state--normalize-time (alist-get 'last-message-time fields)))
         (current-time
          (qq-state--normalize-time (alist-get 'last-message-time session))))
     (cond
-     ((and (qq-protocol--nonzero-decimal-string-p candidate-id)
-           (qq-protocol--nonzero-decimal-string-p current-id))
-      (qq-protocol-decimal-string-compare candidate-id current-id))
      ((< candidate-time current-time) -1)
      ((> candidate-time current-time) 1)
+     ((and (qq-protocol--nonzero-decimal-string-p candidate-seq)
+           (qq-protocol--nonzero-decimal-string-p current-seq))
+      (qq-protocol-decimal-string-compare candidate-seq current-seq))
+     ;; The same canonical identity denotes the same frontier even when one
+     ;; observation carries less sequence metadata than the other.
+     ((and candidate-id (equal candidate-id current-id)) 0)
      ;; A promotion is the same optimistic row acquiring its server id.
      ((and (stringp current-id)
            (string-prefix-p "local-" current-id)
@@ -1680,7 +1687,7 @@ ties and unknown positions at the acceptance boundary."
       0)
      ;; Once canonical storage proves that the current optimistic row acquired
      ;; a server id, its local frontier no longer shields equal-second server
-     ;; messages.  The caller supplies the exact maximum server candidate from
+     ;; messages.  The caller supplies the latest sequence/time candidate from
      ;; a cache which includes that promoted row.
      ((and current-local-resolved-p
            (qq-protocol--nonzero-decimal-string-p candidate-id)
@@ -1697,6 +1704,8 @@ ties and unknown positions at the acceptance boundary."
      ;; last known server message even when their integer timestamps tie.
      ((and (stringp current-id) (string-prefix-p "local-" current-id)) -1)
      ((and (stringp candidate-id) (string-prefix-p "local-" candidate-id)) 1)
+     ((< candidate-order current-order) -1)
+     ((> candidate-order current-order) 1)
      (t 0))))
 
 (defun qq-state--apply-session-summary
@@ -1751,6 +1760,7 @@ fallback describes the already accepted exact message."
        . ,(qq-state--normalize-time (alist-get 'time message)))
       (last-message-id . ,(or (alist-get 'server-id message)
                               (alist-get 'id message)))
+      (last-message-seq . ,(alist-get 'message-seq message))
       (last-message-local-id . ,(alist-get 'local-id message))
       (last-message-order . ,(alist-get 'order message))
       (last-message-preview . ,(qq-state-message-preview message))
@@ -1763,9 +1773,9 @@ fallback describes the already accepted exact message."
   "Return the newest summary candidate in normalized MESSAGES.
 
 Do not inherit timeline list order here: canonical rendering deliberately uses
-arrival order to break equal-second ties, while root summary ownership uses
-exact server snowflakes.  Local rows fall back to timestamp and then explicit
-local insertion order."
+arrival order to break equal-second ties.  Root summary ownership uses server
+time, then the exact per-session message sequence.  Local rows and messages
+without sequence metadata fall back to explicit local insertion order."
   (let (latest)
     (dolist (message messages latest)
       (if (null latest)
@@ -2599,16 +2609,27 @@ its session metadata can be committed."
            (target-id (alist-get 'target-id identity))
            (msg-time (qq-state--normalize-time (alist-get 'msgTime contact)))
            (msg-id (qq-state--normalize-id (alist-get 'msgId contact)))
+           (msg-seq (alist-get 'msgSeq contact))
            (last-message (alist-get 'lastestMsg contact))
            (message-copy (and (consp last-message) (copy-tree last-message)))
            (unread-entry (assq 'unreadCount contact))
            (disturb-entry (assq 'isMsgDisturb contact))
            (notify-mode-entry (assq 'messageNotifyMode contact)))
+      (unless (qq-protocol--decimal-string-p msg-seq)
+        (error "qq: recent contact requires exact decimal msgSeq"))
       (when message-copy
+        (when-let* ((embedded-seq
+                     (alist-get 'message_seq message-copy nil nil #'eq)))
+          (unless (and (stringp embedded-seq)
+                       (equal embedded-seq msg-seq))
+            (error "qq: recent contact msgSeq disagrees with latest message")))
         (when (and msg-id
                    (not (alist-get 'message_id message-copy nil nil #'eq))
                    (not (alist-get 'id message-copy nil nil #'eq)))
           (push (cons 'message_id msg-id) message-copy))
+        (when (and msg-seq
+                   (not (alist-get 'message_seq message-copy nil nil #'eq)))
+          (push (cons 'message_seq msg-seq) message-copy))
         (when (and (> msg-time 0)
                    (not (alist-get 'time message-copy nil nil #'eq)))
           (push (cons 'time msg-time) message-copy)))
@@ -2631,6 +2652,7 @@ its session metadata can be committed."
        :summary-fields
        `((last-message-time . ,msg-time)
          (last-message-id . ,msg-id)
+         (last-message-seq . ,msg-seq)
          (last-message-local-id . nil)
          (last-message-order . nil)
          (last-message-preview
