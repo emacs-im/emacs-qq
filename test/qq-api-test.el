@@ -407,38 +407,79 @@ The authoritative post-state reports UNREAD-COUNT."
                               (qq-state-session "service:u_mail"))))
       (should-not (gethash "service:u_mail" qq-api--read-operations)))))
 
-(ert-deftest qq-api-mark-read-rejects-contradictory-success-scope ()
+(ert-deftest qq-api-mark-dataline-read-requires-session-scoped-post-state ()
   (let ((qq-state-change-hook nil)
         (qq-api--read-operations (make-hash-table :test #'equal))
         (qq-api--read-operation-counter 0)
         (qq-api--read-observation-clock 0)
         (qq-api--session-read-observation-tokens
          (make-hash-table :test #'equal))
-        actions
-        mark-success
-        reported-error)
+        captured-params
+        success-fn)
     (qq-state-reset)
     (qq-state-upsert-session
-     "service:u_mail" '((unread-count . 1)) nil)
+     "dataline:desktop:dev:a"
+     '((title . "我的手机") (unread-count . 1))
+     nil)
     (cl-letf (((symbol-function 'qq-api-call)
-               (lambda (action _params callback &optional _errback)
-                 (setq actions (append actions (list action)))
-                 (when (equal action "emacs_mark_read")
-                   (setq mark-success callback))
-                 'sent))
-              ((symbol-function 'qq-api--default-error)
-               (lambda (_response reason) (setq reported-error reason))))
+               (lambda (_action params callback &optional _errback)
+                 (setq captured-params params
+                       success-fn callback)
+                 'sent)))
       (qq-api-mark-message-read
-       "service:u_mail" "9007199254741004645")
-      (funcall mark-success
+       "dataline:desktop:dev:a" "9007199254741004645")
+      (should
+       (equal (alist-get 'chat captured-params)
+              '((kind . "dataline")
+                (peer_uid . "dev:a")
+                (variant . "desktop"))))
+      (funcall success-fn
                (qq-api-test--mark-read-response
-                "message" "9007199254741004645" 0))
-      (should (equal actions
-                     '("emacs_mark_read" "emacs_get_read_state")))
-      (should (string-match-p "message scope for service" reported-error))
-      (should (= 1 (alist-get 'unread-count
-                              (qq-state-session "service:u_mail"))))
-      (should-not (gethash "service:u_mail" qq-api--read-operations)))))
+                "session" "9007199254741004645" 0))
+      (should (= 0 (alist-get 'unread-count
+                              (qq-state-session
+                               "dataline:desktop:dev:a"))))
+      (should-not
+       (gethash "dataline:desktop:dev:a" qq-api--read-operations)))))
+
+(ert-deftest qq-api-mark-read-rejects-contradictory-success-scope ()
+  (dolist (case '(("service:u_mail" . service)
+                  ("dataline:desktop:dev:a" . dataline)))
+    (let ((qq-state-change-hook nil)
+          (qq-api--read-operations (make-hash-table :test #'equal))
+          (qq-api--read-operation-counter 0)
+          (qq-api--read-observation-clock 0)
+          (qq-api--session-read-observation-tokens
+           (make-hash-table :test #'equal))
+          (session-key (car case))
+          (session-type (cdr case))
+          actions
+          mark-success
+          reported-error)
+      (qq-state-reset)
+      (qq-state-upsert-session
+       session-key '((unread-count . 1)) nil)
+      (cl-letf (((symbol-function 'qq-api-call)
+                 (lambda (action _params callback &optional _errback)
+                   (setq actions (append actions (list action)))
+                   (when (equal action "emacs_mark_read")
+                     (setq mark-success callback))
+                   'sent))
+                ((symbol-function 'qq-api--default-error)
+                 (lambda (_response reason) (setq reported-error reason))))
+        (qq-api-mark-message-read
+         session-key "9007199254741004645")
+        (funcall mark-success
+                 (qq-api-test--mark-read-response
+                  "message" "9007199254741004645" 0))
+        (should (equal actions
+                       '("emacs_mark_read" "emacs_get_read_state")))
+        (should
+         (string-match-p
+          (format "message scope for %s" session-type) reported-error))
+        (should (= 1 (alist-get 'unread-count
+                                (qq-state-session session-key))))
+        (should-not (gethash session-key qq-api--read-operations))))))
 
 (ert-deftest qq-api-session-emacs-locator-tags-kernel-only-session-kinds ()
   (should

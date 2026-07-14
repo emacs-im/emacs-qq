@@ -1297,17 +1297,18 @@ current owner instead of starting an overlapping request."
     (session-key message-id response)
   "Return RESPONSE's closed mark-read result for SESSION-KEY and MESSAGE-ID.
 
-Service sessions have an explicit session-scoped native read capability.
-Every other supported session must report an exact message-scoped advance.
-The tagged result must echo the requested NT message identity in the field
-belonging to that scope."
+Service and DataLine sessions expose only a session-scoped native read
+capability.  Private and group sessions must report an exact message-scoped
+advance.  The tagged result must echo the requested NT message identity in
+the field belonging to that scope."
   (let* ((result
           (qq-protocol-validate-emacs-mark-read-result
            (qq-api--response-data response)
            "emacs_mark_read response"))
          (type (qq-state-session-key-type session-key))
          (scope (alist-get 'scope result))
-         (expected-scope (if (eq type 'service) "session" "message"))
+         (expected-scope
+          (if (memq type '(service dataline)) "session" "message"))
          (reported-id
           (alist-get (if (equal scope "session")
                          'requested_message_id
@@ -1365,13 +1366,13 @@ belonging to that scope."
 (defun qq-api-mark-message-read (session-key message-id)
   "Advance SESSION-KEY's native read state using MESSAGE-ID as ownership.
 
-MESSAGE-ID remains the original decimal NT snowflake string.  Ordinary
-sessions advance through that exact message.  Linux QQ exposes service reads
-only at session scope, so their tagged response explicitly reports that wider
-operation and returns an authoritative post-state instead of pretending to
-own a precise cursor.  Concurrent intents coalesce behind one request and
-retain only the newest target.  Failure starts one authoritative read-state
-refresh."
+MESSAGE-ID remains the original decimal NT snowflake string.  Private and
+group sessions advance through that exact message.  Linux QQ exposes service
+and DataLine reads only at session scope, so their tagged response explicitly
+reports that wider operation and returns an authoritative post-state instead
+of pretending to own a precise cursor.  Concurrent intents coalesce behind
+one request and retain only the newest target.  Failure starts one
+authoritative read-state refresh."
   (interactive)
   (setq message-id
         (qq-api-validate-message-id message-id "mark read target"))
