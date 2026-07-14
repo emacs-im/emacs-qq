@@ -22,6 +22,8 @@
 
 (defvar qq-transport--ws nil)
 (defvar qq-transport--connecting nil)
+(defvar qq-transport--connection-owner nil
+  "Identity owner of the current connecting or open websocket.")
 (defvar qq-transport--stopping nil)
 (defvar qq-transport--pending (make-hash-table :test #'equal))
 (defvar qq-transport--echo-counter 0)
@@ -95,10 +97,44 @@
     (dolist (echo echoes)
       (qq-transport--complete echo 'error nil reason))))
 
+(defun qq-transport--connection-current-p (owner socket)
+  "Return non-nil when OWNER still owns SOCKET.
+
+The callback may run synchronously before `websocket-open' returns SOCKET, so
+the first callback is allowed to bind the owner's socket identity."
+  (and (eq owner qq-transport--connection-owner)
+       (not (plist-get owner :settled))
+       (let ((owned-socket (plist-get owner :socket)))
+         (cond
+          ((null owned-socket)
+           (setf (plist-get owner :socket) socket)
+           t)
+          ((eq owned-socket socket))))))
+
+(defun qq-transport--settle-connection (owner socket event &optional error-data)
+  "Settle OWNER's SOCKET once for EVENT and optional ERROR-DATA.
+
+Return non-nil only for the callback which still owns the current connection.
+Late close/error callbacks from an older or already-settled socket are inert."
+  (when (qq-transport--connection-current-p owner socket)
+    (setf (plist-get owner :settled) t)
+    (setq qq-transport--connection-owner nil)
+    (setq qq-transport--connecting nil)
+    (pcase event
+      ('close (message "qq: websocket closed"))
+      ('error (message "qq: websocket error: %s"
+                       (error-message-string error-data))))
+    (unless qq-transport--stopping
+      (qq-transport--disconnect t))
+    t))
+
 (defun qq-transport--disconnect (&optional schedule-reconnect)
   "Disconnect websocket transport.
 
 When SCHEDULE-RECONNECT is non-nil, queue a reconnect attempt."
+  (when qq-transport--connection-owner
+    (setf (plist-get qq-transport--connection-owner :settled) t))
+  (setq qq-transport--connection-owner nil)
   (setq qq-transport--connecting nil)
   (when qq-transport--ws
     (ignore-errors (websocket-close qq-transport--ws))
@@ -191,48 +227,50 @@ is ignored."
 (defun qq-transport--connect ()
   "Connect websocket transport when not already connected."
   (unless (qq-transport-running-p)
-    (setq qq-transport--connecting t)
-    (setq qq-transport--stopping nil)
-    (qq-state-set-connection-status 'connecting)
-    (condition-case err
-        (setq qq-transport--ws
-              (websocket-open
-               (qq-build-websocket-url)
-               :on-open (lambda (_ws)
-                          (setq qq-transport--connecting nil)
-                          (setq qq-transport--reconnect-attempt 0)
-                          (qq-state-set-connection-status 'open)
-                          (message "qq: websocket opened"))
-               :on-message (lambda (_ws frame)
-                             (condition-case payload-error
-                                 (when-let* ((text (qq-transport--frame-text frame)))
-                                   (unless (string-empty-p (string-trim text))
-                                     (qq-transport--handle-payload
-                                      (qq-transport--json-decode text))))
-                               (error
-                                (message "qq: websocket payload error: %s"
-                                         (error-message-string payload-error)))))
-               :on-close (lambda (_ws)
-                           (setq qq-transport--ws nil)
-                           (setq qq-transport--connecting nil)
-                           (unless qq-transport--stopping
-                             (message "qq: websocket closed")
-                             (qq-transport--disconnect t)))
-               :on-error (lambda (_ws _type socket-error)
-                           (setq qq-transport--connecting nil)
-                           (message "qq: websocket error: %s"
-                                    (error-message-string socket-error))
-                           (unless qq-transport--stopping
-                             (qq-transport--disconnect t)))))
-      (error
-       ;; `websocket-open' can fail synchronously before it has an object on
-       ;; which to deliver `:on-error'.  Leaving `--connecting' set here would
-       ;; suppress every later retry.
-       (setq qq-transport--ws nil)
-       (setq qq-transport--connecting nil)
-       (message "qq: websocket error: %s" (error-message-string err))
-       (unless qq-transport--stopping
-         (qq-transport--disconnect t))))))
+    (let ((owner (list :socket nil :settled nil)))
+      (setq qq-transport--connection-owner owner)
+      (setq qq-transport--connecting t)
+      (setq qq-transport--stopping nil)
+      (qq-state-set-connection-status 'connecting)
+      (condition-case err
+          (let ((socket
+                 (websocket-open
+                  (qq-build-websocket-url)
+                  :on-open
+                  (lambda (ws)
+                    (when (qq-transport--connection-current-p owner ws)
+                      (setq qq-transport--ws ws)
+                      (setq qq-transport--connecting nil)
+                      (setq qq-transport--reconnect-attempt 0)
+                      (qq-state-set-connection-status 'open)
+                      (message "qq: websocket opened")))
+                  :on-message
+                  (lambda (ws frame)
+                    (when (qq-transport--connection-current-p owner ws)
+                      (condition-case payload-error
+                          (when-let* ((text (qq-transport--frame-text frame)))
+                            (unless (string-empty-p (string-trim text))
+                              (qq-transport--handle-payload
+                               (qq-transport--json-decode text))))
+                        (error
+                         (message "qq: websocket payload error: %s"
+                                  (error-message-string payload-error))))))
+                  :on-close
+                  (lambda (ws)
+                    (qq-transport--settle-connection owner ws 'close))
+                  :on-error
+                  (lambda (ws _type socket-error)
+                    (qq-transport--settle-connection
+                     owner ws 'error socket-error)))))
+            ;; A callback may have synchronously settled OWNER before
+            ;; `websocket-open' returns.  Never resurrect that socket.
+            (when (qq-transport--connection-current-p owner socket)
+              (setq qq-transport--ws socket)))
+        (error
+         ;; `websocket-open' can fail synchronously before it has an object on
+         ;; which to deliver `:on-error'.  Settle the same owner path so later
+         ;; retries are not suppressed by a stale `--connecting' flag.
+         (qq-transport--settle-connection owner nil 'error err))))))
 
 (defun qq-transport-start ()
   "Start websocket transport when needed."
