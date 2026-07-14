@@ -128,13 +128,6 @@ same normal projection unless preserving point requires an exact around fetch.")
 (defvar-local qq-chat--filter-owner nil
   "Opaque identity owning the active materialized-filter request.")
 
-(defvar-local qq-chat--filter-patch-journal nil
-  "Ordered exact message patches observed while a filter is active.
-
-Each entry is a plist carrying `:message-id' and `:patch'.  The journal keeps
-recall and reaction notices authoritative even when their matching search hit
-arrives in a later materialized page.")
-
 (defvar qq-chat-group-messages t
   "When non-nil, compact consecutive messages from the same sender.")
 
@@ -1365,30 +1358,63 @@ Order (telega-inspired):
   (let ((id (and (listp result) (plist-get result :message-id))))
     (and (qq-api-message-id-p id) id)))
 
-(defun qq-chat--normalize-filter-result (result)
-  "Convert one validated wire RESULT into a filter-owned local item."
+(defun qq-chat--filter-patch-replay-p (owner entry)
+  "Return non-nil when OWNER may replay request-local patch ENTRY.
+
+Recall is an irreversible tombstone.  Reaction patches are deltas or aggregate
+observations and only belong to a response whose request started before the
+notice was observed."
+  (pcase (plist-get (plist-get entry :patch) :kind)
+    ('recall t)
+    ('emoji-like
+     (let ((request-token (plist-get owner :observation-token))
+           (event-token (plist-get entry :observation-token)))
+       (unless (and (integerp request-token) (integerp event-token))
+         (error "qq: reaction filter patch lacks exact observation tokens"))
+       (> event-token request-token)))
+    (kind (error "qq: unsupported filter message patch kind %S" kind))))
+
+(defun qq-chat--normalize-filter-result (owner result)
+  "Convert wire RESULT into a request-owned local item for OWNER."
   (let* ((id (alist-get 'message_id result))
          (message
-          (qq-state-normalize-message-snapshot
-           qq-chat--session-key result)))
+          (qq-state-message-apply-tombstones
+           qq-chat--session-key
+           (qq-state-normalize-message-snapshot
+            qq-chat--session-key result))))
     (unless (equal (alist-get 'server-id message) id)
       (error "qq: filter result message identity changed during normalization"))
-    (dolist (entry qq-chat--filter-patch-journal)
-      (when (equal (plist-get entry :message-id) id)
+    (dolist (entry (plist-get owner :patches))
+      (when (and (equal (plist-get entry :message-id) id)
+                 (qq-chat--filter-patch-replay-p owner entry))
         (setq message
               (qq-state-message-apply-patch
                message (plist-get entry :patch)))))
     (list :message-id id
           :message message)))
 
-(defun qq-chat--apply-filter-message-patch (message-id patch)
-  "Apply exact PATCH to filter-owned MESSAGE-ID without touching history."
+(defun qq-chat--apply-filter-message-patch
+    (message-id patch observation-token)
+  "Apply exact PATCH to filter-owned MESSAGE-ID without touching history.
+
+OBSERVATION-TOKEN is the matching state event observation.  A pending request
+keeps the patch only until its callback."
   (when (and (qq-chat--msg-filter-active-p)
              (qq-api-message-id-p message-id))
-    (setq qq-chat--filter-patch-journal
-          (nconc qq-chat--filter-patch-journal
-                 (list (list :message-id message-id
-                             :patch (copy-tree patch)))))
+    (let ((kind (plist-get patch :kind))
+          (patch-token (plist-get patch :observation-token)))
+      (unless (memq kind '(recall emoji-like))
+        (error "qq: unsupported filter message patch kind %S" kind))
+      (unless (and (integerp observation-token)
+                   (equal patch-token observation-token))
+        (error "qq: message patch contradicts its state observation")))
+    (when (and (listp qq-chat--filter-owner)
+               (plist-get qq-chat--filter-owner :pending))
+      (setf (plist-get qq-chat--filter-owner :patches)
+            (nconc (plist-get qq-chat--filter-owner :patches)
+                   (list (list :message-id message-id
+                               :patch (copy-tree patch)
+                               :observation-token observation-token)))))
     (let (changed items)
       (dolist (item (or (plist-get qq-chat--msg-filter :items) '()))
         (if (equal (qq-chat--filter-result-id item) message-id)
@@ -1407,7 +1433,8 @@ Order (telega-inspired):
               (plist-put (copy-sequence qq-chat--msg-filter) :items items))
         ;; An append owner captured the pre-request list.  Patch that private
         ;; snapshot too, so its eventual page cannot resurrect stale content.
-        (when (listp qq-chat--filter-owner)
+        (when (and (listp qq-chat--filter-owner)
+                   (plist-get qq-chat--filter-owner :pending))
           (setf (plist-get qq-chat--filter-owner :existing) items)))
       changed)))
 
@@ -3792,7 +3819,8 @@ AppKit's identity barrier.  The established normal window is not changed."
   (when qq-chat--filter-request
     (qq-api-cancel-request qq-chat--filter-request))
   (when (listp qq-chat--filter-owner)
-    (setf (plist-get qq-chat--filter-owner :pending) nil))
+    (setf (plist-get qq-chat--filter-owner :pending) nil)
+    (setf (plist-get qq-chat--filter-owner :patches) nil))
   (setq qq-chat--filter-request nil
         qq-chat--filter-owner nil))
 
@@ -3823,7 +3851,8 @@ AppKit's identity barrier.  The established normal window is not changed."
   (when (qq-chat--filter-request-current-p buffer session-key owner)
     (with-current-buffer buffer
       (let* ((page-items
-              (mapcar #'qq-chat--normalize-filter-result
+              (mapcar (lambda (result)
+                        (qq-chat--normalize-filter-result owner result))
                       (or (alist-get 'results page) '())))
              (existing (or (plist-get owner :existing) '()))
              (items
@@ -3836,6 +3865,7 @@ AppKit's identity barrier.  The established normal window is not changed."
                    (qq-chat--filter-point-state-current-p owner)))
              (filter (copy-sequence (plist-get owner :filter))))
         (setf (plist-get owner :pending) nil)
+        (setf (plist-get owner :patches) nil)
         (setq qq-chat--filter-request nil
               qq-chat--filter-owner nil)
         (setq filter (plist-put filter :active t)
@@ -3865,6 +3895,7 @@ AppKit's identity barrier.  The established normal window is not changed."
   (when (qq-chat--filter-request-current-p buffer session-key owner)
     (with-current-buffer buffer
       (setf (plist-get owner :pending) nil)
+      (setf (plist-get owner :patches) nil)
       (setq qq-chat--filter-request nil
             qq-chat--filter-owner nil
             qq-chat--msg-filter
@@ -3888,8 +3919,7 @@ AppKit's identity barrier.  The established normal window is not changed."
       (user-error "qq: no more filtered messages available"))
     (qq-chat--cancel-filter-request)
     (unless append
-      (qq-chat--invalidate-normal-history-requests)
-      (setq qq-chat--filter-patch-journal nil))
+      (qq-chat--invalidate-normal-history-requests))
     (let* ((buffer (current-buffer))
            (session-key qq-chat--session-key)
            (origin (and (not append)
@@ -3899,7 +3929,9 @@ AppKit's identity barrier.  The established normal window is not changed."
                         :append (and append t)
                         :origin-id (and origin (alist-get 'server-id origin))
                         :point-state nil
-                        :pending t))
+                        :observation-token nil
+                        :patches nil
+                        :pending nil))
            request)
       ;; A cursor capability is single-use.  Remove it from visible state
       ;; before dispatch so a synchronous error cannot accidentally replay it.
@@ -3915,6 +3947,12 @@ AppKit's identity barrier.  The established normal window is not changed."
       ;; later callback may restore the pre-filter semantic origin only while
       ;; the user has left this post-dispatch point and composer untouched.
       (setf (plist-get owner :point-state) (qq-chat--filter-point-state))
+      ;; Capture the state clock at the actual transport boundary.  Notices
+      ;; handled before this point are already part of any future snapshot and
+      ;; must not be replayed as deltas over that snapshot.
+      (setf (plist-get owner :observation-token)
+            (qq-state-message-observation-token))
+      (setf (plist-get owner :pending) t)
       (condition-case error-data
           (progn
             (setq request
@@ -3996,8 +4034,7 @@ AppKit's identity barrier.  The established normal window is not changed."
 (defun qq-chat--deactivate-filter ()
   "Clear the materialized filter without changing the normal history window."
   (qq-chat--cancel-filter-request)
-  (setq qq-chat--msg-filter nil
-        qq-chat--filter-patch-journal nil)
+  (setq qq-chat--msg-filter nil)
   (qq-chat--clear-search-highlights))
 
 (defun qq-chat-filter-cancel ()
@@ -4840,7 +4877,6 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (setq-local qq-chat--msg-filter nil)
   (setq-local qq-chat--filter-request nil)
   (setq-local qq-chat--filter-owner nil)
-  (setq-local qq-chat--filter-patch-journal nil)
   (setq-local qq-chat--marked-message-anchors nil)
   (setq-local qq-chat--forward-request-active-p nil)
   (setq-local qq-chat--last-read-target-id nil)
@@ -5311,8 +5347,6 @@ redisplay has not processed the queued event yet."
          (rekeys (qq-chat--message-event-rekeys event)))
     (unless (or anchor previous-anchor)
       (error "qq: message state event has no stable anchor: %S" event))
-    (when-let* ((patch (plist-get event :message-patch)))
-      (qq-chat--apply-filter-message-patch anchor patch))
     ;; Idempotent with the eager observation in `qq-chat--handle-state-change'.
     (qq-chat--observe-message-frontier event)
     (qq-chat--rekey-forward-mark previous-anchor anchor)
@@ -5347,7 +5381,16 @@ redisplay has not processed the queued event yet."
                 (qq-chat--deactivate-filter)
                 (qq-chat--reset-search-state))
               (when (eq event-type 'message)
-                (qq-chat--observe-message-frontier event))
+                (qq-chat--observe-message-frontier event)
+                ;; Filter snapshots are private request state.  Observe their
+                ;; exact patch before queueing redisplay so a synchronous or
+                ;; already-ready filter callback cannot merge an older
+                ;; `:existing' snapshot over this notice.
+                (when-let* ((patch (plist-get event :message-patch)))
+                  (qq-chat--apply-filter-message-patch
+                   (plist-get event :message-anchor)
+                   patch
+                   (plist-get event :observation-token))))
               (appkit-view-enqueue-event view event)
               (appkit-invalidate
                view :part (if (memq event-type

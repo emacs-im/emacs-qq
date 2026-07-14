@@ -48,7 +48,7 @@
     (group-id . "20001")
     (order . ,(or order time))))
 
-(defun qq-chat-test--filter-wire-result (id sequence time text)
+(defun qq-chat-test--filter-snapshot (id sequence time text &optional reactions)
   "Return one flat rendering snapshot wire result for chat filter tests."
   `((chat . ((kind . "group") (group_id . "20001")))
     (message_id . ,id)
@@ -59,7 +59,7 @@
     (state . "live")
     (segments . (((kind . "text")
                   (payload . ((text . ,text))))))
-    (reactions)))
+    (reactions . ,(copy-tree reactions))))
 
 (defun qq-chat-test--filter-item (id time text)
   "Return one filter-owned local item."
@@ -493,7 +493,7 @@
            (goto-char (or (appkit-chatbuf-input-start-position) (point-max))))
          (funcall callback
                   `((projection . "message")
-                    (results . (,(qq-chat-test--filter-wire-result
+                    (results . (,(qq-chat-test--filter-snapshot
                                   "20" "20" 20 "needle")))
                     (next_cursor))))
        (should-not positioned)))))
@@ -521,7 +521,7 @@
          (qq-chat-filter-refresh)
          (funcall callback
                   `((projection . "message")
-                    (results . (,(qq-chat-test--filter-wire-result
+                    (results . (,(qq-chat-test--filter-snapshot
                                   "20" "20" 20 "needle")))
                     (next_cursor))))
        (should positioned)))))
@@ -563,7 +563,7 @@
          (funcall
           start-callback
           `((projection . "message")
-            (results . (,(qq-chat-test--filter-wire-result
+            (results . (,(qq-chat-test--filter-snapshot
                           "30" "30" 30 "new needle")))
             (next_cursor . "cursor-1")))
          (should-not qq-chat--filter-owner)
@@ -583,7 +583,7 @@
          (funcall
           next-callback
           `((projection . "message")
-            (results . (,(qq-chat-test--filter-wire-result
+            (results . (,(qq-chat-test--filter-snapshot
                           "10" "10" 10 "old needle")))
             (next_cursor)))
          (should
@@ -629,7 +629,7 @@
          (funcall
           late-callback
           `((projection . "message")
-            (results . (,(qq-chat-test--filter-wire-result
+            (results . (,(qq-chat-test--filter-snapshot
                           "99" "99" 99 "late needle")))
             (next_cursor)))
          (should-not qq-chat--msg-filter)
@@ -664,7 +664,7 @@
                            (results)
                            (next_cursor . "empty-2"))
                        `((projection . "message")
-                         (results . (,(qq-chat-test--filter-wire-result
+                         (results . (,(qq-chat-test--filter-snapshot
                                        "90" "90" 90 "needle")))
                          (next_cursor))))
                     (intern (concat "token-" cursor)))))
@@ -692,32 +692,37 @@
                                "90" 90 "needle"))))
      (qq-chat--set-empty-history-window)
      (qq-chat-render)
-     (qq-chat--apply-message-state-change
+     (qq-chat--handle-state-change
       (list :type 'message
             :session-key "group:20001"
             :message-anchor "90"
             :mutation 'update
             :source 'notice
+            :observation-token 1
             :message-patch
             (list :kind 'emoji-like
+                  :observation-token 1
                   :notice
                   '((message_id . "90")
                     (group_id . "20001")
                     (user_id . "10002")
                     (is_add . t)
                     (likes . (((emoji_id . "178") (count . 2))))))))
+     (qq-chat-test-sync-invalidations)
      (let* ((item (car (plist-get qq-chat--msg-filter :items)))
             (message (plist-get item :message))
             (reaction (car (qq-state-message-reactions message))))
        (should (equal (alist-get 'emoji-id reaction) "178"))
        (should (= (alist-get 'count reaction) 2)))
-     (qq-chat--apply-message-state-change
+     (qq-chat--handle-state-change
       '(:type message
         :session-key "group:20001"
         :message-anchor "90"
         :mutation update
         :source notice
-        :message-patch (:kind recall)))
+        :observation-token 2
+        :message-patch (:kind recall :observation-token 2)))
+     (qq-chat-test-sync-invalidations)
      (should (qq-state-message-recalled-p
               (plist-get (car (plist-get qq-chat--msg-filter :items))
                          :message)))
@@ -725,7 +730,7 @@
      (should (equal (appkit-chat-timeline-keys)
                     (list qq-chat--empty-placeholder))))))
 
-(ert-deftest qq-chat-filter-journals-patches-before-their-hit-arrives ()
+(ert-deftest qq-chat-filter-replays-only-in-flight-patches-on-new-hit ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "group:20001"
@@ -735,26 +740,32 @@
      (setq qq-chat--session-key "group:20001")
      (qq-chat--set-empty-history-window)
      (qq-chat-render)
-     (let (callback)
-       (cl-letf (((symbol-function 'qq-api-filter-messages-start)
+     (let (callback owner)
+       (cl-letf (((symbol-function 'qq-state-message-observation-token)
+                  (lambda () 10))
+                 ((symbol-function 'qq-api-filter-messages-start)
                   (lambda (_session _query success &optional _errback _limit)
                     (setq callback success)
                     'filter-token)))
          (qq-chat-filter-search "needle")
+         (setq owner qq-chat--filter-owner)
          (qq-chat--apply-filter-message-patch
           "90"
           (list :kind 'emoji-like
+                :observation-token 11
                 :notice
                 '((message_id . "90")
                   (group_id . "20001")
                   (user_id . "10002")
                   (is_add . t)
-                  (likes . (((emoji_id . "178") (count . 2)))))))
-         (qq-chat--apply-filter-message-patch "90" '(:kind recall))
-         (should (= (length qq-chat--filter-patch-journal) 2))
+                  (likes . (((emoji_id . "178") (count . 2))))))
+          11)
+         (qq-chat--apply-filter-message-patch
+          "90" '(:kind recall :observation-token 12) 12)
+         (should (= (length (plist-get owner :patches)) 2))
          (funcall callback
                   `((projection . "message")
-                    (results . (,(qq-chat-test--filter-wire-result
+                    (results . (,(qq-chat-test--filter-snapshot
                                   "90" "90" 90 "needle")))
                     (next_cursor))))
        (let* ((item (car (plist-get qq-chat--msg-filter :items)))
@@ -762,9 +773,67 @@
               (reaction (car (qq-state-message-reactions message))))
          (should (qq-state-message-recalled-p message))
          (should (equal (alist-get 'emoji-id reaction) "178"))
-         (should (= (alist-get 'count reaction) 2)))))))
+         (should (= (alist-get 'count reaction) 2))
+         (should-not (plist-get owner :patches)))))))
 
-(ert-deftest qq-chat-filter-refresh-clears-old-patch-journal-before-dispatch ()
+(ert-deftest qq-chat-filter-cancel-discards-request-local-patches ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001")) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat--set-empty-history-window)
+     (qq-chat-render)
+     (let (owner canceled)
+       (cl-letf (((symbol-function 'qq-state-message-observation-token)
+                  (lambda () 10))
+                 ((symbol-function 'qq-api-filter-messages-start)
+                  (lambda (&rest _) 'filter-token))
+                 ((symbol-function 'qq-api-cancel-request)
+                  (lambda (request) (setq canceled request))))
+         (qq-chat-filter-search "needle")
+         (setq owner qq-chat--filter-owner)
+         (qq-chat--apply-filter-message-patch
+          "90" '(:kind recall :observation-token 11) 11)
+         (should (plist-get owner :patches))
+         (qq-chat--cancel-filter-request)
+         (should (eq canceled 'filter-token))
+         (should-not (plist-get owner :pending))
+         (should-not (plist-get owner :patches))
+         (should-not qq-chat--filter-request)
+         (should-not qq-chat--filter-owner))))))
+
+(ert-deftest qq-chat-filter-failure-discards-request-local-patches ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001")) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat--set-empty-history-window)
+     (qq-chat-render)
+     (let (owner errback)
+       (cl-letf (((symbol-function 'qq-state-message-observation-token)
+                  (lambda () 10))
+                 ((symbol-function 'qq-api-filter-messages-start)
+                  (lambda (_session _query _success failure &optional _limit)
+                    (setq errback failure)
+                    'filter-token)))
+         (qq-chat-filter-search "needle")
+         (setq owner qq-chat--filter-owner)
+         (qq-chat--apply-filter-message-patch
+          "90" '(:kind recall :observation-token 11) 11)
+         (should (plist-get owner :patches))
+         (funcall errback nil "failed")
+         (should-not (plist-get owner :pending))
+         (should-not (plist-get owner :patches))
+         (should-not qq-chat--filter-request)
+         (should-not qq-chat--filter-owner))))))
+
+(ert-deftest qq-chat-filter-does-not-replay-reaction-observed-before-request ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "group:20001"
@@ -774,19 +843,75 @@
      (setq qq-chat--session-key "group:20001"
            qq-chat--msg-filter
            (list :active t :title "search \"needle\"" :query "needle"
-                 :items (list (qq-chat-test--filter-item "90" 90 "needle")))
-           qq-chat--filter-patch-journal
-           '((:message-id "90" :patch (:kind recall))))
-     (let (journal-at-dispatch)
-       (cl-letf (((symbol-function 'qq-api-filter-messages-start)
-                  (lambda (_session _query _callback &optional _errback _limit)
-                    (setq journal-at-dispatch qq-chat--filter-patch-journal)
+                 :items (list (qq-chat-test--filter-item "90" 90 "needle"))))
+     ;; This delta predates the next request.  Its future response already
+     ;; reports count 3, so replaying the old +1 would incorrectly produce 4.
+     (qq-chat--apply-filter-message-patch
+      "90"
+      '(:kind emoji-like
+        :observation-token 5
+        :notice ((message_id . "90")
+                 (group_id . "20001")
+                 (user_id . "10002")
+                 (is_add . t)
+                 (likes . (((emoji_id . "178"))))))
+      5)
+     (let (callback)
+       (cl-letf (((symbol-function 'qq-state-message-observation-token)
+                  (lambda () 6))
+                 ((symbol-function 'qq-api-filter-messages-start)
+                  (lambda (_session _query success &optional _errback _limit)
+                    (setq callback success)
                     'filter-token)))
-         (qq-chat-filter-refresh))
-       (should-not journal-at-dispatch)
-       (should-not qq-chat--filter-patch-journal)))))
+         (qq-chat-filter-refresh)
+         (funcall
+          callback
+          `((projection . "message")
+            (results
+             . (,(qq-chat-test--filter-snapshot
+                  "90" "90" 90 "needle"
+                  '(((emoji_id . "178")
+                     (emoji_type . "1")
+                     (count . 3)
+                     (chosen . :false))))))
+            (next_cursor))))
+       (let* ((item (car (plist-get qq-chat--msg-filter :items)))
+              (reaction (car (qq-state-message-reactions
+                              (plist-get item :message)))))
+         (should (= (alist-get 'count reaction) 3)))))))
 
-(ert-deftest qq-chat-filter-append-preserves-patch-journal ()
+(ert-deftest qq-chat-filter-applies-recall-observed-before-request ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001")) nil)
+   (let ((message-id "9007199254741004881"))
+     ;; Recall is a permanent state tombstone, unlike a reaction observation.
+     (qq-state-apply-recall "group:20001" message-id)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "group:20001")
+       (qq-chat--set-empty-history-window)
+       (qq-chat-render)
+       (let (callback)
+         (cl-letf (((symbol-function 'qq-api-filter-messages-start)
+                    (lambda (_session _query success &optional _errback _limit)
+                      (setq callback success)
+                      'filter-token)))
+           (qq-chat-filter-search "needle")
+           (funcall
+            callback
+            `((projection . "message")
+              (results
+               . (,(qq-chat-test--filter-snapshot
+                    message-id "90" 90 "stale live result")))
+              (next_cursor))))
+         (should
+          (qq-state-message-recalled-p
+           (plist-get (car (plist-get qq-chat--msg-filter :items))
+                      :message))))))))
+
+(ert-deftest qq-chat-filter-append-keeps-in-flight-patch-on-existing-item ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "group:20001"
@@ -797,31 +922,48 @@
            qq-chat--msg-filter
            (list :active t :title "search \"needle\"" :query "needle"
                  :items (list (qq-chat-test--filter-item "90" 90 "needle"))
-                 :next-cursor "cursor")
-           qq-chat--filter-patch-journal
-           '((:message-id "80" :patch (:kind recall))))
-     (let (journal-at-dispatch)
-       (cl-letf (((symbol-function 'qq-api-filter-messages-next)
-                  (lambda (_session _cursor _callback &optional _errback)
-                    (setq journal-at-dispatch qq-chat--filter-patch-journal)
+                 :next-cursor "cursor"))
+     (let (callback owner)
+       (cl-letf (((symbol-function 'qq-state-message-observation-token)
+                  (lambda () 10))
+                 ((symbol-function 'qq-api-filter-messages-next)
+                  (lambda (_session _cursor success &optional _errback)
+                    (setq callback success)
                     'filter-token)))
-         (qq-chat-filter-load-more))
-       (should (equal journal-at-dispatch
-                      '((:message-id "80" :patch (:kind recall)))))
-       (should (equal qq-chat--filter-patch-journal journal-at-dispatch))))))
-
-(ert-deftest qq-chat-filter-cancel-clears-patch-journal ()
-  (with-temp-buffer
-    (qq-chat-mode)
-    (setq qq-chat--session-key "group:20001"
-          qq-chat--msg-filter '(:active t :title "search" :query "needle")
-          qq-chat--filter-patch-journal
-          '((:message-id "90" :patch (:kind recall))))
-    (cl-letf (((symbol-function 'qq-chat-render) #'ignore)
-              ((symbol-function 'qq-chat--history-window-known-p)
-               (lambda () t)))
-      (qq-chat-filter-cancel))
-    (should-not qq-chat--filter-patch-journal)))
+         (qq-chat-filter-load-more)
+         (setq owner qq-chat--filter-owner)
+         (qq-chat--handle-state-change
+          '(:type message
+            :session-key "group:20001"
+            :message-anchor "90"
+            :mutation update
+            :source notice
+            :observation-token 11
+            :message-patch
+            (:kind emoji-like
+             :observation-token 11
+             :notice ((message_id . "90")
+                      (group_id . "20001")
+                      (user_id . "10002")
+                      (is_add . t)
+                      (likes . (((emoji_id . "178"))))))))
+         ;; Accept the filter response before AppKit flushes the queued state
+         ;; event.  Eager filter observation must already have repaired both
+         ;; the visible item and OWNER's captured `:existing' snapshot.
+         (funcall
+          callback
+          `((projection . "message")
+            (results . (,(qq-chat-test--filter-snapshot
+                          "80" "80" 80 "older needle")))
+            (next_cursor))))
+       (let* ((item (seq-find
+                     (lambda (candidate)
+                       (equal (qq-chat--filter-result-id candidate) "90"))
+                     (plist-get qq-chat--msg-filter :items)))
+              (reaction (car (qq-state-message-reactions
+                              (plist-get item :message)))))
+         (should (= (alist-get 'count reaction) 1))
+         (should-not (plist-get owner :patches)))))))
 
 (ert-deftest qq-chat-reset-invalidates-filter-owner-before-late-callback ()
   (qq-chat-test-with-reset
@@ -848,7 +990,7 @@
          (funcall
           late-callback
           `((projection . "message")
-            (results . (,(qq-chat-test--filter-wire-result
+            (results . (,(qq-chat-test--filter-snapshot
                           "99" "99" 99 "stale")))
             (next_cursor)))
          (should-not qq-chat--msg-filter))))))
@@ -2455,7 +2597,7 @@
      (let ((message
             (qq-state-normalize-message-snapshot
              "group:20001"
-             (qq-chat-test--filter-wire-result
+             (qq-chat-test--filter-snapshot
               "9007199254741004001" "101" 1710000000 "hit"))))
        (should
         (equal (qq-chat--message-reference message)
