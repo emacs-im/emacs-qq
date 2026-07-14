@@ -194,35 +194,45 @@ is ignored."
     (setq qq-transport--connecting t)
     (setq qq-transport--stopping nil)
     (qq-state-set-connection-status 'connecting)
-    (setq qq-transport--ws
-          (websocket-open
-           (qq-build-websocket-url)
-           :on-open (lambda (_ws)
-                      (setq qq-transport--connecting nil)
-                      (setq qq-transport--reconnect-attempt 0)
-                      (qq-state-set-connection-status 'open)
-                      (message "qq: websocket opened"))
-           :on-message (lambda (_ws frame)
-                         (condition-case err
-                             (when-let* ((text (qq-transport--frame-text frame)))
-                               (unless (string-empty-p (string-trim text))
-                                 (qq-transport--handle-payload
-                                  (qq-transport--json-decode text))))
-                           (error
-                            (message "qq: websocket payload error: %s"
-                                     (error-message-string err)))))
-           :on-close (lambda (_ws)
-                       (setq qq-transport--ws nil)
-                       (setq qq-transport--connecting nil)
-                       (unless qq-transport--stopping
-                         (message "qq: websocket closed")
-                         (qq-transport--disconnect t)))
-           :on-error (lambda (_ws _type err)
-                       (setq qq-transport--connecting nil)
-                       (message "qq: websocket error: %s"
-                                (error-message-string err))
-                       (unless qq-transport--stopping
-                         (qq-transport--disconnect t)))))))
+    (condition-case err
+        (setq qq-transport--ws
+              (websocket-open
+               (qq-build-websocket-url)
+               :on-open (lambda (_ws)
+                          (setq qq-transport--connecting nil)
+                          (setq qq-transport--reconnect-attempt 0)
+                          (qq-state-set-connection-status 'open)
+                          (message "qq: websocket opened"))
+               :on-message (lambda (_ws frame)
+                             (condition-case payload-error
+                                 (when-let* ((text (qq-transport--frame-text frame)))
+                                   (unless (string-empty-p (string-trim text))
+                                     (qq-transport--handle-payload
+                                      (qq-transport--json-decode text))))
+                               (error
+                                (message "qq: websocket payload error: %s"
+                                         (error-message-string payload-error)))))
+               :on-close (lambda (_ws)
+                           (setq qq-transport--ws nil)
+                           (setq qq-transport--connecting nil)
+                           (unless qq-transport--stopping
+                             (message "qq: websocket closed")
+                             (qq-transport--disconnect t)))
+               :on-error (lambda (_ws _type socket-error)
+                           (setq qq-transport--connecting nil)
+                           (message "qq: websocket error: %s"
+                                    (error-message-string socket-error))
+                           (unless qq-transport--stopping
+                             (qq-transport--disconnect t)))))
+      (error
+       ;; `websocket-open' can fail synchronously before it has an object on
+       ;; which to deliver `:on-error'.  Leaving `--connecting' set here would
+       ;; suppress every later retry.
+       (setq qq-transport--ws nil)
+       (setq qq-transport--connecting nil)
+       (message "qq: websocket error: %s" (error-message-string err))
+       (unless qq-transport--stopping
+         (qq-transport--disconnect t))))))
 
 (defun qq-transport-start ()
   "Start websocket transport when needed."
