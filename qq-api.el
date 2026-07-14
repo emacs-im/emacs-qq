@@ -35,6 +35,9 @@ from authoritative Linux QQ observations.")
   (make-hash-table :test #'equal)
   "Last accepted read-state token keyed by session key.")
 
+(defvar qq-api--request-finalizers (make-hash-table :test #'equal)
+  "Cleanup callbacks keyed by live transport request token.")
+
 (defun qq-api--next-read-observation-token ()
   "Allocate a token for one read-state request or observation."
   (cl-incf qq-api--read-observation-clock))
@@ -80,9 +83,73 @@ barrier before mutating state or choosing a timeline position."
 ERRBACK falls back to `qq-api--default-error'."
   (qq-transport-send action params callback (or errback #'qq-api--default-error)))
 
+(defun qq-api--run-request-finalizer (request-token)
+  "Run and forget cleanup registered for REQUEST-TOKEN."
+  (when-let* ((finalizer (and request-token
+                              (gethash request-token
+                                       qq-api--request-finalizers))))
+    (remhash request-token qq-api--request-finalizers)
+    (funcall finalizer)
+    t))
+
+(defun qq-api--call-with-materialization-owner
+    (session-key action params callback &optional errback)
+  "Call ACTION while owning one SESSION-KEY materialization window.
+
+CALLBACK receives RESPONSE and the active request owner.  ERRBACK keeps the
+ordinary `(RESPONSE REASON)' signature.  Success, error, synchronous callback,
+synchronous dispatch failure, and explicit cancellation all settle the owner
+exactly once."
+  (let ((owner (qq-state-materialization-request-begin session-key))
+        (handle-error (or errback #'qq-api--default-error))
+        request-token
+        settled)
+    (cl-labels
+        ((finish
+          ()
+          (unless settled
+            (setq settled t)
+            (when request-token
+              (remhash request-token qq-api--request-finalizers))
+            (qq-state-materialization-request-end owner)))
+         (succeed
+          (response)
+          (unless settled
+            (unwind-protect
+                (funcall callback response owner)
+              (finish))))
+         (fail
+          (response reason)
+          (unless settled
+            (unwind-protect
+                (funcall handle-error response reason)
+              (finish)))))
+      (condition-case err
+          (progn
+            (setq request-token
+                  (qq-api-call action params #'succeed #'fail))
+            (cond
+             (settled nil)
+             (request-token
+              (puthash request-token #'finish qq-api--request-finalizers))
+             (t
+              ;; A transport should invoke ERRBACK when it cannot dispatch.
+              ;; Still settle defensively when a test double or alternate
+              ;; transport returns nil without doing so.
+              (finish)))
+            request-token)
+        (error
+         (finish)
+         (signal (car err) (cdr err)))))))
+
 (defun qq-api-cancel-request (request-token)
   "Cancel local callback ownership for REQUEST-TOKEN."
-  (and request-token (qq-transport-cancel request-token)))
+  (when request-token
+    (unwind-protect
+        (qq-transport-cancel request-token)
+      ;; Cancellation is also an API ownership boundary.  Settle a registered
+      ;; materialization window even if the transport entry raced to absence.
+      (qq-api--run-request-finalizer request-token))))
 
 (defun qq-api-message-id-p (value)
   "Return non-nil when VALUE is a canonical NT message snowflake.
@@ -1023,13 +1090,15 @@ ERRBACK receives (RESPONSE REASON)."
                   (when cursor
                     `((message_seq . ,(format "%s" cursor))
                       (reverse_order . ,(if (eq direction 'older) t :false)))))))
-    (qq-api-call
+    (qq-api--call-with-materialization-owner
+     session-key
      action
      params
-     (lambda (response)
+     (lambda (response request-owner)
        (let* ((data (qq-api--response-data response))
               (messages (alist-get 'messages data nil nil #'eq))
-              (meta (qq-state-merge-history session-key messages)))
+              (meta (qq-state-merge-history
+                     session-key messages request-owner)))
          (when callback
            (funcall callback meta))))
      errback)))
@@ -1256,20 +1325,22 @@ parent message id, or a different interface."
   "Fetch a history window around MESSAGE-ID (NapCat `get_msg_history_around').
 
 Fork action: older+newer pages around the NT snowflake center (telega around).
-CALLBACK receives the merge-history plist.  On action-missing/network error,
-ERRBACK is called so the client can fall back to single-side seek."
+CALLBACK receives the merge-history plist.  ERRBACK receives
+`(RESPONSE REASON)' when the exact around request fails."
   (let ((n (max 1 (or count
                       (and (boundp 'qq-chat-jump-history-count)
                            qq-chat-jump-history-count)
                       qq-history-fetch-count))))
-    (qq-api-call
+    (qq-api--call-with-materialization-owner
+     session-key
      "get_msg_history_around"
      (qq-api--history-around-params session-key message-id n)
-     (lambda (response)
+     (lambda (response request-owner)
        (let* ((data (qq-api--response-data response))
               (messages (or (alist-get 'messages data nil nil #'eq)
                             (and (listp data) data)))
-              (meta (qq-state-merge-history session-key messages)))
+              (meta (qq-state-merge-history
+                     session-key messages request-owner)))
          (when callback
            (funcall callback meta))))
      errback)))
@@ -1431,10 +1502,11 @@ is stored as the message `server-id' and becomes the timeline anchor."
                  session-key local-id reason)
             (funcall failure-callback response reason))))
       (condition-case err
-          (qq-api-call
+          (qq-api--call-with-materialization-owner
+           session-key
            "send_msg"
            params
-           (lambda (response)
+           (lambda (response request-owner)
              ;; Protocol decoding and state promotion belong to the send
              ;; transaction.  The caller callback does not: never reinterpret
              ;; a client callback error as a failed network delivery.
@@ -1446,7 +1518,7 @@ is stored as the message `server-id' and becomes the timeline anchor."
                               (alist-get 'message_id data nil nil #'eq)
                               "send_msg response" t)))
                        (qq-state-mark-pending-message-sent
-                        session-key local-id message-id)
+                        session-key local-id message-id request-owner)
                        t)
                    (error
                     (fail-pending

@@ -103,6 +103,196 @@ The authoritative post-state reports UNREAD-COUNT."
                  `((kind . "group") (group_id . ,target-id))
                `((kind . "private") (user_id . ,target-id))))))
 
+(ert-deftest qq-api-materialization-owner-settles-synchronous-success ()
+  (let ((qq-state-change-hook nil)
+        seen-owner)
+    (qq-state-reset)
+    (clrhash qq-api--request-finalizers)
+    (unwind-protect
+        (cl-letf (((symbol-function 'qq-api-call)
+                   (lambda (_action _params callback &optional _errback)
+                     (funcall callback '((status . "ok")))
+                     'sync-request)))
+          (should
+           (eq 'sync-request
+               (qq-api--call-with-materialization-owner
+                "private:10001" "action" nil
+                (lambda (_response owner)
+                  (setq seen-owner owner)))))
+          (should seen-owner)
+          (should-not (qq-state-materialization-request-end seen-owner))
+          (should-not (gethash 'sync-request qq-api--request-finalizers))
+          (should (= 0 (hash-table-count
+                        qq-state--materialization-request-owners))))
+      (clrhash qq-api--request-finalizers)
+      (qq-state-reset))))
+
+(ert-deftest qq-api-materialization-owner-settles-synchronous-error ()
+  (let ((qq-state-change-hook nil)
+        reason-seen)
+    (qq-state-reset)
+    (clrhash qq-api--request-finalizers)
+    (unwind-protect
+        (cl-letf (((symbol-function 'qq-api-call)
+                   (lambda (_action _params _callback &optional errback)
+                     (funcall errback nil "synchronous failure")
+                     nil)))
+          (should-not
+           (qq-api--call-with-materialization-owner
+            "private:10001" "action" nil #'ignore
+            (lambda (_response reason)
+              (setq reason-seen reason))))
+          (should (equal reason-seen "synchronous failure"))
+          (should (= 0 (hash-table-count
+                        qq-state--materialization-request-owners))))
+      (clrhash qq-api--request-finalizers)
+      (qq-state-reset))))
+
+(ert-deftest qq-api-materialization-owner-settles-asynchronous-error ()
+  (let ((qq-state-change-hook nil)
+        error-callback
+        reason-seen)
+    (qq-state-reset)
+    (clrhash qq-api--request-finalizers)
+    (unwind-protect
+        (cl-letf (((symbol-function 'qq-api-call)
+                   (lambda (_action _params _callback &optional errback)
+                     (setq error-callback errback)
+                     'async-error-request)))
+          (should
+           (eq 'async-error-request
+               (qq-api--call-with-materialization-owner
+                "private:10001" "action" nil #'ignore
+                (lambda (_response reason)
+                  (setq reason-seen reason)))))
+          (should (= 1 (hash-table-count
+                        qq-state--materialization-request-owners)))
+          (funcall error-callback nil "late failure")
+          (should (equal reason-seen "late failure"))
+          (should (= 0 (hash-table-count
+                        qq-state--materialization-request-owners)))
+          (should-not
+           (gethash 'async-error-request qq-api--request-finalizers)))
+      (clrhash qq-api--request-finalizers)
+      (qq-state-reset))))
+
+(ert-deftest qq-api-cancel-request-settles-materialization-owner ()
+  (let ((qq-state-change-hook nil))
+    (qq-state-reset)
+    (clrhash qq-api--request-finalizers)
+    (unwind-protect
+        (cl-letf (((symbol-function 'qq-api-call)
+                   (lambda (&rest _args) 'async-request))
+                  ((symbol-function 'qq-transport-cancel)
+                   (lambda (token) (eq token 'async-request))))
+          (should
+           (eq 'async-request
+               (qq-api--call-with-materialization-owner
+                "group:20001" "action" nil #'ignore)))
+          (should (= 1 (hash-table-count
+                        qq-state--materialization-request-owners)))
+          (should (gethash 'async-request qq-api--request-finalizers))
+          (should (qq-api-cancel-request 'async-request))
+          (should (= 0 (hash-table-count
+                        qq-state--materialization-request-owners)))
+          (should-not (gethash 'async-request qq-api--request-finalizers)))
+      (clrhash qq-api--request-finalizers)
+      (qq-state-reset))))
+
+(ert-deftest qq-api-cancel-request-settles-owner-after-transport-race ()
+  (let ((qq-state-change-hook nil))
+    (qq-state-reset)
+    (clrhash qq-api--request-finalizers)
+    (unwind-protect
+        (cl-letf (((symbol-function 'qq-api-call)
+                   (lambda (&rest _args) 'raced-request))
+                  ((symbol-function 'qq-transport-cancel)
+                   (lambda (_token) nil)))
+          (should
+           (eq 'raced-request
+               (qq-api--call-with-materialization-owner
+                "group:20001" "action" nil #'ignore)))
+          (should (= 1 (hash-table-count
+                        qq-state--materialization-request-owners)))
+          (should-not (qq-api-cancel-request 'raced-request))
+          (should (= 0 (hash-table-count
+                        qq-state--materialization-request-owners)))
+          (should-not (gethash 'raced-request qq-api--request-finalizers)))
+      (clrhash qq-api--request-finalizers)
+      (qq-state-reset))))
+
+(ert-deftest qq-api-cancel-request-settles-owner-when-transport-signals ()
+  (let ((qq-state-change-hook nil))
+    (qq-state-reset)
+    (clrhash qq-api--request-finalizers)
+    (unwind-protect
+        (cl-letf (((symbol-function 'qq-api-call)
+                   (lambda (&rest _args) 'signalling-request))
+                  ((symbol-function 'qq-transport-cancel)
+                   (lambda (_token) (error "transport cancel failed"))))
+          (qq-api--call-with-materialization-owner
+           "group:20001" "action" nil #'ignore)
+          (should (= 1 (hash-table-count
+                        qq-state--materialization-request-owners)))
+          (should
+           (gethash 'signalling-request qq-api--request-finalizers))
+          (should
+           (equal '(error "transport cancel failed")
+                  (condition-case err
+                      (qq-api-cancel-request 'signalling-request)
+                    (error err))))
+          (should (= 0 (hash-table-count
+                        qq-state--materialization-request-owners)))
+          (should-not
+           (gethash 'signalling-request qq-api--request-finalizers)))
+      (clrhash qq-api--request-finalizers)
+      (qq-state-reset))))
+
+(ert-deftest qq-api-cancel-request-rejects-late-materialization-callbacks ()
+  (let ((qq-state-change-hook nil)
+        success-callback
+        error-callback
+        calls)
+    (qq-state-reset)
+    (clrhash qq-api--request-finalizers)
+    (unwind-protect
+        (cl-letf (((symbol-function 'qq-api-call)
+                   (lambda (_action _params success &optional error)
+                     (setq success-callback success
+                           error-callback error)
+                     'late-request))
+                  ((symbol-function 'qq-transport-cancel)
+                   (lambda (_token) t)))
+          (qq-api--call-with-materialization-owner
+           "group:20001" "action" nil
+           (lambda (&rest _args) (push 'success calls))
+           (lambda (&rest _args) (push 'error calls)))
+          (should (qq-api-cancel-request 'late-request))
+          ;; An alternate transport may still deliver stale closures after it
+          ;; reported cancellation.  API ownership rejects both outcomes.
+          (funcall success-callback '((status . "ok")))
+          (funcall error-callback nil "late failure")
+          (should-not calls)
+          (should (= 0 (hash-table-count
+                        qq-state--materialization-request-owners))))
+      (clrhash qq-api--request-finalizers)
+      (qq-state-reset))))
+
+(ert-deftest qq-api-materialization-owner-settles-dispatch-signal ()
+  (let ((qq-state-change-hook nil))
+    (qq-state-reset)
+    (clrhash qq-api--request-finalizers)
+    (unwind-protect
+        (cl-letf (((symbol-function 'qq-api-call)
+                   (lambda (&rest _args) (error "dispatch failed"))))
+          (should-error
+           (qq-api--call-with-materialization-owner
+            "private:10001" "action" nil #'ignore))
+          (should (= 0 (hash-table-count
+                        qq-state--materialization-request-owners))))
+      (clrhash qq-api--request-finalizers)
+      (qq-state-reset))))
+
 (ert-deftest qq-api-send-message-builds-send-msg-request ()
   (let (captured-action captured-params pending-call)
     (cl-letf (((symbol-function 'qq-state-insert-pending-message)
@@ -113,7 +303,7 @@ The authoritative post-state reports UNREAD-COUNT."
                (lambda (action params _callback &optional _errback)
                  (setq captured-action action)
                  (setq captured-params params)
-                 'sent)))
+                 nil)))
       (qq-api-send-message
        "private:10001"
        '(((type . "reply")
@@ -137,14 +327,16 @@ The authoritative post-state reports UNREAD-COUNT."
                          (data . ((text . "hello"))))))))))
 
 (ert-deftest qq-api-send-message-calls-owner-after-pending-success ()
-  (let (success-fn events)
+  (let (success-fn events promotion-args)
     (cl-letf (((symbol-function 'qq-state-insert-pending-message)
                (lambda (&rest _args) '((local-id . "local-1"))))
               ((symbol-function 'qq-api-call)
                (lambda (_action _params callback &optional _errback)
                  (setq success-fn callback)))
               ((symbol-function 'qq-state-mark-pending-message-sent)
-               (lambda (&rest _args) (push 'promoted events))))
+               (lambda (&rest args)
+                 (setq promotion-args args)
+                 (push 'promoted events))))
       (qq-api-send-message
        "private:10001"
        '(((type . "text") (data . ((text . "hello")))))
@@ -152,7 +344,14 @@ The authoritative post-state reports UNREAD-COUNT."
        (lambda (_response) (push 'callback events)))
       (funcall success-fn
                '((data . ((message_id . "9007199254742007094")))))
-      (should (equal '(promoted callback) (nreverse events))))))
+      (should (equal '(promoted callback) (nreverse events)))
+      (should (equal (seq-take promotion-args 3)
+                     '("private:10001" "local-1"
+                       "9007199254742007094")))
+      (should (equal (plist-get (nth 3 promotion-args) :session-key)
+                     "private:10001"))
+      (should-not
+       (qq-state-materialization-request-end (nth 3 promotion-args))))))
 
 (ert-deftest qq-api-send-message-calls-owner-after-pending-failure ()
   (let (error-fn events)
@@ -230,7 +429,7 @@ The authoritative post-state reports UNREAD-COUNT."
                (lambda (action params _callback &optional _errback)
                  (setq captured-action action)
                  (setq captured-params params)
-                 'sent)))
+                 nil)))
       (qq-api-send-message
        "dataline:mobile:dev:a"
        '(((type . "text")
@@ -981,8 +1180,8 @@ The authoritative post-state reports UNREAD-COUNT."
                    (chat-type . "8")
                    (peer-uid . "wrong"))))
               ((symbol-function 'qq-state-merge-history)
-               (lambda (session-key messages)
-                 (setq merged (list session-key messages))
+               (lambda (session-key messages &optional request-owner)
+                 (setq merged (list session-key messages request-owner))
                  (list :session-key session-key
                        :message-count (length messages)
                        :added-count (length messages))))
@@ -997,8 +1196,12 @@ The authoritative post-state reports UNREAD-COUNT."
       (should (equal captured-action "get_peer_msg_history"))
       (should (equal (alist-get 'chat_type captured-params) "134"))
       (should (equal (alist-get 'peer_uid captured-params) "dev:a"))
-      (should (equal merged
+      (should (equal (seq-take merged 2)
                      '("dataline:mobile:dev:a" (((message_id . 1))))))
+      (should (equal (plist-get (nth 2 merged) :session-key)
+                     "dataline:mobile:dev:a"))
+      (should-not
+       (qq-state-materialization-request-end (nth 2 merged)))
       (should (= (plist-get done-meta :added-count) 1)))))
 
 (ert-deftest qq-api-history-around-preserves-mobile-colon-peer-identity ()

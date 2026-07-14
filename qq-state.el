@@ -28,6 +28,7 @@ include:
 - `:message' / `:message-anchor' / `:previous-anchor' — when a single
   message is the subject (anchor prefers NT snowflake `server-id')
 - `:message-patch' — a pure ID-scoped patch when the subject is not cached
+- `:observation-token' — message-patch observation clock for request windows
 
 Chat views project canonical state after every relevant mutation; anchors and
 resource identities let the shared timeline redraw only affected rows.")
@@ -42,10 +43,16 @@ resource identities let the shared timeline redraw only affected rows.")
   "Notice state keyed by (SESSION-KEY . MESSAGE-ID).
 
 Recall tombstones remain authoritative for the lifetime of the state store.
-Emoji notices received before their message are queued in arrival order.  On
-first materialization they are folded into an exact reaction overlay, making
-subsequent stale history/live snapshots idempotent instead of reapplying
-reaction deltas.")
+Reaction patches are retained only while an older materialization request is
+active.  Such a request may replay patches observed after it started, but a
+future request must accept its own authoritative reaction snapshot unchanged.")
+(defvar qq-state--message-observation-clock 0
+  "Monotonic token for ID-scoped message patch observations.")
+(defvar qq-state--materialization-request-counter 0
+  "Monotonic identity counter for materialization request owners.")
+(defvar qq-state--materialization-request-owners
+  (make-hash-table :test #'eql)
+  "Active materialization request owners keyed by their numeric identity.")
 (defvar qq-state--friends-by-id (make-hash-table :test #'equal))
 (defvar qq-state--groups-by-id (make-hash-table :test #'equal))
 (defvar qq-state--requests nil)
@@ -222,6 +229,7 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   (clrhash qq-state--sessions)
   (clrhash qq-state--messages-by-session)
   (clrhash qq-state--message-patch-journal)
+  (clrhash qq-state--materialization-request-owners)
   (clrhash qq-state--friends-by-id)
   (clrhash qq-state--groups-by-id)
   (clrhash qq-state--message-session-index)
@@ -1873,56 +1881,147 @@ Return the local message object."
   "Return the journal key for exact MESSAGE-ID in SESSION-KEY."
   (cons session-key message-id))
 
-(defun qq-state--remember-unmaterialized-message-patch
-    (session-key message-id patch)
-  "Remember closed PATCH for an absent MESSAGE-ID in SESSION-KEY.
+(defun qq-state-message-observation-token ()
+  "Return the current ID-scoped message observation clock.
 
-Recall is stored as a tombstone.  Emoji deltas stay ordered until a message
-snapshot provides their base reaction counts."
+Callers which own a buffer-local request may capture this value before
+dispatch and accept only later reaction patches.  Recall patches are
+tombstones and do not require that freshness comparison."
+  qq-state--message-observation-clock)
+
+(defun qq-state--next-message-observation-token ()
+  "Allocate the next ID-scoped message observation token."
+  (cl-incf qq-state--message-observation-clock))
+
+(defun qq-state-materialization-request-begin (session-key)
+  "Begin a materialization request for SESSION-KEY and return its owner.
+
+The returned opaque plist captures the current message observation clock.
+Only reaction patches observed strictly after that clock may repair the
+request's eventual snapshot."
+  (qq-state-session-key-identity session-key)
+  (let* ((id (cl-incf qq-state--materialization-request-counter))
+         (owner (list :id id
+                      :session-key session-key
+                      :start-token qq-state--message-observation-clock)))
+    (puthash id owner qq-state--materialization-request-owners)
+    (copy-tree owner)))
+
+(defun qq-state--materialization-request-current (owner &optional session-key)
+  "Return registered OWNER when it is active and matches SESSION-KEY."
+  (when (listp owner)
+    (let* ((id (plist-get owner :id))
+           (current (and (integerp id)
+                         (gethash id
+                                  qq-state--materialization-request-owners))))
+      (when (and current
+                 (equal current owner)
+                 (or (null session-key)
+                     (equal session-key (plist-get current :session-key))))
+        current))))
+
+(defun qq-state--reaction-patch-needed-p (session-key patch)
+  "Return non-nil when an active SESSION-KEY owner may need PATCH."
+  (let ((token (plist-get patch :observation-token))
+        needed)
+    (when (integerp token)
+      (maphash
+       (lambda (_id owner)
+         (when (and (equal session-key (plist-get owner :session-key))
+                    (< (plist-get owner :start-token) token))
+           (setq needed t)))
+       qq-state--materialization-request-owners))
+    needed))
+
+(defun qq-state--prune-reaction-patch-journal (&optional only-session-key)
+  "Discard reaction patches no active request can observe.
+
+When ONLY-SESSION-KEY is non-nil, inspect only entries in that session.
+Recall tombstones are retained permanently."
+  (let (updates removals)
+    (maphash
+     (lambda (key entry)
+       (when (or (null only-session-key)
+                 (equal only-session-key (car key)))
+         (let* ((session-key (car key))
+                (retained
+                 (seq-filter
+                  (lambda (patch)
+                    (qq-state--reaction-patch-needed-p session-key patch))
+                  (plist-get entry :reaction-patches)))
+                (next (plist-put (copy-tree entry)
+                                 :reaction-patches retained)))
+           (if (or (plist-get next :recalled-p) retained)
+               (push (cons key next) updates)
+             (push key removals)))))
+     qq-state--message-patch-journal)
+    (dolist (update updates)
+      (puthash (car update) (cdr update) qq-state--message-patch-journal))
+    (dolist (key removals)
+      (remhash key qq-state--message-patch-journal))))
+
+(defun qq-state-materialization-request-end (owner)
+  "End active materialization request OWNER.
+
+Return non-nil only when OWNER was active.  Reaction patches are pruned once
+no older request in the same session can still consume them."
+  (when-let* ((current (qq-state--materialization-request-current owner))
+              (id (plist-get current :id))
+              (session-key (plist-get current :session-key)))
+    (remhash id qq-state--materialization-request-owners)
+    (qq-state--prune-reaction-patch-journal session-key)
+    t))
+
+(defun qq-state--journal-message-patch
+    (session-key message-id patch)
+  "Journal closed PATCH for MESSAGE-ID in SESSION-KEY when required.
+
+Recall is stored as a tombstone.  A reaction patch is retained only when an
+active request started before its observation token."
   (let* ((key (qq-state--message-patch-journal-key session-key message-id))
          (entry (copy-tree (gethash key qq-state--message-patch-journal))))
     (pcase (plist-get patch :kind)
       ('recall
        (setq entry (plist-put entry :recalled-p t)))
       ('emoji-like
-       (if (plist-get entry :reaction-overlay-p)
-           (let* ((base `((reactions . ,(copy-tree
-                                         (plist-get entry :reactions)))))
-                  (updated (qq-state-message-apply-patch base patch)))
-             (setq entry
-                   (plist-put entry :reactions
-                              (copy-tree (alist-get 'reactions updated)))))
+       (when (qq-state--reaction-patch-needed-p session-key patch)
          (setq entry
                (plist-put
-                entry :pending-reaction-patches
-                (append (plist-get entry :pending-reaction-patches)
+                entry :reaction-patches
+                (append (plist-get entry :reaction-patches)
                         (list (copy-tree patch)))))))
       (kind (error "qq: unsupported message patch kind %S" kind)))
-    (puthash key entry qq-state--message-patch-journal)))
+    (when (or (plist-get entry :recalled-p)
+              (plist-get entry :reaction-patches))
+      (puthash key entry qq-state--message-patch-journal))))
 
-(defun qq-state--record-materialized-message-patch
-    (session-key message-id patch message)
-  "Record the exact result of applying PATCH to materialized MESSAGE."
-  (let* ((key (qq-state--message-patch-journal-key session-key message-id))
-         (entry (copy-tree (gethash key qq-state--message-patch-journal))))
-    (pcase (plist-get patch :kind)
-      ('recall
-       (setq entry (plist-put entry :recalled-p t)))
-      ('emoji-like
-       (setq entry (plist-put entry :reaction-overlay-p t))
-       (setq entry
-             (plist-put entry :reactions
-                        (copy-tree (qq-state-message-reactions message))))
-       (setq entry (plist-put entry :pending-reaction-patches nil)))
-      (kind (error "qq: unsupported message patch kind %S" kind)))
-    (puthash key entry qq-state--message-patch-journal)))
+(defun qq-state--message-reaction-observation-token (message)
+  "Return MESSAGE's latest materialized reaction observation token."
+  (let ((token (alist-get 'reaction-observation-token message)))
+    (and (integerp token) token)))
 
-(defun qq-state--materialize-message-patches (session-key message)
+(defun qq-state--apply-observed-reaction-patch (message patch)
+  "Apply reaction PATCH to MESSAGE and record its observation token.
+
+The token is a per-canonical-message watermark.  It lets a later request
+response replay only deltas that have not already reached that row."
+  (let ((token (plist-get patch :observation-token))
+        (updated (qq-state-message-apply-patch message patch)))
+    (unless (integerp token)
+      (error "qq: reaction patch requires an observation token"))
+    (setf (alist-get 'reaction-observation-token updated nil nil #'eq) token)
+    updated))
+
+(defun qq-state--materialize-message-patches
+    (session-key message &optional owner replay-retained-reactions-p)
   "Apply journaled notice state to normalized MESSAGE in SESSION-KEY.
 
-Pending emoji deltas are consumed once and replaced by their exact resulting
-reaction projection.  That projection and a recall tombstone are then safe to
-overlay repeatedly on stale snapshots."
+Recall tombstones always apply.  Reaction patches apply only when OWNER is an
+active request for SESSION-KEY and they were observed after OWNER started.
+When REPLAY-RETAINED-REACTIONS-P is non-nil without an owner, catch a
+canonical row up through every retained delta before applying a newer live
+notice.  In both cases the row's reaction observation watermark prevents a
+delta from being applied twice."
   (let* ((message-id (alist-get 'server-id message))
          (key (and message-id
                    (qq-state--message-patch-journal-key
@@ -1932,21 +2031,25 @@ overlay repeatedly on stale snapshots."
                       (gethash key qq-state--message-patch-journal)))))
     (if (null entry)
         message
-      (let ((updated (copy-tree message))
-            (pending (plist-get entry :pending-reaction-patches)))
-        (cond
-         ((plist-get entry :reaction-overlay-p)
-          (setf (alist-get 'reactions updated nil nil #'eq)
-                (copy-tree (plist-get entry :reactions))))
-         (pending
-          (dolist (patch pending)
-            (setq updated (qq-state-message-apply-patch updated patch)))
-          (setq entry (plist-put entry :reaction-overlay-p t))
-          (setq entry
-                (plist-put entry :reactions
-                           (copy-tree (qq-state-message-reactions updated))))
-          (setq entry (plist-put entry :pending-reaction-patches nil))
-          (puthash key entry qq-state--message-patch-journal)))
+      (let* ((updated (copy-tree message))
+             (current-owner
+              (qq-state--materialization-request-current owner session-key))
+             (start-token (and current-owner
+                               (plist-get current-owner :start-token)))
+             (replay-floor
+              (cond (start-token start-token)
+                    (replay-retained-reactions-p -1)))
+             (applied-token
+              (or (qq-state--message-reaction-observation-token updated) -1)))
+        (when replay-floor
+          (dolist (patch (plist-get entry :reaction-patches))
+            (let ((token (plist-get patch :observation-token)))
+              (when (and (integerp token)
+                         (< replay-floor token)
+                         (< applied-token token))
+                (setq updated
+                      (qq-state--apply-observed-reaction-patch updated patch))
+                (setq applied-token token)))))
         (when (plist-get entry :recalled-p)
           (setq updated (qq-state--as-recalled-message updated)))
         updated))))
@@ -2086,11 +2189,15 @@ echo.  Numeric participant IDs remain display labels of last resort."
                  (list :previous-anchor previous-anchor)))
         merged))))
 
-(defun qq-state-merge-history (session-key raw-messages)
+(defun qq-state-merge-history (session-key raw-messages &optional request-owner)
   "Merge RAW-MESSAGES history batch into SESSION-KEY.
 
 Recalled rows from NapCat (`recalled'/`recall_time') are stored as stubs so
 `qq-chat-show-recalled-messages' can optionally show them.
+
+REQUEST-OWNER, when non-nil, is the active owner returned before this history
+request was dispatched.  Only reaction patches observed after that owner
+started may repair an explicit reaction snapshot in the response.
 
 Return a plist:
   :session-key, :message-count (batch size), :added-count (new server ids),
@@ -2130,6 +2237,8 @@ Return a plist:
                             (gethash (alist-get 'local-id pending)
                                      local-cells))))
              (existing (and cell (car cell)))
+             (explicit-reactions-p (and (assq 'emoji_likes_list raw-message)
+                                        t))
              (merged (if existing
                          (qq-state--merge-alists existing normalized)
                        normalized))
@@ -2142,8 +2251,23 @@ Return a plist:
                    (qq-state-message-recalled-p existing)
                    (not (qq-state-message-recalled-p merged)))
           (setq merged (qq-state--as-recalled-message merged)))
+        ;; An explicit reaction snapshot replaces the previous canonical base.
+        ;; Reset its watermark to the request's observation boundary so only
+        ;; later journaled deltas are replayed.  Without a valid owner there is
+        ;; no freshness proof, so do not preserve a watermark from the row that
+        ;; the snapshot just replaced.
+        (when explicit-reactions-p
+          (setq merged
+                (assq-delete-all 'reaction-observation-token merged))
+          (when-let* ((current-owner
+                       (qq-state--materialization-request-current
+                        request-owner session-key))
+                      (start-token (plist-get current-owner :start-token)))
+            (setf (alist-get 'reaction-observation-token merged nil nil #'eq)
+                  start-token)))
         (setq merged
-              (qq-state--materialize-message-patches session-key merged))
+              (qq-state--materialize-message-patches
+               session-key merged request-owner))
         (if cell
             (setcar cell merged)
           (push merged messages)
@@ -2182,11 +2306,13 @@ Return a plist:
             :batch-oldest-message-id (car batch-ids)
             :batch-newest-message-id (car (last batch-ids))))))
 
-(defun qq-state-mark-pending-message-sent (session-key local-id message-id)
+(defun qq-state-mark-pending-message-sent
+    (session-key local-id message-id &optional request-owner)
   "Mark local pending message LOCAL-ID as sent with MESSAGE-ID in SESSION-KEY.
 
 MESSAGE-ID is the NapCat NT snowflake string (`message_id' in the protocol
-hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor."
+hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor.
+REQUEST-OWNER is the owner captured before dispatching the send request."
   (let* ((messages (copy-tree (or (gethash session-key qq-state--messages-by-session) '())))
          (existing (qq-state--find-message
                     messages
@@ -2202,7 +2328,8 @@ hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor."
                         (status . sent)
                         (error . nil)))))
         (setq updated
-              (qq-state--materialize-message-patches session-key updated))
+              (qq-state--materialize-message-patches
+               session-key updated request-owner))
         (setq messages (qq-state--replace-message messages existing updated))
         (setq messages (qq-state--sort-messages messages))
         (puthash session-key messages qq-state--messages-by-session)
@@ -2370,15 +2497,17 @@ Return the updated canonical message, if one was present."
                          messages
                          (lambda (it)
                            (equal (alist-get 'server-id it) normalized-id)))))
-         (patch '(:kind recall)))
+         (observation-token (qq-state--next-message-observation-token))
+         (patch (list :kind 'recall
+                      :observation-token observation-token)))
     (cond
      ((and session-key existing)
       (let* ((materialized
               (qq-state--materialize-message-patches
                session-key existing))
              (updated (qq-state-message-apply-patch materialized patch)))
-        (qq-state--record-materialized-message-patch
-         session-key normalized-id patch updated)
+        (qq-state--journal-message-patch
+         session-key normalized-id patch)
         (setq messages (qq-state--replace-message messages existing updated))
         (puthash session-key messages qq-state--messages-by-session)
         (qq-state--index-message updated)
@@ -2389,19 +2518,21 @@ Return the updated canonical message, if one was present."
                         :message-anchor (qq-state-message-anchor updated)
                         :mutation 'update
                         :source 'notice
+                        :observation-token observation-token
                         :message-patch patch)
         updated))
      ((and session-key normalized-id)
       ;; Filter projections deliberately do not register in the canonical
       ;; message index.  Journal the patch for later canonical materialization
       ;; and publish it so the private projection updates immediately.
-      (qq-state--remember-unmaterialized-message-patch
+      (qq-state--journal-message-patch
        session-key normalized-id patch)
       (qq-state--emit 'message
                       :session-key session-key
                       :message-anchor normalized-id
                       :mutation 'update
                       :source 'notice
+                      :observation-token observation-token
                       :message-patch patch)
       nil))))
 
@@ -2526,14 +2657,22 @@ canonical history."
                 messages
                 (lambda (message)
                   (equal (alist-get 'server-id message) message-id)))))
-         (patch (list :kind 'emoji-like :notice (copy-tree notice))))
+         (observation-token (qq-state--next-message-observation-token))
+         (patch (list :kind 'emoji-like
+                      :observation-token observation-token
+                      :notice (copy-tree notice))))
     (cond
      ((and session-key existing)
       (let* ((materialized
-              (qq-state--materialize-message-patches session-key existing))
-             (updated (qq-state-message-apply-patch materialized patch)))
-        (qq-state--record-materialized-message-patch
-         session-key message-id patch updated)
+              (qq-state--materialize-message-patches
+               ;; Fold any older retained deltas first.  This keeps the
+               ;; per-message watermark contiguous when a first notice arrived
+               ;; before the live message and this newer notice arrived after.
+               session-key existing nil t))
+             (updated
+              (qq-state--apply-observed-reaction-patch materialized patch)))
+        (qq-state--journal-message-patch
+         session-key message-id patch)
         (setq messages (qq-state--replace-message messages existing updated))
         (puthash session-key messages qq-state--messages-by-session)
         (qq-state--index-message updated)
@@ -2544,16 +2683,18 @@ canonical history."
                         :message-anchor message-id
                         :mutation 'update
                         :source 'notice
+                        :observation-token observation-token
                         :message-patch patch)
         updated))
      ((and session-key message-id)
-      (qq-state--remember-unmaterialized-message-patch
+      (qq-state--journal-message-patch
        session-key message-id patch)
       (qq-state--emit 'message
                       :session-key session-key
                       :message-anchor message-id
                       :mutation 'update
                       :source 'notice
+                      :observation-token observation-token
                       :message-patch patch)
       nil))))
 
@@ -2955,6 +3096,18 @@ field.  Requiring a non-empty status_text previously dropped every event."
                         :source 'notice
                         :actions (qq-state-session-actions session-key))
         (qq-state-session-actions session-key))))))
+
+(defun qq-state-message-apply-tombstones (session-key message)
+  "Apply permanent SESSION-KEY tombstones to normalized MESSAGE.
+
+This is the public projection boundary for buffer-owned snapshots such as
+message-search results.  It does not store MESSAGE or replay request-scoped
+reaction observations; recall is the only permanent message patch."
+  (qq-state-session-key-identity session-key)
+  (unless (listp message)
+    (error "qq: message tombstones require a normalized message"))
+  (qq-state--materialize-message-patches session-key message))
+
 (provide 'qq-state)
 
 ;;; qq-state.el ends here

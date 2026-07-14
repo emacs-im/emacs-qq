@@ -2076,7 +2076,12 @@
        (should (equal (plist-get event :message-anchor) message-id))
        (should (eq (plist-get event :mutation) 'update))
        (should (eq (plist-get event :source) 'notice))
-       (should (equal (plist-get event :message-patch) '(:kind recall)))
+       (should (integerp (plist-get event :observation-token)))
+       (should (equal (plist-get event :observation-token)
+                      (plist-get (plist-get event :message-patch)
+                                 :observation-token)))
+       (should (eq (plist-get (plist-get event :message-patch) :kind)
+                   'recall))
        (should-not (plist-member event :message)))
      (should-not (qq-state-session-messages "private:10001")))))
 
@@ -2090,6 +2095,7 @@
              (message_id . ,message-id)
              (is_add . t)
              (likes . (((emoji_id . "178") (count . 2))))))
+          (before-token (qq-state-message-observation-token))
           events)
      (add-hook 'qq-state-change-hook
                (lambda (event)
@@ -2105,6 +2111,11 @@
        (should (eq (plist-get event :mutation) 'update))
        (should (eq (plist-get event :source) 'notice))
        (should (eq (plist-get patch :kind) 'emoji-like))
+       (should (integerp (plist-get event :observation-token)))
+       (should (= (1+ before-token)
+                  (plist-get event :observation-token)))
+       (should (equal (plist-get event :observation-token)
+                      (plist-get patch :observation-token)))
        (should (equal (plist-get patch :notice) notice))
        (should-not (plist-member event :message)))
      (should-not (qq-state-session-messages "group:20001")))))
@@ -2145,8 +2156,8 @@
      (should (qq-state-message-recalled-p
               (car (qq-state-session-messages "private:10001")))))))
 
-(ert-deftest qq-state-emoji-before-history-folds-delta-once ()
-  "Queued reaction deltas become an idempotent overlay after materialization."
+(ert-deftest qq-state-reaction-window-repairs-only-older-request ()
+  "A reaction repairs an older request without freezing future snapshots."
   (qq-test-with-reset
    (qq-state-set-self-info '((user_id . "90001") (nickname . "Me")))
    (let* ((message-id "9007199254741004886")
@@ -2171,41 +2182,101 @@
               . (((emoji_id . "178")
                   (emoji_type . "1")
                   (likes_cnt . "2")
-                  (is_clicked . "0")))))))
+                  (is_clicked . "0"))))))
+          (current-owner
+           (qq-state-materialization-request-begin "group:20001")))
      (should-not
       (qq-state-apply-emoji-like-notice "group:20001" notice))
-     (qq-state-merge-history "group:20001" (list stale-snapshot))
+     (qq-state-merge-history
+      "group:20001" (list stale-snapshot) current-owner)
      (should
       (= 3
          (alist-get
           'count
           (car (qq-state-message-reactions
                 (car (qq-state-session-messages "group:20001")))))))
-     ;; The same stale page must not apply the queued +1 a second time.
-     (qq-state-merge-history "group:20001" (list stale-snapshot))
+     ;; Re-materializing the same explicit base under the same owner remains
+     ;; base 2 + one delta, rather than using the already-updated base 3.
+     (qq-state-merge-history
+      "group:20001" (list stale-snapshot) current-owner)
      (should
       (= 3
          (alist-get
           'count
           (car (qq-state-message-reactions
                 (car (qq-state-session-messages "group:20001")))))))
-     ;; A newer aggregate notice updates the overlay; stale history cannot
-     ;; overwrite it afterwards.
-     (qq-state-apply-emoji-like-notice
-      "group:20001"
-      `((notice_type . "group_msg_emoji_like")
-        (group_id . "20001")
-        (user_id . "10002")
-        (message_id . ,message-id)
-        (is_add . t)
-        (likes . (((emoji_id . "178") (emoji_type . "1") (count . 4))))))
-     (qq-state-merge-history "group:20001" (list stale-snapshot))
+     (should (qq-state-materialization-request-end current-owner))
+     (should-not
+      (gethash (cons "group:20001" message-id)
+               qq-state--message-patch-journal))
+     ;; A future owner starts after the notice.  Its base 3 must stay 3: the
+     ;; old +1 is outside this request's observation window.
+     (let* ((future-owner
+             (qq-state-materialization-request-begin "group:20001"))
+            (future-snapshot (copy-tree stale-snapshot)))
+       (setf (alist-get 'likes_cnt
+                        (car (alist-get 'emoji_likes_list future-snapshot)))
+             "3")
+       (qq-state-merge-history
+        "group:20001" (list future-snapshot) future-owner)
+       (should
+        (= 3
+           (alist-get
+            'count
+            (car (qq-state-message-reactions
+                  (car (qq-state-session-messages "group:20001")))))))
+       ;; A later authoritative snapshot remains free to advance to 4.
+       (setf (alist-get 'likes_cnt
+                        (car (alist-get 'emoji_likes_list future-snapshot)))
+             "4")
+       (qq-state-merge-history
+        "group:20001" (list future-snapshot) future-owner)
+       (should (qq-state-materialization-request-end future-owner)))
      (should
       (= 4
          (alist-get
           'count
           (car (qq-state-message-reactions
                 (car (qq-state-session-messages "group:20001"))))))))))
+
+(ert-deftest qq-state-reaction-window-does-not-replay-on-merged-current-base ()
+  "A response omitting reactions keeps the already patched canonical base."
+  (qq-test-with-reset
+   (let* ((session-key "group:20001")
+          (message-id "9007199254741004888")
+          (base
+           `((message_id . ,message-id)
+             (message_type . "group")
+             (chat_type . 2)
+             (peer_uin . "20001")
+             (group_id . "20001")
+             (user_id . "10001")
+             (time . 1710000001)
+             (sender . ((user_id . "10001") (nickname . "Alice")))
+             (message . ())
+             (emoji_likes_list
+              . (((emoji_id . "178") (likes_cnt . "2"))))))
+          (without-reactions (copy-tree base)))
+     (setq without-reactions
+           (assq-delete-all 'emoji_likes_list without-reactions))
+     (qq-state-merge-history session-key (list base))
+     (let ((owner (qq-state-materialization-request-begin session-key)))
+       (qq-state-apply-emoji-like-notice
+        session-key
+        `((notice_type . "group_msg_emoji_like")
+          (group_id . "20001")
+          (user_id . "10002")
+          (message_id . ,message-id)
+          (is_add . t)
+          (likes . (((emoji_id . "178"))))))
+       (qq-state-merge-history session-key (list without-reactions) owner)
+       (should
+        (= 3
+           (alist-get
+            'count
+            (car (qq-state-message-reactions
+                  (car (qq-state-session-messages session-key)))))))
+       (should (qq-state-materialization-request-end owner))))))
 
 (ert-deftest qq-state-pending-promotion-materializes-earlier-recall ()
   "The send response is a materialization boundary for a known snowflake."
@@ -2220,6 +2291,235 @@
      (let ((message (car (qq-state-session-messages "private:10001"))))
        (should (equal (alist-get 'server-id message) message-id))
        (should (qq-state-message-recalled-p message))))))
+
+(ert-deftest qq-state-pending-promotion-replays-only-owner-window-reaction ()
+  "A send response applies a reaction observed while that send was active."
+  (qq-test-with-reset
+   (let* ((session-key "group:20001")
+          (message-id "9007199254741004889")
+          (pending
+           (qq-state-insert-pending-text-message session-key "race"))
+          (local-id (alist-get 'local-id pending))
+          (owner (qq-state-materialization-request-begin session-key)))
+     (qq-state-apply-emoji-like-notice
+      session-key
+      `((notice_type . "group_msg_emoji_like")
+        (group_id . "20001")
+        (user_id . "10002")
+        (message_id . ,message-id)
+        (is_add . t)
+        (likes . (((emoji_id . "178"))))))
+     (qq-state-mark-pending-message-sent
+      session-key local-id message-id owner)
+     (should
+      (= 1
+         (alist-get
+          'count
+          (car (qq-state-message-reactions
+                (car (qq-state-session-messages session-key)))))))
+     (should (qq-state-materialization-request-end owner)))))
+
+(ert-deftest qq-state-send-response-replays-notice-before-live-promotion ()
+  "A late send response applies a notice missed by ownerless live promotion."
+  (qq-test-with-reset
+   (qq-state-set-self-info '((user_id . "90001") (nickname . "Me")))
+   (let* ((session-key "group:20001")
+          (message-id "9007199254741004891")
+          (pending
+           (qq-state-insert-pending-text-message session-key "race"))
+          (local-id (alist-get 'local-id pending))
+          (owner (qq-state-materialization-request-begin session-key))
+          (now (truncate (float-time))))
+     ;; The reaction is ID-scoped, but the optimistic row does not know that
+     ;; server ID yet, so the active send owner keeps it in the journal.
+     (qq-state-apply-emoji-like-notice
+      session-key
+      `((notice_type . "group_msg_emoji_like")
+        (group_id . "20001")
+        (user_id . "10002")
+        (message_id . ,message-id)
+        (is_add . t)
+        (likes . (((emoji_id . "178"))))))
+     ;; The real websocket event wins the promotion race.  Use the production
+     ;; live merge, including weak pending reconciliation and timeline rekey.
+     (qq-state-merge-live-message
+      `((post_type . "message_sent")
+        (message_type . "group")
+        (chat_type . 2)
+        (peer_uin . "20001")
+        (group_id . "20001")
+        (message_id . ,message-id)
+        (self_id . "90001")
+        (user_id . "90001")
+        (time . ,now)
+        (sender . ((user_id . "90001") (nickname . "Me")))
+        (raw_message . "race")
+        (message . (((type . "text") (data . ((text . "race"))))))))
+     (let ((promoted (car (qq-state-session-messages session-key))))
+       (should (equal (alist-get 'local-id promoted) local-id))
+       (should (equal (alist-get 'server-id promoted) message-id))
+       (should-not (qq-state-message-reactions promoted)))
+     ;; server-id was already installed by the live event, but the canonical
+     ;; reaction watermark still proves that this owner-window delta is absent.
+     (qq-state-mark-pending-message-sent
+      session-key local-id message-id owner)
+     (qq-state-mark-pending-message-sent
+      session-key local-id message-id owner)
+     (let* ((message (car (qq-state-session-messages session-key)))
+            (reaction (car (qq-state-message-reactions message))))
+       (should (equal (alist-get 'server-id message) message-id))
+       (should (= 1 (alist-get 'count reaction)))
+       (should (integerp
+                (alist-get 'reaction-observation-token message))))
+     (should (qq-state-materialization-request-end owner)))))
+
+(ert-deftest qq-state-overlapping-reaction-owners-replay-selectively-and-prune ()
+  "Overlapping owners replay their own windows and retain only shared work."
+  (qq-test-with-reset
+   (let* ((session-key "group:20001")
+          (message-id "9007199254741004892")
+          (journal-key (cons session-key message-id))
+          (older-owner
+           (qq-state-materialization-request-begin session-key)))
+     (qq-state-apply-emoji-like-notice
+      session-key
+      `((notice_type . "group_msg_emoji_like")
+        (group_id . "20001")
+        (user_id . "10002")
+        (message_id . ,message-id)
+        (is_add . t)
+        (likes . (((emoji_id . "178"))))))
+     (let ((newer-owner
+            (qq-state-materialization-request-begin session-key)))
+       (qq-state-apply-emoji-like-notice
+        session-key
+        `((notice_type . "group_msg_emoji_like")
+          (group_id . "20001")
+          (user_id . "10003")
+          (message_id . ,message-id)
+          (is_add . t)
+          (likes . (((emoji_id . "178"))))))
+       (cl-labels
+           ((snapshot
+             (count)
+             `((message_id . ,message-id)
+               (message_type . "group")
+               (chat_type . 2)
+               (peer_uin . "20001")
+               (group_id . "20001")
+               (user_id . "10001")
+               (time . 1710000001)
+               (sender . ((user_id . "10001") (nickname . "Alice")))
+               (message . ())
+               (emoji_likes_list
+                . (((emoji_id . "178")
+                    (emoji_type . "1")
+                    (likes_cnt . ,(number-to-string count))
+                    (is_clicked . "0"))))))
+            (reaction-count
+             ()
+             (alist-get
+              'count
+              (car (qq-state-message-reactions
+                    (car (qq-state-session-messages session-key)))))))
+         ;; The older response base predates both deltas; the newer response
+         ;; base already includes the first.  Both converge to exactly two.
+         (qq-state-merge-history
+          session-key (list (snapshot 0)) older-owner)
+         (should (= 2 (reaction-count)))
+         (qq-state-merge-history
+          session-key (list (snapshot 1)) newer-owner)
+         (should (= 2 (reaction-count)))
+         (should
+          (= 2 (length (plist-get (gethash journal-key
+                                           qq-state--message-patch-journal)
+                                  :reaction-patches))))
+         ;; Once the older window closes, its first-only delta is pruned while
+         ;; the second remains available to the overlapping newer owner.
+         (should (qq-state-materialization-request-end older-owner))
+         (let ((retained
+                (plist-get (gethash journal-key
+                                    qq-state--message-patch-journal)
+                           :reaction-patches)))
+           (should (= 1 (length retained)))
+           (should
+            (< (plist-get newer-owner :start-token)
+               (plist-get (car retained) :observation-token))))
+         ;; Replaying the newer response is idempotent despite that retained
+         ;; delta, because its explicit base resets the per-row watermark.
+         (qq-state-merge-history
+          session-key (list (snapshot 1)) newer-owner)
+         (should (= 2 (reaction-count)))
+         (should (qq-state-materialization-request-end newer-owner))
+         (should-not
+          (gethash journal-key qq-state--message-patch-journal)))))))
+
+(ert-deftest qq-state-reaction-watermark-catches-up-before-newer-delta ()
+  "A newer live delta first folds an older journaled delta in arrival order."
+  (qq-test-with-reset
+   (let* ((session-key "group:20001")
+          (message-id "9007199254741004893")
+          (owner (qq-state-materialization-request-begin session-key)))
+     (qq-state-apply-emoji-like-notice
+      session-key
+      `((notice_type . "group_msg_emoji_like")
+        (group_id . "20001")
+        (user_id . "10002")
+        (message_id . ,message-id)
+        (is_add . t)
+        (likes . (((emoji_id . "178"))))))
+     (qq-state-merge-live-message
+      (qq-state-test--group-message
+       message-id (truncate (float-time)) "hello"))
+     (should-not
+      (qq-state-message-reactions
+       (car (qq-state-session-messages session-key))))
+     (qq-state-apply-emoji-like-notice
+      session-key
+      `((notice_type . "group_msg_emoji_like")
+        (group_id . "20001")
+        (user_id . "10003")
+        (message_id . ,message-id)
+        (is_add . t)
+        (likes . (((emoji_id . "178"))))))
+     (let* ((message (car (qq-state-session-messages session-key)))
+            (reaction (car (qq-state-message-reactions message))))
+       (should (= 2 (alist-get 'count reaction)))
+       (should (= (qq-state-message-observation-token)
+                  (alist-get 'reaction-observation-token message))))
+     (should (qq-state-materialization-request-end owner)))))
+
+(ert-deftest qq-state-send-response-does-not-replay-on-live-promoted-base ()
+  "A late send response keeps reactions already applied to the promoted row."
+  (qq-test-with-reset
+   (let* ((session-key "group:20001")
+          (message-id "9007199254741004890")
+          (pending
+           (qq-state-insert-pending-text-message session-key "race"))
+          (local-id (alist-get 'local-id pending))
+          (owner (qq-state-materialization-request-begin session-key)))
+     ;; Model the websocket event winning the send-response race.
+     (qq-state-mark-pending-message-sent session-key local-id message-id)
+     (qq-state-apply-emoji-like-notice
+      session-key
+      `((notice_type . "group_msg_emoji_like")
+        (group_id . "20001")
+        (user_id . "10002")
+        (message_id . ,message-id)
+        (is_add . t)
+        (likes . (((emoji_id . "178"))))))
+     ;; The pending row is already server-backed and contains the +1.  The
+     ;; request response carries no reaction snapshot base, so it must not
+     ;; apply the same patch again.
+     (qq-state-mark-pending-message-sent
+      session-key local-id message-id owner)
+     (should
+      (= 1
+         (alist-get
+          'count
+          (car (qq-state-message-reactions
+                (car (qq-state-session-messages session-key)))))))
+     (should (qq-state-materialization-request-end owner)))))
 
 (ert-deftest qq-state-message-patches-reject-identity-contradictions ()
   (qq-test-with-reset
