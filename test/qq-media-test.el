@@ -1285,6 +1285,17 @@
          (should (eq 'download-handle (plist-get state :transfer)))
          (should (symbolp (plist-get state :token))))))))
 
+(ert-deftest qq-media-cached-avatar-rendering-never-starts-fetches ()
+  (let (api-called)
+    (cl-letf (((symbol-function 'qq-media--cached-image) (lambda (_key) nil))
+              ((symbol-function 'qq-api-get-avatar)
+               (lambda (&rest _args) (setq api-called t)))
+              ((symbol-function 'qq-api-get-group-avatar)
+               (lambda (&rest _args) (setq api-called t))))
+      (should (equal (qq-media-avatar-cached-display-string "10001") "@"))
+      (should (equal (qq-media-group-avatar-cached-display-string "20001") "#"))
+      (should-not api-called))))
+
 (provide 'qq-media-test)
 
 ;;; qq-media-test.el ends here

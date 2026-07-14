@@ -324,6 +324,7 @@ Prefer this over inline button rows."
     ("i" "Session info" qq-root-open-info-at-point
      :inapt-if qq-transient--root-info-inapt-p)
     ("I" "My profile" qq-root-open-self-user)
+    ("d" "Contacts" qq-contacts-open)
     ("/" "Find session…" qq-root-open-session)
     ("s" "Search messages…" qq-root-search)
     ("u" "Next unread" qq-root-next-unread)]

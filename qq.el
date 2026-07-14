@@ -29,6 +29,7 @@
 (require 'qq-user-photo)
 (require 'qq-user)
 (require 'qq-group)
+(require 'qq-contacts)
 (require 'qq-root)
 (require 'qq-transient)
 (require 'qq-notifications)

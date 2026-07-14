@@ -136,6 +136,75 @@
   (should-not (qq-state-session-sendable-p "unknown:target"))
   (should-not (qq-state-session-sendable-p nil)))
 
+(ert-deftest qq-state-friend-categories-preserve-order-flatten-and-copy ()
+  (qq-test-with-reset
+   (let* ((source
+           '(((category_id . 7) (sort_id . 10) (name . "工作")
+              (online_count . 1)
+              (friends . (((user_id . "10002") (nickname . "B") (remark))
+                          ((user_id . "10001") (nickname . "A")
+                           (remark . "Alice")))))
+             ((category_id . 3) (sort_id . 20) (name . "空分组")
+              (online_count . 0) (friends))))
+          events)
+     (add-hook 'qq-state-change-hook
+               (lambda (event)
+                 (when (eq (plist-get event :type) 'friends-refreshed)
+                   (push event events))))
+     (qq-state-apply-friend-categories source)
+     (should (= (length events) 1))
+     (should (= (plist-get (car events) :count) 2))
+     (should (= (plist-get (car events) :category-count) 2))
+     (should (= (qq-state-friend-count) 2))
+     (should (equal (mapcar (lambda (friend) (alist-get 'user_id friend))
+                            (qq-state-friends))
+                    '("10002" "10001")))
+     (should (equal (alist-get 'remark (qq-state-friend "10001")) "Alice"))
+     (setf (alist-get 'name (car source)) "mutated")
+     (should (equal (alist-get 'name (car (qq-state-friend-categories)))
+                    "工作"))
+     (let ((copy (qq-state-friend-categories)))
+       (setf (alist-get 'nickname
+                        (car (alist-get 'friends (car copy))))
+             "changed")
+       (should (equal (alist-get 'nickname (qq-state-friend "10002")) "B"))))))
+
+(ert-deftest qq-state-joined-groups-preserve-snapshot-order ()
+  (qq-test-with-reset
+   (qq-state-apply-groups
+    '(((group_id . "20002") (group_name . "Second"))
+      ((group_id . "20001") (group_name . "First"))))
+   (should (equal (mapcar (lambda (group) (alist-get 'group_id group))
+                          (qq-state-groups))
+                  '("20002" "20001")))
+   (should (= (qq-state-group-count) 2))))
+
+(ert-deftest qq-state-reset-clears-directory-order-and-categories ()
+  (let ((qq-state-change-hook nil))
+    (qq-state-apply-friend-categories
+     '(((category_id . 1) (friends . (((user_id . "10001")))))))
+    (qq-state-apply-groups '(((group_id . "20001"))))
+    (qq-state-reset)
+    (should-not (qq-state-friend-categories))
+    (should-not (qq-state-friends))
+    (should-not (qq-state-groups))
+    (should (= (qq-state-friend-count) 0))
+    (should (= (qq-state-group-count) 0))))
+
+(ert-deftest qq-state-recent-snapshot-membership-is-not-session-existence ()
+  (qq-test-with-reset
+   (qq-state-apply-recent-contacts
+    (list (qq-state-test--recent-group-contact
+           "9007199254741004991" 1710000000 "hello")))
+   (should (qq-state-session-recent-p "group:20001"))
+   (qq-state-upsert-session
+    "group:20002" '((type . group) (target-id . "20002")) nil)
+   (should-not (qq-state-session-recent-p "group:20002"))
+   (should (equal (qq-state-recent-session-keys) '("group:20001")))
+   (let ((copy (qq-state-recent-session-keys)))
+     (setcar copy "changed")
+     (should (equal (qq-state-recent-session-keys) '("group:20001"))))))
+
 (ert-deftest qq-state-apply-input-status-tracks-and-clears ()
   "NapCat input_status maps to telega-like session actions."
   (qq-test-with-reset
@@ -193,10 +262,12 @@
 (ert-deftest qq-state-apply-poke-notice-uses-private-contact-names ()
   (qq-test-with-reset
    (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
-   (qq-state-apply-friends
-    '(((user_id . "10001")
-       (remark . "Alice")
-       (nickname . "Alice Nick"))))
+   (qq-state-apply-friend-categories
+    '(((category_id . 0) (sort_id . 0) (name . "好友")
+       (online_count . 0)
+       (friends . (((user_id . "10001")
+                    (remark . "Alice")
+                    (nickname . "Alice Nick")))))))
    (qq-state-upsert-session
     "private:10001"
     '((type . private)
@@ -1526,10 +1597,12 @@
 
 (ert-deftest qq-state-private-message-prefers-remark-and-keeps-nickname-trail ()
   (qq-test-with-reset
-   (qq-state-apply-friends
-    '(((user_id . 10001)
-       (remark . "Alice Remark")
-       (nickname . "Alice Nick"))))
+   (qq-state-apply-friend-categories
+    '(((category_id . 0) (sort_id . 0) (name . "好友")
+       (online_count . 0)
+       (friends . (((user_id . "10001")
+                    (remark . "Alice Remark")
+                    (nickname . "Alice Nick")))))))
    (qq-state-merge-live-message
     '((post_type . "message")
       (message_type . "private")

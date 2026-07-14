@@ -5,6 +5,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'qq-group)
+(require 'qq-contacts)
 (require 'qq-chat)
 (require 'qq-root)
 
@@ -74,6 +75,8 @@
       (should-not (string-match-p "\\[Open\\]" text))
       (goto-char (point-min))
       (search-forward "打开群聊")
+      (should (button-at (1- (point))))
+      (search-forward "搜索成员")
       (should (button-at (1- (point)))))))
 
 (ert-deftest qq-group-render-omits-unresolved-raw-enums ()
@@ -112,6 +115,42 @@
       (should-not qq-group--request)
       (should-not qq-group--request-owner))))
 
+(ert-deftest qq-group-member-search-button-prompts-and-dispatches ()
+  (with-temp-buffer
+    (qq-group-mode)
+    (setq qq-group--group-id "20001"
+          qq-group--profile (copy-tree qq-group-test--profile))
+    (let (call)
+      (cl-letf (((symbol-function 'qq-media-group-avatar-display-string)
+                 (lambda (_group-id) "@"))
+                ((symbol-function 'read-string)
+                 (lambda (&rest _args) "synthetic member"))
+                ((symbol-function 'qq-contacts-search-group-members)
+                 (lambda (group-id query) (setq call (list group-id query)))))
+        (qq-group-render)
+        (goto-char (point-min))
+        (search-forward "搜索成员")
+        (push-button (button-at (1- (point))))
+        (should (equal call '("20001" "synthetic member")))))))
+
+(ert-deftest qq-group-refresh-settles-synchronous-dispatch-error ()
+  (with-temp-buffer
+    (qq-group-mode)
+    (setq qq-group--group-id "20001")
+    (cl-letf (((symbol-function 'qq-group-render) #'ignore)
+              ((symbol-function 'qq-api-get-group)
+               (lambda (&rest _args) (error "synthetic dispatch failure"))))
+      (qq-group-refresh)
+      (should-not qq-group--loading)
+      (should-not qq-group--request)
+      (should-not qq-group--request-owner)
+      (should (string-match-p "synthetic dispatch failure" qq-group--error)))))
+
+(ert-deftest qq-group-mode-cancels-request-before-major-mode-change ()
+  (with-temp-buffer
+    (qq-group-mode)
+    (should (memq #'qq-group--cancel-request change-major-mode-hook))))
+
 (ert-deftest qq-group-entry-commands-dispatch-by-session-type ()
   (let (opened-user opened-group)
     (cl-letf (((symbol-function 'qq-root--session-at-point)
@@ -137,7 +176,9 @@
   (should (eq (lookup-key qq-chat-mode-map (kbd "C-c i"))
               #'qq-chat-open-peer-info))
   (should (eq (lookup-key qq-group-mode-map (kbd "m"))
-              #'qq-group-open-chat)))
+              #'qq-group-open-chat))
+  (should (eq (lookup-key qq-group-mode-map (kbd "s"))
+              #'qq-group-search-members)))
 
 (ert-deftest qq-group-reuses-one-profile-buffer-like-telega ()
   (should (equal (qq-group--buffer-name "20001") "*qq-group*"))

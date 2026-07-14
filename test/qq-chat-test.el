@@ -1766,10 +1766,12 @@
 
 (ert-deftest qq-chat-render-uses-friend-remark-with-nickname-trail ()
   (qq-chat-test-with-reset
-   (qq-state-apply-friends
-    '(((user_id . 10001)
-       (remark . "Alice Remark")
-       (nickname . "Alice Nick"))))
+   (qq-state-apply-friend-categories
+    '(((category_id . 0) (sort_id . 0) (name . "好友")
+       (online_count . 0)
+       (friends . (((user_id . "10001")
+                    (remark . "Alice Remark")
+                    (nickname . "Alice Nick")))))))
    (qq-state-upsert-session
     "private:10001"
     '((title . "Alice Remark")
@@ -5329,8 +5331,11 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
 
 (ert-deftest qq-chat-forward-targets-include-non-session-friends-and-groups ()
   (qq-chat-test-with-reset
-   (qq-state-apply-friends
-    '(((user_id . "10001") (nickname . "Alice") (remark . "A"))))
+   (qq-state-apply-friend-categories
+    '(((category_id . 0) (sort_id . 0) (name . "好友")
+       (online_count . 0)
+       (friends . (((user_id . "10001")
+                    (nickname . "Alice") (remark . "A")))))))
    (qq-state-apply-groups
     '(((group_id . "20001") (group_name . "Group A"))))
    (let ((targets (qq-chat--forwardable-target-sessions)))

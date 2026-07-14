@@ -38,6 +38,10 @@ resource identities let the shared timeline redraw only affected rows.")
 (defvar qq-state--self-info nil)
 (defvar qq-state--status nil)
 (defvar qq-state--sessions (make-hash-table :test #'equal))
+(defvar qq-state--recent-session-keys nil
+  "Canonical keys in the latest authoritative recent-contact snapshot.")
+(defvar qq-state--recent-session-key-set (make-hash-table :test #'equal)
+  "Set form of `qq-state--recent-session-keys' for constant-time membership.")
 (defvar qq-state--messages-by-session (make-hash-table :test #'equal))
 (defvar qq-state--message-patch-journal (make-hash-table :test #'equal)
   "Notice state keyed by (SESSION-KEY . MESSAGE-ID).
@@ -54,7 +58,17 @@ future request must accept its own authoritative reaction snapshot unchanged.")
   (make-hash-table :test #'eql)
   "Active materialization request owners keyed by their numeric identity.")
 (defvar qq-state--friends-by-id (make-hash-table :test #'equal))
+(defvar qq-state--friend-order nil
+  "Friend UINs in the authoritative snapshot order.")
+(defvar qq-state--friend-categories nil
+  "Authoritative ordered friend categories from Linux QQ.")
+(defvar qq-state--friend-categories-loaded-p nil
+  "Non-nil after an authoritative friend-category snapshot was applied.")
 (defvar qq-state--groups-by-id (make-hash-table :test #'equal))
+(defvar qq-state--group-order nil
+  "Joined group codes in the authoritative snapshot order.")
+(defvar qq-state--groups-loaded-p nil
+  "Non-nil after an authoritative joined-group snapshot was applied.")
 (defvar qq-state--requests nil)
 (defvar qq-state--message-session-index (make-hash-table :test #'equal))
 (defvar qq-state--local-message-session-index (make-hash-table :test #'equal))
@@ -219,6 +233,13 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   (setq qq-state--self-info nil)
   (setq qq-state--status nil)
   (setq qq-state--requests nil)
+  (setq qq-state--recent-session-keys nil)
+  (clrhash qq-state--recent-session-key-set)
+  (setq qq-state--friend-order nil)
+  (setq qq-state--friend-categories nil)
+  (setq qq-state--friend-categories-loaded-p nil)
+  (setq qq-state--group-order nil)
+  (setq qq-state--groups-loaded-p nil)
   (setq qq-state--message-order-counter 0)
   (setq qq-state--local-message-counter 0)
   (setq qq-state--session-summary-observation-clock 0)
@@ -2832,6 +2853,12 @@ write, so malformed payloads cannot leave a half-committed session snapshot."
          ;; Prepare the complete response before the first store mutation.
          (prepared (delq nil (mapcar #'qq-state--prepare-recent-contact
                                      (or contacts '())))))
+    (setq qq-state--recent-session-keys
+          (delete-dups
+           (mapcar (lambda (entry) (plist-get entry :session-key)) prepared)))
+    (clrhash qq-state--recent-session-key-set)
+    (dolist (session-key qq-state--recent-session-keys)
+      (puthash session-key t qq-state--recent-session-key-set))
     (dolist (entry prepared)
       (let* ((session-key (plist-get entry :session-key))
              (unread-count (plist-get entry :unread-count))
@@ -2867,6 +2894,14 @@ write, so malformed payloads cannot leave a half-committed session snapshot."
     (qq-state--emit 'sessions-refreshed :count (length contacts))
     (qq-state-sessions)))
 
+(defun qq-state-recent-session-keys ()
+  "Return keys from the latest authoritative recent-contact snapshot."
+  (copy-sequence qq-state--recent-session-keys))
+
+(defun qq-state-session-recent-p (session-key)
+  "Return non-nil when SESSION-KEY belongs to the latest recent snapshot."
+  (and (gethash session-key qq-state--recent-session-key-set) t))
+
 (defun qq-state--refresh-session-titles ()
   "Refresh hydrated session titles from current contact caches."
   (maphash
@@ -2875,24 +2910,37 @@ write, so malformed payloads cannot leave a half-committed session snapshot."
        (puthash session-key updated qq-state--sessions)))
    qq-state--sessions))
 
-(defun qq-state-apply-friends (friends)
-  "Replace cached friend list with FRIENDS."
+(defun qq-state-apply-friend-categories (categories)
+  "Replace cached friends with ordered authoritative CATEGORIES.
+
+Each category contains a `friends' list.  Both category order and friend
+order are retained exactly as supplied by the native snapshot."
+  (setq qq-state--friend-categories (copy-tree (or categories '())))
+  (setq qq-state--friend-categories-loaded-p t)
+  (setq qq-state--friend-order nil)
   (clrhash qq-state--friends-by-id)
-  (dolist (friend (or friends '()))
-    (puthash (qq-state--normalize-id (alist-get 'user_id friend))
-             (copy-tree friend)
-             qq-state--friends-by-id))
+  (dolist (category qq-state--friend-categories)
+    (dolist (friend (alist-get 'friends category))
+      (let ((user-id (alist-get 'user_id friend)))
+        (push user-id qq-state--friend-order)
+        (puthash user-id (copy-tree friend) qq-state--friends-by-id))))
+  (setq qq-state--friend-order (nreverse qq-state--friend-order))
   (qq-state--refresh-session-titles)
-  (qq-state--emit 'friends-refreshed :count (length friends))
-  friends)
+  (qq-state--emit 'friends-refreshed
+                  :count (length qq-state--friend-order)
+                  :category-count (length qq-state--friend-categories))
+  (qq-state-friend-categories))
 
 (defun qq-state-apply-groups (groups)
   "Replace cached group list with GROUPS."
+  (setq qq-state--groups-loaded-p t)
+  (setq qq-state--group-order nil)
   (clrhash qq-state--groups-by-id)
   (dolist (group (or groups '()))
-    (puthash (qq-state--normalize-id (alist-get 'group_id group))
-             (copy-tree group)
-             qq-state--groups-by-id))
+    (let ((group-id (qq-state--normalize-id (alist-get 'group_id group))))
+      (push group-id qq-state--group-order)
+      (puthash group-id (copy-tree group) qq-state--groups-by-id)))
+  (setq qq-state--group-order (nreverse qq-state--group-order))
   (qq-state--refresh-session-titles)
   (qq-state--emit 'groups-refreshed :count (length groups))
   groups)
@@ -2903,10 +2951,21 @@ write, so malformed payloads cannot leave a half-committed session snapshot."
 
 (defun qq-state-friends ()
   "Return all cached friend objects."
-  (let (friends)
-    (maphash (lambda (_id friend) (push (copy-tree friend) friends))
-             qq-state--friends-by-id)
-    friends))
+  (mapcar (lambda (user-id)
+            (copy-tree (gethash user-id qq-state--friends-by-id)))
+          qq-state--friend-order))
+
+(defun qq-state-friend-categories ()
+  "Return ordered authoritative friend categories."
+  (copy-tree qq-state--friend-categories))
+
+(defun qq-state-friend-categories-loaded-p ()
+  "Return non-nil after the native friend-category snapshot has loaded."
+  qq-state--friend-categories-loaded-p)
+
+(defun qq-state-friend-count ()
+  "Return the number of friends in the authoritative snapshot."
+  (length qq-state--friend-order))
 
 (defun qq-state-group (group-id)
   "Return cached group object for GROUP-ID."
@@ -2914,10 +2973,17 @@ write, so malformed payloads cannot leave a half-committed session snapshot."
 
 (defun qq-state-groups ()
   "Return all cached group objects."
-  (let (groups)
-    (maphash (lambda (_id group) (push (copy-tree group) groups))
-             qq-state--groups-by-id)
-    groups))
+  (mapcar (lambda (group-id)
+            (copy-tree (gethash group-id qq-state--groups-by-id)))
+          qq-state--group-order))
+
+(defun qq-state-groups-loaded-p ()
+  "Return non-nil after the native joined-group snapshot has loaded."
+  qq-state--groups-loaded-p)
+
+(defun qq-state-group-count ()
+  "Return the number of joined groups in the authoritative snapshot."
+  (length qq-state--group-order))
 
 (defun qq-state-add-request (request)
   "Append REQUEST event to local request list."

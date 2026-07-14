@@ -1167,6 +1167,12 @@ When image data is not ready yet, return a textual fallback."
    (qq-media-avatar-image user-id)
    "@"))
 
+(defun qq-media-avatar-cached-display-string (user-id)
+  "Return cached inline avatar for USER-ID without starting network work."
+  (qq-media--image-display-string
+   (qq-media--cached-image (format "avatar:%s" user-id))
+   "@"))
+
 (defun qq-media-url-preview-image (key url &optional max-height)
   "Return preview image for remote URL under cache KEY.
 
@@ -1212,6 +1218,12 @@ Use FALLBACK until the preview is available."
 When image data is not ready yet, return a textual fallback."
   (qq-media--image-display-string
    (qq-media-group-avatar-image group-id)
+   "#"))
+
+(defun qq-media-group-avatar-cached-display-string (group-id)
+  "Return cached inline group avatar for GROUP-ID without fetching it."
+  (qq-media--image-display-string
+   (qq-media--cached-image (format "group-avatar:%s" group-id))
    "#"))
 
 (defun qq-media-session-avatar-display-string (session)

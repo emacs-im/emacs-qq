@@ -5,12 +5,14 @@ A NapCat-backed QQ client for Emacs.
 Current scope:
 
 - connect to NapCat over OneBot websocket
-- keep recent sessions, friend list, and group list in memory
+- keep exact native recent sessions, friend categories, and joined groups
 - use appkit's shared UI and chat runtime across root and chat buffers
 - keep chat keybindings closer to telega.el conventions
 - handle live message events, replies, QQ media resources, and basic recall notices
 - complete native group members and QQ faces directly in the composer
 - search private/group history through Linux QQ, including messages not loaded locally
+- browse the complete QQ directory and natively search friends, group chats,
+  and members outside the recent-session list
 
 Quick start:
 
@@ -22,6 +24,13 @@ Quick start:
 ```
 
 Then run `M-x qq`.
+
+Press `c` in the root buffer to open `*qq-contacts*`.  It preserves Linux
+QQ's friend-category and joined-group order; `G` shows every joined group and
+`I` shows groups absent from the current recent-session snapshot.  `/` runs
+the native friend and group-chat searches with independent pagination.  On a
+group profile, `s` searches that group's members through the native contact
+index.  `RET` opens the exact chat and `i` opens its user/group profile.
 
 In a group composer, type `@` followed by a group card, nickname, QID, or QQ
 number and press `TAB`.  The selected row is stored as a real QQ `at` segment,
@@ -60,6 +69,8 @@ Development with Eask:
 - `eask install-deps`
 - `eask recompile`
 - `eask run script test`
+- `eask run script test-concise` — compile and print only the ERT summary on
+  success, while retaining the useful failure tail
 - `eask run script test-local` — force-refresh the sibling `appkit.el`, then
   run the tests
 - `eask emacs -Q -L . -l qq.el`

@@ -18,6 +18,20 @@
   (dolist (value '(nil :false :null 0 "false" "0" "no"))
     (should-not (qq-protocol-json-true-p value))))
 
+(ert-deftest qq-protocol-group-uin-is-canonical-uint32-string ()
+  (should (qq-protocol-group-uin-p "1"))
+  (should (qq-protocol-group-uin-p "4294967295"))
+  (dolist (value '("0" "01" "4294967296" 20001 nil))
+    (should-not (qq-protocol-group-uin-p value))))
+
+(ert-deftest qq-protocol-emacs-chat-locator-rejects-out-of-range-group-uin ()
+  (should
+   (qq-protocol-emacs-chat-locator-p
+    '((kind . "group") (group_id . "4294967295"))))
+  (should-not
+   (qq-protocol-emacs-chat-locator-p
+    '((kind . "group") (group_id . "4294967296")))))
+
 (defun qq-protocol-test--read-state ()
   "Return one complete strict authoritative read-state payload."
   '((unread_count . 3)
@@ -51,6 +65,7 @@
       (locator
        '(nil
          ((kind . "group") (group_id . 20001))
+         ((kind . "group") (group_id . "4294967296"))
          ((kind . "group") (group_id . "20001") (extra . t))
          ((kind . "private") (user_id . ""))
          ((kind . "dataline") (peer_uid . "device-1"))

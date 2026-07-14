@@ -24,9 +24,11 @@
 (autoload 'qq-user-open "qq-user" nil t)
 (autoload 'qq-group-open "qq-group" nil t)
 (autoload 'qq-search-open "qq-search" nil t)
+(autoload 'qq-contacts-open "qq-contacts" nil t)
 (declare-function qq-user-open "qq-user" (user-id))
 (declare-function qq-group-open "qq-group" (group-id))
 (declare-function qq-search-open "qq-search" (session-key &optional query))
+(declare-function qq-contacts-open "qq-contacts" ())
 
 (defconst qq-root-buffer-name "*qq-root*"
   "Name of the emacs-qq root buffer.")
@@ -582,6 +584,7 @@ offered."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "g") #'qq-root-refresh)
     (define-key map (kbd "s") #'qq-root-search)
+    (define-key map (kbd "c") #'qq-contacts-open)
     (define-key map (kbd "/") #'qq-root-open-session)
     (define-key map (kbd "RET") #'qq-root-open-at-point)
     (define-key map (kbd "a") #'qq-root-open-avatar-at-point)

@@ -9,6 +9,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'seq)
 (require 'subr-x)
 (require 'qq-customize)
 (require 'qq-protocol)
@@ -37,6 +38,29 @@ from authoritative Linux QQ observations.")
 
 (defvar qq-api--request-finalizers (make-hash-table :test #'equal)
   "Cleanup callbacks keyed by live transport request token.")
+
+(cl-defstruct (qq-api--snapshot-request
+               (:constructor qq-api--snapshot-request-create))
+  resource
+  action
+  validator
+  apply-function
+  subscribers
+  transport-token
+  settled-p)
+
+(cl-defstruct (qq-api--snapshot-subscription
+               (:constructor qq-api--snapshot-subscription-create))
+  request
+  callback
+  errback
+  active-p)
+
+(defvar qq-api--snapshot-active (make-hash-table :test #'eq)
+  "Active authoritative-directory request keyed by resource.")
+
+(defvar qq-api--snapshot-queued (make-hash-table :test #'eq)
+  "Next authoritative-directory request keyed by resource.")
 
 (defun qq-api--next-read-observation-token ()
   "Allocate a token for one read-state request or observation."
@@ -144,12 +168,15 @@ exactly once."
 
 (defun qq-api-cancel-request (request-token)
   "Cancel local callback ownership for REQUEST-TOKEN."
-  (when request-token
+  (cond
+   ((qq-api--snapshot-subscription-p request-token)
+    (qq-api--snapshot-cancel-subscription request-token))
+   (request-token
     (unwind-protect
         (qq-transport-cancel request-token)
       ;; Cancellation is also an API ownership boundary.  Settle a registered
       ;; materialization window even if the transport entry raced to absence.
-      (qq-api--run-request-finalizer request-token))))
+      (qq-api--run-request-finalizer request-token)))))
 
 (defun qq-api-message-id-p (value)
   "Return non-nil when VALUE is a canonical NT message snowflake.
@@ -176,8 +203,15 @@ low bits may already have been lost."
 
 (defun qq-api-group-id-p (value)
   "Return non-nil when VALUE is a canonical QQ group-code string."
-  (and (stringp value)
-       (string-match-p "\\`[0-9]+\\'" value)))
+  (qq-protocol-group-uin-p value))
+
+(defconst qq-api--uint32-max #xffffffff
+  "Largest exact unsigned 32-bit integer accepted by native directory data.")
+
+(defun qq-api--uint32-p (value)
+  "Return non-nil when VALUE is an exact unsigned 32-bit integer."
+  (and (integerp value)
+       (<= 0 value qq-api--uint32-max)))
 
 (defun qq-api-entry-id-p (value)
   "Return non-nil when VALUE is a canonical native snapshot entry id."
@@ -327,9 +361,10 @@ and must not be retained as an `unsupported.raw' diagnostic payload."
        (unless (qq-api--exact-object-keys-p chat '(kind group_id))
          (qq-api--signal-schema-error
           protocol-p "qq: %s group locator has invalid fields" context))
-       (unless (qq-api-user-id-p (alist-get 'group_id chat))
+       (unless (qq-api-group-id-p (alist-get 'group_id chat))
          (qq-api--signal-schema-error
-          protocol-p "qq: %s group_id must be a decimal string" context)))
+          protocol-p "qq: %s group_id must be a canonical uint32 group UIN"
+          context)))
       ("private"
        (unless (qq-api--exact-object-keys-p chat '(kind user_id))
          (qq-api--signal-schema-error
@@ -894,29 +929,261 @@ segments.  A resolve action result itself must be terminal or available."
          (when callback (funcall callback contacts))))
      errback)))
 
-(defun qq-api-refresh-friend-list (&optional callback errback)
-  "Refresh friend list, then call CALLBACK with it."
-  (interactive)
-  (qq-api-call
-   "get_friend_list"
-   nil
-   (lambda (response)
-     (let ((friends (qq-api--response-data response)))
-       (qq-state-apply-friends friends)
-       (when callback (funcall callback friends))))
-   errback))
+(defun qq-api--validate-friend-categories-snapshot (data)
+  "Validate and copy exact native friend-category snapshot DATA."
+  (unless (qq-api--exact-object-keys-p data '(categories))
+    (error "qq: emacs_get_friend_categories returned an invalid object"))
+  (let ((categories (alist-get 'categories data))
+        (seen-categories (make-hash-table :test #'eql))
+        (seen-friends (make-hash-table :test #'equal)))
+    (unless (listp categories)
+      (error "qq: emacs_get_friend_categories.categories must be an array"))
+    (cl-loop
+     for category in categories
+     for category-index from 0
+     do
+     (let ((context (format "emacs_get_friend_categories.categories[%d]"
+                            category-index)))
+       (unless (qq-api--exact-object-keys-p
+                category '(category_id sort_id name online_count friends))
+         (error "qq: %s has invalid fields" context))
+       (dolist (key '(category_id sort_id online_count))
+         (unless (qq-api--uint32-p (alist-get key category))
+           (error "qq: %s.%s must be an unsigned 32-bit integer"
+                  context key)))
+       (unless (stringp (alist-get 'name category))
+         (error "qq: %s.name must be a string" context))
+       (let ((category-id (alist-get 'category_id category))
+             (friends (alist-get 'friends category)))
+         (when (gethash category-id seen-categories)
+           (error "qq: friend snapshot duplicated category_id %s" category-id))
+         (puthash category-id t seen-categories)
+         (unless (listp friends)
+           (error "qq: %s.friends must be an array" context))
+         (cl-loop
+          for friend in friends
+          for friend-index from 0
+          do
+          (let ((friend-context (format "%s.friends[%d]" context friend-index)))
+            (unless (qq-api--exact-object-keys-p
+                     friend '(user_id nickname remark))
+              (error "qq: %s has invalid fields" friend-context))
+            (let ((user-id (alist-get 'user_id friend)))
+              (unless (qq-protocol--nonzero-decimal-string-p user-id)
+                (error "qq: %s.user_id must be an original nonzero decimal string"
+                       friend-context))
+              (when (gethash user-id seen-friends)
+                (error "qq: friend snapshot duplicated user_id %s" user-id))
+              (puthash user-id t seen-friends))
+            (unless (stringp (alist-get 'nickname friend))
+              (error "qq: %s.nickname must be a string" friend-context))
+            (unless (or (null (alist-get 'remark friend))
+                        (stringp (alist-get 'remark friend)))
+              (error "qq: %s.remark must be a string or null"
+                     friend-context)))))))
+    (copy-tree categories)))
 
-(defun qq-api-refresh-group-list (&optional callback errback)
-  "Refresh group list, then call CALLBACK with it."
+(defun qq-api--validate-joined-groups-snapshot (data)
+  "Validate exact native joined-group snapshot DATA and normalize its names."
+  (unless (qq-api--exact-object-keys-p data '(groups))
+    (error "qq: emacs_get_joined_groups returned an invalid object"))
+  (let ((groups (alist-get 'groups data))
+        (seen-groups (make-hash-table :test #'equal)))
+    (unless (listp groups)
+      (error "qq: emacs_get_joined_groups.groups must be an array"))
+    (cl-loop
+     for group in groups
+     for index from 0
+     collect
+     (let ((context (format "emacs_get_joined_groups.groups[%d]" index)))
+       (unless (qq-api--exact-object-keys-p
+                group '(group_id name remark member_count max_member_count
+                                 pinned self_permission))
+         (error "qq: %s has invalid fields" context))
+       (let ((group-id (alist-get 'group_id group)))
+         (unless (qq-protocol-group-uin-p group-id)
+           (error "qq: %s.group_id must be a canonical uint32 group UIN"
+                  context))
+         (when (gethash group-id seen-groups)
+           (error "qq: joined-group snapshot duplicated group_id %s" group-id))
+         (puthash group-id t seen-groups))
+       (unless (stringp (alist-get 'name group))
+         (error "qq: %s.name must be a string" context))
+       (unless (or (null (alist-get 'remark group))
+                   (stringp (alist-get 'remark group)))
+         (error "qq: %s.remark must be a string or null" context))
+       (dolist (key '(member_count max_member_count))
+         (unless (qq-api--uint32-p (alist-get key group))
+           (error "qq: %s.%s must be an unsigned 32-bit integer" context key)))
+       (unless (memq (alist-get 'pinned group) '(t :false))
+         (error "qq: %s.pinned must be a boolean" context))
+       (unless (member (alist-get 'self_permission group)
+                       '("member" "admin" "owner"))
+         (error "qq: %s.self_permission is invalid" context))
+       `((group_id . ,(alist-get 'group_id group))
+         (group_name . ,(alist-get 'name group))
+         (group_remark . ,(alist-get 'remark group))
+         (member_count . ,(alist-get 'member_count group))
+         (max_member_count . ,(alist-get 'max_member_count group))
+         (pinned . ,(alist-get 'pinned group))
+         (self_permission . ,(alist-get 'self_permission group)))))))
+
+(defun qq-api--snapshot-live-subscribers (request)
+  "Return active subscribers owned by authoritative REQUEST."
+  (seq-filter #'qq-api--snapshot-subscription-active-p
+              (qq-api--snapshot-request-subscribers request)))
+
+(defun qq-api--snapshot-call-subscriber (subscriber outcome value response reason)
+  "Settle SUBSCRIBER once with authoritative snapshot OUTCOME."
+  (when (qq-api--snapshot-subscription-active-p subscriber)
+    (setf (qq-api--snapshot-subscription-active-p subscriber) nil)
+    (condition-case error-data
+        (if (eq outcome 'success)
+            (when-let* ((callback
+                         (qq-api--snapshot-subscription-callback subscriber)))
+              (funcall callback value))
+          (funcall (qq-api--snapshot-subscription-errback subscriber)
+                   response reason))
+      (error
+       (message "qq: directory snapshot subscriber failed: %s"
+                (error-message-string error-data))))))
+
+(defun qq-api--snapshot-promote-queued (request)
+  "Finish REQUEST ownership and start its resource's queued request."
+  (let ((resource (qq-api--snapshot-request-resource request)))
+    (when (eq (gethash resource qq-api--snapshot-active) request)
+      (remhash resource qq-api--snapshot-active))
+    (when-let* ((queued (gethash resource qq-api--snapshot-queued)))
+      (remhash resource qq-api--snapshot-queued)
+      (when (qq-api--snapshot-live-subscribers queued)
+        (qq-api--snapshot-start queued)))))
+
+(defun qq-api--snapshot-complete (request outcome value response reason)
+  "Complete authoritative REQUEST with OUTCOME, VALUE, RESPONSE and REASON."
+  (unless (qq-api--snapshot-request-settled-p request)
+    (setf (qq-api--snapshot-request-settled-p request) t)
+    (let ((subscribers
+           (nreverse (qq-api--snapshot-request-subscribers request))))
+      (setf (qq-api--snapshot-request-subscribers request) nil)
+      (dolist (subscriber subscribers)
+        (qq-api--snapshot-call-subscriber
+         subscriber outcome value response reason)))
+    (qq-api--snapshot-promote-queued request)))
+
+(defun qq-api--snapshot-succeed (request response)
+  "Validate, apply and publish successful authoritative REQUEST RESPONSE."
+  (if (null (qq-api--snapshot-live-subscribers request))
+      (qq-api--snapshot-complete request 'success nil response nil)
+    (condition-case error-data
+        (let ((value
+               (funcall (qq-api--snapshot-request-validator request)
+                        (qq-api--response-data response))))
+          (funcall (qq-api--snapshot-request-apply-function request) value)
+          (qq-api--snapshot-complete request 'success value response nil))
+      (error
+       (qq-api--snapshot-complete
+        request 'error nil response (error-message-string error-data))))))
+
+(defun qq-api--snapshot-fail (request response reason)
+  "Publish transport failure REASON for authoritative REQUEST."
+  (qq-api--snapshot-complete request 'error nil response reason))
+
+(defun qq-api--snapshot-start (request)
+  "Start authoritative directory REQUEST as its resource's sole flight."
+  (let ((resource (qq-api--snapshot-request-resource request)))
+    (puthash resource request qq-api--snapshot-active)
+    (condition-case error-data
+        (let ((token
+               (qq-api-call
+                (qq-api--snapshot-request-action request)
+                '((refresh . t))
+                (apply-partially #'qq-api--snapshot-succeed request)
+                (apply-partially #'qq-api--snapshot-fail request))))
+          (cond
+           ((qq-api--snapshot-request-settled-p request))
+           (token
+            (setf (qq-api--snapshot-request-transport-token request) token))
+           (t
+            (qq-api--snapshot-complete
+             request 'error nil nil
+             "transport did not return a directory snapshot request token"))))
+      (error
+       (qq-api--snapshot-complete
+        request 'error nil nil (error-message-string error-data))))))
+
+(defun qq-api--snapshot-subscribe
+    (resource action validator apply-function callback errback)
+  "Subscribe to a serialized authoritative RESOURCE snapshot refresh."
+  (let* ((active (gethash resource qq-api--snapshot-active))
+         (request
+          (if active
+              (or (gethash resource qq-api--snapshot-queued)
+                  (let ((queued
+                         (qq-api--snapshot-request-create
+                          :resource resource
+                          :action action
+                          :validator validator
+                          :apply-function apply-function)))
+                    (puthash resource queued qq-api--snapshot-queued)
+                    queued))
+            (qq-api--snapshot-request-create
+             :resource resource
+             :action action
+             :validator validator
+             :apply-function apply-function)))
+         (subscriber
+          (qq-api--snapshot-subscription-create
+           :request request
+           :callback callback
+           :errback (or errback #'qq-api--default-error)
+           :active-p t)))
+    (push subscriber (qq-api--snapshot-request-subscribers request))
+    (unless active
+      (qq-api--snapshot-start request))
+    subscriber))
+
+(defun qq-api--snapshot-cancel-orphaned-active (resource)
+  "Cancel RESOURCE's active request when no subscriber or queue owns it."
+  (when-let* ((active (gethash resource qq-api--snapshot-active))
+              ((null (qq-api--snapshot-live-subscribers active)))
+              ((null (gethash resource qq-api--snapshot-queued))))
+    (setf (qq-api--snapshot-request-settled-p active) t)
+    (remhash resource qq-api--snapshot-active)
+    (when-let* ((token (qq-api--snapshot-request-transport-token active)))
+      (qq-transport-cancel token))))
+
+(defun qq-api--snapshot-cancel-subscription (subscriber)
+  "Cancel only authoritative snapshot SUBSCRIBER's callback ownership."
+  (when (qq-api--snapshot-subscription-active-p subscriber)
+    (setf (qq-api--snapshot-subscription-active-p subscriber) nil)
+    (let* ((request (qq-api--snapshot-subscription-request subscriber))
+           (resource (qq-api--snapshot-request-resource request))
+           (live (qq-api--snapshot-live-subscribers request)))
+      (when (and (eq (gethash resource qq-api--snapshot-queued) request)
+                 (not live))
+        (remhash resource qq-api--snapshot-queued))
+      (qq-api--snapshot-cancel-orphaned-active resource)
+      t)))
+
+(defun qq-api-refresh-friend-categories (&optional callback errback)
+  "Refresh exact native friend categories, then call CALLBACK with them."
   (interactive)
-  (qq-api-call
-   "get_group_list"
-   nil
-   (lambda (response)
-     (let ((groups (qq-api--response-data response)))
-       (qq-state-apply-groups groups)
-       (when callback (funcall callback groups))))
-   errback))
+  (qq-api--snapshot-subscribe
+   'friend-categories
+   "emacs_get_friend_categories"
+   #'qq-api--validate-friend-categories-snapshot
+   #'qq-state-apply-friend-categories
+   callback errback))
+
+(defun qq-api-refresh-joined-groups (&optional callback errback)
+  "Refresh exact native joined groups, then call CALLBACK with them."
+  (interactive)
+  (qq-api--snapshot-subscribe
+   'joined-groups
+   "emacs_get_joined_groups"
+   #'qq-api--validate-joined-groups-snapshot
+   #'qq-state-apply-groups
+   callback errback))
 
 (defun qq-api-bootstrap ()
   "Run initial bootstrap in dependency order.
@@ -929,13 +1196,13 @@ self message as incoming or store a weaker sender display name."
   (cl-labels
       ((recent () (qq-api-refresh-recent-contacts))
        (groups ()
-         (qq-api-refresh-group-list
+         (qq-api-refresh-joined-groups
           (lambda (_groups) (recent))
           (lambda (response reason)
             (qq-api--default-error response reason)
             (recent))))
        (friends ()
-         (qq-api-refresh-friend-list
+         (qq-api-refresh-friend-categories
           (lambda (_friends) (groups))
           (lambda (response reason)
             (qq-api--default-error response reason)
@@ -1812,7 +2079,7 @@ notice reconciles it with the authoritative aggregate count."
 (defun qq-api-get-group (group-id callback &optional errback)
   "Fetch native group profile for GROUP-ID and pass it to CALLBACK."
   (unless (qq-api-group-id-p group-id)
-    (user-error "qq: group profile requires a decimal string group id"))
+    (user-error "qq: group profile requires a canonical uint32 group UIN"))
   (qq-api-call
    "emacs_get_group"
    `((group_id . ,group-id))
@@ -1994,6 +2261,41 @@ continuous window remain untouched."
             (eq (alist-get 'robot member) t))
       copy)))
 
+(defun qq-api--validate-group-member-search-results (data)
+  "Validate and copy the closed native group-member search array DATA."
+  (unless (and (listp data) (proper-list-p data))
+    (error "qq: emacs_search_group_members returned a non-array"))
+  (let ((seen-user-ids (make-hash-table :test #'equal)))
+    (cl-loop
+     for member in data
+     for index from 0
+     for normalized = (qq-api--normalize-group-member-search-result member index)
+     for user-id = (alist-get 'user_id normalized)
+     do (when (gethash user-id seen-user-ids)
+          (error
+           "qq: emacs_search_group_members returned duplicate user_id %s"
+           user-id))
+     do (puthash user-id t seen-user-ids)
+     collect normalized)))
+
+(defun qq-api--group-member-search-callback (callback errback response)
+  "Validate group-member search RESPONSE before invoking CALLBACK.
+
+Only protocol validation failures reach ERRBACK.  Errors raised by the
+consumer CALLBACK remain consumer errors and are never relabelled as wire
+failures."
+  (let (members valid-p)
+    (condition-case error-data
+        (setq members
+              (qq-api--validate-group-member-search-results
+               (qq-api--response-data response))
+              valid-p t)
+      (error
+       (funcall (or errback #'qq-api--default-error)
+                response (error-message-string error-data))))
+    (when valid-p
+      (funcall callback members))))
+
 (defun qq-api-search-group-members
     (group-id query callback &optional errback limit)
   "Search native members in GROUP-ID for QUERY and call CALLBACK.
@@ -2001,9 +2303,9 @@ continuous window remain untouched."
 The fork-native action searches card, nickname, remark, QID and QQ number.
 Every returned identity is validated as an original string; there is no
 OneBot numeric member-list fallback.  LIMIT defaults server-side and may be
-between 1 and 200."
+  between 1 and 200."
   (unless (qq-api-group-id-p group-id)
-    (user-error "qq: group member search requires a decimal string group id"))
+    (user-error "qq: group member search requires a canonical uint32 group UIN"))
   (unless (stringp query)
     (user-error "qq: group member search query must be a string"))
   (when (and limit (not (and (integerp limit) (<= 1 limit 200))))
@@ -2013,30 +2315,496 @@ between 1 and 200."
    `((group_id . ,group-id)
      (query . ,query)
      ,@(when limit `((limit . ,limit))))
-   (lambda (response)
-     (condition-case error-data
-         (let ((members (qq-api--response-data response)))
-           (unless (listp members)
-             (error "qq: emacs_search_group_members returned a non-list"))
-           (let ((seen-user-ids (make-hash-table :test #'equal)))
-             (funcall
-              callback
-              (cl-loop
-               for member in members
-               for index from 0
-               for normalized =
-               (qq-api--normalize-group-member-search-result member index)
-               for user-id = (alist-get 'user_id normalized)
-               do (when (gethash user-id seen-user-ids)
-                    (error
-                     "qq: emacs_search_group_members returned duplicate user_id %s"
-                     user-id))
-               do (puthash user-id t seen-user-ids)
-               collect normalized))))
-       (error
-        (funcall (or errback #'qq-api--default-error)
-                 response (error-message-string error-data)))))
+   (apply-partially #'qq-api--group-member-search-callback callback errback)
    errback))
+
+(defun qq-api--validate-directory-search-hit (hit context)
+  "Validate and copy one closed native directory HIT in CONTEXT."
+  (unless (qq-api--exact-object-keys-p hit '(start end text))
+    (error "qq: %s has invalid fields" context))
+  (let ((start (alist-get 'start hit))
+        (end (alist-get 'end hit))
+        (text (alist-get 'text hit)))
+    (unless (and (qq-protocol--nonnegative-safe-integer-p start)
+                 (qq-protocol--positive-safe-integer-p end)
+                 (< start end))
+      (error "qq: %s has an invalid hit range" context))
+    (unless (qq-api-non-empty-string-p text)
+      (error "qq: %s.text must be a non-empty string" context))
+    (copy-tree hit)))
+
+(defun qq-api--validate-directory-hit-object (hits field-sources context)
+  "Validate closed directory HITS against FIELD-SOURCES in CONTEXT.
+
+FIELD-SOURCES maps every required hit field to its exact source string.
+Offsets are JavaScript UTF-16 code units and every hit text must equal the
+corresponding source slice."
+  (let ((fields (mapcar #'car field-sources)))
+    (unless (qq-api--exact-object-keys-p hits fields)
+      (error "qq: %s has invalid hit fields" context))
+    (dolist (spec field-sources)
+      (let* ((field (car spec))
+             (source (cdr spec))
+             (items (alist-get field hits))
+             (hit-context (format "%s.%s" context field)))
+        (unless (and (listp items) (proper-list-p items))
+          (error "qq: %s must be a hit array" hit-context))
+        (cl-loop
+         for hit in items
+         for index from 0
+         do
+         (let ((item-context (format "%s[%d]" hit-context index)))
+           (qq-api--validate-directory-search-hit hit item-context)
+           (let* ((start (alist-get 'start hit))
+                  (end (alist-get 'end hit))
+                  (text (alist-get 'text hit))
+                  (slice (qq-api--utf-16-unit-slice source start end)))
+             (unless (and slice (string= text slice))
+               (error "qq: %s does not match its source text"
+                      item-context)))))))
+    (copy-tree hits)))
+
+(defun qq-api--validate-group-chat-search-group (group context)
+  "Validate and copy a closed group-search GROUP in CONTEXT."
+  (unless (qq-api--exact-object-keys-p
+           group
+           '(group_id name remark member_count is_conf
+                      has_modify_conf_group_face has_modify_conf_group_name
+                      no_code_finger_open_flag self_permission hits))
+    (error "qq: %s has invalid fields" context))
+  (unless (qq-protocol-group-uin-p (alist-get 'group_id group))
+    (error "qq: %s.group_id must be a canonical uint32 group UIN"
+           context))
+  (dolist (field '(name remark))
+    (unless (stringp (alist-get field group))
+      (error "qq: %s.%s must be a string" context field)))
+  (unless (qq-api--uint32-p (alist-get 'member_count group))
+    (error "qq: %s.member_count must be an unsigned 32-bit integer" context))
+  (dolist (field '(is_conf has_modify_conf_group_face
+                          has_modify_conf_group_name
+                          no_code_finger_open_flag))
+    (unless (memq (alist-get field group) '(t :false))
+      (error "qq: %s.%s must be a boolean" context field)))
+  (unless (member (alist-get 'self_permission group)
+                  '("member" "admin" "owner"))
+    (error "qq: %s.self_permission is invalid" context))
+  (qq-api--validate-directory-hit-object
+   (alist-get 'hits group)
+   `((group_id . ,(alist-get 'group_id group))
+     (name . ,(alist-get 'name group))
+     (remark . ,(alist-get 'remark group)))
+   (format "%s.hits" context))
+  (copy-tree group))
+
+(defun qq-api--validate-group-chat-search-discussion (discussion context)
+  "Validate and copy one group-search DISCUSSION in CONTEXT."
+  (unless (qq-api--exact-object-keys-p discussion '(discussion_id name hits))
+    (error "qq: %s has invalid fields" context))
+  (unless (qq-api-non-empty-string-p (alist-get 'discussion_id discussion))
+    (error "qq: %s.discussion_id must be a non-empty native string" context))
+  (unless (stringp (alist-get 'name discussion))
+    (error "qq: %s.name must be a string" context))
+  (qq-api--validate-directory-hit-object
+   (alist-get 'hits discussion)
+   `((name . ,(alist-get 'name discussion)))
+   (format "%s.hits" context))
+  (copy-tree discussion))
+
+(defun qq-api--validate-group-chat-search-member-profile (profile context)
+  "Validate and copy one group-search member PROFILE in CONTEXT."
+  (unless (qq-api--exact-object-keys-p
+           profile '(uid user_id nickname remark card hits))
+    (error "qq: %s has invalid fields" context))
+  (unless (qq-api-non-empty-string-p (alist-get 'uid profile))
+    (error "qq: %s.uid must be a non-empty native string" context))
+  (unless (qq-protocol--nonzero-decimal-string-p (alist-get 'user_id profile))
+    (error "qq: %s.user_id must be an original nonzero decimal string" context))
+  (dolist (field '(nickname remark card))
+    (unless (stringp (alist-get field profile))
+      (error "qq: %s.%s must be a string" context field)))
+  (qq-api--validate-directory-hit-object
+   (alist-get 'hits profile)
+   `((user_id . ,(alist-get 'user_id profile))
+     (nickname . ,(alist-get 'nickname profile))
+     (remark . ,(alist-get 'remark profile))
+     (card . ,(alist-get 'card profile)))
+   (format "%s.hits" context))
+  (copy-tree profile))
+
+(defun qq-api--validate-group-chat-search-member-card (card context)
+  "Validate and copy one group-search member CARD in CONTEXT."
+  (unless (qq-api--exact-object-keys-p card '(uid card hits))
+    (error "qq: %s has invalid fields" context))
+  (unless (qq-api-non-empty-string-p (alist-get 'uid card))
+    (error "qq: %s.uid must be a non-empty native string" context))
+  (unless (stringp (alist-get 'card card))
+    (error "qq: %s.card must be a string" context))
+  (qq-api--validate-directory-hit-object
+   (alist-get 'hits card)
+   `((card . ,(alist-get 'card card)))
+   (format "%s.hits" context))
+  (copy-tree card))
+
+(defun qq-api--validate-group-chat-search-result (result index)
+  "Validate and copy group-chat search RESULT at INDEX."
+  (let ((context (format "emacs_search_group_chats.results[%d]" index)))
+    (unless (qq-api--exact-object-keys-p
+             result '(group discussions member_profiles member_cards
+                            recall_reason))
+      (error "qq: %s has invalid fields" context))
+    (qq-api--validate-group-chat-search-group
+     (alist-get 'group result) (format "%s.group" context))
+    (dolist (spec `((discussions . ,#'qq-api--validate-group-chat-search-discussion)
+                    (member_profiles
+                     . ,#'qq-api--validate-group-chat-search-member-profile)
+                    (member_cards
+                     . ,#'qq-api--validate-group-chat-search-member-card)))
+      (let ((items (alist-get (car spec) result)))
+        (unless (listp items)
+          (error "qq: %s.%s must be an array" context (car spec)))
+        (cl-loop for item in items
+                 for item-index from 0
+                 do (funcall (cdr spec) item
+                             (format "%s.%s[%d]"
+                                     context (car spec) item-index)))))
+    (unless (stringp (alist-get 'recall_reason result))
+      (error "qq: %s.recall_reason must be a string" context))
+    (copy-tree result)))
+
+(defun qq-api--validate-group-chat-search-page (data)
+  "Validate and copy a closed native group-chat search page DATA."
+  (unless (qq-api--exact-object-keys-p
+           data '(results multi_user_keywords next_cursor))
+    (error "qq: emacs_search_group_chats returned an invalid page"))
+  (let ((results (alist-get 'results data))
+        (keywords (alist-get 'multi_user_keywords data))
+        (cursor (alist-get 'next_cursor data))
+        (seen-groups (make-hash-table :test #'equal)))
+    (unless (listp results)
+      (error "qq: emacs_search_group_chats.results must be an array"))
+    (cl-loop
+     for result in results
+     for index from 0
+     do
+     (let* ((validated (qq-api--validate-group-chat-search-result result index))
+            (group-id (alist-get 'group_id (alist-get 'group validated))))
+       (when (gethash group-id seen-groups)
+         (error "qq: group search page duplicated group_id %s" group-id))
+       (puthash group-id t seen-groups)))
+    (unless (and (listp keywords) (cl-every #'stringp keywords))
+      (error "qq: emacs_search_group_chats.multi_user_keywords must be a string array"))
+    (unless (or (null cursor) (qq-api--uuid-v4-string-p cursor))
+      (error "qq: emacs_search_group_chats.next_cursor must be UUIDv4 or null"))
+    (copy-tree data)))
+
+(defun qq-api--group-chat-search-sort-wire (sort)
+  "Return wire value for semantic group-chat search SORT."
+  (pcase (or sort 'default)
+    ('default "default")
+    ('latest-created "latest_created")
+    ('few-members "few_members")
+    (_ (user-error "qq: invalid group-chat search sort %S" sort))))
+
+(defun qq-api--group-chat-search-owner-params
+    (query sort limit filter-member-uids)
+  "Validate and return group-search owner params.
+
+QUERY, SORT, LIMIT, and FILTER-MEMBER-UIDS are repeated unchanged for cursor
+owner proof on continuation calls."
+  (unless (stringp query)
+    (user-error "qq: group-chat search query must be a string"))
+  (setq query (string-trim query))
+  (when (or (string-empty-p query) (> (length query) 512))
+    (user-error "qq: group-chat search query must contain 1 to 512 characters"))
+  (setq limit (or limit 50))
+  (unless (and (integerp limit) (<= 1 limit 100))
+    (user-error "qq: group-chat search limit must be between 1 and 100"))
+  (setq filter-member-uids (or filter-member-uids '()))
+  (unless (and (listp filter-member-uids)
+               (<= (length filter-member-uids) 100)
+               (cl-every #'qq-api-non-empty-string-p filter-member-uids)
+               (= (length filter-member-uids)
+                  (length (delete-dups (copy-sequence filter-member-uids)))))
+    (user-error "qq: group-chat member filters must be unique native UID strings"))
+  `((query . ,query)
+    (sort . ,(qq-api--group-chat-search-sort-wire sort))
+    (limit . ,limit)
+    ,@(when filter-member-uids
+        `((filter_member_uids . ,(copy-sequence filter-member-uids))))))
+
+(defun qq-api--group-chat-search-callback (callback errback response)
+  "Validate group-chat search RESPONSE before invoking CALLBACK."
+  (let (page valid-p)
+    (condition-case error-data
+        (setq page (qq-api--validate-group-chat-search-page
+                    (qq-api--response-data response))
+              valid-p t)
+      (error
+       (funcall (or errback #'qq-api--default-error)
+                response (error-message-string error-data))))
+    (when valid-p (funcall callback page))))
+
+(defun qq-api-search-group-chats-start
+    (query callback &optional errback sort limit filter-member-uids)
+  "Start native group-chat search for QUERY and invoke CALLBACK with its page."
+  (let ((owner (qq-api--group-chat-search-owner-params
+                query sort limit filter-member-uids)))
+    (qq-api-call
+     "emacs_search_group_chats"
+     (cons '(kind . "start") owner)
+     (apply-partially #'qq-api--group-chat-search-callback callback errback)
+     errback)))
+
+(defun qq-api-search-group-chats-next
+    (cursor query callback &optional errback sort limit filter-member-uids)
+  "Continue opaque group-chat search CURSOR owned by QUERY and its options."
+  (unless (qq-api--uuid-v4-string-p cursor)
+    (user-error "qq: group-chat search cursor must be a canonical UUIDv4"))
+  (let ((owner (qq-api--group-chat-search-owner-params
+                query sort limit filter-member-uids)))
+    (qq-api-call
+     "emacs_search_group_chats"
+     (append `((kind . "next") (cursor . ,cursor)) owner)
+     (apply-partially #'qq-api--group-chat-search-callback callback errback)
+     errback)))
+
+(defun qq-api--uuid-v4-string-p (value)
+  "Return non-nil when VALUE is a lowercase canonical UUIDv4 string."
+  (let ((case-fold-search nil))
+    (and
+     (stringp value)
+     (string-match-p
+      (concat
+       "\\`[0-9a-f]\\{8\\}-[0-9a-f]\\{4\\}-4[0-9a-f]\\{3\\}-"
+       "[89ab][0-9a-f]\\{3\\}-[0-9a-f]\\{12\\}\\'")
+      value))))
+
+(defun qq-api--utf-16-unit-slice (source start end)
+  "Return SOURCE slice between UTF-16 code-unit offsets START and END.
+
+Return nil when either offset is out of bounds or splits a surrogate pair.
+NapCat validates directory hits with JavaScript string offsets, so using
+ordinary Emacs character indexes here would accept the wrong ranges around
+astral Unicode characters."
+  (let* ((encoded (encode-coding-string source 'utf-16le t))
+         (byte-start (* 2 start))
+         (byte-end (* 2 end)))
+    (when (and (<= 0 byte-start byte-end)
+               (<= byte-end (length encoded)))
+      (let* ((bytes (substring encoded byte-start byte-end))
+             (decoded (decode-coding-string bytes 'utf-16le t)))
+        ;; Decoding a lone UTF-16 surrogate may silently produce an empty
+        ;; string.  Round-trip length proves that both offsets were code-point
+        ;; boundaries rather than accepting that lossy decode.
+        (when (= (length (encode-coding-string decoded 'utf-16le t))
+                 (length bytes))
+          decoded)))))
+
+(defun qq-api--validate-contact-search-friend (result context)
+  "Validate and copy closed friend search RESULT in CONTEXT."
+  (unless (qq-api--exact-object-keys-p
+           result
+           '(kind user_id uid qid nickname remark category_name hits
+                  recall_reason))
+    (error "qq: %s has invalid friend fields" context))
+  (unless (equal (alist-get 'kind result) "friend")
+    (error "qq: %s.kind must be friend" context))
+  (unless (qq-protocol--nonzero-decimal-string-p
+           (alist-get 'user_id result))
+    (error "qq: %s.user_id must be an original nonzero decimal string"
+           context))
+  (unless (qq-api-non-empty-string-p (alist-get 'uid result))
+    (error "qq: %s.uid must be a non-empty native string" context))
+  (dolist (field '(qid nickname remark category_name recall_reason))
+    (unless (stringp (alist-get field result))
+      (error "qq: %s.%s must be a string" context field)))
+  (qq-api--validate-directory-hit-object
+   (alist-get 'hits result)
+   `((qid . ,(alist-get 'qid result))
+     (user_id . ,(alist-get 'user_id result))
+     (nickname . ,(alist-get 'nickname result))
+     (remark . ,(alist-get 'remark result)))
+   (format "%s.hits" context))
+  (copy-tree result))
+
+(defun qq-api--validate-contact-search-group-member (result context)
+  "Validate and copy closed group-member search RESULT in CONTEXT."
+  (unless (qq-api--exact-object-keys-p
+           result
+           '(kind group_id group_name group_remark user_id uid nickname
+                  remark card is_friend hits recall_reason))
+    (error "qq: %s has invalid group-member fields" context))
+  (unless (equal (alist-get 'kind result) "group_member")
+    (error "qq: %s.kind must be group_member" context))
+  (unless (qq-protocol-group-uin-p (alist-get 'group_id result))
+    (error "qq: %s.group_id must be a canonical uint32 group UIN" context))
+  (unless (qq-protocol--nonzero-decimal-string-p (alist-get 'user_id result))
+    (error "qq: %s.user_id must be an original nonzero decimal string" context))
+  (unless (qq-api-non-empty-string-p (alist-get 'uid result))
+    (error "qq: %s.uid must be a non-empty native string" context))
+  (dolist (field '(group_name group_remark nickname remark card recall_reason))
+    (unless (stringp (alist-get field result))
+      (error "qq: %s.%s must be a string" context field)))
+  (unless (memq (alist-get 'is_friend result) '(t :false))
+    (error "qq: %s.is_friend must be a boolean" context))
+  (qq-api--validate-directory-hit-object
+   (alist-get 'hits result)
+   `((user_id . ,(alist-get 'user_id result))
+     (nickname . ,(alist-get 'nickname result))
+     (remark . ,(alist-get 'remark result))
+     (card . ,(alist-get 'card result)))
+   (format "%s.hits" context))
+  (copy-tree result))
+
+(defun qq-api--validate-contact-search-result (result index)
+  "Validate and copy contact-search RESULT at INDEX."
+  (let ((context (format "emacs_search_contacts.results[%d]" index)))
+    (pcase (and (consp result) (alist-get 'kind result))
+      ("friend"
+       (qq-api--validate-contact-search-friend result context))
+      ("group_member"
+       (qq-api--validate-contact-search-group-member result context))
+      (_
+       (error "qq: %s has an invalid kind" context)))))
+
+(defun qq-api--validate-contact-search-owner-result (result owner context)
+  "Require validated RESULT to remain inside contact-search OWNER in CONTEXT."
+  (let ((scope (alist-get 'scope owner))
+        (kind (alist-get 'kind result))
+        (group-id (alist-get 'group_id owner)))
+    (pcase scope
+      ("friends"
+       (unless (equal kind "friend")
+         (error "qq: %s escaped friends scope" context)))
+      ("group_members"
+       (unless (and (equal kind "group_member")
+                    (equal (alist-get 'group_id result) group-id))
+         (error "qq: %s escaped group_members owner" context)))
+      ("friends_and_group_members"
+       (unless (or (equal kind "friend")
+                   (and (equal kind "group_member")
+                        (equal (alist-get 'group_id result) group-id)))
+         (error "qq: %s escaped combined contact owner" context)))
+      (_
+       (error "qq: %s has an invalid internal owner scope" context)))))
+
+(defun qq-api--validate-contact-search-page (data &optional owner)
+  "Validate and copy one closed native contact-search page DATA.
+
+When OWNER is non-nil, also prove that every branch and group identity stays
+inside the semantic request scope."
+  (unless (qq-api--exact-object-keys-p data '(results next_cursor))
+    (error "qq: emacs_search_contacts returned an invalid page"))
+  (let ((results (alist-get 'results data))
+        (cursor (alist-get 'next_cursor data)))
+    (unless (and (listp results) (proper-list-p results))
+      (error "qq: emacs_search_contacts.results must be an array"))
+    (let ((seen (make-hash-table :test #'equal))
+          validated)
+      (setq validated
+            (cl-loop
+             for result in results
+             for index from 0
+             for context = (format "emacs_search_contacts.results[%d]" index)
+             for item = (qq-api--validate-contact-search-result result index)
+             for identity = (cons (alist-get 'kind item)
+                                  (alist-get 'user_id item))
+             do (when (gethash identity seen)
+                  (error "qq: %s duplicates contact identity %s:%s"
+                         context (car identity) (cdr identity)))
+             do (puthash identity t seen)
+             do (when owner
+                  (qq-api--validate-contact-search-owner-result
+                   item owner context))
+             collect item))
+      (unless (or (null cursor) (qq-api--uuid-v4-string-p cursor))
+        (error "qq: emacs_search_contacts.next_cursor must be UUIDv4 or null"))
+      `((results . ,validated)
+        (next_cursor . ,cursor)))))
+
+(defun qq-api--contact-search-owner-params (scope query group-id limit)
+  "Validate and return complete contact-search owner parameters.
+
+SCOPE is one of `friends', `group-members', or
+`friends-and-group-members'.  QUERY, semantic SCOPE, GROUP-ID when required,
+and LIMIT are repeated for server-side cursor owner proof."
+  (unless (stringp query)
+    (user-error "qq: contact search query must be a string"))
+  (setq query (string-trim query))
+  (when (or (string-empty-p query) (> (length query) 512))
+    (user-error "qq: contact search query must contain 1 to 512 characters"))
+  (setq limit (or limit 50))
+  (unless (and (integerp limit) (<= 1 limit 100))
+    (user-error "qq: contact search limit must be between 1 and 100"))
+  (pcase scope
+    ('friends
+     (when group-id
+       (user-error "qq: friends contact search forbids group-id"))
+     `((scope . "friends")
+       (query . ,query)
+       (limit . ,limit)))
+    ('group-members
+     (unless (qq-protocol-group-uin-p group-id)
+       (user-error
+        "qq: group-members contact search requires a canonical uint32 group UIN"))
+     `((scope . "group_members")
+       (group_id . ,group-id)
+       (query . ,query)
+       (limit . ,limit)))
+    ('friends-and-group-members
+     (unless (qq-protocol-group-uin-p group-id)
+       (user-error
+        "qq: combined contact search requires a canonical uint32 group UIN"))
+     `((scope . "friends_and_group_members")
+       (group_id . ,group-id)
+       (query . ,query)
+       (limit . ,limit)))
+    (_
+     (user-error "qq: invalid contact search scope %S" scope))))
+
+(defun qq-api--contact-search-callback (owner callback errback response)
+  "Validate contact-search RESPONSE before invoking CALLBACK."
+  (let (page valid-p)
+    (condition-case error-data
+        (setq page (qq-api--validate-contact-search-page
+                    (qq-api--response-data response) owner)
+              valid-p t)
+      (error
+       (funcall (or errback #'qq-api--default-error)
+                response (error-message-string error-data))))
+    (when valid-p (funcall callback page))))
+
+(defun qq-api-search-contacts-start
+    (scope query callback &optional errback group-id limit)
+  "Start native contact search in semantic SCOPE for QUERY.
+
+CALLBACK receives a validated closed page.  GROUP-ID is forbidden for
+`friends' and required for `group-members' and
+`friends-and-group-members'.  LIMIT defaults to 50."
+  (let ((owner (qq-api--contact-search-owner-params
+                scope query group-id limit)))
+    (qq-api-call
+     "emacs_search_contacts"
+     (cons '(kind . "start") owner)
+     (apply-partially
+      #'qq-api--contact-search-callback owner callback errback)
+     errback)))
+
+(defun qq-api-search-contacts-next
+    (scope cursor query callback &optional errback group-id limit)
+  "Continue UUID CURSOR using its complete semantic owner proof.
+
+SCOPE, QUERY, GROUP-ID, and LIMIT must describe the original start request."
+  (unless (qq-api--uuid-v4-string-p cursor)
+    (user-error "qq: contact search cursor must be a canonical UUIDv4 string"))
+  (let ((owner (qq-api--contact-search-owner-params
+                scope query group-id limit)))
+    (qq-api-call
+     "emacs_search_contacts"
+     (append `((kind . "next") (cursor . ,cursor)) owner)
+     (apply-partially
+      #'qq-api--contact-search-callback owner callback errback)
+     errback)))
 
 (defun qq-api-get-base-emoji
     (emoji-id callback &optional errback emoji-type download hints)
@@ -2071,7 +2839,7 @@ needed to resolve newer animated faces absent from static face_config."
 (defun qq-api--refresh-for-notice (notice)
   "Run light refresh actions that correspond to NOTICE."
   (pcase (alist-get 'notice_type notice)
-    ("friend_add" (qq-api-refresh-friend-list))
+    ("friend_add" (qq-api-refresh-friend-categories))
     (_ nil)))
 
 (defun qq-api--handle-meta-event (event)

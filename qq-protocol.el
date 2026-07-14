@@ -45,6 +45,11 @@ exact for canonical decimal strings and cannot lose NT sequence precision."
    ((string-lessp right left) 1)
    (t 0)))
 
+(defun qq-protocol-group-uin-p (value)
+  "Return non-nil when VALUE is a canonical uint32 QQ group UIN string."
+  (and (qq-protocol--nonzero-decimal-string-p value)
+       (<= (qq-protocol-decimal-string-compare value "4294967295") 0)))
+
 (defun qq-protocol-message-id-p (value)
   "Return non-nil when VALUE is an original NT message snowflake string."
   (qq-protocol--decimal-string-p value))
@@ -91,7 +96,7 @@ CONTEXT is included in protocol errors."
   (pcase (and (consp value) (alist-get 'kind value))
     ("group"
      (and (qq-protocol--closed-object-p value '(kind group_id))
-          (qq-protocol--decimal-string-p (alist-get 'group_id value))))
+          (qq-protocol-group-uin-p (alist-get 'group_id value))))
     ("private"
      (and (qq-protocol--closed-object-p value '(kind user_id))
           (qq-protocol--decimal-string-p (alist-get 'user_id value))))
@@ -114,8 +119,7 @@ CONTEXT is included in protocol errors."
   (pcase (and (consp value) (alist-get 'kind value))
     ("group"
      (and (qq-protocol--closed-object-p value '(kind group_id))
-          (qq-protocol--nonzero-decimal-string-p
-           (alist-get 'group_id value))))
+          (qq-protocol-group-uin-p (alist-get 'group_id value))))
     ("private"
      (and (qq-protocol--closed-object-p value '(kind user_id))
           (qq-protocol--nonzero-decimal-string-p
