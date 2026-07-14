@@ -2094,6 +2094,101 @@ notice reconciles it with the authoritative aggregate count."
                  response (error-message-string error-data)))))
    errback))
 
+(defun qq-api--nullable-non-negative-integer-p (value)
+  "Return non-nil when VALUE is nil or a non-negative integer."
+  (or (null value) (and (integerp value) (>= value 0))))
+
+(defun qq-api--nullable-json-boolean-p (value)
+  "Return non-nil when VALUE is JSON true, false, or null."
+  (memq value '(t :false nil)))
+
+(defun qq-api--validate-group-notice-image (image context)
+  "Validate closed group-notice IMAGE from CONTEXT."
+  (unless (qq-api--exact-object-keys-p image '(id width height))
+    (error "qq: %s has invalid fields" context))
+  (unless (qq-api-non-empty-string-p (alist-get 'id image))
+    (error "qq: %s.id must be a non-empty string" context))
+  (dolist (key '(width height))
+    (unless (qq-api--nullable-non-negative-integer-p (alist-get key image))
+      (error "qq: %s.%s must be a non-negative integer or null" context key))))
+
+(defun qq-api--validate-group-notice (notice context)
+  "Validate one closed group NOTICE from CONTEXT."
+  (unless (qq-api--exact-object-keys-p
+           notice
+           '(notice_id sender_id published_at title text images read_count
+                       read confirmation_required all_confirmed))
+    (error "qq: %s has invalid fields" context))
+  (unless (qq-api-non-empty-string-p (alist-get 'notice_id notice))
+    (error "qq: %s.notice_id must be a non-empty string" context))
+  (let ((sender-id (alist-get 'sender_id notice)))
+    (unless (or (null sender-id)
+                (and (qq-api-user-id-p sender-id)
+                     (not (equal sender-id "0"))))
+      (error "qq: %s.sender_id must be a nonzero decimal string or null"
+             context)))
+  (unless (and (integerp (alist-get 'published_at notice))
+               (>= (alist-get 'published_at notice) 0))
+    (error "qq: %s.published_at must be a non-negative integer" context))
+  (unless (or (null (alist-get 'title notice))
+              (stringp (alist-get 'title notice)))
+    (error "qq: %s.title must be a string or null" context))
+  (unless (stringp (alist-get 'text notice))
+    (error "qq: %s.text must be a string" context))
+  (let ((images (alist-get 'images notice)))
+    (unless (listp images)
+      (error "qq: %s.images must be an array" context))
+    (cl-loop for image in images
+             for index from 0
+             do (qq-api--validate-group-notice-image
+                 image (format "%s.images[%d]" context index))))
+  (unless (qq-api--nullable-non-negative-integer-p
+           (alist-get 'read_count notice))
+    (error "qq: %s.read_count must be a non-negative integer or null" context))
+  (dolist (key '(read confirmation_required all_confirmed))
+    (unless (qq-api--nullable-json-boolean-p (alist-get key notice))
+      (error "qq: %s.%s must be a boolean or null" context key))))
+
+(defun qq-api--validate-group-notices (data expected-group-id)
+  "Validate DATA for EXPECTED-GROUP-ID and return copied notices."
+  (unless (qq-api--exact-object-keys-p data '(group_id notices))
+    (error "qq: emacs_get_group_notices returned an invalid object"))
+  (unless (equal (alist-get 'group_id data) expected-group-id)
+    (error "qq: emacs_get_group_notices returned a different group identity"))
+  (let ((notices (alist-get 'notices data))
+        (seen (make-hash-table :test #'equal)))
+    (unless (listp notices)
+      (error "qq: emacs_get_group_notices.notices must be an array"))
+    (cl-loop
+     for notice in notices
+     for index from 0
+     do
+     (let* ((context (format "emacs_get_group_notices.notices[%d]" index))
+            (notice-id (alist-get 'notice_id notice)))
+       (qq-api--validate-group-notice notice context)
+       (when (gethash notice-id seen)
+         (error "qq: emacs_get_group_notices duplicated notice_id %s"
+                notice-id))
+       (puthash notice-id t seen)))
+    (copy-tree notices)))
+
+(defun qq-api-get-group-notices (group-id callback &optional errback)
+  "Fetch the closed read-only announcement list for GROUP-ID."
+  (unless (qq-api-group-id-p group-id)
+    (user-error "qq: group notices require a canonical uint32 group UIN"))
+  (qq-api-call
+   "emacs_get_group_notices"
+   `((group_id . ,group-id))
+   (lambda (response)
+     (condition-case error-data
+         (funcall callback
+                  (qq-api--validate-group-notices
+                   (qq-api--response-data response) group-id))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   errback))
+
 (defun qq-api--message-search-session-locator (session-key)
   "Return a supported message-search locator for SESSION-KEY."
   (let* ((identity (qq-state-session-key-identity session-key))

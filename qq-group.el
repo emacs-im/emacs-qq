@@ -22,6 +22,8 @@
 (declare-function qq-contacts-search-group-members
                   "qq-contacts" (group-id query))
 (declare-function qq-user-open "qq-user" (user-id))
+(declare-function qq-group-notices-open
+                  "qq-group-notices" (group-id &optional group-name))
 (declare-function qq-api-cancel-request "qq-api" (request-token))
 
 (defface qq-group-action-button
@@ -153,6 +155,14 @@
   (require 'qq-contacts)
   (qq-contacts-search-group-members qq-group--group-id query))
 
+(defun qq-group-open-notices ()
+  "Open the current group's read-only announcement list."
+  (interactive)
+  (unless qq-group--group-id
+    (user-error "qq: this buffer has no group identity"))
+  (require 'qq-group-notices)
+  (qq-group-notices-open qq-group--group-id (qq-group--display-name)))
+
 (defun qq-group--insert-action-buttons ()
   "Insert primary group action buttons."
   (insert "  ")
@@ -167,6 +177,10 @@
   (appkit-ui-insert-action-button
    " 搜索成员 " #'qq-group-search-members
    :face 'qq-group-action-button :help-echo "原生搜索群成员 (s)")
+  (insert "  ")
+  (appkit-ui-insert-action-button
+   " 群公告 " #'qq-group-open-notices
+   :face 'qq-group-action-button :help-echo "查看群公告列表 (n)")
   (when (qq-api-user-id-p (alist-get 'owner_id qq-group--profile))
     (insert "  ")
     (appkit-ui-insert-action-button
@@ -215,7 +229,7 @@
          (insert "\n")
          (qq-group--insert-action-buttons)
          (appkit-view-insert-note-line
-          "g 刷新 · m 群聊 · s 搜索成员 · a 头像 · o 群主 · w 复制 · q 退出")
+          "g 刷新 · m 群聊 · s 搜索成员 · n 群公告 · a 头像 · o 群主 · w 复制 · q 退出")
          (insert "\n")
          (appkit-view-insert-heading-line "资料" :face 'bold)
          (let ((name (qq-group--present-string
@@ -367,6 +381,7 @@
     (define-key map (kbd "m") #'qq-group-open-chat)
     (define-key map (kbd "a") #'qq-group-open-avatar)
     (define-key map (kbd "s") #'qq-group-search-members)
+    (define-key map (kbd "n") #'qq-group-open-notices)
     (define-key map (kbd "o") #'qq-group-open-owner)
     (define-key map (kbd "w") #'qq-group-copy-id)
     (define-key map (kbd "TAB") #'forward-button)

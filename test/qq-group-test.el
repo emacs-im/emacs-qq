@@ -77,6 +77,8 @@
       (search-forward "打开群聊")
       (should (button-at (1- (point))))
       (search-forward "搜索成员")
+      (should (button-at (1- (point))))
+      (search-forward "群公告")
       (should (button-at (1- (point)))))))
 
 (ert-deftest qq-group-render-omits-unresolved-raw-enums ()
@@ -178,7 +180,9 @@
   (should (eq (lookup-key qq-group-mode-map (kbd "m"))
               #'qq-group-open-chat))
   (should (eq (lookup-key qq-group-mode-map (kbd "s"))
-              #'qq-group-search-members)))
+              #'qq-group-search-members))
+  (should (eq (lookup-key qq-group-mode-map (kbd "n"))
+              #'qq-group-open-notices)))
 
 (ert-deftest qq-group-reuses-one-profile-buffer-like-telega ()
   (should (equal (qq-group--buffer-name "20001") "*qq-group*"))
