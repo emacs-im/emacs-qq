@@ -1,0 +1,161 @@
+#+title: emacs-qq
+#+language: zh-CN
+#+options: toc:2 num:nil
+
+* 简介
+
+~emacs-qq~ 是一个运行在 Emacs 中的 QQ 客户端，以 NapCat 为后端，并复用
+Appkit 提供的列表、会话、补全和媒体基础设施。
+
+项目仍处于开发阶段。目前的目标是做好私聊和普通群聊的核心体验，不追求覆盖
+NapCat 暴露的全部 OneBot action。
+
+* 协议要求
+
+开发和联调必须使用本项目维护的
+[[https://github.com/0WD0/NapCatQQ-emacs][NapCatQQ-emacs]] 分支，而不是上游原版 NapCat。客户端依赖该分支提供的
+~emacs_*~ 严格接口，以及下列消息主键约定：
+
+- 字段名仍为 ~message_id~。
+- 值始终是 NT 消息雪花 ID 的原始十进制字符串。
+- JavaScript 和 Elisp 都不得把它转换成数值。
+- 发送中的消息可以使用 ~local-*~ 临时主键；收到回执后再晋升为服务端雪花 ID。
+
+* 当前功能
+
+- 通过 OneBot WebSocket 连接 NapCat。
+- 保留 Linux QQ 提供的最近会话、好友分组和已加入群聊顺序。
+- 浏览完整好友和群聊目录，包括不在最近会话中的群聊。
+- 原生搜索好友、群聊、群成员和私聊/群聊历史消息。
+- 收取实时消息并显示回复、合并转发、图片、文件、视频、表情和 QQ 卡片。
+- 发送文本、回复、图片、文件、剪贴板附件、QQ 表情和收藏表情。
+- 显示、添加和移除群消息表情回应。
+- 处理消息撤回、戳一戳、输入状态、灰字提示和原生已读状态。
+- 查看用户资料、头像、资料点赞和照片墙。
+- 查看群资料、群主资料、群成员搜索和群公告列表。
+- 可选的桌面通知与本地通知历史。
+
+* 快速开始
+
+先启动并登录 [[https://github.com/0WD0/NapCatQQ-emacs][NapCatQQ-emacs]]，启用 OneBot WebSocket，然后在 Emacs 中配置：
+
+#+begin_src emacs-lisp
+(require 'qq)
+
+(setq qq-onebot-websocket-url "ws://127.0.0.1:3001/")
+(setq qq-onebot-token "YOUR_ONEBOT_TOKEN")
+#+end_src
+
+执行 ~M-x qq~ 打开主界面。
+
+建议使用以下 NapCat 配置：
+
+- WebSocket 地址：~ws://127.0.0.1:3001/~
+- ~messagePostFormat = array~
+- ~reportSelfMessage = true~
+
+* 联系人与资料
+
+在主界面按 ~c~ 打开 ~*qq-contacts*~。
+
+| 按键 | 功能 |
+|------+------|
+| ~f~ | 查看好友目录 |
+| ~G~ | 查看全部已加入群聊 |
+| ~I~ | 查看未出现在最近会话中的群聊 |
+| ~/~ 或 ~s~ | 原生搜索好友和群聊 |
+| ~RET~ | 打开当前联系人或群聊 |
+| ~i~ | 打开用户或群资料 |
+| ~g~ | 刷新目录 |
+
+好友搜索和群聊搜索分别维护自己的分页状态。群资料页按 ~s~ 可以通过 QQ 原生
+联系人索引搜索群成员，按 ~n~ 可以打开只读群公告列表。
+
+* 输入、附件与补全
+
+群聊输入区支持真实的 QQ 提及。输入 ~@~ 加群名片、昵称、QID 或 QQ 号，
+再按 ~TAB~ 选择成员。选中项会保存为结构化 ~at~ 消息段；普通文本中的 ~@名字~
+不会被猜成提及。
+
+表情补全包括：
+
+- 输入 ~/~ 加 QQ 基础表情名称，再按 ~TAB~。
+- 输入 ~/fav~，可继续输入描述，打开收藏表情候选。
+- 输入 ~:unicode_name:~，补全标准 Unicode emoji。
+- ~C-c C-e~ 打开带图片预览的 QQ 基础表情选择器。
+- ~C-u C-c C-e~ 直接打开收藏表情选择器。
+
+附件由结构化输入对象表示，不会先拼成 CQ 字符串。聊天 transient 菜单和对应命令
+支持文件、图片及剪贴板内容。
+
+* 消息搜索
+
+消息搜索以 Linux QQ 返回的结果为准，并且严格绑定当前会话；它不会只在已经渲染
+到缓冲区的文本中循环查找。
+
+| 按键 | 功能 |
+|------+------|
+| ~C-c /~ | 选择 ~search~ 或 ~hashtag~ 过滤器，并用服务端结果替换当前时间线 |
+| ~C-c g~ | 刷新当前过滤结果 |
+| ~C-c C-c~ | 退出过滤器，恢复原来的普通历史窗口 |
+| ~C-c C-r~ / ~C-c C-s~ | 在当前缓冲区中向旧/向新搜索 |
+| ~M-g p~ / ~M-g n~ | 继续上一个/下一个搜索结果 |
+| ~C-c M-/~ | 打开独立的分页结果缓冲区 ~*qq-search*~ |
+
+在 ~*qq-search*~ 中按 ~RET~，客户端会加载目标消息及其上下文，而不是假定目标已经
+存在于本地时间线。
+
+* 桌面通知
+
+通知采用和 telega 相近的显式全局次要模式：
+
+#+begin_src emacs-lisp
+(qq-notifications-mode 1)
+#+end_src
+
+通知会短暂延迟；当目标聊天位于当前聚焦 frame 的选中窗口时，不再重复弹出。
+被静音的会话默认不通知，但原生 QQ ~@我~ 可以突破静音；~@全体成员~ 是否突破
+静音由 ~qq-notifications-at-all-breaks-mute~ 控制。
+
+执行 ~M-x qq-notifications-history~ 可以打开本地通知历史。
+
+* 开发
+
+项目使用 Eask 管理 Emacs 包依赖和测试：
+
+#+begin_src sh
+eask install-deps
+eask recompile
+eask run script test
+eask run script test-concise
+eask run script test-local
+eask emacs -Q -L . -l qq.el
+#+end_src
+
+其中：
+
+- ~test-concise~ 会先编译，再在成功时只打印 ERT 摘要；失败时保留有用的日志尾部。
+- ~test-local~ 会强制刷新相邻目录中的 ~appkit.el~，然后运行测试。
+
+同时开发两个仓库时，可以让 Eask 直接链接 Appkit 源码包：
+
+#+begin_src sh
+eask link add appkit ../appkit.el
+#+end_src
+
+使用 ~eask link list~ 查看当前链接；使用
+~eask link delete appkit-0.1.0~ 恢复为快照安装。
+
+* 架构边界
+
+- QQ 运行时只依赖 Appkit 的 view、presentation、media、chat-buffer、completion
+  和 chat-timeline 基础设施，不依赖 ~disco.el~。
+- ~qq-root.el~ 把最近会话投影为带稳定 key 的单行列表。
+- ~qq-chat.el~ 把 QQ 消息投影到 Appkit 的共享时间线，并负责结构化输入适配。
+- ~qq-media.el~ 负责 QQ 特有的头像、图片、文件、视频和表情资源解析。
+- ~qq-api.el~ 是严格协议边界；来自该分支的响应必须通过封闭结构校验后才能
+  进入客户端状态。
+- 聊天快捷键尽量遵循 telega 的搜索与过滤习惯；QQ 特有命令放在独立扩展按键上。
+
+跨 ~emacs-qq~、~NapCatQQ-emacs~、Appkit 和参考客户端的架构决策，不放进可发布
+的 Emacs 包仓库，而是记录在工作区根目录及 ~docs/adr~。
