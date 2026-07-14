@@ -1073,7 +1073,9 @@ missing or contradictory wire identity."
 
 (defun qq-state--gray-tip-data (notice)
   "Return stable visual data decoded from gray-tip NOTICE."
-  (let* ((json (qq-state--gray-tip-json notice))
+  (let* ((direct-text
+          (qq-state--present-string (alist-get 'text notice)))
+         (json (qq-state--gray-tip-json notice))
          (items (and (listp json) (alist-get 'items json)))
          (texts
           (delq nil
@@ -1082,8 +1084,12 @@ missing or contradictory wire identity."
                    (and (listp item)
                         (qq-state--present-string (alist-get 'txt item))))
                  (if (listp items) items '()))))
-         (text (if texts (string-join texts "") "QQ system notice")))
+         (text (or direct-text
+                   (and texts (string-join texts ""))
+                   "QQ system notice")))
     `((text . ,text)
+      (kind . ,(qq-state--present-string
+                (alist-get 'gray_tip_kind notice)))
       (busi-id . ,(qq-state--normalize-id (alist-get 'busi_id notice)))
       (items . ,(copy-tree items)))))
 

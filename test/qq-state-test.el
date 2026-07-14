@@ -473,6 +473,29 @@
        (should (equal (plist-get (car events) :message-anchor)
                       "9007199254750003456"))))))
 
+(ert-deftest qq-state-apply-gray-tip-notice-prefers-native-semantic-text ()
+  (qq-test-with-reset
+   (let ((message
+          (qq-state-apply-gray-tip-notice
+           '((post_type . "notice")
+             (notice_type . "notify")
+             (sub_type . "gray_tip")
+             (group_id . 20001)
+             (user_id . 0)
+             (message_id . "9007199254750003457")
+             (busi_id . "group-member-add")
+             (gray_tip_kind . "member-add")
+             (text . "新同学加入群聊")
+             (content . "新同学加入群聊")
+             (raw_info . ((msgTime . "1710000001")))))))
+     (should (equal (alist-get 'preview message) "新同学加入群聊"))
+     (should (equal (alist-get 'raw-message message) "新同学加入群聊"))
+     (should
+      (equal
+       (alist-get 'kind
+                  (alist-get 'data (car (alist-get 'segments message))))
+       "member-add")))))
+
 (ert-deftest qq-state-merge-history-normalizes-poke-notice ()
   (qq-test-with-reset
    (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
