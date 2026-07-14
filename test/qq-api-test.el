@@ -9,17 +9,18 @@
 (defun qq-api-test--native-message
     (entry-id &optional message-id segments)
   "Return one strict fork-native forward snapshot."
-  `((entry_id . ,entry-id)
-    ,@(when message-id `((message_id . ,message-id)))
-    (state . "live")
-    (sent_at . 1710000000)
-    (sender . ((kind . "user")
-               (user_id . "10001")
-               (name . "Alice")))
-    (origin . ((kind . "group") (group_id . "20001")))
-    (segments
-     . ,(or segments
-            '(((kind . "text") (payload . ((text . "hello")))))))))
+  (copy-tree
+   `((entry_id . ,entry-id)
+     ,@(when message-id `((message_id . ,message-id)))
+     (state . "live")
+     (sent_at . 1710000000)
+     (sender . ((kind . "user")
+                (user_id . "10001")
+                (name . "Alice")))
+     (origin . ((kind . "group") (group_id . "20001")))
+     (segments
+      . ,(or segments
+             '(((kind . "text") (payload . ((text . "hello"))))))))))
 
 (defun qq-api-test--context-source ()
   "Return one strict fork-native context forward source."
@@ -185,7 +186,19 @@ The authoritative post-state reports UNREAD-COUNT."
   (dolist (group-id '("0" "4294967296" 4294967295))
     (should-error
      (qq-api-validate-chat-locator
-      `((kind . "group") (group_id . ,group-id)))
+     `((kind . "group") (group_id . ,group-id)))
+     :type 'user-error)))
+
+(ert-deftest qq-api-chat-locator-private-id-is-canonical-nonzero-decimal ()
+  (should
+   (equal
+    (qq-api-validate-chat-locator
+     '((kind . "private") (user_id . "10001")))
+    '((kind . "private") (user_id . "10001"))))
+  (dolist (user-id '("0" "010001" 10001))
+    (should-error
+     (qq-api-validate-chat-locator
+      `((kind . "private") (user_id . ,user-id)))
      :type 'user-error)))
 
 (ert-deftest qq-api-materialization-owner-settles-synchronous-success ()
@@ -794,6 +807,12 @@ The authoritative post-state reports UNREAD-COUNT."
   (should-error
    (qq-api-session-key-from-locator
     '((kind . "private") (user_id . 10001))))
+  (should-error
+   (qq-api-session-key-from-locator
+    '((kind . "private") (user_id . "0"))))
+  (should-error
+   (qq-api-session-key-from-locator
+    '((kind . "private") (user_id . "010001"))))
   (should-error
    (qq-api-session-key-from-locator
     '((kind . "group") (group_id . "20001") (extra . t)))))
@@ -2742,6 +2761,28 @@ The authoritative post-state reports UNREAD-COUNT."
     (should callback-called)
     (should-not delivered)))
 
+(ert-deftest qq-api-native-get-forward-keeps-both-dataline-message-sources ()
+  (let (captured-sources)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action params callback &optional _errback)
+                 (push (alist-get 'source params) captured-sources)
+                 (funcall callback '((data . ((messages . nil))))))))
+      (dolist (variant '("desktop" "mobile"))
+        (qq-api-get-forward
+         `((kind . "message")
+           (message_id . "9007199254742007089")
+           (chat . ((kind . "dataline")
+                    (peer_uid . "dev:a")
+                    (variant . ,variant))))
+         #'ignore)))
+    (should
+     (equal
+      (mapcar
+       (lambda (source)
+         (alist-get 'variant (alist-get 'chat source)))
+       (nreverse captured-sources))
+      '("desktop" "mobile")))))
+
 (ert-deftest qq-api-resolve-video-sends-only-the-exact-native-resolver ()
   (let* ((resolver
           '((kind . "message")
@@ -2886,6 +2927,14 @@ The authoritative post-state reports UNREAD-COUNT."
     (should-not delivered)
     (should (stringp failure))))
 
+(ert-deftest qq-api-message-id-requires-canonical-nonzero-decimal-string ()
+  (should
+   (equal (qq-api-validate-message-id "9007199254742007089")
+          "9007199254742007089"))
+  (dolist (value '("" "0" "00" "01" "1.0" "-1"
+                   9007199254742007089))
+    (should-error (qq-api-validate-message-id value) :type 'user-error)))
+
 (ert-deftest qq-api-native-message-validator-separates-entry-and-message-id ()
   (should
    (qq-api-validate-native-forward-messages
@@ -2899,6 +2948,25 @@ The authoritative post-state reports UNREAD-COUNT."
                   (qq-api-test--native-message "1.2" nil))))
     (should-error
      (qq-api-validate-native-forward-messages messages)
+     :type 'user-error)))
+
+(ert-deftest qq-api-native-message-state-requires-matching-segment-cardinality ()
+  (let ((live (qq-api-test--native-message "1" nil))
+        (recalled (qq-api-test--native-message "2" nil)))
+    (setf (alist-get 'state recalled) "recalled"
+          (alist-get 'segments recalled) nil)
+    (should
+     (equal (qq-api-validate-native-forward-messages (list live recalled))
+            (list live recalled))))
+  (let ((live-empty (qq-api-test--native-message "1" nil))
+        (recalled-nonempty (qq-api-test--native-message "2" nil)))
+    (setf (alist-get 'segments live-empty) nil
+          (alist-get 'state recalled-nonempty) "recalled")
+    (should-error
+     (qq-api-validate-native-forward-messages (list live-empty))
+     :type 'user-error)
+    (should-error
+     (qq-api-validate-native-forward-messages (list recalled-nonempty))
      :type 'user-error)))
 
 (ert-deftest qq-api-native-forward-card-presentation-is-closed-and-may-be-empty ()
@@ -3015,15 +3083,16 @@ The authoritative post-state reports UNREAD-COUNT."
         (list (qq-api-test--native-message "1" nil (list segment))))
        :type 'user-error))))
 
-(ert-deftest qq-api-native-forward-message-builds-locator-qualified-single ()
+(ert-deftest qq-api-native-forward-individual-builds-ordered-references ()
   (let (action params result)
     (cl-letf (((symbol-function 'qq-state-session) (lambda (_) nil))
               ((symbol-function 'qq-api-call)
                (lambda (called-action called-params callback &optional _errback)
                  (setq action called-action params called-params)
-                 (funcall callback '((data . ((kind . "single"))))))))
-      (qq-api-forward-message
-       "9007199254742007089" "group:20001" "private:10001"
+                 (funcall callback '((data . ((kind . "individual"))))))))
+      (qq-api-forward-messages-individually
+       "group:20001" "private:10001"
+       '("9007199254742007089" "9007199254742007090")
        (lambda (value) (setq result value))))
     (should (equal action "emacs_send_forward"))
     (should
@@ -3032,13 +3101,15 @@ The authoritative post-state reports UNREAD-COUNT."
     (should
      (equal
       (alist-get 'request params)
-      '((kind . "single")
-        (message
-         . ((message_id . "9007199254742007089")
-            (chat . ((kind . "group") (group_id . "20001"))))))))
-    (should (equal result '((kind . "single"))))))
+      '((kind . "individual")
+        (messages
+         . (((message_id . "9007199254742007089")
+             (chat . ((kind . "group") (group_id . "20001"))))
+            ((message_id . "9007199254742007090")
+             (chat . ((kind . "group") (group_id . "20001")))))))))
+    (should (equal result '((kind . "individual"))))))
 
-(ert-deftest qq-api-native-forward-bundle-preserves-order-and-duplicates ()
+(ert-deftest qq-api-native-forward-merged-preserves-order-and-group-target ()
   (let (params result)
     (cl-letf (((symbol-function 'qq-state-session) (lambda (_) nil))
               ((symbol-function 'qq-api-call)
@@ -3046,10 +3117,10 @@ The authoritative post-state reports UNREAD-COUNT."
                  (setq params called-params)
                  (funcall
                   callback
-                  '((data . ((kind . "bundle")
+                  '((data . ((kind . "merged")
                              (message_id . "9007199254742007999")
                              (resource_id . "resource-b"))))))))
-      (qq-api-send-forward-bundle
+      (qq-api-forward-messages-merged
        "private:10001" "group:20001"
        '("9007199254742007001"
          "9007199254742007001"
@@ -3060,6 +3131,7 @@ The authoritative post-state reports UNREAD-COUNT."
             '((kind . "group") (group_id . "20001"))))
     (let ((messages
            (alist-get 'messages (alist-get 'request params))))
+      (should (equal (alist-get 'kind (alist-get 'request params)) "merged"))
       (should
        (equal (mapcar (lambda (message) (alist-get 'message_id message))
                       messages)
@@ -3074,17 +3146,219 @@ The authoritative post-state reports UNREAD-COUNT."
         messages)))
     (should
      (equal result
-            '((kind . "bundle")
+            '((kind . "merged")
               (message_id . "9007199254742007999")
               (resource_id . "resource-b"))))))
 
+(ert-deftest qq-api-native-forward-rejects-dataline-destination ()
+  (let ((request
+         '((kind . "individual")
+           (messages
+            . (((message_id . "9007199254742007089")
+                (chat . ((kind . "private") (user_id . "10001"))))))))
+        transport-called)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (&rest _arguments) (setq transport-called t))))
+      (should-error
+       (qq-api-send-forward
+        '((kind . "dataline")
+          (peer_uid . "dev:a")
+          (variant . "mobile"))
+        request #'ignore)
+       :type 'user-error)
+      (should-error
+       (qq-api-forward-messages-individually
+        "private:10001" "dataline:mobile:dev:a"
+        '("9007199254742007089") #'ignore)
+       :type 'user-error))
+    (should-not transport-called)))
+
+(ert-deftest qq-api-native-send-forward-request-enforces-dataline-matrix ()
+  (let (transport-calls)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (action params _callback &optional _errback)
+                 (push (list action params) transport-calls)
+                 'forward-request)))
+      (dolist
+          (case
+           '(("individual" "desktop" t)
+             ("individual" "mobile" nil)
+             ("merged" "desktop" nil)
+             ("merged" "mobile" nil)))
+        (let* ((kind (nth 0 case))
+               (variant (nth 1 case))
+               (allowed-p (nth 2 case))
+               (request
+                `((kind . ,kind)
+                  (messages
+                   . (((message_id . "9007199254742007089")
+                       (chat . ((kind . "dataline")
+                                (peer_uid . "dev:a")
+                                (variant . ,variant)))))))))
+          (if allowed-p
+              (should
+               (eq
+                (qq-api-send-forward
+                 '((kind . "group") (group_id . "20001"))
+                 request #'ignore)
+                'forward-request))
+            (should-error
+             (qq-api-send-forward
+              '((kind . "group") (group_id . "20001"))
+              request #'ignore)
+             :type 'user-error)))))
+    (should (= (length transport-calls) 1))
+    (should
+     (equal
+      (alist-get
+       'chat
+       (car
+        (alist-get
+         'messages
+         (alist-get 'request (cadar transport-calls)))))
+      '((kind . "dataline")
+        (peer_uid . "dev:a")
+        (variant . "desktop"))))))
+
+(ert-deftest qq-api-native-forward-builders-enforce-dataline-matrix ()
+  (let (transport-calls)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action params _callback &optional _errback)
+                 (push params transport-calls)
+                 'forward-request)))
+      (should
+       (eq
+        (qq-api-forward-messages-individually
+         "dataline:desktop:dev:a" "group:20001"
+         '("9007199254742007089") #'ignore)
+        'forward-request))
+      (dolist
+          (case
+           '((qq-api-forward-messages-individually
+              "dataline:mobile:dev:a")
+             (qq-api-forward-messages-merged
+              "dataline:desktop:dev:a")
+             (qq-api-forward-messages-merged
+              "dataline:mobile:dev:a")))
+        (should-error
+         (funcall (car case) (cadr case) "group:20001"
+                  '("9007199254742007089") #'ignore)
+         :type 'user-error)))
+    (should (= (length transport-calls) 1))
+    (should
+     (equal
+      (alist-get
+       'chat
+       (car
+        (alist-get
+         'messages
+         (alist-get 'request (car transport-calls)))))
+      '((kind . "dataline")
+        (peer_uid . "dev:a")
+        (variant . "desktop"))))))
+
+(ert-deftest qq-api-native-forward-individual-accepts-service-source ()
+  (let (params)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action called-params callback &optional _errback)
+                 (setq params called-params)
+                 (funcall callback '((data . ((kind . "individual"))))))))
+      (qq-api-forward-messages-individually
+       "service:u:mail:x" "group:20001"
+       '("9007199254742007089") #'ignore))
+    (should
+     (equal
+      (alist-get 'chat
+                 (car (alist-get 'messages (alist-get 'request params))))
+      '((kind . "service") (peer_uid . "u:mail:x"))))))
+
+(ert-deftest qq-api-native-forward-rejects-mixed-source-chats-for-each-kind ()
+  (let (transport-called)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (&rest _arguments) (setq transport-called t))))
+      (dolist (kind '("individual" "merged"))
+        (should-error
+         (qq-api-send-forward
+          '((kind . "group") (group_id . "20001"))
+          `((kind . ,kind)
+            (messages
+             . (((message_id . "9007199254742007001")
+                 (chat . ((kind . "group") (group_id . "20001"))))
+                ((message_id . "9007199254742007002")
+                 (chat . ((kind . "private") (user_id . "10001")))))))
+          #'ignore)
+         :type 'user-error)))
+    (should-not transport-called)))
+
+(ert-deftest qq-api-native-forward-compares-semantic-source-for-each-kind ()
+  (let (transport-called)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (&rest _arguments) (setq transport-called t))))
+      (dolist (kind '("individual" "merged"))
+        (setq transport-called nil)
+        (qq-api-send-forward
+         '((kind . "group") (group_id . "20001"))
+         `((kind . ,kind)
+           (messages
+            . (((message_id . "9007199254742007001")
+                (chat . ((kind . "group") (group_id . "20001"))))
+               ((message_id . "9007199254742007002")
+                (chat . ((group_id . "20001") (kind . "group")))))))
+         #'ignore)
+        (should transport-called)))
+    (should transport-called)))
+
+(ert-deftest qq-api-native-forward-response-kind-matches-request-kind ()
+  (dolist
+      (case
+       '((((kind . "individual"))
+          ((kind . "merged")
+           (message_id . "9007199254742007999")
+           (resource_id . "resource-b")))
+         (((kind . "merged"))
+          ((kind . "individual")))))
+    (let (delivered failure)
+      (cl-letf (((symbol-function 'qq-api-call)
+                 (lambda (_action _params callback &optional _errback)
+                   (funcall callback `((data . ,(cadr case)))))))
+        (qq-api-send-forward
+         '((kind . "group") (group_id . "20001"))
+         `((kind . ,(alist-get 'kind (car case)))
+           (messages
+            . (((message_id . "9007199254742007001")
+                (chat . ((kind . "group") (group_id . "20001")))))))
+         (lambda (_) (setq delivered t))
+         (lambda (_response reason) (setq failure reason))))
+      (should-not delivered)
+      (should (string-match-p "does not match request kind" failure)))))
+
 (ert-deftest qq-api-native-send-rejects-bad-request-and-result-aliases ()
+  ;; The private protocol is a hard cut: old single/bundle shapes never enter
+  ;; the transport, even when all of their identities are otherwise valid.
   (should-error
    (qq-api-send-forward
     '((kind . "group") (group_id . "20001"))
     '((kind . "single")
-      (message . ((message_id . 1)
+      (message . ((message_id . "9007199254742007001")
                   (chat . ((kind . "group") (group_id . "20001"))))))
+   #'ignore)
+   :type 'user-error)
+  (should-error
+   (qq-api-send-forward
+    '((kind . "group") (group_id . "20001"))
+    '((kind . "bundle")
+      (messages
+       . (((message_id . "9007199254742007001")
+           (chat . ((kind . "group") (group_id . "20001")))))))
+    #'ignore)
+   :type 'user-error)
+  (should-error
+   (qq-api-send-forward
+    '((kind . "service") (peer_uid . "service-mail"))
+    '((kind . "individual")
+      (messages
+       . (((message_id . "9007199254742007001")
+           (chat . ((kind . "group") (group_id . "20001")))))))
     #'ignore)
    :type 'user-error)
   (let (delivered failure)
@@ -3092,15 +3366,33 @@ The authoritative post-state reports UNREAD-COUNT."
                (lambda (_action _params callback &optional _errback)
                  (funcall
                   callback
-                  '((data . ((kind . "bundle")
+                  '((data . ((kind . "merged")
                              (message_id . "9007199254742007999")
                              (res_id . "legacy"))))))))
       (qq-api-send-forward
        '((kind . "group") (group_id . "20001"))
-       '((kind . "single")
-         (message
-          . ((message_id . "9007199254742007001")
-             (chat . ((kind . "group") (group_id . "20001"))))))
+       '((kind . "individual")
+         (messages
+          . (((message_id . "9007199254742007001")
+              (chat . ((kind . "group") (group_id . "20001")))))))
+       (lambda (_) (setq delivered t))
+       (lambda (_response reason) (setq failure reason))))
+    (should-not delivered)
+    (should (stringp failure)))
+  (let (delivered failure)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional _errback)
+                 (funcall
+                  callback
+                  '((data . ((kind . "bundle")
+                             (message_id . "9007199254742007999")
+                             (resource_id . "legacy-resource"))))))))
+      (qq-api-send-forward
+       '((kind . "group") (group_id . "20001"))
+       '((kind . "merged")
+         (messages
+          . (((message_id . "9007199254742007001")
+              (chat . ((kind . "group") (group_id . "20001")))))))
        (lambda (_) (setq delivered t))
        (lambda (_response reason) (setq failure reason))))
     (should-not delivered)

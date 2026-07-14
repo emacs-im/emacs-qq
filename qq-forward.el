@@ -37,7 +37,7 @@
                   "qq-api" (message context protocol-p))
 (declare-function qq-api--validate-native-forward-segment
                   "qq-api" (segment context protocol-p))
-(declare-function qq-api-chat-locator "qq-api" (session-key))
+(declare-function qq-api--session-emacs-locator "qq-api" (session-key))
 (declare-function qq-api-validate-forward-source
                   "qq-api" (source &optional context protocol-p))
 (declare-function qq-api-validate-native-forward-messages
@@ -126,13 +126,8 @@ a remote reference that must be fetched.")
     ("message"
      (let* ((chat (alist-get 'chat source))
             (canonical-chat
-             (pcase (alist-get 'kind chat)
-               ("group"
-                (list (cons 'kind "group")
-                      (cons 'group_id (alist-get 'group_id chat))))
-               ("private"
-                (list (cons 'kind "private")
-                      (cons 'user_id (alist-get 'user_id chat)))))))
+             (qq-api--session-emacs-locator
+              (qq-api-session-key-from-locator chat))))
        (list (cons 'kind "message")
              (cons 'message_id (alist-get 'message_id source))
              (cons 'chat canonical-chat))))
@@ -432,7 +427,7 @@ the fork-native forward action using an explicit locator-qualified reference."
             (qq-api-validate-message-id
              (and (listp data) (alist-get 'message_id data))
              "legacy forward event"))
-           (chat (qq-api-chat-locator session-key)))
+           (chat (qq-api--session-emacs-locator session-key)))
       `((type . "forward")
         (data
          . ((content

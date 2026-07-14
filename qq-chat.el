@@ -41,6 +41,7 @@
 (autoload 'qq-user-open "qq-user" nil t)
 (autoload 'qq-group-open "qq-group" nil t)
 (autoload 'qq-search-open "qq-search" nil t)
+(autoload 'qq-chat-forward-transient "qq-transient" nil t)
 
 (declare-function qq-forward-segment-p "qq-forward" (segment))
 (declare-function qq-forward-insert-segment
@@ -53,10 +54,11 @@
 (declare-function qq-chat-message-transient "qq-transient" (&rest args))
 (declare-function qq-chat-attach-transient "qq-transient" (&rest args))
 (declare-function qq-chat-transient "qq-transient" (&rest args))
-(declare-function qq-api-forward-message
-                  "qq-api" (message-id source-session-key target-session-key
-                                        callback &optional errback))
-(declare-function qq-api-send-forward-bundle
+(declare-function qq-chat-forward-transient "qq-transient" (&rest args))
+(declare-function qq-api-forward-messages-individually
+                  "qq-api" (source-session-key target-session-key message-ids
+                                                callback &optional errback))
+(declare-function qq-api-forward-messages-merged
                   "qq-api" (source-session-key target-session-key message-ids
                                                 callback &optional errback))
 (declare-function qq-api-cancel-request "qq-api" (request-token))
@@ -211,11 +213,47 @@ loaded in the chatbuf.")
 
 This mirrors telega's `telega-chatbuf--messages-pop-ring'.")
 
-(defvar-local qq-chat--marked-message-anchors nil
-  "Message anchors selected for one merged-forward operation.")
+(cl-defstruct
+    (qq-chat-message-selection
+     (:constructor qq-chat--make-message-selection (anchor owner message)))
+  "One stable message-selection membership.
 
-(defvar-local qq-chat--forward-request-active-p nil
-  "Non-nil while one merged-forward request from this chat is in flight.")
+OWNER is an opaque identity token.  A completed asynchronous operation may
+remove this membership only while the same OWNER still belongs to ANCHOR."
+  anchor
+  owner
+  message)
+
+(defvar-local qq-chat--message-selection nil
+  "Ordered list of `qq-chat-message-selection' memberships.")
+
+(defvar-local qq-chat--forward-request nil
+  "Cancelable transport token for the active forward request.")
+
+(defvar-local qq-chat--forward-request-owner nil
+  "Opaque owner of the active forward request from this chat buffer.")
+
+(defvar-local qq-chat--forward-plan-owner nil
+  "Opaque runtime/account owner captured by newly created forward plans.")
+
+(defvar qq-chat--last-forward-target-key nil
+  "Most recent session key that accepted a forwarded message.")
+
+(defvar qq-chat-forward-target-history nil
+  "Minibuffer history for QQ forwarding destinations.")
+
+(cl-defstruct
+    (qq-chat-forward-plan
+     (:constructor qq-chat--make-forward-plan
+                   (buffer session-key anchors messages memberships
+                           plan-owner)))
+  "Immutable source snapshot passed through the forwarding transient."
+  buffer
+  session-key
+  anchors
+  messages
+  memberships
+  plan-owner)
 
 (defvar-local qq-chat--send-restore-owner nil
   "Opaque owner allowed to restore the most recently cleared failed send.
@@ -232,9 +270,9 @@ stale network failure can never overwrite newer user input.")
     ;; Message actions at point (telega-style single keys; never steal input).
     (define-key map (kbd "r") #'qq-chat-reply-to-message)
     (define-key map (kbd "d") #'qq-chat-delete-message)
-    (define-key map (kbd "f") #'qq-chat-forward-message)
-    (define-key map (kbd "M") #'qq-chat-toggle-forward-mark)
-    (define-key map (kbd "F") #'qq-chat-forward-marked-messages)
+    (define-key map (kbd "f") #'qq-chat-forward-transient)
+    (define-key map (kbd "m") #'qq-chat-toggle-message-selection)
+    (define-key map (kbd "U") #'qq-chat-clear-message-selection)
     (define-key map (kbd "o") #'qq-chat-open-resource-at-point)
     (define-key map (kbd "a") #'qq-chat-open-avatar-at-point)
     (define-key map (kbd "i") #'qq-chat-open-user-at-point)
@@ -243,15 +281,14 @@ stale network failure can never overwrite newer user input.")
     (define-key map (kbd "x") #'qq-chat-goto-pop-message)
     (define-key map (kbd "P") #'qq-chat-poke-sender)
     (define-key map (kbd "!") #'qq-chat-react-to-message)
-    (define-key map (kbd "m") #'qq-chat-message-transient)
     (define-key map (kbd "?") #'qq-chat-transient)
     map)
   "Timeline-only keymap active when point is outside the draft region.
 
 Single-key message actions (`r' reply, `d' recall, `!' react, `P' poke sender,
-`f' forward,
-`M' mark, `F' forward marked, `o' open media, `a' avatar, `i' user,
-`g' goto replied-to, `x' pop jump) and menus (`m'/`?') apply on the timeline.
+`f' forward, `m' select/unselect, `U' clear selection,
+`o' open media, `a' avatar, `i' user,
+`g' goto replied-to, `x' pop jump) and the `?' menu apply on the timeline.
 They are inactive in the composer so typing is never stolen.")
 
 (define-minor-mode qq-chat-timeline-mode
@@ -321,10 +358,13 @@ of the default chrome."
          (unread-part (if (> unread 0)
                           (format "  · %d unread" unread)
                         ""))
-         (marked-count (length qq-chat--marked-message-anchors))
-         (marked-part (if (> marked-count 0)
-                          (format "  · %d marked" marked-count)
-                        ""))
+         (selected-count (length qq-chat--message-selection))
+         (selected-part (if (> selected-count 0)
+                            (format "  · %d selected" selected-count)
+                          ""))
+         (forward-part (if qq-chat--forward-request-owner
+                           "  · forwarding…"
+                         ""))
          (filter-part
           (if-let* ((status (qq-chat--msg-filter-status)))
               (format "  · %s" status)
@@ -344,8 +384,8 @@ of the default chrome."
                                    (plist-get qq-chat--search-owner :pending)))
                           "+" ""))
             "")))
-    (format " %s%s%s%s%s%s" title status-part unread-part marked-part
-            filter-part search-part)))
+    (format " %s%s%s%s%s%s%s" title status-part unread-part selected-part
+            forward-part filter-part search-part)))
 
 (defun qq-chat--insert-read-only (text &optional face properties)
   "Insert read-only TEXT with optional FACE and PROPERTIES."
@@ -618,9 +658,7 @@ available."
 Prefer the NapCat NT snowflake `server-id' (string) once known.  Pending
 optimistic rows still use `local-id' until send succeeds and the node is
 rekeyed (see `qq-chat--rekey-message-node-if-needed')."
-  (or (alist-get 'server-id message)
-      (alist-get 'local-id message)
-      (alist-get 'id message)))
+  (qq-state-message-anchor message))
 
 (defun qq-chat--authoritative-latest-message-id ()
   "Return the best exact latest-message id known for the current session."
@@ -671,7 +709,8 @@ bounds."
         'qq-chat-message-id (alist-get 'server-id message)
         'qq-chat-message-local-id (alist-get 'local-id message)
         'qq-chat-session-key qq-chat--session-key
-        'qq-chat-forward-marked (and (qq-chat--message-marked-p message) t)
+        'qq-chat-message-selected
+        (and (qq-chat-message-selected-p message) t)
         'read-only t
         'front-sticky '(read-only)
         'rear-nonsticky '(read-only)))
@@ -804,48 +843,201 @@ prompt behavior.  Point on the timeline represents that exact message."
        (qq-api-message-id-p (alist-get 'server-id message))
        (not (qq-state-message-recalled-p message))))
 
-(defun qq-chat--message-marked-p (message)
-  "Return non-nil when MESSAGE is selected for merged forwarding."
-  (member (qq-chat--message-anchor message) qq-chat--marked-message-anchors))
+(defun qq-chat--forward-source-supported-p
+    (&optional style session-key)
+  "Return non-nil when SESSION-KEY may submit native forwards using STYLE.
 
-(defun qq-chat-marked-messages ()
-  "Return selected messages in current timeline order."
+STYLE is `individual', `merged', or nil when any supported style is enough.
+DataLine desktop supports only individual forwarding; DataLine mobile supports
+neither style."
+  (condition-case nil
+      (let* ((identity
+              (qq-state-session-key-identity
+               (or session-key qq-chat--session-key)))
+             (type (alist-get 'type identity))
+             (variant (alist-get 'variant identity)))
+        (and
+         (memq style '(nil individual merged))
+         (pcase type
+           ((or 'private 'group 'service) t)
+           ('dataline
+            (and (equal variant "desktop")
+                 (memq style '(nil individual))))
+           (_ nil))))
+    (error nil)))
+
+(defun qq-chat--validate-forward-source-session (style session-key)
+  "Return SESSION-KEY when it supports native forwarding STYLE."
+  (unless (qq-chat--forward-source-supported-p style session-key)
+    (user-error "qq: %s forwarding is unavailable from %s"
+                (or style 'native) session-key))
+  session-key)
+
+(defun qq-chat--message-selection-anchors ()
+  "Return the selected message anchors in membership insertion order."
+  (mapcar #'qq-chat-message-selection-anchor qq-chat--message-selection))
+
+(defun qq-chat--message-selection-find (anchor)
+  "Return the current selection membership for ANCHOR, or nil."
+  (seq-find
+   (lambda (membership)
+     (equal anchor (qq-chat-message-selection-anchor membership)))
+   qq-chat--message-selection))
+
+(defun qq-chat--stable-message-order (messages)
+  "Return MESSAGES in stable QQ timeline order.
+
+Server time is compared first and exact per-session message sequence second.
+When any message in one timestamp bucket lacks a sequence, that entire bucket
+uses state insertion order instead.  This makes the comparator transitive
+while retaining the only ordering evidence shared by every item.  The
+decorated input position settles ties without treating snowflake IDs as
+ordering numbers."
+  (let ((sequence-complete-by-time (make-hash-table :test #'eql))
+        (missing (make-symbol "missing"))
+        (indexed
+         (cl-loop for message in messages
+                  for index from 0
+                  collect (cons index message))))
+    (dolist (item indexed)
+      (let* ((message (cdr item))
+             (time
+              (qq-state--normalize-time (alist-get 'time message)))
+             (previous
+              (gethash time sequence-complete-by-time missing))
+             (sequence-p
+              (qq-protocol--nonzero-decimal-string-p
+               (alist-get 'message-seq message))))
+        (puthash time
+                 (and (or (eq previous missing) previous) sequence-p)
+                 sequence-complete-by-time)))
+    (mapcar
+     #'cdr
+     (sort indexed
+           (lambda (left right)
+             (let ((left-message (cdr left))
+                   (right-message (cdr right))
+                   (left-sequence (alist-get 'message-seq (cdr left)))
+                   (right-sequence (alist-get 'message-seq (cdr right)))
+                   (left-time
+                    (qq-state--normalize-time
+                     (alist-get 'time (cdr left))))
+                   (right-time
+                    (qq-state--normalize-time
+                     (alist-get 'time (cdr right)))))
+               (cond
+                ((< left-time right-time) t)
+                ((> left-time right-time) nil)
+                ((and (gethash left-time sequence-complete-by-time)
+                      (not (equal left-sequence right-sequence)))
+                 (< (qq-protocol-decimal-string-compare
+                     left-sequence right-sequence)
+                    0))
+                ((qq-state--message-sort< left-message right-message) t)
+                ((qq-state--message-sort< right-message left-message) nil)
+                (t (< (car left) (car right))))))))))
+
+(defun qq-chat--forward-message-candidates ()
+  "Return materialized forward candidates in stable timeline order.
+
+Canonical history remains available while a message filter is active.  The
+filter-owned snapshot replaces a canonical object with the same anchor,
+because that snapshot is the exact projection currently presented to the
+user."
+  (let ((messages (qq-state-session-messages qq-chat--session-key)))
+    (when (qq-chat--msg-filter-active-p)
+      (dolist (filtered (qq-chat--filtered-timeline-messages))
+        (let ((anchor (qq-chat--message-anchor filtered)))
+          (setq messages
+                (seq-remove
+                 (lambda (message)
+                   (equal anchor (qq-chat--message-anchor message)))
+                 messages))
+          (setq messages (append messages (list filtered))))))
+    (dolist (membership qq-chat--message-selection)
+      (let ((anchor (qq-chat-message-selection-anchor membership))
+            (snapshot (qq-chat-message-selection-message membership)))
+        ;; Filter-only selections can outlive their private projection without
+        ;; ever entering canonical history.  Re-project permanent tombstones
+        ;; at this public boundary so a later recall cannot leave the captured
+        ;; live snapshot forwardable.  Do not replace or mutate MEMBERSHIP:
+        ;; its opaque owner remains the immutable async-completion identity.
+        (when (listp snapshot)
+          (setq snapshot
+                (qq-state-message-apply-tombstones
+                 qq-chat--session-key snapshot)))
+        (when (and
+               (listp snapshot)
+               (not
+                (seq-some
+                 (lambda (message)
+                   (equal anchor (qq-chat--message-anchor message)))
+                 messages)))
+          ;; A selected filter-only message owns its materialized snapshot.
+          ;; Refreshing or closing the filter cannot erase that membership.
+          (setq messages (append messages (list snapshot))))))
+    (qq-chat--stable-message-order messages)))
+
+(defun qq-chat-message-selected-p (message)
+  "Return non-nil when normalized MESSAGE belongs to the selection set."
+  (and (qq-chat--message-selection-find (qq-chat--message-anchor message)) t))
+
+(defun qq-chat-selected-messages ()
+  "Return selected, forwardable messages in stable timeline order."
   (seq-filter
    (lambda (message)
      (and (qq-chat--message-forwardable-p message)
-          (qq-chat--message-marked-p message)))
-   (if (qq-chat--msg-filter-active-p)
-       (qq-chat--timeline-messages)
-     (qq-state-session-messages qq-chat--session-key))))
+          (qq-chat-message-selected-p message)))
+   (qq-chat--forward-message-candidates)))
 
-(defun qq-chat--prune-forward-marks ()
-  "Drop marked anchors that no longer name forwardable messages.
+(defun qq-chat--prune-message-selection ()
+  "Drop memberships whose authoritative candidate is no longer forwardable.
 
 The state accessor intentionally returns a defensive deep copy, so only pay
-that cost while a non-empty forwarding selection needs validation.  Header
-formatting then reads the buffer-local list in constant time, and redisplay
-uses the cached header string."
-  (when qq-chat--marked-message-anchors
-    (setq qq-chat--marked-message-anchors
-          (mapcar #'qq-chat--message-anchor
-                  (qq-chat-marked-messages)))))
+that cost while a non-empty message selection needs validation.  Header
+formatting then reads the buffer-local membership list in constant time.
+Canonical candidates remain visible to this validation while a filter owns
+the rendered projection; selection-owned snapshots bridge refresh and cancel
+gaps before filter-only rows enter canonical history."
+  (when qq-chat--message-selection
+    (let ((forwardable (make-hash-table :test #'equal)))
+      (dolist (message (qq-chat--forward-message-candidates))
+        (when (qq-chat--message-forwardable-p message)
+          (puthash (qq-chat--message-anchor message) t forwardable)))
+      (setq qq-chat--message-selection
+            (seq-filter
+             (lambda (membership)
+               (gethash (qq-chat-message-selection-anchor membership)
+                        forwardable))
+             qq-chat--message-selection)))))
 
-(defun qq-chat--rekey-forward-mark (previous-anchor anchor)
-  "Move a forward mark from PREVIOUS-ANCHOR to canonical ANCHOR."
-  (when (and previous-anchor
-             anchor
-             (not (equal previous-anchor anchor))
-             (member previous-anchor qq-chat--marked-message-anchors))
-    (setq qq-chat--marked-message-anchors
-          (delete-dups
-           (mapcar (lambda (marked-anchor)
-                     (if (equal marked-anchor previous-anchor)
-                         anchor
-                       marked-anchor))
-                   qq-chat--marked-message-anchors)))))
+(defun qq-chat--rekey-message-selection (previous-anchor anchor)
+  "Move selection from PREVIOUS-ANCHOR to canonical ANCHOR."
+  (when (and previous-anchor anchor (not (equal previous-anchor anchor)))
+    (when-let* ((previous
+                 (qq-chat--message-selection-find previous-anchor)))
+      (if (qq-chat--message-selection-find anchor)
+          ;; Preserve the canonical membership's newer opaque owner.
+          (setq qq-chat--message-selection
+                (delq previous qq-chat--message-selection))
+        (setq qq-chat--message-selection
+              (mapcar
+               (lambda (membership)
+                 (if (eq membership previous)
+                     (let ((message
+                            (copy-tree
+                             (qq-chat-message-selection-message membership))))
+                       (setf (alist-get 'server-id message) anchor
+                             (alist-get 'id message) anchor)
+                       (qq-chat--make-message-selection
+                        anchor
+                        (qq-chat-message-selection-owner membership)
+                        message))
+                   membership))
+               qq-chat--message-selection))))))
 
 (defun qq-chat--forwardable-target-sessions ()
-  "Return all private/group targets known from sessions and contact caches."
+  "Return all sendable forward targets known from sessions and contacts."
   (let ((by-key (make-hash-table :test #'equal))
         targets)
     (dolist (session (qq-state-sessions))
@@ -887,117 +1079,329 @@ uses the cached header string."
     (maphash (lambda (_key target) (push target targets)) by-key)
     (sort targets
           (lambda (left right)
-            (string-lessp (or (alist-get 'title left) "")
-                          (or (alist-get 'title right) ""))))))
+            (let ((left-title (or (alist-get 'title left) ""))
+                  (right-title (or (alist-get 'title right) "")))
+              (if (equal left-title right-title)
+                  (string-lessp (alist-get 'key left)
+                                (alist-get 'key right))
+                (string-lessp left-title right-title)))))))
 
-(defun qq-chat--read-forward-target ()
-  "Read and return one private/group target session key."
+(defun qq-chat--forward-style-label (style)
+  "Return the user-facing label for forward STYLE."
+  (pcase style
+    ('individual "逐条转发")
+    ('merged "合并转发")
+    (_ (error "qq: unknown forward style %S" style))))
+
+(defun qq-chat--forward-target-type-label (session)
+  "Return a concise destination type label for SESSION."
+  (pcase (format "%s" (or (alist-get 'type session)
+                            (qq-state-session-key-type
+                             (alist-get 'key session))))
+    ("private" "好友")
+    ("group" "群聊")
+    (_ "会话")))
+
+(defun qq-chat--read-forward-target (style count)
+  "Read a destination for forwarding COUNT messages using STYLE."
   (let* ((sessions (qq-chat--forwardable-target-sessions))
          (choices
           (mapcar
            (lambda (session)
              (let ((key (alist-get 'key session)))
-               (cons (format "%s  [%s]"
+               (cons (format "%s  · %s  [%s]"
                              (or (alist-get 'title session) key)
+                             (qq-chat--forward-target-type-label session)
                              key)
                      key)))
-           sessions)))
+           sessions))
+         (default
+          (car (rassoc qq-chat--last-forward-target-key choices))))
     (unless choices
-      (user-error "qq: no private/group forwarding target available"))
-    (cdr (assoc (completing-read "Forward to: " choices nil t) choices))))
+      (user-error "qq: no forwarding destination is available"))
+    (let ((selected
+           (completing-read
+            (format "%s %d 条消息到: "
+                    (qq-chat--forward-style-label style) count)
+            choices nil t nil 'qq-chat-forward-target-history default)))
+      (or (cdr (assoc selected choices))
+          (user-error "qq: invalid forwarding destination")))))
 
-(defun qq-chat-toggle-forward-mark ()
-  "Toggle merged-forward selection for the message at point."
+(defun qq-chat-toggle-message-selection ()
+  "Toggle the message at point in the stable selection and move forward."
   (interactive)
+  ;; Keep the direct `m' command behind the same closed source capability
+  ;; gate as plan creation and submission.  Unsupported sessions must never
+  ;; accumulate a selection that no forwarding style can consume.
+  (qq-chat--validate-forward-source-session nil qq-chat--session-key)
   (let* ((message (or (qq-chat--message-at-point)
                       (user-error "qq: no message at point")))
-         (anchor (qq-chat--message-anchor message)))
+         (anchor (qq-chat--message-anchor message))
+         (membership (qq-chat--message-selection-find anchor)))
     (unless (qq-chat--message-forwardable-p message)
       (user-error "qq: this message cannot be forwarded"))
-    (if (member anchor qq-chat--marked-message-anchors)
-        (setq qq-chat--marked-message-anchors
-              (delete anchor qq-chat--marked-message-anchors))
-      (setq qq-chat--marked-message-anchors
-            (append qq-chat--marked-message-anchors (list anchor))))
+    (if membership
+        (setq qq-chat--message-selection
+              (delq membership qq-chat--message-selection))
+      (setq qq-chat--message-selection
+            (append
+             qq-chat--message-selection
+             (list
+              (qq-chat--make-message-selection
+               anchor
+               (list 'message-selection anchor)
+               (copy-tree message))))))
     (qq-chat--request-row-redisplay (list anchor))
     (qq-chat--header-line-update)
-    (message "qq: %d message%s marked for forwarding"
-             (length qq-chat--marked-message-anchors)
-             (if (= (length qq-chat--marked-message-anchors) 1) "" "s"))))
+    (message "qq: 已选择 %d 条消息"
+             (length qq-chat--message-selection))
+    ;; Match telega: repeated `m' walks through the timeline, but the final
+    ;; message never drops point into the composer.
+    (let ((position (qq-chat--current-message-position)))
+      (when (and position
+                 (seq-some (lambda (candidate) (> candidate position))
+                           (qq-chat--message-positions)))
+        (qq-chat-next-message)))))
 
-(defun qq-chat-clear-forward-marks (&optional quiet)
-  "Clear merged-forward message selection.
+(defun qq-chat-clear-message-selection (&optional quiet)
+  "Clear the current message selection.
 
 Suppress the status message when QUIET is non-nil."
   (interactive)
-  (let ((anchors (copy-sequence qq-chat--marked-message-anchors)))
-    (setq qq-chat--marked-message-anchors nil)
+  (let ((anchors (qq-chat--message-selection-anchors)))
+    (setq qq-chat--message-selection nil)
     (when anchors
       (qq-chat--request-row-redisplay anchors))
     (qq-chat--header-line-update)
     (unless quiet
-      (message "qq: forwarding selection cleared"))))
+      (message "qq: 已清除消息选择"))))
 
-(defun qq-chat-forward-message (&optional target-session-key)
-  "Forward the message at point to TARGET-SESSION-KEY.
-
-Interactively, prompt for a cached private or group session.  This uses the
-fork-native single-forward request and deliberately creates no optimistic row,
-because its result is only `{kind:single}'."
-  (interactive)
-  (let* ((message (or (qq-chat--message-at-point)
-                      (user-error "qq: no message at point")))
-         (message-id (alist-get 'server-id message)))
-    (unless (qq-chat--message-forwardable-p message)
-      (user-error "qq: this message cannot be forwarded"))
-    (let ((target (or target-session-key (qq-chat--read-forward-target))))
-      (qq-api-forward-message
-       message-id
-       qq-chat--session-key
-       target
-       (lambda (_response)
-         (message "qq: forwarded message to %s" target))))))
-
-(defun qq-chat-forward-marked-messages (&optional target-session-key)
-  "Send marked messages as one merged forward to TARGET-SESSION-KEY."
-  (interactive)
-  (when qq-chat--forward-request-active-p
-    (user-error "qq: a merged-forward request is already in progress"))
-  (let ((messages (qq-chat-marked-messages)))
+(defun qq-chat--current-forward-plan ()
+  "Return a stable forward plan from selected messages or point."
+  (qq-chat--validate-forward-source-session nil qq-chat--session-key)
+  (qq-chat--prune-message-selection)
+  (let* ((selection-p (and qq-chat--message-selection t))
+         (messages
+          (if selection-p
+              (qq-chat-selected-messages)
+            (let ((message (qq-chat--message-at-point)))
+              (and message (list message)))))
+         (anchors (mapcar #'qq-chat--message-anchor messages))
+         (memberships
+          (when selection-p
+            (mapcar
+             (lambda (anchor)
+               (let ((membership
+                      (qq-chat--message-selection-find anchor)))
+                 (unless membership
+                   (error "qq: selected message %s lost its membership"
+                          anchor))
+                 (cons anchor
+                       (qq-chat-message-selection-owner membership))))
+             anchors))))
     (unless messages
-      (user-error "qq: no messages marked for forwarding"))
-    (let* ((target (or target-session-key (qq-chat--read-forward-target)))
-           (buffer (current-buffer))
-           (sent-anchors (mapcar #'qq-chat--message-anchor messages)))
-      (setq qq-chat--forward-request-active-p t)
+      (user-error "qq: select a message to forward"))
+    (dolist (message messages)
+      (unless (qq-chat--message-forwardable-p message)
+        (user-error "qq: selected message %s cannot be forwarded"
+                    (qq-chat--message-anchor message))))
+    (qq-chat--make-forward-plan
+     (current-buffer)
+     qq-chat--session-key
+     anchors
+     (copy-tree messages)
+     memberships
+     qq-chat--forward-plan-owner)))
+
+(defun qq-chat--forward-plan-messages (plan)
+  "Return PLAN's immutable message snapshots in their original order."
+  (unless (qq-chat-forward-plan-p plan)
+    (user-error "qq: invalid forwarding plan"))
+  (let ((buffer (qq-chat-forward-plan-buffer plan))
+        (session-key (qq-chat-forward-plan-session-key plan))
+        (anchors (qq-chat-forward-plan-anchors plan))
+        (messages (qq-chat-forward-plan-messages plan))
+        (plan-owner (qq-chat-forward-plan-plan-owner plan)))
+    (unless (buffer-live-p buffer)
+      (user-error "qq: forwarding source buffer no longer exists"))
+    (with-current-buffer buffer
+      (unless (and (derived-mode-p 'qq-chat-mode)
+                   (equal qq-chat--session-key session-key))
+        (user-error "qq: forwarding source buffer changed sessions"))
+      (unless (and plan-owner (eq plan-owner qq-chat--forward-plan-owner))
+        (user-error "qq: forwarding plan belongs to a stale runtime"))
+      (unless (and (consp messages)
+                   (= (length anchors) (length messages)))
+        (user-error "qq: forwarding plan has inconsistent messages"))
+      (let ((projected
+             (mapcar
+              (lambda (message)
+                (qq-state-message-apply-tombstones session-key message))
+              messages)))
+        (cl-loop for anchor in anchors
+                 for message in projected
+                 unless (and (equal anchor (qq-chat--message-anchor message))
+                             (qq-chat--message-forwardable-p message))
+                 do (user-error
+                     "qq: forwarding plan message %s is invalid" anchor))
+        (copy-tree projected)))))
+
+(defun qq-chat--forward-request-current-p (buffer session-key owner)
+  "Return non-nil when OWNER still owns BUFFER's forwarding request."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and (derived-mode-p 'qq-chat-mode)
+              (equal qq-chat--session-key session-key)
+              (eq qq-chat--forward-request-owner owner)))))
+
+(defun qq-chat--cancel-forward-request ()
+  "Cancel and forget the active forwarding request in this buffer."
+  (let ((request qq-chat--forward-request))
+    ;; Invalidate callback ownership before transport cancellation.  A
+    ;; synchronous cancellation callback must already be stale, especially at
+    ;; the runtime/account reset boundary.
+    (setq qq-chat--forward-request nil
+          qq-chat--forward-request-owner nil)
+    (when request
+      (condition-case nil
+          (qq-api-cancel-request request)
+        (quit
+         (setq quit-flag nil)
+         nil)
+        (error nil)))))
+
+(defun qq-chat--forward-succeeded
+    (buffer session-key owner anchors memberships style target _response)
+  "Settle successful forward OWNER and remove captured MEMBERSHIPS."
+  (when (qq-chat--forward-request-current-p buffer session-key owner)
+    (with-current-buffer buffer
+      (let (removed)
+        (dolist (snapshot memberships)
+          (let* ((anchor (car snapshot))
+                 (membership (qq-chat--message-selection-find anchor)))
+            (when (and membership
+                       (eq (qq-chat-message-selection-owner membership)
+                           (cdr snapshot)))
+              (setq qq-chat--message-selection
+                    (delq membership qq-chat--message-selection))
+              (push anchor removed))))
+        (setq qq-chat--forward-request nil
+              qq-chat--forward-request-owner nil)
+        (when removed
+          (qq-chat--request-row-redisplay (nreverse removed))))
+      (qq-chat--header-line-update))
+    (setq qq-chat--last-forward-target-key target)
+    (message "qq: 已%s %d 条消息到 %s"
+             (qq-chat--forward-style-label style)
+             (length anchors)
+             target)))
+
+(defun qq-chat--forward-failed (buffer session-key owner response reason)
+  "Settle failed forward OWNER while preserving its message selection."
+  (when (qq-chat--forward-request-current-p buffer session-key owner)
+    (with-current-buffer buffer
+      (setq qq-chat--forward-request nil
+            qq-chat--forward-request-owner nil)
+      (qq-chat--header-line-update))
+    (qq-api--default-error response reason)))
+
+(defun qq-chat--submit-forward (style plan &optional target-session-key)
+  "Submit PLAN using STYLE to TARGET-SESSION-KEY.
+
+STYLE is `individual' or `merged'.  Cancellation and failures preserve the
+selection; success removes only the immutable selection snapshot in PLAN."
+  (unless (qq-chat-forward-plan-p plan)
+    (user-error "qq: invalid forwarding plan"))
+  (let* ((buffer (qq-chat-forward-plan-buffer plan))
+         (session-key (qq-chat-forward-plan-session-key plan))
+         (_validated-source
+          (qq-chat--validate-forward-source-session style session-key))
+         (messages (qq-chat--forward-plan-messages plan))
+         (anchors (copy-sequence (qq-chat-forward-plan-anchors plan)))
+         (memberships
+          (copy-sequence (qq-chat-forward-plan-memberships plan)))
+         ids target owner request request-installed-p)
+    (with-current-buffer buffer
+      (when qq-chat--forward-request-owner
+        (user-error "qq: another forwarding request is already in progress"))
+      (setq target
+            (or target-session-key
+                (qq-chat--read-forward-target style (length messages))))
+      ;; The minibuffer permits process filters and recursive commands.  Treat
+      ;; its return as a fresh ownership boundary: another request, a reset,
+      ;; or a recall may have invalidated every pre-prompt observation.
+      (when qq-chat--forward-request-owner
+        (user-error "qq: another forwarding request is already in progress"))
+      (qq-chat--validate-forward-source-session style session-key)
+      (setq messages (qq-chat--forward-plan-messages plan)
+            ids (mapcar (lambda (message) (alist-get 'server-id message))
+                        messages)
+            owner (list 'forward style session-key target anchors)
+            qq-chat--forward-request-owner owner)
       (condition-case error-data
-          (qq-api-send-forward-bundle
-           qq-chat--session-key
-           target
-           (mapcar (lambda (message) (alist-get 'server-id message)) messages)
-           (lambda (_response)
-             (when (buffer-live-p buffer)
-               (with-current-buffer buffer
-                 (setq qq-chat--forward-request-active-p nil
-                       qq-chat--marked-message-anchors
-                       (seq-remove
-                        (lambda (anchor) (member anchor sent-anchors))
-                        qq-chat--marked-message-anchors))
-                 (qq-chat--request-row-redisplay
-                  sent-anchors)
-                 (qq-chat--header-line-update)))
-             (message "qq: forwarded %d messages to %s"
-                      (length messages) target))
-           (lambda (response reason)
-             (when (buffer-live-p buffer)
-               (with-current-buffer buffer
-                 (setq qq-chat--forward-request-active-p nil)
-                 (qq-chat--header-line-update)))
-             (qq-api--default-error response reason)))
-        (error
-         (setq qq-chat--forward-request-active-p nil)
-         (qq-chat--header-line-update)
+          (progn
+            ;; Acquiring the owner and reflecting it in the header is part of
+            ;; the pre-dispatch transaction.  A rendering error must not leave
+            ;; an owner behind that permanently suppresses retries.
+            (qq-chat--header-line-update)
+            ;; Extend the transport's inhibited handoff through installation
+            ;; of its returned token in this buffer.  A C-g arriving after the
+            ;; socket handoff but before this assignment is deferred until the
+            ;; request has a cancelable, callback-owned identity here.
+            (let ((inhibit-quit t))
+              (setq request
+                    (funcall
+                     (pcase style
+                       ('individual #'qq-api-forward-messages-individually)
+                       ('merged #'qq-api-forward-messages-merged)
+                       (_ (error "qq: unknown forward style %S" style)))
+                     session-key target ids
+                     (apply-partially
+                      #'qq-chat--forward-succeeded
+                      buffer session-key owner anchors memberships style target)
+                     (apply-partially
+                      #'qq-chat--forward-failed buffer session-key owner)))
+              ;; A test adapter or transport may settle synchronously.  Never
+              ;; install its already-finished request token afterward.
+              (when (qq-chat--forward-request-current-p
+                     buffer session-key owner)
+                (setq qq-chat--forward-request request
+                      request-installed-p (and request t)))
+              ;; Restoring `inhibit-quit' does not guarantee an immediate
+              ;; check of `quit-flag'.  Turn a quit from this outer handoff
+              ;; into one synchronous signal only after token installation,
+              ;; so it cannot leak to an unrelated caller safe point.
+              (when quit-flag
+                (setq quit-flag nil)
+                (signal 'quit nil)))
+            request)
+        ((error quit)
+         ;; Once a non-nil token is installed, the action may already have
+         ;; been delivered.  Keep ownership until its response, timeout, or
+         ;; explicit cancellation; clearing it here would permit a duplicate
+         ;; retry with unknown first-delivery status.
+         (unless request-installed-p
+           (when (eq qq-chat--forward-request-owner owner)
+             (setq qq-chat--forward-request nil
+                   qq-chat--forward-request-owner nil)
+             (ignore-errors (qq-chat--header-line-update))))
+         ;; An automatically delivered deferred quit may leave `quit-flag'
+         ;; set.  Consume that flag before re-signalling exactly once.
+         (when (eq (car error-data) 'quit)
+           (setq quit-flag nil))
          (signal (car error-data) (cdr error-data)))))))
+
+(defun qq-chat-forward-individually (&optional plan target-session-key)
+  "Forward PLAN as individual messages to TARGET-SESSION-KEY."
+  (interactive)
+  (qq-chat--submit-forward
+   'individual (or plan (qq-chat--current-forward-plan)) target-session-key))
+
+(defun qq-chat-forward-merged (&optional plan target-session-key)
+  "Forward PLAN as one merged-forward card to TARGET-SESSION-KEY."
+  (interactive)
+  (qq-chat--submit-forward
+   'merged (or plan (qq-chat--current-forward-plan)) target-session-key))
 
 (defun qq-chat--message-positions ()
   "Return list of message start positions in the current buffer."
@@ -1587,7 +1991,7 @@ same id or unrelated history islands and must not replace a search hit."
 (defun qq-chat--header-line-update ()
   "Update chat header line and buffer name."
   (qq-chat--ensure-buffer-name)
-  (qq-chat--prune-forward-marks)
+  (qq-chat--prune-message-selection)
   (setq-local header-line-format (qq-chat--header-line))
   (force-mode-line-update))
 
@@ -3149,19 +3553,29 @@ on the first inline line when the body is pure inline content."
     prefixes))
 
 (cl-defun qq-chat-message-layout
-    (message &key compact (avatar-p t))
+    (message &key compact (avatar-p t) selected-p)
   "Return shared presentation layout for MESSAGE.
 
 COMPACT makes the first body line use the ordinary continuation prefix.
 AVATAR-P controls whether the shared two-line avatar occupies the heading and
-first body line.  The returned plist owns a fresh mutable body prefix state."
+first body line.  SELECTED-P adds a stable mark to every visual line without
+inserting a synthetic timeline row.  The returned plist owns a fresh mutable
+body prefix state."
   (let* ((avatar-prefixes
           (and avatar-p (qq-chat--message-avatar-prefixes message)))
-         (header-prefix (or (plist-get avatar-prefixes :header) ""))
+         (selection-prefix
+          (if selected-p
+              (propertize "▌ " 'face 'qq-msg-selected-marker)
+            ""))
+         (header-prefix
+          (concat selection-prefix
+                  (or (plist-get avatar-prefixes :header) "")))
          (body-first-prefix
-          (or (plist-get avatar-prefixes :first-body) "  "))
+          (concat selection-prefix
+                  (or (plist-get avatar-prefixes :first-body) "  ")))
          (body-rest-prefix
-          (or (plist-get avatar-prefixes :rest-body) "  ")))
+          (concat selection-prefix
+                  (or (plist-get avatar-prefixes :rest-body) "  "))))
     (list :header-prefix header-prefix
           :body-rest-prefix body-rest-prefix
           :body-prefix-state
@@ -3220,27 +3634,24 @@ Visual model (telega-inspired; later appkit):
          (properties (qq-chat--message-line-properties message anchor))
          (status-suffix (qq-chat--status-suffix message))
          (compact (plist-get context :compact))
-         (marked (qq-chat--message-marked-p message))
+         (selected (qq-chat-message-selected-p message))
          (ordinary-message-p
           (not (or (qq-state-gray-tip-message-p message)
                    (qq-state-poke-message-p message))))
          (layout
           (qq-chat-message-layout
-           message :compact compact :avatar-p ordinary-message-p))
+           message :compact compact :avatar-p ordinary-message-p
+           :selected-p selected))
          (header-prefix (plist-get layout :header-prefix))
          (body-rest-prefix (plist-get layout :body-rest-prefix))
          (body-prefix-state (plist-get layout :body-prefix-state))
-         (short-time (qq-chat--format-time-short (alist-get 'time message))))
+         (short-time (qq-chat--format-time-short (alist-get 'time message)))
+         content-start)
     (when (and (stringp insert-date) (not (string-empty-p insert-date)))
       (qq-chat--insert-date-separator-row (qq-chat--message-day-label insert-date)))
     (when insert-unread
       (qq-chat--insert-unread-divider-row))
-    (when marked
-      (appkit-ui-insert-prefixed-lines
-       (appkit-ui-make-prefix-state body-rest-prefix body-rest-prefix)
-       "✓ selected for merged forwarding"
-       :face 'warning
-       :properties properties))
+    (setq content-start (point))
     (cond
      ((qq-state-gray-tip-message-p message)
       (qq-chat--insert-gray-tip-message message properties))
@@ -3283,6 +3694,15 @@ Visual model (telega-inspired; later appkit):
       (when reply-id
         (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
       (qq-chat--insert-message-body message body-prefix-state properties)))
+    ;; Gray tips and pokes bypass the ordinary heading/body layout.  Give their
+    ;; single visual row the same stable selection stripe without manufacturing
+    ;; a second timeline row.
+    (when (and selected
+               (or (qq-state-gray-tip-message-p message)
+                   (qq-state-poke-message-p message)))
+      (appkit-ui-apply-line-prefix
+       content-start (point)
+       (appkit-ui-make-prefix-state header-prefix header-prefix)))
     (unless (or (qq-state-message-recalled-p message)
                 (qq-state-poke-message-p message)
                 (qq-state-gray-tip-message-p message))
@@ -3361,10 +3781,16 @@ When CALL-OWNER is non-nil, it must also own the currently executing page."
 
 (defun qq-chat--cancel-search-request ()
   "Cancel the current in-chat search callback owner."
-  (when qq-chat--search-request
-    (qq-api-cancel-request qq-chat--search-request))
-  (setq qq-chat--search-request nil
-        qq-chat--search-owner nil)
+  (let ((request qq-chat--search-request))
+    (setq qq-chat--search-request nil
+          qq-chat--search-owner nil)
+    (when request
+      (condition-case nil
+          (qq-api-cancel-request request)
+        (quit
+         (setq quit-flag nil)
+         nil)
+        (error nil))))
   (qq-chat--header-line-update))
 
 (defun qq-chat--show-search-result (index)
@@ -3816,13 +4242,20 @@ AppKit's identity barrier.  The established normal window is not changed."
 
 (defun qq-chat--cancel-filter-request ()
   "Cancel and forget the current materialized-filter request."
-  (when qq-chat--filter-request
-    (qq-api-cancel-request qq-chat--filter-request))
-  (when (listp qq-chat--filter-owner)
-    (setf (plist-get qq-chat--filter-owner :pending) nil)
-    (setf (plist-get qq-chat--filter-owner :patches) nil))
-  (setq qq-chat--filter-request nil
-        qq-chat--filter-owner nil))
+  (let ((request qq-chat--filter-request)
+        (owner qq-chat--filter-owner))
+    (when (listp owner)
+      (setf (plist-get owner :pending) nil)
+      (setf (plist-get owner :patches) nil))
+    (setq qq-chat--filter-request nil
+          qq-chat--filter-owner nil)
+    (when request
+      (condition-case nil
+          (qq-api-cancel-request request)
+        (quit
+         (setq quit-flag nil)
+         nil)
+        (error nil)))))
 
 (defun qq-chat--merge-filter-results (existing page)
   "Append newest-first PAGE to EXISTING without duplicate message ids."
@@ -4812,9 +5245,7 @@ still validated by the strict API contract."
     (define-key map (kbd "C-c r") #'qq-chat-read-all)
     (define-key map (kbd "C-c P") #'qq-chat-send-poke)
     (define-key map (kbd "C-c m") #'qq-chat-message-transient)
-    (define-key map (kbd "C-c f") #'qq-chat-forward-message)
-    (define-key map (kbd "C-c M") #'qq-chat-toggle-forward-mark)
-    (define-key map (kbd "C-c F") #'qq-chat-forward-marked-messages)
+    (define-key map (kbd "C-c f") #'qq-chat-forward-transient)
     (define-key map (kbd "C-c i") #'qq-chat-open-peer-info)
     ;; Keep M-</M-> as native Emacs beginning/end-of-buffer commands.
     ;; Telega reserves its authoritative latest/read-all action for M-g.
@@ -4877,8 +5308,10 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (setq-local qq-chat--msg-filter nil)
   (setq-local qq-chat--filter-request nil)
   (setq-local qq-chat--filter-owner nil)
-  (setq-local qq-chat--marked-message-anchors nil)
-  (setq-local qq-chat--forward-request-active-p nil)
+  (setq-local qq-chat--message-selection nil)
+  (setq-local qq-chat--forward-request nil)
+  (setq-local qq-chat--forward-request-owner nil)
+  (setq-local qq-chat--forward-plan-owner (list 'forward-plan-owner))
   (setq-local qq-chat--last-read-target-id nil)
   (setq-local qq-chat--fill-column nil)
   (setq-local appkit-media-card-fallback-context-function
@@ -4907,6 +5340,7 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (add-hook 'kill-buffer-hook #'qq-chat--cancel-filter-request nil t)
   (add-hook 'kill-buffer-hook #'qq-chat--cancel-open-message-request nil t)
   (add-hook 'kill-buffer-hook #'qq-chat--cancel-initial-history-request nil t)
+  (add-hook 'kill-buffer-hook #'qq-chat--cancel-forward-request nil t)
   (qq-chat--update-context-mode))
 
 (defun qq-chat--initial-history-request-current-p
@@ -5349,7 +5783,7 @@ redisplay has not processed the queued event yet."
       (error "qq: message state event has no stable anchor: %S" event))
     ;; Idempotent with the eager observation in `qq-chat--handle-state-change'.
     (qq-chat--observe-message-frontier event)
-    (qq-chat--rekey-forward-mark previous-anchor anchor)
+    (qq-chat--rekey-message-selection previous-anchor anchor)
     (qq-chat--header-line-update)
     (qq-chat--sync-timeline
      :changed-resources resources
@@ -5363,41 +5797,53 @@ redisplay has not processed the queued event yet."
   "Queue state EVENT invalidations for open QQ chats."
   (let ((event-session-key (plist-get event :session-key))
         (event-type (plist-get event :type)))
+    (when (eq event-type 'reset)
+      ;; The remembered destination belongs to the previous runtime/account,
+      ;; not to any particular chat buffer.
+      (setq qq-chat--last-forward-target-key nil
+            qq-chat-forward-target-history nil))
     (when (memq event-type '(message history reset session action connection
                              sessions-refreshed friends-refreshed groups-refreshed))
       (dolist (buffer (buffer-list))
         (with-current-buffer buffer
-          (when (and (derived-mode-p 'qq-chat-mode)
-                     (appkit-view-live-p (appkit-current-view))
-                     (or (memq event-type
-                               '(reset connection sessions-refreshed
-                                 friends-refreshed groups-refreshed))
-                         (equal event-session-key qq-chat--session-key)))
-            (let ((view (appkit-current-view)))
-              ;; Reset is a hard ownership boundary.  Invalidate request
-              ;; identities synchronously so a pre-reset callback cannot
-              ;; repopulate private filter/search state before queued render.
-              (when (eq event-type 'reset)
-                (qq-chat--deactivate-filter)
-                (qq-chat--reset-search-state))
-              (when (eq event-type 'message)
-                (qq-chat--observe-message-frontier event)
-                ;; Filter snapshots are private request state.  Observe their
-                ;; exact patch before queueing redisplay so a synchronous or
-                ;; already-ready filter callback cannot merge an older
-                ;; `:existing' snapshot over this notice.
-                (when-let* ((patch (plist-get event :message-patch)))
-                  (qq-chat--apply-filter-message-patch
-                   (plist-get event :message-anchor)
-                   patch
-                   (plist-get event :observation-token))))
-              (appkit-view-enqueue-event view event)
-              (appkit-invalidate
-               view :part (if (memq event-type
-                                    '(session action connection sessions-refreshed))
-                              'frame
-                            'timeline))
-              (appkit-schedule-sync view))))))))
+          (when (derived-mode-p 'qq-chat-mode)
+            ;; Reset is a hard ownership boundary even after runtime shutdown
+            ;; has made the AppKit view non-live.  Rotate/clear opaque owners
+            ;; before any best-effort cancellation can run callbacks.
+            (when (eq event-type 'reset)
+              (setq qq-chat--forward-plan-owner (list 'forward-plan-owner)
+                    qq-chat--message-selection nil)
+              (qq-chat--cancel-forward-request)
+              (qq-chat--deactivate-filter)
+              (qq-chat--reset-search-state)
+              (ignore-errors (qq-chat--header-line-update)))
+            ;; Only UI projection requires a live view.  Ownership cleanup
+            ;; above deliberately does not.
+            (when (and (appkit-view-live-p (appkit-current-view))
+                       (or (memq event-type
+                                 '(reset connection sessions-refreshed
+                                   friends-refreshed groups-refreshed))
+                           (equal event-session-key qq-chat--session-key)))
+              (let ((view (appkit-current-view)))
+                (when (eq event-type 'message)
+                  (qq-chat--observe-message-frontier event)
+                  ;; Filter snapshots are private request state.  Observe their
+                  ;; exact patch before queueing redisplay so a synchronous or
+                  ;; already-ready filter callback cannot merge an older
+                  ;; `:existing' snapshot over this notice.
+                  (when-let* ((patch (plist-get event :message-patch)))
+                    (qq-chat--apply-filter-message-patch
+                     (plist-get event :message-anchor)
+                     patch
+                     (plist-get event :observation-token))))
+                (appkit-view-enqueue-event view event)
+                (appkit-invalidate
+                 view :part (if (memq event-type
+                                      '(session action connection
+                                        sessions-refreshed))
+                                'frame
+                              'timeline))
+                (appkit-schedule-sync view)))))))))
 
 (add-hook 'qq-media-cache-update-hook #'qq-chat--rerender-open-chats)
 (add-hook 'qq-state-change-hook #'qq-chat--handle-state-change)

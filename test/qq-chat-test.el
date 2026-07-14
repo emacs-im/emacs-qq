@@ -7,6 +7,7 @@
 (require 'qq-forward)
 (require 'qq-state)
 (require 'qq-transient)
+(require 'qq)
 
 (defmacro qq-chat-test-with-reset (&rest body)
   "Run BODY with clean qq state and disabled live-update hooks."
@@ -66,6 +67,25 @@
   (list :message-id id
         :message (qq-chat-test--canonical-message id time text)))
 
+(defun qq-chat-test--selection (&rest anchors)
+  "Return opaque selection memberships for synthetic ANCHORS."
+  (mapcar
+   (lambda (anchor)
+     (qq-chat--make-message-selection
+      anchor
+      (list 'test-message-selection anchor)
+      `((server-id . ,anchor))))
+   anchors))
+
+(defun qq-chat-test--forward-plan
+    (buffer &optional message-id session-key)
+  "Return a minimal immutable forwarding plan owned by BUFFER."
+  (let ((message-id (or message-id "9007199254743009336")))
+    (qq-chat--make-forward-plan
+     buffer (or session-key "group:20001") (list message-id)
+     (list `((id . ,message-id) (server-id . ,message-id))) nil
+     (buffer-local-value 'qq-chat--forward-plan-owner buffer))))
+
 (ert-deftest qq-chat-header-contains-state-not-a-key-cheat-sheet ()
   (with-temp-buffer
     (qq-chat-mode)
@@ -89,7 +109,8 @@
    (with-temp-buffer
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001"
-           qq-chat--marked-message-anchors '("9007199254743009336"))
+           qq-chat--message-selection
+           (qq-chat-test--selection "9007199254743009336"))
      (let ((original-getter (symbol-function 'qq-state-session-messages))
            (getter-calls 0))
        (cl-letf (((symbol-function 'qq-state-session-messages)
@@ -99,12 +120,12 @@
          (qq-chat--header-line-update)
          (should (= getter-calls 1))
          (should (stringp header-line-format))
-         (should (string-match-p "1 marked" header-line-format))
+         (should (string-match-p "1 selected" header-line-format))
          (dotimes (_ 5)
            (format-mode-line header-line-format))
          (should (= getter-calls 1)))))))
 
-(ert-deftest qq-chat-header-line-prunes-recalled-forward-marks ()
+(ert-deftest qq-chat-header-line-prunes-recalled-message-selection ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "private:10001"
@@ -121,10 +142,11 @@
    (with-temp-buffer
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001"
-           qq-chat--marked-message-anchors '("9007199254743009336"))
+           qq-chat--message-selection
+           (qq-chat-test--selection "9007199254743009336"))
      (qq-chat--header-line-update)
-     (should-not qq-chat--marked-message-anchors)
-     (should-not (string-match-p "marked" header-line-format)))))
+     (should-not qq-chat--message-selection)
+     (should-not (string-match-p "selected" header-line-format)))))
 
 (ert-deftest qq-chat-header-line-recognizes-ready-connection-state ()
   (qq-chat-test-with-reset
@@ -267,15 +289,16 @@
              (should (eq (key-binding (kbd "q") t) 'quit-window))
              (should (eq (key-binding (kbd "r") t) 'qq-chat-reply-to-message))
              (should (eq (key-binding (kbd "d") t) 'qq-chat-delete-message))
-             (should (eq (key-binding (kbd "f") t) 'qq-chat-forward-message))
-             (should (eq (key-binding (kbd "M") t) 'qq-chat-toggle-forward-mark))
-             (should (eq (key-binding (kbd "F") t)
-                         'qq-chat-forward-marked-messages))
+             (should (eq (key-binding (kbd "f") t)
+                         'qq-chat-forward-transient))
+             (should (eq (key-binding (kbd "m") t)
+                         'qq-chat-toggle-message-selection))
+             (should (eq (key-binding (kbd "U") t)
+                         'qq-chat-clear-message-selection))
              (should (eq (key-binding (kbd "!") t)
                          'qq-chat-react-to-message))
              (should (eq (key-binding (kbd "P") t)
                          'qq-chat-poke-sender))
-             (should (eq (key-binding (kbd "m") t) 'qq-chat-message-transient))
              (should (eq (key-binding (kbd "?") t) 'qq-chat-transient))
              (should (eq (key-binding (kbd "C-c /") t)
                          'qq-chat-filter))
@@ -994,6 +1017,118 @@
                           "99" "99" 99 "stale")))
             (next_cursor)))
          (should-not qq-chat--msg-filter))))))
+
+(ert-deftest qq-chat-reset-invalidates-forwarding-state-and-pre-reset-plan ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001")) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat--set-empty-history-window)
+     (qq-chat-render)
+     (let* ((anchor "9007199254743009336")
+            (selection (qq-chat-test--selection anchor))
+            (request-owner (list 'pre-reset-forward-owner))
+            (plan (qq-chat-test--forward-plan (current-buffer) anchor))
+            (old-plan-owner qq-chat--forward-plan-owner)
+            canceled owner-cleared-before-cancel-p dispatch-called)
+       (setq qq-chat--message-selection selection
+             qq-chat--forward-request 'pre-reset-forward-token
+             qq-chat--forward-request-owner request-owner
+             qq-chat--last-forward-target-key "private:10002"
+             qq-chat-forward-target-history '("private:10002"))
+       (qq-chat--header-line-update)
+       (should (string-match-p "1 selected" header-line-format))
+       (should (string-match-p "forwarding" header-line-format))
+       (cl-letf (((symbol-function 'qq-api-cancel-request)
+                  (lambda (token)
+                    (setq canceled token
+                          owner-cleared-before-cancel-p
+                          (and (null qq-chat--forward-request)
+                               (null qq-chat--forward-request-owner)))))
+                 ((symbol-function 'qq-api-forward-messages-individually)
+                  (lambda (&rest _arguments) (setq dispatch-called t)))
+                 ((symbol-function 'appkit-view-live-p)
+                  (lambda (_view) nil)))
+         (qq-chat--handle-state-change '(:type reset))
+         (should (eq canceled 'pre-reset-forward-token))
+         (should owner-cleared-before-cancel-p)
+         (should-not qq-chat--message-selection)
+         (should-not qq-chat--forward-request)
+         (should-not qq-chat--forward-request-owner)
+         (should-not qq-chat--last-forward-target-key)
+         (should-not qq-chat-forward-target-history)
+         (should-not (eq old-plan-owner qq-chat--forward-plan-owner))
+         (should-not (string-match-p "selected" header-line-format))
+         (should-not (string-match-p "forwarding" header-line-format))
+         ;; A callback and Transient scope captured before reset are both
+         ;; stale even though this buffer still names the same session key.
+         (qq-chat--forward-succeeded
+          (current-buffer) "group:20001" request-owner
+          (list anchor) nil 'individual "private:10002" nil)
+         (should-not qq-chat--last-forward-target-key)
+         (should-error
+          (qq-chat-forward-individually plan "private:10002")
+          :type 'user-error)
+         (should-not dispatch-called))))))
+
+(ert-deftest qq-chat-public-reset-cleans-forwarding-after-view-shutdown ()
+  (let ((qq-runtime--app (appkit-start-app 'qq :id 'chat-reset-test))
+        (qq-state-change-hook '(qq-chat--handle-state-change))
+        (qq-media-cache-update-hook nil)
+        (qq-transport--pending (make-hash-table :test #'equal))
+        (qq-transport--ws nil)
+        (qq-transport--connecting nil)
+        (qq-transport--connection-owner nil)
+        (qq-transport--stopping nil)
+        (qq-transport--reconnect-timer nil)
+        (qq-transport--reconnect-attempt 0)
+        (buffer (generate-new-buffer " *qq-public-reset-chat*"))
+        dispatch-called)
+    (unwind-protect
+        (progn
+          (qq-state-reset)
+          (qq-state-upsert-session
+           "group:20001"
+           '((type . group) (title . "Old account")
+             (target-id . "20001"))
+           nil)
+          (with-current-buffer buffer
+            (qq-chat-mode)
+            (setq qq-chat--session-key "group:20001")
+            (qq-chat--set-empty-history-window)
+            (qq-chat-render)
+            (let* ((view (appkit-current-view))
+                   (anchor "9007199254743009336")
+                   (plan (qq-chat-test--forward-plan buffer anchor))
+                   (old-plan-owner qq-chat--forward-plan-owner))
+              (setq qq-chat--message-selection
+                    (qq-chat-test--selection anchor)
+                    qq-chat--forward-request 'pre-reset-request
+                    qq-chat--forward-request-owner
+                    (list 'pre-reset-request-owner))
+              (should (appkit-view-live-p view))
+              (qq-reset-session-state)
+              (should-not (appkit-view-live-p view))
+              (should-not qq-chat--message-selection)
+              (should-not qq-chat--forward-request)
+              (should-not qq-chat--forward-request-owner)
+              (should-not (eq old-plan-owner qq-chat--forward-plan-owner))
+              (cl-letf
+                  (((symbol-function 'qq-api-forward-messages-individually)
+                    (lambda (&rest _arguments) (setq dispatch-called t))))
+                (should-error
+                 (qq-chat-forward-individually plan "private:10002")
+                 :type 'user-error))
+              (should-not dispatch-called))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (when (appkit-app-live-p qq-runtime--app)
+        (appkit-stop-app qq-runtime--app))
+      (setq qq-runtime--app nil)
+      (qq-state-reset))))
 
 (ert-deftest qq-chat-filter-and-inplace-search-are-explicitly-exclusive ()
   (with-temp-buffer
@@ -2326,7 +2461,8 @@
        (let ((node (appkit-chat-timeline-node local-id)))
          (should node)
          (should (equal (appkit-chat-timeline-keys) (list local-id)))
-         (setq qq-chat--marked-message-anchors (list local-id))
+         (setq qq-chat--message-selection
+               (qq-chat-test--selection local-id))
          (puthash "private:10001" sent qq-state--messages-by-session)
          (qq-chat--apply-message-state-change
           (list :type 'message
@@ -2335,7 +2471,8 @@
                 :message (car sent)))
          (should-not (appkit-chat-timeline-node local-id))
          (should (eq node (appkit-chat-timeline-node snowflake)))
-         (should (equal qq-chat--marked-message-anchors (list snowflake))))
+         (should
+          (equal (qq-chat--message-selection-anchors) (list snowflake))))
        (should (equal (appkit-chat-timeline-keys) (list snowflake)))
        (goto-char (point-min))
        (should (search-forward "hi" nil t))))))
@@ -3911,14 +4048,21 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
       (content . "{\"items\":[{\"txt\":\"新进群账号疑似来自非大陆地区，请谨慎核实对方身份。\",\"type\":\"nor\"},{\"txt\":\"查看异常>\",\"type\":\"url\"}]}")))
    (with-temp-buffer
      (qq-chat-mode)
-     (setq qq-chat--session-key "group:987654321")
+     (setq qq-chat--session-key "group:987654321"
+           qq-chat--message-selection
+           (qq-chat-test--selection "9007199254750003456"))
      (qq-chat--set-history-window "9007199254750003456" nil)
      (qq-chat-render)
      (should (equal (appkit-chat-timeline-keys)
                     '("9007199254750003456")))
      (should (string-match-p
               "新进群账号疑似来自非大陆地区，请谨慎核实对方身份。查看异常>"
-              (buffer-substring-no-properties (point-min) (point-max)))))))
+              (buffer-substring-no-properties (point-min) (point-max))))
+     (goto-char (point-min))
+     (search-forward "新进群账号疑似来自非大陆地区")
+     (beginning-of-line)
+     (should
+      (string-prefix-p "▌ " (get-text-property (point) 'line-prefix))))))
 
 (ert-deftest qq-chat-history-header-right-aligns-time-through-appkit ()
   (with-temp-buffer
@@ -5297,7 +5441,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
           (should (equal called segment))
           (should (equal (buffer-string) "FORWARD-CARD\n")))))))
 
-(ert-deftest qq-chat-single-forward-keeps-snowflake-string ()
+(ert-deftest qq-chat-forward-plan-at-point-keeps-snowflake-string ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "group:20001"
@@ -5318,18 +5462,27 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
      (qq-chat-render)
      (goto-char (point-min))
      (search-forward "hello")
-     (let (call)
-       (cl-letf (((symbol-function 'qq-api-forward-message)
-                  (lambda (message-id source target callback
-                                      &optional _errback)
-                    (setq call (list message-id source target))
-                    (funcall callback nil))))
-         (qq-chat-forward-message "private:10002")
-         (should (equal call
-                        '("9007199254743009336"
-                          "group:20001" "private:10002"))))))))
+     (let ((plan (qq-chat--current-forward-plan))
+           call)
+       (should
+        (equal (qq-chat-forward-plan-anchors plan)
+               '("9007199254743009336")))
+       (cl-letf (((symbol-function 'qq-api-forward-messages-individually)
+                  (lambda (source target ids callback &optional _errback)
+                    (setq call (list source target ids))
+                    (funcall callback '((kind . "individual")))
+                    'already-settled)))
+         (qq-chat-forward-individually plan "private:10002")
+         (should
+          (equal call
+                 '("group:20001" "private:10002"
+                   ("9007199254743009336"))))
+         (should (seq-every-p #'stringp (nth 2 call)))
+         ;; A synchronous callback must not resurrect a stale request token.
+         (should-not qq-chat--forward-request)
+         (should-not qq-chat--forward-request-owner))))))
 
-(ert-deftest qq-chat-forward-targets-include-non-session-friends-and-groups ()
+(ert-deftest qq-chat-forward-targets-only-include-private-and-group-sessions ()
   (qq-chat-test-with-reset
    (qq-state-apply-friend-categories
     '(((category_id . 0) (sort_id . 0) (name . "好友")
@@ -5338,17 +5491,169 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                     (nickname . "Alice") (remark . "A")))))))
    (qq-state-apply-groups
     '(((group_id . "20001") (group_name . "Group A"))))
-   (let ((targets (qq-chat--forwardable-target-sessions)))
-     (should (assoc "private:10001"
-                    (mapcar (lambda (target)
-                              (cons (alist-get 'key target) target))
-                            targets)))
-     (should (assoc "group:20001"
-                    (mapcar (lambda (target)
-                              (cons (alist-get 'key target) target))
-                            targets))))))
+   (qq-state-upsert-session
+    "dataline:mobile:dev:a"
+    '((title . "My phone") (target-id . "dev:a") (type . dataline)) nil)
+   (qq-state-upsert-session
+    "service:u:mail:x"
+    '((title . "Mail") (target-id . "u:mail:x") (type . service)) nil)
+   (let* ((targets (qq-chat--forwardable-target-sessions))
+          (by-key
+           (mapcar (lambda (target)
+                     (cons (alist-get 'key target) target))
+                   targets)))
+     (should (assoc "private:10001" by-key))
+     (should (assoc "group:20001" by-key))
+     (should-not (assoc "dataline:mobile:dev:a" by-key))
+     (should-not (assoc "service:u:mail:x" by-key)))))
 
-(ert-deftest qq-chat-marked-forward-preserves-timeline-order-and-clears ()
+(ert-deftest qq-chat-forward-dataline-source-capability-matrix ()
+  (let ((message-id "9007199254743009336")
+        individual-calls merged-called)
+    (with-temp-buffer
+      (qq-chat-mode)
+      (setq qq-chat--session-key "dataline:desktop:dev:a")
+      (let ((plan
+             (qq-chat-test--forward-plan
+              (current-buffer) message-id qq-chat--session-key)))
+        (should (qq-chat--forward-source-supported-p))
+        (should (qq-chat--forward-source-supported-p 'individual))
+        (should-not (qq-chat--forward-source-supported-p 'merged))
+        (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                   (lambda (&optional _position)
+                     `((id . ,message-id) (server-id . ,message-id))))
+                  ((symbol-function 'qq-chat--header-line-update) #'ignore)
+                  ((symbol-function 'qq-api-forward-messages-individually)
+                   (lambda (source target ids callback &optional _errback)
+                     (push (list source target ids) individual-calls)
+                     (funcall callback '((kind . "individual")))
+                     'already-settled))
+                  ((symbol-function 'qq-api-forward-messages-merged)
+                   (lambda (&rest _arguments) (setq merged-called t))))
+          (should (qq-chat-forward-plan-p (qq-chat--current-forward-plan)))
+          (qq-chat-forward-individually plan "group:30001")
+          (should-error
+           (qq-chat-forward-merged plan "group:30001")
+           :type 'user-error))))
+    (should
+     (equal individual-calls
+            `(("dataline:desktop:dev:a" "group:30001" (,message-id)))))
+    (should-not merged-called)
+    (with-temp-buffer
+      (qq-chat-mode)
+      (setq qq-chat--session-key "dataline:mobile:dev:a")
+      (let ((plan
+             (qq-chat-test--forward-plan
+              (current-buffer) message-id qq-chat--session-key))
+            dispatch-called)
+        (should-not (qq-chat--forward-source-supported-p))
+        (should-not (qq-chat--forward-source-supported-p 'individual))
+        (should-not (qq-chat--forward-source-supported-p 'merged))
+        (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                   (lambda (&optional _position)
+                     `((id . ,message-id) (server-id . ,message-id))))
+                  ((symbol-function 'qq-api-forward-messages-individually)
+                   (lambda (&rest _arguments) (setq dispatch-called t)))
+                  ((symbol-function 'qq-api-forward-messages-merged)
+                   (lambda (&rest _arguments) (setq dispatch-called t))))
+          (should-error (qq-chat--current-forward-plan) :type 'user-error)
+          (should-error
+           (qq-chat-forward-individually plan "group:30001")
+           :type 'user-error)
+          (should-error
+           (qq-chat-forward-merged plan "group:30001")
+           :type 'user-error))
+        (should-not dispatch-called)))))
+
+(ert-deftest qq-chat-forward-source-capability-is-a-closed-session-allowlist ()
+  (dolist (session-key '("private:10001" "group:20001" "service:u:mail:x"))
+    (dolist (style '(nil individual merged))
+      (should (qq-chat--forward-source-supported-p style session-key))))
+  (dolist (session-key '("dataline:mobile:dev:a"
+                         "guild:server:channel"
+                         "unknown:session"))
+    (dolist (style '(nil individual merged))
+      (should-not (qq-chat--forward-source-supported-p style session-key))))
+  (should
+   (qq-chat--forward-source-supported-p
+    nil "dataline:desktop:dev:a"))
+  (should
+   (qq-chat--forward-source-supported-p
+    'individual "dataline:desktop:dev:a"))
+  (should-not
+   (qq-chat--forward-source-supported-p
+    'merged "dataline:desktop:dev:a"))
+  ;; Even if the canonical key decoder later learns these session types, the
+  ;; forwarding capability stays closed rather than accepting "not dataline".
+  (dolist (type '(guild unknown))
+    (cl-letf (((symbol-function 'qq-state-session-key-identity)
+               (lambda (_session-key) `((type . ,type) (variant . nil)))))
+      (should-not (qq-chat--forward-source-supported-p nil "synthetic"))
+      (should-not
+       (qq-chat--forward-source-supported-p 'individual "synthetic"))
+      (should-not (qq-chat--forward-source-supported-p 'merged "synthetic")))))
+
+(ert-deftest qq-chat-direct-selection-rejects-unsupported-source-unchanged ()
+  (dolist (session-key '("dataline:mobile:dev:a" "guild:server:channel"))
+    (with-temp-buffer
+      (qq-chat-mode)
+      (let ((selection
+             (qq-chat-test--selection "9007199254743009336"))
+            message-read-p)
+        (setq qq-chat--session-key session-key
+              qq-chat--message-selection selection)
+        (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                   (lambda (&optional _position)
+                     (setq message-read-p t)
+                     '((server-id . "9007199254743009444")))))
+          (should-error
+           (qq-chat-toggle-message-selection)
+           :type 'user-error))
+        (should (eq qq-chat--message-selection selection))
+        (should-not message-read-p)))))
+
+(ert-deftest qq-chat-message-selection-walks-forward-and-renders-as-a-mark ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Source") (target-id . "20001") (type . group)) nil)
+   (puthash
+    "group:20001"
+    '(((server-id . "9007199254743009336")
+       (sender-id . "10001") (sender-name . "Alice")
+       (time . 100) (raw-message . "first"))
+      ((server-id . "9007199254743009444")
+       (sender-id . "10002") (sender-name . "Bob")
+       (time . 101) (raw-message . "second")))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat--set-history-window "9007199254743009336" nil)
+     (qq-chat-render)
+     (goto-char (point-min))
+     (search-forward "first")
+     (qq-chat-toggle-message-selection)
+     (should
+      (equal (qq-chat--message-selection-anchors)
+             '("9007199254743009336")))
+     (should
+      (equal (alist-get 'server-id (qq-chat--message-at-point))
+             "9007199254743009444"))
+     (qq-chat-test-sync-invalidations)
+     (goto-char (point-min))
+     (search-forward "first")
+     (should (eq (get-text-property (point) 'qq-chat-message-selected) t))
+     (let* ((message (qq-chat--message-at-point))
+            (layout (qq-chat-message-layout message :selected-p t)))
+       (should (string-prefix-p "▌ " (plist-get layout :header-prefix)))
+       (should
+        (string-prefix-p
+         "▌ "
+         (appkit-ui-prefix-state-current
+          (plist-get layout :body-prefix-state))))))))
+
+(ert-deftest qq-chat-merged-forward-preserves-timeline-order-and-clears ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "group:20001"
@@ -5368,32 +5673,37 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
      (setq qq-chat--session-key "group:20001")
      (qq-chat--set-history-window "9007199254743009336" nil)
      (qq-chat-render)
-     ;; Mark newest first to prove send order follows the timeline, not clicks.
+     ;; Select newest first to prove send order follows the timeline, not clicks.
      (goto-char (point-min))
      (search-forward "second")
-     (qq-chat-toggle-forward-mark)
+     (qq-chat-toggle-message-selection)
      (goto-char (point-min))
      (search-forward "first")
-     (qq-chat-toggle-forward-mark)
-     (should (= 2 (length (qq-chat-marked-messages))))
+     (qq-chat-toggle-message-selection)
+     (should (= 2 (length (qq-chat-selected-messages))))
      (let (source target captured-ids)
-       (cl-letf (((symbol-function 'qq-api-send-forward-bundle)
+       (cl-letf (((symbol-function 'qq-api-forward-messages-merged)
                   (lambda (source-session-key target-session-key ids callback
                                               &optional _errback)
                     (setq source source-session-key
                           target target-session-key
                           captured-ids ids)
-                    (funcall callback nil))))
-         (qq-chat-forward-marked-messages "group:30001")
+                    (funcall
+                     callback
+                     '((kind . "merged")
+                       (message_id . "9007199254743010000")
+                       (resource_id . "synthetic-resource"))))))
+         (qq-chat-forward-merged
+          (qq-chat--current-forward-plan) "group:30001")
          (should (equal source "group:20001"))
          (should (equal target "group:30001"))
          (should
           (equal captured-ids
                  '("9007199254743009336" "9007199254743009444")))
          (should (seq-every-p #'stringp captured-ids))
-         (should-not qq-chat--marked-message-anchors))))))
+         (should-not qq-chat--message-selection))))))
 
-(ert-deftest qq-chat-forward-callback-preserves-marks-added-in-flight ()
+(ert-deftest qq-chat-forward-callback-preserves-selection-added-in-flight ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "group:20001"
@@ -5418,30 +5728,469 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
      (qq-chat-render)
      (goto-char (point-min))
      (search-forward "first")
-     (qq-chat-toggle-forward-mark)
+     (qq-chat-toggle-message-selection)
      (goto-char (point-min))
      (search-forward "second")
-     (qq-chat-toggle-forward-mark)
-     (let (success-callback)
-       (cl-letf (((symbol-function 'qq-api-send-forward-bundle)
+     (qq-chat-toggle-message-selection)
+     (let ((plan (qq-chat--current-forward-plan))
+           success-callback)
+       (cl-letf (((symbol-function 'qq-api-forward-messages-individually)
                   (lambda (_source _target _ids callback &optional _errback)
-                    (setq success-callback callback))))
-         (qq-chat-forward-marked-messages "group:30001")
-         (should qq-chat--forward-request-active-p)
+                    (setq success-callback callback)
+                    'forward-request)))
+         (qq-chat-forward-individually plan "group:30001")
+         (should (eq qq-chat--forward-request 'forward-request))
+         (should qq-chat--forward-request-owner)
          (should-error
-          (qq-chat-forward-marked-messages "group:30001")
+          (qq-chat-forward-individually plan "group:30001")
           :type 'user-error)
          (goto-char (point-min))
          (search-forward "third")
-         (qq-chat-toggle-forward-mark)
-         (funcall success-callback nil)
-         (should-not qq-chat--forward-request-active-p)
-         (should (equal qq-chat--marked-message-anchors
-                        '("9007199254743009555")))
+         (qq-chat-toggle-message-selection)
+         (funcall success-callback '((kind . "individual")))
+         (should-not qq-chat--forward-request)
+         (should-not qq-chat--forward-request-owner)
+         (should
+          (equal (qq-chat--message-selection-anchors)
+                 '("9007199254743009555")))
          (should (equal
                   (mapcar #'qq-chat--message-anchor
-                          (qq-chat-marked-messages))
+                          (qq-chat-selected-messages))
                   '("9007199254743009555"))))))))
+
+(ert-deftest qq-chat-message-filter-preserves-off-projection-selection ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Source") (target-id . "20001") (type . group)) nil)
+   (puthash
+    "group:20001"
+    '(((server-id . "9007199254743009336")
+       (message-seq . "100")
+       (sender-id . "10001") (sender-name . "Alice")
+       (time . 100) (order . 1) (raw-message . "canonical")))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat--set-history-window "9007199254743009336" nil)
+     (qq-chat-render)
+     (goto-char (point-min))
+     (search-forward "canonical")
+     (qq-chat-toggle-message-selection)
+     (let ((owner
+            (qq-chat-message-selection-owner
+             (car qq-chat--message-selection))))
+       (setq qq-chat--msg-filter
+             (list :active t :title "search" :query "filter-only"
+                   :items
+                   (list
+                    (qq-chat-test--filter-item
+                     "9007199254743009444" 101 "filter-only"))))
+       (qq-chat--header-line-update)
+       (should
+        (equal (qq-chat--message-selection-anchors)
+               '("9007199254743009336")))
+       (should
+        (eq owner
+            (qq-chat-message-selection-owner
+             (car qq-chat--message-selection))))
+       (should
+       (equal (mapcar #'qq-chat--message-anchor
+                       (qq-chat-selected-messages))
+               '("9007199254743009336")))))))
+
+(ert-deftest qq-chat-stable-forward-order-uses-one-rule-per-time-bucket ()
+  (let ((with-high-sequence
+         '((server-id . "9007199254743009336")
+           (message-seq . "300") (time . 100) (order . 3)))
+        (without-sequence
+         '((server-id . "9007199254743009444")
+           (time . 100) (order . 1)))
+        (with-low-sequence
+         '((server-id . "9007199254743009555")
+           (message-seq . "100") (time . 100) (order . 2))))
+    ;; Mixing sequence comparison with local-order comparison pair by pair
+    ;; produces a non-transitive comparator.  One incomplete timestamp bucket
+    ;; therefore uses local insertion order for every member.
+    (should
+     (equal
+      (mapcar #'qq-chat--message-anchor
+              (qq-chat--stable-message-order
+               (list with-high-sequence without-sequence with-low-sequence)))
+      '("9007199254743009444"
+        "9007199254743009555"
+        "9007199254743009336")))))
+
+(ert-deftest qq-chat-filter-refresh-keeps-filter-only-selection-snapshot ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Source") (target-id . "20001") (type . group)) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001"
+           qq-chat--msg-filter
+           (list :active t :title "search" :query "filter-only"
+                 :items
+                 (list
+                  (qq-chat-test--filter-item
+                   "9007199254743009444" 101 "filter-only"))))
+     (qq-chat-render)
+     (goto-char (point-min))
+     (search-forward "filter-only")
+     (qq-chat-toggle-message-selection)
+     (cl-letf (((symbol-function 'qq-api-filter-messages-start)
+                (lambda (&rest _arguments) 'filter-request)))
+       ;; Refresh first renders an empty searching projection.  The selected
+       ;; result must remain owned by its selection snapshot until the native
+       ;; page comes back.
+       (qq-chat-filter-refresh)
+       (should
+        (equal (qq-chat--message-selection-anchors)
+               '("9007199254743009444")))
+       (should
+        (equal (mapcar #'qq-chat--message-anchor
+                       (qq-chat-selected-messages))
+               '("9007199254743009444")))
+       (should
+        (equal (qq-chat-forward-plan-anchors
+                (qq-chat--current-forward-plan))
+               '("9007199254743009444")))
+       (qq-chat--cancel-filter-request)))))
+
+(ert-deftest qq-chat-filter-only-selection-forms-an-immutable-forward-plan ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Source") (target-id . "20001") (type . group)) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001"
+           qq-chat--msg-filter
+           (list :active t :title "search" :query "filter-only"
+                 :items
+                 (list
+                  (qq-chat-test--filter-item
+                   "9007199254743009444" 101 "filter-only"))))
+     (qq-chat-render)
+     (goto-char (point-min))
+     (search-forward "filter-only")
+     (qq-chat-toggle-message-selection)
+     ;; Canceling the projection removes its materialized items before a
+     ;; canonical around-message page exists.  Selection owns the exact
+     ;; snapshot across that gap, and the plan is created afterward.
+     (qq-chat--deactivate-filter)
+     (qq-chat-render)
+     (should
+      (equal (qq-chat--message-selection-anchors)
+             '("9007199254743009444")))
+     (let ((plan (qq-chat--current-forward-plan)) captured-ids)
+       (cl-letf (((symbol-function 'qq-api-forward-messages-merged)
+                  (lambda (_source _target ids callback &optional _errback)
+                    (setq captured-ids ids)
+                    (funcall
+                     callback
+                     '((kind . "merged")
+                       (message_id . "9007199254743010000")
+                       (resource_id . "synthetic-resource"))))))
+         (qq-chat-forward-merged plan "group:30001")
+         (should
+         (equal captured-ids '("9007199254743009444")))
+         (should-not qq-chat--message-selection))))))
+
+(ert-deftest qq-chat-filter-only-selection-is-pruned-after-detached-recall ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Source") (target-id . "20001") (type . group)) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001"
+           qq-chat--msg-filter
+           (list :active t :title "search" :query "filter-only"
+                 :items
+                 (list
+                  (qq-chat-test--filter-item
+                   "9007199254743009444" 101 "filter-only"))))
+     (qq-chat-render)
+     (goto-char (point-min))
+     (search-forward "filter-only")
+     (qq-chat-toggle-message-selection)
+     (let ((membership (car qq-chat--message-selection))
+           (owner
+            (qq-chat-message-selection-owner
+             (car qq-chat--message-selection))))
+       (qq-chat--deactivate-filter)
+       (qq-chat-render)
+       (should-not
+        (qq-state-apply-recall
+         "group:20001" "9007199254743009444"))
+       ;; Tombstone projection is pure: it invalidates the candidate without
+       ;; mutating or replacing the membership's opaque completion identity.
+       (should (eq membership (car qq-chat--message-selection)))
+       (should
+        (eq owner
+            (qq-chat-message-selection-owner
+             (car qq-chat--message-selection))))
+       (should-not
+        (qq-state-message-recalled-p
+         (qq-chat-message-selection-message membership)))
+       (should-not (qq-chat-selected-messages))
+       (should-error (qq-chat--current-forward-plan) :type 'user-error)
+       (should-not qq-chat--message-selection)))))
+
+(ert-deftest qq-chat-point-forward-does-not-remove-later-same-anchor-selection ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Source") (target-id . "20001") (type . group)) nil)
+   (puthash
+    "group:20001"
+    '(((server-id . "9007199254743009336")
+       (sender-id . "10001") (sender-name . "Alice")
+       (time . 100) (raw-message . "first")))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat--set-history-window "9007199254743009336" nil)
+     (qq-chat-render)
+     (goto-char (point-min))
+     (search-forward "first")
+     (let ((plan (qq-chat--current-forward-plan)) success-callback)
+       (cl-letf (((symbol-function 'qq-api-forward-messages-individually)
+                  (lambda (_source _target _ids callback &optional _errback)
+                    (setq success-callback callback)
+                    'forward-request)))
+         (qq-chat-forward-individually plan "group:30001")
+         (qq-chat-toggle-message-selection)
+         (funcall success-callback '((kind . "individual")))
+         (should
+          (equal (qq-chat--message-selection-anchors)
+                 '("9007199254743009336"))))))))
+
+(ert-deftest qq-chat-forward-callback-keeps-reselected-same-anchor-membership ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Source") (target-id . "20001") (type . group)) nil)
+   (puthash
+    "group:20001"
+    '(((server-id . "9007199254743009336")
+       (sender-id . "10001") (sender-name . "Alice")
+       (time . 100) (raw-message . "first")))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat--set-history-window "9007199254743009336" nil)
+     (qq-chat-render)
+     (goto-char (point-min))
+     (search-forward "first")
+     (qq-chat-toggle-message-selection)
+     (let* ((plan (qq-chat--current-forward-plan))
+            (old-owner
+             (qq-chat-message-selection-owner
+              (car qq-chat--message-selection)))
+            success-callback)
+       (cl-letf (((symbol-function 'qq-api-forward-messages-individually)
+                  (lambda (_source _target _ids callback &optional _errback)
+                    (setq success-callback callback)
+                    'forward-request)))
+         (qq-chat-forward-individually plan "group:30001")
+         (qq-chat-toggle-message-selection)
+         (qq-chat-toggle-message-selection)
+         (should-not
+          (eq old-owner
+              (qq-chat-message-selection-owner
+               (car qq-chat--message-selection))))
+         (funcall success-callback '((kind . "individual")))
+         (should
+          (equal (qq-chat--message-selection-anchors)
+                 '("9007199254743009336"))))))))
+
+(ert-deftest qq-chat-forward-dispatch-quit-cleans-owner-and-keeps-selection ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Source") (target-id . "20001") (type . group)) nil)
+   (puthash
+    "group:20001"
+    '(((server-id . "9007199254743009336")
+       (sender-id . "10001") (sender-name . "Alice")
+       (time . 100) (raw-message . "first")))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat--set-history-window "9007199254743009336" nil)
+     (qq-chat-render)
+     (goto-char (point-min))
+     (search-forward "first")
+     (qq-chat-toggle-message-selection)
+     (let ((plan (qq-chat--current-forward-plan)))
+       (cl-letf (((symbol-function 'qq-api-forward-messages-individually)
+                  (lambda (&rest _arguments) (signal 'quit nil))))
+         (let (quit-seen)
+           (condition-case nil
+               (qq-chat-forward-individually plan "group:30001")
+             (quit (setq quit-seen t)))
+           (should quit-seen))
+         (should-not qq-chat--forward-request)
+         (should-not qq-chat--forward-request-owner)
+         (should
+          (equal (qq-chat--message-selection-anchors)
+                 '("9007199254743009336"))))))))
+
+(ert-deftest qq-chat-forward-header-error-releases-owner-before-dispatch ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (setq qq-chat--session-key "group:20001")
+    (let ((plan (qq-chat-test--forward-plan (current-buffer)))
+          dispatch-called)
+      (cl-letf (((symbol-function 'qq-chat--header-line-update)
+                 (lambda () (error "synthetic header failure")))
+                ((symbol-function 'qq-api-forward-messages-individually)
+                 (lambda (&rest _arguments) (setq dispatch-called t))))
+        (should-error
+         (qq-chat-forward-individually plan "group:30001")))
+      (should-not dispatch-called)
+      (should-not qq-chat--forward-request)
+      (should-not qq-chat--forward-request-owner))))
+
+(ert-deftest qq-chat-forward-post-handoff-quit-retains-installed-owner ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (setq qq-chat--session-key "group:20001")
+    (let ((plan (qq-chat-test--forward-plan (current-buffer)))
+          (quit-flag nil)
+          (dispatch-count 0)
+          success-callback
+          quit-seen)
+      (cl-letf (((symbol-function 'qq-chat--header-line-update) #'ignore)
+                ((symbol-function 'qq-api-forward-messages-individually)
+                 (lambda (_source _target _ids callback &optional _errback)
+                   (cl-incf dispatch-count)
+                   (setq success-callback callback)
+                   ;; The transport has returned a live token.  Model C-g in
+                   ;; the remaining API-to-chat handoff as Emacs does while
+                   ;; `inhibit-quit' is non-nil: defer it through `quit-flag'.
+                   (should inhibit-quit)
+                   (setq quit-flag t)
+                   'forward-request)))
+        (condition-case nil
+            (qq-chat-forward-individually plan "group:30001")
+          (quit (setq quit-seen t)))
+        (should quit-seen)
+        (should-not quit-flag)
+        (should (eq qq-chat--forward-request 'forward-request))
+        (should qq-chat--forward-request-owner)
+        (should-error
+         (qq-chat-forward-individually plan "group:30001")
+         :type 'user-error)
+        (should (= dispatch-count 1))
+        (funcall success-callback '((kind . "individual")))
+        (should-not qq-chat--forward-request)
+        (should-not qq-chat--forward-request-owner)))))
+
+(ert-deftest qq-chat-forward-plan-revalidates-recall-before-dispatch ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let* ((message-id "9007199254743009336")
+            (plan
+             (qq-chat-test--forward-plan
+              (current-buffer) message-id qq-chat--session-key))
+            dispatch-called)
+       (qq-state-apply-recall qq-chat--session-key message-id)
+       (cl-letf (((symbol-function 'qq-api-forward-messages-individually)
+                  (lambda (&rest _arguments) (setq dispatch-called t))))
+         (should-error
+          (qq-chat-forward-individually plan "group:30001")
+          :type 'user-error))
+       (should-not dispatch-called)
+       (should-not qq-chat--forward-request-owner)))))
+
+(ert-deftest qq-chat-forward-revalidates-recall-after-target-prompt ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let* ((message-id "9007199254743009336")
+            (plan
+             (qq-chat-test--forward-plan
+              (current-buffer) message-id qq-chat--session-key))
+            dispatch-called)
+       (cl-letf (((symbol-function 'qq-chat--read-forward-target)
+                  (lambda (_style _count)
+                    (qq-state-apply-recall qq-chat--session-key message-id)
+                    "group:30001"))
+                 ((symbol-function 'qq-api-forward-messages-individually)
+                  (lambda (&rest _arguments) (setq dispatch-called t))))
+         (should-error
+          (qq-chat-forward-individually plan)
+          :type 'user-error))
+       (should-not dispatch-called)
+       (should-not qq-chat--forward-request-owner)))))
+
+(ert-deftest qq-chat-forward-rechecks-request-owner-after-target-prompt ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (setq qq-chat--session-key "group:20001")
+    (let ((plan (qq-chat-test--forward-plan (current-buffer)))
+          (recursive-owner (list 'recursive-forward-owner))
+          dispatch-called)
+      (unwind-protect
+          (cl-letf (((symbol-function 'qq-chat--read-forward-target)
+                     (lambda (_style _count)
+                       (setq qq-chat--forward-request 'recursive-request
+                             qq-chat--forward-request-owner recursive-owner)
+                       "group:30001"))
+                    ((symbol-function 'qq-api-forward-messages-individually)
+                     (lambda (&rest _arguments) (setq dispatch-called t))))
+            (should-error
+             (qq-chat-forward-individually plan)
+             :type 'user-error)
+            (should (eq qq-chat--forward-request 'recursive-request))
+            (should (eq qq-chat--forward-request-owner recursive-owner))
+            (should-not dispatch-called))
+        (setq qq-chat--forward-request nil
+              qq-chat--forward-request-owner nil)))))
+
+(ert-deftest qq-chat-forward-failure-preserves-plan-selection ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Source") (target-id . "20001") (type . group)) nil)
+   (puthash
+    "group:20001"
+    '(((server-id . "9007199254743009336")
+       (sender-id . "10001") (sender-name . "Alice")
+       (time . 100) (raw-message . "first")))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat--set-history-window "9007199254743009336" nil)
+     (qq-chat-render)
+     (goto-char (point-min))
+     (search-forward "first")
+     (qq-chat-toggle-message-selection)
+     (let ((plan (qq-chat--current-forward-plan)) error-callback)
+       (cl-letf (((symbol-function 'qq-api-forward-messages-merged)
+                  (lambda (_source _target _ids _callback &optional errback)
+                    (setq error-callback errback)
+                    'forward-request))
+                 ((symbol-function 'qq-api--default-error) #'ignore))
+         (qq-chat-forward-merged plan "private:10002")
+         (funcall error-callback '((retcode . 200)) "synthetic failure")
+         (should-not qq-chat--forward-request)
+         (should-not qq-chat--forward-request-owner)
+         (should
+          (equal (qq-chat--message-selection-anchors)
+                 '("9007199254743009336"))))))))
 
 (provide (quote qq-chat-test))
 

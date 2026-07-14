@@ -96,12 +96,23 @@
     (setq qq-transport--reconnect-timer nil)))
 
 (defun qq-transport--fail-pending (reason)
-  "Fail all pending callbacks with REASON."
-  (let (echoes)
+  "Fail all pending callbacks with REASON.
+
+This bulk settlement boundary isolates `quit' as well as ordinary callback
+errors.  Single-response completion retains its synchronous quit semantics,
+but one disconnect errback must not strand later entries or abort transport
+and runtime cleanup."
+  (let (echoes quit-seen-p)
     (maphash (lambda (echo _entry) (push echo echoes))
              qq-transport--pending)
     (dolist (echo echoes)
-      (qq-transport--complete echo 'error nil reason))))
+      (condition-case nil
+          (qq-transport--complete echo 'error nil reason)
+        (quit
+         (setq quit-seen-p t
+               quit-flag nil))))
+    (when quit-seen-p
+      (message "qq: ignored quit from callback during transport cleanup"))))
 
 (defun qq-transport--connection-current-p (owner socket)
   "Return non-nil when OWNER still owns SOCKET.
@@ -297,27 +308,67 @@ Return the generated echo token, or nil if transport is unavailable."
         (when errback
           (funcall errback nil "transport is not connected"))
         nil)
+    ;; Honor a quit already requested by the selection/UI phase before taking
+    ;; ownership of anything that might cross the socket boundary.
+    (when quit-flag
+      ;; `signal' itself does not consume the pending flag.  Clear it first so
+      ;; a caller that catches this quit does not immediately quit a second
+      ;; time at the next safe point.
+      (setq quit-flag nil)
+      (signal 'quit nil))
     (let* ((echo (qq-transport--next-echo))
            (timeout qq-transport-request-timeout)
-           (timer (and (numberp timeout)
-                       (> timeout 0)
-                       (run-at-time timeout nil
-                                    #'qq-transport--request-timeout
-                                    echo action)))
+           timer
            (entry (list :action action :success callback :error errback
-                        :timer timer))
+                        :timer nil))
            (payload `((action . ,action)
                       (params . ,(or params (make-hash-table :test #'equal)))
                       (echo . ,echo))))
-      (puthash echo entry qq-transport--pending)
-      (condition-case err
-          (progn
-            (websocket-send-text qq-transport--ws (qq-transport--json-encode payload))
-            echo)
-        (error
-         (qq-transport--complete
-          echo 'error nil (error-message-string err))
-         nil)))))
+      ;; Registration, encoding, and the synchronous socket handoff form one
+      ;; ownership boundary.  C-g during it is consumed after handoff: the
+      ;; caller receives ECHO and the original request owner keeps tracking
+      ;; the response.  This avoids unknown delivery followed by a retry.
+      ;; Do not use `unwind-protect' for this boundary: Emacs preserves a quit
+      ;; deferred across its cleanup forms even when they clear `quit-flag'.
+      ;; A straight inhibited body can consume that flag before it is restored.
+      (let ((inhibit-quit t))
+        (condition-case err
+            (progn
+              (setq timer
+                    (and (numberp timeout)
+                         (> timeout 0)
+                         (run-at-time timeout nil
+                                      #'qq-transport--request-timeout
+                                      echo action)))
+              (setf (plist-get entry :timer) timer)
+              (puthash echo entry qq-transport--pending)
+              (websocket-send-text
+               qq-transport--ws (qq-transport--json-encode payload))
+              ;; Consume a keyboard quit deferred anywhere in the complete
+              ;; handoff so the caller can receive and own ECHO.
+              (setq quit-flag nil)
+              echo)
+          (quit
+           (if (gethash echo qq-transport--pending)
+               ;; An explicit quit inside encoding/socket code may mean the
+               ;; handoff did not finish.  Retain ownership until response or
+               ;; timeout instead of exposing a potentially duplicate retry.
+               (progn
+                 (setq quit-flag nil)
+                 echo)
+             (when (timerp timer)
+               (cancel-timer timer))
+             (setq quit-flag nil)
+             (signal 'quit nil)))
+          (error
+           (let ((reason (error-message-string err)))
+             (if (gethash echo qq-transport--pending)
+                 (qq-transport--complete echo 'error nil reason)
+               (when (timerp timer)
+                 (cancel-timer timer))
+               (qq-transport--invoke-callback errback nil reason)))
+           (setq quit-flag nil)
+           nil))))))
 
 (provide 'qq-transport)
 

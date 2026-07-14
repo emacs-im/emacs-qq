@@ -20,8 +20,10 @@
     (origin . ,(or origin
                    '((kind . "group") (group_id . "20001"))))
     (segments
-     . ,(or segments
-            `(((kind . "text") (payload . ((text . ,text)))))))))
+     . ,(if (equal state "recalled")
+            nil
+          (or segments
+              `(((kind . "text") (payload . ((text . ,text))))))))))
 
 (defun qq-forward-test--message-source (message-id chat-id)
   "Return a locator-qualified native message source."
@@ -168,8 +170,16 @@ list are indistinguishable — both mean \"do not claim a count\"."
           (qq-forward-event-segment-to-internal legacy "group:20001"))
          (group-b
           (qq-forward-event-segment-to-internal legacy "group:20002"))
+         (dataline
+          (qq-forward-event-segment-to-internal
+           legacy "dataline:mobile:dev:a"))
+         (service
+          (qq-forward-event-segment-to-internal
+           legacy "service:u:mail:x"))
          (source-a (qq-forward--segment-source group-a))
-         (source-b (qq-forward--segment-source group-b)))
+         (source-b (qq-forward--segment-source group-b))
+         (dataline-source (qq-forward--segment-source dataline))
+         (service-source (qq-forward--segment-source service)))
     (should (equal source-a
                    (qq-forward-test--message-source
                     "9007199254742007089" "20001")))
@@ -177,7 +187,46 @@ list are indistinguishable — both mean \"do not claim a count\"."
                    (qq-forward-test--message-source
                     "9007199254742007089" "20002")))
     (should-not (equal source-a source-b))
+    (should
+     (equal (alist-get 'chat dataline-source)
+            '((kind . "dataline")
+              (peer_uid . "dev:a")
+              (variant . "mobile"))))
+    (should
+     (equal (alist-get 'chat service-source)
+            '((kind . "service") (peer_uid . "u:mail:x"))))
     (should-not (qq-forward--inline-cell group-a))))
+
+(ert-deftest qq-forward-canonical-source-preserves-opaque-session-locators ()
+  (let* ((message-id "9007199254742007089")
+         (dataline
+          `((kind . "message")
+            (message_id . ,message-id)
+            (chat . ((variant . "mobile")
+                     (kind . "dataline")
+                     (peer_uid . "device:alpha")))))
+         (service
+          `((chat . ((peer_uid . "service:mail") (kind . "service")))
+            (message_id . ,message-id)
+            (kind . "message")))
+         (canonical-dataline (qq-forward--canonical-source dataline))
+         (canonical-service (qq-forward--canonical-source service)))
+    (should
+     (equal canonical-dataline
+            `((kind . "message")
+              (message_id . ,message-id)
+              (chat . ((kind . "dataline")
+                       (peer_uid . "device:alpha")
+                       (variant . "mobile"))))))
+    (should
+     (equal canonical-service
+            `((kind . "message")
+              (message_id . ,message-id)
+              (chat . ((kind . "service")
+                       (peer_uid . "service:mail"))))))
+    (should-not
+     (equal (qq-forward--source-buffer-key canonical-dataline)
+            (qq-forward--source-buffer-key canonical-service)))))
 
 (ert-deftest qq-forward-root-event-adapter-translates-ark-resource ()
   (let* ((legacy

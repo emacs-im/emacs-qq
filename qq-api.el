@@ -181,10 +181,10 @@ exactly once."
 (defun qq-api-message-id-p (value)
   "Return non-nil when VALUE is a canonical NT message snowflake.
 
-The hard-cut protocol represents `message_id' as an original, non-empty
-decimal string.  In particular, a number is never accepted and reformatted:
-by the time Emacs or JavaScript has represented a snowflake numerically its
-low bits may already have been lost."
+The hard-cut protocol represents `message_id' as an original, nonzero decimal
+string with no leading zero.  In particular, a number is never accepted and
+reformatted: by the time Emacs or JavaScript has represented a snowflake
+numerically its low bits may already have been lost."
   (qq-protocol-message-id-p value))
 
 (defun qq-api-non-empty-string-p (value)
@@ -235,7 +235,8 @@ unchanged so callers cannot accidentally canonicalize a lossy numeric id."
 
 CONTEXT is included in the diagnostic.  PROTOCOL-P selects a protocol
 `error'; otherwise invalid user/API input signals `user-error'."
-  (qq-api--validate-identity #'qq-api-message-id-p value "decimal message_id"
+  (qq-api--validate-identity #'qq-api-message-id-p value
+                             "canonical nonzero decimal message_id"
                              context protocol-p))
 
 (defun qq-api-validate-resource-id (value &optional context protocol-p)
@@ -369,14 +370,65 @@ and must not be retained as an `unsupported.raw' diagnostic payload."
        (unless (qq-api--exact-object-keys-p chat '(kind user_id))
          (qq-api--signal-schema-error
           protocol-p "qq: %s private locator has invalid fields" context))
-       (unless (qq-api-user-id-p (alist-get 'user_id chat))
+       (unless (qq-protocol--nonzero-decimal-string-p
+                (alist-get 'user_id chat))
          (qq-api--signal-schema-error
-          protocol-p "qq: %s user_id must be a decimal string" context)))
+          protocol-p
+          "qq: %s user_id must be a canonical nonzero decimal string"
+          context)))
       (_
        (qq-api--signal-schema-error
         protocol-p "qq: %s has invalid kind %S"
         context (alist-get 'kind chat))))
     (copy-tree chat)))
+
+(defun qq-api-validate-forward-session-locator
+    (locator &optional context protocol-p)
+  "Validate a session LOCATOR usable for forward lookup and identity."
+  (qq-protocol-validate-emacs-session-locator
+   locator
+   (or context "forward session locator")
+   (if protocol-p 'error 'user-error)))
+
+(defun qq-api-validate-send-forward-source-locator
+    (kind locator &optional context protocol-p)
+  "Validate LOCATOR as a send-forward source for exact request KIND.
+
+DataLine remains part of the general session locator union.  Native probes
+support only `individual' from the desktop variant; mobile individual and all
+merged DataLine sends are rejected without fallback."
+  (unless (member kind '("individual" "merged"))
+    (qq-api--signal-schema-error
+     protocol-p "qq: %s has invalid forwarding kind %S"
+     (or context "send-forward source") kind))
+  (let ((validated
+         (qq-api-validate-forward-session-locator
+          locator (or context "send-forward source") protocol-p)))
+    (when (and (equal (alist-get 'kind validated) "dataline")
+               (not (and (equal kind "individual")
+                         (equal (alist-get 'variant validated) "desktop"))))
+      (qq-api--signal-schema-error
+       protocol-p "qq: %s does not support %s from DataLine %s"
+       (or context "send-forward source") kind
+       (alist-get 'variant validated)))
+    validated))
+
+(defun qq-api-validate-forward-destination
+    (locator &optional context protocol-p)
+  "Validate a sendable forwarding destination LOCATOR.
+
+Only private and group sessions are destinations.  Service sessions remain
+valid send-forward sources; DataLine desktop is valid only as an individual
+source and neither DataLine variant is accepted as a destination."
+  (let ((validated
+         (qq-api-validate-forward-session-locator
+          locator (or context "forward destination") protocol-p)))
+    (unless (member (alist-get 'kind validated)
+                    '("private" "group"))
+      (qq-api--signal-schema-error
+       protocol-p "qq: %s accepts only private or group sessions"
+       (or context "forward destination")))
+    validated))
 
 (defun qq-api-validate-forward-source (source &optional context protocol-p)
   "Validate and return a copied fork-native query SOURCE union."
@@ -394,7 +446,7 @@ and must not be retained as an `unsupported.raw' diagnostic payload."
           context))
        (qq-api-validate-message-id
         (alist-get 'message_id source) context protocol-p)
-       (qq-api-validate-chat-locator
+       (qq-api-validate-forward-session-locator
         (alist-get 'chat source) (format "%s chat" context) protocol-p))
       ("resource"
        (unless (qq-api--exact-object-keys-p
@@ -470,6 +522,24 @@ and must not be retained as an `unsupported.raw' diagnostic payload."
      (alist-get 'message_id reference) context protocol-p)
     (qq-api-validate-chat-locator
      (alist-get 'chat reference) (format "%s chat" context) protocol-p)
+    (copy-tree reference)))
+
+(defun qq-api-validate-forward-message-reference
+    (kind reference &optional context protocol-p)
+  "Validate a locator-qualified send-forward REFERENCE for KIND.
+
+Unlike mutation references, a service session may be a source in addition to
+a private or group chat.  DataLine capability is checked against KIND and the
+locator variant; general forward lookup accepts both variants independently."
+  (let ((context (or context "forward message reference")))
+    (unless (qq-api--exact-object-keys-p reference '(message_id chat))
+      (qq-api--signal-schema-error
+       protocol-p
+       "qq: %s requires only message_id and chat" context))
+    (qq-api-validate-message-id
+     (alist-get 'message_id reference) context protocol-p)
+    (qq-api-validate-send-forward-source-locator
+     kind (alist-get 'chat reference) (format "%s chat" context) protocol-p)
     (copy-tree reference)))
 
 (defun qq-api--validate-native-peer (peer context protocol-p)
@@ -855,17 +925,30 @@ segments.  A resolve action result itself must be terminal or available."
            protocol-p "qq: %s unknown origin has invalid fields" context))
       (qq-api-validate-chat-locator
        origin (format "%s origin" context) protocol-p)))
-  (let ((segments (alist-get 'segments message)))
+  (let* ((segments (alist-get 'segments message))
+         (state (alist-get 'state message)))
     (unless (or (listp segments) (vectorp segments))
       (qq-api--signal-schema-error
        protocol-p "qq: %s segments must be an array" context))
-    (cl-loop for segment in (if (vectorp segments)
-                                (append segments nil)
-                              segments)
+    (let ((items (if (vectorp segments)
+                     (append segments nil)
+                   segments)))
+      (pcase state
+        ("live"
+         (unless (consp items)
+           (qq-api--signal-schema-error
+            protocol-p "qq: %s live message requires non-empty segments"
+            context)))
+        ("recalled"
+         (when (consp items)
+           (qq-api--signal-schema-error
+            protocol-p "qq: %s recalled message requires empty segments"
+            context))))
+      (cl-loop for segment in items
              for index from 0
              do (qq-api--validate-native-forward-segment
                  segment (format "%s.segments[%d]" context index)
-                 protocol-p)))
+                 protocol-p))))
   (copy-tree message))
 
 (defun qq-api-validate-native-forward-messages
@@ -1445,62 +1528,73 @@ parent message id, or a different interface."
 (defun qq-api--validate-send-forward-request
     (request &optional context protocol-p)
   "Validate and copy native send-forward REQUEST."
-  (let ((context (or context "emacs_send_forward request")))
+  (let ((context (or context "emacs_send_forward request"))
+        (kind (and (listp request) (alist-get 'kind request))))
     (unless (qq-api--single-alist-p request)
       (qq-api--signal-schema-error
        protocol-p "qq: %s must be an object" context))
-    (pcase (alist-get 'kind request)
-      ("single"
-       (unless (qq-api--exact-object-keys-p request '(kind message))
-         (qq-api--signal-schema-error
-          protocol-p "qq: %s single request has invalid fields" context))
-       (qq-api-validate-message-reference
-        (alist-get 'message request)
-        (format "%s message" context) protocol-p))
-      ("bundle"
+    (pcase kind
+      ((or "individual" "merged")
        (unless (qq-api--exact-object-keys-p request '(kind messages))
          (qq-api--signal-schema-error
-          protocol-p "qq: %s bundle request has invalid fields" context))
+          protocol-p "qq: %s has invalid fields" context))
        (let ((messages (alist-get 'messages request)))
          (unless (or (listp messages) (vectorp messages))
            (qq-api--signal-schema-error
-            protocol-p "qq: %s bundle messages must be an array" context))
+            protocol-p "qq: %s messages must be an array" context))
          (let ((items (if (vectorp messages)
                           (append messages nil)
                         messages)))
            (unless (consp items)
              (qq-api--signal-schema-error
-              protocol-p "qq: %s bundle messages must not be empty" context))
+              protocol-p "qq: %s messages must not be empty" context))
            (cl-loop for message in items
                     for index from 0
-                    do (qq-api-validate-message-reference
-                        message
+                    do (qq-api-validate-forward-message-reference
+                        kind message
                         (format "%s messages[%d]" context index)
-                        protocol-p)))))
+                        protocol-p))
+           (let ((source-key
+                  (qq-api-session-key-from-locator
+                   (alist-get 'chat (car items)))))
+             (cl-loop for message in (cdr items)
+                      for index from 1
+                      unless (equal
+                              (qq-api-session-key-from-locator
+                               (alist-get 'chat message))
+                              source-key)
+                      do (qq-api--signal-schema-error
+                          protocol-p
+                          "qq: %s messages[%d] has a different source chat"
+                          context index))))))
       (_
        (qq-api--signal-schema-error
         protocol-p "qq: %s has invalid kind %S"
         context (alist-get 'kind request))))
     (copy-tree request)))
 
-(defun qq-api--send-forward-result (response)
-  "Validate and return fork-native emacs_send_forward result."
-  (let ((data (qq-api--response-data response)))
-    (pcase (and (qq-api--single-alist-p data)
-                (alist-get 'kind data))
-      ("single"
+(defun qq-api--send-forward-result (response expected-kind)
+  "Validate and return a forward result matching EXPECTED-KIND."
+  (let* ((data (qq-api--response-data response))
+         (actual-kind
+          (and (qq-api--single-alist-p data) (alist-get 'kind data))))
+    (unless (equal actual-kind expected-kind)
+      (error "qq: emacs_send_forward response kind %S does not match request kind %S"
+             actual-kind expected-kind))
+    (pcase actual-kind
+      ("individual"
        (unless (qq-api--exact-object-keys-p data '(kind))
-         (error "qq: single forward result may contain only kind"))
+         (error "qq: individual forward result may contain only kind"))
        (copy-tree data))
-      ("bundle"
+      ("merged"
        (unless (qq-api--exact-object-keys-p
                 data '(kind message_id resource_id))
          (error
-          "qq: bundle forward result requires kind, message_id, and resource_id"))
+          "qq: merged forward result requires kind, message_id, and resource_id"))
        (qq-api-validate-message-id
-        (alist-get 'message_id data) "bundle forward result" t)
+        (alist-get 'message_id data) "merged forward result" t)
        (qq-api-validate-resource-id
-        (alist-get 'resource_id data) "bundle forward result" t)
+        (alist-get 'resource_id data) "merged forward result" t)
        (copy-tree data))
       (_
        (error "qq: emacs_send_forward result has invalid kind")))))
@@ -1508,62 +1602,74 @@ parent message id, or a different interface."
 (defun qq-api-send-forward (destination request callback &optional errback)
   "Send a fork-native forward REQUEST to DESTINATION."
   (setq destination
-        (qq-api-validate-chat-locator
+        (qq-api-validate-forward-destination
          destination "emacs_send_forward destination")
         request
         (qq-api--validate-send-forward-request request))
-  (qq-api-call
-   "emacs_send_forward"
-   `((destination . ,destination)
-     (request . ,request))
-   (lambda (response)
-     (condition-case error-data
-         (let ((result (qq-api--send-forward-result response)))
-           (when callback
-             (funcall callback result)))
-       (error
-        (funcall (or errback #'qq-api--default-error)
-                 response (error-message-string error-data)))))
-   errback))
+  (let ((request-kind (alist-get 'kind request)))
+    (qq-api-call
+     "emacs_send_forward"
+     `((destination . ,destination)
+       (request . ,request))
+     (lambda (response)
+       (condition-case error-data
+           (let ((result
+                  (qq-api--send-forward-result response request-kind)))
+             (when callback
+               (funcall callback result)))
+         (error
+          (funcall (or errback #'qq-api--default-error)
+                   response (error-message-string error-data)))))
+     errback)))
 
-(defun qq-api-forward-message
-    (message-id source-session-key target-session-key callback &optional errback)
-  "Forward MESSAGE-ID once from SOURCE-SESSION-KEY to TARGET-SESSION-KEY."
-  (let* ((chat (qq-api-chat-locator source-session-key))
-         (message
-          `((message_id
-             . ,(qq-api-validate-message-id
-                 message-id "single forward message"))
-            (chat . ,chat))))
-    (qq-api-send-forward
-     (qq-api-chat-locator target-session-key)
-     `((kind . "single") (message . ,message))
-     callback errback)))
-
-(defun qq-api-send-forward-bundle
-    (source-session-key target-session-key message-ids callback
-                        &optional errback)
-  "Forward ordered MESSAGE-IDS as one native bundle."
+(defun qq-api--forward-message-references
+    (kind source-session-key message-ids)
+  "Build KIND forwarding references for MESSAGE-IDS in SOURCE-SESSION-KEY."
   (unless (or (listp message-ids) (vectorp message-ids))
-    (user-error "qq: bundle message ids must be an array"))
+    (user-error "qq: forward message ids must be an array"))
   (let* ((ids (if (vectorp message-ids)
                   (append message-ids nil)
                 message-ids))
-         (chat (qq-api-chat-locator source-session-key)))
+         (chat (qq-api-validate-send-forward-source-locator
+                kind (qq-api--session-emacs-locator source-session-key)
+                "send-forward source session")))
     (unless (consp ids)
-      (user-error "qq: bundle message ids must not be empty"))
-    (qq-api-send-forward
-     (qq-api-chat-locator target-session-key)
-     `((kind . "bundle")
-       (messages
-        . ,(mapcar
-            (lambda (message-id)
-              `((message_id
-                 . ,(qq-api-validate-message-id
-                     message-id "bundle forward message"))
-                (chat . ,(copy-tree chat))))
-            ids)))
-     callback errback)))
+      (user-error "qq: forward message ids must not be empty"))
+    (mapcar
+     (lambda (message-id)
+       `((message_id
+          . ,(qq-api-validate-message-id message-id "forward message"))
+         (chat . ,(copy-tree chat))))
+     ids)))
+
+(defun qq-api--forward-messages
+    (kind source-session-key target-session-key message-ids callback errback)
+  "Forward MESSAGE-IDS using protocol KIND between exact session keys."
+  (qq-api-send-forward
+   (qq-api-validate-forward-destination
+    (qq-api--session-emacs-locator target-session-key)
+    "forward target session")
+   `((kind . ,kind)
+     (messages
+      . ,(qq-api--forward-message-references
+          kind source-session-key message-ids)))
+   callback errback))
+
+(defun qq-api-forward-messages-individually
+    (source-session-key target-session-key message-ids callback
+                        &optional errback)
+  "Forward ordered MESSAGE-IDS as individual messages."
+  (qq-api--forward-messages
+   "individual" source-session-key target-session-key message-ids
+   callback errback))
+
+(defun qq-api-forward-messages-merged
+    (source-session-key target-session-key message-ids callback
+                        &optional errback)
+  "Forward ordered MESSAGE-IDS as one native merged-forward card."
+  (qq-api--forward-messages
+   "merged" source-session-key target-session-key message-ids
+   callback errback))
 (defun qq-api--history-around-params (session-key message-id count)
   "Build `get_msg_history_around' params for SESSION-KEY centered on MESSAGE-ID."
   (setq message-id

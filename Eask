@@ -13,7 +13,7 @@
 
 (depends-on "emacs" "27.1")
 (depends-on "websocket" "1.16")
-(depends-on "transient" "0.3")
+(depends-on "transient" "0.7")
 (depends-on "appkit" :file "../appkit.el")
 
 (script "refresh-appkit" "eask -f install-file ../appkit.el")

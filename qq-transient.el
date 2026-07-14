@@ -29,9 +29,11 @@
 (declare-function qq-connect "qq")
 (declare-function qq-disconnect "qq")
 (declare-function qq-reset-session-state "qq")
+(declare-function qq-chat--forward-source-supported-p "qq-chat"
+                  (&optional style session-key))
 
-(defvar qq-chat--forward-request-active-p)
-(defvar qq-chat--marked-message-anchors)
+(defvar qq-chat--forward-request-owner)
+(defvar qq-chat--message-selection)
 (defvar qq-chat--session-key)
 
 
@@ -99,22 +101,25 @@
 
 (defun qq-transient--forward-inapt-p ()
   "Return non-nil when forwarding the message at point is unavailable."
-  (not (qq-chat--message-forwardable-p
-        (qq-transient--message-at-point))))
+  (or (not (qq-chat--forward-source-supported-p))
+      (not (qq-chat--message-forwardable-p
+            (qq-transient--message-at-point)))))
 
 (defun qq-transient--reaction-inapt-p ()
   "Return non-nil when reacting to the message at point is unavailable."
   (not (qq-chat--message-reactable-p
         (qq-transient--message-at-point))))
 
-(defun qq-transient--no-forward-marks-p ()
-  "Return non-nil when there are no raw forward selections to clear."
-  (null qq-chat--marked-message-anchors))
+(defun qq-transient--no-message-selection-p ()
+  "Return non-nil when there are no selected message memberships to clear."
+  (null qq-chat--message-selection))
 
-(defun qq-transient--forward-marked-inapt-p ()
-  "Return non-nil when a merged-forward submission is unavailable."
-  (or qq-chat--forward-request-active-p
-      (null (qq-chat-marked-messages))))
+(defun qq-transient--forward-selection-inapt-p ()
+  "Return non-nil when neither selection nor point can form a forward plan."
+  (or qq-chat--forward-request-owner
+      (condition-case nil
+          (progn (qq-chat--current-forward-plan) nil)
+        (user-error t))))
 
 (defun qq-transient--resource-inapt-p ()
   "Return non-nil when open-resource is unavailable at point."
@@ -222,9 +227,9 @@ Prefer this over inline button rows."
   [["Message"
     ("r" "Reply" qq-chat-reply-to-message
      :inapt-if qq-transient--reply-inapt-p)
-    ("f" "Forward" qq-chat-forward-message
+    ("f" "Forward…" qq-chat-forward-transient
      :inapt-if qq-transient--forward-inapt-p)
-    ("M" "Mark / unmark" qq-chat-toggle-forward-mark
+    ("m" "Select / unselect" qq-chat-toggle-message-selection
      :inapt-if qq-transient--forward-inapt-p)
     ("d" "Recall" qq-chat-delete-message
      :inapt-if qq-transient--recall-inapt-p)
@@ -256,6 +261,57 @@ Prefer this over inline button rows."
     ("x" "Pop jump" qq-chat-goto-pop-message
      :inapt-if qq-transient--pop-ring-empty-p)]])
 
+(defun qq-transient--forward-plan-scope ()
+  "Return the immutable plan exported by the forwarding prefix."
+  (let ((plan (transient-scope 'qq-chat-forward-transient)))
+    (unless (qq-chat-forward-plan-p plan)
+      (user-error "qq: forwarding action requires an active forwarding menu"))
+    (qq-chat--forward-plan-messages plan)
+    plan))
+
+(defun qq-transient--forward-merged-inapt-p ()
+  "Return non-nil when the active plan cannot use merged forwarding."
+  (condition-case nil
+      (let ((plan (qq-transient--forward-plan-scope)))
+        (not
+         (qq-chat--forward-source-supported-p
+          'merged (qq-chat-forward-plan-session-key plan))))
+    (error t)))
+
+(transient-define-suffix qq-transient-forward-individually (plan)
+  "Forward PLAN as separate native messages."
+  :transient nil
+  (interactive (list (qq-transient--forward-plan-scope)))
+  (qq-chat-forward-individually plan))
+
+(transient-define-suffix qq-transient-forward-merged (plan)
+  "Forward PLAN as one native merged-forward card."
+  :transient nil
+  :inapt-if #'qq-transient--forward-merged-inapt-p
+  (interactive (list (qq-transient--forward-plan-scope)))
+  (qq-chat-forward-merged plan))
+
+;;;###autoload(autoload 'qq-chat-forward-transient "qq-transient" nil t)
+(transient-define-prefix qq-chat-forward-transient (plan)
+  "Choose explicit QQ forwarding semantics for one immutable PLAN."
+  [:description
+   (lambda ()
+     (format "转发 %d 条消息"
+             (length
+              (qq-chat-forward-plan-anchors
+               (oref (transient-prefix-object) scope)))))]
+  [["发送方式"
+    ("i" "逐条转发…" qq-transient-forward-individually)
+    ("m" "合并转发…" qq-transient-forward-merged)]]
+  (interactive (list (qq-chat--current-forward-plan)))
+  (unless (qq-chat-forward-plan-p plan)
+    (user-error "qq: invalid forwarding plan"))
+  (unless (qq-chat--forward-source-supported-p
+           nil (qq-chat-forward-plan-session-key plan))
+    (user-error "qq: forwarding is unavailable from this session"))
+  (qq-chat--forward-plan-messages plan)
+  (transient-setup 'qq-chat-forward-transient nil nil :scope plan))
+
 ;;;###autoload(autoload 'qq-chat-attach-transient "qq-transient" nil t)
 (transient-define-prefix qq-chat-attach-transient ()
   "Attach local media / QQ faces into the QQ chat composer."
@@ -283,10 +339,10 @@ Prefer this over inline button rows."
     ("p" "Search prev" qq-chat-search-prev)
     ("P" "Poke user…" qq-chat-send-poke
      :inapt-if qq-transient--poke-session-inapt-p)
-    ("v" "Forward marked" qq-chat-forward-marked-messages
-     :inapt-if qq-transient--forward-marked-inapt-p)
-    ("U" "Clear forward marks" qq-chat-clear-forward-marks
-     :inapt-if qq-transient--no-forward-marks-p)
+    ("f" "Forward selected / at point…" qq-chat-forward-transient
+     :inapt-if qq-transient--forward-selection-inapt-p)
+    ("U" "Clear message selection" qq-chat-clear-message-selection
+     :inapt-if qq-transient--no-message-selection-p)
     ("m" "Message at point…" qq-chat-message-transient
      :inapt-if qq-transient--no-message-at-point-p)]
    ["Composer"

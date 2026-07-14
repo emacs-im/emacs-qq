@@ -5,12 +5,14 @@
 (require 'ert)
 (require 'qq-protocol)
 
-(ert-deftest qq-protocol-message-id-never-canonicalizes-numbers ()
+(ert-deftest qq-protocol-message-id-is-canonical-nonzero-decimal-string ()
   (should (equal (qq-protocol-optional-message-id "9007199254742007089")
                  "9007199254742007089"))
   (should-not (qq-protocol-optional-message-id nil))
-  (should-error
-   (qq-protocol-optional-message-id 9007199254742007089)))
+  (dolist (value '("" "0" "00" "01" "1.0" "-1"
+                   9007199254742007089))
+    (should-not (qq-protocol-message-id-p value))
+    (should-error (qq-protocol-optional-message-id value))))
 
 (ert-deftest qq-protocol-json-true-distinguishes-decoded-false ()
   (dolist (value '(t 1 "true" "1" "yes"))
@@ -68,6 +70,9 @@
          ((kind . "group") (group_id . "4294967296"))
          ((kind . "group") (group_id . "20001") (extra . t))
          ((kind . "private") (user_id . ""))
+         ((kind . "private") (user_id . "0"))
+         ((kind . "private") (user_id . "01"))
+         ((kind . "private") (user_id . 10001))
          ((kind . "dataline") (peer_uid . "device-1"))
          ((kind . "dataline")
           (peer_uid . "device-1") (variant . "tablet"))

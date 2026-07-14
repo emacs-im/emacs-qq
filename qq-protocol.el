@@ -51,19 +51,22 @@ exact for canonical decimal strings and cannot lose NT sequence precision."
        (<= (qq-protocol-decimal-string-compare value "4294967295") 0)))
 
 (defun qq-protocol-message-id-p (value)
-  "Return non-nil when VALUE is an original NT message snowflake string."
-  (qq-protocol--decimal-string-p value))
+  "Return non-nil when VALUE is a canonical NT message snowflake string.
+
+The hard-cut wire identity is a nonzero decimal string with no leading zero."
+  (qq-protocol--nonzero-decimal-string-p value))
 
 (defun qq-protocol-optional-message-id (value &optional context)
   "Return optional message-id VALUE after validating its wire representation.
 
-Nil remains nil.  Every non-nil value must be an original decimal string.
+Nil remains nil.  Every non-nil value must be a canonical nonzero decimal
+string with no leading zero.
 CONTEXT is included in protocol errors."
   (cond
    ((null value) nil)
    ((qq-protocol-message-id-p value) value)
    (t
-    (error "qq: %s requires message_id as an original decimal string, got %S"
+    (error "qq: %s requires message_id as a canonical nonzero decimal string, got %S"
            (or context "protocol payload") value))))
 
 (defun qq-protocol--closed-object-p (value keys)
@@ -99,7 +102,8 @@ CONTEXT is included in protocol errors."
           (qq-protocol-group-uin-p (alist-get 'group_id value))))
     ("private"
      (and (qq-protocol--closed-object-p value '(kind user_id))
-          (qq-protocol--decimal-string-p (alist-get 'user_id value))))
+          (qq-protocol--nonzero-decimal-string-p
+           (alist-get 'user_id value))))
     ("dataline"
      (and (qq-protocol--closed-object-p
            value '(kind peer_uid variant))
