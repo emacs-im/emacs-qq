@@ -314,6 +314,43 @@ CONTEXT is included in the diagnostic.  ERROR-SYMBOL defaults to `error'."
                      (or context "protocol payload") value))))
   (copy-tree value))
 
+(defun qq-protocol-emacs-mark-read-result-p (value)
+  "Return non-nil when VALUE is a closed tagged mark-read result.
+
+Message-scoped reads name the exact native message through which Linux QQ
+advanced.  Session-scoped reads retain the requested message only as an
+ownership proof and deliberately do not claim an exact read-through cursor.
+Both variants carry the authoritative post-operation read state."
+  (let ((scope (and (consp value) (alist-get 'scope value))))
+    (pcase scope
+      ("message"
+       (and (qq-protocol--closed-object-p
+             value '(scope read_through_message_id read_state))
+            (qq-protocol-message-id-p
+             (alist-get 'read_through_message_id value))
+            (qq-protocol-emacs-read-state-p
+             (alist-get 'read_state value))))
+      ("session"
+       (and (qq-protocol--closed-object-p
+             value '(scope requested_message_id read_state))
+            (qq-protocol-message-id-p
+             (alist-get 'requested_message_id value))
+            (qq-protocol-emacs-read-state-p
+             (alist-get 'read_state value))))
+      (_ nil))))
+
+(defun qq-protocol-validate-emacs-mark-read-result
+    (value &optional context error-symbol)
+  "Return a copy of closed tagged mark-read VALUE after validation.
+
+CONTEXT is included in the diagnostic.  ERROR-SYMBOL defaults to `error'."
+  (unless (qq-protocol-emacs-mark-read-result-p value)
+    (signal (or error-symbol 'error)
+            (list
+             (format "qq: %s requires a closed mark-read result, got %S"
+                     (or context "protocol payload") value))))
+  (copy-tree value))
+
 (defun qq-protocol-emacs-read-state-notice-p (value)
   "Return non-nil when VALUE is a strict fork read-state notice."
   (and (qq-protocol--closed-object-p

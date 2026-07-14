@@ -1279,9 +1279,52 @@ ERRBACK is called so the client can fall back to single-side seek."
   (equal token
          (plist-get (gethash session-key qq-api--read-operations) :token)))
 
+(defun qq-api--finish-read-operation (session-key token)
+  "Settle TOKEN and start SESSION-KEY's newest coalesced read intent.
+
+The operation remains registered while response state and synchronous hooks
+run.  A reentrant `qq-api-mark-message-read' therefore coalesces into the
+current owner instead of starting an overlapping request."
+  (when (qq-api--read-operation-current-p session-key token)
+    (let ((next-message-id
+           (plist-get (gethash session-key qq-api--read-operations)
+                      :next-message-id)))
+      (remhash session-key qq-api--read-operations)
+      (when next-message-id
+        (qq-api--start-mark-message-read session-key next-message-id)))))
+
+(defun qq-api--validate-mark-read-result
+    (session-key message-id response)
+  "Return RESPONSE's closed mark-read result for SESSION-KEY and MESSAGE-ID.
+
+Service sessions have an explicit session-scoped native read capability.
+Every other supported session must report an exact message-scoped advance.
+The tagged result must echo the requested NT message identity in the field
+belonging to that scope."
+  (let* ((result
+          (qq-protocol-validate-emacs-mark-read-result
+           (qq-api--response-data response)
+           "emacs_mark_read response"))
+         (type (qq-state-session-key-type session-key))
+         (scope (alist-get 'scope result))
+         (expected-scope (if (eq type 'service) "session" "message"))
+         (reported-id
+          (alist-get (if (equal scope "session")
+                         'requested_message_id
+                       'read_through_message_id)
+                     result)))
+    (unless (equal scope expected-scope)
+      (error "qq: emacs_mark_read returned %s scope for %s session"
+             scope type))
+    (unless (equal reported-id message-id)
+      (error "qq: emacs_mark_read response belongs to %s, requested %s"
+             reported-id message-id))
+    result))
+
 (defun qq-api--start-mark-message-read (session-key message-id)
   "Start one read-through request for MESSAGE-ID in SESSION-KEY."
   (let* ((token (cl-incf qq-api--read-operation-counter))
+         (observation-token (qq-api--next-read-observation-token))
          (operation (list :token token
                           :message-id message-id
                           :next-message-id nil)))
@@ -1290,34 +1333,45 @@ ERRBACK is called so the client can fall back to single-side seek."
      "emacs_mark_read"
      (append (qq-api--session-emacs-params session-key)
              `((message_id . ,message-id)))
-     (lambda (_response)
+     (lambda (response)
        (when (qq-api--read-operation-current-p session-key token)
-         (let ((next-message-id
-                (plist-get (gethash session-key qq-api--read-operations)
-                           :next-message-id)))
-           (remhash session-key qq-api--read-operations)
-           (when next-message-id
-             (qq-api--start-mark-message-read session-key next-message-id)))))
+         (unwind-protect
+             (condition-case err
+                 (let* ((result
+                         (qq-api--validate-mark-read-result
+                          session-key message-id response))
+                        (read-state (alist-get 'read_state result)))
+                   (when (qq-api--accept-read-observation-p
+                          session-key observation-token)
+                     (qq-state-apply-session-read-state
+                      session-key read-state)))
+               (error
+                ;; A malformed or contradictory success response is not proof
+                ;; of read state.  Fail closed and request a fresh native state.
+                (qq-api--default-error response (error-message-string err))
+                (qq-api--refresh-session-read-state-after-failure session-key)))
+           (qq-api--finish-read-operation session-key token))))
      (lambda (response reason)
        (when (qq-api--read-operation-current-p session-key token)
-         (let ((next-message-id
-                (plist-get (gethash session-key qq-api--read-operations)
-                           :next-message-id)))
-           (remhash session-key qq-api--read-operations)
-           (qq-api--default-error response reason)
-           (qq-api--refresh-session-read-state-after-failure session-key)
-           ;; Failure does not consume a later cursor intent.  The later
-           ;; target starts clean, so persistent errors cannot self-loop.
-           (when next-message-id
-             (qq-api--start-mark-message-read session-key next-message-id))))))
+         (unwind-protect
+             (progn
+               (qq-api--default-error response reason)
+               (qq-api--refresh-session-read-state-after-failure session-key))
+           ;; Failure does not consume a later cursor intent.  The later target
+           ;; starts clean, so persistent errors cannot self-loop.
+           (qq-api--finish-read-operation session-key token)))))
     token))
 
 (defun qq-api-mark-message-read (session-key message-id)
-  "Advance SESSION-KEY's native read position through MESSAGE-ID.
+  "Advance SESSION-KEY's native read state using MESSAGE-ID as ownership.
 
-MESSAGE-ID remains the original decimal NT snowflake string.  Concurrent
-cursor movements coalesce behind one request and retain only the newest exact
-target.  Failure starts one authoritative read-state refresh."
+MESSAGE-ID remains the original decimal NT snowflake string.  Ordinary
+sessions advance through that exact message.  Linux QQ exposes service reads
+only at session scope, so their tagged response explicitly reports that wider
+operation and returns an authoritative post-state instead of pretending to
+own a precise cursor.  Concurrent intents coalesce behind one request and
+retain only the newest target.  Failure starts one authoritative read-state
+refresh."
   (interactive)
   (setq message-id
         (qq-api-validate-message-id message-id "mark read target"))

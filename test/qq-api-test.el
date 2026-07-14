@@ -54,6 +54,23 @@
     (chat . ,chat)
     (read_state . ,(qq-api-test--read-state))))
 
+(defun qq-api-test--mark-read-response (scope message-id unread-count)
+  "Return a strict mark-read response for SCOPE and MESSAGE-ID.
+
+The authoritative post-state reports UNREAD-COUNT."
+  (let ((state (copy-tree (qq-api-test--read-state))))
+    (setf (alist-get 'unread_count state) unread-count)
+    (when (= unread-count 0)
+      (setf (alist-get 'first_unread state) nil))
+    `((status . "ok")
+      (data
+       . ((scope . ,scope)
+          (,(if (equal scope "session")
+                'requested_message_id
+              'read_through_message_id)
+           . ,message-id)
+          (read_state . ,state))))))
+
 (defun qq-api-test--search-result (&optional message-id sent-at preview)
   "Return one strict fork-native message-search result."
   (copy-tree
@@ -245,10 +262,13 @@
       (should-not pending-called)
       (should-not api-called))))
 
-(ert-deftest qq-api-mark-message-read-sends-exact-id-without-guessing-state ()
+(ert-deftest qq-api-mark-message-read-applies-authoritative-post-state ()
   (let ((qq-state-change-hook nil)
         (qq-api--read-operations (make-hash-table :test #'equal))
         (qq-api--read-operation-counter 0)
+        (qq-api--read-observation-clock 0)
+        (qq-api--session-read-observation-tokens
+         (make-hash-table :test #'equal))
         captured-action
         captured-params
         success-fn)
@@ -273,10 +293,152 @@
                      "9007199254741004645"))
       (should (= 3 (alist-get 'unread-count
                               (qq-state-session "private:10001"))))
-      (funcall success-fn '((status . ok)))
-      (should (= 3 (alist-get 'unread-count
+      (funcall success-fn
+               (qq-api-test--mark-read-response
+                "message" "9007199254741004645" 0))
+      (should (= 0 (alist-get 'unread-count
                               (qq-state-session "private:10001"))))
       (should-not (gethash "private:10001" qq-api--read-operations)))))
+
+(ert-deftest qq-api-mark-read-response-cannot-overwrite-newer-observation ()
+  (let ((qq-state-change-hook nil)
+        (qq-api--read-operations (make-hash-table :test #'equal))
+        (qq-api--read-operation-counter 0)
+        (qq-api--read-observation-clock 0)
+        (qq-api--session-read-observation-tokens
+         (make-hash-table :test #'equal))
+        success-fn)
+    (qq-state-reset)
+    (qq-state-upsert-session
+     "private:10001" '((unread-count . 3)) nil)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action _params callback &optional _errback)
+                 (setq success-fn callback)
+                 'sent)))
+      (qq-api-mark-message-read
+       "private:10001" "9007199254741004645")
+      (let ((newer-token (qq-api--next-read-observation-token))
+            (newer-state (copy-tree (qq-api-test--read-state))))
+        (setf (alist-get 'unread_count newer-state) 7)
+        (should
+         (qq-api--accept-read-observation-p
+          "private:10001" newer-token))
+        (qq-state-apply-session-read-state
+         "private:10001" newer-state))
+      (funcall success-fn
+               (qq-api-test--mark-read-response
+                "message" "9007199254741004645" 0))
+      (should (= 7 (alist-get 'unread-count
+                              (qq-state-session "private:10001")))))))
+
+(ert-deftest qq-api-mark-read-coalesces-reentrant-state-hook-intent ()
+  (let ((qq-state-change-hook nil)
+        (qq-api--read-operations (make-hash-table :test #'equal))
+        (qq-api--read-operation-counter 0)
+        (qq-api--read-observation-clock 0)
+        (qq-api--session-read-observation-tokens
+         (make-hash-table :test #'equal))
+        calls
+        reentered)
+    (qq-state-reset)
+    (qq-state-upsert-session
+     "private:10001" '((unread-count . 3)) nil)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action params callback &optional _errback)
+                 (setq calls
+                       (append calls
+                               (list (cons (alist-get 'message_id params)
+                                           callback))))
+                 (length calls))))
+      (add-hook
+       'qq-state-change-hook
+       (lambda (event)
+         (when (and (eq (plist-get event :type) 'session)
+                    (eq (plist-get event :mutation) 'read)
+                    (not reentered))
+           (setq reentered t)
+           (qq-api-mark-message-read
+            "private:10001" "9007199254741004647"))))
+      (qq-api-mark-message-read
+       "private:10001" "9007199254741004645")
+      ;; This intent is superseded by the still newer one issued reentrantly
+      ;; from the synchronous read-state hook.
+      (qq-api-mark-message-read
+       "private:10001" "9007199254741004646")
+      (funcall (cdar calls)
+               (qq-api-test--mark-read-response
+                "message" "9007199254741004645" 1))
+      (should
+       (equal (mapcar #'car calls)
+              '("9007199254741004645" "9007199254741004647")))
+      (let ((operation (gethash "private:10001" qq-api--read-operations)))
+        (should (equal (plist-get operation :message-id)
+                       "9007199254741004647"))
+        (should-not (plist-get operation :next-message-id))))))
+
+(ert-deftest qq-api-mark-service-read-requires-session-scoped-post-state ()
+  (let ((qq-state-change-hook nil)
+        (qq-api--read-operations (make-hash-table :test #'equal))
+        (qq-api--read-operation-counter 0)
+        (qq-api--read-observation-clock 0)
+        (qq-api--session-read-observation-tokens
+         (make-hash-table :test #'equal))
+        captured-params
+        success-fn)
+    (qq-state-reset)
+    (qq-state-upsert-session
+     "service:u_mail"
+     '((title . "QQ Mail") (unread-count . 1))
+     nil)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (_action params callback &optional _errback)
+                 (setq captured-params params
+                       success-fn callback)
+                 'sent)))
+      (qq-api-mark-message-read
+       "service:u_mail" "9007199254741004645")
+      (should
+       (equal (alist-get 'chat captured-params)
+              '((kind . "service") (peer_uid . "u_mail"))))
+      (funcall success-fn
+               (qq-api-test--mark-read-response
+                "session" "9007199254741004645" 0))
+      (should (= 0 (alist-get 'unread-count
+                              (qq-state-session "service:u_mail"))))
+      (should-not (gethash "service:u_mail" qq-api--read-operations)))))
+
+(ert-deftest qq-api-mark-read-rejects-contradictory-success-scope ()
+  (let ((qq-state-change-hook nil)
+        (qq-api--read-operations (make-hash-table :test #'equal))
+        (qq-api--read-operation-counter 0)
+        (qq-api--read-observation-clock 0)
+        (qq-api--session-read-observation-tokens
+         (make-hash-table :test #'equal))
+        actions
+        mark-success
+        reported-error)
+    (qq-state-reset)
+    (qq-state-upsert-session
+     "service:u_mail" '((unread-count . 1)) nil)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (action _params callback &optional _errback)
+                 (setq actions (append actions (list action)))
+                 (when (equal action "emacs_mark_read")
+                   (setq mark-success callback))
+                 'sent))
+              ((symbol-function 'qq-api--default-error)
+               (lambda (_response reason) (setq reported-error reason))))
+      (qq-api-mark-message-read
+       "service:u_mail" "9007199254741004645")
+      (funcall mark-success
+               (qq-api-test--mark-read-response
+                "message" "9007199254741004645" 0))
+      (should (equal actions
+                     '("emacs_mark_read" "emacs_get_read_state")))
+      (should (string-match-p "message scope for service" reported-error))
+      (should (= 1 (alist-get 'unread-count
+                              (qq-state-session "service:u_mail"))))
+      (should-not (gethash "service:u_mail" qq-api--read-operations)))))
 
 (ert-deftest qq-api-session-emacs-locator-tags-kernel-only-session-kinds ()
   (should
@@ -692,6 +854,9 @@
   (let ((qq-state-change-hook nil)
         (qq-api--read-operations (make-hash-table :test #'equal))
         (qq-api--read-operation-counter 0)
+        (qq-api--read-observation-clock 0)
+        (qq-api--session-read-observation-tokens
+         (make-hash-table :test #'equal))
         calls
         params)
     (qq-state-reset)
@@ -706,13 +871,19 @@
       (qq-api-mark-message-read "private:10001" "9007199254741004645")
       (qq-api-mark-message-read "private:10001" "9007199254741004646")
       (should (= (length calls) 1))
-      (funcall (caar calls) '((status . "ok")))
+      (funcall (caar calls)
+               (qq-api-test--mark-read-response
+                "message" "9007199254741004645" 1))
       (should (= (length calls) 2))
       (should (equal (mapcar (lambda (it) (alist-get 'message_id it)) params)
                      '("9007199254741004645" "9007199254741004646")))
-      (should (= 2 (alist-get 'unread-count
+      (should (= 1 (alist-get 'unread-count
                               (qq-state-session "private:10001"))))
-      (funcall (car (nth 1 calls)) '((status . "ok")))
+      (funcall (car (nth 1 calls))
+               (qq-api-test--mark-read-response
+                "message" "9007199254741004646" 0))
+      (should (= 0 (alist-get 'unread-count
+                              (qq-state-session "private:10001"))))
       (should-not (gethash "private:10001" qq-api--read-operations)))))
 
 (ert-deftest qq-api-mark-message-read-failure-preserves-later-intent-once ()

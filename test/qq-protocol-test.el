@@ -128,6 +128,41 @@
     (should-error
      (qq-protocol-validate-emacs-read-state read-state "event.read_state"))))
 
+(ert-deftest qq-protocol-emacs-mark-read-result-is-a-closed-tagged-union ()
+  (let ((state (qq-protocol-test--read-state)))
+    (dolist
+        (result
+         `(((scope . "message")
+            (read_through_message_id . "9007199254742007094")
+            (read_state . ,state))
+           ((scope . "session")
+            (requested_message_id . "9007199254742007094")
+            (read_state . ,state))))
+      (let ((validated
+             (qq-protocol-validate-emacs-mark-read-result
+              result "emacs_mark_read response")))
+        (should (equal validated result))
+        (should-not (eq validated result))))
+    (dolist
+        (invalid
+         `(((scope . "message")
+            (requested_message_id . "9007199254742007094")
+            (read_state . ,state))
+           ((scope . "session")
+            (read_through_message_id . "9007199254742007094")
+            (read_state . ,state))
+           ((scope . "message")
+            (read_through_message_id . 9007199254742007094)
+            (read_state . ,state))
+           ((scope . "session")
+            (requested_message_id . "9007199254742007094")
+            (read_state . ,state)
+            (extra . t))))
+      (should-not (qq-protocol-emacs-mark-read-result-p invalid))
+      (should-error
+       (qq-protocol-validate-emacs-mark-read-result
+        invalid "emacs_mark_read response")))))
+
 (ert-deftest qq-protocol-emacs-read-state-notice-requires-exact-envelope ()
   (let* ((notice
           `((time . 1710000200)
