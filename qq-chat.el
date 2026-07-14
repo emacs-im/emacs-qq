@@ -789,14 +789,21 @@ prompt behavior.  Point on the timeline represents that exact message."
            (qq-chat--latest-visible-server-message)
          (qq-chat--message-at-point position))))))
 
-(defun qq-chat--window-scroll (window display-start)
-  "Advance reads and load newer history while WINDOW scrolls indirectly."
-  (when (and (window-live-p window)
-             (not (eq window (selected-window))))
+(defun qq-chat--window-scroll (window _display-start)
+  "Advance reads and load newer history from WINDOW's visible timeline edge."
+  (when (window-live-p window)
     (with-current-buffer (window-buffer window)
       (when (derived-mode-p 'qq-chat-mode)
-        (qq-chat--manage-read-position (window-point window))
-        (qq-chat--maybe-auto-load-newer display-start)))))
+        ;; The selected window's ordinary post-command path owns read state.
+        ;; Indirect scrolling can move an inactive window without running it.
+        (unless (eq window (selected-window))
+          (qq-chat--manage-read-position (window-point window)))
+        ;; Mouse-wheel and scroll-bar commands may move the viewport while
+        ;; leaving point far above the newer edge.  Use AppKit's clamped
+        ;; visible end for both selected and inactive windows.
+        (when-let* ((visible-end
+                     (appkit-chat-timeline-window-visible-end-position window)))
+          (qq-chat--maybe-auto-load-newer visible-end))))))
 
 (defun qq-chat--message-forwardable-p (message)
   "Return non-nil when MESSAGE can be forwarded by its server ID."
