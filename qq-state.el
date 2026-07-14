@@ -53,6 +53,8 @@ reaction deltas.")
 (defvar qq-state--local-message-session-index (make-hash-table :test #'equal))
 (defvar qq-state--message-order-counter 0)
 (defvar qq-state--local-message-counter 0)
+(defvar qq-state--session-summary-observation-clock 0
+  "Monotonic token for root latest-message summary observations.")
 (defvar qq-state--actions (make-hash-table :test #'equal)
   "Peer chat-actions by session-key (telega telega--actions counterpart).
 
@@ -212,6 +214,7 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   (setq qq-state--requests nil)
   (setq qq-state--message-order-counter 0)
   (setq qq-state--local-message-counter 0)
+  (setq qq-state--session-summary-observation-clock 0)
   (maphash (lambda (_key actions)
              (qq-state--cancel-session-action-timers actions))
            qq-state--actions)
@@ -228,6 +231,15 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
 (defun qq-state-connection-status ()
   "Return current transport connection status symbol."
   qq-state--connection-status)
+
+(defun qq-state-session-summary-observation-start ()
+  "Return a freshness token for a latest-message summary observation.
+
+Asynchronous summary callers capture this before dispatch.  Live events
+allocate at receipt, so a response that began earlier cannot replace a later
+observation of the same or a newer message.  This clock is deliberately
+independent of unread state ownership."
+  (cl-incf qq-state--session-summary-observation-clock))
 
 (defun qq-state-set-connection-status (status)
   "Set current transport STATUS symbol."
@@ -465,6 +477,11 @@ they are never split, normalized, escaped, or reconstructed from metadata."
       (read-latest-message-id . nil)
       (last-message-time . 0)
       (last-message-preview . "")
+      (last-message-sender-name . nil)
+      (last-message-self-p . nil)
+      (last-message-summary-token . 0)
+      (last-message-local-id . nil)
+      (last-message-order . nil)
       (last-message-id . nil)
       (oldest-message-id . nil))))
 
@@ -1634,20 +1651,165 @@ leaving repeated pokes as distinct timeline records."
     (when (equal (alist-get 'session-key message) session-key)
       (qq-state--index-message message))))
 
-(defun qq-state--sync-session-summary (session-key)
-  "Sync last and oldest message summary for SESSION-KEY."
+(defun qq-state--session-summary-position-compare
+    (fields session &optional current-local-resolved-p)
+  "Compare candidate summary FIELDS with current SESSION position.
+
+Return -1, 0, or 1.  Exact snowflake ordering wins when both summaries carry
+server ids; otherwise use their normalized timestamps.  Freshness tokens break
+ties and unknown positions at the acceptance boundary."
+  (let ((candidate-id (alist-get 'last-message-id fields))
+        (candidate-local-id (alist-get 'last-message-local-id fields))
+        (candidate-order (or (alist-get 'last-message-order fields) 0))
+        (current-id (alist-get 'last-message-id session))
+        (current-order (or (alist-get 'last-message-order session) 0))
+        (candidate-time
+         (qq-state--normalize-time (alist-get 'last-message-time fields)))
+        (current-time
+         (qq-state--normalize-time (alist-get 'last-message-time session))))
+    (cond
+     ((and (qq-protocol--nonzero-decimal-string-p candidate-id)
+           (qq-protocol--nonzero-decimal-string-p current-id))
+      (qq-protocol-decimal-string-compare candidate-id current-id))
+     ((< candidate-time current-time) -1)
+     ((> candidate-time current-time) 1)
+     ;; A promotion is the same optimistic row acquiring its server id.
+     ((and (stringp current-id)
+           (string-prefix-p "local-" current-id)
+           (equal candidate-local-id current-id))
+      0)
+     ;; Once canonical storage proves that the current optimistic row acquired
+     ;; a server id, its local frontier no longer shields equal-second server
+     ;; messages.  The caller supplies the exact maximum server candidate from
+     ;; a cache which includes that promoted row.
+     ((and current-local-resolved-p
+           (qq-protocol--nonzero-decimal-string-p candidate-id)
+           (stringp current-id)
+           (string-prefix-p "local-" current-id))
+      1)
+     ((and (stringp candidate-id) (string-prefix-p "local-" candidate-id)
+           (stringp current-id) (string-prefix-p "local-" current-id))
+      (cond ((< candidate-order current-order) -1)
+            ((> candidate-order current-order) 1)
+            (t 0)))
+     ;; Equal-second server snapshots cannot displace an incomparable local
+     ;; optimistic row.  Conversely, a newly inserted local row follows the
+     ;; last known server message even when their integer timestamps tie.
+     ((and (stringp current-id) (string-prefix-p "local-" current-id)) -1)
+     ((and (stringp candidate-id) (string-prefix-p "local-" candidate-id)) 1)
+     (t 0))))
+
+(defun qq-state--apply-session-summary
+    (session-key fields &optional observation-token low-information-p
+                 current-local-resolved-p)
+  "Apply latest-message summary FIELDS to SESSION-KEY when still fresh.
+
+OBSERVATION-TOKEN belongs to the request that observed FIELDS.  When omitted,
+allocate a token for a synchronous local/live observation.  A candidate must
+both be no older than the accepted message frontier and own a strictly newer
+observation token.  LOW-INFORMATION-P preserves structured sender facts when a
+fallback describes the already accepted exact message."
+  (let* ((token (or observation-token
+                    (qq-state-session-summary-observation-start)))
+         (session (or (gethash session-key qq-state--sessions)
+                      (qq-state--session-template session-key)))
+         (current-token (or (alist-get 'last-message-summary-token session) 0))
+         (position
+          (qq-state--session-summary-position-compare
+           fields session current-local-resolved-p)))
+    (unless (and (integerp token) (> token 0))
+      (error "qq: session summary observation token must be positive"))
+    (when (and (> token current-token) (>= position 0))
+      ;; A same-position fallback can improve preview text, but it has no
+      ;; authority to erase sender facts learned from a structured message.
+      ;; Clearing belongs only to a proven advance to a different frontier.
+      (when (and low-information-p
+                 (= position 0)
+                 (equal (alist-get 'last-message-id fields)
+                        (alist-get 'last-message-id session)))
+        (setq fields
+              (assq-delete-all
+               'last-message-local-id
+               (assq-delete-all
+                'last-message-order
+                (assq-delete-all
+                 'last-message-self-p
+                 (assq-delete-all 'last-message-sender-name
+                                  (copy-tree fields)))))))
+      (qq-state-upsert-session
+       session-key
+       (append (copy-tree fields)
+               `((last-message-summary-token . ,token)))
+       nil)
+      t)))
+
+(defun qq-state--message-summary-fields (message)
+  "Return root latest-message summary fields for normalized MESSAGE."
+  (let ((special-p (or (qq-state-poke-message-p message)
+                       (qq-state-gray-tip-message-p message))))
+    `((last-message-time
+       . ,(qq-state--normalize-time (alist-get 'time message)))
+      (last-message-id . ,(or (alist-get 'server-id message)
+                              (alist-get 'id message)))
+      (last-message-local-id . ,(alist-get 'local-id message))
+      (last-message-order . ,(alist-get 'order message))
+      (last-message-preview . ,(qq-state-message-preview message))
+      (last-message-sender-name
+       . ,(unless special-p (alist-get 'sender-name message)))
+      (last-message-self-p
+       . ,(and (not special-p) (alist-get 'self-p message) t)))))
+
+(defun qq-state--latest-summary-message (messages)
+  "Return the newest summary candidate in normalized MESSAGES.
+
+Do not inherit timeline list order here: canonical rendering deliberately uses
+arrival order to break equal-second ties, while root summary ownership uses
+exact server snowflakes.  Local rows fall back to timestamp and then explicit
+local insertion order."
+  (let (latest)
+    (dolist (message messages latest)
+      (if (null latest)
+          (setq latest message)
+        (let* ((candidate-fields (qq-state--message-summary-fields message))
+               (latest-fields (qq-state--message-summary-fields latest))
+               (position
+                (qq-state--session-summary-position-compare
+                 candidate-fields latest-fields)))
+          (when (or (> position 0)
+                    (and (= position 0)
+                         (> (or (alist-get 'order message) 0)
+                            (or (alist-get 'order latest) 0))))
+            (setq latest message)))))))
+
+(defun qq-state--sync-session-summary (session-key &optional observation-token)
+  "Sync timeline bounds and fresh latest summary for SESSION-KEY.
+
+Keep sender metadata separate from the content preview.  Pokes and gray tips
+already describe their actor or service meaning in their content, so they do
+not project a root-row sender prefix.  OBSERVATION-TOKEN is captured before an
+asynchronous materialization request; nil denotes a live/local observation."
   (let* ((messages (or (gethash session-key qq-state--messages-by-session) '()))
          (oldest (seq-find (lambda (it) (alist-get 'server-id it)) messages))
-         (latest (car (last messages)))
-         fields)
+         (latest (qq-state--latest-summary-message messages))
+         (session (gethash session-key qq-state--sessions))
+         (current-id (and session (alist-get 'last-message-id session)))
+         (current-local-resolved-p
+          (and (stringp current-id)
+               (string-prefix-p "local-" current-id)
+               (seq-some
+                (lambda (message)
+                  (and (equal (alist-get 'local-id message) current-id)
+                       (qq-protocol--nonzero-decimal-string-p
+                        (alist-get 'server-id message))))
+                messages))))
+    (qq-state-upsert-session
+     session-key
+     `((oldest-message-id . ,(alist-get 'server-id oldest)))
+     nil)
     (when latest
-      (setq fields
-            `((last-message-time . ,(qq-state--normalize-time (alist-get 'time latest)))
-              (last-message-id . ,(or (alist-get 'server-id latest)
-                                      (alist-get 'id latest)))
-              (last-message-preview . ,(qq-state-message-preview latest)))))
-    (push `(oldest-message-id . ,(alist-get 'server-id oldest)) fields)
-    (qq-state-upsert-session session-key (nreverse fields) nil)))
+      (qq-state--apply-session-summary
+       session-key (qq-state--message-summary-fields latest)
+       observation-token nil current-local-resolved-p))))
 
 (defun qq-state-session-messages (session-key)
   "Return cached messages for SESSION-KEY."
@@ -1779,7 +1941,8 @@ overlay repeatedly on stale snapshots."
           (setq updated (qq-state--as-recalled-message updated)))
         updated))))
 
-(defun qq-state--merge-normalized-message (session-key message)
+(defun qq-state--merge-normalized-message
+    (session-key message &optional summary-observation-token)
   "Merge normalized MESSAGE into SESSION-KEY.
 
 Unread state is deliberately not inferred from message delivery.  The Linux QQ
@@ -1847,7 +2010,7 @@ Return three values via `cl-values':
                       (cons 'peer-uin (alist-get 'peer-uin merged)))))
      nil)
     (qq-state--index-message merged)
-    (qq-state--sync-session-summary session-key)
+    (qq-state--sync-session-summary session-key summary-observation-token)
     (cl-values merged mutation previous-anchor)))
 
 (defun qq-state-merge-live-message (message)
@@ -2422,102 +2585,124 @@ require the original non-empty `peerUid'; `peerUin' is never a substitute."
          (qq-state-session-key 'service peer-uid)))
       (_ nil))))
 
-(defun qq-state-apply-recent-contacts (contacts &optional read-state-writable-p)
-  "Apply recent CONTACTS snapshot to local session store.
+(defun qq-state--prepare-recent-contact (contact)
+  "Normalize CONTACT without mutating session or timeline stores.
 
-When READ-STATE-WRITABLE-P is non-nil, call it with each session key and apply
-that contact's unread projection only when it returns non-nil.  Other contact
-metadata is always refreshed.  A missing or null `unreadCount' is not an
-authoritative zero and therefore never writes the unread projection."
-  (dolist (contact (or contacts '()))
-    (when-let* ((session-key (qq-state--recent-contact-session-key contact)))
-      (let* ((identity (qq-state-session-key-identity session-key))
-             (chat-type (alist-get 'chat-type identity))
-             (peer-uid (alist-get 'peer-uid identity))
-             (peer-uin (qq-state--normalize-id (alist-get 'peerUin contact)))
-             (target-id (alist-get 'target-id identity))
-             (title (qq-state--recent-contact-title contact session-key))
-             (msg-time (qq-state--normalize-time (alist-get 'msgTime contact)))
-             (msg-id (qq-state--normalize-id (alist-get 'msgId contact)))
-             (unread-entry (assq 'unreadCount contact))
-             (unread-count (and unread-entry (cdr unread-entry)))
-             (valid-unread-count-p
-              (and unread-entry
-                   (qq-protocol--nonnegative-safe-integer-p unread-count)))
-             (write-read-state
-              (and valid-unread-count-p
-                   (or (null read-state-writable-p)
-                       (funcall read-state-writable-p session-key))))
-             (disturb-entry (assq 'isMsgDisturb contact))
-             (notify-mode-entry (assq 'messageNotifyMode contact))
-             (at-me-seq (qq-state--normalize-id
-                         (alist-get 'firstUnreadAtMeSeq contact)))
-             (at-all-seq (qq-state--normalize-id
-                          (alist-get 'firstUnreadAtAllSeq contact)))
-             (last-message (alist-get 'lastestMsg contact))
-             (server-preview
-              (or (alist-get 'lastMessagePreview contact)
-                  (alist-get 'last_message_preview contact)))
-             (preview
-              (qq-state-preview-one-line
-               (or
-                (and (consp last-message)
-                     ;; Prefer structured segments; CQ raw_message is wire format only.
-                     (let* ((from-segments
-                             (qq-state-message-preview-from-segments
-                              (alist-get 'message last-message)))
-                            (raw (alist-get 'raw_message last-message)))
-                       (cond
-                        ((and (stringp from-segments)
-                              (not (string-empty-p from-segments)))
-                         from-segments)
-                        ((and (stringp raw) (qq-state--cq-looks-p raw))
-                         (qq-state-message-preview-from-cq raw))
-                        ((and (stringp raw) (not (string-empty-p raw)))
-                         raw))))
-                server-preview
-                ""))))
-      (qq-state-upsert-session
-       session-key
-       `((title . ,title)
+Return a closed prepared plist, or nil for an unsupported native chat type.
+In particular, a structured `lastestMsg' is fully normalized before any of
+its session metadata can be committed."
+  (when-let* ((session-key (qq-state--recent-contact-session-key contact)))
+    (let* ((identity (qq-state-session-key-identity session-key))
+           (chat-type (alist-get 'chat-type identity))
+           (peer-uid (alist-get 'peer-uid identity))
+           (peer-uin (qq-state--normalize-id (alist-get 'peerUin contact)))
+           (target-id (alist-get 'target-id identity))
+           (msg-time (qq-state--normalize-time (alist-get 'msgTime contact)))
+           (msg-id (qq-state--normalize-id (alist-get 'msgId contact)))
+           (last-message (alist-get 'lastestMsg contact))
+           (message-copy (and (consp last-message) (copy-tree last-message)))
+           (unread-entry (assq 'unreadCount contact))
+           (disturb-entry (assq 'isMsgDisturb contact))
+           (notify-mode-entry (assq 'messageNotifyMode contact)))
+      (when message-copy
+        (when (and msg-id
+                   (not (alist-get 'message_id message-copy nil nil #'eq))
+                   (not (alist-get 'id message-copy nil nil #'eq)))
+          (push (cons 'message_id msg-id) message-copy))
+        (when (and (> msg-time 0)
+                   (not (alist-get 'time message-copy nil nil #'eq)))
+          (push (cons 'time msg-time) message-copy)))
+      (list
+       :session-key session-key
+       :metadata-fields
+       `((title . ,(qq-state--recent-contact-title contact session-key))
          (target-id . ,target-id)
          (chat-type . ,(qq-state--normalize-id chat-type))
          (peer-uid . ,peer-uid)
          (peer-uin . ,peer-uin)
          (peer-name . ,(qq-state--present-string (alist-get 'peerName contact)))
          (remark . ,(alist-get 'remark contact))
-         (last-message-time . ,msg-time)
-         (last-message-id . ,msg-id)
-         (last-message-preview . ,preview)
-         ,@(when write-read-state
-             `((unread-count . ,unread-count)
-               (first-unread-message-id . nil)
-               (first-unread-message-seq . nil)
-               (read-position-available . nil)
-               (read-latest-message-id . nil)
-               (unread-at-me-message-id . nil)
-               (unread-at-me-message-seq . ,(and (> unread-count 0) at-me-seq))
-               (unread-at-all-message-id . nil)
-               (unread-at-all-message-seq . ,(and (> unread-count 0) at-all-seq))))
          ,@(when disturb-entry
-             `((muted-p . ,(and (qq-protocol-json-true-p (cdr disturb-entry)) t))))
+             `((muted-p
+                . ,(and (qq-protocol-json-true-p (cdr disturb-entry)) t))))
          ,@(when notify-mode-entry
-             `((message-notify-mode . ,(intern (format "%s" (cdr notify-mode-entry)))))))
-       nil)
-      (when (consp last-message)
-        (let ((message-copy (copy-tree last-message)))
-          (when (and msg-id
-                     (not (alist-get 'message_id message-copy nil nil #'eq))
-                     (not (alist-get 'id message-copy nil nil #'eq)))
-            (push (cons 'message_id msg-id) message-copy))
-          (when (and (> msg-time 0)
-                     (not (alist-get 'time message-copy nil nil #'eq)))
-            (push (cons 'time msg-time) message-copy))
-          (qq-state--merge-normalized-message
-           session-key
-           (qq-state--normalize-raw-message message-copy session-key)))))))
-  (qq-state--emit 'sessions-refreshed :count (length contacts))
-  (qq-state-sessions))
+             `((message-notify-mode
+                . ,(intern (format "%s" (cdr notify-mode-entry)))))))
+       :summary-fields
+       `((last-message-time . ,msg-time)
+         (last-message-id . ,msg-id)
+         (last-message-local-id . nil)
+         (last-message-order . nil)
+         (last-message-preview
+          . ,(qq-state-preview-one-line
+              (or (alist-get 'lastMessagePreview contact)
+                  (alist-get 'last_message_preview contact)
+                  "")))
+         (last-message-sender-name . nil)
+         (last-message-self-p . nil))
+       :normalized-message
+       (and message-copy
+            (qq-state--normalize-raw-message message-copy session-key))
+       :unread-entry-p (and unread-entry t)
+       :unread-count (and unread-entry (cdr unread-entry))
+       :at-me-seq
+       (qq-state--normalize-id (alist-get 'firstUnreadAtMeSeq contact))
+       :at-all-seq
+       (qq-state--normalize-id (alist-get 'firstUnreadAtAllSeq contact))))))
+
+(defun qq-state-apply-recent-contacts
+    (contacts &optional read-state-writable-p summary-observation-token)
+  "Apply recent CONTACTS snapshot to local session store.
+
+When READ-STATE-WRITABLE-P is non-nil, call it with each session key and apply
+that contact's unread projection only when it returns non-nil.  This unread
+gate is independent of SUMMARY-OBSERVATION-TOKEN, which owns only root latest
+message summaries.  Callers dispatching asynchronous refreshes must capture
+that token with `qq-state-session-summary-observation-start'.  Other contact
+metadata is always refreshed.  A missing or null `unreadCount' is not an
+authoritative zero and therefore never writes the unread projection.
+
+All structured latest messages are normalized before the first session store
+write, so malformed payloads cannot leave a half-committed session snapshot."
+  (let* ((token (or summary-observation-token
+                    (qq-state-session-summary-observation-start)))
+         ;; Prepare the complete response before the first store mutation.
+         (prepared (delq nil (mapcar #'qq-state--prepare-recent-contact
+                                     (or contacts '())))))
+    (dolist (entry prepared)
+      (let* ((session-key (plist-get entry :session-key))
+             (unread-count (plist-get entry :unread-count))
+             (valid-unread-count-p
+              (and (plist-get entry :unread-entry-p)
+                   (qq-protocol--nonnegative-safe-integer-p unread-count)))
+             (write-read-state
+              (and valid-unread-count-p
+                   (or (null read-state-writable-p)
+                       (funcall read-state-writable-p session-key))))
+             (at-me-seq (plist-get entry :at-me-seq))
+             (at-all-seq (plist-get entry :at-all-seq)))
+        (qq-state-upsert-session
+         session-key
+         (append
+          (plist-get entry :metadata-fields)
+          (when write-read-state
+            `((unread-count . ,unread-count)
+              (first-unread-message-id . nil)
+              (first-unread-message-seq . nil)
+              (read-position-available . nil)
+              (read-latest-message-id . nil)
+              (unread-at-me-message-id . nil)
+              (unread-at-me-message-seq . ,(and (> unread-count 0) at-me-seq))
+              (unread-at-all-message-id . nil)
+              (unread-at-all-message-seq . ,(and (> unread-count 0)
+                                                 at-all-seq)))))
+         nil)
+        (if-let* ((message (plist-get entry :normalized-message)))
+            (qq-state--merge-normalized-message session-key message token)
+          (qq-state--apply-session-summary
+           session-key (plist-get entry :summary-fields) token t))))
+    (qq-state--emit 'sessions-refreshed :count (length contacts))
+    (qq-state-sessions)))
 
 (defun qq-state--refresh-session-titles ()
   "Refresh hydrated session titles from current contact caches."

@@ -812,16 +812,18 @@ segments.  A resolve action result itself must be terminal or available."
 (defun qq-api-refresh-recent-contacts (&optional callback errback)
   "Refresh recent contacts, then call CALLBACK with the contact list."
   (interactive)
-  (let ((token (qq-api--next-read-observation-token)))
+  (let ((read-token (qq-api--next-read-observation-token))
+        (summary-token (qq-state-session-summary-observation-start)))
     (qq-api-call
      "get_recent_contact"
      `((count . ,(max 1 qq-recent-contact-count)))
      (lambda (response)
        (let ((contacts (qq-api--response-data response)))
          (qq-state-apply-recent-contacts
-          contacts
+         contacts
           (lambda (session-key)
-            (qq-api--accept-read-observation-p session-key token)))
+            (qq-api--accept-read-observation-p session-key read-token))
+          summary-token)
          (when callback (funcall callback contacts))))
      errback)))
 

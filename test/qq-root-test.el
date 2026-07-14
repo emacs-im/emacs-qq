@@ -53,10 +53,50 @@
                  (qq-root--session-preview-text
                   '((last-message-preview . " first\nsecond\r\n  third "))))))
 
+(ert-deftest qq-root-group-preview-shows-latest-sender ()
+  (let* ((session '((type . group)
+                    (last-message-sender-name . " Alice\n")
+                    (last-message-preview . "first\nsecond")))
+         (preview-model (qq-root--session-preview-model session))
+         (row (qq-root--session-one-line-row session)))
+    (should (equal "Alice: first second" (plist-get preview-model :text)))
+    (should (= 7 (plist-get preview-model :leading-length)))
+    (should (eq 'qq-msg-user-title (plist-get preview-model :leading-face)))
+    (should (= 7 (appkit-view-one-line-row-preview-leading-length row)))
+    (should (eq 'qq-msg-user-title
+                (appkit-view-one-line-row-preview-leading-face row)))))
+
+(ert-deftest qq-root-private-preview-shows-sender-only-when-outgoing ()
+  (let ((incoming '((type . private)
+                    (last-message-sender-name . "Alice")
+                    (last-message-self-p . nil)
+                    (last-message-preview . "hello")))
+        (outgoing '((type . private)
+                    (last-message-sender-name . "Me")
+                    (last-message-self-p . t)
+                    (last-message-preview . "hello"))))
+    (should (equal "hello" (qq-root--session-preview-text incoming)))
+    (should (equal "Me: hello" (qq-root--session-preview-text outgoing)))
+    (should (eq 'qq-msg-self-title
+                (plist-get (qq-root--session-preview-model outgoing)
+                           :leading-face)))))
+
+(ert-deftest qq-root-service-and-dataline-previews-omit-sender ()
+  (dolist (type '(service dataline))
+    (should
+     (equal "Henrik: subject"
+            (qq-root--session-preview-text
+             `((type . ,type)
+               (last-message-sender-name . "QQ Mail")
+               (last-message-self-p . t)
+               (last-message-preview . "Henrik: subject")))))))
+
 (ert-deftest qq-root-does-not-invent-a-missing-message-preview ()
   (should (equal ""
                  (qq-root--session-preview-text
-                  '((last-message-id . "9007199254741004991"))))))
+                  '((type . group)
+                    (last-message-id . "9007199254741004991")
+                    (last-message-sender-name . "Alice"))))))
 
 (ert-deftest qq-root-mentions-stay-important-through-muted-groups ()
   (let ((session '((muted-p . t)

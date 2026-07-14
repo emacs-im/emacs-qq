@@ -235,34 +235,60 @@ prominent even when the session is muted."
                                   (alist-get 'key session)
                                   "session"))))))
 
-(defun qq-root--session-preview-text (session)
-  "Return one-line preview for SESSION.
+(defun qq-root--session-preview-model (session)
+  "Return the one-line preview model for SESSION.
 
 Mirrors telega `telega-ins--chat-status': peer chat-actions (typing) take
-priority over the last-message preview."
+priority over the last-message preview.  Group previews identify an ordinary
+message's sender; private previews do so only for outgoing messages, since the
+session title already identifies an incoming peer.  The model keeps the sender
+prefix length and face separate so the shared row renderer can style it like a
+message title rather than like dimmed preview content."
   (let* ((session-key (alist-get 'key session))
          (action-text (and qq-chat-show-peer-actions
                            session-key
                            (qq-state-preview-one-line
                             (qq-state-action-text session-key))))
          (preview (qq-state-preview-one-line
-                   (alist-get 'last-message-preview session))))
+                   (alist-get 'last-message-preview session)))
+         (sender (qq-state-preview-one-line
+                  (alist-get 'last-message-sender-name session)))
+         (show-sender-p
+          (and (not (string-empty-p sender))
+               (pcase (alist-get 'type session)
+                 ('group t)
+                 ('private (eq (alist-get 'last-message-self-p session) t))
+                 (_ nil)))))
     (if (and (stringp action-text) (not (string-empty-p action-text)))
-        (concat (or qq-chat-action-prefix ".. ") action-text)
-      preview)))
+        (list :text (concat (or qq-chat-action-prefix ".. ") action-text))
+      (if (and show-sender-p (not (string-empty-p preview)))
+          (let ((prefix (concat sender ": ")))
+            (list :text (concat prefix preview)
+                  :leading-length (length prefix)
+                  :leading-face (if (eq (alist-get 'last-message-self-p session) t)
+                                    'qq-msg-self-title
+                                  'qq-msg-user-title)))
+        (list :text preview)))))
+
+(defun qq-root--session-preview-text (session)
+  "Return SESSION's one-line preview text."
+  (plist-get (qq-root--session-preview-model session) :text))
 
 (defun qq-root--session-one-line-row (session)
   "Return one-line row model for SESSION."
   (let* ((session-key (alist-get 'key session))
          (unread (or (alist-get 'unread-count session) 0))
          (muted (qq-root--session-muted-p session))
-         (important (qq-root--session-important-unread-p session)))
+         (important (qq-root--session-important-unread-p session))
+         (preview-model (qq-root--session-preview-model session)))
     (appkit-view-one-line-row-create
      :icon-inserter (lambda ()
                       (qq-root--insert-session-icon session))
      :context (qq-root--session-context-label session)
      :context-trail (qq-root--session-unread-trail session)
-     :preview (qq-root--session-preview-text session)
+     :preview (plist-get preview-model :text)
+     :preview-leading-length (plist-get preview-model :leading-length)
+     :preview-leading-face (plist-get preview-model :leading-face)
      ;; Unread activity lives in the title trail.  Keep a dedicated time-tail
      ;; face (meant for a trailing status glyph) off the plain timestamp.
      :time (qq-root--format-time (alist-get 'last-message-time session))

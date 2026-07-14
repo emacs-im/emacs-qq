@@ -976,12 +976,24 @@
       (qq-api-refresh-recent-contacts)
       (funcall (nth 1 callbacks)
                '((data . (((chatType . 2) (peerUid . "20001")
-                            (peerUin . "20001") (unreadCount . 2))))))
+                            (peerUin . "20001") (unreadCount . 2)
+                            (msgTime . "1710000002")
+                            (msgId . "9007199254741004646")
+                            (lastMessagePreview . "newer"))))))
       (funcall (nth 0 callbacks)
                '((data . (((chatType . 2) (peerUid . "20001")
-                            (peerUin . "20001") (unreadCount . 9))))))
+                            (peerUin . "20001") (unreadCount . 9)
+                            (msgTime . "1710000001")
+                            (msgId . "9007199254741004645")
+                            (lastMessagePreview . "older"))))))
       (should (= 2 (alist-get 'unread-count
-                              (qq-state-session "group:20001")))))))
+                              (qq-state-session "group:20001"))))
+      (should (equal "9007199254741004646"
+                     (alist-get 'last-message-id
+                                (qq-state-session "group:20001"))))
+      (should (equal "newer"
+                     (alist-get 'last-message-preview
+                                (qq-state-session "group:20001")))))))
 
 (ert-deftest qq-api-fetch-older-history-uses-peer-history-for-service-sessions ()
   (let (captured-action captured-params)

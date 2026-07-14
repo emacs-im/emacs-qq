@@ -22,6 +22,32 @@
              (guild_id . "")))
     (valid_before . 4102444800)))
 
+(defun qq-state-test--group-message (message-id time text &optional sender-name)
+  "Return a raw group message fixture with MESSAGE-ID, TIME, and TEXT."
+  `((post_type . "message")
+    (message_type . "group")
+    (chat_type . 2)
+    (peer_uin . "20001")
+    (group_id . 20001)
+    (message_id . ,message-id)
+    (user_id . 10001)
+    (time . ,time)
+    (sender . ((user_id . 10001)
+               (nickname . ,(or sender-name "Alice"))))
+    (raw_message . ,text)
+    (message . (((type . "text") (data . ((text . ,text))))))))
+
+(defun qq-state-test--recent-group-contact
+    (message-id time text &optional peer-name)
+  "Return one structured recent group contact fixture."
+  `((chatType . 2)
+    (peerUid . "20001")
+    (peerUin . "20001")
+    (peerName . ,(or peer-name "Group"))
+    (msgTime . ,(format "%s" time))
+    (msgId . ,message-id)
+    (lastestMsg . ,(qq-state-test--group-message message-id time text))))
+
 (ert-deftest qq-state-session-key-normalizes-type-and-id ()
   (qq-test-with-reset
    (should (equal (qq-state-session-key 'private 12345)
@@ -91,7 +117,10 @@
      (should (equal (alist-get 'target-id session) "10001"))
      (should (equal (alist-get 'chat-type session) "1"))
      (should (equal (alist-get 'peer-uid session) "u:native:alice"))
-     (should-not (alist-get 'variant session)))))
+     (should-not (alist-get 'variant session))
+     (should (= (alist-get 'last-message-summary-token session) 0))
+     (should-not (alist-get 'last-message-local-id session))
+     (should-not (alist-get 'last-message-order session)))))
 
 (ert-deftest qq-state-session-sendable-p-is-an-explicit-capability ()
   (should (qq-state-session-sendable-p "private:10001"))
@@ -182,7 +211,13 @@
      (should (equal (alist-get 'session-key message) "private:10001"))
      (should (equal (alist-get 'sender-name message) "Alice"))
      (should (equal (alist-get 'preview message) "戳了戳 我"))
-     (should-not (string-match-p "unknown" (alist-get 'preview message))))))
+     (should-not (string-match-p "unknown" (alist-get 'preview message)))
+     (should-not
+      (alist-get 'last-message-sender-name
+                 (qq-state-session "private:10001")))
+     (should-not
+      (alist-get 'last-message-self-p
+                 (qq-state-session "private:10001"))))))
 
 (ert-deftest qq-state-private-poke-recall-requires-exact-stored-peer-uid ()
   (qq-test-with-reset
@@ -352,6 +387,12 @@
                 (alist-get 'last-message-preview
                            (qq-state-session "group:987654321"))
                 "新进群账号疑似来自非大陆地区，请谨慎核实对方身份。查看异常>"))
+       (should-not
+        (alist-get 'last-message-sender-name
+                   (qq-state-session "group:987654321")))
+       (should-not
+        (alist-get 'last-message-self-p
+                   (qq-state-session "group:987654321")))
        (should (equal (plist-get (car events) :message-anchor)
                       "9007199254750003456"))))))
 
@@ -560,6 +601,10 @@
      (should (equal (alist-get 'session-key (car messages))
                     "private:10001"))
      (should (equal (alist-get 'target-id (car messages)) "10001")))
+   (let ((session (qq-state-session "private:10001")))
+     (should (equal (alist-get 'last-message-sender-name session)
+                    "90001"))
+     (should (eq (alist-get 'last-message-self-p session) t)))
    (should-not (qq-state-session "private:90001"))))
 
 (ert-deftest qq-state-apply-recent-contacts-uses-kernel-unread-count ()
@@ -873,7 +918,12 @@
        ;; Anchor prefers server snowflake after send.
        (should (equal (or (alist-get 'server-id message)
                           (alist-get 'local-id message))
-                      snowflake))))))
+                      snowflake)))
+     (let ((session (qq-state-session "private:10001")))
+       (should (equal (alist-get 'last-message-id session) snowflake))
+       (should (equal (alist-get 'last-message-local-id session) local-id))
+       (should (= (alist-get 'last-message-order session)
+                  (alist-get 'order pending)))))))
 
 (ert-deftest qq-state-late-send-failure-does-not-downgrade-server-backed-message ()
   (qq-test-with-reset
@@ -1384,7 +1434,10 @@
                    (data . ((text . "hello"))))))))
    (let ((message (car (qq-state-session-messages "group:20001"))))
      (should (equal (alist-get 'sender-name message) "Alice"))
-     (should-not (alist-get 'sender-secondary-name message)))))
+     (should-not (alist-get 'sender-secondary-name message))
+     (let ((session (qq-state-session "group:20001")))
+       (should (equal (alist-get 'last-message-sender-name session) "Alice"))
+       (should-not (alist-get 'last-message-self-p session))))))
 
 (ert-deftest qq-state-group-message-keeps-card-and-nickname-for-display ()
   (qq-test-with-reset
@@ -1573,6 +1626,245 @@
             "群通知第一行 第二行"
             (alist-get 'last-message-preview
                        (qq-state-session "group:20002"))))))
+
+(ert-deftest qq-state-recent-fallback-preview-clears-stale-latest-sender ()
+  (qq-test-with-reset
+   (qq-state-upsert-session
+    "group:20002"
+    '((last-message-id . "9007199254741004990")
+      (last-message-preview . "old")
+      (last-message-sender-name . "Alice")
+      (last-message-self-p . t))
+    nil)
+   (qq-state-apply-recent-contacts
+    '(((chatType . 2)
+       (peerUin . "20002")
+       (peerName . "Group")
+       (msgTime . "1710000002")
+       (msgId . "9007199254741004991")
+       (lastestMsg . nil)
+       (lastMessagePreview . "new fallback"))))
+   (let ((session (qq-state-session "group:20002")))
+     (should (equal (alist-get 'last-message-preview session)
+                    "new fallback"))
+     (should-not (alist-get 'last-message-sender-name session))
+     (should-not (alist-get 'last-message-self-p session)))))
+
+(ert-deftest qq-state-recent-fallback-preserves-sender-at-same-frontier ()
+  (qq-test-with-reset
+   (let* ((message-id "9007199254741005100")
+          (first-token (qq-state-session-summary-observation-start))
+          (second-token (qq-state-session-summary-observation-start)))
+     (qq-state-apply-recent-contacts
+      (list (qq-state-test--recent-group-contact
+             message-id 1710000100 "structured"))
+      nil first-token)
+     (qq-state-apply-recent-contacts
+      `(((chatType . 2)
+         (peerUid . "20001")
+         (peerUin . "20001")
+         (peerName . "Group")
+         (msgTime . "1710000100")
+         (msgId . ,message-id)
+         (lastestMsg . nil)
+         (lastMessagePreview . "fallback")))
+      nil second-token)
+     (let ((session (qq-state-session "group:20001")))
+       (should (equal (alist-get 'last-message-preview session) "fallback"))
+       (should (equal (alist-get 'last-message-sender-name session) "Alice"))
+       (should-not (alist-get 'last-message-self-p session))
+       (should (= (alist-get 'last-message-summary-token session)
+                  second-token))))))
+
+(ert-deftest qq-state-summary-frontier-rejects-older-history-and-patches ()
+  (qq-test-with-reset
+   (let ((frontier-id "9007199254741005200")
+         (older-id "9007199254741005120"))
+     ;; Model a recent-contact fallback whose authoritative latest message is
+     ;; not materialized in the canonical timeline.
+     (qq-state-apply-recent-contacts
+      `(((chatType . 2)
+         (peerUid . "20001")
+         (peerUin . "20001")
+         (peerName . "Group")
+         (msgTime . "1710000200")
+         (msgId . ,frontier-id)
+         (lastestMsg . nil)
+         (lastMessagePreview . "M100"))))
+     (let ((frontier-token
+            (alist-get 'last-message-summary-token
+                       (qq-state-session "group:20001"))))
+       (qq-state-merge-history
+        "group:20001"
+        (list (qq-state-test--group-message
+               older-id 1710000120 "M20")))
+       (should (equal (alist-get 'last-message-id
+                                 (qq-state-session "group:20001"))
+                      frontier-id))
+       (qq-state-apply-emoji-like-notice
+        "group:20001"
+        `((group_id . "20001")
+          (user_id . "10002")
+          (message_id . ,older-id)
+          (is_add . t)
+          (likes . (((emoji_id . "178"))))))
+       (qq-state-apply-recall "group:20001" older-id)
+       (let ((session (qq-state-session "group:20001")))
+         (should (equal (alist-get 'last-message-id session) frontier-id))
+         (should (equal (alist-get 'last-message-preview session) "M100"))
+         (should (= (alist-get 'last-message-summary-token session)
+                    frontier-token)))))))
+
+(ert-deftest qq-state-summary-selects-max-snowflake-inside-same-second-batch ()
+  (qq-test-with-reset
+   (let ((newer-id "9007199254741005301")
+         (older-id "9007199254741005300"))
+     ;; The lower snowflake arrives second and therefore has the larger local
+     ;; order.  Root summary must still use the exact larger server id.
+     (qq-state-merge-history
+      "group:20001"
+      (list (qq-state-test--group-message newer-id 1710000300 "newer")
+            (qq-state-test--group-message older-id 1710000300 "older")))
+     (let ((session (qq-state-session "group:20001")))
+       (should (equal (alist-get 'last-message-id session) newer-id))
+       (should (equal (alist-get 'last-message-preview session) "newer"))))))
+
+(ert-deftest qq-state-summary-older-recent-cannot-overwrite-later-live-message ()
+  (qq-test-with-reset
+   (let* ((older-token (qq-state-session-summary-observation-start))
+          (older-id "9007199254741005401")
+          (live-id "9007199254741005402")
+          (contact (qq-state-test--recent-group-contact
+                    older-id 1710000401 "older recent" "stale metadata")))
+     (qq-state-merge-live-message
+      (qq-state-test--group-message live-id 1710000402 "live" "Bob"))
+     (push '(unreadCount . 9) contact)
+     (qq-state-apply-recent-contacts
+      (list contact) (lambda (_session-key) t) older-token)
+     (let ((session (qq-state-session "group:20001")))
+       (should (equal (alist-get 'last-message-id session) live-id))
+       (should (equal (alist-get 'last-message-preview session) "live"))
+       (should (equal (alist-get 'last-message-sender-name session) "Bob"))
+       ;; Metadata and the independently accepted unread projection still
+       ;; refresh even though the message-summary owner lost.
+       (should (equal (alist-get 'title session) "stale metadata"))
+       (should (= (alist-get 'unread-count session) 9))))))
+
+(ert-deftest qq-state-summary-newer-recent-response-supersedes-older-request ()
+  (qq-test-with-reset
+   (let ((older-token (qq-state-session-summary-observation-start))
+         (newer-token (qq-state-session-summary-observation-start)))
+     (qq-state-apply-recent-contacts
+      (list (qq-state-test--recent-group-contact
+             "9007199254741005502" 1710000502 "newer" "new metadata"))
+      nil newer-token)
+     (qq-state-apply-recent-contacts
+      (list (qq-state-test--recent-group-contact
+             "9007199254741005501" 1710000501 "older" "old metadata"))
+      nil older-token)
+     (let ((session (qq-state-session "group:20001")))
+       (should (equal (alist-get 'last-message-id session)
+                      "9007199254741005502"))
+       (should (equal (alist-get 'last-message-preview session) "newer"))
+       (should (= (alist-get 'last-message-summary-token session)
+                  newer-token))
+       (should (equal (alist-get 'title session) "old metadata"))))))
+
+(ert-deftest qq-state-recent-malformed-structured-latest-is-atomic ()
+  (qq-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Before")
+      (unread-count . 3)
+      (last-message-id . "9007199254741005600")
+      (last-message-time . 1710000600)
+      (last-message-preview . "before")
+      (last-message-sender-name . "Alice")
+      (last-message-summary-token . 7))
+    nil)
+   (let ((before (qq-state-session "group:20001"))
+         (gate-called nil))
+     (should-error
+      (qq-state-apply-recent-contacts
+       '(((chatType . 2)
+          (peerUid . "20001")
+          (peerUin . "20001")
+          (peerName . "After")
+          (msgTime . "1710000601")
+          (msgId . "9007199254741005601")
+          (unreadCount . 9)
+          (lastestMsg
+           (message_type . "private")
+           (chat_type . 1)
+           (peer_uin . "99999")
+           (user_id . 99999)
+           (message . (((type . "text")
+                        (data . ((text . "malformed")))))))))
+       (lambda (_session-key) (setq gate-called t))))
+     (should-not gate-called)
+     (should (equal (qq-state-session "group:20001") before)))))
+
+(ert-deftest qq-state-summary-orders-consecutive-same-second-local-messages ()
+  (qq-test-with-reset
+   (cl-letf (((symbol-function 'float-time) (lambda (&optional _) 1710000700.0)))
+     (let* ((first (qq-state-insert-pending-text-message
+                    "group:20001" "first"))
+            (second (qq-state-insert-pending-text-message
+                     "group:20001" "second"))
+            (session (qq-state-session "group:20001")))
+       (should (equal (alist-get 'last-message-id session)
+                      (alist-get 'local-id second)))
+       (should (equal (alist-get 'last-message-preview session) "second"))
+       (should (> (alist-get 'last-message-order session)
+                  (alist-get 'order first)))))))
+
+(ert-deftest qq-state-summary-keeps-local-pending-over-equal-time-fallback ()
+  (qq-test-with-reset
+   (cl-letf (((symbol-function 'float-time) (lambda (&optional _) 1710000800.0)))
+     (let* ((pending (qq-state-insert-pending-text-message
+                      "group:20001" "pending"))
+            (local-id (alist-get 'local-id pending))
+            (token (qq-state-session-summary-observation-start)))
+       (qq-state-apply-recent-contacts
+        '(((chatType . 2)
+           (peerUid . "20001")
+           (peerUin . "20001")
+           (peerName . "Group")
+           (msgTime . "1710000800")
+           (msgId . "9007199254741005800")
+           (lastestMsg . nil)
+           (lastMessagePreview . "fallback")))
+        nil token)
+       (let ((session (qq-state-session "group:20001")))
+         (should (equal (alist-get 'last-message-id session) local-id))
+         (should (equal (alist-get 'last-message-preview session)
+                        "pending")))))))
+
+(ert-deftest qq-state-summary-releases-local-frontier-after-promotion ()
+  (qq-test-with-reset
+   (cl-letf (((symbol-function 'float-time) (lambda (&optional _) 1710000900.0)))
+     (let* ((pending (qq-state-insert-pending-text-message
+                      "group:20001" "local A"))
+            (local-id (alist-get 'local-id pending))
+            (sent-a "9007199254741005900")
+            (remote-m2 "9007199254741005901"))
+       ;; The unresolved local row wins the equal-second race temporarily.
+       (qq-state-merge-live-message
+        (qq-state-test--group-message
+         remote-m2 1710000900 "remote M2" "Bob"))
+       (should (equal (alist-get 'last-message-id
+                                 (qq-state-session "group:20001"))
+                      local-id))
+       ;; Promotion proves A's exact server position.  The canonical maximum
+       ;; is M2, so root must leave the local frontier and select M2.
+       (qq-state-mark-pending-message-sent
+        "group:20001" local-id sent-a)
+       (let ((session (qq-state-session "group:20001")))
+         (should (equal (alist-get 'last-message-id session) remote-m2))
+         (should (equal (alist-get 'last-message-preview session)
+                        "remote M2"))
+         (should-not (string-prefix-p
+                      "local-" (alist-get 'last-message-id session))))))))
 
 (ert-deftest qq-state-set-status-deduplicates-identical-events ()
   (qq-test-with-reset
