@@ -1578,6 +1578,10 @@ identify that exact group session."
       (_
        `((type . ,kind) (data . ,(copy-tree payload)))))))
 
+(defun qq-state-normalize-closed-segments (segments)
+  "Map validated closed protocol SEGMENTS to the shared rendering model."
+  (mapcar #'qq-state--emacs-search-segment-to-internal segments))
+
 (defun qq-state--emacs-search-reaction-to-internal (reaction)
   "Map one validated fork-native search REACTION to the local model."
   `((emoji-id . ,(alist-get 'emoji_id reaction))
@@ -2422,8 +2426,7 @@ Return three values via `cl-values':
          (segments
           (if deleted-p
               '(((type . "text") (data . ((text . "[post deleted]")))))
-            (mapcar #'qq-state--emacs-search-segment-to-internal
-                    (alist-get 'segments post))))
+            (qq-state-normalize-closed-segments (alist-get 'segments post))))
          (segment-preview (qq-state-message-preview-from-segments segments))
          (title (alist-get 'title post))
          (preview (if (string-empty-p title) segment-preview title)))

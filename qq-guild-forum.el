@@ -13,6 +13,7 @@
 (require 'seq)
 (require 'subr-x)
 (require 'appkit-core)
+(require 'appkit-discussion)
 (require 'appkit-ewoc)
 (require 'appkit-invalidation)
 (require 'appkit-position)
@@ -21,6 +22,7 @@
 (require 'appkit-view)
 (require 'qq-api)
 (require 'qq-chat)
+(require 'qq-guild-forum-post)
 (require 'qq-media)
 (require 'qq-runtime)
 (require 'qq-state)
@@ -78,12 +80,6 @@
           (lambda (message) (equal (alist-get 'id message) post-id))
           (qq-guild-forum--messages)))))
 
-(defun qq-guild-forum--avatar-prefix (message)
-  "Return a fixed first-line avatar prefix for MESSAGE."
-  (if-let* ((image (qq-media-message-avatar-image message)))
-      (concat (propertize " " 'display image) " ")
-    "@ "))
-
 (defun qq-guild-forum--time-string (message)
   "Return compact local time for forum MESSAGE."
   (format-time-string "%m-%d %H:%M"
@@ -131,44 +127,58 @@ cover TITLE exactly; non-text content is never guessed through."
            (alist-get 'segments copy) title))
     copy))
 
-(defun qq-guild-forum--insert-post (message)
-  "Insert one native forum MESSAGE card."
+(defun qq-guild-forum--discussion-width ()
+  "Return the current Appkit discussion surface width."
+  (or (appkit-view-window-fill-column nil qq-chat-auto-fill-margin-columns)
+      (and (integerp fill-column) (> fill-column 0) fill-column)
+      80))
+
+(defun qq-guild-forum--post-discussion-entry (message show-comment-count-p)
+  "Return Appkit discussion entry for forum MESSAGE.
+
+When SHOW-COMMENT-COUNT-P is non-nil, include the directory metadata footer."
   (let* ((post-id (alist-get 'id message))
-         (start (point))
-         (properties
-          (list 'qq-guild-forum-post-id post-id
-                'rear-nonsticky '(qq-guild-forum-post-id)))
-         (prefix
-          (appkit-ui-make-prefix-state
-           (qq-guild-forum--avatar-prefix message) "  "))
-         (header-start (point)))
-    (appkit-ui-insert-prefixed-lines
-     prefix
-     (format "%s  %s"
-             (or (alist-get 'sender-name message) "频道用户")
-             (qq-guild-forum--time-string message))
-     :properties properties)
-    (add-text-properties
-     header-start (point)
-     '(face font-lock-function-name-face))
-    (when-let* ((title (alist-get 'forum-title message)))
-      (unless (string-empty-p title)
-        (let ((title-start (point)))
-          (appkit-ui-insert-prefixed-lines prefix title :properties properties)
-          (add-text-properties title-start (point) '(face bold)))))
-    (let* ((title (or (alist-get 'forum-title message) ""))
-           (body (qq-guild-forum--body-message message title)))
-      (when (or (alist-get 'segments body) (string-empty-p title))
-        (qq-chat--insert-message-body body prefix properties)))
-    (let ((meta-start (point)))
-      (appkit-ui-insert-prefixed-lines
-       prefix
-       (format "%d 条评论"
-               (or (alist-get 'forum-comment-count message) 0))
-       :properties properties)
-      (add-text-properties meta-start (point) '(face shadow)))
-    (insert "\n")
-    (add-text-properties start (point) properties)))
+         (title (or (alist-get 'forum-title message) ""))
+         (body (qq-guild-forum--body-message message title)))
+    (appkit-discussion-entry-create
+     :key (list 'forum-post post-id)
+     :depth 0
+     :avatar (qq-media-message-avatar-image message)
+     :avatar-fallback "@"
+     :avatar-action
+     (lambda ()
+       (interactive)
+       (qq-media-open-message-avatar message))
+     :avatar-help-echo "Open channel member avatar"
+     :heading-inserter
+     (lambda ()
+       (qq-chat--insert-message-sender message 'qq-msg-user-title))
+     :heading-line-face 'qq-msg-heading
+     :time (qq-guild-forum--time-string message)
+     :time-face 'qq-msg-status
+     :body-inserter
+     (lambda (prefix properties)
+       (unless (string-empty-p title)
+         (appkit-ui-insert-prefixed-lines
+          prefix title :face 'bold :properties properties))
+       (when (or (alist-get 'segments body) (string-empty-p title))
+         (qq-chat--insert-message-body body prefix properties)))
+     :footer
+     (and show-comment-count-p
+          (format "%d 条评论"
+                  (or (alist-get 'forum-comment-count message) 0)))
+     :footer-face 'shadow
+     :properties
+     (list 'qq-guild-forum-post-id post-id
+           'rear-nonsticky '(qq-guild-forum-post-id)))))
+
+(defun qq-guild-forum--insert-post (message &optional detail-p)
+  "Insert native forum MESSAGE through the Appkit discussion surface.
+
+DETAIL-P suppresses directory-only comment-count metadata."
+  (appkit-discussion-insert-entry
+   (qq-guild-forum--post-discussion-entry message (not detail-p))
+   :width (qq-guild-forum--discussion-width)))
 
 (defun qq-guild-forum--entry-printer (entry)
   "Insert persistent forum ENTRY."
@@ -356,13 +366,11 @@ An empty CURSOR replaces the authoritative first page."
       (goto-char (point-min)))))
 
 (defun qq-guild-forum-open-post ()
-  "Show the exact native post represented at point."
+  "Open the native post and its independent comment directory."
   (interactive)
   (let ((post (or (qq-guild-forum--post-at-point)
                   (user-error "qq: point is not on a forum post"))))
-    (message "qq: post %s has %d comments; comment loading is not implemented"
-             (alist-get 'id post)
-             (or (alist-get 'forum-comment-count post) 0))))
+    (qq-guild-forum-post-open post)))
 
 (defun qq-guild-forum--setup-view (view)
   "Register state and media ownership for forum VIEW."

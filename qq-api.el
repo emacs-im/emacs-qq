@@ -1332,6 +1332,16 @@ segments.  A resolve action result itself must be terminal or available."
        (error "qq: Guild navigation_sequences[%d].native_kind is invalid" index))))
   (copy-tree navigation))
 
+(defun qq-api--validate-guild-forum-sender (sender context)
+  "Validate a closed forum SENDER at CONTEXT."
+  (unless (qq-api--exact-object-keys-p
+           sender '(native_id display_name avatar_url))
+    (error "qq: %s has invalid fields" context))
+  (dolist (field '(native_id display_name avatar_url))
+    (unless (qq-api-non-empty-string-p (alist-get field sender))
+      (error "qq: %s.%s must be a non-empty string" context field)))
+  (copy-tree sender))
+
 (defun qq-api--validate-guild-forum-post (post expected-chat context)
   "Validate one closed forum POST for EXPECTED-CHAT at CONTEXT."
   (unless (qq-api--exact-object-keys-p
@@ -1356,13 +1366,8 @@ segments.  A resolve action result itself must be terminal or available."
   (dolist (field '(channel_name title))
     (unless (stringp (alist-get field post))
       (error "qq: %s.%s must be a string" context field)))
-  (let ((sender (alist-get 'sender post)))
-    (unless (qq-api--exact-object-keys-p
-             sender '(native_id display_name avatar_url))
-      (error "qq: %s.sender has invalid fields" context))
-    (dolist (field '(native_id display_name avatar_url))
-      (unless (qq-api-non-empty-string-p (alist-get field sender))
-        (error "qq: %s.sender.%s must be a non-empty string" context field))))
+  (qq-api--validate-guild-forum-sender
+   (alist-get 'sender post) (concat context ".sender"))
   (unless (member (alist-get 'state post) '("live" "deleted"))
     (error "qq: %s.state is invalid" context))
   (let ((segments (alist-get 'segments post)))
@@ -1375,6 +1380,135 @@ segments.  A resolve action result itself must be terminal or available."
              do (qq-api--validate-native-forward-segment
                  segment (format "%s.segments[%d]" context index) t)))
   (copy-tree post))
+
+(defun qq-api--validate-guild-forum-comment
+    (comment expected-chat expected-post-id context)
+  "Validate closed forum COMMENT for EXPECTED-CHAT and EXPECTED-POST-ID."
+  (unless (qq-api--exact-object-keys-p
+           comment '(chat post_id comment_id parent_comment_id
+                         reply_to_comment_id created_at sender reply_to_sender
+                         reply_count reply_cursor replies_finished segments))
+    (error "qq: %s has invalid fields" context))
+  (let ((chat (qq-api-validate-forward-session-locator
+               (alist-get 'chat comment) (concat context ".chat") t)))
+    (unless (and (equal (alist-get 'kind chat) "guild-channel")
+                 (equal chat expected-chat))
+      (error "qq: %s returned a contradictory channel identity" context)))
+  (unless (equal (alist-get 'post_id comment) expected-post-id)
+    (error "qq: %s returned a contradictory post identity" context))
+  (unless (qq-api-non-empty-string-p (alist-get 'comment_id comment))
+    (error "qq: %s.comment_id must be an opaque non-empty string" context))
+  (dolist (field '(parent_comment_id reply_to_comment_id))
+    (let ((value (alist-get field comment)))
+      (unless (or (null value) (qq-api-non-empty-string-p value))
+        (error "qq: %s.%s must be null or an opaque string" context field))))
+  (dolist (field '(created_at reply_count))
+    (unless (qq-protocol--nonnegative-safe-integer-p (alist-get field comment))
+      (error "qq: %s.%s must be a safe non-negative integer" context field)))
+  (qq-api--validate-guild-forum-sender
+   (alist-get 'sender comment) (concat context ".sender"))
+  (let ((target (alist-get 'reply_to_sender comment)))
+    (when target
+      (qq-api--validate-guild-forum-sender
+       target (concat context ".reply_to_sender"))))
+  (let ((finished (alist-get 'replies_finished comment))
+        (cursor (alist-get 'reply_cursor comment)))
+    (unless (memq finished '(t :false))
+      (error "qq: %s.replies_finished must be a boolean" context))
+    (if (eq finished t)
+        (when cursor
+          (error "qq: %s finished replies must not have a cursor" context))
+      (unless (qq-api-non-empty-string-p cursor)
+        (error "qq: %s unfinished replies require an opaque cursor" context))))
+  (if (alist-get 'parent_comment_id comment)
+      (unless (and (= (alist-get 'reply_count comment) 0)
+                   (eq (alist-get 'replies_finished comment) t)
+                   (null (alist-get 'reply_cursor comment)))
+        (error "qq: %s nested reply cannot own another reply directory" context))
+    (when (or (alist-get 'reply_to_comment_id comment)
+              (alist-get 'reply_to_sender comment))
+      (error "qq: %s top-level comment cannot target another comment" context)))
+  (let ((segments (alist-get 'segments comment)))
+    (unless (and (listp segments) (proper-list-p segments))
+      (error "qq: %s.segments must be an array" context))
+    (cl-loop for segment in segments
+             for index from 0
+             do (qq-api--validate-native-forward-segment
+                 segment (format "%s.segments[%d]" context index) t)))
+  (copy-tree comment))
+
+(defun qq-api--validate-guild-forum-comments-page
+    (data expected-chat expected-post-id)
+  "Validate one top-level comment page DATA for EXPECTED-POST-ID."
+  (unless (qq-api--exact-object-keys-p
+           data '(comments next_cursor finished total_comment_count))
+    (error "qq: Guild forum comments page has invalid fields"))
+  (let ((comments (alist-get 'comments data))
+        (cursor (alist-get 'next_cursor data))
+        (finished (alist-get 'finished data))
+        (seen (make-hash-table :test #'equal)))
+    (unless (and (listp comments) (proper-list-p comments))
+      (error "qq: Guild forum comments must be an array"))
+    (unless (qq-protocol--nonnegative-safe-integer-p
+             (alist-get 'total_comment_count data))
+      (error "qq: Guild forum total_comment_count is invalid"))
+    (unless (memq finished '(t :false))
+      (error "qq: Guild forum comments finished must be a boolean"))
+    (if (eq finished t)
+        (when cursor
+          (error "qq: finished Guild forum comments page must not have a cursor"))
+      (unless (qq-api-non-empty-string-p cursor)
+        (error "qq: unfinished Guild forum comments page requires a cursor")))
+    (cl-loop
+     for comment in comments
+     for index from 0
+     for validated = (qq-api--validate-guild-forum-comment
+                      comment expected-chat expected-post-id
+                      (format "Guild forum comments[%d]" index))
+     for comment-id = (alist-get 'comment_id validated)
+     do
+     (when (gethash comment-id seen)
+       (error "qq: Guild forum comments duplicated comment_id %s" comment-id))
+     (puthash comment-id t seen)))
+  (copy-tree data))
+
+(defun qq-api--validate-guild-forum-replies-page
+    (data expected-chat expected-post-id expected-comment-id)
+  "Validate a reply page DATA for EXPECTED-COMMENT-ID."
+  (unless (qq-api--exact-object-keys-p
+           data '(replies next_cursor finished total_reply_count))
+    (error "qq: Guild forum replies page has invalid fields"))
+  (let ((replies (alist-get 'replies data))
+        (cursor (alist-get 'next_cursor data))
+        (finished (alist-get 'finished data))
+        (seen (make-hash-table :test #'equal)))
+    (unless (and (listp replies) (proper-list-p replies))
+      (error "qq: Guild forum replies must be an array"))
+    (unless (qq-protocol--nonnegative-safe-integer-p
+             (alist-get 'total_reply_count data))
+      (error "qq: Guild forum total_reply_count is invalid"))
+    (unless (memq finished '(t :false))
+      (error "qq: Guild forum replies finished must be a boolean"))
+    (if (eq finished t)
+        (when cursor
+          (error "qq: finished Guild forum replies page must not have a cursor"))
+      (unless (qq-api-non-empty-string-p cursor)
+        (error "qq: unfinished Guild forum replies page requires a cursor")))
+    (cl-loop
+     for reply in replies
+     for index from 0
+     for validated = (qq-api--validate-guild-forum-comment
+                      reply expected-chat expected-post-id
+                      (format "Guild forum replies[%d]" index))
+     for reply-id = (alist-get 'comment_id validated)
+     do
+     (unless (equal (alist-get 'parent_comment_id validated)
+                    expected-comment-id)
+       (error "qq: Guild forum reply returned a contradictory parent comment"))
+     (when (gethash reply-id seen)
+       (error "qq: Guild forum replies duplicated comment_id %s" reply-id))
+     (puthash reply-id t seen)))
+  (copy-tree data))
 
 (defun qq-api--validate-guild-forum-page (data expected-chat)
   "Validate one closed forum page DATA for EXPECTED-CHAT."
@@ -1718,6 +1852,70 @@ segments.  A resolve action result itself must be terminal or available."
                  (qq-state-replace-guild-forum-posts session-key posts)
                (dolist (post posts)
                  (qq-state-merge-guild-forum-post post)))
+             (when callback (funcall callback page)))
+         (error
+          (funcall (or errback #'qq-api--default-error)
+                   response (error-message-string error-data)))))
+     errback)))
+
+(defun qq-api--guild-forum-post-request-identity (post)
+  "Return exact closed request identity carried by normalized forum POST."
+  (unless (equal (alist-get 'message-type post) "guild-forum-post")
+    (user-error "qq: comments require a native forum post"))
+  (let* ((raw (alist-get 'raw-event post))
+         (chat (alist-get 'chat raw))
+         (post-id (alist-get 'post_id raw))
+         (author-id (alist-get 'native_id (alist-get 'sender raw))))
+    (unless (and (equal post-id (alist-get 'id post))
+                 (qq-api-non-empty-string-p post-id)
+                 (qq-api-non-empty-string-p author-id))
+      (error "qq: normalized forum post lost its native request identity"))
+    (list chat post-id author-id)))
+
+(defun qq-api-fetch-guild-forum-comments
+    (post cursor callback &optional errback)
+  "Fetch one native comment page for POST at opaque CURSOR."
+  (unless (stringp cursor)
+    (user-error "qq: Guild forum comment cursor must be an opaque string"))
+  (pcase-let* ((`(,chat ,post-id ,author-id)
+                (qq-api--guild-forum-post-request-identity post)))
+    (qq-api-call
+     "emacs_get_guild_forum_comments"
+     `((chat . ,chat)
+       (post_id . ,post-id)
+       (author_id . ,author-id)
+       (cursor . ,cursor))
+     (lambda (response)
+       (condition-case error-data
+           (let ((page (qq-api--validate-guild-forum-comments-page
+                        (qq-api--response-data response) chat post-id)))
+             (when callback (funcall callback page)))
+         (error
+          (funcall (or errback #'qq-api--default-error)
+                   response (error-message-string error-data)))))
+     errback)))
+
+(defun qq-api-fetch-guild-forum-replies
+    (comment cursor callback &optional errback)
+  "Fetch one native reply page for top-level COMMENT at opaque CURSOR."
+  (unless (stringp cursor)
+    (user-error "qq: Guild forum reply cursor must be an opaque string"))
+  (let ((chat (alist-get 'chat comment))
+        (post-id (alist-get 'post_id comment))
+        (comment-id (alist-get 'comment_id comment)))
+    (unless (null (alist-get 'parent_comment_id comment))
+      (user-error "qq: nested replies do not own another reply directory"))
+    (qq-api-call
+     "emacs_get_guild_forum_replies"
+     `((chat . ,chat)
+       (post_id . ,post-id)
+       (comment_id . ,comment-id)
+       (cursor . ,cursor))
+     (lambda (response)
+       (condition-case error-data
+           (let ((page (qq-api--validate-guild-forum-replies-page
+                        (qq-api--response-data response)
+                        chat post-id comment-id)))
              (when callback (funcall callback page)))
          (error
           (funcall (or errback #'qq-api--default-error)

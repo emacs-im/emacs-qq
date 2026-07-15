@@ -48,6 +48,30 @@
      (segments . (((kind . "text")
                    (payload . ((text . "Synthetic body")))))))))
 
+(defun qq-guild-forum-test--comment
+    (comment-id post-id parent-id text &optional reply-count cursor)
+  "Return one strict synthetic forum comment for POST-ID."
+  `((chat . ((kind . "guild-channel")
+             (guild_id . ,qq-guild-forum-test--guild-id)
+             (channel_id . ,qq-guild-forum-test--channel-id)))
+    (post_id . ,post-id)
+    (comment_id . ,comment-id)
+    (parent_comment_id . ,parent-id)
+    (reply_to_comment_id . ,(and parent-id parent-id))
+    (created_at . 1784000200)
+    (sender . ((native_id . "144115219000000002")
+               (display_name . "Synthetic commenter")
+               (avatar_url . "https://example.invalid/commenter.png")))
+    (reply_to_sender
+     . ,(and parent-id
+             '((native_id . "144115219000000001")
+               (display_name . "Synthetic member")
+               (avatar_url . "https://example.invalid/avatar.png"))))
+    (reply_count . ,(or reply-count 0))
+    (reply_cursor . ,cursor)
+    (replies_finished . ,(if cursor :false t))
+    (segments . (((kind . "text") (payload . ((text . ,text))))))))
+
 (ert-deftest qq-guild-forum-removes-only-an-exact-native-title-prefix ()
   (let* ((segments
           '(((type . "text") (data . ((text . "Synthetic "))))
@@ -141,6 +165,131 @@
       (when (appkit-app-live-p app)
         (appkit-stop-app app))
       (qq-state-reset))))
+
+(ert-deftest qq-guild-forum-post-owns-native-comments-and-reply-pagination ()
+  (let* ((qq-state-change-hook nil)
+         (qq-media-cache-update-hook nil)
+         (app (appkit-start-app 'qq :id (make-symbol "qq-post-test")))
+         (qq-runtime--app app)
+         (session-key
+          (qq-state-guild-channel-session-key
+           qq-guild-forum-test--guild-id qq-guild-forum-test--channel-id))
+         (closed-post
+          (qq-guild-forum-test--post
+           "B_synthetic_detail" 1784000100 "Synthetic detail"))
+         (top
+          (qq-guild-forum-test--comment
+           "c_synthetic_top" "B_synthetic_detail" nil
+           "Top-level comment" 2 "reply=opaque-next"))
+         (preview
+          (qq-guild-forum-test--comment
+           "r_synthetic_preview" "B_synthetic_detail" "c_synthetic_top"
+           "Preview reply"))
+         (next
+          (qq-guild-forum-test--comment
+           "r_synthetic_next" "B_synthetic_detail" "c_synthetic_top"
+           "Next reply"))
+         comment-cursors
+         reply-cursors
+         buffer)
+    (qq-state-reset)
+    (unwind-protect
+        (progn
+          (qq-state-apply-guild-directory (qq-guild-forum-test--directory))
+          (qq-state-replace-guild-forum-posts session-key (list closed-post))
+          (let ((post (car (qq-state-session-messages session-key))))
+            (cl-letf (((symbol-function 'qq-runtime-app) (lambda () app))
+                      ((symbol-function 'qq-media-message-avatar-image)
+                       (lambda (_message) nil))
+                      ((symbol-function 'qq-api-fetch-guild-forum-comments)
+                       (lambda (candidate cursor callback &optional _errback)
+                         (should (equal (alist-get 'id candidate)
+                                        "B_synthetic_detail"))
+                         (push cursor comment-cursors)
+                         (funcall callback
+                                  `((comments . (,top ,preview))
+                                    (next_cursor . nil)
+                                    (finished . t)
+                                    (total_comment_count . 3)))
+                         'synthetic-comment-request))
+                      ((symbol-function 'qq-api-fetch-guild-forum-replies)
+                       (lambda (comment cursor callback &optional _errback)
+                         (should (equal (alist-get 'comment_id comment)
+                                        "c_synthetic_top"))
+                         (push cursor reply-cursors)
+                         (funcall callback
+                                  `((replies . (,next))
+                                    (next_cursor . nil)
+                                    (finished . t)
+                                    (total_reply_count . 2)))
+                         'synthetic-reply-request)))
+              (setq buffer (qq-guild-forum-post-open post))
+              (with-current-buffer buffer
+                (appkit-sync-invalidations (appkit-current-view))
+                (should (derived-mode-p 'qq-guild-forum-post-mode))
+                (should-not (appkit-chatbuf-input-start-position))
+                (should (string-match-p "Synthetic detail" (buffer-string)))
+                (should (string-match-p "Top-level comment" (buffer-string)))
+                (should (string-match-p "Preview reply" (buffer-string)))
+                (should (string-match-p "1/2 条回复" (buffer-string)))
+                (let ((message (qq-guild-forum-post--comment-message top)))
+                  (should (equal (alist-get 'session-key message) session-key))
+                  (should
+                   (equal (qq-media--message-avatar-identity message)
+                          `(:guild-member
+                            ,qq-guild-forum-test--guild-id
+                            "144115219000000002"))))
+                (goto-char (point-min))
+                (should (search-forward "Top-level comment" nil t))
+                (should (equal (get-text-property
+                                (1- (point)) 'qq-guild-forum-comment-id)
+                               "c_synthetic_top"))
+                (should (= 0 (get-text-property
+                              (1- (point)) appkit-discussion-depth-property)))
+                (should (search-forward "Preview reply" nil t))
+                (should (= 1 (get-text-property
+                              (1- (point)) appkit-discussion-depth-property)))
+                (search-backward "Top-level comment")
+                (qq-guild-forum-post-open-at-point)
+                (appkit-sync-invalidations (appkit-current-view))
+                (should (string-match-p "Next reply" (buffer-string)))
+                (should (string-match-p "2/2 条回复" (buffer-string))))))
+          (should (equal comment-cursors '("")))
+          (should (equal reply-cursors '("reply=opaque-next"))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (when (appkit-app-live-p app)
+        (appkit-stop-app app))
+      (qq-state-reset))))
+
+(ert-deftest qq-api-guild-forum-comments-enforce-native-cursor-relations ()
+  (let* ((post-id "B_synthetic_validation")
+         (chat `((kind . "guild-channel")
+                 (guild_id . ,qq-guild-forum-test--guild-id)
+                 (channel_id . ,qq-guild-forum-test--channel-id)))
+         (comment
+          (qq-guild-forum-test--comment
+           "c_synthetic_validation" post-id nil "Validated"))
+         (page `((comments . (,comment))
+                 (next_cursor . nil)
+                 (finished . t)
+                 (total_comment_count . 1))))
+    (should
+     (equal (qq-api--validate-guild-forum-comments-page page chat post-id)
+            page))
+    (let ((bad (copy-tree page)))
+      (setf (alist-get 'finished bad) :false)
+      (should-error
+       (qq-api--validate-guild-forum-comments-page bad chat post-id)))
+    (let ((bad (copy-tree comment)))
+      (setf (alist-get 'parent_comment_id bad) "c_other_parent")
+      (should-error
+       (qq-api--validate-guild-forum-replies-page
+        `((replies . (,bad))
+          (next_cursor . nil)
+          (finished . t)
+          (total_reply_count . 1))
+        chat post-id "c_expected_parent")))))
 
 (provide 'qq-guild-forum-test)
 
