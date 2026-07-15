@@ -223,6 +223,11 @@
                          (name . "Synthetic guild")
                          (avatar_seq . "3")
                          (pinned_at))))
+             (categories . (((guild_id . ,guild-id)
+                             (category_id . "0")
+                             (name . "")
+                             (uncategorized . t)
+                             (channel_ids . (,channel-id)))))
              (channels . (((guild_id . ,guild-id)
                            (channel_id . ,channel-id)
                            (guild_name . "Synthetic guild")
@@ -238,6 +243,9 @@
      (should (equal (alist-get 'name
                                (qq-state-guild-channel guild-id channel-id))
                     "General"))
+     (should (equal (alist-get 'channel_ids
+                               (car (qq-state-guild-categories guild-id)))
+                    (list channel-id)))
      (setf (alist-get 'name (car (alist-get 'channels source))) "mutated")
      (should (equal (alist-get 'name
                                (qq-state-guild-channel guild-id channel-id))

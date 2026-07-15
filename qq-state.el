@@ -13,6 +13,7 @@
 (require 'seq)
 (require 'subr-x)
 (require 'qq-customize)
+(require 'qq-guild-channel-type)
 (require 'qq-protocol)
 
 (defvar qq-state-change-hook nil
@@ -72,6 +73,8 @@ future request must accept its own authoritative reaction snapshot unchanged.")
 (defvar qq-state--guilds-by-id (make-hash-table :test #'equal))
 (defvar qq-state--guild-order nil
   "Guild IDs in the authoritative Linux QQ message-list order.")
+(defvar qq-state--guild-categories nil
+  "Authoritative Guild category groups in native display order.")
 (defvar qq-state--guild-channels-by-key (make-hash-table :test #'equal))
 (defvar qq-state--guild-channel-order nil
   "Composite Guild channel keys in authoritative Linux QQ order.")
@@ -249,6 +252,7 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   (setq qq-state--group-order nil)
   (setq qq-state--groups-loaded-p nil)
   (setq qq-state--guild-order nil)
+  (setq qq-state--guild-categories nil)
   (setq qq-state--guild-channel-order nil)
   (setq qq-state--guild-directory-loaded-p nil)
   (setq qq-state--message-order-counter 0)
@@ -480,11 +484,10 @@ they are never split, normalized, escaped, or reconstructed from metadata."
         (pcase type
           ((or 'private 'group 'dataline) t)
           ('guild-channel
-           (equal
+           (qq-guild-channel-sendable-p
             (alist-get
              'kind
-             (gethash session-key qq-state--guild-channels-by-key))
-            "text"))
+             (gethash session-key qq-state--guild-channels-by-key))))
           (_ nil)))
     (error nil)))
 
@@ -3352,11 +3355,13 @@ order are retained exactly as supplied by the native snapshot."
 (defun qq-state-apply-guild-directory (directory)
   "Replace the authoritative Guild DIRECTORY caches.
 
-DIRECTORY is an alist containing ordered `guilds' and `channels' lists."
+DIRECTORY contains ordered `guilds', `categories', and `channels' lists."
   (let ((guilds (alist-get 'guilds directory))
+        (categories (alist-get 'categories directory))
         (channels (alist-get 'channels directory)))
     (setq qq-state--guild-directory-loaded-p t
           qq-state--guild-order nil
+          qq-state--guild-categories (copy-tree categories)
           qq-state--guild-channel-order nil)
     (clrhash qq-state--guilds-by-id)
     (clrhash qq-state--guild-channels-by-key)
@@ -3383,6 +3388,7 @@ DIRECTORY is an alist containing ordered `guilds' and `channels' lists."
           (nreverse qq-state--guild-channel-order))
     (qq-state--emit 'guild-directory-refreshed
                     :guild-count (length guilds)
+                    :category-count (length categories)
                     :channel-count (length channels))
     (qq-state-guild-directory)))
 
@@ -3392,10 +3398,18 @@ DIRECTORY is an alist containing ordered `guilds' and `channels' lists."
                 (lambda (guild-id)
                   (copy-tree (gethash guild-id qq-state--guilds-by-id)))
                 qq-state--guild-order))
+    (categories . ,(copy-tree qq-state--guild-categories))
     (channels . ,(mapcar
                   (lambda (key)
                     (copy-tree (gethash key qq-state--guild-channels-by-key)))
                   qq-state--guild-channel-order))))
+
+(defun qq-state-guild-categories (guild-id)
+  "Return native ordered category groups belonging to GUILD-ID."
+  (seq-filter
+   (lambda (category)
+     (equal (alist-get 'guild_id category) guild-id))
+   (copy-tree qq-state--guild-categories)))
 
 (defun qq-state-guild-directory-loaded-p ()
   "Return non-nil once the authoritative Guild directory has loaded."

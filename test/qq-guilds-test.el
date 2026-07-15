@@ -43,6 +43,11 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                 (name . "Synthetic guild")
                 (avatar_seq . "3")
                 (pinned_at))))
+    (categories . (((guild_id . ,qq-guilds-test--guild-id)
+                    (category_id . "0")
+                    (name . "")
+                    (uncategorized . t)
+                    (channel_ids . (,qq-guilds-test--channel-id)))))
     (channels . (((guild_id . ,qq-guilds-test--guild-id)
                   (channel_id . ,qq-guilds-test--channel-id)
                   (guild_name . "Synthetic guild")
@@ -60,6 +65,14 @@ Each item is either a channel id string or a cons of id and display name."
                 (name . "Synthetic guild")
                 (avatar_seq . "3")
                 (pinned_at))))
+    (categories
+     . (((guild_id . ,qq-guilds-test--guild-id)
+         (category_id . "0")
+         (name . "")
+         (uncategorized . t)
+         (channel_ids
+          . ,(mapcar (lambda (spec) (if (consp spec) (car spec) spec))
+                     channel-specs)))))
     (channels
      . ,(mapcar
          (lambda (spec)
@@ -67,35 +80,16 @@ Each item is either a channel id string or a cons of id and display name."
                  (name (if (consp spec)
                            (cdr spec)
                          (format "Channel %s" spec))))
-             `((guild_id . ,qq-guilds-test--guild-id)
-               (channel_id . ,channel-id)
-               (guild_name . "Synthetic guild")
-               (name . ,name)
-               (kind . "text")
-               (avatar_seq . "4")
-               (pinned_at)
-               (latest_sequence . "23"))))
+             (copy-tree
+              `((guild_id . ,qq-guilds-test--guild-id)
+                (channel_id . ,channel-id)
+                (guild_name . "Synthetic guild")
+                (name . ,name)
+                (kind . "text")
+                (avatar_seq . "4")
+                (pinned_at)
+                (latest_sequence . "23")))))
          channel-specs))))
-
-(defun qq-guilds-test--partial-directory (&optional guild-name)
-  "Return one channel whose Guild metadata is optional.
-
-When GUILD-NAME is non-nil, include the authoritative Guild object with that
-name; otherwise only the channel's fallback Guild name is present."
-  `((guilds
-     . ,(when guild-name
-          `(((guild_id . ,qq-guilds-test--guild-id)
-             (name . ,guild-name)
-             (avatar_seq . "3")
-             (pinned_at)))))
-    (channels . (((guild_id . ,qq-guilds-test--guild-id)
-                  (channel_id . ,qq-guilds-test--channel-id)
-                  (guild_name . "Fallback guild")
-                  (name . "General")
-                  (kind . "text")
-                  (avatar_seq . "4")
-                  (pinned_at)
-                  (latest_sequence . "23"))))))
 
 (defun qq-guilds-test--channel-id (index)
   "Return a canonical synthetic channel id for INDEX."
@@ -123,6 +117,106 @@ name; otherwise only the channel's fallback Guild name is present."
               (should-not (get-text-property end 'mouse-face)))
             (should (search-forward "文字" nil t))))
       (qq-state-reset))))
+
+(ert-deftest qq-guilds-folds-one-guild-without-replacing-the-directory-view ()
+  (let ((qq-state-change-hook nil))
+    (qq-state-reset)
+    (unwind-protect
+        (progn
+          (qq-state-apply-guild-directory (qq-guilds-test--directory))
+          (qq-guilds-test-with-live-view
+            (appkit-invalidate view :structure t :part 'directory)
+            (appkit-sync-invalidations view)
+            (should (string-match-p "# General" (buffer-string)))
+            (let ((heading-node
+                   (gethash
+                    (qq-guilds--guild-entry-key qq-guilds-test--guild-id)
+                    qq-guilds--node-table)))
+              (qq-guilds-toggle-guild qq-guilds-test--guild-id)
+              (should-not (string-match-p "# General" (buffer-string)))
+              (should
+               (eq heading-node
+                   (gethash
+                    (qq-guilds--guild-entry-key qq-guilds-test--guild-id)
+                    qq-guilds--node-table)))
+              (should (gethash qq-guilds-test--guild-id
+                               qq-guilds--collapsed-guilds))
+              (qq-guilds-toggle-guild qq-guilds-test--guild-id)
+              (should (string-match-p "# General" (buffer-string))))))
+      (qq-state-reset))))
+
+(ert-deftest qq-guilds-projects-native-category-order-and-filter ()
+  (let ((qq-state-change-hook nil)
+        (first-id (qq-guilds-test--channel-id 1))
+        (second-id (qq-guilds-test--channel-id 2)))
+    (qq-state-reset)
+    (unwind-protect
+        (let ((directory
+               (qq-guilds-test--directory-with-channels
+                `((,first-id . "General") (,second-id . "Announcements")))))
+          (setf (alist-get 'categories directory)
+                `(((guild_id . ,qq-guilds-test--guild-id)
+                   (category_id . "0") (name . "")
+                   (uncategorized . t) (channel_ids . (,first-id)))
+                  ((guild_id . ,qq-guilds-test--guild-id)
+                   (category_id . "7") (name . "Information")
+                   (uncategorized . :false) (channel_ids . (,second-id)))))
+          (qq-state-apply-guild-directory directory)
+          (qq-guilds-test-with-live-view
+            (appkit-invalidate view :structure t :part 'directory)
+            (appkit-sync-invalidations view)
+            (should (< (string-match "# General" (buffer-string))
+                       (string-match "Information" (buffer-string))))
+            (should (< (string-match "Information" (buffer-string))
+                       (string-match "# Announcements" (buffer-string))))
+            (qq-guilds-filter "announce")
+            (should-not (string-match-p "# General" (buffer-string)))
+            (should (string-match-p "# Announcements" (buffer-string)))
+            (should (string-match-p "/announce/" (qq-guilds--header-line)))
+            (qq-guilds-clear-filter)
+            (should (string-match-p "# General" (buffer-string)))))
+      (qq-state-reset))))
+
+(ert-deftest qq-guilds-routes-closed-channel-kinds-by-capability ()
+  (let ((qq-state-change-hook nil)
+        (text-id (qq-guilds-test--channel-id 1))
+        (forum-id (qq-guilds-test--channel-id 2))
+        (live-id (qq-guilds-test--channel-id 3))
+        calls)
+    (qq-state-reset)
+    (unwind-protect
+        (let ((directory
+               (qq-guilds-test--directory-with-channels
+                (list text-id forum-id live-id))))
+          (setf (alist-get 'kind (nth 1 (alist-get 'channels directory)))
+                "forum"
+                (alist-get 'kind (nth 2 (alist-get 'channels directory)))
+                "live")
+          (qq-state-apply-guild-directory directory)
+          (cl-letf (((symbol-function 'qq-chat-open)
+                     (lambda (key) (push (list 'timeline key) calls)))
+                    ((symbol-function 'qq-guild-forum-open)
+                     (lambda (guild channel)
+                       (push (list 'forum guild channel) calls)))
+                    ((symbol-function 'qq-guild-channel-open)
+                     (lambda (guild channel)
+                       (push (list 'inspect guild channel) calls))))
+            (qq-guilds-open-channel qq-guilds-test--guild-id text-id)
+            (qq-guilds-open-channel qq-guilds-test--guild-id forum-id)
+            (qq-guilds-open-channel qq-guilds-test--guild-id live-id))
+          (should
+           (equal
+            (nreverse calls)
+            `((timeline
+               ,(qq-state-guild-channel-session-key
+                 qq-guilds-test--guild-id text-id))
+              (forum ,qq-guilds-test--guild-id ,forum-id)
+              (inspect ,qq-guilds-test--guild-id ,live-id)))))
+      (qq-state-reset))))
+
+(ert-deftest qq-guild-channel-type-rejects-unknown-protocol-kinds ()
+  (should (equal (qq-guild-channel-type-label "forum") "论坛"))
+  (should-error (qq-guild-channel-type-label "unknown")))
 
 (ert-deftest qq-guilds-open-channel-installs-complete-session-identity ()
   (let ((qq-state-change-hook nil)
@@ -421,38 +515,6 @@ name; otherwise only the channel's fallback Guild name is present."
                     (qq-guilds--channel-entry-key
                      qq-guilds-test--guild-id added-id)
                     qq-guilds--node-table)))))))
-      (qq-state-reset))))
-
-(ert-deftest qq-guilds-orphan-metadata-upgrade-preserves-heading-identity ()
-  (let ((qq-state-change-hook nil))
-    (qq-state-reset)
-    (unwind-protect
-        (progn
-          (qq-state-apply-guild-directory
-           (qq-guilds-test--partial-directory))
-          (qq-guilds-test-with-live-view
-            (appkit-invalidate view :structure t :part 'directory)
-            (appkit-sync-invalidations view)
-            (let* ((heading-key
-                    (qq-guilds--guild-entry-key qq-guilds-test--guild-id))
-                   (heading-node
-                    (gethash heading-key qq-guilds--node-table)))
-              (should heading-node)
-              (goto-char (ewoc-location heading-node))
-              (should (equal heading-key (qq-guilds--entry-key-at-point)))
-              (should (string-match-p "Fallback guild" (buffer-string)))
-              (qq-state-apply-guild-directory
-               (qq-guilds-test--partial-directory "Hydrated guild"))
-              (appkit-invalidate view :structure t :part 'directory)
-              (appkit-sync-invalidations view)
-              (should
-               (eq heading-node
-                   (gethash heading-key qq-guilds--node-table)))
-              (should (equal heading-key (qq-guilds--entry-key-at-point)))
-              (should (string-match-p "Hydrated guild" (buffer-string)))
-              (should-not
-               (gethash (list 'orphan-guild qq-guilds-test--guild-id)
-                        qq-guilds--node-table)))))
       (qq-state-reset))))
 
 (ert-deftest qq-guilds-renamed-buffer-hook-uses-the-registered-view ()

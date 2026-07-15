@@ -2557,6 +2557,13 @@ The authoritative post-state reports UNREAD-COUNT."
                                  (name . "Synthetic guild")
                                  (avatar_seq . "3")
                                  (pinned_at))))
+                            (categories
+                             . (((guild_id . "9007199254740993")
+                                 (category_id . "0")
+                                 (name . "")
+                                 (uncategorized . t)
+                                 (channel_ids
+                                  . ("9007199254741999")))))
                             (channels
                              . (((guild_id . "9007199254740993")
                                  (channel_id . "9007199254741999")
@@ -2578,7 +2585,12 @@ The authoritative post-state reports UNREAD-COUNT."
            (equal (alist-get 'name
                              (qq-state-guild-channel
                               "9007199254740993" "9007199254741999"))
-                  "General")))
+                  "General"))
+          (should
+           (equal (alist-get 'channel_ids
+                             (car (qq-state-guild-categories
+                                   "9007199254740993")))
+                  '("9007199254741999"))))
       (qq-state-reset))))
 
 (ert-deftest qq-api-get-guild-member-profile-preserves-native-identities ()
@@ -2646,11 +2658,39 @@ The authoritative post-state reports UNREAD-COUNT."
    (qq-api--validate-guild-directory-snapshot
     '((guilds . (((guild_id . "9007199254740993")
                   (name . "Guild") (avatar_seq . "1") (pinned_at))))
+      (categories . (((guild_id . "9007199254740993")
+                      (category_id . "0") (name . "")
+                      (uncategorized . t)
+                      (channel_ids . ("9007199254741999")))))
       (channels . (((guild_id . "9007199254740993")
                     (channel_id . "9007199254741999")
                     (guild_name . "Guild") (name . "Forum")
                     (kind . "unknown") (avatar_seq . "1")
                     (pinned_at) (latest_sequence . "0"))))))))
+
+(ert-deftest qq-api-guild-directory-requires-exact-category-coverage ()
+  (let ((directory
+         '((guilds . (((guild_id . "9007199254740993")
+                       (name . "Guild") (avatar_seq . "1") (pinned_at))))
+           (categories . (((guild_id . "9007199254740993")
+                           (category_id . "0") (name . "")
+                           (uncategorized . t)
+                           (channel_ids . ("9007199254741999")))))
+           (channels . (((guild_id . "9007199254740993")
+                         (channel_id . "9007199254741999")
+                         (guild_name . "Guild") (name . "General")
+                         (kind . "text") (avatar_seq . "1")
+                         (pinned_at) (latest_sequence . "0")))))))
+    (should (equal (qq-api--validate-guild-directory-snapshot directory)
+                   directory))
+    (let ((bad (copy-tree directory)))
+      (setf (alist-get 'channel_ids (car (alist-get 'categories bad)))
+            '("9007199254742999"))
+      (should-error (qq-api--validate-guild-directory-snapshot bad)))
+    (let ((bad (copy-tree directory)))
+      (setf (alist-get 'uncategorized (car (alist-get 'categories bad)))
+            :false)
+      (should-error (qq-api--validate-guild-directory-snapshot bad)))))
 
 (ert-deftest qq-api-bootstrap-normalizes-contacts-after-identity-and-names ()
   (let (order)

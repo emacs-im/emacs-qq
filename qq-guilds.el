@@ -19,6 +19,9 @@
 (require 'appkit-view)
 (require 'qq-api)
 (require 'qq-chat)
+(require 'qq-guild-channel)
+(require 'qq-guild-channel-type)
+(require 'qq-guild-forum)
 (require 'qq-runtime)
 (require 'qq-state)
 
@@ -42,6 +45,10 @@
   "Persistent EWOC containing Guild directory entries.")
 (defvar-local qq-guilds--node-table nil
   "Stable Guild directory entry key to EWOC node table.")
+(defvar-local qq-guilds--collapsed-guilds nil
+  "Set of collapsed Guild IDs in the current directory view.")
+(defvar-local qq-guilds--filter nil
+  "Case-insensitive substring filter for the current directory view.")
 
 (cl-defstruct (qq-guilds--entry
                (:constructor qq-guilds--entry-create))
@@ -49,6 +56,8 @@
   type
   text
   face
+  guild-id
+  expanded-p
   channel)
 
 (defconst qq-guilds--view-id 'guilds
@@ -64,35 +73,20 @@
   "Face used for channel links."
   :group 'qq)
 
-(defconst qq-guilds--channel-kind-labels
-  '(("text" . "文字")
-    ("forum" . "论坛")
-    ("live" . "直播")
-    ("application" . "应用")
-    ("schedule" . "日程"))
-  "Protocol channel kinds and their compact directory labels.")
-
 (defun qq-guilds--header-line ()
   "Return the Guild directory header."
   (let* ((directory (qq-state-guild-directory))
          (guild-count (length (alist-get 'guilds directory)))
          (channel-count (length (alist-get 'channels directory))))
-    (format " QQ频道  %d 个频道 · %d 个子频道%s"
+    (format " QQ频道  %d 个频道 · %d 个子频道%s%s"
             guild-count channel-count
+            (if qq-guilds--filter
+                (format " · /%s/" qq-guilds--filter)
+              "")
             (cond
              (qq-guilds--loading " · refreshing")
              (qq-guilds--error " · 刷新失败")
              (t "")))))
-
-(defun qq-guilds--channels-by-guild (channels)
-  "Return CHANNELS grouped by their exact guild_id."
-  (let ((table (make-hash-table :test #'equal)))
-    (dolist (channel channels table)
-      (push channel (gethash (alist-get 'guild_id channel) table)))
-    (maphash (lambda (guild-id items)
-               (puthash guild-id (nreverse items) table))
-             table)
-    table))
 
 (defun qq-guilds--guild-entry-key (guild-id)
   "Return the stable Guild heading key for GUILD-ID."
@@ -102,11 +96,39 @@
   "Return the stable channel row key for GUILD-ID and CHANNEL-ID."
   (list 'channel guild-id channel-id))
 
+(defun qq-guilds--category-entry-key (guild-id category-id)
+  "Return the stable category row key for GUILD-ID and CATEGORY-ID."
+  (list 'category guild-id category-id))
+
 (defun qq-guilds--display-name (name fallback)
   "Return non-empty NAME, or a printable FALLBACK."
   (if (and (stringp name) (not (string-empty-p name)))
       name
     (format "%s" (or fallback "未命名"))))
+
+(defun qq-guilds--insert-guild (entry key)
+  "Insert one foldable Guild heading ENTRY carrying stable KEY."
+  (let* ((guild-id (qq-guilds--entry-guild-id entry))
+         (expanded-p (qq-guilds--entry-expanded-p entry))
+         (start (point)))
+    (insert (if expanded-p "▾ " "▸ ")
+            (qq-guilds--entry-text entry))
+    (make-text-button
+     start (point)
+     'follow-link t
+     'face (qq-guilds--entry-face entry)
+     'mouse-face 'highlight
+     'help-echo (if expanded-p "折叠 QQ 频道" "展开 QQ 频道")
+     'qq-guild-id guild-id
+     'action (lambda (button)
+               (qq-guilds-toggle-guild
+                (button-get button 'qq-guild-id))))
+    (insert "\n")
+    (add-text-properties
+     start (point)
+     (list 'qq-guilds-key key
+           'qq-guild-id guild-id
+           'qq-guild-action 'toggle))))
 
 (defun qq-guilds--insert-channel (channel key)
   "Insert one clickable CHANNEL row carrying stable KEY."
@@ -114,15 +136,20 @@
          (channel-id (alist-get 'channel_id channel))
          (name (alist-get 'name channel))
          (kind (alist-get 'kind channel))
+         (session
+          (qq-state-session
+           (qq-state-guild-channel-session-key guild-id channel-id)))
+         (unread (or (alist-get 'unread-count session) 0))
          (start (point)))
-    (insert "    # " (qq-guilds--display-name name channel-id))
+    (insert "    " (qq-guild-channel-type-icon kind) " "
+            (qq-guilds--display-name name channel-id))
     (make-text-button
      start (point)
      'follow-link t
      'face 'qq-guilds-channel
      'mouse-face 'highlight
-     'help-echo (format "打开%s频道 %s · #%s"
-                        (or (cdr (assoc kind qq-guilds--channel-kind-labels)) "")
+     'help-echo (format "打开%s频道 %s · %s"
+                        (qq-guild-channel-type-label kind)
                         (alist-get 'guild_name channel) name)
      'qq-guild-id guild-id
      'qq-guild-channel-id channel-id
@@ -130,18 +157,29 @@
                (qq-guilds-open-channel
                 (button-get button 'qq-guild-id)
                 (button-get button 'qq-guild-channel-id))))
-    (when-let* ((label (cdr (assoc kind qq-guilds--channel-kind-labels))))
-      (insert (propertize (format "  %s" label) 'face 'shadow)))
+    (insert (propertize
+             (format "  %s" (qq-guild-channel-type-label kind))
+             'face 'shadow))
     (when (alist-get 'pinned_at channel)
       (insert (propertize "  置顶" 'face 'shadow)))
+    (when (> unread 0)
+      (insert (propertize (format "  %d 未读" unread)
+                          'face 'font-lock-warning-face)))
     (insert "\n")
-    (add-text-properties start (point) (list 'qq-guilds-key key))))
+    (add-text-properties
+     start (point)
+     (list 'qq-guilds-key key
+           'qq-guild-id guild-id
+           'qq-guild-channel-id channel-id
+           'qq-guild-action 'open))))
 
 (defun qq-guilds--entry-printer (entry)
   "Insert one persistent Guild directory ENTRY."
   (let ((key (qq-guilds--entry-key entry)))
     (pcase (qq-guilds--entry-type entry)
-      ('heading
+      ('guild
+       (qq-guilds--insert-guild entry key))
+      ('category
        (appkit-view-insert-heading-line
         (qq-guilds--entry-text entry)
         :face (qq-guilds--entry-face entry)
@@ -169,91 +207,129 @@
      :key 'status :type 'note
      :text (concat "  " qq-guilds--error) :face 'error))))
 
-(defun qq-guilds--project-guild-group (guild channels)
-  "Project GUILD and its ordered CHANNELS into stable entries."
-  (let* ((guild-id (alist-get 'guild_id guild))
-         (heading
-          (qq-guilds--entry-create
-           :key (qq-guilds--guild-entry-key guild-id)
-           :type 'heading
-           :text (qq-guilds--display-name (alist-get 'name guild) guild-id)
-           :face 'qq-guilds-title)))
-    (append
-     (list heading)
-     (if channels
-         (mapcar
-          (lambda (channel)
-            (qq-guilds--entry-create
-             :key (qq-guilds--channel-entry-key
-                   guild-id (alist-get 'channel_id channel))
-             :type 'channel :channel channel))
-          channels)
-       (list
-        (qq-guilds--entry-create
-         :key (list 'guild-empty guild-id) :type 'note
-         :text "    暂无消息列表子频道" :face 'shadow)))
-     (list
-      (qq-guilds--entry-create
-       :key (list 'guild-gap guild-id) :type 'blank)))))
+(defun qq-guilds--matches-p (&rest values)
+  "Return non-nil when current filter matches one of VALUES."
+  (or (null qq-guilds--filter)
+      (let ((case-fold-search t))
+        (seq-some
+         (lambda (value)
+           (and (stringp value)
+                (string-match-p (regexp-quote qq-guilds--filter) value)))
+         values))))
 
-(defun qq-guilds--project-orphan-group (guild-id channels)
-  "Project orphaned CHANNELS belonging to GUILD-ID."
-  (let ((guild-name (alist-get 'guild_name (car channels))))
-    (append
-     (list
-      (qq-guilds--entry-create
-       ;; Guild identity does not change when its metadata arrives later.
-       ;; Sharing this key with a known Guild preserves the heading node and
-       ;; semantic position while its fallback title is upgraded.
-       :key (qq-guilds--guild-entry-key guild-id) :type 'heading
-       :text (qq-guilds--display-name guild-name guild-id)
-       :face 'qq-guilds-title))
-     (mapcar
-      (lambda (channel)
-        (qq-guilds--entry-create
-         :key (qq-guilds--channel-entry-key
-               guild-id (alist-get 'channel_id channel))
-         :type 'channel :channel channel))
-      channels)
-     (list
-      (qq-guilds--entry-create
-       :key (list 'orphan-gap guild-id) :type 'blank)))))
+(defun qq-guilds--channel-table (channels)
+  "Return exact (GUILD-ID . CHANNEL-ID) to channel table for CHANNELS."
+  (let ((table (make-hash-table :test #'equal)))
+    (dolist (channel channels table)
+      (puthash (cons (alist-get 'guild_id channel)
+                     (alist-get 'channel_id channel))
+               channel table))))
+
+(defun qq-guilds--category-channels (category channel-table guild-match-p)
+  "Return visible channels for CATEGORY from CHANNEL-TABLE.
+
+GUILD-MATCH-P means the parent Guild itself matched the active filter."
+  (let ((category-match-p
+         (qq-guilds--matches-p (alist-get 'name category)))
+        (guild-id (alist-get 'guild_id category)))
+    (seq-keep
+     (lambda (channel-id)
+       (let ((channel (gethash (cons guild-id channel-id) channel-table)))
+         (unless channel
+           (error "qq: directory category references unknown channel %s"
+                  channel-id))
+         (and (or guild-match-p category-match-p
+                  (qq-guilds--matches-p
+                   (alist-get 'name channel)
+                   (qq-guild-channel-type-label (alist-get 'kind channel))))
+              channel)))
+     (alist-get 'channel_ids category))))
+
+(defun qq-guilds--project-guild-group (guild categories channel-table)
+  "Project GUILD, CATEGORIES, and CHANNEL-TABLE into stable entries."
+  (let* ((guild-id (alist-get 'guild_id guild))
+         (guild-name (qq-guilds--display-name (alist-get 'name guild) guild-id))
+         (guild-match-p (qq-guilds--matches-p guild-name))
+         (expanded-p
+          (or qq-guilds--filter
+              (not (gethash guild-id qq-guilds--collapsed-guilds))))
+         (visible-categories
+          (seq-keep
+           (lambda (category)
+             (let ((visible
+                    (qq-guilds--category-channels
+                     category channel-table guild-match-p)))
+               (and visible (cons category visible))))
+           categories))
+         (visible-p (or (null qq-guilds--filter) guild-match-p
+                        visible-categories))
+         entries)
+    (when visible-p
+      (push
+       (qq-guilds--entry-create
+        :key (qq-guilds--guild-entry-key guild-id)
+        :type 'guild :text guild-name :face 'qq-guilds-title
+        :guild-id guild-id :expanded-p expanded-p)
+       entries)
+      (when expanded-p
+        (if visible-categories
+            (dolist (pair visible-categories)
+              (let ((category (car pair))
+                    (channels (cdr pair)))
+                (unless (eq (alist-get 'uncategorized category) t)
+                  (push
+                   (qq-guilds--entry-create
+                    :key (qq-guilds--category-entry-key
+                          guild-id (alist-get 'category_id category))
+                    :type 'category
+                    :text (format "    ── %s ──"
+                                  (qq-guilds--display-name
+                                   (alist-get 'name category)
+                                   (alist-get 'category_id category)))
+                    :face 'shadow)
+                   entries))
+                (dolist (channel channels)
+                  (push
+                   (qq-guilds--entry-create
+                    :key (qq-guilds--channel-entry-key
+                          guild-id (alist-get 'channel_id channel))
+                    :type 'channel :channel channel)
+                   entries))))
+          (push
+           (qq-guilds--entry-create
+            :key (list 'guild-empty guild-id) :type 'note
+            :text "    暂无匹配的子频道" :face 'shadow)
+           entries)))
+      (push
+       (qq-guilds--entry-create
+        :key (list 'guild-gap guild-id) :type 'blank)
+       entries))
+    (nreverse entries)))
 
 (defun qq-guilds--project-entries ()
   "Project authoritative state and transient status into stable entries."
   (let* ((directory (qq-state-guild-directory))
          (guilds (alist-get 'guilds directory))
+         (categories (alist-get 'categories directory))
          (channels (alist-get 'channels directory))
-         (by-guild (qq-guilds--channels-by-guild channels))
-         (known-guilds (make-hash-table :test #'equal))
-         (orphan-seen (make-hash-table :test #'equal))
-         orphan-order
+         (channel-table (qq-guilds--channel-table channels))
          entries)
     (when-let* ((status (qq-guilds--project-status-entry)))
       (push status entries))
     (dolist (guild guilds)
-      (puthash (alist-get 'guild_id guild) t known-guilds))
-    (dolist (guild guilds)
       (setq entries
             (nconc entries
                    (qq-guilds--project-guild-group
-                    guild (gethash (alist-get 'guild_id guild) by-guild)))))
-    ;; Keep native rows whose Guild metadata is absent visible, while grouping
-    ;; each orphan Guild once instead of inventing a synthetic parent object.
-    (dolist (channel channels)
-      (let ((guild-id (alist-get 'guild_id channel)))
-        (unless (or (gethash guild-id known-guilds)
-                    (gethash guild-id orphan-seen))
-          (puthash guild-id t orphan-seen)
-          (push guild-id orphan-order))))
-    (dolist (guild-id (nreverse orphan-order))
-      (setq entries
-            (nconc entries
-                   (qq-guilds--project-orphan-group
-                    guild-id (gethash guild-id by-guild)))))
+                    guild
+                    (seq-filter
+                     (lambda (category)
+                       (equal (alist-get 'guild_id category)
+                              (alist-get 'guild_id guild)))
+                     categories)
+                    channel-table))))
     ;; An in-flight refresh or failed refresh is itself the useful empty-state
     ;; note.  Do not flash a contradictory "no Guilds" row underneath it.
-    (when (and (null guilds) (null channels)
+    (when (and (null guilds)
                (null qq-guilds--loading) (null qq-guilds--error))
       (setq entries
             (nconc entries
@@ -261,6 +337,17 @@
                     (qq-guilds--entry-create
                      :key 'empty :type 'note
                      :text "  没有可见的 QQ 频道。" :face 'shadow)))))
+    (when (and qq-guilds--filter guilds
+               (not (seq-some
+                     (lambda (entry)
+                       (eq (qq-guilds--entry-type entry) 'guild))
+                     entries)))
+      (setq entries
+            (nconc entries
+                   (list
+                    (qq-guilds--entry-create
+                     :key 'filter-empty :type 'note
+                     :text "  没有匹配的频道或子频道。" :face 'shadow)))))
     entries))
 
 (defun qq-guilds--reconcile-directory ()
@@ -447,29 +534,86 @@ buffer has been renamed."
       (appkit-with-live-view view
         (qq-guilds--queue-view-sync view)))))
 
+(defun qq-guilds-toggle-guild (&optional guild-id)
+  "Toggle GUILD-ID, or the Guild heading at point."
+  (interactive)
+  (let* ((key (qq-guilds--entry-key-at-point))
+         (id (or guild-id
+                 (and (eq (car-safe key) 'guild) (cdr key))
+                 (user-error "qq: point is not on a QQ 频道 heading"))))
+    (if (gethash id qq-guilds--collapsed-guilds)
+        (remhash id qq-guilds--collapsed-guilds)
+      (puthash id t qq-guilds--collapsed-guilds))
+    (let ((view (qq-guilds--ensure-view)))
+      (appkit-request-sync view :structure t :part 'directory)
+      (appkit-sync-invalidations view))))
+
+(defun qq-guilds-filter (query)
+  "Filter the QQ Guild directory by substring QUERY."
+  (interactive
+   (list (read-string "Filter QQ channels: " qq-guilds--filter)))
+  (setq qq-guilds--filter
+        (and (not (string-empty-p query)) query))
+  (let ((view (qq-guilds--ensure-view)))
+    (appkit-request-sync view :structure t :part 'directory)
+    (appkit-sync-invalidations view)))
+
+(defun qq-guilds-clear-filter ()
+  "Clear the active QQ Guild directory filter."
+  (interactive)
+  (unless qq-guilds--filter
+    (user-error "qq: no Guild directory filter is active"))
+  (setq qq-guilds--filter nil)
+  (let ((view (qq-guilds--ensure-view)))
+    (appkit-request-sync view :structure t :part 'directory)
+    (appkit-sync-invalidations view)))
+
+(defun qq-guilds-activate ()
+  "Activate the fold or channel action at point."
+  (interactive)
+  (pcase (get-text-property (line-beginning-position) 'qq-guild-action)
+    ('toggle
+     (qq-guilds-toggle-guild
+      (get-text-property (line-beginning-position) 'qq-guild-id)))
+    ('open
+     (qq-guilds-open-channel
+      (get-text-property (line-beginning-position) 'qq-guild-id)
+      (get-text-property (line-beginning-position) 'qq-guild-channel-id)))
+    (_ (user-error "qq: no action at point"))))
+
 (defun qq-guilds-open-channel (guild-id channel-id)
   "Open the channel identified by GUILD-ID and CHANNEL-ID."
   (interactive)
   (let* ((channel (or (qq-state-guild-channel guild-id channel-id)
                       (user-error "QQ: channel is no longer in the directory")))
-         (key (qq-state-guild-channel-session-key guild-id channel-id)))
-    (qq-state-upsert-session
-     key `((title . ,(format "%s · #%s"
-                            (alist-get 'guild_name channel)
-                            (alist-get 'name channel)))
-           (guild-name . ,(alist-get 'guild_name channel))
-           (channel-name . ,(alist-get 'name channel))
-           (channel-kind . ,(alist-get 'kind channel)))
-     nil)
-    (qq-chat-open key)))
+         (kind (alist-get 'kind channel)))
+    (pcase (qq-guild-channel-open-mode kind)
+      ('timeline
+       (let ((key (qq-state-guild-channel-session-key guild-id channel-id)))
+         (qq-state-upsert-session
+          key `((title . ,(format "%s · #%s"
+                                 (alist-get 'guild_name channel)
+                                 (alist-get 'name channel)))
+                (guild-name . ,(alist-get 'guild_name channel))
+                (channel-name . ,(alist-get 'name channel))
+                (channel-kind . ,kind))
+          nil)
+         (qq-chat-open key)))
+      ('forum (qq-guild-forum-open guild-id channel-id))
+      ('inspect (qq-guild-channel-open guild-id channel-id))
+      (mode (error "qq: unknown Guild channel open mode %S" mode)))))
 
 (defvar qq-guilds-mode-map
   (let ((map (make-sparse-keymap)))
     (set-keymap-parent map special-mode-map)
     (define-key map (kbd "g") #'qq-guilds-refresh)
+    (define-key map (kbd "/") #'qq-guilds-filter)
+    (define-key map (kbd "C-c C-k") #'qq-guilds-clear-filter)
     (define-key map (kbd "n") #'forward-button)
     (define-key map (kbd "p") #'backward-button)
-    (define-key map (kbd "RET") #'push-button)
+    (define-key map (kbd "TAB") #'qq-guilds-toggle-guild)
+    (define-key map (kbd "RET") #'qq-guilds-activate)
+    (define-key map (kbd "q") #'quit-window)
     map))
 
 (define-derived-mode qq-guilds-mode special-mode "QQ-Guilds"
@@ -483,6 +627,8 @@ buffer has been renamed."
   (setq-local qq-guilds--refresh-owner nil)
   (setq-local qq-guilds--refresh-request nil)
   (setq-local qq-guilds--node-table (make-hash-table :test #'equal))
+  (setq-local qq-guilds--collapsed-guilds (make-hash-table :test #'equal))
+  (setq-local qq-guilds--filter nil)
   (setq-local header-line-format '(:eval (qq-guilds--header-line)))
   (let ((inhibit-read-only t)
         (buffer-undo-list t))

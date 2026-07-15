@@ -1167,13 +1167,20 @@ segments.  A resolve action result itself must be terminal or available."
 
 (defun qq-api--validate-guild-directory-snapshot (data)
   "Validate and copy exact native QQ Guild directory DATA."
-  (unless (qq-api--exact-object-keys-p data '(guilds channels))
+  (unless (qq-api--exact-object-keys-p data '(guilds categories channels))
     (error "qq: emacs_get_guild_directory returned an invalid object"))
   (let ((guilds (alist-get 'guilds data))
+        (categories (alist-get 'categories data))
         (channels (alist-get 'channels data))
         (seen-guilds (make-hash-table :test #'equal))
+        (guild-names (make-hash-table :test #'equal))
+        (seen-categories (make-hash-table :test #'equal))
+        (seen-uncategorized (make-hash-table :test #'equal))
+        (referenced-channels (make-hash-table :test #'equal))
         (seen-channels (make-hash-table :test #'equal)))
-    (unless (and (listp guilds) (listp channels))
+    (unless (and (proper-list-p guilds)
+                 (proper-list-p categories)
+                 (proper-list-p channels))
       (error "qq: Guild directory members must be arrays"))
     (cl-labels
         ((decimal (value context &optional zero)
@@ -1197,12 +1204,54 @@ segments.  A resolve action result itself must be terminal or available."
            (decimal guild-id (concat context ".guild_id"))
            (when (gethash guild-id seen-guilds)
              (error "qq: Guild directory duplicated guild_id %s" guild-id))
-           (puthash guild-id t seen-guilds))
+           (puthash guild-id t seen-guilds)
+           (puthash guild-id (alist-get 'name guild) guild-names))
          (unless (stringp (alist-get 'name guild))
            (error "qq: %s.name must be a string" context))
          (decimal (alist-get 'avatar_seq guild)
                   (concat context ".avatar_seq") t)
          (pin (alist-get 'pinned_at guild) (concat context ".pinned_at"))))
+      (cl-loop
+       for category in categories
+       for index from 0
+       do
+       (let ((context
+              (format "emacs_get_guild_directory.categories[%d]" index)))
+         (unless (qq-api--exact-object-keys-p
+                  category '(guild_id category_id name uncategorized channel_ids))
+           (error "qq: %s has invalid fields" context))
+         (let* ((guild-id (alist-get 'guild_id category))
+                (category-id (alist-get 'category_id category))
+                (key (cons guild-id category-id))
+                (uncategorized (alist-get 'uncategorized category))
+                (channel-ids (alist-get 'channel_ids category)))
+           (decimal guild-id (concat context ".guild_id"))
+           (decimal category-id (concat context ".category_id") t)
+           (unless (gethash guild-id seen-guilds)
+             (error "qq: %s belongs to an unknown Guild" context))
+           (when (gethash key seen-categories)
+             (error "qq: Guild directory duplicated category identity"))
+           (puthash key t seen-categories)
+           (unless (stringp (alist-get 'name category))
+             (error "qq: %s.name must be a string" context))
+           (unless (memq uncategorized '(t :false))
+             (error "qq: %s.uncategorized must be a boolean" context))
+           (when (eq uncategorized t)
+             (when (gethash guild-id seen-uncategorized)
+               (error "qq: Guild directory has duplicate uncategorized groups"))
+             (puthash guild-id t seen-uncategorized))
+           (unless (proper-list-p channel-ids)
+             (error "qq: %s.channel_ids must be an array" context))
+           (cl-loop
+            for channel-id in channel-ids
+            for channel-index from 0
+            do
+            (decimal channel-id
+                     (format "%s.channel_ids[%d]" context channel-index))
+            (let ((channel-key (cons guild-id channel-id)))
+              (when (gethash channel-key referenced-channels)
+                (error "qq: Guild directory references one channel twice"))
+              (puthash channel-key t referenced-channels))))))
       (cl-loop
        for channel in channels
        for index from 0
@@ -1217,12 +1266,17 @@ segments.  A resolve action result itself must be terminal or available."
                 (key (cons guild-id channel-id)))
            (decimal guild-id (concat context ".guild_id"))
            (decimal channel-id (concat context ".channel_id"))
+           (unless (gethash guild-id seen-guilds)
+             (error "qq: %s belongs to an unknown Guild" context))
            (when (gethash key seen-channels)
              (error "qq: Guild directory duplicated channel identity"))
            (puthash key t seen-channels))
          (dolist (field '(guild_name name))
            (unless (stringp (alist-get field channel))
              (error "qq: %s.%s must be a string" context field)))
+         (unless (equal (alist-get 'guild_name channel)
+                        (gethash (alist-get 'guild_id channel) guild-names))
+           (error "qq: %s.guild_name contradicts its Guild" context))
          (unless (member (alist-get 'kind channel)
                          '("text" "forum" "live" "application" "schedule"))
            (error "qq: %s.kind is invalid" context))
@@ -1231,6 +1285,19 @@ segments.  A resolve action result itself must be terminal or available."
          (pin (alist-get 'pinned_at channel) (concat context ".pinned_at"))
          (decimal (alist-get 'latest_sequence channel)
                   (concat context ".latest_sequence") t)))
+      (maphash
+       (lambda (guild-id _present)
+         (unless (gethash guild-id seen-uncategorized)
+           (error "qq: Guild %s has no uncategorized category" guild-id)))
+       seen-guilds)
+      (unless (= (hash-table-count referenced-channels)
+                 (hash-table-count seen-channels))
+        (error "qq: Guild categories do not cover every channel exactly once"))
+      (maphash
+       (lambda (key _present)
+         (unless (gethash key seen-channels)
+           (error "qq: Guild category references an unknown channel")))
+       referenced-channels)
       (copy-tree data))))
 
 (defun qq-api--validate-guild-navigation (navigation expected-chat)

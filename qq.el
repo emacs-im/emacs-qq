@@ -32,6 +32,8 @@
 (require 'qq-user-photo)
 (require 'qq-user)
 (require 'qq-guild-user)
+(require 'qq-guild-channel)
+(require 'qq-guild-forum)
 (require 'qq-group)
 (require 'qq-contacts)
 (require 'qq-guilds)
@@ -46,6 +48,8 @@
     qq-forward-mode
     qq-group-mode
     qq-group-notices-mode
+    qq-guild-channel-mode
+    qq-guild-forum-mode
     qq-guild-user-mode
     qq-guilds-mode
     qq-red-packet-mode
