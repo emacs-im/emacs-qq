@@ -19,6 +19,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'subr-x)
 (require 'qq-customize)
 (require 'qq-runtime)
@@ -27,6 +28,7 @@
 (require 'qq-api)
 (require 'qq-chat)
 (require 'qq-search)
+(require 'qq-media)
 (require 'qq-forward)
 (require 'qq-red-packet)
 (require 'qq-user-photo)
@@ -59,6 +61,21 @@
     qq-user-photo-mode)
   "Major modes whose buffers contain account-scoped QQ client data.")
 
+(defconst qq--reset-drain-limit 128
+  "Maximum reentrant runtime/buffer cleanup passes during one QQ reset.")
+
+(defvar qq--resetting-p nil
+  "Non-nil while `qq-reset-session-state' is draining account resources.")
+
+(defun qq--foreign-live-qq-view-p (buffer)
+  "Return non-nil when BUFFER belongs to another live QQ Appkit app."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (when-let* ((view (appkit-current-view)))
+           (and (appkit-view-live-p view)
+                (eq 'qq (appkit-app-kind (appkit-view-app view)))
+                (not (eq qq-runtime--app (appkit-view-app view))))))))
+
 (defun qq--collect-client-buffers ()
   "Return live buffers owned by the current QQ client session.
 
@@ -70,7 +87,8 @@ major-mode list also finds legacy QQ buffers that are not Appkit views."
        (lambda (_id view)
          (when-let* ((buffer (and (appkit-view-p view)
                                   (appkit-view-buffer view))))
-           (when (and (buffer-live-p buffer)
+           (when (and (eq qq-runtime--app (appkit-view-app view))
+                      (buffer-live-p buffer)
                       (not (memq buffer buffers)))
              (push buffer buffers))))
        (appkit-app-view-registry qq-runtime--app)))
@@ -78,6 +96,10 @@ major-mode list also finds legacy QQ buffers that are not Appkit views."
       (when (and (buffer-live-p buffer)
                  (with-current-buffer buffer
                    (apply #'derived-mode-p qq--client-major-modes))
+                 ;; A QQ major mode is only a fallback ownership signal.  A
+                 ;; reciprocal live view belonging to another QQ app is an
+                 ;; explicit foreign owner and must never be destroyed here.
+                 (not (qq--foreign-live-qq-view-p buffer))
                  (not (memq buffer buffers)))
         (push buffer buffers)))
     (nreverse buffers)))
@@ -127,6 +149,50 @@ account data is not left visible."
                 (if (buffer-live-p buffer) (buffer-name buffer) "QQ buffer")
                 (error-message-string error-data))))))
 
+(defun qq--stop-current-runtime-for-reset ()
+  "Detach and stop the exact current runtime without losing a replacement.
+
+The global is revoked before Appkit shutdown.  If a shutdown hook creates a
+replacement runtime reentrantly, that new app remains visible to the drain
+loop instead of being overwritten by a trailing unconditional nil assignment."
+  (when-let* ((app (and (appkit-app-p qq-runtime--app) qq-runtime--app)))
+    (when (eq qq-runtime--app app)
+      (setq qq-runtime--app nil))
+    (condition-case error-data
+        (appkit-stop-app app)
+      (error
+       (message "qq: runtime cleanup failed: %s"
+                (error-message-string error-data)))
+      (quit
+       (message "qq: runtime cleanup was interrupted")))
+    app))
+
+(defun qq--drain-reset-resources (&optional initial-buffers)
+  "Stop and kill account resources until reentrant creation quiesces.
+
+INITIAL-BUFFERS preserves the registry snapshot taken before the first Appkit
+detach.  Each pass then discovers a replacement current runtime and any new
+current, detached, or legacy QQ buffers created by shutdown/kill hooks."
+  (let ((pending (copy-sequence initial-buffers))
+        (passes 0)
+        done)
+    (while (not done)
+      (let ((buffers (delete-dups
+                      (append pending (qq--collect-client-buffers))))
+            (app (and (appkit-app-p qq-runtime--app) qq-runtime--app)))
+        (setq pending nil)
+        (if (and (null app) (null buffers))
+            (setq done t)
+          (cl-incf passes)
+          (when (> passes qq--reset-drain-limit)
+            (error "QQ reset did not quiesce after %d cleanup passes"
+                   qq--reset-drain-limit))
+          (when app
+            (qq--stop-current-runtime-for-reset))
+          (qq--kill-client-buffers buffers))))
+    (setq qq-runtime--app nil)
+    t))
+
 ;;;###autoload
 (defun qq ()
   "Start emacs-qq and open the root buffer."
@@ -164,20 +230,34 @@ When transport is already open, request a fresh snapshot immediately."
 (defun qq-reset-session-state ()
   "Destructively log out of the in-memory emacs-qq session.
 
-Transport and Appkit ownership are stopped first, then store reset hooks run,
-and finally all account-scoped QQ buffers are closed.  Buffers are collected
-before Appkit detaches renamed views; legacy QQ major modes are included too."
+Transport and Appkit ownership are stopped first.  Notification timers/history
+and media requests/caches are then revoked before store reset hooks run, and
+finally all account-scoped QQ buffers are closed.  Buffers are collected before
+Appkit detaches renamed views; legacy QQ major modes are included too."
   (interactive)
-  (let ((buffers (qq--collect-client-buffers)))
-    (unwind-protect
+  (unless qq--resetting-p
+    (let ((qq--resetting-p t)
+          ;; Keep notification callbacks inert for the entire QQ transaction,
+          ;; not merely during each individual notification cleanup pass.
+          (qq-notifications--resetting-p t)
+          (buffers (qq--collect-client-buffers)))
+      (unwind-protect
+          (unwind-protect
+              (unwind-protect
+                  (qq--stop-current-runtime-for-reset)
+                (qq-notifications-reset-session-state))
+            (qq-media-clear-cache))
         (unwind-protect
-            (qq-runtime-stop)
-          (qq-state-reset))
-      ;; Include a QQ buffer created reentrantly by a reset hook, while keeping
-      ;; the pre-stop registry snapshot needed for renamed Appkit views.
-      (qq--kill-client-buffers
-       (append buffers (qq--collect-client-buffers)))))
-  (message "qq: session state reset; client buffers closed"))
+            (qq-state-reset)
+          (unwind-protect
+              (qq--drain-reset-resources buffers)
+            (unwind-protect
+                ;; Kill/cancel hooks may try to retain notification state or
+                ;; create another current runtime.  Revoke and drain once more
+                ;; before the dynamic barriers are lifted.
+                (qq-notifications-reset-session-state)
+              (qq--drain-reset-resources))))))
+    (message "qq: session state reset; client buffers closed")))
 
 (provide 'qq)
 

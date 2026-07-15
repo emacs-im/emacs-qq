@@ -990,13 +990,56 @@ list are indistinguishable — both mean \"do not claim a count\"."
                         (qq-forward--source-buffer-key source-b))))
               (let ((reopened (qq-forward-open source-a)))
                 (should (eq reopened first))
-                (should (= requests 2))
+                ;; A detached buffer is reused only as a presentation shell;
+                ;; its replacement view performs a fresh account-scoped load.
+                (should (= requests 3))
                 (with-current-buffer reopened
                   (should (appkit-view-live-p (appkit-current-view)))
                   (should qq-forward--loaded-p)
                   (should
                    (equal qq-forward--buffer-key
                           (qq-forward--source-buffer-key source-a))))))))))))
+
+(ert-deftest qq-forward-replacement-runtime-removes-old-account-preview ()
+  (qq-forward-test--with-clean-viewers
+    (let ((qq-runtime--app nil)
+          (source (qq-forward-test--message-source
+                   "9007199254742007047" "20001"))
+          (calls 0)
+          first)
+      (unwind-protect
+          (cl-letf (((symbol-function 'qq-api-get-forward)
+                     (lambda (_source callback &optional errback)
+                       (cl-incf calls)
+                       (if (= calls 1)
+                           (funcall
+                            callback
+                            (list
+                             (qq-forward-test--native-message
+                              "1" "OLD_ACCOUNT_SECRET")))
+                         (funcall errback nil "replacement failure"))
+                       (intern (format "request-%d" calls)))))
+            (save-window-excursion
+              (setq first (qq-forward-open source))
+              (with-current-buffer first
+                (should qq-forward--loaded-p)
+                (should (string-match-p "OLD_ACCOUNT_SECRET"
+                                        (buffer-string))))
+              (qq-runtime-stop)
+              (let ((replacement (qq-forward-open source)))
+                (should (eq replacement first))
+                (should (= calls 2))
+                (with-current-buffer replacement
+                  (should (appkit-view-live-p (appkit-current-view)))
+                  (should-not qq-forward--loaded-p)
+                  (should-not qq-forward--messages)
+                  (should (equal qq-forward--error "replacement failure"))
+                  (should-not (string-match-p "OLD_ACCOUNT_SECRET"
+                                              (buffer-string)))
+                  (should-not
+                   (text-property-not-all
+                    (point-min) (point-max) 'qq-forward-message nil))))))
+        (qq-runtime-stop)))))
 
 (ert-deftest qq-forward-reply-context-updates-without-replacing-row ()
   (qq-forward-test--with-clean-viewers

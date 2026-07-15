@@ -900,7 +900,10 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
     (should (memq #'qq-contacts--cancel-search change-major-mode-hook))))
 
 (ert-deftest qq-contacts-app-replacement-clears-view-owned-search-state ()
-  (let* ((app-one (appkit-start-app 'qq :id 'contacts-old-runtime))
+  ;; Runtime replacement preserves the app's stable identity.  A different
+  ;; app id denotes a different Appkit fingerprint and must not be allowed to
+  ;; steal this detached buffer merely to make the fixture pass.
+  (let* ((app-one (appkit-start-app 'qq :id 'default))
          (app-two nil)
          (qq-runtime--app app-one)
          (buffer (generate-new-buffer " *qq-contacts-runtime-replace*"))
@@ -963,7 +966,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
             (should-not qq-contacts--search-member-request)
             (should (= 4 (length cancelled)))
             (setq app-two
-                  (appkit-start-app 'qq :id 'contacts-new-runtime)
+                  (appkit-start-app 'qq :id 'default)
                   qq-runtime--app app-two)
             (let ((view-two (qq-contacts--ensure-view)))
               (should (appkit-view-live-p view-two))

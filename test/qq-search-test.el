@@ -409,6 +409,69 @@ BODY may refer to the lexical variable `view'."
         (kill-buffer first))
       (qq-runtime-stop))))
 
+(ert-deftest qq-search-detach-erases-renamed-buffer-before-runtime-replacement ()
+  "A detached singleton must not retain rendered data from the old account."
+  (let ((qq-runtime--app nil)
+        (qq-search-buffer-name "*qq-search-detach-privacy-test*")
+        buffer
+        old-view
+        (cancel-count 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'pop-to-buffer) #'ignore)
+                  ((symbol-function 'qq-api-search-messages-start)
+                   (lambda (_session _query _callback &optional _errback _limit)
+                     'search-request))
+                  ((symbol-function 'qq-api-cancel-request)
+                   (lambda (_request)
+                     (cl-incf cancel-count)
+                     (when (= cancel-count 1)
+                       (error "Synthetic cancellation failure")))))
+          (setq buffer (qq-search-open "group:20001" "OLD QUERY SECRET"))
+          (with-current-buffer buffer
+            (setq old-view (appkit-current-view)
+                  qq-search--results
+                  (list (qq-search-test--result
+                         "900719925474099312345" 100
+                         "OLD RESULT SECRET" "OLD SENDER SECRET"))
+                  qq-search--results-tail (last qq-search--results)
+                  qq-search--seen (make-hash-table :test #'equal)
+                  qq-search--status 'eof)
+            (qq-search-test--sync old-view)
+            (should (string-match-p "OLD RESULT SECRET" (buffer-string)))
+            (rename-buffer "*qq-search-renamed-detached-privacy*" t))
+
+          ;; Appkit intentionally leaves the user's buffer alive.  The view
+          ;; release hook must therefore erase both presentation and model.
+          (qq-runtime-stop)
+          (should (buffer-live-p buffer))
+          (with-current-buffer buffer
+            (should-not (appkit-current-view))
+            (should (equal (buffer-string) ""))
+            (should-not qq-search--ewoc)
+            (should-not qq-search--node-table)
+            (should-not qq-search--session-key)
+            (should-not qq-search--query)
+            (should-not qq-search--results)
+            (should-not qq-search--seen)
+            (should-not qq-search--consumed-cursors))
+
+          ;; A new runtime with the same stable app identity reclaims the
+          ;; renamed detached buffer, but only after replacement setup has
+          ;; crossed the account-clean boundary.
+          (let ((replacement
+                 (qq-search-open "private:10002" "NEW QUERY")))
+            (should (eq replacement buffer))
+            (with-current-buffer replacement
+              (should-not (eq old-view (appkit-current-view)))
+              (should (equal qq-search--session-key "private:10002"))
+              (should (equal qq-search--query "NEW QUERY"))
+              (should-not (string-match-p
+                           "OLD \(?:QUERY\|RESULT\|SENDER\) SECRET"
+                           (buffer-string))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (qq-runtime-stop))))
+
 (ert-deftest qq-search-api-callback-defers-presentation-to-view-sync ()
   (qq-search-test-with-buffer
     (let (success)

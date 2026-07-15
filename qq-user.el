@@ -814,17 +814,53 @@ RESOURCE identifies a presentation-only media dependency update."
   "Return non-nil when VIEW and OWNER load likes for USER-ID in BUFFER."
   (and (qq-user--view-current-p view)
        (eq (appkit-view-buffer view) buffer)
+       (buffer-live-p buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-user-mode)
               (eq view (appkit-current-view))
               (equal qq-user--user-id user-id)
               (eq qq-user--like-request-owner owner)))))
 
+(defun qq-user--cancel-like-request ()
+  "Cancel and forget the active received-like request."
+  (let ((request qq-user--like-request))
+    (setq qq-user--like-request nil
+          qq-user--like-request-owner nil
+          qq-user--like-loading nil)
+    (when request
+      (qq-api-cancel-request request))))
+
+(defun qq-user--apply-like-event (event)
+  "Apply one owner-checked received-like EVENT to domain state."
+  (pcase (plist-get event :type)
+    ('success
+     (setq qq-user--like-count (plist-get event :count)
+           qq-user--like-loading nil
+           qq-user--like-error nil
+           qq-user--like-request nil
+           qq-user--like-request-owner nil))
+    ('error
+     (setq qq-user--like-count nil
+           qq-user--like-loading nil
+           qq-user--like-error (plist-get event :error)
+           qq-user--like-request nil
+           qq-user--like-request-owner nil))
+    (type
+     (error "QQ: unknown received-like event %S" type))))
+
+(defun qq-user--accept-like-event (view buffer user-id owner event)
+  "Settle EVENT in BUFFER for exact VIEW's received-like request generation."
+  (when (qq-user--like-request-current-p view buffer user-id owner)
+    (with-current-buffer buffer
+      (when (qq-user--like-request-current-p view buffer user-id owner)
+        (qq-user--apply-like-event event)
+        (qq-user--request-sync view)
+        t))))
+
 (defun qq-user--refresh-like (&optional view)
   "Refresh received profile-like count using the current user VIEW."
   (setq view (or view (qq-user--ensure-view)))
-  (when qq-user--like-request
-    (qq-api-cancel-request qq-user--like-request))
+  (qq-user--cancel-like-request)
   (let ((buffer (current-buffer))
         (user-id qq-user--user-id)
         (owner (list 'user-like qq-user--user-id)))
@@ -834,47 +870,83 @@ RESOURCE identifies a presentation-only media dependency update."
           qq-user--like-request nil
           qq-user--like-request-owner owner)
     (qq-user--request-sync view)
-    (let ((request
-           (qq-api-get-user-like
-            user-id
-            (lambda (count)
-              (when (qq-user--like-request-current-p
-                     view buffer user-id owner)
-                (with-current-buffer buffer
-                  (setq qq-user--like-count count
-                        qq-user--like-loading nil
-                        qq-user--like-error nil
-                        qq-user--like-request nil
-                        qq-user--like-request-owner nil)
-                  (qq-user--request-sync view))))
-            (lambda (_response reason)
-              (when (qq-user--like-request-current-p
-                     view buffer user-id owner)
-                (with-current-buffer buffer
-                  (setq qq-user--like-count nil
-                        qq-user--like-loading nil
-                        qq-user--like-error (or reason "unknown error")
-                        qq-user--like-request nil
-                        qq-user--like-request-owner nil)
-                  (qq-user--request-sync view)))))))
-      (when (eq qq-user--like-request-owner owner)
-        (setq qq-user--like-request request)))))
+    (condition-case error-data
+        (let ((request
+               (qq-api-get-user-like
+                user-id
+                (lambda (count)
+                  (qq-user--accept-like-event
+                   view buffer user-id owner
+                   (list :type 'success :count count)))
+                (lambda (_response reason)
+                  (qq-user--accept-like-event
+                   view buffer user-id owner
+                   (list :type 'error
+                         :error (or reason "unknown error")))))))
+          ;; A local transport may settle synchronously before returning.
+          (when (eq qq-user--like-request-owner owner)
+            (setq qq-user--like-request request)))
+      ((error quit)
+       (qq-user--accept-like-event
+        view buffer user-id owner
+        (list :type 'error
+              :error (format "dispatch failed: %s"
+                             (error-message-string error-data))))
+       (when (eq (car error-data) 'quit)
+         (setq quit-flag nil)
+         (signal (car error-data) (cdr error-data)))))))
 
 (defun qq-user--photo-request-current-p (view buffer user-id owner)
   "Return non-nil when VIEW and OWNER load photos for USER-ID in BUFFER."
   (and (qq-user--view-current-p view)
        (eq (appkit-view-buffer view) buffer)
+       (buffer-live-p buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-user-mode)
               (eq view (appkit-current-view))
               (equal qq-user--user-id user-id)
               (eq qq-user--photo-request-owner owner)))))
 
+(defun qq-user--cancel-photo-request ()
+  "Cancel and forget the active inline photo-wall request."
+  (let ((request qq-user--photo-request))
+    (setq qq-user--photo-request nil
+          qq-user--photo-request-owner nil
+          qq-user--photo-loading nil)
+    (when request
+      (qq-api-cancel-request request))))
+
+(defun qq-user--apply-photo-event (event)
+  "Apply one owner-checked inline photo-wall EVENT to domain state."
+  (pcase (plist-get event :type)
+    ('success
+     (setq qq-user--photos (plist-get event :photos)
+           qq-user--photo-loading nil
+           qq-user--photo-loaded t
+           qq-user--photo-request nil
+           qq-user--photo-request-owner nil))
+    ('error
+     (setq qq-user--photos nil
+           qq-user--photo-loading nil
+           qq-user--photo-loaded nil
+           qq-user--photo-request nil
+           qq-user--photo-request-owner nil))
+    (type
+     (error "QQ: unknown inline photo-wall event %S" type))))
+
+(defun qq-user--accept-photo-event (view buffer user-id owner event)
+  "Settle EVENT in BUFFER for exact VIEW's photo-wall request generation."
+  (when (qq-user--photo-request-current-p view buffer user-id owner)
+    (with-current-buffer buffer
+      (when (qq-user--photo-request-current-p view buffer user-id owner)
+        (qq-user--apply-photo-event event)
+        (qq-user--request-sync view)
+        t))))
+
 (defun qq-user--refresh-photos (&optional view)
   "Refresh inline photo-wall entries using the current user VIEW."
   (setq view (or view (qq-user--ensure-view)))
-  (when qq-user--photo-request
-    (qq-api-cancel-request qq-user--photo-request))
+  (qq-user--cancel-photo-request)
   (let ((buffer (current-buffer))
         (user-id qq-user--user-id)
         (owner (list 'user-photos qq-user--user-id)))
@@ -884,31 +956,28 @@ RESOURCE identifies a presentation-only media dependency update."
           qq-user--photo-request nil
           qq-user--photo-request-owner owner)
     (qq-user--request-sync view)
-    (let ((request
-           (qq-api-get-user-photo-wall
-            user-id
-            (lambda (photos)
-              (when (qq-user--photo-request-current-p
-                     view buffer user-id owner)
-                (with-current-buffer buffer
-                  (setq qq-user--photos photos
-                        qq-user--photo-loading nil
-                        qq-user--photo-loaded t
-                        qq-user--photo-request nil
-                        qq-user--photo-request-owner nil)
-                  (qq-user--request-sync view))))
-            (lambda (_response _reason)
-              (when (qq-user--photo-request-current-p
-                     view buffer user-id owner)
-                (with-current-buffer buffer
-                  (setq qq-user--photos nil
-                        qq-user--photo-loading nil
-                        qq-user--photo-loaded nil
-                        qq-user--photo-request nil
-                        qq-user--photo-request-owner nil)
-                  (qq-user--request-sync view)))))))
-      (when (eq qq-user--photo-request-owner owner)
-        (setq qq-user--photo-request request)))))
+    (condition-case error-data
+        (let ((request
+               (qq-api-get-user-photo-wall
+                user-id
+                (lambda (photos)
+                  (qq-user--accept-photo-event
+                   view buffer user-id owner
+                   (list :type 'success :photos photos)))
+                (lambda (_response _reason)
+                  (qq-user--accept-photo-event
+                   view buffer user-id owner '(:type error))))))
+          ;; A local transport may settle synchronously before returning.
+          (when (eq qq-user--photo-request-owner owner)
+            (setq qq-user--photo-request request)))
+      ((error quit)
+       (qq-user--accept-photo-event
+        view buffer user-id owner
+        (list :type 'error
+              :error (error-message-string error-data)))
+       (when (eq (car error-data) 'quit)
+         (setq quit-flag nil)
+         (signal (car error-data) (cdr error-data)))))))
 
 (defun qq-user-open-chat ()
   "Open a private chat with the current profile user."
@@ -921,11 +990,30 @@ RESOURCE identifies a presentation-only media dependency update."
   "Return non-nil when VIEW and OWNER still like USER-ID in BUFFER."
   (and (qq-user--view-current-p view)
        (eq (appkit-view-buffer view) buffer)
+       (buffer-live-p buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-user-mode)
               (eq view (appkit-current-view))
               (equal qq-user--user-id user-id)
               (eq qq-user--send-like-request-owner owner)))))
+
+(defun qq-user--accept-send-like-event
+    (view buffer user-id owner event)
+  "Settle EVENT for the exact profile-like mutation generation.
+
+Return EVENT when accepted, and nil when VIEW, BUFFER, USER-ID, or OWNER is
+stale."
+  (when (qq-user--send-like-request-current-p
+         view buffer user-id owner)
+    (with-current-buffer buffer
+      (when (qq-user--send-like-request-current-p
+             view buffer user-id owner)
+        (setq qq-user--send-like-request nil
+              qq-user--send-like-request-owner nil)
+        (when (equal (plist-get event :outcome) "daily_limit")
+          (setq qq-user--like-limit-date (format-time-string "%Y-%m-%d")))
+        (qq-user--request-sync view)
+        event))))
 
 (defun qq-user-like ()
   "Add one native QQ profile like to the current user."
@@ -945,37 +1033,33 @@ RESOURCE identifies a presentation-only media dependency update."
       (setq qq-user--send-like-request nil
             qq-user--send-like-request-owner owner)
       (qq-user--request-sync view)
-      (let ((request
-             (qq-api-like-user
-              user-id
-              (lambda (result)
-                (when (qq-user--send-like-request-current-p
-                       view buffer user-id owner)
-                  (with-current-buffer buffer
-                    (setq qq-user--send-like-request nil
-                          qq-user--send-like-request-owner nil)
-                    (pcase (alist-get 'outcome result)
-                      ("liked"
-                       (qq-user--refresh-like)
-                       (qq-user--request-sync view)
-                       (message "qq: 已给 %s 的资料新增 1 个赞"
-                                (qq-user--display-name)))
-                      ("daily_limit"
-                       (setq qq-user--like-limit-date
-                             (format-time-string "%Y-%m-%d"))
-                       (qq-user--request-sync view)
-                       (message "qq: 今日对 %s 的资料点赞已达上限"
-                                (qq-user--display-name)))))))
-              (lambda (response reason)
-                (when (qq-user--send-like-request-current-p
-                       view buffer user-id owner)
-                  (with-current-buffer buffer
-                    (setq qq-user--send-like-request nil
-                          qq-user--send-like-request-owner nil)
-                    (qq-user--request-sync view)
-                    (qq-api--default-error response reason)))))))
-        (when (eq qq-user--send-like-request-owner owner)
-          (setq qq-user--send-like-request request))))
+      (condition-case error-data
+          (let ((request
+                 (qq-api-like-user
+                  user-id
+                  (lambda (result)
+                    (when (qq-user--accept-send-like-event
+                           view buffer user-id owner
+                           (list :type 'success
+                                 :outcome (alist-get 'outcome result)))
+                      (when (equal (alist-get 'outcome result) "liked")
+                        (qq-user--refresh-like view))))
+                  (lambda (response reason)
+                    (when (qq-user--accept-send-like-event
+                           view buffer user-id owner
+                           (list :type 'error :reason reason))
+                      (qq-api--default-error response reason))))))
+            ;; A local transport may settle synchronously before returning.
+            (when (eq qq-user--send-like-request-owner owner)
+              (setq qq-user--send-like-request request)))
+        ((error quit)
+         (qq-user--accept-send-like-event
+          view buffer user-id owner
+          (list :type 'dispatch-error
+                :reason (error-message-string error-data)))
+         (when (eq (car error-data) 'quit)
+           (setq quit-flag nil))
+         (signal (car error-data) (cdr error-data)))))
     (qq-user--sync-now view)))
 
 (defun qq-user-open-avatar ()
@@ -1011,30 +1095,33 @@ RESOURCE identifies a presentation-only media dependency update."
 
 (defun qq-user--cancel-request ()
   "Cancel asynchronous work owned by the current user view."
-  (when qq-user--request
-    (qq-api-cancel-request qq-user--request))
-  (when qq-user--like-request
-    (qq-api-cancel-request qq-user--like-request))
-  (when qq-user--send-like-request
-    (qq-api-cancel-request qq-user--send-like-request))
-  (when qq-user--photo-request
-    (qq-api-cancel-request qq-user--photo-request))
-  (when-let* ((state qq-user--friend-add-state)
-              (request (qq-user--friend-add-state-request state)))
-    (qq-api-cancel-request request))
-  (setq qq-user--request nil
-        qq-user--request-owner nil
-        qq-user--like-request nil
-        qq-user--like-request-owner nil
-        qq-user--send-like-request nil
-        qq-user--send-like-request-owner nil
-        qq-user--photo-request nil
-        qq-user--photo-request-owner nil
-        qq-user--loading nil
-        qq-user--like-loading nil
-        qq-user--photo-loading nil
-        qq-user--search-result nil
-        qq-user--friend-add-state nil))
+  (let ((requests
+         (delq nil
+               (list qq-user--request
+                     qq-user--like-request
+                     qq-user--send-like-request
+                     qq-user--photo-request
+                     (and qq-user--friend-add-state
+                          (qq-user--friend-add-state-request
+                           qq-user--friend-add-state))))))
+    ;; Release every generation before transport cancellation.  A synchronous
+    ;; cancellation callback must already be stale and cannot settle a later
+    ;; replacement owner.
+    (setq qq-user--request nil
+          qq-user--request-owner nil
+          qq-user--like-request nil
+          qq-user--like-request-owner nil
+          qq-user--send-like-request nil
+          qq-user--send-like-request-owner nil
+          qq-user--photo-request nil
+          qq-user--photo-request-owner nil
+          qq-user--loading nil
+          qq-user--like-loading nil
+          qq-user--photo-loading nil
+          qq-user--search-result nil
+          qq-user--friend-add-state nil)
+    (dolist (request requests)
+      (qq-api-cancel-request request))))
 
 (defun qq-user--clear-view-data ()
   "Clear account-scoped data projected by the current user view."

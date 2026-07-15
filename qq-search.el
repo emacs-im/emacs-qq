@@ -242,21 +242,38 @@ text in the results buffer can never receive search highlighting."
     (and (qq-search--view-current-p view (current-buffer)) view)))
 
 (defun qq-search--reset-buffer-work (buffer)
-  "Reset requests and result state retained by search BUFFER."
+  "Erase all account-scoped search state retained by BUFFER.
+
+This is a view-lifecycle privacy boundary.  A detached buffer can outlive its
+Appkit view (and can be renamed by the user), so clearing only the transport
+request and Lisp result list is insufficient: rendered text properties and
+EWOC markers would otherwise retain the previous account's messages."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (derived-mode-p 'qq-search-mode)
-        (qq-search--cancel-request)
-        (setq qq-search--query nil
-              qq-search--results nil
-              qq-search--results-tail nil
-              qq-search--seen nil
-              qq-search--consumed-cursors nil
-              qq-search--next-cursor nil
-              qq-search--status 'eof
-              qq-search--error nil
-              qq-search--pending-next-key nil
-              qq-search--focus-first-result-p nil)))))
+        (unwind-protect
+            (qq-search--cancel-request)
+          ;; Cancellation can synchronously signal through an alternate
+          ;; transport.  Privacy cleanup must still finish before Appkit lets
+          ;; a replacement runtime attach this buffer.
+          (unwind-protect
+              (let ((inhibit-read-only t)
+                    (inhibit-modification-hooks t))
+                (widen)
+                (erase-buffer))
+            (setq qq-search--ewoc nil
+                  qq-search--node-table nil
+                  qq-search--session-key nil
+                  qq-search--query nil
+                  qq-search--results nil
+                  qq-search--results-tail nil
+                  qq-search--seen nil
+                  qq-search--consumed-cursors nil
+                  qq-search--next-cursor nil
+                  qq-search--status 'eof
+                  qq-search--error nil
+                  qq-search--pending-next-key nil
+                  qq-search--focus-first-result-p nil)))))))
 
 (defun qq-search--release-view-work (view buffer)
   "Release BUFFER work while it is still owned by search VIEW."
@@ -268,10 +285,10 @@ text in the results buffer can never receive search highlighting."
 (defun qq-search--setup-view (view)
   "Reset replacement state and register lifecycle cleanup for search VIEW."
   (let ((buffer (appkit-view-buffer view)))
-    (qq-search--reset-buffer-work buffer)
     (appkit-register-handle
      view 'function
-     (apply-partially #'qq-search--release-view-work view buffer))))
+     (apply-partially #'qq-search--release-view-work view buffer))
+    (qq-search--reset-buffer-work buffer)))
 
 (defun qq-search--ensure-view ()
   "Return the live Appkit view owning the current search buffer."
@@ -290,7 +307,11 @@ text in the results buffer can never receive search highlighting."
      ((appkit-view-live-p current)
       (error "QQ: search buffer belongs to another Appkit view"))
      (t
-      (let ((view
+      ;; SETUP clears a detached view's old account identity.  This direct
+      ;; attach path is used only after the caller has supplied the fresh
+      ;; session identity explicitly, so restore that identity after cleanup.
+      (let ((session-key qq-search--session-key)
+            (view
              (appkit-attach-view
               :app app
               :id qq-search--view-id
@@ -298,6 +319,7 @@ text in the results buffer can never receive search highlighting."
               :sync-function #'qq-search--sync-invalidations
               :parts '(results))))
         (qq-search--setup-view view)
+        (setq qq-search--session-key session-key)
         view)))))
 
 (defun qq-search--request-sync (&optional view)

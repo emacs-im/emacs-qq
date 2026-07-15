@@ -55,6 +55,14 @@
     (role . "admin")
     (robot . nil)))
 
+(defun qq-completion-test--cache-members (query members)
+  "Install QUERY MEMBERS under the current test runtime generation."
+  (let ((view (appkit-current-view)))
+    (unless (appkit-view-live-p view)
+      (ert-fail "member cache fixture requires a live Appkit view"))
+    (qq-completion--activate-member-app (appkit-view-app view))
+    (puthash query members qq-completion--member-cache)))
+
 (ert-deftest qq-completion-token-at-point-classifies-all-composer-syntax ()
   (qq-completion-test-with-group
     (cl-letf (((symbol-function 'qq-completion--base-face-candidates)
@@ -92,8 +100,8 @@
 
 (ert-deftest qq-completion-member-capf-inserts-real-at-segment ()
   (qq-completion-test-with-group
-    (puthash "alice" (list qq-completion-test--member)
-             qq-completion--member-cache)
+    (qq-completion-test--cache-members
+     "alice" (list qq-completion-test--member))
     (insert "@alice")
     (cl-letf (((symbol-function 'qq-media-avatar-display-string)
                (lambda (_user-id) "@")))
@@ -211,8 +219,8 @@
           (query-reads 0)
           (picker-reads 0))
       ;; A broad composer cache must never become a poke target source.
-      (puthash "" (list '((user_id . "99999")))
-               qq-completion--member-cache)
+      (qq-completion-test--cache-members
+       "" (list '((user_id . "99999"))))
       (cl-letf (((symbol-function 'read-string)
                  (lambda (_prompt &optional initial _history &rest _)
                    (cl-incf query-reads)
@@ -626,6 +634,136 @@
       (should-not (gethash "alice" qq-completion--member-pending))
       (should (eq qq-completion--cache-miss
                   (qq-completion--cached-members "alice"))))))
+
+(ert-deftest qq-completion-replacement-view-retries-member-query-immediately ()
+  (qq-completion-test-with-group
+    (let (successes old-view replacement-view)
+      (cl-letf (((symbol-function 'qq-api-search-group-members)
+                 (lambda (_group-id _query callback &optional _errback _limit)
+                   (setq successes (append successes (list callback)))
+                   (intern (format "request-%d" (length successes))))))
+        (qq-completion--request-members "alice")
+        (setq old-view
+              (plist-get (gethash "alice" qq-completion--member-pending) :view))
+        (appkit-kill-view old-view)
+        (setq replacement-view (qq-chat--ensure-view))
+        (qq-completion--request-members "alice")
+        (should (= (length successes) 2))
+        (let ((replacement-owner
+               (gethash "alice" qq-completion--member-pending)))
+          (should (eq (plist-get replacement-owner :view) replacement-view))
+          ;; The old completion cannot populate the cache or remove the newer
+          ;; request entry, even when it returns first.
+          (funcall (car successes)
+                   (list '((user_id . "10002") (nickname . "Old"))))
+          (should (eq replacement-owner
+                      (gethash "alice" qq-completion--member-pending)))
+          (should (eq qq-completion--cache-miss
+                      (qq-completion--cached-members "alice")))
+          (funcall (cadr successes) (list qq-completion-test--member))
+          (should-not (gethash "alice" qq-completion--member-pending))
+          (should (equal (qq-completion--cached-members "alice")
+                         (list qq-completion-test--member))))))))
+
+(ert-deftest qq-completion-runtime-replacement-invalidates-member-cache ()
+  (let ((qq-runtime--app nil)
+        (qq-state-change-hook nil)
+        (old-member
+         '((user_id . "10002") (nickname . "OLD_ACCOUNT_SECRET")))
+        (late-old-member
+         '((user_id . "10003") (nickname . "OLD_ACCOUNT_SECRET_LATE")))
+        (new-member
+         '((user_id . "20002") (nickname . "New Account Alice")))
+        buffer app-a app-b view-a view-b fingerprint successes requests)
+    (unwind-protect
+        (progn
+          (qq-state-reset)
+          (qq-state-upsert-session
+           "group:20001"
+           '((type . group) (target-id . "20001") (title . "Group")) nil)
+          (setq buffer
+                (generate-new-buffer " *qq-completion-runtime-cache-test*"))
+          (with-current-buffer buffer
+            (qq-chat-mode)
+            (setq-local qq-chat--session-key "group:20001")
+            (appkit-chatbuf-install-prompt "qq> ")
+            (setq app-a (appkit-start-app 'qq :id 'default)
+                  qq-runtime--app app-a
+                  view-a (qq-chat--ensure-view)
+                  fingerprint appkit--view-fingerprint)
+            (cl-letf
+                (((symbol-function 'qq-api-search-group-members)
+                  (lambda (_group-id query callback
+                           &optional _errback _limit)
+                    (setq successes (append successes (list callback))
+                          requests
+                          (append requests
+                                  (list (list qq-runtime--app query))))
+                    (intern (format "request-%d" (length successes))))))
+              ;; Runtime A first caches an account-private member, then leaves
+              ;; another same-query callback in flight across shutdown.
+              (qq-completion--request-members "alice")
+              (funcall (car successes) (list old-member))
+              (should (eq qq-completion--member-cache-owner app-a))
+              (should (equal (qq-completion--cached-members "alice")
+                             (list old-member)))
+              (qq-completion--request-members "alice")
+              (should (= (length successes) 2))
+              (appkit-stop-app app-a)
+              (setq qq-runtime--app nil)
+              (should-not (appkit-current-view))
+
+              ;; Runtime B has the same stable Appkit fingerprint and reuses
+              ;; this detached chat buffer, but is a distinct app generation.
+              (setq app-b (appkit-start-app 'qq :id 'default)
+                    qq-runtime--app app-b
+                    view-b (qq-chat--ensure-view))
+              (should-not (eq view-a view-b))
+              (should (equal appkit--view-fingerprint fingerprint))
+              (appkit-chatbuf-input-set-text "@alice")
+              (goto-char (point-max))
+              ;; A's apparent cache hit must be invisible.  The normal CAPF
+              ;; path therefore submits B's request immediately.
+              (should-not (qq-completion-member-capf))
+              (should (= (length successes) 3))
+              (should (equal (mapcar #'cadr requests)
+                             '("alice" "alice" "alice")))
+              (should (eq (caar (last requests)) app-b))
+              (should (eq qq-completion--member-cache-owner app-b))
+              (should (eq (qq-completion--cached-members "alice")
+                          qq-completion--cache-miss))
+              (let ((b-owner
+                     (gethash "alice" qq-completion--member-pending)))
+                ;; A's late callback cannot remove B's owner or populate B's
+                ;; replacement table with old-account data.
+                (funcall (nth 1 successes) (list late-old-member))
+                (should (eq b-owner
+                            (gethash "alice"
+                                     qq-completion--member-pending)))
+                (should (eq (qq-completion--cached-members "alice")
+                            qq-completion--cache-miss))
+                (funcall (nth 2 successes) (list new-member)))
+              (should-not (gethash "alice" qq-completion--member-pending))
+              (should (equal (qq-completion--cached-members "alice")
+                             (list new-member)))
+              (let* ((capf (qq-completion-member-capf))
+                     (table (nth 2 capf))
+                     (labels (all-completions "@alice" table)))
+                (should capf)
+                (should (= (length successes) 3))
+                (should-not
+                 (seq-some
+                  (lambda (label)
+                    (string-match-p "OLD_ACCOUNT_SECRET" label))
+                  labels))))))
+      (when (appkit-app-live-p app-a)
+        (appkit-stop-app app-a))
+      (when (appkit-app-live-p app-b)
+        (appkit-stop-app app-b))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (setq qq-runtime--app nil)
+      (qq-state-reset))))
 
 (ert-deftest qq-completion-replacement-view-rejects-favorite-response ()
   (qq-completion-test-with-group

@@ -6868,6 +6868,347 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
           (equal (qq-chat--message-selection-anchors)
                  '("9007199254743009336"))))))))
 
+(ert-deftest qq-chat-replacement-view-settles-older-history-owner ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice") (target-id . "10001") (type . private)) nil)
+   (puthash
+    "private:10001"
+    '(((server-id . "200") (time . 200))
+      ((server-id . "300") (time . 300)))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat--set-history-window "200" "300")
+     (let (callback old-view replacement-view projection-calls)
+       (cl-letf (((symbol-function 'qq-api-fetch-older-history)
+                  (lambda (_session _before success &optional _failure _count)
+                    (setq callback success)
+                    'older-token)))
+         (qq-chat-load-older-messages t))
+       (should (appkit-chat-history-loading-p))
+       (setq old-view (appkit-current-view))
+       (appkit-kill-view old-view)
+       (setq replacement-view (qq-chat--ensure-view))
+       (should-not (eq old-view replacement-view))
+       ;; The transport has already merged its canonical batch before this
+       ;; metadata callback, matching the real API boundary.
+       (puthash
+        "private:10001"
+        '(((server-id . "150") (time . 150))
+          ((server-id . "200") (time . 200))
+          ((server-id . "300") (time . 300)))
+        qq-state--messages-by-session)
+       (cl-letf (((symbol-function 'appkit-request-sync)
+                  (lambda (&rest arguments)
+                    (push arguments projection-calls))))
+         (funcall callback
+                  '(:added-count 1
+                    :message-count 2
+                    :batch-message-ids ("150" "200"))))
+       (should-not projection-calls)
+       (should-not (appkit-chat-history-loading-p))
+       (should-not (appkit-chat-history-request-owner))
+       (should (equal (appkit-chat-history-window-first-key) "150"))
+       (should (equal (appkit-chat-history-window-last-key) "300"))))))
+
+(ert-deftest qq-chat-replacement-view-settles-filter-and-search-owners ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Group") (target-id . "20001") (type . group)) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat--set-empty-history-window)
+     (qq-chat-render)
+     (let (filter-callback old-view replacement-view projection-calls)
+       (cl-letf (((symbol-function 'qq-api-filter-messages-start)
+                  (lambda (_session _query success &optional _failure _limit)
+                    (setq filter-callback success)
+                    'filter-token)))
+         (qq-chat-filter-search "needle"))
+       (setq old-view (appkit-current-view))
+       (appkit-kill-view old-view)
+       (setq replacement-view (qq-chat--ensure-view))
+       (cl-letf (((symbol-function 'appkit-request-sync)
+                  (lambda (&rest arguments)
+                    (push arguments projection-calls))))
+         (funcall
+          filter-callback
+          `((projection . "message")
+            (results . (,(qq-chat-test--filter-snapshot
+                          "90" "90" 90 "needle")))
+            (next_cursor))))
+       (should-not projection-calls)
+       (should-not qq-chat--filter-request)
+       (should-not qq-chat--filter-owner)
+       (should-not qq-chat--filter-sync-request)
+       (should (= (length (plist-get qq-chat--msg-filter :items)) 1))
+       (should (eq replacement-view (appkit-current-view))))
+     (qq-chat--deactivate-filter)
+     (let (search-callback old-view replacement-view opened projection-calls)
+       (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                  (lambda (&optional _position) nil))
+                 ((symbol-function 'qq-api-search-messages-start)
+                  (lambda (_session _query success &optional _failure _limit)
+                    (setq search-callback success)
+                    'search-token))
+                 ((symbol-function 'qq-chat-open-message)
+                  (lambda (_session message-id &optional _query)
+                    (setq opened message-id))))
+         (qq-chat-search "needle"))
+       (setq old-view (appkit-current-view))
+       (appkit-kill-view old-view)
+       (setq replacement-view (qq-chat--ensure-view))
+       (cl-letf (((symbol-function 'appkit-request-sync)
+                  (lambda (&rest arguments)
+                    (push arguments projection-calls))))
+         (funcall
+          search-callback
+          `((results . (,(qq-chat-test--search-result "91" "91" 91)))
+            (next_cursor))))
+       (should-not projection-calls)
+       (should-not opened)
+       (should-not qq-chat--search-request)
+       (should-not qq-chat--search-owner)
+       (should-not qq-chat--callback-sync-request)
+       (should (equal (alist-get 'message_id (car qq-chat--search-results))
+                      "91"))
+       (should (eq replacement-view (appkit-current-view)))))))
+
+(ert-deftest qq-chat-replacement-view-settles-initial-history-chain ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Group") (target-id . "20001") (type . group)) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let (read-callback latest-callback old-view replacement-view
+                         projection-calls)
+       (cl-letf (((symbol-function 'qq-api-fetch-session-read-state)
+                  (lambda (_session success &optional _failure)
+                    (setq read-callback success)
+                    'read-token))
+                 ((symbol-function 'qq-api-fetch-older-history)
+                  (lambda (_session _before success &optional _failure _count)
+                    (setq latest-callback success)
+                    'latest-token)))
+         (qq-chat--load-initial-history (current-buffer) "group:20001")
+         (should (eq qq-chat--initial-history-request 'read-token))
+         (setq old-view (appkit-current-view))
+         (appkit-kill-view old-view)
+         (setq replacement-view (qq-chat--ensure-view))
+         (cl-letf (((symbol-function 'appkit-request-sync)
+                    (lambda (&rest arguments)
+                      (push arguments projection-calls))))
+           (funcall read-callback
+                    '((unread_count . 0)
+                      (first_unread . nil)
+                      (latest . nil)))
+           (should (eq qq-chat--initial-history-request 'latest-token))
+           (puthash
+            "group:20001"
+            '(((server-id . "300") (time . 300)))
+            qq-state--messages-by-session)
+           (funcall latest-callback
+                    '(:added-count 1
+                      :message-count 1
+                      :batch-message-ids ("300")))))
+       (should-not projection-calls)
+       (should-not qq-chat--initial-history-request)
+       (should-not qq-chat--initial-history-owner)
+       (should-not (appkit-chat-history-loading-p))
+       (should (equal (appkit-chat-history-window-first-key) "300"))
+       (should (eq replacement-view (appkit-current-view)))))))
+
+(ert-deftest qq-chat-replacement-view-settles-forward-owner ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Group") (target-id . "20001") (type . group)) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let* ((anchor "9007199254743009336")
+            (membership (car (qq-chat-test--selection anchor)))
+            (old-view (qq-chat--ensure-view))
+            (owner (list :view old-view))
+            replacement-view projection-calls)
+       (setq qq-chat--message-selection (list membership)
+             qq-chat--forward-request 'forward-token
+             qq-chat--forward-request-owner owner)
+       (appkit-kill-view old-view)
+       (setq replacement-view (qq-chat--ensure-view))
+       (cl-letf (((symbol-function 'appkit-request-sync)
+                  (lambda (&rest arguments)
+                    (push arguments projection-calls))))
+         (qq-chat--forward-succeeded
+          (current-buffer) "group:20001" owner (list anchor)
+          (list (cons anchor
+                      (qq-chat-message-selection-owner membership)))
+          'individual "private:10002" nil))
+       (should-not projection-calls)
+       (should-not qq-chat--forward-request)
+       (should-not qq-chat--forward-request-owner)
+       (should-not qq-chat--forward-sync-request)
+       (should-not qq-chat--message-selection)
+       (should (equal qq-chat--last-forward-target-key "private:10002"))
+       (should (eq replacement-view (appkit-current-view)))))))
+
+(ert-deftest qq-chat-failed-send-survives-replacement-first-render ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice") (target-id . "10001") (type . private)) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat--set-empty-history-window)
+     (qq-chat-render)
+     (qq-chat--insert-input-segment-object
+      '((type . "at")
+        (data . ((qq . "10001") (name . "Alice Card")))))
+     (qq-chat--set-reply-message
+      '((server-id . "9007199254742007094") (raw-message . "source")))
+     ;; Match the send boundary, which normalizes live editable properties into
+     ;; the canonical snapshot before the destructive clear.
+     (qq-chat--sync-draft-from-buffer)
+     (let (failure old-view replacement-view draft-state aux-state segments
+                   undo-state)
+       (setq draft-state (appkit-chatbuf-input-state)
+             aux-state (copy-tree (appkit-chatbuf-aux-state))
+             segments (qq-chat--current-input-segments))
+       (buffer-enable-undo)
+       (setq buffer-undo-list nil)
+       (cl-letf (((symbol-function 'qq-api-send-message)
+                  (lambda (_session _segments &optional _raw _success errback)
+                    (setq failure errback)
+                    'send-token))
+                 ((symbol-function 'qq-api--default-error) #'ignore))
+         (qq-chat-send-message)
+         (funcall failure nil "network failed"))
+       (should (equal-including-properties
+                (appkit-chatbuf-input-state) draft-state))
+       (should (equal (appkit-chatbuf-input-string) ""))
+       (should qq-chat--send-sync-request)
+       (setq undo-state (copy-tree buffer-undo-list)
+             old-view (appkit-current-view))
+       (appkit-kill-view old-view)
+       (setq replacement-view (qq-chat--ensure-view))
+       (should-not (eq old-view replacement-view))
+       (qq-chat-render)
+       (should-not qq-chat--send-sync-request)
+       (should (appkit-chatbuf-string-has-objects-p
+                (appkit-chatbuf-input-state)))
+       (should (equal (qq-chat--current-input-segments) segments))
+       (should (equal (substring-no-properties
+                       (appkit-chatbuf-input-string))
+                      (substring-no-properties draft-state)))
+       (should (appkit-chatbuf-input-has-objects-p))
+       (should (equal (appkit-chatbuf-aux-state) aux-state))
+       (should (equal buffer-undo-list undo-state))))))
+
+(ert-deftest qq-chat-late-send-failure-materializes-current-replacement-view ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((title . "Alice") (target-id . "10001") (type . private)) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat--set-empty-history-window)
+     (qq-chat-render)
+     (qq-chat--insert-input-segment-object
+      '((type . "at")
+        (data . ((qq . "10001") (name . "Alice Card")))))
+     (qq-chat--set-reply-message
+      '((server-id . "9007199254742007094") (raw-message . "source")))
+     (qq-chat--sync-draft-from-buffer)
+     (let (failure old-view replacement-view draft-state aux-state segments
+                   sync-views)
+       (setq draft-state (appkit-chatbuf-input-state)
+             aux-state (copy-tree (appkit-chatbuf-aux-state))
+             segments (qq-chat--current-input-segments))
+       (cl-letf (((symbol-function 'qq-api-send-message)
+                  (lambda (_session _segments &optional _raw _success errback)
+                    (setq failure errback)
+                    'send-token)))
+         (qq-chat-send-message))
+       (setq old-view (appkit-current-view))
+       (appkit-kill-view old-view)
+       (setq replacement-view (qq-chat--ensure-view))
+       ;; This is the reverse ordering: the replacement has already projected
+       ;; the successful-send shape before the old transport reports failure.
+       (qq-chat-render)
+       (should (equal (appkit-chatbuf-input-state) ""))
+       (should (equal (appkit-chatbuf-input-string) ""))
+       (let ((request-sync (symbol-function 'appkit-request-sync)))
+         (cl-letf (((symbol-function 'appkit-request-sync)
+                    (lambda (view &rest arguments)
+                      (push view sync-views)
+                      (apply request-sync view arguments)))
+                   ((symbol-function 'qq-api--default-error) #'ignore))
+           (funcall failure nil "network failed")))
+       (should (equal sync-views (list replacement-view)))
+       (should (eq (plist-get qq-chat--send-sync-request :view)
+                   replacement-view))
+       (should (equal-including-properties
+                (appkit-chatbuf-input-state) draft-state))
+       (should (equal (appkit-chatbuf-input-string) ""))
+       (qq-chat-test-sync-until-idle)
+       (should-not qq-chat--send-sync-request)
+       (should (appkit-chatbuf-input-has-objects-p))
+       (should (equal (qq-chat--current-input-segments) segments))
+       (should (equal (appkit-chatbuf-aux-state) aux-state))
+       ;; The first real edit must extend the materialized rich draft instead
+       ;; of synchronizing the formerly empty replacement tail over it.
+       (goto-char (appkit-chatbuf-input-logical-end-position))
+       (insert " tail")
+       (should (appkit-chatbuf-string-has-objects-p
+                (appkit-chatbuf-input-state)))
+       (should (equal (car (qq-chat--current-input-segments))
+                      (car segments)))
+       (should (string-suffix-p
+                " tail" (appkit-chatbuf-input-string)))))))
+
+(ert-deftest qq-chat-search-cancel-invalidates-queued-result-action ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Group") (target-id . "20001") (type . group)) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat--set-empty-history-window)
+     (qq-chat-render)
+     (let (callback opened)
+       (cl-letf (((symbol-function 'qq-chat--message-at-point)
+                  (lambda (&optional _position) nil))
+                 ((symbol-function 'qq-api-search-messages-start)
+                  (lambda (_session _query success &optional _failure _limit)
+                    (setq callback success)
+                    'search-token))
+                 ((symbol-function 'qq-chat-open-message)
+                  (lambda (_session message-id &optional _query)
+                    (setq opened message-id))))
+         (qq-chat-search "needle")
+         (funcall
+          callback
+          `((results . (,(qq-chat-test--search-result "91" "91" 91)))
+            (next_cursor)))
+         (should qq-chat--callback-sync-request)
+         (qq-chat-search-cancel)
+         ;; The queued closure used to index the now-cleared result list here.
+         (qq-chat-test-sync-until-idle))
+       (should-not opened)
+       (should-not qq-chat--last-search-query)
+       (should-not qq-chat--search-results)
+       (should-not qq-chat--search-owner)))))
+
 (provide (quote qq-chat-test))
 
 ;;; qq-chat-test.el ends here

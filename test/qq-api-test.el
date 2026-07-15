@@ -2553,7 +2553,7 @@ The authoritative post-state reports UNREAD-COUNT."
                       callback
                       '((data
                          . ((guilds
-                             . (((guild_id . "9007199254740993")
+                            . (((guild_id . "9007199254740993")
                                  (name . "Synthetic guild")
                                  (avatar_seq . "3")
                                  (pinned_at))))

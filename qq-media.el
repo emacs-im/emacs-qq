@@ -9,6 +9,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'json)
 (require 'seq)
 (require 'subr-x)
@@ -36,10 +37,63 @@
 (defvar qq-media--download-state-table (make-hash-table :test #'equal)
   "Download state plist table keyed by QQ media logical identity.")
 
+(defvar qq-media--account-generation 0
+  "Account generation owning asynchronous media cache callbacks.")
+
+(defvar qq-media--custom-faces nil
+  "Cached list of favorite custom-face alists from NapCat.")
+
+(defvar qq-media--custom-faces-fetched-at nil
+  "Float time when `qq-media--custom-faces' was last fetched.")
+
+(defvar qq-media--custom-face-waiters nil
+  "Callbacks waiting for the shared favorite-face refresh.")
+
+(defvar qq-media--custom-face-refresh-owner nil
+  "Owner plist for the current favorite-face refresh, or nil.")
+
+(defvar qq-media--custom-face-completion-pairs nil
+  "Active `(LABEL . FACE)' pairs for favorite-face `completing-read'.")
+
+(defun qq-media--custom-face-owner-generation-current-p (owner)
+  "Return non-nil when OWNER belongs to the current account generation."
+  (= (or (plist-get owner :generation) -1)
+     qq-media--account-generation))
+
+(defun qq-media--custom-face-owner-current-p (owner)
+  "Return non-nil when OWNER owns the current favorite-face request."
+  (and (eq owner qq-media--custom-face-refresh-owner)
+       (qq-media--custom-face-owner-generation-current-p owner)))
+
+(defun qq-media--revoke-custom-face-work ()
+  "Revoke favorite-face callbacks and cancel their transport request."
+  ;; Invalidate callback ownership before cancellation.  Some transports run
+  ;; an errback synchronously from their cancellation path.
+  (cl-incf qq-media--account-generation)
+  (let ((token (and qq-media--custom-face-refresh-owner
+                    (plist-get qq-media--custom-face-refresh-owner :token))))
+    (setq qq-media--custom-face-refresh-owner nil
+          qq-media--custom-face-waiters nil
+          qq-media--custom-faces nil
+          qq-media--custom-faces-fetched-at nil
+          qq-media--custom-face-completion-pairs nil)
+    (when token
+      (condition-case err
+          (qq-api-cancel-request token)
+        (error
+         (message "qq: favorite-face request cancellation failed: %s"
+                  (error-message-string err)))
+        (quit
+         (message "qq: favorite-face request cancellation was interrupted"))))))
+
 (defun qq-media-clear-cache ()
-  "Clear cached resource metadata and disk-backed remote image cache."
+  "Clear all account-owned media caches and asynchronous work."
   (interactive)
-  (appkit-media-clear-video-decoration-cache 'qq)
+  (qq-media--revoke-custom-face-work)
+  (condition-case nil
+      (appkit-media-clear-video-decoration-cache 'qq)
+    (error nil)
+    (quit nil))
   (let (keys transfers)
     (maphash
      (lambda (key fetching)
@@ -54,9 +108,15 @@
            (push transfer transfers))))
      qq-media--download-state-table)
     (dolist (key keys)
-      (appkit-media-cancel-video-preview (concat "qq:" key)))
+      (condition-case nil
+          (appkit-media-cancel-video-preview (concat "qq:" key))
+        (error nil)
+        (quit nil)))
     (dolist (transfer transfers)
-      (appkit-media-cancel-transfer transfer)))
+      (condition-case nil
+          (appkit-media-cancel-transfer transfer)
+        (error nil)
+        (quit nil))))
   (clrhash qq-media--resource-cache)
   (clrhash qq-media--image-cache)
   (clrhash qq-media--preview-missing-cache)
@@ -1450,18 +1510,6 @@ Metadata:
 
 ;;; Favorite / custom faces (收藏表情)
 
-(defvar qq-media--custom-faces nil
-  "Cached list of favorite custom-face alists from NapCat.")
-
-(defvar qq-media--custom-faces-fetched-at nil
-  "Float time when `qq-media--custom-faces' was last fetched.")
-
-(defvar qq-media--custom-face-waiters nil
-  "Callbacks waiting for the shared favorite-face refresh.")
-
-(defvar qq-media--custom-face-refresh-owner nil
-  "Non-nil owner object while a favorite-face refresh is in flight.")
-
 (defun qq-media--json-truthy-p (value)
   "Return non-nil when JSON VALUE is a true-ish flag (not :false/:null)."
   (and value
@@ -1512,64 +1560,114 @@ With FORCE non-nil, ignore the cache (caller should still refresh via
   "Return non-nil after the favorite-face cache has been fetched."
   (numberp qq-media--custom-faces-fetched-at))
 
+(defun qq-media--refresh-custom-faces-page
+    (owner callback errback requested-count)
+  "Fetch one favorite-face page owned by OWNER.
+
+CALLBACK, ERRBACK, and REQUESTED-COUNT have the same meaning as in
+`qq-media-refresh-custom-faces'.  Full responses continue recursively under
+the exact same owner, so a reset invalidates every page in the chain."
+  (when (qq-media--custom-face-owner-current-p owner)
+    (let ((request
+           (qq-api-fetch-custom-face-info
+            (lambda (data)
+              (when (qq-media--custom-face-owner-current-p owner)
+                (let* ((faces (qq-media--normalize-custom-face-list data))
+                       (n (length faces))
+                       (max-count
+                        (max requested-count
+                             qq-media-custom-face-count-max)))
+                  (if (and (>= n requested-count)
+                           (< requested-count max-count))
+                      (qq-media--refresh-custom-faces-page
+                       owner callback errback
+                       (min max-count
+                            (max (* requested-count 2)
+                                 (1+ requested-count))))
+                    (setq qq-media--custom-faces faces
+                          qq-media--custom-faces-fetched-at (float-time))
+                    (when (and (>= n requested-count)
+                               (>= requested-count max-count))
+                      (message
+                       "qq: favorite faces may be truncated (%d returned, count max %d)"
+                       n max-count))
+                    (unwind-protect
+                        (when callback
+                          (funcall callback faces))
+                      ;; Shared waiter callbacks clear OWNER themselves.  A
+                      ;; direct refresh still needs a terminal owner boundary.
+                      (when (qq-media--custom-face-owner-current-p owner)
+                        (setq qq-media--custom-face-refresh-owner nil)))))))
+            (lambda (response reason)
+              (when (qq-media--custom-face-owner-current-p owner)
+                (unwind-protect
+                    (when errback
+                      (funcall errback response reason))
+                  (when (qq-media--custom-face-owner-current-p owner)
+                    (setq qq-media--custom-face-refresh-owner nil)))))
+            requested-count)))
+      ;; Synchronous transports may already have completed and retired OWNER.
+      (when (qq-media--custom-face-owner-current-p owner)
+        (setf (plist-get owner :token) request))
+      request)))
+
 (defun qq-media-refresh-custom-faces (&optional callback errback count)
   "Fetch favorite custom faces from NapCat and cache them.
 
-CALLBACK is called with the face list on success.
+CALLBACK is called with the face list on success.  The request is owned by the
+current account generation, including all automatic larger-page retries.
+ERRBACK receives the transport response and failure reason.
+COUNT is the initial requested page size.
 
 `fetch_custom_face_info' is capped by its `count' argument (see
-`qq-media-custom-face-count').  When the response is full — length
-equals the requested count — this function retries with a larger
-count (doubling, capped by `qq-media-custom-face-count-max') so large
-favorites libraries are not silently truncated at 96/page-size."
-  (let ((req (max 1 (or count qq-media-custom-face-count))))
-    (qq-api-fetch-custom-face-info
-     (lambda (data)
-       (let* ((faces (qq-media--normalize-custom-face-list data))
-              (n (length faces))
-              (max-count (max req qq-media-custom-face-count-max)))
-         (if (and (>= n req)
-                  (< req max-count))
-             ;; Likely truncated: ask for more.
-             (qq-media-refresh-custom-faces
-              callback errback
-              (min max-count (max (* req 2) (1+ req))))
-           (setq qq-media--custom-faces faces
-                 qq-media--custom-faces-fetched-at (float-time))
-           (when (and (>= n req) (>= req max-count))
-             (message
-              "qq: favorite faces may be truncated (%d returned, count max %d)"
-              n max-count))
-           (when callback
-             (funcall callback faces)))))
-     errback
-     req)))
+`qq-media-custom-face-count').  When the response is full — length equals the
+requested count — this function retries with a larger count (doubling, capped
+by `qq-media-custom-face-count-max') so large favorites libraries are not
+silently truncated at 96/page-size."
+  (let ((owner (or qq-media--custom-face-refresh-owner
+                   (list :generation qq-media--account-generation
+                         :token nil))))
+    (unless qq-media--custom-face-refresh-owner
+      (setq qq-media--custom-face-refresh-owner owner))
+    (qq-media--refresh-custom-faces-page
+     owner callback errback
+     (max 1 (or count qq-media-custom-face-count)))))
 
-(defun qq-media--finish-custom-face-waiters (faces)
-  "Finish all shared favorite-face waiters successfully with FACES."
-  (let ((waiters (prog1 (nreverse qq-media--custom-face-waiters)
-                   (setq qq-media--custom-face-waiters nil
-                         qq-media--custom-face-refresh-owner nil))))
-    (dolist (waiter waiters)
-      (when-let* ((callback (car waiter)))
-        (condition-case err
-            (funcall callback faces)
-          (error
-           (message "qq: favorite-face callback failed: %s"
-                    (error-message-string err))))))))
+(defun qq-media--finish-custom-face-waiters (owner faces)
+  "Finish OWNER's shared favorite-face waiters successfully with FACES."
+  (when (qq-media--custom-face-owner-current-p owner)
+    (let ((waiters (prog1 (nreverse qq-media--custom-face-waiters)
+                     (setq qq-media--custom-face-waiters nil
+                           qq-media--custom-face-refresh-owner nil))))
+      (dolist (waiter waiters)
+        (when-let* ((current-generation-p
+                     (qq-media--custom-face-owner-generation-current-p owner))
+                    (callback (car waiter)))
+          (condition-case err
+              (funcall callback faces)
+            (error
+             (message "qq: favorite-face callback failed: %s"
+                      (error-message-string err)))
+            (quit
+             (message "qq: favorite-face callback was interrupted"))))))))
 
-(defun qq-media--fail-custom-face-waiters (response reason)
-  "Fail all shared favorite-face waiters with RESPONSE and REASON."
-  (let ((waiters (prog1 (nreverse qq-media--custom-face-waiters)
-                   (setq qq-media--custom-face-waiters nil
-                         qq-media--custom-face-refresh-owner nil))))
-    (dolist (waiter waiters)
-      (when-let* ((errback (cdr waiter)))
-        (condition-case err
-            (funcall errback response reason)
-          (error
-           (message "qq: favorite-face errback failed: %s"
-                    (error-message-string err))))))))
+(defun qq-media--fail-custom-face-waiters (owner response reason)
+  "Fail OWNER's shared favorite-face waiters with RESPONSE and REASON."
+  (when (qq-media--custom-face-owner-current-p owner)
+    (let ((waiters (prog1 (nreverse qq-media--custom-face-waiters)
+                     (setq qq-media--custom-face-waiters nil
+                           qq-media--custom-face-refresh-owner nil))))
+      (dolist (waiter waiters)
+        (when-let* ((current-generation-p
+                     (qq-media--custom-face-owner-generation-current-p owner))
+                    (errback (cdr waiter)))
+          (condition-case err
+              (funcall errback response reason)
+            (error
+             (message "qq: favorite-face errback failed: %s"
+                      (error-message-string err)))
+            (quit
+             (message "qq: favorite-face errback was interrupted"))))))))
 
 (defun qq-media-ensure-custom-faces (&optional callback errback force)
   "Call CALLBACK with the authoritative favorite-face cache.
@@ -1584,20 +1682,23 @@ cache was already loaded."
         t)
     (push (cons callback errback) qq-media--custom-face-waiters)
     (unless qq-media--custom-face-refresh-owner
-      (let ((owner (list :token nil)))
+      (let ((owner (list :generation qq-media--account-generation
+                         :token nil)))
         (setq qq-media--custom-face-refresh-owner owner)
         (condition-case err
             (let ((token
                    (qq-media-refresh-custom-faces
-                    #'qq-media--finish-custom-face-waiters
-                    #'qq-media--fail-custom-face-waiters)))
+                    (apply-partially
+                     #'qq-media--finish-custom-face-waiters owner)
+                    (apply-partially
+                     #'qq-media--fail-custom-face-waiters owner))))
               ;; Test transports may complete synchronously and clear OWNER.
               (when (eq qq-media--custom-face-refresh-owner owner)
                 (setf (plist-get owner :token) token)))
           (error
-           (when (eq qq-media--custom-face-refresh-owner owner)
+           (when (qq-media--custom-face-owner-current-p owner)
              (qq-media--fail-custom-face-waiters
-              nil (error-message-string err)))))))
+              owner nil (error-message-string err)))))))
     qq-media--custom-face-refresh-owner))
 
 (defun qq-media-custom-face-id (face)
@@ -1670,9 +1771,6 @@ even when several favorites share an empty `desc'."
                (not (string-empty-p e-id)))
           (qq-media-custom-face-file face)
           (appkit-media-url-present-p url)))))
-
-(defvar qq-media--custom-face-completion-pairs nil
-  "Active `(LABEL . FACE)' pairs for the favorite-face completing-read.")
 
 (defun qq-media-custom-face-completion-candidates (&optional faces)
   "Return completion candidates for favorite FACES (default: cache).

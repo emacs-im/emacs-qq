@@ -119,6 +119,9 @@ mirrors telega's `telega-chatbuf--my-action'.")
 (defvar-local qq-chat--search-owner nil
   "Opaque identity owning the active in-chat search request.")
 
+(defvar-local qq-chat--search-generation nil
+  "Opaque generation invalidating deferred in-chat search actions.")
+
 (defvar-local qq-chat--search-highlight-overlays nil
   "Overlays highlighting matched message text, never surrounding UI.")
 
@@ -153,7 +156,12 @@ Actions run only after the accepted state has been projected by that exact
 live Appkit view.")
 
 (defvar-local qq-chat--send-sync-request nil
-  "Failed-send composer state awaiting presentation by its captured view.")
+  "Failed-send composer state awaiting safe presentation.
+
+An asynchronous failure schedules only the exact live canonical view resolved
+at restoration time.  The state remains pending so a later replacement can
+materialize the restored composer before synchronizing its editable tail back
+into canonical state.")
 
 (defvar qq-chat-group-messages t
   "When non-nil, compact consecutive messages from the same sender.")
@@ -1335,13 +1343,14 @@ Suppress the status message when QUIET is non-nil."
         (copy-tree projected)))))
 
 (defun qq-chat--forward-request-current-p (buffer session-key owner)
-  "Return non-nil when OWNER still owns BUFFER's forwarding request."
+  "Return non-nil when OWNER still owns BUFFER's SESSION-KEY forward request.
+
+This is logical ownership only.  The view captured by OWNER is checked
+separately before any Appkit presentation is requested."
   (and (buffer-live-p buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-chat-mode)
               (equal qq-chat--session-key session-key)
-              (qq-chat--captured-view-current-p
-               (plist-get owner :view))
               (eq qq-chat--forward-request-owner owner)))))
 
 (defun qq-chat--cancel-forward-request ()
@@ -1379,7 +1388,7 @@ Suppress the status message when QUIET is non-nil."
               (push anchor removed))))
         (setq qq-chat--forward-request nil
               qq-chat--forward-request-owner nil)
-        (when view
+        (when (qq-chat--captured-view-current-p view)
           (setq qq-chat--forward-sync-request
                 (list :kind 'forward-settlement :owner owner :view view))
           (appkit-request-sync
@@ -1397,7 +1406,7 @@ Suppress the status message when QUIET is non-nil."
       (let ((view (plist-get owner :view)))
         (setq qq-chat--forward-request nil
               qq-chat--forward-request-owner nil)
-        (when view
+        (when (qq-chat--captured-view-current-p view)
           (setq qq-chat--forward-sync-request
                 (list :kind 'forward-settlement :owner owner :view view))
           (appkit-request-sync view :part 'frame))))
@@ -1580,8 +1589,10 @@ selection; success removes only the immutable selection snapshot in PLAN."
                  :invalid-boundary-p t))))
     (when (plist-get result :changed-p)
       ;; Any real composer mutation revokes a cleared send's right to restore
-      ;; its old draft after a late transport failure.
-      (setq qq-chat--send-restore-owner nil)
+      ;; its old draft after a late transport failure, as well as a restored
+      ;; canonical draft's right to overwrite a newer live edit before sync.
+      (setq qq-chat--send-restore-owner nil
+            qq-chat--send-sync-request nil)
       (qq-chat--maybe-update-my-action-from-input))
     (plist-get result :value)))
 
@@ -1593,6 +1604,9 @@ selection; success removes only the immutable selection snapshot in PLAN."
 
 (defun qq-chat--set-reply-message (message)
   "Set shared reply aux state to MESSAGE, or clear it when nil."
+  ;; Before failure this revokes restoration ownership.  After failure the
+  ;; owner is already nil; retain any pending draft materialization so an aux
+  ;; edit cannot expose the old empty tail as authoritative input.
   (setq qq-chat--send-restore-owner nil)
   (if message
       (appkit-chatbuf-aux-set
@@ -2007,6 +2021,17 @@ same id or unrelated history islands and must not replace a search hit."
 (defun qq-chat--ensure-timeline ()
   "Ensure current QQ chat owns one shared projected timeline."
   (qq-chat--ensure-view)
+  ;; Killing a view retires its timeline controller but intentionally leaves
+  ;; the reusable buffer and composer state intact.  Before a replacement
+  ;; controller creates a fresh EWOC at `point-max', remove the old generated
+  ;; prompt/tail; otherwise that new footer would be born after the composer.
+  ;; Canonical input is buffer-local and has already been synchronized by user
+  ;; edits (or restored by the failed-send barrier), so this loses no draft.
+  (when (and (not (appkit-chat-timeline-live-p))
+             (or (appkit-chatbuf-prompt-start-position)
+                 (appkit-chatbuf-input-start-position)))
+    (appkit-chatbuf-with-generated-update
+      (appkit-chatbuf-clear-prompt-and-input)))
   (appkit-chat-timeline-ensure
    :printer #'qq-chat--row-printer
    :anchor-property 'qq-chat-message-anchor
@@ -2092,7 +2117,7 @@ projection.  A replacement or detached view is inert."
         :force-keys (appkit-chat-timeline-keys))))))
 
 (defun qq-chat--sync-invalidations (view invalidations)
-  "Synchronize current chat from coalesced appkit INVALIDATIONS."
+  "Synchronize VIEW's current chat from coalesced appkit INVALIDATIONS."
   (let* ((events (appkit-view-pending-events-snapshot view))
          (parts (appkit-invalidations-parts invalidations))
          (geometry-p (memq 'geometry parts))
@@ -2116,9 +2141,11 @@ projection.  A replacement or detached view is inert."
          (callback-actions
           (copy-sequence (plist-get callback-sync-request :actions)))
          (raw-send-sync-request qq-chat--send-sync-request)
-         (send-sync-request
-          (and (eq view (plist-get raw-send-sync-request :view))
-               raw-send-sync-request))
+         ;; A failed-send callback schedules the exact live view resolved when
+         ;; canonical state is restored.  That view can still be replaced
+         ;; before its transaction runs, so any later live view sync consumes
+         ;; the buffer-local materialization barrier before rendering.
+         (send-sync-request raw-send-sync-request)
          (filter-point-owner
           (plist-get filter-sync-request :point-owner))
          ;; Point ownership must be sampled before geometry or queued events
@@ -2132,11 +2159,6 @@ projection.  A replacement or detached view is inert."
                   (_ (and (integerp next) (> next 15))))
         (setq-local qq-chat--fill-column next
                     fill-column next)))
-    ;; A failed send already restored canonical composer state.  Materialize
-    ;; it before any full render can synchronize the still-empty tail back
-    ;; over that authoritative state.
-    (when send-sync-request
-      (qq-chat--render-canonical-input))
     (dolist (event events)
       (when (appkit-view-live-p view)
         (qq-chat--apply-state-event event)))
@@ -2188,6 +2210,12 @@ projection.  A replacement or detached view is inert."
                 (append entries (appkit-chat-timeline-keys)))
              entries)
            :changed-resources resources))
+        ;; Stabilize EWOC/frame boundaries before inserting a restored tail.
+        ;; Full renders above know to skip live-to-canonical synchronization
+        ;; while this barrier exists; materializing afterward cannot let the
+        ;; old empty composer overwrite the authoritative structured draft.
+        (when send-sync-request
+          (qq-chat--materialize-pending-send-restoration))
         (when (and filter-sync-request filter-point-owned-p)
           (qq-chat--position-after-filter-first-page point-owner))
         ;; Forward settlement changes the mode-line header even when its frame
@@ -2363,9 +2391,22 @@ required after text scaling because pixel-aligned avatars can still change."
     (appkit-chatbuf-input-replace (appkit-chatbuf-input-state))
     (appkit-chatbuf-input-apply-text-properties)))
 
+(defun qq-chat--materialize-pending-send-restoration ()
+  "Materialize a restored canonical draft before live-tail synchronization.
+
+Return non-nil when a pending failed-send restoration was consumed.  Clearing
+the marker happens only after the generated update succeeds, so a failed view
+transaction can retry without losing structured input properties."
+  (when-let* ((request qq-chat--send-sync-request))
+    (qq-chat--render-canonical-input)
+    (when (eq request qq-chat--send-sync-request)
+      (setq qq-chat--send-sync-request nil))
+    t))
+
 (defun qq-chat--set-draft (text)
   "Set canonical draft TEXT and update the shared tail composer."
-  (setq qq-chat--send-restore-owner nil)
+  (setq qq-chat--send-restore-owner nil
+        qq-chat--send-sync-request nil)
   (appkit-chatbuf-input-state-set text :reset-history-p t)
   (qq-chat--render-canonical-input)
   (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max))))
@@ -2474,7 +2515,8 @@ VISIBLE-LABEL overrides the segment-derived label, for example to retain a
 favorite face's local thumbnail alongside its sendable mface payload."
   ;; Structured insertion inhibits ordinary modification hooks inside Appkit,
   ;; so revoke stale send restoration explicitly before changing the draft.
-  (setq qq-chat--send-restore-owner nil)
+  (setq qq-chat--send-restore-owner nil
+        qq-chat--send-sync-request nil)
   (qq-chat--ensure-composer-visible)
   (unless (appkit-chatbuf-point-in-input-p)
     (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max))))
@@ -2934,7 +2976,6 @@ Return non-nil on success."
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (when (and (equal qq-chat--session-key session-key)
-                      (qq-chat--captured-view-current-p view)
                       (appkit-chat-history-request-current-p owner))
              (appkit-chat-history-request-end owner)
              (qq-chat--note-history-window meta)
@@ -2948,7 +2989,6 @@ Return non-nil on success."
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (when (and (equal qq-chat--session-key session-key)
-                      (qq-chat--captured-view-current-p view)
                       (appkit-chat-history-request-current-p owner))
              (appkit-chat-history-request-end owner)
              (qq-chat--request-callback-sync
@@ -4148,16 +4188,20 @@ When CALL-OWNER is non-nil, it must also own the currently executing page."
          (and (derived-mode-p 'qq-chat-mode)
               (equal qq-chat--session-key session-key)
               (eq qq-chat--search-owner owner)
-              (qq-chat--captured-view-current-p
-               (plist-get owner :view))
               (or (null call-owner)
                   (eq (plist-get owner :call-owner) call-owner))))))
 
+(defun qq-chat--search-deferred-current-p (owner)
+  "Return non-nil when OWNER's deferred action remains current."
+  (and (equal qq-chat--session-key (plist-get owner :session-key))
+       (eq qq-chat--search-generation (plist-get owner :generation))))
+
 (defun qq-chat--cancel-search-request ()
-  "Cancel the current in-chat search callback owner."
+  "Cancel the current in-chat search callback owner and deferred actions."
   (let ((request qq-chat--search-request))
     (setq qq-chat--search-request nil
-          qq-chat--search-owner nil)
+          qq-chat--search-owner nil
+          qq-chat--search-generation (list 'search-generation))
     (when request
       (condition-case nil
           (qq-api-cancel-request request)
@@ -4278,11 +4322,13 @@ original decimal kernel sequence is compared as a string."
                      (qq-chat--finish-search-request owner)
                      (setq action
                            (lambda ()
-                             (qq-chat--show-search-result selection))))
+                             (when (qq-chat--search-deferred-current-p owner)
+                               (qq-chat--show-search-result selection)))))
                     ((eq selection 'need-more)
                      (setq action
                            (lambda ()
-                             (qq-chat--continue-search-request owner))))
+                             (when (qq-chat--search-deferred-current-p owner)
+                               (qq-chat--continue-search-request owner)))))
                     (t
                      (qq-chat--finish-search-request
                       owner
@@ -4297,11 +4343,13 @@ original decimal kernel sequence is compared as a string."
                      (qq-chat--finish-search-request owner)
                      (setq action
                            (lambda ()
-                             (qq-chat--show-search-result desired-index))))
+                             (when (qq-chat--search-deferred-current-p owner)
+                               (qq-chat--show-search-result desired-index)))))
                     (qq-chat--search-next-cursor
                      (setq action
                            (lambda ()
-                             (qq-chat--continue-search-request owner))))
+                             (when (qq-chat--search-deferred-current-p owner)
+                               (qq-chat--continue-search-request owner)))))
                     (t
                      (qq-chat--finish-search-request
                       owner
@@ -4313,7 +4361,14 @@ original decimal kernel sequence is compared as a string."
             owner
             (format "qq: invalid message-search result: %s"
                     (error-message-string error-data)))))
-        (qq-chat--request-callback-sync view action)))))
+        (if (qq-chat--captured-view-current-p view)
+            (qq-chat--request-callback-sync view action)
+          ;; A continuation normally waits until the accepted page is
+          ;; projected.  When that exact view was replaced there is no such
+          ;; transaction, so release the logical owner instead of leaving the
+          ;; query permanently loading.
+          (when (eq qq-chat--search-owner owner)
+            (qq-chat--finish-search-request owner)))))))
 
 (defun qq-chat--search-page-failed
     (buffer session-key owner call-owner _response reason)
@@ -4392,6 +4447,7 @@ original decimal kernel sequence is compared as a string."
   "Start a search request for PURPOSE and optional DESIRED-INDEX."
   (qq-chat--cancel-search-request)
   (let ((owner (list :session-key qq-chat--session-key
+                     :generation qq-chat--search-generation
                      :view (qq-chat--ensure-view)
                      :purpose purpose
                      :desired-index desired-index
@@ -4622,14 +4678,12 @@ AppKit's identity barrier.  The established normal window is not changed."
     (goto-char (or (appkit-chatbuf-input-start-position) (point-max)))))
 
 (defun qq-chat--filter-request-current-p (buffer session-key owner)
-  "Return non-nil when OWNER still owns BUFFER's filter request."
+  "Return non-nil when OWNER owns BUFFER's SESSION-KEY filter request."
   (and (buffer-live-p buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-chat-mode)
               (equal qq-chat--session-key session-key)
               (qq-chat--msg-filter-active-p)
-              (qq-chat--captured-view-current-p
-               (plist-get owner :view))
               (eq qq-chat--filter-owner owner)))))
 
 (defun qq-chat--cancel-filter-request ()
@@ -4702,10 +4756,10 @@ AppKit's identity barrier.  The established normal window is not changed."
                                 (alist-get 'next_cursor page)))
         (setq qq-chat--msg-filter filter)
         (setq qq-chat--filter-auto-load-p
-              (and view
+              (and (qq-chat--captured-view-current-p view)
                    (= added 0)
                    (qq-chat--msg-filter-has-more-p)))
-        (when view
+        (when (qq-chat--captured-view-current-p view)
           (setq qq-chat--filter-sync-request
                 (list :owner owner
                       :point-owner (and point-owned-p owner)
@@ -4742,7 +4796,7 @@ AppKit's identity barrier.  The established normal window is not changed."
               qq-chat--filter-auto-load-p nil
               qq-chat--msg-filter
               (plist-put qq-chat--msg-filter :next-cursor nil))
-        (when view
+        (when (qq-chat--captured-view-current-p view)
           (setq qq-chat--filter-sync-request
                 (list :owner owner :view view))
           (appkit-request-sync
@@ -4919,14 +4973,23 @@ search highlights; `qq-chat-search-cancel' owns full result-state cleanup."
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
   (qq-chat--ensure-view)
-  (when (appkit-chatbuf-input-region-bounds)
-    (appkit-chatbuf-input-state-sync :reset-history-p nil))
+  ;; A replacement view may be the first presentation transaction after a
+  ;; failed-send callback restored canonical state.  Never synchronize its
+  ;; still-empty tail over that authoritative state.
+  (unless qq-chat--send-sync-request
+    (when (appkit-chatbuf-input-region-bounds)
+      (appkit-chatbuf-input-state-sync :reset-history-p nil)))
   (qq-chat--header-line-update)
   ;; Establish the EWOC rows before the trailing composer.  On an empty EWOC
   ;; the footer's tail boundary is not stable until first reconciliation;
   ;; binding input first can leave the prompt inside the message region.
   (qq-chat--sync-timeline)
-  (qq-chat--update-frame))
+  (qq-chat--update-frame)
+  ;; A detached/replacement EWOC can temporarily own its footer boundary at
+  ;; the old tail.  Materialize only after timeline and frame reconciliation;
+  ;; generated composer replacement remains undo-free and property-preserving.
+  (when qq-chat--send-sync-request
+    (qq-chat--materialize-pending-send-restoration)))
 
 (defun qq-chat-refresh ()
   "Refresh the active filter or rebuild the authoritative latest window."
@@ -5014,8 +5077,7 @@ batch is authoritative latest history."
          (lambda (meta)
            (when (buffer-live-p buffer)
              (with-current-buffer buffer
-               (when (and (qq-chat--captured-view-current-p view)
-                          (equal qq-chat--session-key session-key)
+               (when (and (equal qq-chat--session-key session-key)
                           (appkit-chat-history-request-current-p owner))
                  (appkit-chat-history-request-end owner)
                  (pcase-let* ((`(,_oldest . ,newest)
@@ -5075,8 +5137,7 @@ batch is authoritative latest history."
          (lambda (response reason)
            (when (buffer-live-p buffer)
              (with-current-buffer buffer
-               (when (and (qq-chat--captured-view-current-p view)
-                          (equal qq-chat--session-key session-key)
+               (when (and (equal qq-chat--session-key session-key)
                           (appkit-chat-history-request-current-p owner))
                  (appkit-chat-history-request-end owner)
                  (qq-chat--request-callback-sync view)
@@ -5159,8 +5220,7 @@ than jumping across an unfilled cached gap."
        (lambda (meta)
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
-             (when (and (qq-chat--captured-view-current-p view)
-                        (equal qq-chat--session-key session-key)
+             (when (and (equal qq-chat--session-key session-key)
                         (appkit-chat-history-request-current-p owner))
                (appkit-chat-history-request-end owner)
                (pcase-let* ((`(,oldest . ,newest)
@@ -5206,8 +5266,7 @@ than jumping across an unfilled cached gap."
        (lambda (response reason)
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
-             (when (and (qq-chat--captured-view-current-p view)
-                        (equal qq-chat--session-key session-key)
+             (when (and (equal qq-chat--session-key session-key)
                         (appkit-chat-history-request-current-p owner))
                (appkit-chat-history-request-end owner)
                (qq-chat--request-callback-sync view)
@@ -5238,8 +5297,7 @@ than jumping across an unfilled cached gap."
        (lambda (records)
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
-             (when (and (qq-chat--captured-view-current-p view)
-                        (equal qq-chat--session-key session-key)
+             (when (and (equal qq-chat--session-key session-key)
                         (appkit-chat-history-request-current-p owner))
                (appkit-chat-history-request-end owner)
                (let* ((ids (qq-chat--guild-record-ids records))
@@ -5258,8 +5316,7 @@ than jumping across an unfilled cached gap."
        (lambda (response reason)
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
-             (when (and (qq-chat--captured-view-current-p view)
-                        (equal qq-chat--session-key session-key)
+             (when (and (equal qq-chat--session-key session-key)
                         (appkit-chat-history-request-current-p owner))
                (appkit-chat-history-request-end owner)
                (qq-chat--request-callback-sync view)
@@ -5296,8 +5353,7 @@ than jumping across an unfilled cached gap."
        (lambda (page)
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
-             (when (and (qq-chat--captured-view-current-p view)
-                        (equal qq-chat--session-key session-key)
+             (when (and (equal qq-chat--session-key session-key)
                         (appkit-chat-history-request-current-p owner))
                (appkit-chat-history-request-end owner)
                (setq qq-chat--guild-forum-next-cursor
@@ -5318,8 +5374,7 @@ than jumping across an unfilled cached gap."
        (lambda (response reason)
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
-             (when (and (qq-chat--captured-view-current-p view)
-                        (equal qq-chat--session-key session-key)
+             (when (and (equal qq-chat--session-key session-key)
                         (appkit-chat-history-request-current-p owner))
                (appkit-chat-history-request-end owner)
                (qq-chat--request-callback-sync view)
@@ -5371,8 +5426,7 @@ independent native sequence range."
        (lambda (meta)
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
-             (when (and (qq-chat--captured-view-current-p view)
-                        (equal qq-chat--session-key session-key)
+             (when (and (equal qq-chat--session-key session-key)
                         (appkit-chat-history-request-current-p owner))
                (appkit-chat-history-request-end owner)
                (pcase-let* ((`(,oldest . ,_newest)
@@ -5407,8 +5461,7 @@ independent native sequence range."
        (lambda (response reason)
          (when (buffer-live-p buffer)
            (with-current-buffer buffer
-             (when (and (qq-chat--captured-view-current-p view)
-                        (equal qq-chat--session-key session-key)
+             (when (and (equal qq-chat--session-key session-key)
                         (appkit-chat-history-request-current-p owner))
                (appkit-chat-history-request-end owner)
                (if (qq-api--history-exhausted-error-p response reason)
@@ -5435,14 +5488,13 @@ SESSION-KEY prevents a reused buffer from receiving another chat's draft.
 DRAFT-STATE preserves rich input properties and AUX-STATE preserves its reply.
 Normally the cleared composer must still be pristine.  ALLOW-PARTIAL-P is for
 rolling back synchronous errors inside the destructive clear transaction; its
-opaque OWNER must still be current.  Return non-nil only when restoration
-happened."
+opaque OWNER must still be current.  Non-nil CAPTURED-VIEW identifies an
+asynchronous callback, but presentation is requested from the exact live view
+resolved at restoration time.  Return non-nil only when restoration happened."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (and (equal qq-chat--session-key session-key)
                  (eq qq-chat--send-restore-owner owner)
-                 (or (null captured-view)
-                     (qq-chat--captured-view-current-p captured-view))
                  (or allow-partial-p
                      (and (equal-including-properties
                            (appkit-chatbuf-input-state) "")
@@ -5455,11 +5507,16 @@ happened."
             (appkit-chatbuf-aux-set (copy-tree aux-state))
           (appkit-chatbuf-aux-reset))
         (if captured-view
-            (progn
+            (let ((presentation-view (qq-chat--live-current-view)))
+              ;; The request that failed may belong to a retired view.  Resolve
+              ;; the canonical presentation target only after logical restore;
+              ;; a replacement that already rendered the cleared send state
+              ;; must materialize this draft before its next editable change.
               (setq qq-chat--send-sync-request
-                    (list :view captured-view :owner owner))
-              (appkit-request-sync
-               captured-view :part 'frame :position t))
+                    (list :view presentation-view :owner owner))
+              (when presentation-view
+                (appkit-request-sync
+                 presentation-view :part 'frame :position t)))
           (qq-chat--render-canonical-input)
           (qq-chat--update-frame)
           (goto-char
@@ -5889,6 +5946,7 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (setq-local qq-chat--search-next-cursor nil)
   (setq-local qq-chat--search-request nil)
   (setq-local qq-chat--search-owner nil)
+  (setq-local qq-chat--search-generation (list 'search-generation))
   (setq-local qq-chat--search-highlight-overlays nil)
   (setq-local qq-chat--msg-filter nil)
   (setq-local qq-chat--filter-request nil)
@@ -5942,8 +6000,6 @@ Attach from clipboard with `C-c C-v' (telega-style)."
          (and (derived-mode-p 'qq-chat-mode)
               (equal qq-chat--session-key session-key)
               (eq qq-chat--initial-history-owner owner)
-              (qq-chat--captured-view-current-p
-               (plist-get owner :view))
               (appkit-chat-history-request-current-p owner)))))
 
 (defun qq-chat--cancel-initial-history-request ()
@@ -5971,14 +6027,12 @@ Attach from clipboard with `C-c C-v' (telega-style)."
 
 (defun qq-chat--open-message-request-current-p
     (buffer session-key owner)
-  "Return non-nil when OWNER owns BUFFER's exact open-message request."
+  "Return non-nil when OWNER owns BUFFER's SESSION-KEY open-message request."
   (and (buffer-live-p buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-chat-mode)
               (equal qq-chat--session-key session-key)
-              (eq qq-chat--open-message-owner owner)
-              (qq-chat--captured-view-current-p
-               (plist-get owner :view))))))
+              (eq qq-chat--open-message-owner owner)))))
 
 (defun qq-chat--complete-initial-history-load
     (buffer session-key owner &optional target meta)

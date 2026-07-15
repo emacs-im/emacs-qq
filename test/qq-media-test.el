@@ -102,6 +102,83 @@
       (should (equal '(download-handle) canceled))
       (should (= 0 (hash-table-count qq-media--download-state-table))))))
 
+(ert-deftest qq-media-clear-cache-revokes-custom-face-account-generation ()
+  "Late favorite callbacks cannot repopulate a replacement account's cache."
+  (let* ((qq-media-cache-directory (make-temp-file "qq-faces-reset" t))
+         (qq-media--resource-cache (make-hash-table :test #'equal))
+         (qq-media--image-cache (make-hash-table :test #'equal))
+         (qq-media--preview-missing-cache (make-hash-table :test #'equal))
+         (qq-media--fetching-cache (make-hash-table :test #'equal))
+         (qq-media--download-state-table (make-hash-table :test #'equal))
+         (qq-media--account-generation 3)
+         (qq-media--custom-faces nil)
+         (qq-media--custom-faces-fetched-at nil)
+         (qq-media--custom-face-waiters nil)
+         (qq-media--custom-face-refresh-owner nil)
+         (qq-media--custom-face-completion-pairs
+          '(("OLD COMPLETION SECRET" . ((md5 . "old")))))
+         old-success old-error new-success
+         old-deliveries new-deliveries failures cancelled
+         (calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'qq-api-fetch-custom-face-info)
+                   (lambda (callback &optional errback _count)
+                     (cl-incf calls)
+                     (if (= calls 1)
+                         (setq old-success callback
+                               old-error errback)
+                       (setq new-success callback))
+                     (if (= calls 1) 'old-face-request 'new-face-request)))
+                  ((symbol-function 'qq-api-cancel-request)
+                   (lambda (token)
+                     (push token cancelled)
+                     ;; Cancellation may synchronously emit an errback.  The
+                     ;; old owner has already been revoked at this boundary.
+                     (when old-error
+                       (funcall old-error nil "cancelled")))))
+          (qq-media-ensure-custom-faces
+           (lambda (faces) (push faces old-deliveries))
+           (lambda (_response reason) (push reason failures)))
+          (should qq-media--custom-face-refresh-owner)
+          (qq-media-clear-cache)
+          (should (= qq-media--account-generation 4))
+          (should (equal cancelled '(old-face-request)))
+          (should-not failures)
+          (should-not qq-media--custom-faces)
+          (should-not qq-media--custom-faces-fetched-at)
+          (should-not qq-media--custom-face-refresh-owner)
+          (should-not qq-media--custom-face-waiters)
+          (should-not qq-media--custom-face-completion-pairs)
+
+          (qq-media-ensure-custom-faces
+           (lambda (faces) (push faces new-deliveries)))
+          (let ((replacement-owner qq-media--custom-face-refresh-owner))
+            (funcall old-success
+                     '(((md5 . "old-secret-md5")
+                        (desc . "OLD FAVORITE SECRET"))))
+            (should (eq replacement-owner
+                        qq-media--custom-face-refresh-owner))
+            (should-not qq-media--custom-faces)
+            (should-not old-deliveries)
+            (should-not
+             (string-match-p
+              "OLD \(?:COMPLETION\|FAVORITE\) SECRET"
+              (prin1-to-string
+               (list qq-media--custom-faces
+                     qq-media--custom-face-waiters
+                     qq-media--custom-face-completion-pairs)))))
+          (funcall new-success
+                   '(((md5 . "new-md5") (desc . "NEW FAVORITE"))))
+          (should-not old-deliveries)
+          (should (= 1 (length new-deliveries)))
+          (should (equal "new-md5"
+                         (alist-get 'md5
+                                    (car (car new-deliveries)))))
+          (should-not qq-media--custom-face-refresh-owner)
+          (should-not qq-media--custom-face-waiters))
+      (when (file-directory-p qq-media-cache-directory)
+        (delete-directory qq-media-cache-directory t)))))
+
 (ert-deftest qq-media-ensure-resource-image-starts-remote-download-for-url-only-resource ()
   (qq-media-test-with-reset
    (let (started-key started-resource started-spec)
@@ -403,6 +480,34 @@
                                            (symbol-name right))))))
       (should-not qq-media--custom-face-refresh-owner)
       (should-not qq-media--custom-face-waiters))))
+
+(ert-deftest qq-media-custom-face-waiters-stop-at-account-reset ()
+  "A reset from one waiter prevents later old-account waiters from running."
+  (let ((qq-media--account-generation 30)
+        (qq-media--custom-faces nil)
+        (qq-media--custom-faces-fetched-at nil)
+        (qq-media--custom-face-waiters nil)
+        (qq-media--custom-face-refresh-owner nil)
+        success
+        first-called
+        second-called)
+    (cl-letf (((symbol-function 'qq-media-refresh-custom-faces)
+               (lambda (callback &optional _errback _count)
+                 (setq success callback)
+                 'favorite-request)))
+      (qq-media-ensure-custom-faces
+       (lambda (_faces)
+         (setq first-called t)
+         (qq-media--revoke-custom-face-work)))
+      (qq-media-ensure-custom-faces
+       (lambda (_faces) (setq second-called t)))
+      (funcall success '(((md5 . "old-account-face"))))
+      (should first-called)
+      (should-not second-called)
+      (should (= qq-media--account-generation 31))
+      (should-not qq-media--custom-faces)
+      (should-not qq-media--custom-face-waiters)
+      (should-not qq-media--custom-face-refresh-owner))))
 
 (ert-deftest qq-media-ensure-custom-faces-cleans-up-synchronous-success ()
   (let ((qq-media--custom-faces nil)

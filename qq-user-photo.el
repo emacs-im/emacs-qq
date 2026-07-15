@@ -204,19 +204,39 @@
                 (qq-user-photo--view-id qq-user-photo--user-id))
          view)))
 
-(defun qq-user-photo--cancel-buffer-work (buffer)
-  "Cancel photo-wall work still owned by BUFFER."
+(defun qq-user-photo--clear-view-data ()
+  "Clear account-scoped data projected by the current photo-wall view."
+  (setq qq-user-photo--display-name nil
+        qq-user-photo--photos nil
+        qq-user-photo--error nil
+        ;; EWOC nodes contain photo objects and their text properties.  A
+        ;; replacement view must build a new projection for its own runtime.
+        qq-user-photo--ewoc nil
+        qq-user-photo--node-table nil))
+
+(defun qq-user-photo--reset-buffer-work (buffer)
+  "Reset requests and projected state retained by photo-wall BUFFER."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (derived-mode-p 'qq-user-photo-mode)
-        (qq-user-photo--cancel-request)))))
+        (unwind-protect
+            (qq-user-photo--cancel-request)
+          (qq-user-photo--clear-view-data))))))
+
+(defun qq-user-photo--release-view-work (view buffer)
+  "Release BUFFER work while it is still owned by photo-wall VIEW."
+  (when (and (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (eq view (appkit-current-view))))
+    (qq-user-photo--reset-buffer-work buffer)))
 
 (defun qq-user-photo--setup-view (view)
-  "Register lifecycle cleanup for newly attached VIEW."
-  (appkit-register-handle
-   view 'function
-   (apply-partially #'qq-user-photo--cancel-buffer-work
-                    (appkit-view-buffer view))))
+  "Reset replacement state and register cleanup for photo-wall VIEW."
+  (let ((buffer (appkit-view-buffer view)))
+    (appkit-register-handle
+     view 'function
+     (apply-partially #'qq-user-photo--release-view-work view buffer))
+    (qq-user-photo--reset-buffer-work buffer)))
 
 (defun qq-user-photo--ensure-view ()
   "Return the live Appkit view owning the current photo-wall buffer."
@@ -307,11 +327,44 @@ the stable-key projection is reconciled."
   "Return non-nil when VIEW and OWNER still load USER-ID in BUFFER."
   (and (appkit-view-live-p view)
        (eq (appkit-view-buffer view) buffer)
+       (buffer-live-p buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-user-photo-mode)
               (eq view (appkit-current-view))
               (equal qq-user-photo--user-id user-id)
               (eq qq-user-photo--request-owner owner)))))
+
+(defun qq-user-photo--apply-load-event (event)
+  "Apply one owner-checked photo-wall load EVENT to domain state."
+  (pcase (plist-get event :type)
+    ('success
+     (setq qq-user-photo--photos (plist-get event :photos)
+           qq-user-photo--loading nil
+           qq-user-photo--error nil
+           qq-user-photo--request nil
+           qq-user-photo--request-owner nil))
+    ('error
+     ;; An ordinary live-view refresh retains its accepted rows.  Replacement
+     ;; setup clears them before dispatch, so another runtime can never reach
+     ;; this branch with the previous account's photos.
+     (setq qq-user-photo--loading nil
+           qq-user-photo--error (plist-get event :error)
+           qq-user-photo--request nil
+           qq-user-photo--request-owner nil))
+    (type
+     (error "QQ: unknown photo-wall load event %S" type))))
+
+(defun qq-user-photo--accept-load-event
+    (view buffer user-id owner event)
+  "Settle EVENT in BUFFER for the exact VIEW, USER-ID, and OWNER generation."
+  (when (qq-user-photo--request-current-p view buffer user-id owner)
+    (with-current-buffer buffer
+      (when (qq-user-photo--request-current-p view buffer user-id owner)
+        (qq-user-photo--apply-load-event event)
+        ;; Settlement mutates only domain state.  Presentation remains behind
+        ;; Appkit's coalesced synchronization gate.
+        (qq-user-photo--request-sync view)
+        t))))
 
 (defun qq-user-photo-refresh ()
   "Refresh the current native photo wall."
@@ -319,8 +372,7 @@ the stable-key projection is reconciled."
   (unless qq-user-photo--user-id
     (user-error "qq: this photo buffer has no user identity"))
   (let ((view (qq-user-photo--ensure-view)))
-    (when qq-user-photo--request
-      (qq-api-cancel-request qq-user-photo--request))
+    (qq-user-photo--cancel-request)
     (let ((buffer (current-buffer))
           (user-id qq-user-photo--user-id)
           (owner (list 'photo-wall qq-user-photo--user-id)))
@@ -331,52 +383,44 @@ the stable-key projection is reconciled."
       (qq-user-photo--request-sync view)
       (condition-case error-data
           (let ((request
-		 (qq-api-get-user-photo-wall
+                 (qq-api-get-user-photo-wall
                   user-id
                   (lambda (photos)
-                    (when (qq-user-photo--request-current-p
-                           view buffer user-id owner)
-                      (with-current-buffer buffer
-			(setq qq-user-photo--photos photos
-                              qq-user-photo--loading nil
-                              qq-user-photo--error nil
-                              qq-user-photo--request nil
-                              qq-user-photo--request-owner nil)
-			(qq-user-photo--request-sync view))))
+                    (qq-user-photo--accept-load-event
+                     view buffer user-id owner
+                     (list :type 'success :photos photos)))
                   (lambda (_response reason)
-                    (when (qq-user-photo--request-current-p
-                           view buffer user-id owner)
-                      (with-current-buffer buffer
-			(setq qq-user-photo--loading nil
-                              qq-user-photo--error
-                              (format "Unable to load photo wall: %s"
-                                      (or reason "unknown error"))
-                              qq-user-photo--request nil
-                              qq-user-photo--request-owner nil)
-			(qq-user-photo--request-sync view)))))))
+                    (qq-user-photo--accept-load-event
+                     view buffer user-id owner
+                     (list
+                      :type 'error
+                      :error
+                      (format "Unable to load photo wall: %s"
+                              (or reason "unknown error"))))))))
             (when (eq qq-user-photo--request-owner owner)
               (setq qq-user-photo--request request)))
-	(error
-	 (when (qq-user-photo--request-current-p view buffer user-id owner)
-           (with-current-buffer buffer
-             (setq qq-user-photo--loading nil
-                   qq-user-photo--error
-                   (format "Unable to load photo wall: %s"
-                           (error-message-string error-data))
-                   qq-user-photo--request nil
-                   qq-user-photo--request-owner nil)
-             (qq-user-photo--request-sync view)))))
+        ((error quit)
+         (qq-user-photo--accept-load-event
+          view buffer user-id owner
+          (list :type 'error
+                :error
+                (format "Unable to load photo wall: %s"
+                        (error-message-string error-data))))
+         (when (eq (car error-data) 'quit)
+           (setq quit-flag nil)
+           (signal (car error-data) (cdr error-data)))))
       (qq-user-photo--sync-now view))))
 
 (defun qq-user-photo--cancel-request ()
   "Cancel the active photo-wall request."
-  (when qq-user-photo--request
-    (qq-api-cancel-request qq-user-photo--request))
-  (setq qq-user-photo--request nil
-        qq-user-photo--request-owner nil
-        ;; Appkit views may be detached while their buffers survive.  Do not
-        ;; let a replacement inherit the loading flag of cancelled work.
-        qq-user-photo--loading nil))
+  (let ((request qq-user-photo--request))
+    ;; Relinquish ownership before cancellation because transports may invoke
+    ;; callbacks synchronously from their cancellation path.
+    (setq qq-user-photo--request nil
+          qq-user-photo--request-owner nil
+          qq-user-photo--loading nil)
+    (when request
+      (qq-api-cancel-request request))))
 
 (defun qq-user-photo-button-backward ()
   "Move point to the previous photo button."

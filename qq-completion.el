@@ -32,6 +32,9 @@
 (defvar-local qq-completion--member-cache nil
   "Query -> native group member list for the current chat buffer.")
 
+(defvar-local qq-completion--member-cache-owner nil
+  "Exact Appkit app generation owning the member cache and pending table.")
+
 (defvar-local qq-completion--member-pending nil
   "Query -> request metadata for in-flight native member searches.")
 
@@ -71,6 +74,25 @@ completion model rather than choosing a command argument.")
        (with-current-buffer buffer
          (and (equal qq-chat--session-key session-key)
               (qq-chat--captured-view-current-p view)))))
+
+(defun qq-completion--current-member-app ()
+  "Return the exact live Appkit app generation for this chat buffer."
+  (when-let* ((view (appkit-current-view))
+              (_ (qq-chat--captured-view-current-p view)))
+    (appkit-view-app view)))
+
+(defun qq-completion--activate-member-app (app)
+  "Make APP own this buffer's member cache and pending request table.
+
+An Appkit app object is one runtime generation even when its stable kind/id
+matches a stopped predecessor.  Crossing that identity boundary replaces both
+tables, so old-account cache entries become unreachable and their callbacks
+cannot find or mutate a new generation's pending owners."
+  (unless (eq app qq-completion--member-cache-owner)
+    (setq qq-completion--member-cache-owner app
+          qq-completion--member-cache (make-hash-table :test #'equal)
+          qq-completion--member-pending (make-hash-table :test #'equal)))
+  app)
 
 (defun qq-completion--group-id ()
   "Return current group id, or nil outside a group chat buffer."
@@ -192,59 +214,83 @@ this function.  It is intended for submit guards such as
        members))))
 
 (defun qq-completion--request-current-p
-    (buffer session-key group-id view)
-  "Return non-nil when BUFFER still owns SESSION-KEY, GROUP-ID, and VIEW."
-  (and (qq-completion--captured-view-current-p buffer session-key view)
+    (buffer session-key group-id app view)
+  "Return non-nil when BUFFER still owns SESSION-KEY, GROUP-ID, APP, and VIEW."
+  (and (eq app (appkit-view-app view))
+       (qq-completion--captured-view-current-p buffer session-key view)
        (with-current-buffer buffer
-         (equal (qq-completion--group-id) group-id))))
+         (and (eq qq-completion--member-cache-owner app)
+              (equal (qq-completion--group-id) group-id)))))
 
 (defun qq-completion--request-members (query &optional _reopen)
   "Request native group members for QUERY.
 
 The optional compatibility argument is ignored.  A response only updates the
 member model; a later explicit completion command owns presentation."
-  (let* ((group-id (qq-completion--group-id))
-         (pending (and group-id
-                       (gethash query qq-completion--member-pending))))
+  (let ((group-id (qq-completion--group-id)))
     (when group-id
-      (unless pending
-        (let ((buffer (current-buffer))
-              (session-key qq-chat--session-key)
-              (view (or (qq-completion--capture-view)
-                        (user-error "qq: member search requires a live chat view")))
-              owner)
-          (setq owner (list :view view
-                            :session-key session-key
-                            :group-id group-id
-                            :query query))
-          (puthash query owner qq-completion--member-pending)
-          (qq-api-search-group-members
-           group-id query
-           (lambda (members)
-             (when (buffer-live-p buffer)
-               (with-current-buffer buffer
-                 (when (and (hash-table-p qq-completion--member-pending)
-                            (eq owner
-                                (gethash query
-                                         qq-completion--member-pending)))
-                   (remhash query qq-completion--member-pending)
-                   (when (qq-completion--request-current-p
-                          buffer session-key group-id view)
-                     (puthash query members qq-completion--member-cache))))))
-           (lambda (_response reason)
-             (ignore reason)
-             (when (buffer-live-p buffer)
-               (with-current-buffer buffer
-                 (when (and (hash-table-p qq-completion--member-pending)
-                            (eq owner
-                                (gethash query
-                                         qq-completion--member-pending)))
-                   (remhash query qq-completion--member-pending)))))
-           200))))))
+      (let* ((buffer (current-buffer))
+             (session-key qq-chat--session-key)
+             (view (or (qq-completion--capture-view)
+                       (user-error
+                        "qq: member search requires a live chat view")))
+             (app (appkit-view-app view))
+             (_ (qq-completion--activate-member-app app))
+             (pending (gethash query qq-completion--member-pending)))
+        ;; A pending entry is useful only while its exact captured view and app
+        ;; generation remain canonical.  Replacement views may retry
+        ;; immediately; identity checks in both old callbacks prevent them
+        ;; from removing or overwriting the newer request.
+        (when (and pending
+                   (not (qq-completion--request-current-p
+                         buffer
+                         (plist-get pending :session-key)
+                         (plist-get pending :group-id)
+                         (plist-get pending :app)
+                         (plist-get pending :view))))
+          (when (eq pending (gethash query qq-completion--member-pending))
+            (remhash query qq-completion--member-pending))
+          (setq pending nil))
+        (unless pending
+          (let (owner)
+            (setq owner (list :view view
+                              :app app
+                              :session-key session-key
+                              :group-id group-id
+                              :query query))
+            (puthash query owner qq-completion--member-pending)
+            (qq-api-search-group-members
+             group-id query
+             (lambda (members)
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (when (and (hash-table-p qq-completion--member-pending)
+                              (eq owner
+                                  (gethash query
+                                           qq-completion--member-pending)))
+                     (remhash query qq-completion--member-pending)
+                     (when (qq-completion--request-current-p
+                            buffer session-key group-id app view)
+                       (puthash query members qq-completion--member-cache))))))
+             (lambda (_response reason)
+               (ignore reason)
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (when (and (hash-table-p qq-completion--member-pending)
+                              (eq owner
+                                  (gethash query
+                                           qq-completion--member-pending)))
+                     (remhash query qq-completion--member-pending)))))
+             200)))))))
 
 (defun qq-completion--cached-members (query)
   "Return cached members for QUERY, or `qq-completion--cache-miss'."
-  (gethash query qq-completion--member-cache qq-completion--cache-miss))
+  (if-let* ((app (qq-completion--current-member-app)))
+      (progn
+        (qq-completion--activate-member-app app)
+        (gethash query qq-completion--member-cache
+                 qq-completion--cache-miss))
+    qq-completion--cache-miss))
 
 (defun qq-completion--member-fallback (query)
   "Return locally filtered broad member cache for QUERY."
@@ -794,6 +840,7 @@ after the model is ready to present candidates."
 (defun qq-completion-setup ()
   "Initialize shared QQ composer completion in the current chat buffer."
   (qq-completion--cancel-poke-request)
+  (setq-local qq-completion--member-cache-owner nil)
   (setq-local qq-completion--member-cache (make-hash-table :test #'equal))
   (setq-local qq-completion--member-pending (make-hash-table :test #'equal))
   (setq-local qq-completion--custom-face-pending nil)

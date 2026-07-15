@@ -689,19 +689,37 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
     (when request
       (qq-api-cancel-request request))))
 
-(defun qq-forward--cancel-buffer-work (buffer)
-  "Cancel forward work still owned by BUFFER."
+(defun qq-forward--clear-view-data ()
+  "Clear account-scoped data projected by the current forward view."
+  (setq qq-forward--messages nil
+        qq-forward--loaded-p nil
+        qq-forward--error nil))
+
+(defun qq-forward--reset-buffer-work (buffer)
+  "Reset requests and projected data retained by forward BUFFER."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (derived-mode-p 'qq-forward-mode)
-        (qq-forward--cancel-request)))))
+        (unwind-protect
+            (qq-forward--cancel-request)
+          (qq-forward--clear-view-data))))))
+
+(defun qq-forward--release-view-work (view buffer)
+  "Release BUFFER work while it is still owned by forward VIEW."
+  (when (and (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (eq view (appkit-current-view))))
+    (qq-forward--reset-buffer-work buffer)))
 
 (defun qq-forward--setup-view (view)
-  "Register lifecycle cleanup for newly attached forward VIEW."
-  (appkit-register-handle
-   view 'function
-   (apply-partially #'qq-forward--cancel-buffer-work
-                    (appkit-view-buffer view))))
+  "Reset replacement state and register cleanup for forward VIEW."
+  (let ((buffer (appkit-view-buffer view)))
+    (appkit-register-handle
+     view 'function
+     (apply-partially #'qq-forward--release-view-work view buffer))
+    ;; A detached buffer is a presentation shell, not an account cache.  A
+    ;; replacement runtime must project a loading state and fetch again.
+    (qq-forward--reset-buffer-work buffer)))
 
 (defun qq-forward--ensure-view ()
   "Return the live appkit view owning the current forward buffer."
@@ -876,11 +894,14 @@ sync; timeline mutation remains owned by `qq-forward--sync-invalidations'."
           ;; A synchronous callback may already have released OWNER.
           (when (eq qq-forward--request-owner owner)
             (setq qq-forward--request request)))
-      (error
+      ((error quit)
        (qq-forward--accept-request-event
         view buffer source owner
         (list :type 'load-error
-              :error (error-message-string error-data)))))))
+              :error (error-message-string error-data)))
+       (when (eq (car error-data) 'quit)
+         (setq quit-flag nil)
+         (signal (car error-data) (cdr error-data)))))))
 
 (defun qq-forward--load-inline ()
   "Render the authoritative inline subtree in the current viewer."
@@ -1063,10 +1084,15 @@ width is unchanged so pixel-aligned media follows text scaling."
                    (not qq-forward--loading)
                    (null qq-forward--error))
           (qq-forward--load-remote))))
+    (unless existing
+      (appkit-sync-invalidations view))
     (pop-to-buffer buffer)
     (with-current-buffer buffer
       (qq-forward--on-window-size-change))
     (unless existing
+      ;; Consume geometry measured only after the buffer has a real window.
+      ;; The earlier sync guarantees that replacement data was removed before
+      ;; selection; this one leaves no unrelated invalidation behind.
       (appkit-sync-invalidations view))
     buffer))
 
