@@ -668,7 +668,7 @@ segments.  A resolve action result itself must be terminal or available."
     (unless (member
              kind
              '("text" "at" "reply" "image" "file" "record" "face"
-               "mface" "mail" "music" "poke" "dice" "rps" "contact"
+               "mface" "mail" "wallet" "music" "poke" "dice" "rps" "contact"
                "location" "json" "card" "xml" "markdown" "miniapp"
                "onlinefile" "flashtransfer" "video" "forward"
                "forward-card" "unsupported"))
@@ -739,6 +739,40 @@ segments.  A resolve action result itself must be terminal or available."
        (qq-api--validate-string-fields
         payload '(sender subject content prompt detail url)
         context protocol-p))
+      ("wallet"
+       (unless (qq-api--exact-object-keys-p
+                payload
+                '(wallet_kind message_type session_type red_type red_channel grab_state
+                  grabbed_amount sender receiver))
+         (qq-api--signal-schema-error
+          protocol-p "qq: %s wallet payload has invalid fields" context))
+       (unless (member (alist-get 'wallet_kind payload)
+                       '("transfer" "red-packet" "password-red-packet" "unknown"))
+         (qq-api--signal-schema-error
+          protocol-p "qq: %s wallet.wallet_kind is invalid" context))
+       (dolist (key '(message_type session_type red_type red_channel grab_state))
+         (unless (integerp (alist-get key payload))
+           (qq-api--signal-schema-error
+            protocol-p "qq: %s wallet.%s must be an integer" context key)))
+       (unless (qq-api-user-id-p (alist-get 'grabbed_amount payload))
+         (qq-api--signal-schema-error
+          protocol-p "qq: %s wallet.grabbed_amount must be decimal" context))
+       (dolist (key '(sender receiver))
+         (let ((presentation (alist-get key payload)))
+           (unless (qq-api--exact-object-keys-p
+                    presentation
+                    '(background icon title sub_title content notice))
+             (qq-api--signal-schema-error
+              protocol-p "qq: %s wallet.%s has invalid fields"
+              context key))
+           (dolist (number-key '(background icon))
+             (unless (integerp (alist-get number-key presentation))
+               (qq-api--signal-schema-error
+                protocol-p "qq: %s wallet.%s.%s must be an integer"
+                context key number-key)))
+           (qq-api--validate-string-fields
+            presentation '(title sub_title content notice)
+            context protocol-p))))
       ("video"
        (unless (qq-api--exact-object-keys-p
                 payload '(file remote)
@@ -1358,6 +1392,117 @@ NapCat throws when `message_seq' is unknown or the page is empty
 (defun qq-api--session-emacs-params (session-key)
   "Return native Emacs action params for SESSION-KEY."
   `((chat . ,(qq-api--session-emacs-locator session-key))))
+
+(defun qq-api--validate-red-packet-receipt (receipt context)
+  "Validate and copy one native red-packet RECEIPT for CONTEXT."
+  (unless (qq-api--exact-object-keys-p
+           receipt '(user_id name amount received_at))
+    (error "qq: %s has invalid receipt fields" context))
+  (unless (qq-api-user-id-p (alist-get 'user_id receipt))
+    (error "qq: %s.user_id must be decimal" context))
+  (unless (stringp (alist-get 'name receipt))
+    (error "qq: %s.name must be a string" context))
+  (unless (qq-api-user-id-p (alist-get 'amount receipt))
+    (error "qq: %s.amount must be decimal" context))
+  (unless (and (integerp (alist-get 'received_at receipt))
+               (>= (alist-get 'received_at receipt) 0))
+    (error "qq: %s.received_at must be a non-negative integer" context))
+  (copy-tree receipt))
+
+(defun qq-api--validate-red-packet-detail (data expected-message-id)
+  "Validate native red-packet detail DATA for EXPECTED-MESSAGE-ID."
+  (unless (qq-api--exact-object-keys-p data '(message_id send_order receipts))
+    (error "qq: red-packet detail has invalid fields"))
+  (unless (equal (alist-get 'message_id data) expected-message-id)
+    (error "qq: red-packet detail returned a different message identity"))
+  (let ((order (alist-get 'send_order data)))
+    (unless (qq-api--exact-object-keys-p
+             order
+             '(sender_id sender_name wishing total_count total_amount
+               channel business_type receiver_type created_at expires_at state
+               received_count received_amount lucky_user_id)
+             '(lucky_name))
+      (error "qq: red-packet detail has invalid send_order fields"))
+    (dolist (key '(sender_id total_count total_amount received_count
+                   received_amount lucky_user_id))
+      (unless (qq-api-user-id-p (alist-get key order))
+        (error "qq: red-packet detail send_order.%s must be decimal" key)))
+    (dolist (key '(sender_name wishing))
+      (unless (stringp (alist-get key order))
+        (error "qq: red-packet detail send_order.%s must be a string" key)))
+    (when (and (assq 'lucky_name order)
+               (not (stringp (alist-get 'lucky_name order))))
+      (error "qq: red-packet detail send_order.lucky_name must be a string"))
+    (dolist (key '(channel business_type receiver_type state))
+      (unless (integerp (alist-get key order))
+        (error "qq: red-packet detail send_order.%s must be an integer" key)))
+    (dolist (key '(created_at expires_at))
+      (unless (and (integerp (alist-get key order))
+                   (>= (alist-get key order) 0))
+        (error "qq: red-packet detail send_order.%s must be non-negative" key))))
+  (let ((receipts (alist-get 'receipts data)))
+    (unless (or (listp receipts) (vectorp receipts))
+      (error "qq: red-packet detail receipts must be an array"))
+    (cl-loop for receipt in (if (vectorp receipts)
+                                (append receipts nil)
+                              receipts)
+             for index from 0
+             do (qq-api--validate-red-packet-receipt
+                 receipt (format "red-packet receipts[%d]" index))))
+  (copy-tree data))
+
+(defun qq-api-get-red-packet-detail
+    (session-key message-id callback &optional errback)
+  "Fetch red-packet MESSAGE-ID detail in SESSION-KEY and call CALLBACK."
+  (qq-api-validate-message-id message-id "red-packet detail")
+  (qq-api-call
+   "emacs_get_red_packet_detail"
+   `((chat . ,(qq-api--session-emacs-locator session-key))
+     (message_id . ,message-id))
+   (lambda (response)
+     (condition-case error-data
+         (funcall callback
+                  (qq-api--validate-red-packet-detail
+                   (qq-api--response-data response) message-id))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   errback))
+
+(defun qq-api-grab-red-packet
+    (session-key message-id callback &optional errback)
+  "Explicitly claim red-packet MESSAGE-ID in SESSION-KEY."
+  (qq-api-validate-message-id message-id "red-packet claim")
+  (qq-api-call
+   "emacs_grab_red_packet"
+   `((chat . ,(qq-api--session-emacs-locator session-key))
+     (message_id . ,message-id))
+   (lambda (response)
+     (condition-case error-data
+         (let ((data (qq-api--response-data response)))
+           (pcase (alist-get 'interaction data)
+             ("direct"
+              (unless (qq-api--exact-object-keys-p
+                       data '(message_id interaction) '(receipt))
+                (error "qq: direct red-packet claim result has invalid fields"))
+              (when (assq 'receipt data)
+                (qq-api--validate-red-packet-receipt
+                 (alist-get 'receipt data) "red-packet claim receipt")))
+             ("password"
+              (unless (qq-api--exact-object-keys-p
+                       data '(message_id interaction password_message_id))
+                (error "qq: password red-packet claim result has invalid fields"))
+              (qq-api-validate-message-id
+               (alist-get 'password_message_id data)
+               "password red-packet text"))
+             (_ (error "qq: red-packet claim result has invalid interaction")))
+           (unless (equal (alist-get 'message_id data) message-id)
+             (error "qq: red-packet claim returned a different message identity"))
+           (funcall callback (copy-tree data)))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   errback))
 
 (defun qq-api-session-key-from-locator (locator)
   "Return the unique local session key represented by LOCATOR.

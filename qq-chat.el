@@ -41,6 +41,7 @@
 (autoload 'qq-user-open "qq-user" nil t)
 (autoload 'qq-group-open "qq-group" nil t)
 (autoload 'qq-search-open "qq-search" nil t)
+(autoload 'qq-red-packet-open "qq-red-packet" nil t)
 (autoload 'qq-chat-forward-transient "qq-transient" nil t)
 
 (declare-function qq-forward-segment-p "qq-forward" (segment))
@@ -51,6 +52,9 @@
 (declare-function qq-user-open "qq-user" (user-id))
 (declare-function qq-group-open "qq-group" (group-id))
 (declare-function qq-search-open "qq-search" (session-key &optional query))
+(declare-function qq-red-packet-open
+                  "qq-red-packet"
+                  (session-key message-id segment outgoing-p))
 (declare-function qq-chat-message-transient "qq-transient" (&rest args))
 (declare-function qq-chat-attach-transient "qq-transient" (&rest args))
 (declare-function qq-chat-transient "qq-transient" (&rest args))
@@ -2896,6 +2900,10 @@ base emoji), never as OneBot CQ text."
   "Return non-nil when SEGMENT is a structured QQ Mail notification."
   (equal (alist-get 'type segment) "mail"))
 
+(defun qq-chat--wallet-segment-p (segment)
+  "Return non-nil when SEGMENT is a native QQ wallet message."
+  (equal (alist-get 'type segment) "wallet"))
+
 (defun qq-chat--poke-segment-p (segment)
   "Return non-nil when SEGMENT is a QQ gray-tip poke decoration."
   (equal (alist-get 'type segment) "poke"))
@@ -3112,6 +3120,76 @@ with the timestamp."
     (when open-action
       (add-text-properties start (point) card-properties))))
 
+(defun qq-chat--insert-wallet-segment
+    (segment message prefix-state properties)
+  "Insert native wallet SEGMENT belonging to MESSAGE as one card."
+  (let* ((data (alist-get 'data segment))
+         (receiver (alist-get 'receiver data))
+         (sender (alist-get 'sender data))
+         (presentation
+          (if (seq-some (lambda (key)
+                          (qq-chat--present-string (alist-get key receiver)))
+                        '(title sub_title content notice))
+              receiver
+            sender))
+         (title (qq-chat--present-string (alist-get 'title presentation)))
+         (subtitle (qq-chat--present-string
+                    (alist-get 'sub_title presentation)))
+         (content (qq-chat--present-string (alist-get 'content presentation)))
+         (wallet-kind (alist-get 'wallet_kind data))
+         (red-packet-p (member wallet-kind
+                               '("red-packet" "password-red-packet")))
+         (kind-label
+          (pcase wallet-kind
+            ("red-packet" "🧧 QQ 红包")
+            ("password-red-packet" "🧧 口令红包")
+            ("transfer" (if content (format "💳 %s" content) "💳 转账"))
+            (_ (if content (format "💳 %s" content) "QQ 钱包"))))
+         (message-id (alist-get 'server-id message))
+         (outgoing-p (eq (alist-get 'self-p message) t))
+         (open-action
+          (and red-packet-p
+               (qq-api-message-id-p message-id)
+               (lambda ()
+                 (qq-red-packet-open
+                  qq-chat--session-key message-id segment outgoing-p))))
+         (map (when open-action
+                (let ((map (make-sparse-keymap)))
+                  (set-keymap-parent map button-map)
+                  (define-key map (kbd "RET")
+                    (lambda () (interactive) (funcall open-action)))
+                  (define-key map [mouse-1]
+                    (lambda () (interactive) (funcall open-action)))
+                  map)))
+         (card-properties
+          (append properties
+                  (when open-action
+                    (list 'mouse-face 'highlight
+                          'help-echo "查看 QQ 红包"
+                          'follow-link t
+                          'keymap map
+                          'button t
+                          'category 'default-button
+                          'action (lambda (_button)
+                                    (funcall open-action))))))
+         (appkit-ui-card-indent-prefix-state prefix-state)
+         (card-prefix-state (appkit-ui-card-prefix-state))
+         (start (point)))
+    (appkit-ui-insert-prefixed-lines
+     card-prefix-state kind-label
+     :face 'bold :properties card-properties)
+    (when title
+      (appkit-ui-insert-prefixed-lines
+       card-prefix-state title :properties card-properties))
+    (when subtitle
+      (appkit-ui-insert-prefixed-lines
+       card-prefix-state subtitle :face 'shadow :properties card-properties))
+    (when (and content (not (equal content title)))
+      (appkit-ui-insert-prefixed-lines
+       card-prefix-state content :face 'shadow :properties card-properties))
+    (when open-action
+      (add-text-properties start (point) card-properties))))
+
 (defun qq-chat--media-segment-p (segment)
   "Return non-nil when SEGMENT should render as a media block."
   (member (alist-get 'type segment)
@@ -3311,6 +3389,10 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
                ((qq-chat--mail-segment-p segment)
                 (flush-inline)
                 (qq-chat--insert-mail-segment segment prefix-state properties))
+               ((qq-chat--wallet-segment-p segment)
+                (flush-inline)
+                (qq-chat--insert-wallet-segment
+                 segment message prefix-state properties))
                ((qq-chat--card-segment-p segment)
                 (flush-inline)
                 (qq-chat--insert-card-segment segment prefix-state properties))

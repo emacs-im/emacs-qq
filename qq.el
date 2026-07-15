@@ -26,6 +26,7 @@
 (require 'qq-chat)
 (require 'qq-search)
 (require 'qq-forward)
+(require 'qq-red-packet)
 (require 'qq-user-photo)
 (require 'qq-user)
 (require 'qq-group)

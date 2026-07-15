@@ -823,6 +823,19 @@ reply chrome elsewhere).  Media becomes short placeholders like
                                          (alist-get 'subject data))))))
                  (and parts (string-join parts ": ")))
                "[mail]"))
+          ("wallet"
+           (let* ((receiver (alist-get 'receiver data))
+                  (sender (alist-get 'sender data))
+                  (kind (alist-get 'wallet_kind data)))
+             (or (qq-state--present-string (alist-get 'notice receiver))
+                 (qq-state--present-string (alist-get 'title receiver))
+                 (qq-state--present-string (alist-get 'notice sender))
+                 (qq-state--present-string (alist-get 'title sender))
+                 (pcase kind
+                   ("transfer" "[转账]")
+                   ("red-packet" "[QQ红包]")
+                   ("password-red-packet" "[口令红包]")
+                   (_ "[QQ钱包]")))))
           ("card"
            (or (qq-state--present-string (alist-get 'prompt data))
                (qq-state--present-string (alist-get 'title data))
@@ -1484,6 +1497,9 @@ identify that exact group session."
                   (reference . ,(copy-tree (alist-get 'reference payload)))
                   (presentation . ,(copy-tree
                                      (alist-get 'presentation payload)))))))
+      ("wallet"
+       `((type . "wallet")
+         (data . ,(copy-tree payload))))
       ("unsupported"
        `((type . "__unsupported")
          (data . ((native_keys . ,(copy-tree
