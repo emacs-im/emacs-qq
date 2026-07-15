@@ -5,6 +5,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'qq-media)
+(require 'qq-runtime)
 
 (defmacro qq-media-test-with-reset (&rest body)
   "Run BODY with clean qq-media caches and rerender hooks disabled."
@@ -901,6 +902,7 @@
   "QQ supplies only its cache policy to the shared media opener."
   (let ((qq-media-cache-directory "/tmp/qq-media-cache/")
         (qq-media--resource-cache (make-hash-table :test #'equal))
+        (owner (list 'exact-owner))
         captured)
     (cl-letf (((symbol-function 'appkit-media-open-resource)
                (lambda (&rest arguments)
@@ -914,7 +916,8 @@
                   (qq-media-open-resource
                    '((url . "https://example.com/cat.png"))
                    'image
-                   "image:test")))
+                   "image:test"
+                   :owner owner)))
       (should (equal (nth 0 captured)
                      '((url . "https://example.com/cat.png"))))
       (should (eq (plist-get (cdr captured) :kind) 'image))
@@ -922,6 +925,7 @@
       (should (equal (plist-get (cdr captured) :cache-directory)
                      qq-media-cache-directory))
       (should (equal (plist-get (cdr captured) :client-label) "qq"))
+      (should (eq (plist-get (cdr captured) :owner) owner))
       (should (equal (alist-get 'file
                                 (qq-media--cached-resource "image:test"))
                      "/tmp/cat.png")))))
@@ -931,7 +935,8 @@
   (let* ((segment '((type . "file")
                     (data . ((name . "movie.mp4")
                              (url . "https://example.com/movie.mp4")))))
-         played-source)
+         (owner (list 'exact-owner))
+         played-source played-owner)
     (cl-letf (((symbol-function 'qq-media-segment-local-file)
                (lambda (_segment) nil))
               ((symbol-function 'qq-media-resolve-segment-resource)
@@ -939,10 +944,12 @@
                  (funcall callback
                           '((url . "https://example.com/movie.mp4")))))
               ((symbol-function 'appkit-media-play-video-source)
-               (lambda (source &optional _client-label)
-                 (setq played-source source))))
-      (qq-media-segment-open segment)
-      (should (equal played-source "https://example.com/movie.mp4")))))
+               (lambda (source &optional _client-label &rest keys)
+                 (setq played-source source
+                       played-owner (plist-get keys :owner)))))
+      (qq-media-segment-open segment :owner owner)
+      (should (equal played-source "https://example.com/movie.mp4"))
+      (should (eq played-owner owner)))))
 
 (ert-deftest qq-media-video-segments-are-inline-preview-capable ()
   (should
@@ -1194,6 +1201,92 @@
     (should (functionp supplied-error))
     (should (equal displayed
                    "qq: failed to play video: manual resolution failed"))))
+
+(ert-deftest qq-media-video-play-keeps-owner-across-runtime-replacement ()
+  "A late resolver callback cannot transfer its player to a same-id app."
+  (let* ((segment '((type . "video") (data . nil)))
+         (old-app (appkit-start-app 'qq :id 'default :shutdown #'ignore))
+         (qq-runtime--app old-app)
+         replacement resolver-success played-owner played-source)
+    (unwind-protect
+        (cl-letf (((symbol-function 'qq-media-segment-playable-p)
+                   (lambda (_segment) t))
+                  ((symbol-function 'qq-media-segment-local-file)
+                   (lambda (_segment) nil))
+                  ((symbol-function 'qq-media-resolve-segment-resource)
+                   (lambda (_segment success &optional _error)
+                     (setq resolver-success success)))
+                  ((symbol-function 'appkit-media-play-video-source)
+                   (lambda (source &optional _client-label &rest keys)
+                     (setq played-source source
+                           played-owner (plist-get keys :owner)))))
+          (qq-media-segment-play segment :owner old-app)
+          (should (functionp resolver-success))
+          (appkit-stop-app old-app)
+          (setq replacement
+                (appkit-start-app 'qq :id 'default :shutdown #'ignore)
+                qq-runtime--app replacement)
+          (funcall resolver-success
+                   '((url . "https://example.com/late.mp4")))
+          (should (equal played-source "https://example.com/late.mp4"))
+          (should (eq played-owner old-app))
+          (should-not (eq played-owner replacement))
+          (should-not (appkit-app-live-p old-app)))
+      (when (appkit-app-live-p old-app)
+        (appkit-stop-app old-app))
+      (when (appkit-app-live-p replacement)
+        (appkit-stop-app replacement)))))
+
+(ert-deftest qq-media-video-process-follows-exact-account-generation ()
+  "Account stop kills its real player without touching a replacement's one."
+  (let ((shell (executable-find "sh"))
+        (sleeper (executable-find "sleep")))
+    (skip-unless (and shell sleeper))
+    (let* ((source (make-temp-file "qq-media-player-" nil ".mp4"))
+           ;; SOURCE is appended after these arguments.  The shell receives it
+           ;; as $2 while executing the absolute sleep program from $1.
+           (appkit-media-video-player-command
+            (list shell "-c" "exec \"$1\" 30" "qq-media-player" sleeper))
+           (segment '((type . "video") (data . nil)))
+           (qq-runtime--app nil)
+           old-app replacement-app old-process replacement-process)
+      (unwind-protect
+          (cl-letf (((symbol-function 'qq-media-segment-playable-p)
+                     (lambda (_segment) t))
+                    ((symbol-function 'qq-media-segment-local-file)
+                     (lambda (_segment) source)))
+            (setq old-app
+                  (appkit-start-app 'qq :id 'default :shutdown #'ignore)
+                  qq-runtime--app old-app
+                  old-process
+                  (qq-media-segment-play segment :owner old-app))
+            (should (process-live-p old-process))
+            (qq-runtime-stop)
+            (should-not (process-live-p old-process))
+
+            (setq replacement-app
+                  (appkit-start-app 'qq :id 'default :shutdown #'ignore)
+                  qq-runtime--app replacement-app
+                  replacement-process
+                  (qq-media-segment-play segment :owner replacement-app))
+            (should (process-live-p replacement-process))
+            ;; Re-stopping the exact old generation is inert for the same-id
+            ;; replacement and its independently owned process.
+            (appkit-stop-app old-app)
+            (should (process-live-p replacement-process))
+            (qq-runtime-stop)
+            (should-not (process-live-p replacement-process)))
+        (dolist (process (list old-process replacement-process))
+          (when (processp process)
+            (set-process-sentinel process nil)
+            (when (process-live-p process)
+              (delete-process process))))
+        (when (appkit-app-live-p old-app)
+          (appkit-stop-app old-app))
+        (when (appkit-app-live-p replacement-app)
+          (appkit-stop-app replacement-app))
+        (when (file-exists-p source)
+          (delete-file source))))))
 
 ;; Strict video remote-status model overrides for the pre-wire-model fixtures.
 

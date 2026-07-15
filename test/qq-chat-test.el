@@ -4093,7 +4093,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                      (setq preview-url url)
                      (insert "PREVIEW")))
                   ((symbol-function 'qq-media-segment-open)
-                   (lambda (media-segment)
+                   (lambda (media-segment &rest _keys)
                      (setq opened-segment media-segment))))
           (qq-chat--insert-segment-media-line segment nil nil)
           (should-not preview-url)
@@ -4112,6 +4112,81 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
             (should (functionp (plist-get context :copy-url-action)))
             (appkit-media-card-call-action 'open context))
           (should (equal opened-segment segment)))))))
+
+(ert-deftest qq-chat-media-card-captures-exact-account-owner ()
+  "Closing a view keeps app ownership; a same-id app cannot take it over."
+  (let* ((old-app (appkit-start-app 'qq :id 'default :shutdown #'ignore))
+         (qq-runtime--app old-app)
+         (segment '((type . "video")
+                    (data . ((name . "late.mp4")
+                             (url . "https://example.com/late.mp4")
+                             (remote_status . "available")))))
+         replacement view context calls)
+    (unwind-protect
+        (with-temp-buffer
+          (qq-chat-mode)
+          (setq qq-chat--session-key "group:20001")
+          (setq view
+                (appkit-attach-view
+                 :app old-app :id (qq-chat--view-id)
+                 :state qq-chat--session-key :mode 'qq-chat-mode))
+          (setq context (qq-chat--segment-media-card-context segment))
+          (should (functionp (plist-get context :open-action)))
+          (appkit-kill-view view)
+          (cl-letf (((symbol-function 'qq-media-segment-open)
+                     (lambda (called-segment &rest keys)
+                       (push (list called-segment (plist-get keys :owner))
+                             calls))))
+            ;; The player owner is the account app, so merely closing this chat
+            ;; view does not revoke the captured action.
+            (funcall (plist-get context :open-action))
+            (should (appkit-app-live-p old-app))
+            (should (eq (cadar calls) old-app))
+            (should-not (eq (cadar calls) view))
+
+            ;; Replacing the runtime with an equal kind/id app must not alter an
+            ;; action rendered by the preceding account generation.
+            (appkit-stop-app old-app)
+            (setq replacement
+                  (appkit-start-app 'qq :id 'default :shutdown #'ignore)
+                  qq-runtime--app replacement)
+            (funcall (plist-get context :open-action))
+            (should (= (length calls) 2))
+            (dolist (call calls)
+              (should (equal (car call) segment))
+              (should (eq (cadr call) old-app))
+              (should-not (eq (cadr call) replacement)))))
+      (when (appkit-app-live-p old-app)
+        (appkit-stop-app old-app))
+      (when (appkit-app-live-p replacement)
+        (appkit-stop-app replacement)))))
+
+(ert-deftest qq-chat-media-card-captures-owner-in-shared-nonchat-view ()
+  "Shared message renderers bind video actions outside `qq-chat-mode'."
+  (let* ((app (appkit-start-app 'qq :id 'shared-render :shutdown #'ignore))
+         (segment '((type . "video")
+                    (data . ((name . "shared.mp4")
+                             (url . "https://example.com/shared.mp4")
+                             (remote_status . "available")))))
+         context called-owner view)
+    (unwind-protect
+        (with-temp-buffer
+          ;; Forward and Guild forum buffers reuse this renderer but have
+          ;; their own modes and view ids.  Only the exact Appkit view is a
+          ;; valid source of account ownership here.
+          (setq view
+                (appkit-attach-view
+                 :app app :id '(forward "shared") :mode major-mode))
+          (setq context (qq-chat--segment-media-card-context segment))
+          (cl-letf (((symbol-function 'qq-media-segment-open)
+                     (lambda (_segment &rest keys)
+                       (setq called-owner (plist-get keys :owner)))))
+            (funcall (plist-get context :open-action))
+            (should (eq called-owner app))))
+      (when (appkit-view-live-p view)
+        (appkit-kill-view view))
+      (when (appkit-app-live-p app)
+        (appkit-stop-app app)))))
 
 (ert-deftest qq-chat-video-preview-keeps-video-alt-text ()
   (let ((segment '((type . "video")

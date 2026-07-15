@@ -3559,8 +3559,14 @@ Keep this short — size is useful; internal sub_type / emoji ids are not."
 (defun qq-chat--segment-media-card-context (segment &optional capabilities)
   "Adapt OneBot media SEGMENT to the shared card action protocol.
 
-CAPABILITIES defaults to the centralized `qq-media' action/status model."
-  (let* ((capabilities (or capabilities
+CAPABILITIES defaults to the centralized `qq-media' action/status model.
+The exact account app is captured while rendering; later actions never resolve
+a replacement runtime generation."
+  (let* ((view (appkit-current-view))
+         (owner (and (appkit-view-live-p view)
+                     (eq (appkit-app-kind (appkit-view-app view)) 'qq)
+                     (appkit-view-app view)))
+         (capabilities (or capabilities
                            (qq-media-segment-capabilities segment)))
          (url (plist-get capabilities :remote-url)))
     (appkit-media-card-context-create
@@ -3569,10 +3575,11 @@ CAPABILITIES defaults to the centralized `qq-media' action/status model."
      :title (qq-chat--segment-media-summary segment)
      :open-action (when (plist-get capabilities :open)
                     (lambda ()
-                      (qq-media-segment-open segment)))
+                      (qq-media-segment-open segment :owner owner)))
      :download-action (when (plist-get capabilities :download)
                         (lambda ()
-                          (qq-media-segment-start-download segment)))
+                          (qq-media-segment-start-download
+                           segment nil :owner owner)))
      :save-as-action (when (plist-get capabilities :save)
                        (lambda ()
                          (qq-media-segment-save-as segment)))

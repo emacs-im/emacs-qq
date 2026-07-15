@@ -852,18 +852,22 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
      (t
       (user-error "qq: segment has neither local file nor URL"))))))
 
-(defun qq-media-segment-open (segment)
-  "Open OneBot message SEGMENT using QQ-aware resource resolution."
+(cl-defun qq-media-segment-open (segment &key owner)
+  "Open OneBot message SEGMENT using QQ-aware resource resolution.
+
+OWNER is the exact Appkit app generation that owns any external video player."
   (let ((kind (qq-media-segment-kind segment))
         (cache-key (qq-media--segment-resource-key segment)))
     (if (eq kind 'video)
-        (qq-media-segment-play segment)
+        (qq-media-segment-play segment :owner owner)
       (if-let* ((file (qq-media-segment-local-file segment)))
-          (qq-media-open-resource `((file . ,file)) kind cache-key)
+          (qq-media-open-resource
+           `((file . ,file)) kind cache-key :owner owner)
         (qq-media-resolve-segment-resource
          segment
          (lambda (resource)
-           (qq-media-open-resource resource kind cache-key)))))))
+           (qq-media-open-resource
+            resource kind cache-key :owner owner)))))))
 
 (defun qq-media-segment-openable-p (segment)
   "Return non-nil when SEGMENT can be opened via `qq-media'."
@@ -888,10 +892,12 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
      ((and (equal type "file") (appkit-media-video-file-name-p name)) 'video)
      (t 'file))))
 
-(defun qq-media-open-resource (resource &optional kind cache-key)
+(cl-defun qq-media-open-resource
+    (resource &optional kind cache-key &key owner)
   "Open QQ RESOURCE through the shared browser-free media backend.
 
-CACHE-KEY also records the resolved local resource in QQ's logical cache."
+CACHE-KEY also records the resolved local resource in QQ's logical cache.
+OWNER is forwarded exactly to lifecycle-own an external video player."
   (appkit-media-open-resource
    (qq-media--appkit-resource resource)
    :kind kind
@@ -901,7 +907,8 @@ CACHE-KEY also records the resolved local resource in QQ's logical cache."
    (and cache-key
         (lambda (updated-resource)
           (qq-media--cache-resource cache-key updated-resource)))
-   :client-label "qq"))
+   :client-label "qq"
+   :owner owner))
 
 (defun qq-media-segment-default-save-name (segment)
   "Return default filename for saving SEGMENT locally."
@@ -1007,8 +1014,12 @@ CACHE-KEY also records the resolved local resource in QQ's logical cache."
      ((qq-media--absolute-local-file-present-p preview-file) preview-file)
      (t nil))))
 
-(defun qq-media-segment-start-download (segment &optional open-after)
-  "Download SEGMENT into `qq-media-download-directory'."
+(cl-defun qq-media-segment-start-download
+    (segment &optional open-after &key owner)
+  "Download SEGMENT into `qq-media-download-directory'.
+
+When OPEN-AFTER is non-nil, OWNER lifecycle-owns a video player opened after
+the asynchronous download."
   (let* ((capabilities (qq-media-segment-capabilities segment))
          (entry (plist-get capabilities :download-state))
          (path (plist-get entry :path))
@@ -1019,7 +1030,7 @@ CACHE-KEY also records the resolved local resource in QQ's logical cache."
      ((and (eq status 'downloaded)
            (appkit-media-file-present-p path))
       (when open-after
-        (qq-media-segment-open-local segment))
+        (qq-media-segment-open-local segment :owner owner))
       path)
      ((not (plist-get capabilities :download))
       (user-error "qq: %s"
@@ -1059,7 +1070,8 @@ CACHE-KEY also records the resolved local resource in QQ's logical cache."
                              (when (finish 'downloaded nil)
                                (message "qq: downloaded media -> %s" path)
                                (when open-after
-                                 (qq-media-segment-open-local segment))))
+                                 (qq-media-segment-open-local
+                                  segment :owner owner))))
                            (lambda (reason)
                              (when (finish 'error reason)
                                (message "qq: media download failed: %s"
@@ -1078,13 +1090,16 @@ CACHE-KEY also records the resolved local resource in QQ's logical cache."
                (message "qq: media download failed: %s" reason))))
           nil))))))
 
-(defun qq-media-segment-open-local (segment)
-  "Open the best local file available for SEGMENT."
+(cl-defun qq-media-segment-open-local (segment &key owner)
+  "Open the best local file available for SEGMENT.
+
+OWNER lifecycle-owns an external player when SEGMENT is a video."
   (if-let* ((file (qq-media-segment-local-file segment)))
       (qq-media-open-resource
        `((file . ,file))
        (qq-media-segment-kind segment)
-       (qq-media--segment-resource-key segment))
+       (qq-media--segment-resource-key segment)
+       :owner owner)
     (user-error "qq: media segment has no local file yet")))
 
 (defun qq-media-segment-save-as (segment &optional target-path)
@@ -1122,12 +1137,15 @@ CACHE-KEY also records the resolved local resource in QQ's logical cache."
          (user-error "qq: failed to save media: %s"
                      (error-message-string err)))))))
 
-(defun qq-media-segment-play (segment)
-  "Play video SEGMENT, preferring local files when available."
+(cl-defun qq-media-segment-play (segment &key owner)
+  "Play video SEGMENT, preferring local files when available.
+
+OWNER is captured before remote resolution and forwarded unchanged to Appkit;
+an asynchronous callback never resolves a replacement runtime app."
   (unless (qq-media-segment-playable-p segment)
     (user-error "qq: segment is not playable"))
   (if-let* ((file (qq-media-segment-local-file segment)))
-      (appkit-media-play-video-source file "qq")
+      (appkit-media-play-video-source file "qq" :owner owner)
     (qq-media-resolve-segment-resource
      segment
      (lambda (resource)
@@ -1138,9 +1156,10 @@ CACHE-KEY also records the resolved local resource in QQ's logical cache."
                                      :remote-url))))
              (cond
               ((qq-media--video-local-file-present-p resolved-file resource)
-               (appkit-media-play-video-source resolved-file "qq"))
+               (appkit-media-play-video-source
+                resolved-file "qq" :owner owner))
               ((appkit-media-url-present-p url)
-               (appkit-media-play-video-source url "qq"))
+               (appkit-media-play-video-source url "qq" :owner owner))
               (t
                (error "video segment has no playable source"))))
          ((error quit)
@@ -1164,10 +1183,12 @@ CACHE-KEY also records the resolved local resource in QQ's logical cache."
   "Return non-nil when MESSAGE has at least one openable resource segment."
   (not (null (qq-media-message-primary-segment message))))
 
-(defun qq-media-open-message-resource (message)
-  "Open the most relevant resource from MESSAGE."
+(cl-defun qq-media-open-message-resource (message &key owner)
+  "Open the most relevant resource from MESSAGE.
+
+OWNER lifecycle-owns an external player when the primary segment is a video."
   (if-let* ((segment (qq-media-message-primary-segment message)))
-      (qq-media-segment-open segment)
+      (qq-media-segment-open segment :owner owner)
     (user-error "qq: message has no openable media segment")))
 
 (defun qq-media-open-user-avatar (user-id)
