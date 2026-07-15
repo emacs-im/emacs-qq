@@ -1212,11 +1212,19 @@ remain disjoint: a Guild tiny id is not a QQ account id."
 
 (defun qq-media-message-avatar-image (message)
   "Return the identity-correct inline sender avatar for MESSAGE."
-  (pcase (qq-media--message-avatar-identity message)
-    (`(:guild-member ,guild-id ,native-id)
-     (qq-media-guild-member-avatar-image guild-id native-id))
-    (`(:user ,user-id)
-     (qq-media-avatar-image user-id))))
+  (let ((identity (qq-media--message-avatar-identity message))
+        (avatar-url (alist-get 'sender-avatar-url message)))
+    (pcase identity
+      (`(:guild-member ,guild-id ,native-id)
+       (if (appkit-media-url-present-p avatar-url)
+           (qq-media--ensure-resource-image
+            (qq-media--guild-member-avatar-key guild-id native-id)
+            (lambda (done _error)
+              (funcall done `((url . ,avatar-url))))
+            qq-media-avatar-image-height)
+         (qq-media-guild-member-avatar-image guild-id native-id)))
+      (`(:user ,user-id)
+       (qq-media-avatar-image user-id)))))
 
 (defun qq-media-avatar-image (user-id)
   "Return inline avatar image for USER-ID, triggering fetch when needed."

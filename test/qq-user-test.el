@@ -32,6 +32,22 @@
     (vip . ((kind . "svip") (level . 8) (annual . t))))
   "One complete native profile fixture.")
 
+(defmacro qq-user-test-with-profile-view (&rest body)
+  "Evaluate BODY in a live Appkit user-profile view.
+
+BODY may refer to the lexical variables `buffer' and `view'."
+  (declare (indent 0) (debug t))
+  `(let ((qq-runtime--app nil))
+     (unwind-protect
+         (with-temp-buffer
+           (qq-user-mode)
+           (setq qq-user--user-id "10001")
+           (let ((buffer (current-buffer))
+                 (view (qq-user--ensure-view)))
+             (ignore buffer view)
+             ,@body))
+       (qq-runtime-stop))))
+
 (ert-deftest qq-api-get-user-sends-string-identity ()
   (let (action params value)
     (cl-letf (((symbol-function 'qq-api-call)
@@ -76,6 +92,8 @@
       (should (string-match-p "SVIP 8" text))
       (should (string-match-p "hello from Emacs" text))
       (should-not (string-match-p "\\[Open\\]" text))
+      (should (equal (get-text-property (point-min) 'qq-user-profile-key)
+                     '(user-profile "10001")))
       (goto-char (point-min))
       (search-forward "发消息")
       (should (button-at (1- (point))))
@@ -126,9 +144,7 @@
     (should (string-match-p "获赞:[[:space:]]+获取失败" (buffer-string)))))
 
 (ert-deftest qq-user-refresh-handles-synchronous-response-ownership ()
-  (with-temp-buffer
-    (qq-user-mode)
-    (setq qq-user--user-id "10001")
+  (qq-user-test-with-profile-view
     (cl-letf (((symbol-function 'qq-user-render) #'ignore)
               ((symbol-function 'qq-api-get-user)
                (lambda (_user-id callback &optional _errback)
@@ -188,6 +204,169 @@
 (ert-deftest qq-user-reuses-one-profile-buffer-like-telega ()
   (should (equal (qq-user--buffer-name "10001") "*qq-user*"))
   (should (equal (qq-user--buffer-name "10002") "*qq-user*")))
+
+(ert-deftest qq-user-open-reuses-renamed-live-view-and-media-hook ()
+  (qq-user-test-with-profile-view
+    (let* ((profile (copy-tree qq-user-test--profile))
+           (hook qq-user--media-hook-function)
+           (renamed (generate-new-buffer-name " *qq-user-renamed*"))
+           selected
+           calls)
+      (setq qq-user--profile profile)
+      (rename-buffer renamed)
+      (cl-letf (((symbol-function 'pop-to-buffer)
+                 (lambda (candidate &rest _arguments)
+                   (setq selected candidate)
+                   candidate))
+                ((symbol-function 'appkit-request-sync)
+                 (lambda (candidate &rest arguments)
+                   (push (cons candidate arguments) calls)
+                   'owned-timer)))
+        (should (eq buffer (qq-user-open "10001")))
+        (should (eq selected buffer))
+        (should (eq view (appkit-current-view)))
+        (should (equal qq-user--view-id (appkit-view-id view)))
+        (should (eq profile qq-user--profile))
+        (should (eq hook qq-user--media-hook-function))
+        (should (equal renamed (buffer-name buffer)))
+        (should-not (get-buffer (qq-user--buffer-name "10001")))
+        (setq calls nil)
+        (funcall hook "avatar:10001"))
+      (should (= 1 (length calls)))
+      (should (eq view (caar calls)))
+      (should (equal '(user-profile "10001")
+                     (plist-get (cdar calls) :entry)))
+      (should (equal "avatar:10001"
+                     (plist-get (cdar calls) :resource)))
+      (should-not (plist-get (cdar calls) :structure)))))
+
+(ert-deftest qq-user-replacement-setup-clears-owned-view-state ()
+  (qq-user-test-with-profile-view
+    (let ((old-hook qq-user--media-hook-function)
+          cancelled)
+      (setq qq-user--profile (copy-tree qq-user-test--profile)
+            qq-user--loading t
+            qq-user--request 'old-profile-request
+            qq-user--request-owner 'old-owner
+            qq-user--like-count 42
+            qq-user--like-loading t
+            qq-user--photos '(((id . "old-photo")))
+            qq-user--photo-loading t
+            qq-user--photo-loaded t)
+      (cl-letf (((symbol-function 'qq-api-cancel-request)
+                 (lambda (request) (push request cancelled))))
+        (appkit-kill-view view)
+        (should (member 'old-profile-request cancelled))
+        (should-not qq-user--profile)
+        (should-not qq-user--loading)
+        (should-not qq-user--like-count)
+        (should-not qq-user--like-loading)
+        (should-not qq-user--photos)
+        (should-not qq-user--photo-loading)
+        (should-not qq-user--photo-loaded)
+        (should-not qq-user--media-hook-function)
+        (should-not (memq old-hook qq-media-cache-update-hook))
+        ;; Simulate residue in the detached buffer.  The replacement's
+        ;; `:setup' boundary must clear it without affecting ordinary reuse.
+        (setq qq-user--profile '((user_id . "stale"))
+              qq-user--loading t
+              qq-user--request 'orphan-profile-request
+              qq-user--request-owner 'orphan-owner
+              qq-user--media-hook-function old-hook)
+        (add-hook 'qq-media-cache-update-hook old-hook)
+        (let ((replacement
+               (appkit-open-view
+                :app (qq-runtime-app)
+                :id qq-user--view-id
+                :mode 'qq-user-mode
+                :buffer-name (qq-user--buffer-name "10001")
+                :sync-function #'qq-user--sync-invalidations
+                :parts '(profile)
+                :setup #'qq-user--setup-view)))
+          (should (appkit-view-live-p replacement))
+          (should-not (eq replacement view))
+          (should (member 'orphan-profile-request cancelled))
+          (should-not qq-user--profile)
+          (should-not qq-user--loading)
+          (should-not qq-user--request)
+          (should-not qq-user--request-owner)
+          (should-not (memq old-hook qq-media-cache-update-hook))
+          (should qq-user--media-hook-function)
+          (should (memq qq-user--media-hook-function
+                        qq-media-cache-update-hook))
+          (setq qq-user--profile '((user_id . "replacement")))
+          (qq-user--release-view-work view buffer)
+          (should (equal qq-user--profile
+                         '((user_id . "replacement")))))))))
+
+(ert-deftest qq-user-dead-view-makes-late-profile-response-inert ()
+  (qq-user-test-with-profile-view
+    (let (success)
+      (cl-letf (((symbol-function 'qq-api-get-user)
+                 (lambda (_user-id callback &optional _errback)
+                   (setq success callback)
+                   'profile-token))
+                ((symbol-function 'qq-api-get-user-like)
+                 (lambda (&rest _arguments) 'like-token))
+                ((symbol-function 'qq-api-get-user-photo-wall)
+                 (lambda (&rest _arguments) 'photo-token))
+                ((symbol-function 'qq-api-cancel-request) #'ignore))
+        (qq-user-refresh)
+        (appkit-kill-view view)
+        (let ((replacement (qq-user--ensure-view))
+              (replacement-profile '((user_id . "10001")
+                                     (nickname . "Replacement"))))
+          (setq qq-user--profile replacement-profile)
+          (cl-letf (((symbol-function 'appkit-request-sync)
+                     (lambda (&rest _arguments)
+                       (ert-fail "late user response requested a sync")))
+                    ((symbol-function 'qq-api--default-error)
+                     (lambda (&rest _arguments)
+                       (ert-fail "late user response emitted an error"))))
+            (funcall success (copy-tree qq-user-test--profile)))
+          (should (appkit-view-live-p replacement))
+          (should (eq replacement-profile qq-user--profile))
+          (should-not qq-user--request-owner))))))
+
+(ert-deftest qq-user-profile-callback-uses-atomic-appkit-request-sync ()
+  (qq-user-test-with-profile-view
+    (let (success calls)
+      (cl-letf (((symbol-function 'qq-api-get-user)
+                 (lambda (_user-id callback &optional _errback)
+                   (setq success callback)
+                   'profile-token))
+                ((symbol-function 'qq-api-get-user-like)
+                 (lambda (&rest _arguments) 'like-token))
+                ((symbol-function 'qq-api-get-user-photo-wall)
+                 (lambda (&rest _arguments) 'photo-token)))
+        (qq-user-refresh))
+      (let ((before (buffer-string)))
+        (cl-letf (((symbol-function 'appkit-request-sync)
+                   (lambda (candidate &rest arguments)
+                     (push (cons candidate arguments) calls)
+                     'owned-timer))
+                  ((symbol-function 'appkit-invalidate)
+                   (lambda (&rest _arguments)
+                     (ert-fail "user callback used bare invalidation")))
+                  ((symbol-function 'appkit-schedule-sync)
+                   (lambda (&rest _arguments)
+                     (ert-fail "user callback used bare scheduling")))
+                  ((symbol-function 'appkit-sync-invalidations)
+                   (lambda (&rest _arguments)
+                     (ert-fail "user callback synchronized inline")))
+                  ((symbol-function 'qq-user-render)
+                   (lambda () (ert-fail "user callback rendered directly")))
+                  ((symbol-function 'erase-buffer)
+                   (lambda () (ert-fail "user callback erased the buffer"))))
+          (funcall success (copy-tree qq-user-test--profile)))
+        (should (equal before (buffer-string))))
+      (should (equal qq-user--profile qq-user-test--profile))
+      (should-not qq-user--loading)
+      (should-not qq-user--request-owner)
+      (should (= 1 (length calls)))
+      (should (eq view (caar calls)))
+      (should (plist-get (cdar calls) :structure))
+      (should (eq 'profile (plist-get (cdar calls) :part))))))
 
 (ert-deftest qq-user-global-search-result-is-strict-and-closed ()
   (let ((result
@@ -571,10 +750,8 @@
     (should (string-match-p "unknown outcome" failure))))
 
 (ert-deftest qq-user-like-refreshes-the-exact-profile-after-success ()
-  (with-temp-buffer
-    (qq-user-mode)
-    (setq qq-user--user-id "10001"
-          qq-user--profile (copy-tree qq-user-test--profile))
+  (qq-user-test-with-profile-view
+    (setq qq-user--profile (copy-tree qq-user-test--profile))
     (let (liked-user-id refreshed)
       (cl-letf (((symbol-function 'qq-state-self-user-id) (lambda () "99999"))
                 ((symbol-function 'qq-user-render) #'ignore)
@@ -595,10 +772,8 @@
       (should-not qq-user--send-like-request-owner))))
 
 (ert-deftest qq-user-like-renders-the-daily-limit-as-domain-state ()
-  (with-temp-buffer
-    (qq-user-mode)
-    (setq qq-user--user-id "10001"
-          qq-user--profile (copy-tree qq-user-test--profile))
+  (qq-user-test-with-profile-view
+    (setq qq-user--profile (copy-tree qq-user-test--profile))
     (cl-letf (((symbol-function 'qq-state-self-user-id) (lambda () "99999"))
               ((symbol-function 'qq-api-like-user)
                (lambda (_user-id callback &optional _errback)
@@ -723,6 +898,29 @@ BODY may refer to the lexical variable `view'."
                  (lambda (&rest _arguments)
                    (ert-fail "dead photo view requested a media sync"))))
         (qq-user-photo--handle-media-cache-update media-key)))))
+
+(ert-deftest qq-user-photo-replacement-view-can-restart-cancelled-load ()
+  (qq-user-photo-test-with-view
+    (let ((calls 0)
+          cancelled)
+      (cl-letf (((symbol-function 'qq-api-get-user-photo-wall)
+                 (lambda (_user-id _callback &optional _errback)
+                   (cl-incf calls)
+                   (list 'photo-request calls)))
+                ((symbol-function 'qq-api-cancel-request)
+                 (lambda (request) (push request cancelled))))
+        (qq-user-photo-refresh)
+        (should qq-user-photo--loading)
+        (appkit-kill-view view)
+        (should-not qq-user-photo--loading)
+        (should-not qq-user-photo--request)
+        (should-not qq-user-photo--request-owner)
+        (should (= 1 (length cancelled)))
+        (let ((replacement (qq-user-photo--ensure-view)))
+          (should (appkit-view-live-p replacement))
+          (qq-user-photo-refresh)
+          (should (= 2 calls))
+          (should qq-user-photo--loading))))))
 
 (provide 'qq-user-test)
 

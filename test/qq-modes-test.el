@@ -29,6 +29,18 @@
     (should-not (memq 'qq-mode-line-format mode-line-misc-info))
     (should-not (memq #'qq-mode-line-update qq-state-change-hook))))
 
+(ert-deftest qq-mode-line-state-hook-does-not-force-redisplay ()
+  (let ((qq-mode-line-mode t)
+        (qq-mode-line-string "")
+        (redisplays 0))
+    (cl-letf (((symbol-function 'qq-mode-line--counts)
+               (lambda () '(4 . 2)))
+              ((symbol-function 'force-mode-line-update)
+               (lambda (&rest _) (cl-incf redisplays))))
+      (qq-mode-line-update)
+      (should (stringp qq-mode-line-string))
+      (should (zerop redisplays)))))
+
 (provide 'qq-modes-test)
 
 ;;; qq-modes-test.el ends here

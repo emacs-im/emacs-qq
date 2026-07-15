@@ -886,13 +886,32 @@
   "Return non-nil when the directory has a live display window."
   (window-live-p (get-buffer-window (current-buffer) t)))
 
+(defun qq-contacts--view-current-p (view buffer)
+  "Return non-nil when VIEW still owns contacts BUFFER."
+  (and (buffer-live-p buffer)
+       (appkit-view-live-p view)
+       (eq (appkit-view-buffer view) buffer)
+       (equal qq-contacts--view-id (appkit-view-id view))
+       (with-current-buffer buffer
+         (and (derived-mode-p 'qq-contacts-mode)
+              (eq view (appkit-current-view))))))
+
 (defun qq-contacts--live-current-view ()
   "Return this buffer's live contacts view without creating one."
   (let ((view (appkit-current-view)))
-    (and (derived-mode-p 'qq-contacts-mode)
-         (appkit-view-live-p view)
-         (equal qq-contacts--view-id (appkit-view-id view))
-         view)))
+    (and (qq-contacts--view-current-p view (current-buffer)) view)))
+
+(defun qq-contacts--live-view ()
+  "Return the existing live Appkit contacts view, or nil.
+
+This registry lookup deliberately does not call `qq-runtime-app'.  State and
+media hooks must not start a QQ application merely to discover that the
+directory is closed, and the registered view remains authoritative when its
+owning buffer has been renamed."
+  (when (appkit-app-live-p qq-runtime--app)
+    (when-let* ((view (appkit-view-for-id
+                       qq-runtime--app qq-contacts--view-id)))
+      (and (qq-contacts--view-current-p view (appkit-view-buffer view)) view))))
 
 (defun qq-contacts--ensure-window-avatars (window)
   "Start avatar work only for directory rows visible in WINDOW."
@@ -946,7 +965,7 @@
       (setf (appkit-view-sync-function current)
             #'qq-contacts--sync-invalidations
             (appkit-view-parts current) '(directory))
-     current)
+      current)
      ((appkit-view-live-p current)
       (error "QQ: contacts buffer belongs to a different Appkit view"))
      (t
@@ -960,20 +979,53 @@
         (qq-contacts--setup-view view)
         view)))))
 
-(defun qq-contacts--cancel-buffer-work (buffer)
-  "Cancel asynchronous contacts work still owned by BUFFER."
+(defun qq-contacts--reset-buffer-work (buffer)
+  "Reset requests and account-scoped view state retained by BUFFER.
+
+This is a view-lifecycle boundary, not ordinary live-view reuse.  Search
+queries, results, cursors, and the global-stranger one-use capability must not
+survive attachment to a replacement runtime."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (derived-mode-p 'qq-contacts-mode)
-        (qq-contacts--cancel-refresh)
-        (qq-contacts--cancel-search)))))
+        (unwind-protect
+            (progn
+              (qq-contacts--cancel-refresh)
+              (qq-contacts--cancel-search))
+          ;; State release is unconditional: transport cancellation may signal,
+          ;; while Appkit still has to make a replacement runtime account-clean.
+          (qq-contacts--clear-search-results)
+          (setq qq-contacts--query nil
+                qq-contacts--search-scope 'all
+                qq-contacts--view 'friends
+                qq-contacts--previous-view 'friends
+                qq-contacts--loading nil
+                qq-contacts--error nil
+                qq-contacts--refresh-owner nil
+                qq-contacts--refresh-pending 0
+                qq-contacts--refresh-parts nil
+                qq-contacts--friend-request nil
+                qq-contacts--group-request nil
+                qq-contacts--search-owner nil
+                qq-contacts--search-pending nil
+                qq-contacts--search-friend-request nil
+                qq-contacts--search-group-request nil
+                qq-contacts--search-stranger-request nil
+                qq-contacts--search-member-request nil))))))
+
+(defun qq-contacts--release-view-work (view buffer)
+  "Release BUFFER work while it is still owned by contacts VIEW."
+  (when (and (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (eq view (appkit-current-view))))
+    (qq-contacts--reset-buffer-work buffer)))
 
 (defun qq-contacts--setup-view (view)
-  "Register lifecycle cleanup for newly attached contacts VIEW."
-  (appkit-register-handle
-   view 'function
-   (apply-partially #'qq-contacts--cancel-buffer-work
-                    (appkit-view-buffer view))))
+  "Register exact-view lifecycle cleanup for newly attached contacts VIEW."
+  (let ((buffer (appkit-view-buffer view)))
+    (appkit-register-handle
+     view 'function
+     (apply-partially #'qq-contacts--release-view-work view buffer))))
 
 (defun qq-contacts--queue-view-sync (view &optional force-keys)
   "Queue one coalesced directory sync for live VIEW.
@@ -981,9 +1033,8 @@
 FORCE-KEYS identifies existing rows whose presentation resources changed."
   (when (appkit-view-live-p view)
     (if force-keys
-        (appkit-invalidate view :entries force-keys)
-      (appkit-invalidate view :structure t :part 'directory))
-    (appkit-schedule-sync view)))
+        (appkit-request-sync view :entries force-keys)
+      (appkit-request-sync view :structure t :part 'directory))))
 
 (defun qq-contacts--request-reconcile (&optional force-keys)
   "Request a coalesced directory sync, forcing FORCE-KEYS when non-nil."
@@ -1085,13 +1136,11 @@ FORCE-KEYS identifies existing rows whose presentation resources changed."
         qq-contacts--search-stranger-request nil
         qq-contacts--search-member-request nil))
 
-(defun qq-contacts--search-current-p (buffer owner kind)
-  "Return non-nil when OWNER still owns search KIND in BUFFER."
-  (and (buffer-live-p buffer)
+(defun qq-contacts--search-current-p (view buffer owner kind)
+  "Return non-nil when VIEW and OWNER still own search KIND in BUFFER."
+  (and (qq-contacts--view-current-p view buffer)
        (with-current-buffer buffer
-         (and (derived-mode-p 'qq-contacts-mode)
-              (appkit-view-live-p (appkit-current-view))
-              (eq owner qq-contacts--search-owner)
+         (and (eq owner qq-contacts--search-owner)
               (memq kind qq-contacts--search-pending)))))
 
 (defconst qq-contacts--contact-search-identities
@@ -1152,11 +1201,12 @@ values still have to be unique."
               (puthash key t seen-new))))))
     (append (copy-sequence old) (copy-tree new))))
 
-(defun qq-contacts--finish-search-page (buffer owner kind append-p page)
-  "Apply native search PAGE for KIND owned by OWNER in BUFFER.
+(defun qq-contacts--finish-search-page
+    (view buffer owner kind append-p page)
+  "Apply native search PAGE for KIND owned by VIEW and OWNER in BUFFER.
 
 When APPEND-P is non-nil, merge PAGE after prior pages by exact identity."
-  (when (qq-contacts--search-current-p buffer owner kind)
+  (when (qq-contacts--search-current-p view buffer owner kind)
     (with-current-buffer buffer
       (let ((items (alist-get 'results page))
             (cursor (alist-get 'next_cursor page))
@@ -1192,7 +1242,7 @@ When APPEND-P is non-nil, merge PAGE after prior pages by exact identity."
                     prepared-p t))
           (error
            (qq-contacts--fail-search-page
-            buffer owner kind nil (error-message-string error-data))))
+            view buffer owner kind nil (error-message-string error-data))))
         (when prepared-p
           (pcase kind
             ('friends
@@ -1215,11 +1265,12 @@ When APPEND-P is non-nil, merge PAGE after prior pages by exact identity."
                 (assq-delete-all kind qq-contacts--search-errors)
                 qq-contacts--search-pending
                 (delq kind qq-contacts--search-pending))
-          (qq-contacts--request-reconcile))))))
+          (qq-contacts--queue-view-sync view))))))
 
-(defun qq-contacts--fail-search-page (buffer owner kind _response reason)
-  "Record native search failure REASON for KIND owned by OWNER in BUFFER."
-  (when (qq-contacts--search-current-p buffer owner kind)
+(defun qq-contacts--fail-search-page
+    (view buffer owner kind _response reason)
+  "Record search failure REASON for KIND owned by VIEW and OWNER in BUFFER."
+  (when (qq-contacts--search-current-p view buffer owner kind)
     (with-current-buffer buffer
       (pcase kind
         ('friends
@@ -1239,19 +1290,21 @@ When APPEND-P is non-nil, merge PAGE after prior pages by exact identity."
                   (assq-delete-all kind qq-contacts--search-errors))
             qq-contacts--search-pending
             (delq kind qq-contacts--search-pending))
-      (qq-contacts--request-reconcile))))
+      (qq-contacts--queue-view-sync view))))
 
-(defun qq-contacts--issue-search-request (kind cursor append-p)
-  "Issue native search KIND, continuing opaque CURSOR when non-nil.
+(defun qq-contacts--issue-search-request (view kind cursor append-p)
+  "Issue native search KIND through captured VIEW and opaque CURSOR.
 
 APPEND-P controls whether the resulting page extends existing entries."
   (let* ((buffer (current-buffer))
          (owner qq-contacts--search-owner)
          (query qq-contacts--query)
          (success (apply-partially #'qq-contacts--finish-search-page
-                                   buffer owner kind append-p))
+                                   view buffer owner kind append-p))
          (failure (apply-partially #'qq-contacts--fail-search-page
-                                   buffer owner kind)))
+                                   view buffer owner kind)))
+    (unless (qq-contacts--search-current-p view buffer owner kind)
+      (error "QQ: directory search lost its dispatch view"))
     (condition-case error-data
         (let ((request
                (pcase kind
@@ -1282,7 +1335,7 @@ APPEND-P controls whether the resulting page extends existing entries."
                      'group-members query success failure
                      qq-contacts--member-group-id 50)))
                  (_ (error "qq: unknown native directory search kind %S" kind)))))
-          (when (qq-contacts--search-current-p buffer owner kind)
+          (when (qq-contacts--search-current-p view buffer owner kind)
             (pcase kind
               ('friends (setq qq-contacts--search-friend-request request))
               ('groups (setq qq-contacts--search-group-request request))
@@ -1291,7 +1344,7 @@ APPEND-P controls whether the resulting page extends existing entries."
               ('members (setq qq-contacts--search-member-request request)))))
       (error
        (qq-contacts--fail-search-page
-        buffer owner kind nil (error-message-string error-data))))))
+        view buffer owner kind nil (error-message-string error-data))))))
 
 (defun qq-contacts-search (query &optional scope)
   "Search exact native directory SCOPE for QUERY.
@@ -1311,50 +1364,50 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
     ;; current search.  The API repeats this check at the transport boundary.
     (when (and (not (string-empty-p query)) (memq 'strangers kinds))
       (qq-api--stranger-search-owner-params query 50))
-    (qq-contacts--ensure-view)
-    (if (string-empty-p query)
-        (when (memq qq-contacts--view '(search members))
-          (qq-contacts-clear-search))
-      (unless (memq qq-contacts--view '(search members))
-        (setq qq-contacts--previous-view qq-contacts--view))
-      (qq-contacts--cancel-search)
-      (qq-contacts--clear-search-results)
-      (setq qq-contacts--query query
-            qq-contacts--search-scope scope
-            qq-contacts--view 'search
-            qq-contacts--search-owner
-            (list 'native-directory-search scope query)
-            qq-contacts--search-pending (copy-sequence kinds))
-      (qq-contacts--request-reconcile)
-      (dolist (kind kinds)
-        (qq-contacts--issue-search-request kind nil nil)))))
+    (let ((view (qq-contacts--ensure-view)))
+      (if (string-empty-p query)
+          (when (memq qq-contacts--view '(search members))
+            (qq-contacts-clear-search))
+        (unless (memq qq-contacts--view '(search members))
+          (setq qq-contacts--previous-view qq-contacts--view))
+        (qq-contacts--cancel-search)
+        (qq-contacts--clear-search-results)
+        (setq qq-contacts--query query
+              qq-contacts--search-scope scope
+              qq-contacts--view 'search
+              qq-contacts--search-owner
+              (list 'native-directory-search scope query)
+              qq-contacts--search-pending (copy-sequence kinds))
+        (qq-contacts--queue-view-sync view)
+        (dolist (kind kinds)
+          (qq-contacts--issue-search-request view kind nil nil))))))
 
 (defun qq-contacts--load-more (kind)
   "Load the next exact native search page for KIND."
-  (qq-contacts--ensure-view)
-  (unless (and (memq qq-contacts--view '(search members))
-               qq-contacts--search-owner)
-    (user-error "qq: there is no active directory search"))
-  (let ((cursor (pcase kind
-                  ('friends qq-contacts--search-friend-cursor)
-                  ('groups qq-contacts--search-group-cursor)
-                  ('strangers qq-contacts--search-stranger-cursor)
-                  ('members qq-contacts--search-member-cursor))))
-    (unless (qq-api-non-empty-string-p cursor)
-      (user-error "qq: this search section has no next page"))
-    (when (memq kind qq-contacts--search-pending)
-      (user-error "qq: this search section is already loading"))
-    (setq qq-contacts--search-errors
-          (assq-delete-all kind qq-contacts--search-errors)
-          qq-contacts--search-pending
-          (cons kind qq-contacts--search-pending))
-    (pcase kind
-      ('friends (setq qq-contacts--search-friend-cursor nil))
-      ('groups (setq qq-contacts--search-group-cursor nil))
-      ('strangers (setq qq-contacts--search-stranger-cursor nil))
-      ('members (setq qq-contacts--search-member-cursor nil)))
-    (qq-contacts--request-reconcile)
-    (qq-contacts--issue-search-request kind cursor t)))
+  (let ((view (qq-contacts--ensure-view)))
+    (unless (and (memq qq-contacts--view '(search members))
+                 qq-contacts--search-owner)
+      (user-error "qq: there is no active directory search"))
+    (let ((cursor (pcase kind
+                    ('friends qq-contacts--search-friend-cursor)
+                    ('groups qq-contacts--search-group-cursor)
+                    ('strangers qq-contacts--search-stranger-cursor)
+                    ('members qq-contacts--search-member-cursor))))
+      (unless (qq-api-non-empty-string-p cursor)
+        (user-error "qq: this search section has no next page"))
+      (when (memq kind qq-contacts--search-pending)
+        (user-error "qq: this search section is already loading"))
+      (setq qq-contacts--search-errors
+            (assq-delete-all kind qq-contacts--search-errors)
+            qq-contacts--search-pending
+            (cons kind qq-contacts--search-pending))
+      (pcase kind
+        ('friends (setq qq-contacts--search-friend-cursor nil))
+        ('groups (setq qq-contacts--search-group-cursor nil))
+        ('strangers (setq qq-contacts--search-stranger-cursor nil))
+        ('members (setq qq-contacts--search-member-cursor nil)))
+      (qq-contacts--queue-view-sync view)
+      (qq-contacts--issue-search-request view kind cursor t))))
 
 (defun qq-contacts-load-more-friends ()
   "Load the next native friend-search page."
@@ -1387,11 +1440,15 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
   (setq query (string-trim (or query "")))
   (when (string-empty-p query)
     (user-error "qq: group member search query cannot be empty"))
-  (let ((buffer (get-buffer-create qq-contacts-buffer-name)))
+  (let* ((view
+          (or (qq-contacts--live-view)
+              ;; The canonical open path initializes mode and lifecycle before
+              ;; we capture the exact view used by all member-search callbacks.
+              (let ((buffer (qq-contacts-open)))
+                (with-current-buffer buffer
+                  (qq-contacts--ensure-view)))))
+         (buffer (appkit-view-buffer view)))
     (with-current-buffer buffer
-      (unless (derived-mode-p 'qq-contacts-mode)
-        (qq-contacts-mode))
-      (qq-contacts--ensure-view)
       (unless (memq qq-contacts--view '(search members))
         (setq qq-contacts--previous-view qq-contacts--view))
       (qq-contacts--cancel-search)
@@ -1402,8 +1459,8 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
             qq-contacts--search-owner
             (list 'native-group-member-search group-id query)
             qq-contacts--search-pending '(members))
-      (qq-contacts--request-reconcile)
-      (qq-contacts--issue-search-request 'members nil nil))
+      (qq-contacts--queue-view-sync view)
+      (qq-contacts--issue-search-request view 'members nil nil))
     (pop-to-buffer buffer)
     buffer))
 
@@ -1589,23 +1646,22 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
   (setq qq-contacts--friend-request nil
         qq-contacts--group-request nil))
 
-(defun qq-contacts--refresh-current-p (buffer owner)
-  "Return non-nil when OWNER still owns refresh in BUFFER."
-  (and (buffer-live-p buffer)
+(defun qq-contacts--refresh-current-p (view buffer owner)
+  "Return non-nil when VIEW and OWNER still own refresh in BUFFER."
+  (and (qq-contacts--view-current-p view buffer)
        (with-current-buffer buffer
-         (and (derived-mode-p 'qq-contacts-mode)
-              (appkit-view-live-p (appkit-current-view))
-              (eq owner qq-contacts--refresh-owner)))))
+         (eq owner qq-contacts--refresh-owner))))
 
-(defun qq-contacts--refresh-part-current-p (buffer owner kind)
-  "Return non-nil when OWNER still owns refresh KIND in BUFFER."
-  (and (qq-contacts--refresh-current-p buffer owner)
+(defun qq-contacts--refresh-part-current-p (view buffer owner kind)
+  "Return non-nil when VIEW and OWNER still own refresh KIND in BUFFER."
+  (and (qq-contacts--refresh-current-p view buffer owner)
        (with-current-buffer buffer
          (memq kind qq-contacts--refresh-parts))))
 
-(defun qq-contacts--finish-refresh-part (buffer owner kind &optional reason)
-  "Finish one refresh KIND owned by OWNER in BUFFER, recording REASON."
-  (when (qq-contacts--refresh-part-current-p buffer owner kind)
+(defun qq-contacts--finish-refresh-part
+    (view buffer owner kind &optional reason)
+  "Finish refresh KIND owned by VIEW and OWNER in BUFFER, recording REASON."
+  (when (qq-contacts--refresh-part-current-p view buffer owner kind)
     (with-current-buffer buffer
       (pcase kind
         ('friends (setq qq-contacts--friend-request nil))
@@ -1622,60 +1678,59 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
       (when (= qq-contacts--refresh-pending 0)
         (setq qq-contacts--refresh-owner nil
               qq-contacts--loading nil))
-      (qq-contacts--request-reconcile))))
+      (qq-contacts--queue-view-sync view))))
 
 (defun qq-contacts-refresh ()
   "Refresh exact friend categories and joined groups from Linux QQ."
   (interactive)
-  (qq-contacts--ensure-view)
-  (qq-contacts--cancel-refresh)
-  (let ((buffer (current-buffer))
-        (owner (list 'contacts-refresh (float-time))))
-    (setq qq-contacts--refresh-owner owner
-          qq-contacts--refresh-pending 2
-          qq-contacts--refresh-parts '(friends groups)
-          qq-contacts--loading t
-          qq-contacts--error nil)
-    (qq-contacts--request-reconcile)
-    (condition-case error-data
-        (let ((request
-               (qq-api-refresh-friend-categories
-                (lambda (_categories)
-                  (qq-contacts--finish-refresh-part
-                   buffer owner 'friends))
-                (lambda (_response reason)
-                  (qq-contacts--finish-refresh-part
-                   buffer owner 'friends reason)))))
-          (when (qq-contacts--refresh-part-current-p buffer owner 'friends)
-            (setq qq-contacts--friend-request request)))
-      (error
-       (qq-contacts--finish-refresh-part
-        buffer owner 'friends (error-message-string error-data))))
-    (condition-case error-data
-        (let ((request
-               (qq-api-refresh-joined-groups
-                (lambda (_groups)
-                  (qq-contacts--finish-refresh-part
-                   buffer owner 'groups))
-                (lambda (_response reason)
-                  (qq-contacts--finish-refresh-part
-                   buffer owner 'groups reason)))))
-          (when (qq-contacts--refresh-part-current-p buffer owner 'groups)
-            (setq qq-contacts--group-request request)))
-      (error
-       (qq-contacts--finish-refresh-part
-        buffer owner 'groups (error-message-string error-data))))))
+  (let ((view (qq-contacts--ensure-view)))
+    (qq-contacts--cancel-refresh)
+    (let ((buffer (current-buffer))
+          (owner (list 'contacts-refresh (float-time))))
+      (setq qq-contacts--refresh-owner owner
+            qq-contacts--refresh-pending 2
+            qq-contacts--refresh-parts '(friends groups)
+            qq-contacts--loading t
+            qq-contacts--error nil)
+      (qq-contacts--queue-view-sync view)
+      (condition-case error-data
+          (let ((request
+                 (qq-api-refresh-friend-categories
+                  (lambda (_categories)
+                    (qq-contacts--finish-refresh-part
+                     view buffer owner 'friends))
+                  (lambda (_response reason)
+                    (qq-contacts--finish-refresh-part
+                     view buffer owner 'friends reason)))))
+            (when (qq-contacts--refresh-part-current-p
+                   view buffer owner 'friends)
+              (setq qq-contacts--friend-request request)))
+        (error
+         (qq-contacts--finish-refresh-part
+          view buffer owner 'friends (error-message-string error-data))))
+      (condition-case error-data
+          (let ((request
+                 (qq-api-refresh-joined-groups
+                  (lambda (_groups)
+                    (qq-contacts--finish-refresh-part
+                     view buffer owner 'groups))
+                  (lambda (_response reason)
+                    (qq-contacts--finish-refresh-part
+                     view buffer owner 'groups reason)))))
+            (when (qq-contacts--refresh-part-current-p
+                   view buffer owner 'groups)
+              (setq qq-contacts--group-request request)))
+        (error
+         (qq-contacts--finish-refresh-part
+          view buffer owner 'groups (error-message-string error-data)))))))
 
 (defun qq-contacts--handle-state-change (event)
   "Invalidate the open directory after relevant state EVENT."
   (when (memq (plist-get event :type)
               '(reset friends-refreshed groups-refreshed sessions-refreshed))
-    (when-let* ((buffer (get-buffer qq-contacts-buffer-name)))
-      (with-current-buffer buffer
-        (let ((view (appkit-current-view)))
-          (when (and (derived-mode-p 'qq-contacts-mode)
-                     (appkit-view-live-p view))
-            (qq-contacts--queue-view-sync view)))))))
+    (when-let* ((view (qq-contacts--live-view)))
+      (appkit-with-live-view view
+        (qq-contacts--queue-view-sync view)))))
 
 (defun qq-contacts--handle-media-cache-update (media-key)
   "Invalidate the directory row identified by avatar MEDIA-KEY."
@@ -1686,16 +1741,12 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
         (setq keys (list (cons 'friend (match-string 1 media-key))
                          (cons 'member (match-string 1 media-key))
                          (cons 'stranger (match-string 1 media-key)))))
-      ((string-match "\\`group-avatar:\\([1-9][0-9]*\\)\\'" media-key)
+       ((string-match "\\`group-avatar:\\([1-9][0-9]*\\)\\'" media-key)
         (setq keys (list (cons 'group (match-string 1 media-key))))))
       (when keys
-        (let ((buffer (get-buffer qq-contacts-buffer-name)))
-          (when (buffer-live-p buffer)
-            (with-current-buffer buffer
-              (let ((view (appkit-current-view)))
-                (when (and (derived-mode-p 'qq-contacts-mode)
-                           (appkit-view-live-p view))
-                  (qq-contacts--queue-view-sync view keys))))))))))
+        (when-let* ((view (qq-contacts--live-view)))
+          (appkit-with-live-view view
+            (qq-contacts--queue-view-sync view keys)))))))
 
 (defvar qq-contacts-mode-map
   (let ((map (make-sparse-keymap)))

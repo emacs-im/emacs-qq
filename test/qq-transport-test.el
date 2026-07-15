@@ -268,6 +268,89 @@
     (should-not qq-runtime--app)
     (should-not (qq-state-session "group:20001"))))
 
+(ert-deftest qq-reset-session-state-kills-renamed-and-legacy-client-buffers ()
+  (let* ((qq-runtime--app
+          (appkit-start-app 'qq :id 'reset-buffer-privacy-test))
+         (qq-state-change-hook nil)
+         (qq-media-cache-update-hook nil)
+         (qq-transport--pending (make-hash-table :test #'equal))
+         (qq-transport--ws nil)
+         (qq-transport--connecting nil)
+         (qq-transport--connection-owner nil)
+         (qq-transport--stopping nil)
+         (qq-transport--reconnect-timer nil)
+         (qq-transport--reconnect-attempt 0)
+         (view-buffer (generate-new-buffer " *qq-reset-view*"))
+         (legacy-buffer (generate-new-buffer " *qq-reset-legacy*"))
+         ;; A QQ-looking name alone must not make an unrelated buffer a
+         ;; destructive-reset target.
+         (unrelated-buffer (generate-new-buffer " *qq-reset-unrelated*"))
+         kill-observations)
+    (unwind-protect
+        (progn
+          (qq-state-upsert-session
+           "group:20001"
+           '((type . group) (target-id . "20001")
+             (title . "OLD ACCOUNT SECRET"))
+           nil)
+          (with-current-buffer view-buffer
+            (qq-root-mode)
+            (let ((inhibit-read-only t))
+              (insert "OLD ACCOUNT GENERATED VIEW"))
+            (appkit-attach-view
+             :app qq-runtime--app :id 'renamed-reset-view
+             :mode 'qq-root-mode :parts '(root))
+            (rename-buffer
+             (generate-new-buffer-name " *renamed-account-view*"))
+            (setq-local kill-buffer-query-functions
+                        (list (lambda () nil)))
+            (add-hook
+             'kill-buffer-hook
+             (lambda ()
+               (push (list (null qq-runtime--app)
+                           (null (qq-state-session "group:20001")))
+                     kill-observations))
+             nil t))
+          (with-current-buffer legacy-buffer
+            (qq-user-mode)
+            (let ((inhibit-read-only t))
+              (insert "OLD ACCOUNT LEGACY PROFILE"))
+            (setq-local kill-buffer-query-functions
+                        (list (lambda () nil)))
+            (add-hook
+             'kill-buffer-hook
+             (lambda ()
+               (push (list (null qq-runtime--app)
+                           (null (qq-state-session "group:20001")))
+                     kill-observations))
+             nil t))
+          (with-current-buffer unrelated-buffer
+            (special-mode)
+            (let ((inhibit-read-only t))
+              (insert "UNRELATED SENTINEL")))
+          (qq-reset-session-state)
+          ;; Repeating a destructive reset is harmless and does not broaden
+          ;; its buffer selection after the original runtime is gone.
+          (qq-reset-session-state)
+          (should-not (buffer-live-p view-buffer))
+          (should-not (buffer-live-p legacy-buffer))
+          (should (= 2 (length kill-observations)))
+          (should (cl-every (lambda (observation)
+                              (equal observation '(t t)))
+                            kill-observations))
+          (should-not qq-runtime--app)
+          (should-not (qq-state-session "group:20001"))
+          (should (buffer-live-p unrelated-buffer))
+          (with-current-buffer unrelated-buffer
+            (should (equal (buffer-string) "UNRELATED SENTINEL"))))
+      (dolist (buffer (list view-buffer legacy-buffer unrelated-buffer))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer)))
+      (when (appkit-app-live-p qq-runtime--app)
+        (appkit-stop-app qq-runtime--app))
+      (setq qq-runtime--app nil)
+      (qq-state-reset))))
+
 (ert-deftest qq-transport-synchronous-connect-error-schedules-retry ()
   "A refused socket must not leave the transport permanently connecting."
   (let ((qq-transport--pending (make-hash-table :test #'equal))

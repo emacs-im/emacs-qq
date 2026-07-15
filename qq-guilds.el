@@ -202,7 +202,10 @@
     (append
      (list
       (qq-guilds--entry-create
-       :key (list 'orphan-guild guild-id) :type 'heading
+       ;; Guild identity does not change when its metadata arrives later.
+       ;; Sharing this key with a known Guild preserves the heading node and
+       ;; semantic position while its fallback title is upgraded.
+       :key (qq-guilds--guild-entry-key guild-id) :type 'heading
        :text (qq-guilds--display-name guild-name guild-id)
        :face 'qq-guilds-title))
      (mapcar
@@ -275,6 +278,28 @@
           (goto-char probe)
           (get-text-property (line-beginning-position) 'qq-guilds-key)))))
 
+(defun qq-guilds--view-current-p (view buffer)
+  "Return non-nil when VIEW still owns Guild directory BUFFER."
+  (and (buffer-live-p buffer)
+       (appkit-view-live-p view)
+       (eq (appkit-view-buffer view) buffer)
+       (equal qq-guilds--view-id (appkit-view-id view))
+       (with-current-buffer buffer
+         (and (derived-mode-p 'qq-guilds-mode)
+              (eq view (appkit-current-view))))))
+
+(defun qq-guilds--live-view ()
+  "Return the existing live Appkit Guild directory view, or nil.
+
+This registry lookup deliberately does not call `qq-runtime-app'.  State
+hooks must not start a QQ application merely to discover that the directory
+is closed, and the registered view remains authoritative when its owning
+buffer has been renamed."
+  (when (appkit-app-live-p qq-runtime--app)
+    (when-let* ((view (appkit-view-for-id
+                       qq-runtime--app qq-guilds--view-id)))
+      (and (qq-guilds--view-current-p view (appkit-view-buffer view)) view))))
+
 (defun qq-guilds--ensure-view ()
   "Return the live Appkit view owning the current Guild directory."
   (let* ((app (qq-runtime-app))
@@ -286,7 +311,7 @@
       (setf (appkit-view-sync-function current)
             #'qq-guilds--sync-invalidations
             (appkit-view-parts current) '(directory))
-     current)
+      current)
      ((appkit-view-live-p current)
       (error "QQ: Guild directory belongs to a different Appkit view"))
      (t
@@ -300,19 +325,28 @@
         (qq-guilds--setup-view view)
         view)))))
 
-(defun qq-guilds--cancel-buffer-work (buffer)
-  "Cancel asynchronous Guild work still owned by BUFFER."
+(defun qq-guilds--reset-buffer-work (buffer)
+  "Reset requests and transient Guild state retained by BUFFER."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (derived-mode-p 'qq-guilds-mode)
-        (qq-guilds--cancel-refresh)))))
+        (qq-guilds--cancel-refresh)
+        (setq qq-guilds--error nil)))))
+
+(defun qq-guilds--release-view-work (view buffer)
+  "Release BUFFER work while it is still owned by Guild VIEW."
+  (when (and (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (eq view (appkit-current-view))))
+    (qq-guilds--reset-buffer-work buffer)))
 
 (defun qq-guilds--setup-view (view)
-  "Register lifecycle cleanup for newly attached Guild directory VIEW."
-  (appkit-register-handle
-   view 'function
-   (apply-partially #'qq-guilds--cancel-buffer-work
-                    (appkit-view-buffer view))))
+  "Reset replacement state and register lifecycle cleanup for Guild VIEW."
+  (let ((buffer (appkit-view-buffer view)))
+    (qq-guilds--reset-buffer-work buffer)
+    (appkit-register-handle
+     view 'function
+     (apply-partially #'qq-guilds--release-view-work view buffer))))
 
 (defun qq-guilds--queue-view-sync (view)
   "Queue one coalesced directory synchronization for live VIEW."
@@ -360,63 +394,58 @@
     (qq-api-cancel-request qq-guilds--refresh-request))
   (setq qq-guilds--refresh-request nil))
 
-(defun qq-guilds--refresh-current-p (buffer owner)
-  "Return non-nil when OWNER still owns the refresh in BUFFER."
-  (and (buffer-live-p buffer)
+(defun qq-guilds--refresh-current-p (view buffer owner)
+  "Return non-nil when VIEW and OWNER still own the refresh in BUFFER."
+  (and (qq-guilds--view-current-p view buffer)
        (with-current-buffer buffer
-         (and (derived-mode-p 'qq-guilds-mode)
-              (appkit-view-live-p (appkit-current-view))
-              (eq owner qq-guilds--refresh-owner)))))
+         (eq owner qq-guilds--refresh-owner))))
 
-(defun qq-guilds--finish-refresh (buffer owner &optional reason)
-  "Finish OWNER's Guild refresh in BUFFER, recording optional REASON."
-  (when (qq-guilds--refresh-current-p buffer owner)
+(defun qq-guilds--finish-refresh (view buffer owner &optional reason)
+  "Finish VIEW and OWNER's Guild refresh in BUFFER with optional REASON."
+  (when (qq-guilds--refresh-current-p view buffer owner)
     (with-current-buffer buffer
       (setq qq-guilds--refresh-owner nil
             qq-guilds--refresh-request nil
             qq-guilds--loading nil
             qq-guilds--error reason)
-      (qq-guilds--queue-view-sync (appkit-current-view)))))
+      (qq-guilds--queue-view-sync view))))
 
 (defun qq-guilds-refresh ()
   "Refresh the QQ Guild directory."
   (interactive)
-  (qq-guilds--ensure-view)
-  (qq-guilds--cancel-refresh)
-  (let ((buffer (current-buffer))
-        (owner (list 'guild-directory-refresh (float-time))))
-    (setq qq-guilds--loading t
-          qq-guilds--error nil
-          qq-guilds--refresh-owner owner)
-    (qq-guilds--queue-view-sync (appkit-current-view))
-    (condition-case error-data
-        (let ((request
-               (qq-api-refresh-guild-directory
-                (lambda (_directory)
-                  (qq-guilds--finish-refresh buffer owner))
-                (lambda (response reason)
-                  (qq-guilds--finish-refresh
-                   buffer owner
-                   (format "读取频道目录失败: %s"
-                           (or reason (alist-get 'message response)
-                               "未知错误")))))))
-          (when (qq-guilds--refresh-current-p buffer owner)
-            (setq qq-guilds--refresh-request request)))
-      (error
-       (qq-guilds--finish-refresh
-        buffer owner
-        (format "读取频道目录失败: %s"
-                (error-message-string error-data)))))))
+  (let ((view (qq-guilds--ensure-view)))
+    (qq-guilds--cancel-refresh)
+    (let ((buffer (current-buffer))
+          (owner (list 'guild-directory-refresh (float-time))))
+      (setq qq-guilds--loading t
+            qq-guilds--error nil
+            qq-guilds--refresh-owner owner)
+      (qq-guilds--queue-view-sync view)
+      (condition-case error-data
+          (let ((request
+                 (qq-api-refresh-guild-directory
+                  (lambda (_directory)
+                    (qq-guilds--finish-refresh view buffer owner))
+                  (lambda (response reason)
+                    (qq-guilds--finish-refresh
+                     view buffer owner
+                     (format "读取频道目录失败: %s"
+                             (or reason (alist-get 'message response)
+                                 "未知错误")))))))
+            (when (qq-guilds--refresh-current-p view buffer owner)
+              (setq qq-guilds--refresh-request request)))
+        (error
+         (qq-guilds--finish-refresh
+          view buffer owner
+          (format "读取频道目录失败: %s"
+                  (error-message-string error-data))))))))
 
 (defun qq-guilds--handle-state-change (event)
   "Invalidate the open Guild directory after relevant state EVENT."
   (when (memq (plist-get event :type) '(reset guild-directory-refreshed))
-    (when-let* ((buffer (get-buffer qq-guilds-buffer-name)))
-      (with-current-buffer buffer
-        (let ((view (appkit-current-view)))
-          (when (and (derived-mode-p 'qq-guilds-mode)
-                     (appkit-view-live-p view))
-            (qq-guilds--queue-view-sync view)))))))
+    (when-let* ((view (qq-guilds--live-view)))
+      (appkit-with-live-view view
+        (qq-guilds--queue-view-sync view)))))
 
 (defun qq-guilds-open-channel (guild-id channel-id)
   "Open the channel identified by GUILD-ID and CHANNEL-ID."

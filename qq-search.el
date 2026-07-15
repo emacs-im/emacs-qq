@@ -70,25 +70,34 @@
 (defvar-local qq-search--focus-first-result-p nil
   "Non-nil when the next sync should select the first result.")
 
-(defun qq-search--view-id (session-key)
-  "Return Appkit view identity for SESSION-KEY search results."
-  (list 'search session-key))
+(defconst qq-search--view-id 'search
+  "Stable Appkit identity of the singleton message-search view.")
+
+(defun qq-search--view-current-p (view buffer)
+  "Return non-nil when VIEW still owns search BUFFER."
+  (and (buffer-live-p buffer)
+       (appkit-view-live-p view)
+       (eq (appkit-view-buffer view) buffer)
+       (equal qq-search--view-id (appkit-view-id view))
+       (with-current-buffer buffer
+         (and (derived-mode-p 'qq-search-mode)
+              (eq view (appkit-current-view))))))
 
 (defun qq-search--cancel-request ()
   "Cancel the current buffer's owned transport request, if any."
-  (when qq-search--request
-    (qq-api-cancel-request qq-search--request))
-  (setq qq-search--request nil
-        qq-search--request-owner nil))
+  (let ((request qq-search--request))
+    ;; Revoke ownership before transport cancellation: a synchronous errback
+    ;; emitted by cancellation must already be stale at the callback boundary.
+    (setq qq-search--request nil
+          qq-search--request-owner nil)
+    (when request
+      (qq-api-cancel-request request))))
 
 (defun qq-search--request-current-p (view buffer session-key owner)
   "Return non-nil when VIEW and OWNER still own BUFFER and SESSION-KEY."
-  (and (appkit-view-live-p view)
-       (eq (appkit-view-buffer view) buffer)
+  (and (qq-search--view-current-p view buffer)
        (with-current-buffer buffer
-         (and (derived-mode-p 'qq-search-mode)
-              (eq view (appkit-current-view))
-              (equal qq-search--session-key session-key)
+         (and (equal qq-search--session-key session-key)
               (eq qq-search--request-owner owner)))))
 
 (defun qq-search--result-key (result)
@@ -213,51 +222,67 @@ text in the results buffer can never receive search highlighting."
 
 (defun qq-search--ewoc-printer (entry)
   "Insert one projected search ENTRY."
-  (pcase (qq-search--entry-type entry)
-    ('header
-     (insert (propertize
-              (format "Search in %s\n" (qq-search--session-title))
-              'face 'bold))
-     (insert (format "Query: %s\nLoaded: %d\n\n"
-                     qq-search--query (length qq-search--results))))
-    ('result (qq-search--insert-result (qq-search--entry-object entry)))
-    ('status (qq-search--insert-status))
-    (type (error "qq: unknown search entry type %S" type))))
+  (let ((start (point)))
+    (pcase (qq-search--entry-type entry)
+      ('header
+       (insert (propertize
+                (format "Search in %s\n" (qq-search--session-title))
+                'face 'bold))
+       (insert (format "Query: %s\nLoaded: %d\n\n"
+                       qq-search--query (length qq-search--results))))
+      ('result (qq-search--insert-result (qq-search--entry-object entry)))
+      ('status (qq-search--insert-status))
+      (type (error "qq: unknown search entry type %S" type)))
+    (put-text-property start (point) 'qq-search-entry-key
+                       (qq-search--entry-key entry))))
 
 (defun qq-search--live-current-view ()
   "Return this buffer's live session-search view, or nil."
   (let ((view (appkit-current-view)))
-    (and (derived-mode-p 'qq-search-mode)
-         (appkit-view-live-p view)
-         (equal (appkit-view-id view)
-                (qq-search--view-id qq-search--session-key))
-         view)))
+    (and (qq-search--view-current-p view (current-buffer)) view)))
 
-(defun qq-search--cancel-buffer-work (buffer)
-  "Cancel search work still owned by BUFFER."
+(defun qq-search--reset-buffer-work (buffer)
+  "Reset requests and result state retained by search BUFFER."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (derived-mode-p 'qq-search-mode)
-        (qq-search--cancel-request)))))
+        (qq-search--cancel-request)
+        (setq qq-search--query nil
+              qq-search--results nil
+              qq-search--results-tail nil
+              qq-search--seen nil
+              qq-search--consumed-cursors nil
+              qq-search--next-cursor nil
+              qq-search--status 'eof
+              qq-search--error nil
+              qq-search--pending-next-key nil
+              qq-search--focus-first-result-p nil)))))
+
+(defun qq-search--release-view-work (view buffer)
+  "Release BUFFER work while it is still owned by search VIEW."
+  (when (and (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (eq view (appkit-current-view))))
+    (qq-search--reset-buffer-work buffer)))
 
 (defun qq-search--setup-view (view)
-  "Register lifecycle cleanup for newly attached search VIEW."
-  (appkit-register-handle
-   view 'function
-   (apply-partially #'qq-search--cancel-buffer-work
-                    (appkit-view-buffer view))))
+  "Reset replacement state and register lifecycle cleanup for search VIEW."
+  (let ((buffer (appkit-view-buffer view)))
+    (qq-search--reset-buffer-work buffer)
+    (appkit-register-handle
+     view 'function
+     (apply-partially #'qq-search--release-view-work view buffer))))
 
 (defun qq-search--ensure-view ()
   "Return the live Appkit view owning the current search buffer."
   (unless qq-search--session-key
     (error "QQ: cannot attach a search view without a session identity"))
   (let* ((app (qq-runtime-app))
-         (view-id (qq-search--view-id qq-search--session-key))
          (current (appkit-current-view)))
     (cond
      ((and (appkit-view-live-p current)
            (eq app (appkit-view-app current))
-           (equal view-id (appkit-view-id current)))
+           (equal qq-search--view-id (appkit-view-id current)))
       (setf (appkit-view-sync-function current)
             #'qq-search--sync-invalidations
             (appkit-view-parts current) '(results))
@@ -268,7 +293,7 @@ text in the results buffer can never receive search highlighting."
       (let ((view
              (appkit-attach-view
               :app app
-              :id view-id
+              :id qq-search--view-id
               :mode 'qq-search-mode
               :sync-function #'qq-search--sync-invalidations
               :parts '(results))))
@@ -309,7 +334,7 @@ empty continuation pages while next-result navigation is pending."
     (let ((snapshot
            (with-current-buffer (appkit-view-buffer view)
              (appkit-position-capture
-              :anchor-property 'qq-search-result-key
+              :anchor-property 'qq-search-entry-key
               :preserve-window-start t))))
       (appkit-with-content-update view
 				  (unless qq-search--ewoc
@@ -391,7 +416,7 @@ empty continuation pages while next-result navigation is pending."
          (qq-search--request-sync view))))))
 
 (defun qq-search--page-failed (view buffer session-key owner _response reason)
-  "Record search failure REASON when VIEW and OWNER still own BUFFER."
+  "Record REASON when VIEW and OWNER still own SESSION-KEY in BUFFER."
   (when (qq-search--request-current-p view buffer session-key owner)
     (with-current-buffer buffer
       (setf (plist-get owner :pending) nil)
@@ -609,27 +634,21 @@ empty continuation pages while next-result navigation is pending."
   (unless (and (stringp query) (not (string-empty-p query)))
     (user-error "qq: empty search query"))
   (let* ((app (qq-runtime-app))
-         (view-id (qq-search--view-id session-key))
-         (buffer (get-buffer-create qq-search-buffer-name)))
+         (view
+          (appkit-open-view
+           :app app
+           :id qq-search--view-id
+           :mode 'qq-search-mode
+           :buffer-name qq-search-buffer-name
+           :sync-function #'qq-search--sync-invalidations
+           :parts '(results)
+           :setup #'qq-search--setup-view))
+         (buffer (appkit-view-buffer view)))
     (with-current-buffer buffer
-      (unless (derived-mode-p 'qq-search-mode)
-        (qq-search-mode))
-      (when-let* ((current (appkit-current-view)))
-        (when (and (appkit-view-live-p current)
-                   (not (equal view-id (appkit-view-id current))))
-          (appkit-kill-view current)))
-      (setq qq-search--session-key session-key))
-    (let ((view
-           (appkit-open-view
-            :app app
-            :id view-id
-            :mode 'qq-search-mode
-            :buffer-name qq-search-buffer-name
-            :sync-function #'qq-search--sync-invalidations
-            :parts '(results)
-            :setup #'qq-search--setup-view)))
-      (setq buffer (appkit-view-buffer view)))
-    (with-current-buffer buffer
+      ;; The stable Appkit identity owns this singleton even after the user
+      ;; renames its buffer.  Session replacement is buffer-local state, not a
+      ;; reason to locate or allocate another view by its fallback name.
+      (setq qq-search--session-key session-key)
       (qq-search-search query))
     (pop-to-buffer buffer)
     buffer))

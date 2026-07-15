@@ -1,5 +1,11 @@
 ;;; qq-red-packet-test.el --- Tests for QQ red packets -*- lexical-binding: t; -*-
 
+;;; Commentary:
+
+;; Regression coverage for native QQ red-packet protocol and views.
+
+;;; Code:
+
 (require 'ert)
 (require 'cl-lib)
 (require 'qq-api)
@@ -7,9 +13,11 @@
 (require 'qq-red-packet)
 (require 'qq-state)
 
-(defconst qq-red-packet-test--message-id "7467703692092974645")
+(defconst qq-red-packet-test--message-id "7467703692092974645"
+  "Opaque NT message identity used by red-packet fixtures.")
 
 (defun qq-red-packet-test--presentation (title)
+  "Return a native wallet presentation carrying TITLE."
   `((background . 100)
     (icon . 4)
     (title . ,title)
@@ -18,6 +26,7 @@
     (notice . ,(concat "[packet]" title))))
 
 (defun qq-red-packet-test--segment ()
+  "Return one closed native red-packet segment fixture."
   (copy-tree
    `((type . "wallet")
      (data
@@ -32,6 +41,7 @@
       (receiver . ,(qq-red-packet-test--presentation "Best wishes"))))))
 
 (defun qq-red-packet-test--detail ()
+  "Return one closed native red-packet detail fixture."
   `((message_id . ,qq-red-packet-test--message-id)
     (send_order
      (sender_id . "10001")
@@ -53,6 +63,22 @@
          (name . "Receiver")
          (amount . "100")
          (received_at . 1700000100))])))
+
+(defmacro qq-red-packet-test-with-view (&rest body)
+  "Evaluate BODY in a live Appkit packet view bound as `view'."
+  (declare (indent 0) (debug t))
+  `(let ((qq-runtime--app nil))
+     (unwind-protect
+         (with-temp-buffer
+           (qq-red-packet-mode)
+           (setq qq-red-packet--session-key "private:10002"
+                 qq-red-packet--message-id qq-red-packet-test--message-id
+                 qq-red-packet--segment (qq-red-packet-test--segment)
+                 qq-red-packet--outgoing-p nil)
+           (let ((view (qq-red-packet--ensure-view)))
+             (ignore view)
+             ,@body))
+       (qq-runtime-stop))))
 
 (ert-deftest qq-red-packet-preview-uses-native-presentation ()
   (should (equal "[packet]Best wishes"
@@ -210,6 +236,282 @@
   (should (equal "¥2.00" (qq-red-packet--format-amount "200")))
   (should (equal "¥12345678901234567890.12"
                  (qq-red-packet--format-amount "1234567890123456789012"))))
+
+(ert-deftest qq-red-packet-view-id-keeps-session-and-message-id-opaque ()
+  (should
+   (equal '(red-packet "private:10002" "7467703692092974645")
+          (qq-red-packet--view-id
+           "private:10002" "7467703692092974645"))))
+
+(ert-deftest qq-red-packet-renamed-live-and-detached-buffer-is-reused ()
+  (let ((qq-runtime--app nil)
+        buffer first-view
+        (calls 0))
+    (unwind-protect
+        (save-window-excursion
+          (cl-letf (((symbol-function 'pop-to-buffer)
+                     (lambda (candidate &rest _arguments) candidate))
+                    ((symbol-function 'qq-api-get-red-packet-detail)
+                     (lambda (_session-key _message-id callback
+                              &optional _errback)
+                       (cl-incf calls)
+                       (funcall callback (qq-red-packet-test--detail))
+                       (list 'detail-request calls))))
+            (setq buffer
+                  (qq-red-packet-open
+                   "private:10002" qq-red-packet-test--message-id
+                   (qq-red-packet-test--segment) nil))
+            (with-current-buffer buffer
+              (setq first-view (appkit-current-view)
+                    qq-red-packet--notice "preserved live notice")
+              (rename-buffer "*renamed-red-packet*" t))
+            (should
+             (eq buffer
+                 (qq-red-packet-open
+                  "private:10002" qq-red-packet-test--message-id
+                  (qq-red-packet-test--segment) nil)))
+            (with-current-buffer buffer
+              (should (eq first-view (appkit-current-view)))
+              (should (equal qq-red-packet--detail
+                             (qq-red-packet-test--detail)))
+              (should (equal qq-red-packet--notice
+                             "preserved live notice"))
+              (appkit-kill-view first-view)
+              (should-not qq-red-packet--detail)
+              (should-not qq-red-packet--notice))
+            (should
+             (eq buffer
+                 (qq-red-packet-open
+                  "private:10002" qq-red-packet-test--message-id
+                  (qq-red-packet-test--segment) nil)))
+            (with-current-buffer buffer
+              (should-not (eq first-view (appkit-current-view)))
+              (should (appkit-view-live-p (appkit-current-view))))
+            (should (= calls 2))))
+      (qq-runtime-stop)
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest qq-red-packet-runtime-replacement-resets-owned-work-via-setup ()
+  (let ((qq-runtime--app nil)
+        buffer old-view new-view
+        cancelled
+        (calls 0))
+    (unwind-protect
+        (save-window-excursion
+          (cl-letf (((symbol-function 'pop-to-buffer)
+                     (lambda (candidate &rest _arguments) candidate))
+                    ((symbol-function 'qq-api-get-red-packet-detail)
+                     (lambda (_session-key _message-id _callback
+                              &optional _errback)
+                       (cl-incf calls)
+                       (when (= calls 2)
+                         (should-not qq-red-packet--detail)
+                         (should-not qq-red-packet--error)
+                         (should-not qq-red-packet--notice)
+                         (should-not qq-red-packet--grabbing))
+                       (list 'detail-request calls)))
+                    ((symbol-function 'qq-api-cancel-request)
+                     (lambda (request) (push request cancelled))))
+            (setq buffer
+                  (qq-red-packet-open
+                   "private:10002" qq-red-packet-test--message-id
+                   (qq-red-packet-test--segment) nil))
+            (with-current-buffer buffer
+              (setq old-view (appkit-current-view)
+                    qq-red-packet--detail (qq-red-packet-test--detail)
+                    qq-red-packet--error "old account error"
+                    qq-red-packet--notice "old account notice"
+                    qq-red-packet--grabbing t
+                    qq-red-packet--grab-request 'old-grab-request
+                    qq-red-packet--grab-owner '(old-grab-owner))
+              (rename-buffer "*renamed-runtime-red-packet*" t))
+            (qq-runtime-stop)
+            (with-current-buffer buffer
+              (should-not qq-red-packet--loading)
+              (should-not qq-red-packet--grabbing)
+              (should-not qq-red-packet--detail)
+              ;; Force stale state back in; replacement :setup must clear and
+              ;; cancel it before dispatching the new runtime's request.
+              (setq qq-red-packet--detail (qq-red-packet-test--detail)
+                    qq-red-packet--error "stale"
+                    qq-red-packet--notice "stale"
+                    qq-red-packet--loading t
+                    qq-red-packet--request 'retained-detail-request
+                    qq-red-packet--request-owner '(retained-detail-owner)
+                    qq-red-packet--grabbing t
+                    qq-red-packet--grab-request 'retained-grab-request
+                    qq-red-packet--grab-owner '(retained-grab-owner)))
+            (should
+             (eq buffer
+                 (qq-red-packet-open
+                  "private:10002" qq-red-packet-test--message-id
+                  (qq-red-packet-test--segment) nil)))
+            (with-current-buffer buffer
+              (setq new-view (appkit-current-view))
+              (should (appkit-view-live-p new-view))
+              (should-not (eq old-view new-view))
+              (should qq-red-packet--loading)
+              (should-not qq-red-packet--grabbing)
+              (should-not qq-red-packet--detail)
+              (should-not qq-red-packet--error)
+              (should-not qq-red-packet--notice))
+            ;; A second open finds the live registry entry and preserves its
+            ;; active request instead of replaying :setup.
+            (should
+             (eq buffer
+                 (qq-red-packet-open
+                  "private:10002" qq-red-packet-test--message-id
+                  (qq-red-packet-test--segment) nil)))
+            (with-current-buffer buffer
+              (should (eq new-view (appkit-current-view)))
+              (should qq-red-packet--loading))
+            (should (= calls 2))
+            (dolist (request '((detail-request 1) old-grab-request
+                               retained-detail-request retained-grab-request))
+              (should (member request cancelled)))))
+      (qq-runtime-stop)
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest qq-red-packet-stale-and-dead-detail-responses-are-inert ()
+  (qq-red-packet-test-with-view
+    (let (callbacks)
+      (cl-letf (((symbol-function 'qq-api-get-red-packet-detail)
+                 (lambda (_session-key _message-id callback
+                          &optional _errback)
+                   (push callback callbacks)
+                   (list 'detail-request (length callbacks))))
+                ((symbol-function 'qq-api-cancel-request) #'ignore))
+        (qq-red-packet-refresh)
+        (let ((first (car callbacks)))
+          (qq-red-packet-refresh)
+          (let ((owner qq-red-packet--request-owner)
+                (request qq-red-packet--request))
+            (cl-letf (((symbol-function 'appkit-request-sync)
+                       (lambda (&rest _arguments)
+                         (ert-fail "stale detail callback requested sync"))))
+              (funcall first (qq-red-packet-test--detail)))
+            (should (eq owner qq-red-packet--request-owner))
+            (should (eq request qq-red-packet--request)))))
+      (let ((latest (car callbacks)))
+        (appkit-kill-view view)
+        (cl-letf (((symbol-function 'appkit-request-sync)
+                   (lambda (&rest _arguments)
+                     (ert-fail "dead detail callback requested sync"))))
+          (funcall latest (qq-red-packet-test--detail)))
+        (should-not qq-red-packet--detail)
+        (should-not qq-red-packet--request-owner)))))
+
+(ert-deftest qq-red-packet-detail-callback-requests-one-atomic-appkit-sync ()
+  (qq-red-packet-test-with-view
+    (let (success calls)
+      (cl-letf (((symbol-function 'qq-api-get-red-packet-detail)
+                 (lambda (_session-key _message-id callback
+                          &optional _errback)
+                   (setq success callback)
+                   'detail-request)))
+        (qq-red-packet-refresh))
+      (let ((before (buffer-string)))
+        (cl-letf (((symbol-function 'appkit-request-sync)
+                   (lambda (candidate &rest options)
+                     (push (cons candidate options) calls)))
+                  ((symbol-function 'qq-red-packet-render)
+                   (lambda () (ert-fail "detail callback rendered directly")))
+                  ((symbol-function 'appkit-invalidate)
+                   (lambda (&rest _arguments)
+                     (ert-fail "detail callback split invalidation")))
+                  ((symbol-function 'appkit-schedule-sync)
+                   (lambda (&rest _arguments)
+                     (ert-fail "detail callback scheduled directly"))))
+          (funcall success (qq-red-packet-test--detail)))
+        (should (equal before (buffer-string)))
+        (should (equal qq-red-packet--detail
+                       (qq-red-packet-test--detail)))
+        (should
+         (equal calls (list (list view :structure t :part 'packet))))))))
+
+(ert-deftest qq-red-packet-grab-callback-queues-post-sync-detail-refresh ()
+  (qq-red-packet-test-with-view
+    (let (grab-success
+          (detail-calls 0))
+      (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                ((symbol-function 'qq-api-grab-red-packet)
+                 (lambda (_session-key _message-id callback
+                          &optional _errback)
+                   (setq grab-success callback)
+                   'grab-request))
+                ((symbol-function 'qq-api-get-red-packet-detail)
+                 (lambda (_session-key _message-id _callback
+                          &optional _errback)
+                   (cl-incf detail-calls)
+                   'detail-request)))
+        (qq-red-packet-grab)
+        (let ((before (buffer-string))
+              (real-request-sync (symbol-function 'appkit-request-sync))
+              calls)
+          (cl-letf (((symbol-function 'appkit-request-sync)
+                     (lambda (candidate &rest options)
+                       (push (cons candidate options) calls)
+                       (apply real-request-sync candidate options)))
+                    ((symbol-function 'qq-red-packet-render)
+                     (lambda () (ert-fail "grab callback rendered directly")))
+                    ((symbol-function 'qq-red-packet-refresh)
+                     (lambda () (ert-fail "grab callback refreshed directly"))))
+            (funcall grab-success '((interaction . "normal")))
+            (should (= detail-calls 0))
+            (should (equal before (buffer-string)))
+            (should (= 1 (length calls)))
+            (should
+             (equal (appkit-view-pending-events-snapshot view)
+                    `((:type refresh-detail
+                       :session-key "private:10002"
+                       :message-id ,qq-red-packet-test--message-id)))))
+          (qq-red-packet--sync-now view)
+          (should (= detail-calls 1))
+          (should qq-red-packet--loading)
+          (should-not (appkit-view-pending-events-snapshot view)))))))
+
+(ert-deftest qq-red-packet-dead-view-makes-grab-response-inert ()
+  (qq-red-packet-test-with-view
+    (let (success)
+      (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                ((symbol-function 'qq-api-grab-red-packet)
+                 (lambda (_session-key _message-id callback
+                          &optional _errback)
+                   (setq success callback)
+                   'grab-request)))
+        (qq-red-packet-grab))
+      (appkit-kill-view view)
+      (cl-letf (((symbol-function 'appkit-request-sync)
+                 (lambda (&rest _arguments)
+                   (ert-fail "dead grab callback requested sync"))))
+        (funcall success '((interaction . "normal"))))
+      (should-not qq-red-packet--notice)
+      (should-not qq-red-packet--grab-owner))))
+
+(ert-deftest qq-red-packet-sync-preserves-stable-receipt-position-key ()
+  (qq-red-packet-test-with-view
+    (setq qq-red-packet--detail (qq-red-packet-test--detail))
+    (qq-red-packet--request-sync view)
+    (qq-red-packet--sync-now view)
+    (goto-char (point-min))
+    (search-forward "Receiver")
+    (let ((key (get-text-property (1- (point))
+                                  qq-red-packet--position-property)))
+      (should
+       (equal key
+              `(red-packet "private:10002"
+                           ,qq-red-packet-test--message-id
+                           receipt "10002")))
+      (setf (alist-get 'name
+                       (aref (alist-get 'receipts qq-red-packet--detail) 0))
+            "Updated receiver")
+      (qq-red-packet--request-sync view)
+      (qq-red-packet--sync-now view)
+      (should (equal key
+                     (get-text-property (point)
+                                        qq-red-packet--position-property))))))
 
 (provide 'qq-red-packet-test)
 

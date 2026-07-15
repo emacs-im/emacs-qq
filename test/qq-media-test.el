@@ -289,6 +289,28 @@
                   'user-avatar))
       (should (equal user-request "10001")))))
 
+(ert-deftest qq-media-forum-avatar-uses-authoritative-feed-url ()
+  (let (profile-request fetch-resource)
+    (cl-letf (((symbol-function 'qq-media--ensure-resource-image)
+               (lambda (_key fetch _height &optional _factory)
+                 (funcall fetch
+                          (lambda (resource) (setq fetch-resource resource))
+                          #'ignore)
+                 'forum-avatar))
+              ((symbol-function 'qq-media-guild-member-avatar-image)
+               (lambda (&rest args) (setq profile-request args))))
+      (should
+       (eq
+        (qq-media-message-avatar-image
+         '((session-key
+            . "guild:9007199254740993:channel:9007199254741999")
+           (sender-native-id . "144115219000000001")
+           (sender-avatar-url . "https://example.invalid/forum-avatar.png")))
+        'forum-avatar))
+      (should (equal fetch-resource
+                     '((url . "https://example.invalid/forum-avatar.png"))))
+      (should-not profile-request))))
+
 (ert-deftest qq-media-message-avatar-cache-key-keeps-native-identities-disjoint ()
   (let ((guild-message
          '((session-key

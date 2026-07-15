@@ -35,6 +35,22 @@
     (has_custom_avatar . t))
   "One complete native group profile fixture.")
 
+(defmacro qq-group-test-with-profile-view (&rest body)
+  "Evaluate BODY in a live Appkit group-profile view.
+
+BODY may refer to the lexical variables `buffer' and `view'."
+  (declare (indent 0) (debug t))
+  `(let ((qq-runtime--app nil))
+     (unwind-protect
+         (with-temp-buffer
+           (qq-group-mode)
+           (setq qq-group--group-id "20001")
+           (let ((buffer (current-buffer))
+                 (view (qq-group--ensure-view)))
+             (ignore buffer view)
+             ,@body))
+       (qq-runtime-stop))))
+
 (ert-deftest qq-api-get-group-preserves-string-identity ()
   (let (action params value)
     (cl-letf (((symbol-function 'qq-api-call)
@@ -73,6 +89,8 @@
       (should (string-match-p "Talk about Emacs" text))
       (should (string-match-p "Read the rules" text))
       (should-not (string-match-p "\\[Open\\]" text))
+      (should (equal (get-text-property (point-min) 'qq-group-profile-key)
+                     '(group-profile "20001")))
       (goto-char (point-min))
       (search-forward "打开群聊")
       (should (button-at (1- (point))))
@@ -103,9 +121,7 @@
       (should-not (string-match-p "认证:" text)))))
 
 (ert-deftest qq-group-refresh-handles-synchronous-response-ownership ()
-  (with-temp-buffer
-    (qq-group-mode)
-    (setq qq-group--group-id "20001")
+  (qq-group-test-with-profile-view
     (cl-letf (((symbol-function 'qq-group-render) #'ignore)
               ((symbol-function 'qq-api-get-group)
                (lambda (_group-id callback &optional _errback)
@@ -136,9 +152,7 @@
         (should (equal call '("20001" "synthetic member")))))))
 
 (ert-deftest qq-group-refresh-settles-synchronous-dispatch-error ()
-  (with-temp-buffer
-    (qq-group-mode)
-    (setq qq-group--group-id "20001")
+  (qq-group-test-with-profile-view
     (cl-letf (((symbol-function 'qq-group-render) #'ignore)
               ((symbol-function 'qq-api-get-group)
                (lambda (&rest _args) (error "synthetic dispatch failure"))))
@@ -187,6 +201,149 @@
 (ert-deftest qq-group-reuses-one-profile-buffer-like-telega ()
   (should (equal (qq-group--buffer-name "20001") "*qq-group*"))
   (should (equal (qq-group--buffer-name "20002") "*qq-group*")))
+
+(ert-deftest qq-group-open-reuses-renamed-live-view-and-media-hook ()
+  (qq-group-test-with-profile-view
+    (let* ((profile (copy-tree qq-group-test--profile))
+           (hook qq-group--media-hook-function)
+           (renamed (generate-new-buffer-name " *qq-group-renamed*"))
+           selected
+           calls)
+      (setq qq-group--profile profile)
+      (rename-buffer renamed)
+      (cl-letf (((symbol-function 'pop-to-buffer)
+                 (lambda (candidate &rest _arguments)
+                   (setq selected candidate)
+                   candidate))
+                ((symbol-function 'appkit-request-sync)
+                 (lambda (candidate &rest arguments)
+                   (push (cons candidate arguments) calls)
+                   'owned-timer)))
+        (should (eq buffer (qq-group-open "20001")))
+        (should (eq selected buffer))
+        (should (eq view (appkit-current-view)))
+        (should (equal qq-group--view-id (appkit-view-id view)))
+        (should (eq profile qq-group--profile))
+        (should (eq hook qq-group--media-hook-function))
+        (should (equal renamed (buffer-name buffer)))
+        (should-not (get-buffer (qq-group--buffer-name "20001")))
+        (setq calls nil)
+        (funcall hook "group-avatar:20001"))
+      (should (= 1 (length calls)))
+      (should (eq view (caar calls)))
+      (should (equal '(group-profile "20001")
+                     (plist-get (cdar calls) :entry)))
+      (should (equal "group-avatar:20001"
+                     (plist-get (cdar calls) :resource)))
+      (should-not (plist-get (cdar calls) :structure)))))
+
+(ert-deftest qq-group-replacement-setup-clears-owned-view-state ()
+  (qq-group-test-with-profile-view
+    (let ((old-hook qq-group--media-hook-function)
+          cancelled)
+      (setq qq-group--profile (copy-tree qq-group-test--profile)
+            qq-group--loading t
+            qq-group--request 'old-group-request
+            qq-group--request-owner 'old-owner)
+      (cl-letf (((symbol-function 'qq-api-cancel-request)
+                 (lambda (request) (push request cancelled))))
+        (appkit-kill-view view)
+        (should (member 'old-group-request cancelled))
+        (should-not qq-group--profile)
+        (should-not qq-group--loading)
+        (should-not qq-group--media-hook-function)
+        (should-not (memq old-hook qq-media-cache-update-hook))
+        (setq qq-group--profile '((group_id . "stale"))
+              qq-group--loading t
+              qq-group--request 'orphan-group-request
+              qq-group--request-owner 'orphan-owner
+              qq-group--media-hook-function old-hook)
+        (add-hook 'qq-media-cache-update-hook old-hook)
+        (let ((replacement
+               (appkit-open-view
+                :app (qq-runtime-app)
+                :id qq-group--view-id
+                :mode 'qq-group-mode
+                :buffer-name (qq-group--buffer-name "20001")
+                :sync-function #'qq-group--sync-invalidations
+                :parts '(profile)
+                :setup #'qq-group--setup-view)))
+          (should (appkit-view-live-p replacement))
+          (should-not (eq replacement view))
+          (should (member 'orphan-group-request cancelled))
+          (should-not qq-group--profile)
+          (should-not qq-group--loading)
+          (should-not qq-group--request)
+          (should-not qq-group--request-owner)
+          (should-not (memq old-hook qq-media-cache-update-hook))
+          (should qq-group--media-hook-function)
+          (should (memq qq-group--media-hook-function
+                        qq-media-cache-update-hook))
+          (setq qq-group--profile '((group_id . "replacement")))
+          (qq-group--release-view-work view buffer)
+          (should (equal qq-group--profile
+                         '((group_id . "replacement")))))))))
+
+(ert-deftest qq-group-dead-view-makes-late-profile-response-inert ()
+  (qq-group-test-with-profile-view
+    (let (success)
+      (cl-letf (((symbol-function 'qq-api-get-group)
+                 (lambda (_group-id callback &optional _errback)
+                   (setq success callback)
+                   'group-token))
+                ((symbol-function 'qq-api-cancel-request) #'ignore))
+        (qq-group-refresh)
+        (appkit-kill-view view)
+        (let ((replacement (qq-group--ensure-view))
+              (replacement-profile '((group_id . "20001")
+                                      (name . "Replacement"))))
+          (setq qq-group--profile replacement-profile)
+          (cl-letf (((symbol-function 'appkit-request-sync)
+                     (lambda (&rest _arguments)
+                       (ert-fail "late group response requested a sync")))
+                    ((symbol-function 'qq-api--default-error)
+                     (lambda (&rest _arguments)
+                       (ert-fail "late group response emitted an error"))))
+            (funcall success (copy-tree qq-group-test--profile)))
+          (should (appkit-view-live-p replacement))
+          (should (eq replacement-profile qq-group--profile))
+          (should-not qq-group--request-owner))))))
+
+(ert-deftest qq-group-profile-callback-uses-atomic-appkit-request-sync ()
+  (qq-group-test-with-profile-view
+    (let (success calls)
+      (cl-letf (((symbol-function 'qq-api-get-group)
+                 (lambda (_group-id callback &optional _errback)
+                   (setq success callback)
+                   'group-token)))
+        (qq-group-refresh))
+      (let ((before (buffer-string)))
+        (cl-letf (((symbol-function 'appkit-request-sync)
+                   (lambda (candidate &rest arguments)
+                     (push (cons candidate arguments) calls)
+                     'owned-timer))
+                  ((symbol-function 'appkit-invalidate)
+                   (lambda (&rest _arguments)
+                     (ert-fail "group callback used bare invalidation")))
+                  ((symbol-function 'appkit-schedule-sync)
+                   (lambda (&rest _arguments)
+                     (ert-fail "group callback used bare scheduling")))
+                  ((symbol-function 'appkit-sync-invalidations)
+                   (lambda (&rest _arguments)
+                     (ert-fail "group callback synchronized inline")))
+                  ((symbol-function 'qq-group-render)
+                   (lambda () (ert-fail "group callback rendered directly")))
+                  ((symbol-function 'erase-buffer)
+                   (lambda () (ert-fail "group callback erased the buffer"))))
+          (funcall success (copy-tree qq-group-test--profile)))
+        (should (equal before (buffer-string))))
+      (should (equal qq-group--profile qq-group-test--profile))
+      (should-not qq-group--loading)
+      (should-not qq-group--request-owner)
+      (should (= 1 (length calls)))
+      (should (eq view (caar calls)))
+      (should (plist-get (cdar calls) :structure))
+      (should (eq 'profile (plist-get (cdar calls) :part))))))
 
 (provide 'qq-group-test)
 

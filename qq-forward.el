@@ -51,8 +51,8 @@
                   "qq-chat" (message &rest keys))
 (declare-function qq-chat-insert-message-heading
                   "qq-chat" (message properties layout &rest keys))
-(declare-function qq-chat-sync-timeline-geometry
-                  "qq-chat" (&rest keys))
+(declare-function qq-chat--compute-fill-column
+                  "qq-chat" (&optional window))
 
 (defvar-local qq-forward--buffer-key nil
   "Explicit remote reference or local inline identity for this viewer.")
@@ -460,6 +460,29 @@ the fork-native forward action using an explicit locator-qualified reference."
   "Return the exact appkit view identity for canonical BUFFER-KEY."
   (list 'forward buffer-key))
 
+(defun qq-forward--orphan-buffer (buffer-key)
+  "Return a detached forward buffer with canonical BUFFER-KEY, or nil."
+  (cl-find-if
+   (lambda (buffer)
+     (and (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (and (derived-mode-p 'qq-forward-mode)
+                 (equal qq-forward--buffer-key buffer-key)
+                 (not (appkit-view-live-p (appkit-current-view)))))))
+   (buffer-list)))
+
+(defun qq-forward--live-current-view ()
+  "Return the live canonical forward view in the current buffer, or nil."
+  (let ((view (appkit-current-view)))
+    (and qq-forward--buffer-key
+         (derived-mode-p 'qq-forward-mode)
+         (appkit-view-live-p view)
+         (eq (appkit-view-buffer view) (current-buffer))
+         (equal (appkit-view-id view)
+                (qq-forward--view-id qq-forward--buffer-key))
+         (equal (appkit-view-state view) qq-forward--buffer-key)
+         view)))
+
 (defun qq-forward--entry-properties (message)
   "Return text properties for normalized MESSAGE."
   (list 'qq-forward-message message
@@ -655,6 +678,31 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
                  'rear-nonsticky '(qq-forward-entry-id))))
       (qq-forward--insert-message payload context))))
 
+(defun qq-forward--cancel-request ()
+  "Cancel and forget the active native forward request."
+  (let ((request qq-forward--request))
+    ;; Relinquish ownership before transport cancellation.  A synchronous
+    ;; cancellation callback must already be stale, even while the view lives.
+    (setq qq-forward--request nil
+          qq-forward--request-owner nil
+          qq-forward--loading nil)
+    (when request
+      (qq-api-cancel-request request))))
+
+(defun qq-forward--cancel-buffer-work (buffer)
+  "Cancel forward work still owned by BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (derived-mode-p 'qq-forward-mode)
+        (qq-forward--cancel-request)))))
+
+(defun qq-forward--setup-view (view)
+  "Register lifecycle cleanup for newly attached forward VIEW."
+  (appkit-register-handle
+   view 'function
+   (apply-partially #'qq-forward--cancel-buffer-work
+                    (appkit-view-buffer view))))
+
 (defun qq-forward--ensure-view ()
   "Return the live appkit view owning the current forward buffer."
   (unless qq-forward--buffer-key
@@ -669,18 +717,21 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
       (setf (appkit-view-state current) qq-forward--buffer-key
             (appkit-view-sync-function current)
             #'qq-forward--sync-invalidations
-            (appkit-view-parts current) '(timeline))
+            (appkit-view-parts current) '(timeline geometry))
       current)
      ((appkit-view-live-p current)
       (error "qq: forward buffer belongs to a different appkit view"))
      (t
-      (appkit-attach-view
-       :app app
-       :id id
-       :state qq-forward--buffer-key
-       :mode 'qq-forward-mode
-       :sync-function #'qq-forward--sync-invalidations
-       :parts '(timeline))))))
+      (let ((view
+             (appkit-attach-view
+              :app app
+              :id id
+              :state qq-forward--buffer-key
+              :mode 'qq-forward-mode
+              :sync-function #'qq-forward--sync-invalidations
+              :parts '(timeline geometry))))
+        (qq-forward--setup-view view)
+        view)))))
 
 (defun qq-forward--ensure-timeline ()
   "Ensure the current forward view owns one projected appkit timeline."
@@ -702,17 +753,28 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
 
 (defun qq-forward--sync-invalidations (view invalidations)
   "Consume coalesced appkit INVALIDATIONS for forward VIEW."
-  (let ((resources (appkit-invalidations-resource-keys invalidations))
-        (entries (appkit-invalidations-entry-keys invalidations)))
+  (let* ((parts (appkit-invalidations-parts invalidations))
+         (geometry-p (memq 'geometry parts))
+         (resources (appkit-invalidations-resource-keys invalidations))
+         (entries (appkit-invalidations-entry-keys invalidations)))
     (when (appkit-view-live-p view)
-      (if (or resources entries)
-          (qq-forward--sync-timeline
-           :force-keys entries
-           :changed-resources resources)
-        (when (or (appkit-invalidations-structure-p invalidations)
-                  (appkit-invalidations-parts invalidations)
-                  (appkit-invalidations-position-p invalidations))
-          (qq-forward--sync-timeline))))))
+      (when geometry-p
+        (when-let* ((next (qq-chat--compute-fill-column))
+                    (_ (and (integerp next) (> next 15))))
+          (setq-local qq-chat--fill-column next
+                      fill-column next)))
+      (when (or resources
+                entries
+                (appkit-invalidations-structure-p invalidations)
+                parts
+                (appkit-invalidations-position-p invalidations))
+        (qq-forward--sync-timeline
+         :force-keys
+         (if geometry-p
+             (delete-dups
+              (append entries (appkit-chat-timeline-keys)))
+           entries)
+         :changed-resources resources)))))
 
 (defun qq-forward--request-timeline-sync (view)
   "Request one coalesced structural timeline sync for live VIEW."
@@ -763,13 +825,6 @@ sync; timeline mutation remains owned by `qq-forward--sync-invalidations'."
         (qq-forward--apply-load-event event)
         (qq-forward--request-timeline-sync view)
         t))))
-
-(defun qq-forward--cancel-request ()
-  "Cancel and forget the active native forward request."
-  (when qq-forward--request
-    (qq-api-cancel-request qq-forward--request))
-  (setq qq-forward--request nil
-        qq-forward--request-owner nil))
 
 (defun qq-forward--error-text (response reason)
   "Return readable viewer error from RESPONSE and REASON."
@@ -903,15 +958,27 @@ records issue a fresh `emacs_get_forward' request."
     map)
   "Keymap for `qq-forward-mode'.")
 
+(defun qq-forward--request-geometry-sync (&optional force)
+  "Request a position-preserving geometry sync for the live forward view.
+
+When FORCE is non-nil, request projection even if the measured character
+width is unchanged so pixel-aligned media follows text scaling."
+  (when-let* ((view (qq-forward--live-current-view)))
+    (let ((next (qq-chat--compute-fill-column)))
+      (when (or force
+                (and (integerp next)
+                     (> next 15)
+                     (not (equal next qq-chat--fill-column))))
+        (appkit-request-sync view :part 'geometry :position t)
+        view))))
+
 (defun qq-forward--on-window-size-change (&optional _frame)
-  "Refresh shared chat row geometry after this forward window resizes."
-  (when (eq major-mode 'qq-forward-mode)
-    (qq-chat-sync-timeline-geometry)))
+  "Queue shared chat row geometry after this forward window resizes."
+  (qq-forward--request-geometry-sync))
 
 (defun qq-forward--on-text-scale-change ()
-  "Refresh shared chat row geometry after text scaling changes."
-  (when (eq major-mode 'qq-forward-mode)
-    (qq-chat-sync-timeline-geometry :reset t :force t)))
+  "Queue shared chat row geometry after text scaling changes."
+  (qq-forward--request-geometry-sync t))
 
 (define-derived-mode qq-forward-mode special-mode "QQ-Forward"
   "Major mode for one QQ merged-forward message tree."
@@ -962,33 +1029,31 @@ records issue a fresh `emacs_get_forward' request."
          (app (qq-runtime-app))
          (view-id (qq-forward--view-id buffer-key))
          (existing (appkit-view-for-id app view-id))
+         (orphan (and (null existing)
+                      (qq-forward--orphan-buffer buffer-key)))
+         (fresh-p (and (null existing) (null orphan)))
          (view existing)
          (buffer (or (and existing (appkit-view-buffer existing))
+                     orphan
                      (generate-new-buffer (qq-forward--buffer-name name-key)))))
     (with-current-buffer buffer
       (unless existing
-        (qq-forward-mode)
-        (setq qq-forward--buffer-key buffer-key
-              qq-forward--source (copy-tree source)
-              qq-forward--lookup-id lookup-id
-              qq-forward--lookup-kind lookup-kind
-              qq-forward--messages nil
-              qq-forward--loading nil
-              qq-forward--loaded-p nil
-              qq-forward--error nil
-              qq-forward--request nil
-              qq-forward--request-owner nil
-              qq-forward--inline-p inline-p
-              qq-forward--inline-content (and inline-p
-                                              (copy-tree inline-content)))
-        (setq view
-              (appkit-attach-view
-               :app app
-               :id view-id
-               :state buffer-key
-               :mode 'qq-forward-mode
-               :sync-function #'qq-forward--sync-invalidations
-               :parts '(timeline))))
+        (when fresh-p
+          (qq-forward-mode)
+          (setq qq-forward--buffer-key buffer-key
+                qq-forward--source (copy-tree source)
+                qq-forward--lookup-id lookup-id
+                qq-forward--lookup-kind lookup-kind
+                qq-forward--messages nil
+                qq-forward--loading nil
+                qq-forward--loaded-p nil
+                qq-forward--error nil
+                qq-forward--request nil
+                qq-forward--request-owner nil
+                qq-forward--inline-p inline-p
+                qq-forward--inline-content (and inline-p
+                                                (copy-tree inline-content))))
+        (setq view (qq-forward--ensure-view)))
       (unless (equal qq-forward--buffer-key buffer-key)
         (error "qq: appkit returned a mismatched forward view"))
       (if inline-p
@@ -1112,11 +1177,9 @@ records issue a fresh `emacs_get_forward' request."
   (when (stringp media-key)
     (dolist (buffer (buffer-list))
       (with-current-buffer buffer
-        (when (and (derived-mode-p 'qq-forward-mode)
-                   (appkit-view-live-p (appkit-current-view)))
-          (let ((view (appkit-current-view)))
-            (appkit-invalidate view :resource (list :media media-key))
-            (appkit-schedule-sync view)))))))
+        (when-let* ((view (qq-forward--live-current-view)))
+          (appkit-request-sync
+           view :resource (list :media media-key)))))))
 
 (add-hook 'qq-media-cache-update-hook #'qq-forward--handle-media-cache-update)
 

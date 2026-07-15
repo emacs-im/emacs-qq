@@ -22,6 +22,9 @@
 (declare-function qq-transport-cancel "qq-transport" (echo))
 (declare-function qq-state-apply-poke-notice "qq-state" (notice))
 (declare-function qq-state-merge-guild-message "qq-state" (event))
+(declare-function qq-state-merge-guild-forum-post "qq-state" (post))
+(declare-function qq-state-replace-guild-forum-posts
+                  "qq-state" (session-key posts))
 
 (defvar qq-api--read-operations (make-hash-table :test #'equal)
   "In-flight mark-read operations keyed by session key.
@@ -1262,6 +1265,81 @@ segments.  A resolve action result itself must be terminal or available."
        (error "qq: Guild navigation_sequences[%d].native_kind is invalid" index))))
   (copy-tree navigation))
 
+(defun qq-api--validate-guild-forum-post (post expected-chat context)
+  "Validate one closed forum POST for EXPECTED-CHAT at CONTEXT."
+  (unless (qq-api--exact-object-keys-p
+           post '(chat post_id created_at updated_at channel_name sender state
+                       title comment_count segments))
+    (error "qq: %s has invalid fields" context))
+  (let ((chat (qq-api-validate-forward-session-locator
+               (alist-get 'chat post) (concat context ".chat") t)))
+    (unless (and (equal (alist-get 'kind chat) "guild-channel")
+                 (equal chat expected-chat))
+      (error "qq: %s returned a contradictory channel identity" context)))
+  (unless (qq-api-non-empty-string-p (alist-get 'post_id post))
+    (error "qq: %s.post_id must be an opaque non-empty string" context))
+  (dolist (field '(created_at comment_count))
+    (unless (qq-protocol--nonnegative-safe-integer-p (alist-get field post))
+      (error "qq: %s.%s must be a safe non-negative integer" context field)))
+  (let ((updated-at (alist-get 'updated_at post)))
+    (unless (or (null updated-at)
+                (qq-protocol--nonnegative-safe-integer-p updated-at))
+      (error "qq: %s.updated_at must be a safe non-negative integer or null"
+             context)))
+  (dolist (field '(channel_name title))
+    (unless (stringp (alist-get field post))
+      (error "qq: %s.%s must be a string" context field)))
+  (let ((sender (alist-get 'sender post)))
+    (unless (qq-api--exact-object-keys-p
+             sender '(native_id display_name avatar_url))
+      (error "qq: %s.sender has invalid fields" context))
+    (dolist (field '(native_id display_name avatar_url))
+      (unless (qq-api-non-empty-string-p (alist-get field sender))
+        (error "qq: %s.sender.%s must be a non-empty string" context field))))
+  (unless (member (alist-get 'state post) '("live" "deleted"))
+    (error "qq: %s.state is invalid" context))
+  (let ((segments (alist-get 'segments post)))
+    (unless (and (listp segments) (proper-list-p segments))
+      (error "qq: %s.segments must be an array" context))
+    (when (and (equal (alist-get 'state post) "deleted") segments)
+      (error "qq: %s deleted post must not contain segments" context))
+    (cl-loop for segment in segments
+             for index from 0
+             do (qq-api--validate-native-forward-segment
+                 segment (format "%s.segments[%d]" context index) t)))
+  (copy-tree post))
+
+(defun qq-api--validate-guild-forum-page (data expected-chat)
+  "Validate one closed forum page DATA for EXPECTED-CHAT."
+  (unless (qq-api--exact-object-keys-p
+           data '(posts next_cursor finished))
+    (error "qq: Guild forum page has invalid fields"))
+  (let ((posts (alist-get 'posts data))
+        (cursor (alist-get 'next_cursor data))
+        (finished (alist-get 'finished data))
+        (seen (make-hash-table :test #'equal)))
+    (unless (and (listp posts) (proper-list-p posts))
+      (error "qq: Guild forum posts must be an array"))
+    (unless (memq finished '(t :false))
+      (error "qq: Guild forum finished must be a boolean"))
+    (if (eq finished t)
+        (when cursor
+          (error "qq: finished Guild forum page must not have a cursor"))
+      (unless (qq-api-non-empty-string-p cursor)
+        (error "qq: unfinished Guild forum page requires an opaque cursor")))
+    (cl-loop
+     for post in posts
+     for index from 0
+     for validated = (qq-api--validate-guild-forum-post
+                      post expected-chat
+                      (format "Guild forum posts[%d]" index))
+     for post-id = (alist-get 'post_id validated)
+     do
+     (when (gethash post-id seen)
+       (error "qq: Guild forum page duplicated post_id %s" post-id))
+     (puthash post-id t seen))
+    (copy-tree data)))
+
 (defun qq-api--snapshot-live-subscribers (request)
   "Return active subscribers owned by authoritative REQUEST."
   (seq-filter #'qq-api--snapshot-subscription-active-p
@@ -1521,7 +1599,7 @@ segments.  A resolve action result itself must be terminal or available."
   (let* ((chat (qq-api--session-emacs-locator session-key))
          (channel-kind
           (alist-get 'channel-kind (qq-state-session session-key))))
-    (unless (member channel-kind '("text" "forum"))
+    (unless (equal channel-kind "text")
       (user-error "qq: this channel kind has no message timeline"))
     (qq-api-call
      "emacs_get_guild_messages_by_range"
@@ -1545,6 +1623,35 @@ segments.  A resolve action result itself must be terminal or available."
                    (qq-state-merge-guild-message
                     (cons '(post_type . "emacs_guild_message") validated))))
                (when callback (funcall callback (copy-tree messages)))))
+         (error
+          (funcall (or errback #'qq-api--default-error)
+                   response (error-message-string error-data)))))
+     errback)))
+
+(defun qq-api-fetch-guild-forum-page
+    (session-key cursor callback &optional errback)
+  "Fetch and merge one forum page at opaque CURSOR for SESSION-KEY."
+  (unless (eq (qq-state-session-key-type session-key) 'guild-channel)
+    (user-error "qq: Guild forum history requires a channel session"))
+  (unless (stringp cursor)
+    (user-error "qq: Guild forum cursor must be an opaque string"))
+  (let* ((session (qq-state-session session-key))
+         (chat (qq-api--session-emacs-locator session-key)))
+    (unless (equal (alist-get 'channel-kind session) "forum")
+      (user-error "qq: this channel is not a forum"))
+    (qq-api-call
+     "emacs_get_guild_forum_page"
+     `((chat . ,chat) (cursor . ,cursor))
+     (lambda (response)
+       (condition-case error-data
+           (let* ((page (qq-api--validate-guild-forum-page
+                         (qq-api--response-data response) chat))
+                  (posts (alist-get 'posts page)))
+             (if (string-empty-p cursor)
+                 (qq-state-replace-guild-forum-posts session-key posts)
+               (dolist (post posts)
+                 (qq-state-merge-guild-forum-post post)))
+             (when callback (funcall callback page)))
          (error
           (funcall (or errback #'qq-api--default-error)
                    response (error-message-string error-data)))))

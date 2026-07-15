@@ -373,7 +373,10 @@ the stable-key projection is reconciled."
   (when qq-user-photo--request
     (qq-api-cancel-request qq-user-photo--request))
   (setq qq-user-photo--request nil
-        qq-user-photo--request-owner nil))
+        qq-user-photo--request-owner nil
+        ;; Appkit views may be detached while their buffers survive.  Do not
+        ;; let a replacement inherit the loading flag of cancelled work.
+        qq-user-photo--loading nil))
 
 (defun qq-user-photo-button-backward ()
   "Move point to the previous photo button."

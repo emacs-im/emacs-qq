@@ -6,6 +6,14 @@
 (require 'cl-lib)
 (require 'qq-api)
 
+(defmacro qq-api-test-with-reset (&rest body)
+  "Run BODY with isolated QQ state."
+  (declare (indent 0) (debug t))
+  `(let ((qq-state-change-hook nil))
+     (unwind-protect
+         (progn (qq-state-reset) ,@body)
+       (qq-state-reset))))
+
 (defun qq-api-test--native-message
     (entry-id &optional message-id segments)
   "Return one strict fork-native forward snapshot."
@@ -79,6 +87,24 @@
 (defun qq-api-test--guild-message-record ()
   "Return the action-response form of the synthetic Guild message."
   (assq-delete-all 'post_type (qq-api-test--guild-message-event)))
+
+(defun qq-api-test--guild-forum-post (&optional post-id created-at)
+  "Return one strict synthetic QQ Guild forum post."
+  `((chat . ((kind . "guild-channel")
+             (guild_id . "9007199254740993")
+             (channel_id . "9007199254741999")))
+    (post_id . ,(or post-id "B_synthetic_opaque_post"))
+    (created_at . ,(or created-at 1784000000))
+    (updated_at . nil)
+    (channel_name . "Synthetic forum")
+    (sender . ((native_id . "144115219000000001")
+               (display_name . "Synthetic member")
+               (avatar_url . "https://example.invalid/avatar.png")))
+    (state . "live")
+    (title . "Synthetic title")
+    (comment_count . 3)
+    (segments . (((kind . "text")
+                  (payload . ((text . "Synthetic body"))))))))
 
 (defun qq-api-test--mark-read-response (scope message-id unread-count)
   "Return a strict mark-read response for SCOPE and MESSAGE-ID.
@@ -617,6 +643,60 @@ The authoritative post-state reports UNREAD-COUNT."
     (let ((event (qq-api-test--guild-message-event)))
       (funcall mutator event)
       (should-error (qq-api--validate-guild-message-event event)))))
+
+(ert-deftest qq-api-guild-forum-page-validates-opaque-cursor-and-post-identity ()
+  (let* ((chat '((kind . "guild-channel")
+                 (guild_id . "9007199254740993")
+                 (channel_id . "9007199254741999")))
+         (page `((posts . (,(qq-api-test--guild-forum-post)))
+                 (next_cursor . "page=synthetic-next")
+                 (finished . :false))))
+    (should (equal (qq-api--validate-guild-forum-page page chat) page))
+    (let ((bad (copy-tree page)))
+      (setf (alist-get 'post_id (car (alist-get 'posts bad))) 9007199254740992)
+      (should-error (qq-api--validate-guild-forum-page bad chat)))
+    (let ((bad (copy-tree page)))
+      (setf (alist-get 'next_cursor bad) nil)
+      (should-error (qq-api--validate-guild-forum-page bad chat)))))
+
+(ert-deftest qq-api-fetch-guild-forum-page-replaces-first-page-and-merges-older-pages ()
+  (qq-api-test-with-reset
+   (let* ((session-key
+           (qq-state-guild-channel-session-key
+            "9007199254740993" "9007199254741999"))
+          (post (qq-api-test--guild-forum-post))
+          action params replaced merged delivered)
+     (qq-state-upsert-session
+      session-key '((type . guild-channel) (channel-kind . "forum")) nil)
+     (cl-letf (((symbol-function 'qq-api-call)
+                (lambda (candidate-action candidate-params callback
+                         &optional _errback)
+                  (setq action candidate-action
+                        params candidate-params)
+                  (funcall callback
+                           `((data . ((posts . (,post))
+                                      (next_cursor . "page=synthetic-next")
+                                      (finished . :false)))))))
+               ((symbol-function 'qq-state-replace-guild-forum-posts)
+                (lambda (candidate posts)
+                  (setq replaced (list candidate posts))))
+               ((symbol-function 'qq-state-merge-guild-forum-post)
+                (lambda (candidate) (push candidate merged))))
+       (qq-api-fetch-guild-forum-page
+        session-key "" (lambda (page) (setq delivered page)))
+       (should (equal action "emacs_get_guild_forum_page"))
+       (should (equal (alist-get 'cursor params) ""))
+       (should (equal replaced (list session-key (list post))))
+       (should-not merged)
+       (should (equal (alist-get 'next_cursor delivered)
+                      "page=synthetic-next"))
+       (setq replaced nil delivered nil)
+       (qq-api-fetch-guild-forum-page
+        session-key "page=synthetic-next"
+        (lambda (page) (setq delivered page)))
+       (should-not replaced)
+       (should (equal merged (list post)))
+       (should (equal (alist-get 'cursor params) "page=synthetic-next"))))))
 
 (ert-deftest qq-api-fetch-guild-navigation-applies-exact-channel-state ()
   (let (captured-action captured-params applied delivered)

@@ -322,6 +322,93 @@ BODY may refer to the lexical variable `view'."
         (should (string-match-p "Loaded: 2" (buffer-string)))
         (should (string-match-p "second" (buffer-string)))))))
 
+(ert-deftest qq-search-status-keeps-semantic-position-when-page-is-inserted ()
+  (qq-search-test-with-buffer
+    (let ((first (qq-search-test--result "11" 100 "first"))
+          (second (qq-search-test--result "10" 90 "second")))
+      (setq qq-search--query "result"
+            qq-search--results (list first)
+            qq-search--results-tail (last qq-search--results)
+            qq-search--seen (make-hash-table :test #'equal)
+            qq-search--status 'ready
+            qq-search--next-cursor "next")
+      (puthash (qq-search--result-key first) t qq-search--seen)
+      (qq-search-test--sync view)
+      (goto-char
+       (appkit-position-find-property-value
+        (point-min) (point-max) 'qq-search-entry-key 'status))
+      (qq-search--append-results (list second))
+      (setq qq-search--status 'eof
+            qq-search--next-cursor nil)
+      (qq-search-test--sync view)
+      (should (eq 'status
+                  (get-text-property (point) 'qq-search-entry-key)))
+      (should (equal 'header
+                     (get-text-property (point-min) 'qq-search-entry-key))))))
+
+(ert-deftest qq-search-open-reuses-renamed-view-across-session-replacement ()
+  (let ((qq-runtime--app nil)
+        (qq-search-buffer-name "*qq-search-rename-test*")
+        callbacks
+        cancelled
+        first
+        first-view)
+    (unwind-protect
+        (cl-letf (((symbol-function 'pop-to-buffer) #'ignore)
+                  ((symbol-function 'qq-api-cancel-request)
+                   (lambda (request) (push request cancelled)))
+                  ((symbol-function 'qq-api-search-messages-start)
+                   (lambda (session query callback &optional _errback _limit)
+                     (push (list session query callback) callbacks)
+                     (if (equal session "group:20001")
+                         'first-request
+                       'second-request))))
+          (setq first (qq-search-open "group:20001" "first"))
+          (setq first-view (with-current-buffer first (appkit-current-view)))
+          (let ((first-owner
+                 (with-current-buffer first qq-search--request-owner)))
+            (with-current-buffer first
+              (rename-buffer "*qq-search-renamed*" t))
+            (let* ((second (qq-search-open "private:10002" "second"))
+                   (second-owner
+                    (with-current-buffer second qq-search--request-owner))
+                   (first-callback (nth 2 (assoc "group:20001" callbacks)))
+                   (second-callback (nth 2 (assoc "private:10002" callbacks))))
+              (should (eq first second))
+              (should (eq first-view
+                          (with-current-buffer second (appkit-current-view))))
+              (should (eq qq-search--view-id (appkit-view-id first-view)))
+              (should-not (get-buffer qq-search-buffer-name))
+              (should (equal cancelled '(first-request)))
+              (with-current-buffer second
+                (should (equal qq-search--session-key "private:10002"))
+                (should (equal qq-search--query "second"))
+                ;; Each dimension is necessary on its own: the old owner is
+                ;; stale even under the current session, and the old session is
+                ;; stale even when paired with the current owner.
+                (should-not
+                 (qq-search--request-current-p
+                  first-view second "private:10002" first-owner))
+                (should-not
+                 (qq-search--request-current-p
+                  first-view second "group:20001" second-owner)))
+              (funcall first-callback
+                       `((results . (,(qq-search-test--result
+                                      "11" 100 "stale first session")))
+                         (next_cursor)))
+              (with-current-buffer second
+                (should (eq qq-search--request-owner second-owner))
+                (should-not qq-search--results)
+                (should (eq qq-search--status 'loading)))
+              (funcall second-callback '((results) (next_cursor)))
+              (with-current-buffer second
+                (should-not qq-search--request-owner)
+                (should-not qq-search--results)
+                (should (eq qq-search--status 'eof))))))
+      (when (buffer-live-p first)
+        (kill-buffer first))
+      (qq-runtime-stop))))
+
 (ert-deftest qq-search-api-callback-defers-presentation-to-view-sync ()
   (qq-search-test-with-buffer
     (let (success)

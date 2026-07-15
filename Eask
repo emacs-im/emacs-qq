@@ -2,7 +2,9 @@
 
 (package "qq"
          "0.1.0"
-         "NapCat-backed QQ client for Emacs")
+         "NapCat-backed QQ chat client")
+
+(website-url "https://github.com/0WD0/emacs-qq")
 
 (keywords "comm")
 

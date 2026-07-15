@@ -44,6 +44,27 @@
          (kill-buffer buffer))
        (qq-state-reset))))
 
+(defmacro qq-contacts-test-with-runtime-view (&rest body)
+  "Run BODY in an isolated live contacts view.
+
+BODY may refer to the lexical variables `app', `buffer', and `view'."
+  (declare (indent 0) (debug t))
+  `(let* ((qq-contacts-buffer-name
+           (generate-new-buffer-name " *qq-contacts-test*"))
+          (app (appkit-start-app 'qq :id (make-symbol "qq-contacts-test")))
+          (qq-runtime--app app)
+          (buffer (get-buffer-create qq-contacts-buffer-name))
+          view)
+     (unwind-protect
+         (with-current-buffer buffer
+           (qq-contacts-mode)
+           (setq view (qq-contacts--ensure-view))
+           ,@body)
+       (when (appkit-app-live-p app)
+         (appkit-stop-app app))
+       (when (buffer-live-p buffer)
+         (kill-buffer buffer)))))
+
 (defun qq-contacts-test--entry-keys (entries)
   "Return stable keys from ENTRIES."
   (mapcar #'qq-contacts--entry-key entries))
@@ -168,6 +189,7 @@
 (ert-deftest qq-contacts-empty-search-and-clear-outside-search-preserve-view ()
   (with-temp-buffer
     (qq-contacts-mode)
+    (qq-contacts--ensure-view)
     (setq qq-contacts--view 'groups
           qq-contacts--previous-view 'friends)
     (qq-contacts-search "   ")
@@ -180,7 +202,7 @@
     (qq-contacts-mode)
     (let (contact-call group-call stranger-call)
       (cl-letf
-          (((symbol-function 'qq-contacts--request-reconcile) #'ignore)
+          (((symbol-function 'qq-contacts--queue-view-sync) #'ignore)
            ((symbol-function 'qq-api-search-contacts-start)
             (lambda (scope query callback &optional _errback group-id limit)
               (setq contact-call (list scope query group-id limit))
@@ -242,6 +264,7 @@
 (ert-deftest qq-contacts-load-more-repeats-native-search-owner ()
   (with-temp-buffer
     (qq-contacts-mode)
+    (qq-contacts--ensure-view)
     (setq qq-contacts--view 'search
           qq-contacts--query "Emacs"
           qq-contacts--search-owner '(owner)
@@ -250,7 +273,7 @@
           qq-contacts--search-friend-cursor
           "00000000-0000-4000-8000-000000000000")
     (let (call)
-      (cl-letf (((symbol-function 'qq-contacts--request-reconcile) #'ignore)
+      (cl-letf (((symbol-function 'qq-contacts--queue-view-sync) #'ignore)
                 ((symbol-function 'qq-api-search-contacts-next)
                  (lambda (scope cursor query callback
                           &optional _errback group-id limit)
@@ -276,6 +299,7 @@
 (ert-deftest qq-contacts-load-more-strangers-consumes-exact-capability ()
   (with-temp-buffer
     (qq-contacts-mode)
+    (qq-contacts--ensure-view)
     (let ((cursor (make-string 43 ?Q)))
       (setq qq-contacts--view 'search
             qq-contacts--query "Synthetic"
@@ -288,7 +312,7 @@
                (candidate . ,(make-string 43 ?A))))
             qq-contacts--search-stranger-cursor cursor)
       (let (call)
-        (cl-letf (((symbol-function 'qq-contacts--request-reconcile) #'ignore)
+        (cl-letf (((symbol-function 'qq-contacts--queue-view-sync) #'ignore)
                   ((symbol-function 'qq-api-search-strangers-next)
                    (lambda (token query callback &optional _errback limit)
                      (setq call (list token query limit))
@@ -370,7 +394,7 @@
 (ert-deftest qq-contacts-synchronous-refresh-does-not-retain-stale-tokens ()
   (with-temp-buffer
     (qq-contacts-mode)
-    (cl-letf (((symbol-function 'qq-contacts--request-reconcile) #'ignore)
+    (cl-letf (((symbol-function 'qq-contacts--queue-view-sync) #'ignore)
               ((symbol-function 'qq-api-refresh-friend-categories)
                (lambda (callback &optional _errback)
                  (funcall callback nil)
@@ -402,6 +426,167 @@
             (qq-contacts--handle-media-cache-update "forward-image:x")
             (should-not forced)))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest qq-contacts-renamed-buffer-hooks-use-the-registered-view ()
+  (qq-contacts-test-with-runtime-view
+    (let ((renamed (generate-new-buffer-name " *qq-contacts-renamed*"))
+          calls)
+      (rename-buffer renamed)
+      (cl-letf (((symbol-function 'qq-runtime-app)
+                 (lambda ()
+                   (ert-fail "contacts hook started a runtime app")))
+                ((symbol-function 'qq-contacts--queue-view-sync)
+                 (lambda (candidate &optional keys)
+                   (push (list candidate keys (current-buffer)) calls))))
+        (qq-contacts--handle-state-change '(:type friends-refreshed))
+        (qq-contacts--handle-media-cache-update "avatar:10001"))
+      (setq calls (nreverse calls))
+      (should (= 2 (length calls)))
+      (dolist (call calls)
+        (should (eq view (nth 0 call)))
+        (should (eq buffer (nth 2 call))))
+      (should-not (nth 1 (nth 0 calls)))
+      (should
+       (equal '((friend . "10001")
+                (member . "10001")
+                (stranger . "10001"))
+              (nth 1 (nth 1 calls))))
+      (should (equal renamed (buffer-name buffer)))
+      (should-not (get-buffer qq-contacts-buffer-name)))))
+
+(ert-deftest qq-contacts-hooks-do-not-create-a-runtime-app-when-closed ()
+  (let ((qq-runtime--app nil))
+    (cl-letf (((symbol-function 'qq-runtime-app)
+               (lambda ()
+                 (ert-fail "closed contacts hook created a runtime app")))
+              ((symbol-function 'qq-contacts--queue-view-sync)
+               (lambda (&rest _arguments)
+                 (ert-fail "closed contacts hook requested a sync"))))
+      (qq-contacts--handle-state-change '(:type friends-refreshed))
+      (qq-contacts--handle-media-cache-update "avatar:10001"))
+    (should-not qq-runtime--app)))
+
+(ert-deftest qq-contacts-queue-view-sync-uses-atomic-appkit-request ()
+  (qq-contacts-test-with-runtime-view
+    (let ((forced '((friend . "10001") (member . "10001")))
+          calls)
+      (cl-letf (((symbol-function 'appkit-request-sync)
+                 (lambda (candidate &rest arguments)
+                   (push (cons candidate arguments) calls)
+                   'owned-timer))
+                ((symbol-function 'appkit-invalidate)
+                 (lambda (&rest _arguments)
+                   (ert-fail "contacts queue used bare invalidation")))
+                ((symbol-function 'appkit-schedule-sync)
+                 (lambda (&rest _arguments)
+                   (ert-fail "contacts queue used bare scheduling")))
+                ((symbol-function 'appkit-sync-invalidations)
+                 (lambda (&rest _arguments)
+                   (ert-fail "contacts queue synchronized inline"))))
+        (should (eq 'owned-timer
+                    (qq-contacts--queue-view-sync view forced)))
+        (should (eq 'owned-timer
+                    (qq-contacts--queue-view-sync view)))
+        (appkit-kill-view view)
+        (should-not (qq-contacts--queue-view-sync view forced)))
+      (setq calls (nreverse calls))
+      (should
+       (equal calls
+              (list (list view :entries forced)
+                    (list view :structure t :part 'directory)))))))
+
+(ert-deftest qq-contacts-search-callback-requires-its-dispatch-view ()
+  (qq-contacts-test-with-runtime-view
+    (let (success failure syncs)
+      (cl-letf (((symbol-function 'qq-api-search-contacts-start)
+                 (lambda (_scope _query callback &optional errback _group _limit)
+                   (setq success callback
+                         failure errback)
+                   'friend-search-request))
+                ((symbol-function 'appkit-request-sync)
+                 (lambda (candidate &rest arguments)
+                   (push (cons candidate arguments) syncs)
+                   'owned-timer)))
+        (qq-contacts-search "Alice" 'friends)
+        (let ((owner qq-contacts--search-owner))
+          (should success)
+          (should failure)
+          (with-temp-buffer
+            (qq-contacts-mode)
+            (should-not
+             (qq-contacts--search-current-p
+              view (current-buffer) owner 'friends)))
+          (setq syncs nil)
+          (unwind-protect
+              (progn
+                ;; `appkit-view-live-p' alone remains true here.  The callback
+                ;; must additionally require that VIEW is still current in its
+                ;; exact owning buffer.
+                (setq-local appkit--current-view nil)
+                (funcall success
+                         '((results
+                            . (((kind . "friend") (user_id . "10001")
+                                (uid . "native-10001"))))
+                           (next_cursor)))
+                (funcall failure nil "stale failure"))
+            (setq-local appkit--current-view view))
+          (should (eq owner qq-contacts--search-owner))
+          (should (equal qq-contacts--search-pending '(friends)))
+          (should-not qq-contacts--search-friends)
+          (should-not qq-contacts--search-errors)
+          (should-not syncs)
+          (funcall success
+                   '((results
+                      . (((kind . "friend") (user_id . "10001")
+                          (uid . "native-10001"))))
+                     (next_cursor)))
+          (should-not qq-contacts--search-pending)
+          (should (equal (alist-get 'user_id
+                                    (car qq-contacts--search-friends))
+                         "10001"))
+          (should (= (length syncs) 1))
+          (should (eq view (caar syncs))))))))
+
+(ert-deftest qq-contacts-refresh-callback-rejects-replacement-view ()
+  (qq-contacts-test-with-runtime-view
+    (let (friend-success friend-failure group-success group-failure syncs)
+      (cl-letf (((symbol-function 'qq-api-refresh-friend-categories)
+                 (lambda (callback &optional errback)
+                   (setq friend-success callback
+                         friend-failure errback)
+                   'friend-refresh-request))
+                ((symbol-function 'qq-api-refresh-joined-groups)
+                 (lambda (callback &optional errback)
+                   (setq group-success callback
+                         group-failure errback)
+                   'group-refresh-request))
+                ((symbol-function 'qq-api-cancel-request) #'ignore)
+                ((symbol-function 'appkit-request-sync)
+                 (lambda (candidate &rest arguments)
+                   (push (cons candidate arguments) syncs)
+                   'owned-timer)))
+        (qq-contacts-refresh)
+        (should (cl-every (lambda (call) (eq (car call) view)) syncs))
+        (appkit-kill-view view)
+        (let ((replacement (qq-contacts--ensure-view))
+              (replacement-owner (list 'replacement-refresh)))
+          (should-not (eq replacement view))
+          (setq qq-contacts--refresh-owner replacement-owner
+                qq-contacts--refresh-parts '(friends groups)
+                qq-contacts--refresh-pending 2
+                qq-contacts--loading t
+                qq-contacts--error "replacement state"
+                syncs nil)
+          (funcall friend-success nil)
+          (funcall friend-failure nil "stale friend failure")
+          (funcall group-success nil)
+          (funcall group-failure nil "stale group failure")
+          (should (eq qq-contacts--refresh-owner replacement-owner))
+          (should (equal qq-contacts--refresh-parts '(friends groups)))
+          (should (= qq-contacts--refresh-pending 2))
+          (should qq-contacts--loading)
+          (should (equal qq-contacts--error "replacement state"))
+          (should-not syncs))))))
 
 (ert-deftest qq-contacts-visible-avatar-update-invalidates-only-target-rows ()
   (with-temp-buffer
@@ -467,7 +652,7 @@
               ;; notifications before the timer fires still form one snapshot.
               (qq-contacts--handle-state-change '(:type friends-refreshed))
               (qq-contacts--handle-state-change '(:type friends-refreshed))
-              (qq-contacts--finish-refresh-part buffer owner 'friends)
+              (qq-contacts--finish-refresh-part view buffer owner 'friends)
               (should-not sync-count)
               (appkit-sync-invalidations view)
               (should (= sync-count 1))
@@ -496,9 +681,9 @@
               (qq-contacts--handle-state-change '(:type friends-refreshed))
               (qq-contacts--handle-media-cache-update "avatar:10001")
               (qq-contacts--finish-refresh-part
-               buffer refresh-owner 'friends)
+               view buffer refresh-owner 'friends)
               (qq-contacts--finish-search-page
-               buffer search-owner 'friends nil
+               view buffer search-owner 'friends nil
                '((results . (((kind . "friend")
                               (user_id . "10001")
                               (uid . "native-10001"))))
@@ -652,8 +837,8 @@
 (ert-deftest qq-contacts-duplicate-continuation-settles-pending-section ()
   (with-temp-buffer
     (qq-contacts-mode)
-    (qq-contacts--ensure-view)
-    (let* ((owner (list 'synthetic-search-owner))
+    (let* ((view (qq-contacts--ensure-view))
+           (owner (list 'synthetic-search-owner))
            (existing
             '(((kind . "friend")
                (user_id . "synthetic-user")
@@ -665,9 +850,9 @@
             qq-contacts--search-pending '(friends)
             qq-contacts--search-friends (copy-tree existing)
             qq-contacts--search-friend-request 'synthetic-request)
-      (cl-letf (((symbol-function 'qq-contacts--request-reconcile) #'ignore))
+      (cl-letf (((symbol-function 'qq-contacts--queue-view-sync) #'ignore))
         (qq-contacts--finish-search-page
-         (current-buffer) owner 'friends t
+         view (current-buffer) owner 'friends t
          '((results
             . (((kind . "friend")
                 (user_id . "synthetic-user")
@@ -714,12 +899,170 @@
     (should (memq #'qq-contacts--cancel-refresh change-major-mode-hook))
     (should (memq #'qq-contacts--cancel-search change-major-mode-hook))))
 
+(ert-deftest qq-contacts-app-replacement-clears-view-owned-search-state ()
+  (let* ((app-one (appkit-start-app 'qq :id 'contacts-old-runtime))
+         (app-two nil)
+         (qq-runtime--app app-one)
+         (buffer (generate-new-buffer " *qq-contacts-runtime-replace*"))
+         cancelled)
+    (unwind-protect
+        (with-current-buffer buffer
+          (qq-contacts-mode)
+          (let ((view-one (qq-contacts--ensure-view)))
+            (setq qq-contacts--view 'members
+                  qq-contacts--previous-view 'groups
+                  qq-contacts--query "OLD GLOBAL QUERY"
+                  qq-contacts--search-scope 'strangers
+                  qq-contacts--search-owner '(old-search-owner)
+                  qq-contacts--search-pending
+                  '(friends groups strangers members)
+                  qq-contacts--search-errors
+                  '((strangers . "old account error"))
+                  qq-contacts--search-friends '(((user_id . "10001")))
+                  qq-contacts--search-groups '(((group_id . "20001")))
+                  qq-contacts--search-strangers
+                  '(((user_id . "10002") (uid . "old-native-uid")))
+                  qq-contacts--search-members '(((user_id . "10003")))
+                  qq-contacts--member-group-id "20001"
+                  qq-contacts--search-friend-cursor "friend-cursor"
+                  qq-contacts--search-group-cursor "group-cursor"
+                  qq-contacts--search-stranger-cursor (make-string 43 ?O)
+                  qq-contacts--search-member-cursor "member-cursor"
+                  qq-contacts--search-friend-request 'friend-request
+                  qq-contacts--search-group-request 'group-request
+                  qq-contacts--search-stranger-request 'stranger-request
+                  qq-contacts--search-member-request 'member-request)
+            ;; Looking up the current live view is not a lifecycle boundary.
+            (should (eq view-one (qq-contacts--ensure-view)))
+            (should (equal qq-contacts--query "OLD GLOBAL QUERY"))
+            (should qq-contacts--search-strangers)
+            (should qq-contacts--search-stranger-cursor)
+            (cl-letf (((symbol-function 'qq-api-cancel-request)
+                       (lambda (request) (push request cancelled))))
+              (appkit-stop-app app-one))
+            (should-not (appkit-view-live-p view-one))
+            (should-not qq-contacts--query)
+            (should (eq qq-contacts--search-scope 'all))
+            (should (eq qq-contacts--view 'friends))
+            (should (eq qq-contacts--previous-view 'friends))
+            (should-not qq-contacts--search-owner)
+            (should-not qq-contacts--search-pending)
+            (should-not qq-contacts--search-errors)
+            (should-not qq-contacts--search-friends)
+            (should-not qq-contacts--search-groups)
+            (should-not qq-contacts--search-strangers)
+            (should-not qq-contacts--search-members)
+            (should-not qq-contacts--member-group-id)
+            (should-not qq-contacts--search-friend-cursor)
+            (should-not qq-contacts--search-group-cursor)
+            (should-not qq-contacts--search-stranger-cursor)
+            (should-not qq-contacts--search-member-cursor)
+            (should-not qq-contacts--search-friend-request)
+            (should-not qq-contacts--search-group-request)
+            (should-not qq-contacts--search-stranger-request)
+            (should-not qq-contacts--search-member-request)
+            (should (= 4 (length cancelled)))
+            (setq app-two
+                  (appkit-start-app 'qq :id 'contacts-new-runtime)
+                  qq-runtime--app app-two)
+            (let ((view-two (qq-contacts--ensure-view)))
+              (should (appkit-view-live-p view-two))
+              (should-not (eq view-one view-two))
+              (should-not qq-contacts--query)
+              (should-not qq-contacts--search-strangers)
+              (should-not qq-contacts--search-stranger-cursor))))
+      (when (appkit-app-live-p app-one)
+        (appkit-stop-app app-one))
+      (when (appkit-app-live-p app-two)
+        (appkit-stop-app app-two))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest qq-contacts-group-member-search-reuses-a-renamed-owning-buffer ()
+  (qq-contacts-test-with-runtime-view
+    (let ((renamed (generate-new-buffer-name " *qq-contacts-members*"))
+          call
+          selected)
+      (rename-buffer renamed)
+      (cl-letf
+          (((symbol-function 'qq-runtime-app)
+            (lambda ()
+              (ert-fail "member entrypoint ignored its registered view")))
+           ((symbol-function 'qq-contacts-open)
+            (lambda ()
+              (ert-fail "member entrypoint opened a duplicate view")))
+           ((symbol-function 'pop-to-buffer)
+            (lambda (candidate &rest _arguments)
+              (setq selected candidate)
+              candidate))
+           ((symbol-function 'qq-contacts--queue-view-sync) #'ignore)
+           ((symbol-function 'qq-api-search-contacts-start)
+            (lambda (scope query callback &optional _errback group-id limit)
+              (setq call (list scope query group-id limit))
+              (funcall callback '((results) (next_cursor)))
+              'finished)))
+        ;; Invoke the public entrypoint away from the owning buffer.  Its
+        ;; Appkit view id, not the default buffer name, selects the target.
+        (with-temp-buffer
+          (qq-contacts-search-group-members "20002" " Carol ")))
+      (should (eq selected buffer))
+      (should (eq buffer (appkit-view-buffer view)))
+      (should (equal renamed (buffer-name buffer)))
+      (should-not (get-buffer qq-contacts-buffer-name))
+      (should (equal call '(group-members "Carol" "20002" 50)))
+      (should (eq qq-contacts--view 'members))
+      (should (equal qq-contacts--member-group-id "20002"))
+      (should-not qq-contacts--search-pending))))
+
+(ert-deftest qq-contacts-group-member-search-uses-canonical-open-without-view ()
+  (let ((qq-runtime--app nil)
+        (buffer (generate-new-buffer " *qq-contacts-canonical-open*"))
+        opened
+        opened-view
+        issued
+        selected)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (qq-contacts-mode))
+          (cl-letf (((symbol-function 'qq-contacts-open)
+                     (lambda ()
+                       (setq opened t)
+                       (setq opened-view
+                             (with-current-buffer buffer
+                               (qq-contacts--ensure-view)))
+                       buffer))
+                    ((symbol-function 'get-buffer-create)
+                     (lambda (&rest _arguments)
+                       (ert-fail
+                        "member entrypoint bypassed canonical open")))
+                    ((symbol-function 'qq-contacts--queue-view-sync) #'ignore)
+                    ((symbol-function 'qq-contacts--issue-search-request)
+                     (lambda (candidate section &rest _arguments)
+                       (setq issued
+                             (list candidate section (current-buffer)))))
+                    ((symbol-function 'pop-to-buffer)
+                     (lambda (candidate &rest _arguments)
+                       (setq selected candidate)
+                       candidate)))
+            (qq-contacts-search-group-members "20002" "Carol"))
+          (should opened)
+          (should (eq (car issued) opened-view))
+          (should (equal (cdr issued) (list 'members buffer)))
+          (should (eq selected buffer))
+          (with-current-buffer buffer
+            (should (eq qq-contacts--view 'members))
+            (should (equal qq-contacts--member-group-id "20002"))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (qq-runtime-stop))))
+
 (ert-deftest qq-contacts-group-member-search-is-native-and-actionable ()
   (let ((buffer (get-buffer-create qq-contacts-buffer-name)) call opened)
     (unwind-protect
         (cl-letf
             (((symbol-function 'pop-to-buffer) (lambda (&rest _args) buffer))
-             ((symbol-function 'qq-contacts--request-reconcile) #'ignore)
+             ((symbol-function 'qq-contacts--queue-view-sync) #'ignore)
              ((symbol-function 'qq-api-search-contacts-start)
               (lambda (scope query callback &optional _errback group-id limit)
                 (setq call (list scope query group-id limit))

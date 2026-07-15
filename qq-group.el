@@ -10,9 +10,14 @@
 ;;; Code:
 
 (require 'button)
+(require 'cl-lib)
 (require 'subr-x)
+(require 'appkit-core)
+(require 'appkit-invalidation)
+(require 'appkit-transaction)
 (require 'qq-api)
 (require 'qq-media)
+(require 'qq-runtime)
 (require 'qq-state)
 (require 'appkit-ui)
 (require 'appkit-view)
@@ -25,6 +30,9 @@
 (declare-function qq-group-notices-open
                   "qq-group-notices" (group-id &optional group-name))
 (declare-function qq-api-cancel-request "qq-api" (request-token))
+
+(defconst qq-group--view-id 'group-profile
+  "Stable Appkit identity of the singleton group-profile view.")
 
 (defface qq-group-action-button
   '((t :inherit mode-line-inactive :weight semi-bold
@@ -55,9 +63,18 @@
 (defvar-local qq-group--error nil
   "Last group-profile loading error, or nil.")
 
+(defvar-local qq-group--media-hook-function nil
+  "View-owned media cache hook installed for this group buffer.")
+
 (defun qq-group--buffer-name (_group-id)
   "Return the shared group profile buffer name."
   "*qq-group*")
+
+(defun qq-group--profile-key (&optional group-id)
+  "Return the stable presentation key for opaque GROUP-ID.
+
+GROUP-ID defaults to the identity selected in the current buffer."
+  (list 'group-profile (or group-id qq-group--group-id)))
 
 (defun qq-group--present-string (value)
   "Return non-empty string VALUE, or nil."
@@ -292,14 +309,63 @@
              (insert "\n")
              (appkit-view-insert-heading-line (car section) :face 'bold)
              (insert text "\n")))))
+       (add-text-properties
+        (point-min) (point-max)
+        (list 'qq-group-profile-key (qq-group--profile-key)
+              'rear-nonsticky '(qq-group-profile-key)))
        (goto-char (point-min))))
+   :anchor-property 'qq-group-profile-key
    :preserve-window-start t))
 
-(defun qq-group--request-current-p (buffer group-id owner)
-  "Return non-nil when OWNER still loads GROUP-ID in BUFFER."
-  (and (buffer-live-p buffer)
+(defun qq-group--view-current-p (view)
+  "Return non-nil when VIEW still owns this group-profile buffer."
+  (and (appkit-view-live-p view)
+       (equal (appkit-view-id view) qq-group--view-id)
+       (with-current-buffer (appkit-view-buffer view)
+         (and (derived-mode-p 'qq-group-mode)
+              (eq view (appkit-current-view))))))
+
+(defun qq-group--live-current-view ()
+  "Return the live group-profile view attached to this buffer, or nil."
+  (let ((view (appkit-current-view)))
+    (and (qq-group--view-current-p view) view)))
+
+(defun qq-group--live-view ()
+  "Return the registered live group-profile view without starting QQ."
+  (when (appkit-app-live-p qq-runtime--app)
+    (when-let* ((view (appkit-view-for-id qq-runtime--app
+                                          qq-group--view-id)))
+      (and (qq-group--view-current-p view) view))))
+
+(cl-defun qq-group--request-sync (&optional view &key resource)
+  "Request one coalesced group-profile sync for live VIEW.
+
+RESOURCE identifies a presentation-only media dependency update."
+  (when-let* ((view (or view (qq-group--live-current-view))))
+    (if resource
+        (appkit-request-sync
+         view :entry (qq-group--profile-key) :resource resource)
+      (appkit-request-sync view :structure t :part 'profile))))
+
+(defun qq-group--sync-now (view)
+  "Consume pending invalidations for live group-profile VIEW."
+  (when (qq-group--view-current-p view)
+    (appkit-sync-invalidations view)))
+
+(defun qq-group--sync-invalidations (view invalidations)
+  "Render group profile VIEW from coalesced INVALIDATIONS."
+  (when (and (qq-group--view-current-p view)
+             (appkit-invalidations-any-p invalidations))
+    (appkit-with-content-update view
+      (qq-group-render))))
+
+(defun qq-group--request-current-p (view buffer group-id owner)
+  "Return non-nil when VIEW and OWNER still load GROUP-ID in BUFFER."
+  (and (qq-group--view-current-p view)
+       (eq (appkit-view-buffer view) buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-group-mode)
+              (eq view (appkit-current-view))
               (equal qq-group--group-id group-id)
               (eq qq-group--request-owner owner)))))
 
@@ -308,66 +374,136 @@
   (interactive)
   (unless qq-group--group-id
     (user-error "qq: this buffer has no group identity"))
-  (when qq-group--request
-    (qq-api-cancel-request qq-group--request))
-  (let ((buffer (current-buffer))
-        (group-id qq-group--group-id)
-        (owner (list 'group-profile qq-group--group-id)))
-    (setq qq-group--loading t
-          qq-group--error nil
-          qq-group--request nil
-          qq-group--request-owner owner)
-    (qq-group-render)
-    (condition-case error-data
-        (let ((request
-               (qq-api-get-group
-                group-id
-                (lambda (profile)
-                  (when (qq-group--request-current-p buffer group-id owner)
-                    (with-current-buffer buffer
-                      (setq qq-group--profile profile
-                            qq-group--loading nil
-                            qq-group--error nil
-                            qq-group--request nil
-                            qq-group--request-owner nil)
-                      (qq-group-render))))
-                (lambda (response reason)
-                  (when (qq-group--request-current-p buffer group-id owner)
-                    (with-current-buffer buffer
-                      (setq qq-group--loading nil
-                            qq-group--error
-                            (format "Unable to load group: %s"
-                                    (or reason "unknown error"))
-                            qq-group--request nil
-                            qq-group--request-owner nil)
-                      (qq-group-render)))
-                  (qq-api--default-error response reason)))))
-          (when (eq qq-group--request-owner owner)
-            (setq qq-group--request request)))
-      (error
-       (when (qq-group--request-current-p buffer group-id owner)
-         (setq qq-group--loading nil
-               qq-group--error
-               (format "Unable to load group: %s"
-                       (error-message-string error-data))
-               qq-group--request nil
-               qq-group--request-owner nil)
-         (qq-group-render))))))
+  (let ((view (qq-group--ensure-view)))
+    (when qq-group--request
+      (qq-api-cancel-request qq-group--request))
+    (let ((buffer (current-buffer))
+          (group-id qq-group--group-id)
+          (owner (list 'group-profile qq-group--group-id)))
+      (setq qq-group--loading t
+            qq-group--error nil
+            qq-group--request nil
+            qq-group--request-owner owner)
+      (qq-group--request-sync view)
+      (condition-case error-data
+          (let ((request
+                 (qq-api-get-group
+                  group-id
+                  (lambda (profile)
+                    (when (qq-group--request-current-p
+                           view buffer group-id owner)
+                      (with-current-buffer buffer
+                        (setq qq-group--profile profile
+                              qq-group--loading nil
+                              qq-group--error nil
+                              qq-group--request nil
+                              qq-group--request-owner nil)
+                        (qq-group--request-sync view))))
+                  (lambda (response reason)
+                    (when (qq-group--request-current-p
+                           view buffer group-id owner)
+                      (with-current-buffer buffer
+                        (setq qq-group--loading nil
+                              qq-group--error
+                              (format "Unable to load group: %s"
+                                      (or reason "unknown error"))
+                              qq-group--request nil
+                              qq-group--request-owner nil)
+                        (qq-group--request-sync view)
+                        (qq-api--default-error response reason)))))))
+            (when (eq qq-group--request-owner owner)
+              (setq qq-group--request request)))
+        (error
+         (when (qq-group--request-current-p view buffer group-id owner)
+           (setq qq-group--loading nil
+                 qq-group--error
+                 (format "Unable to load group: %s"
+                         (error-message-string error-data))
+                 qq-group--request nil
+                 qq-group--request-owner nil)
+           (qq-group--request-sync view))))
+      (qq-group--sync-now view))))
 
 (defun qq-group--cancel-request ()
   "Cancel the active group-profile request."
   (when qq-group--request
     (qq-api-cancel-request qq-group--request))
   (setq qq-group--request nil
-        qq-group--request-owner nil))
+        qq-group--request-owner nil
+        qq-group--loading nil))
+
+(defun qq-group--clear-view-data ()
+  "Clear account-scoped data projected by the current group view."
+  (setq qq-group--profile nil
+        qq-group--error nil))
+
+(defun qq-group--reset-buffer-work (buffer)
+  "Reset requests, data, and media hook state retained by BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (derived-mode-p 'qq-group-mode)
+        (when qq-group--media-hook-function
+          (remove-hook 'qq-media-cache-update-hook
+                       qq-group--media-hook-function))
+        (setq qq-group--media-hook-function nil)
+        (qq-group--cancel-request)
+        (qq-group--clear-view-data)))))
+
+(defun qq-group--release-view-work (view buffer)
+  "Release BUFFER work when it is still owned by group-profile VIEW."
+  (when (and (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (eq view (appkit-current-view))))
+    (qq-group--reset-buffer-work buffer)))
+
+(defun qq-group--setup-view (view)
+  "Reset replacement state and register lifecycle work for group VIEW."
+  (let ((buffer (appkit-view-buffer view)))
+    (qq-group--reset-buffer-work buffer)
+    (appkit-register-handle
+     view 'function
+     (apply-partially #'qq-group--release-view-work view buffer))
+    (let ((hook (apply-partially
+                 #'qq-group--handle-media-cache-update view)))
+      (with-current-buffer buffer
+        (setq qq-group--media-hook-function hook))
+      (appkit-register-handle
+       view 'hook
+       (list 'qq-media-cache-update-hook hook nil buffer))
+      (add-hook 'qq-media-cache-update-hook hook))))
+
+(defun qq-group--ensure-view ()
+  "Return the live Appkit view owning the current group buffer."
+  (unless qq-group--group-id
+    (error "QQ: cannot attach a group view without an opaque group identity"))
+  (let* ((app (qq-runtime-app))
+         (current (appkit-current-view)))
+    (cond
+     ((and (appkit-view-live-p current)
+           (eq app (appkit-view-app current))
+           (equal qq-group--view-id (appkit-view-id current)))
+      (setf (appkit-view-sync-function current)
+            #'qq-group--sync-invalidations
+            (appkit-view-parts current) '(profile))
+      current)
+     ((appkit-view-live-p current)
+      (error "QQ: group buffer belongs to another Appkit view"))
+     (t
+      (let ((view
+             (appkit-attach-view
+              :app app
+              :id qq-group--view-id
+              :mode 'qq-group-mode
+              :sync-function #'qq-group--sync-invalidations
+              :parts '(profile))))
+        (qq-group--setup-view view)
+        view)))))
 
 (defun qq-group--select-group (group-id)
   "Prepare the shared group buffer to display GROUP-ID."
   (unless (equal qq-group--group-id group-id)
     (qq-group--cancel-request)
-    (setq qq-group--profile nil
-          qq-group--loading nil
-          qq-group--error nil))
+    (qq-group--clear-view-data))
   (setq qq-group--group-id group-id))
 
 (defun qq-group-button-backward ()
@@ -394,6 +530,7 @@
   "Major mode for one native QQ group profile."
   (setq-local truncate-lines nil)
   (setq-local switch-to-buffer-preserve-window-point nil)
+  (setq-local header-line-format '(:eval (qq-group--header-line)))
   (add-hook 'change-major-mode-hook #'qq-group--cancel-request nil t)
   (add-hook 'kill-buffer-hook #'qq-group--cancel-request nil t))
 
@@ -403,28 +540,34 @@
   (interactive "sQQ group number: ")
   (unless (qq-api-group-id-p group-id)
     (user-error "qq: group profile requires a canonical uint32 group id"))
-  (let ((buffer (get-buffer-create (qq-group--buffer-name group-id))))
+  (let* ((app (qq-runtime-app))
+         (view
+          (appkit-open-view
+           :app app
+           :id qq-group--view-id
+           :mode 'qq-group-mode
+           :buffer-name (qq-group--buffer-name group-id)
+           :sync-function #'qq-group--sync-invalidations
+           :parts '(profile)
+           :setup #'qq-group--setup-view))
+         (buffer (appkit-view-buffer view)))
     (with-current-buffer buffer
-      (unless (derived-mode-p 'qq-group-mode)
-        (qq-group-mode))
       (qq-group--select-group group-id)
-      (qq-group-render)
       (when (and (null qq-group--profile)
                  (not qq-group--loading))
-        (qq-group-refresh)))
+        (qq-group-refresh))
+      (qq-group--request-sync view)
+      (qq-group--sync-now view))
     (pop-to-buffer buffer)
     buffer))
 
-(defun qq-group--handle-media-cache-update (media-key)
-  "Rerender the group buffer after its avatar cache changes."
-  (when-let* (((stringp media-key))
-              (buffer (get-buffer (qq-group--buffer-name nil))))
-    (with-current-buffer buffer
-      (when (and (derived-mode-p 'qq-group-mode)
-                 (equal media-key (format "group-avatar:%s" qq-group--group-id)))
-        (qq-group-render)))))
-
-(add-hook 'qq-media-cache-update-hook #'qq-group--handle-media-cache-update)
+(defun qq-group--handle-media-cache-update (view media-key)
+  "Request a targeted VIEW update after MEDIA-KEY changes."
+  (when (and (stringp media-key) (qq-group--view-current-p view))
+    (with-current-buffer (appkit-view-buffer view)
+      (when (equal media-key
+                   (format "group-avatar:%s" qq-group--group-id))
+        (qq-group--request-sync view :resource media-key)))))
 
 (provide 'qq-group)
 

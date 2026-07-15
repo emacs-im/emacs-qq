@@ -22,6 +22,21 @@
   "Synchronously flush the current chat view's queued invalidations."
   (appkit-sync-invalidations (appkit-current-view)))
 
+(defun qq-chat-test-sync-until-idle (&optional limit)
+  "Flush callback-driven chat invalidations until idle, bounded by LIMIT."
+  (let ((view (appkit-current-view))
+        (remaining (or limit 32)))
+    (while (and (> remaining 0)
+                (appkit-view-live-p view)
+                (appkit-invalidations-any-p
+                 (appkit-view-invalidations view)))
+      (cl-decf remaining)
+      (appkit-sync-invalidations view))
+    (when (and (appkit-view-live-p view)
+               (appkit-invalidations-any-p
+                (appkit-view-invalidations view)))
+      (ert-fail "chat invalidations did not settle"))))
+
 (defun qq-chat-test--search-result (id sequence time &optional preview)
   "Return one strict group search result."
   `((chat . ((kind . "group") (group_id . "20001")))
@@ -519,6 +534,7 @@
                     (results . (,(qq-chat-test--filter-snapshot
                                   "20" "20" 20 "needle")))
                     (next_cursor))))
+       (qq-chat-test-sync-invalidations)
        (should-not positioned)))))
 
 (ert-deftest qq-chat-filter-refresh-restores-point-while-dispatch-owns-it ()
@@ -546,8 +562,130 @@
                   `((projection . "message")
                     (results . (,(qq-chat-test--filter-snapshot
                                   "20" "20" 20 "needle")))
-                    (next_cursor))))
-       (should positioned)))))
+                    (next_cursor)))
+         ;; The transport callback records state and projection work only.
+         (should-not positioned)
+         (should qq-chat--filter-sync-request)
+         (should (plist-get qq-chat--filter-sync-request :point-owner))
+         (should
+          (qq-chat--filter-point-state-current-p
+           (plist-get qq-chat--filter-sync-request :point-owner)))
+         (let ((view (appkit-current-view)))
+           (qq-chat--sync-invalidations
+            view
+            (appkit-invalidations-take
+             (appkit-view-invalidations view))))
+         (should-not qq-chat--filter-sync-request)
+         (should positioned))))))
+
+(ert-deftest qq-chat-filter-success-callback-projects-and-positions-via-appkit ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001")) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001"
+           qq-chat--msg-filter
+           (list :active t :title "search \"needle\"" :query "needle"
+                 :items (list (qq-chat-test--filter-item "20" 20 "needle"))))
+     (qq-chat--set-empty-history-window)
+     (qq-chat-render)
+     (let (callback calls trace snapshot)
+       (cl-letf (((symbol-function 'qq-api-filter-messages-start)
+                  (lambda (_session _query success &optional _errback _limit)
+                    (setq callback success)
+                    'filter-token)))
+         ;; This explicit command initialization remains synchronous.
+         (qq-chat-filter-refresh))
+       (let ((view (appkit-current-view))
+             (real-invalidate (symbol-function 'appkit-invalidate)))
+         (cl-letf (((symbol-function 'appkit-request-sync)
+                    (lambda (candidate &rest options)
+                      (push (cons candidate options) calls)
+                      (apply real-invalidate candidate options)))
+                   ((symbol-function 'appkit-invalidate)
+                    (lambda (&rest _)
+                      (ert-fail "filter callback split invalidation")))
+                   ((symbol-function 'appkit-schedule-sync)
+                    (lambda (&rest _)
+                      (ert-fail "filter callback used bare scheduling")))
+                   ((symbol-function 'appkit-sync-invalidations)
+                    (lambda (&rest _)
+                      (ert-fail "filter callback flushed Appkit directly")))
+                   ((symbol-function 'qq-chat-render)
+                    (lambda () (ert-fail "filter callback rendered")))
+                   ((symbol-function 'qq-chat--sync-timeline)
+                    (lambda (&rest _)
+                      (ert-fail "filter callback projected rows")))
+                   ((symbol-function 'qq-chat--position-after-filter-first-page)
+                    (lambda (&rest _)
+                      (ert-fail "filter callback positioned before sync"))))
+           (funcall callback
+                    `((projection . "message")
+                      (results . (,(qq-chat-test--filter-snapshot
+                                    "20" "20" 20 "needle")))
+                      (next_cursor))))
+         (should
+          (equal calls
+                 (list (list view
+                             :structure t
+                             :parts '(timeline frame)
+                             :position t))))
+         (setq snapshot
+               (appkit-invalidations-take
+                (appkit-view-invalidations view)))
+         (cl-letf (((symbol-function 'qq-chat-render)
+                    (lambda () (push 'project trace)))
+                   ((symbol-function 'qq-chat--position-after-filter-first-page)
+                    (lambda (_owner) (push 'point trace))))
+           (qq-chat--sync-invalidations view snapshot))
+         (should (equal (nreverse trace) '(project point))))))))
+
+(ert-deftest qq-chat-filter-failure-callback-only-requests-appkit-sync ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001")) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat--set-empty-history-window)
+     (qq-chat-render)
+     (let (errback calls)
+       (cl-letf (((symbol-function 'qq-api-filter-messages-start)
+                  (lambda (_session _query _success failure &optional _limit)
+                    (setq errback failure)
+                    'filter-token)))
+         (qq-chat-filter-search "needle"))
+       (let ((view (appkit-current-view)))
+         (cl-letf (((symbol-function 'appkit-request-sync)
+                    (lambda (candidate &rest options)
+                      (push (cons candidate options) calls)))
+                   ((symbol-function 'appkit-invalidate)
+                    (lambda (&rest _)
+                      (ert-fail "filter failure split invalidation")))
+                   ((symbol-function 'appkit-schedule-sync)
+                    (lambda (&rest _)
+                      (ert-fail "filter failure used bare scheduling")))
+                   ((symbol-function 'appkit-sync-invalidations)
+                    (lambda (&rest _)
+                      (ert-fail "filter failure flushed Appkit directly")))
+                   ((symbol-function 'qq-chat-render)
+                    (lambda () (ert-fail "filter failure rendered")))
+                   ((symbol-function 'qq-chat--sync-timeline)
+                    (lambda (&rest _)
+                      (ert-fail "filter failure projected rows")))
+                   ((symbol-function 'qq-api--default-error) #'ignore))
+           (funcall errback nil "offline"))
+         (should-not qq-chat--filter-owner)
+         (should-not (plist-get qq-chat--msg-filter :next-cursor))
+         (should
+          (equal calls
+                 (list (list view
+                             :structure t
+                             :parts '(timeline frame)
+                             :position t)))))))))
 
 (ert-deftest qq-chat-filter-materializes-pages-and-preserves-normal-window ()
   (qq-chat-test-with-reset
@@ -595,6 +733,7 @@
           (equal (mapcar #'qq-chat--message-anchor
                          (qq-chat--timeline-messages))
                  '("30")))
+         (qq-chat-test-sync-invalidations)
          (should (qq-chat--goto-loaded-message "30" nil))
          (should (equal (alist-get 'server-id (qq-chat--message-at-point))
                         "30"))
@@ -609,6 +748,7 @@
             (results . (,(qq-chat-test--filter-snapshot
                           "10" "10" 10 "old needle")))
             (next_cursor)))
+         (qq-chat-test-sync-invalidations)
          (should
           (equal (mapcar #'qq-chat--message-anchor
                          (qq-chat--timeline-messages))
@@ -692,6 +832,11 @@
                          (next_cursor))))
                     (intern (concat "token-" cursor)))))
          (qq-chat-filter-search "needle")
+         (should-not continued)
+         ;; Each accepted duplicate-only page is projected before Appkit
+         ;; consumes its cursor and dispatches the next request.
+         (dotimes (_ 3)
+           (qq-chat-test-sync-invalidations))
          (should (equal (nreverse continued) '("empty-1" "empty-2")))
          (should
           (equal (mapcar #'qq-chat--message-anchor
@@ -1061,8 +1206,11 @@
          (should-not qq-chat--last-forward-target-key)
          (should-not qq-chat-forward-target-history)
          (should-not (eq old-plan-owner qq-chat--forward-plan-owner))
-         (should-not (string-match-p "selected" header-line-format))
-         (should-not (string-match-p "forwarding" header-line-format))
+         ;; Reset state is canonical immediately, while a dead captured view
+         ;; must remain presentation-inert.  Its old header is intentionally
+         ;; untouched because no live view exists to own a sync transaction.
+         (should (string-match-p "selected" header-line-format))
+         (should (string-match-p "forwarding" header-line-format))
          ;; A callback and Transient scope captured before reset are both
          ;; stale even though this buffer still names the same session key.
          (qq-chat--forward-succeeded
@@ -1086,7 +1234,7 @@
         (qq-transport--reconnect-timer nil)
         (qq-transport--reconnect-attempt 0)
         (buffer (generate-new-buffer " *qq-public-reset-chat*"))
-        dispatch-called)
+        view plan dispatch-called)
     (unwind-protect
         (progn
           (qq-state-reset)
@@ -1100,29 +1248,28 @@
             (setq qq-chat--session-key "group:20001")
             (qq-chat--set-empty-history-window)
             (qq-chat-render)
-            (let* ((view (appkit-current-view))
-                   (anchor "9007199254743009336")
-                   (plan (qq-chat-test--forward-plan buffer anchor))
-                   (old-plan-owner qq-chat--forward-plan-owner))
-              (setq qq-chat--message-selection
+            (let ((anchor "9007199254743009336"))
+              (setq view (appkit-current-view)
+                    plan (qq-chat-test--forward-plan buffer anchor)
+                    qq-chat--message-selection
                     (qq-chat-test--selection anchor)
                     qq-chat--forward-request 'pre-reset-request
                     qq-chat--forward-request-owner
-                    (list 'pre-reset-request-owner))
-              (should (appkit-view-live-p view))
-              (qq-reset-session-state)
-              (should-not (appkit-view-live-p view))
-              (should-not qq-chat--message-selection)
-              (should-not qq-chat--forward-request)
-              (should-not qq-chat--forward-request-owner)
-              (should-not (eq old-plan-owner qq-chat--forward-plan-owner))
-              (cl-letf
-                  (((symbol-function 'qq-api-forward-messages-individually)
-                    (lambda (&rest _arguments) (setq dispatch-called t))))
-                (should-error
-                 (qq-chat-forward-individually plan "private:10002")
-                 :type 'user-error))
-              (should-not dispatch-called))))
+                    (list 'pre-reset-request-owner))))
+          (should (appkit-view-live-p view))
+          (qq-reset-session-state)
+          (should-not (buffer-live-p buffer))
+          (should-not (appkit-view-live-p view))
+          ;; A forwarding plan captured by the destroyed account view cannot
+          ;; dispatch from any surviving buffer in the new runtime.
+          (with-temp-buffer
+            (cl-letf
+                (((symbol-function 'qq-api-forward-messages-individually)
+                  (lambda (&rest _arguments) (setq dispatch-called t))))
+              (should-error
+               (qq-chat-forward-individually plan "private:10002")
+               :type 'user-error)))
+          (should-not dispatch-called))
       (when (buffer-live-p buffer)
         (kill-buffer buffer))
       (when (appkit-app-live-p qq-runtime--app)
@@ -1206,10 +1353,16 @@
                  ((symbol-function 'qq-chat-open-message)
                   (lambda (_session id &optional _query) (setq opened id))))
          (qq-chat-search "needle")
+         ;; Search callbacks mutate canonical state only.  Navigation is a
+         ;; captured-view action and therefore cannot run before AppKit sync.
+         (should-not opened)
+         (qq-chat-test-sync-until-idle)
          (should (equal opened "9000"))
          (should (= qq-chat--search-index 1))
          (setq opened nil)
          (qq-chat-search "needle" t)
+         (should-not opened)
+         (qq-chat-test-sync-until-idle)
          (should (equal opened "1000"))
          (should (= qq-chat--search-index 0)))))))
 
@@ -1237,8 +1390,11 @@
                  ((symbol-function 'qq-chat-open-message)
                   (lambda (_session id &optional _query) (setq opened id))))
          (qq-chat-search "needle")
+         (should-not opened)
+         (qq-chat-test-sync-until-idle)
          (should (equal opened "900"))
          (qq-chat-search "needle" t)
+         (qq-chat-test-sync-until-idle)
          (should (equal opened "100")))))))
 
 (ert-deftest qq-chat-search-exact-anchor-id-skips-the-anchor-itself ()
@@ -1263,8 +1419,11 @@
                  ((symbol-function 'qq-chat-open-message)
                   (lambda (_session id &optional _query) (setq opened id))))
          (qq-chat-search "needle")
+         (should-not opened)
+         (qq-chat-test-sync-until-idle)
          (should (equal opened "900"))
          (qq-chat-search "needle" t)
+         (qq-chat-test-sync-until-idle)
          (should (equal opened "100")))))))
 
 (ert-deftest qq-chat-search-follows-empty-pages-without-restarting ()
@@ -1297,6 +1456,8 @@
                  ((symbol-function 'qq-chat-open-message)
                   (lambda (_session id &optional _query) (setq opened id))))
          (qq-chat-search "needle")
+         (should-not opened)
+         (qq-chat-test-sync-until-idle)
          (should (= start-calls 1))
          (should (equal next-cursors '("cursor-1" "cursor-2")))
          (should (equal opened "123"))
@@ -1347,6 +1508,8 @@
                  ((symbol-function 'qq-chat-open-message)
                   (lambda (_session id &optional _query) (setq opened id))))
          (qq-chat-search "needle")
+         (should-not opened)
+         (qq-chat-test-sync-until-idle)
          (should (= start-calls 1))
          (should (equal next-cursors expected-cursors))
          (should (equal opened "499"))
@@ -1413,6 +1576,8 @@
                   `((results . (,(qq-chat-test--search-result
                                   "222" "10" 10)))
                     (next_cursor)))
+         (should-not opened)
+         (qq-chat-test-sync-until-idle)
          (should (equal opened "222")))))))
 
 (ert-deftest qq-chat-open-message-cancels-pending-search-and-stale-callback ()
@@ -1477,7 +1642,8 @@
                (qq-chat-mode)
                (setq qq-chat--session-key "group:20001"
                      qq-chat--initial-history-request 'initial-token
-                     qq-chat--initial-history-owner '(initial)))
+                     qq-chat--initial-history-owner '(initial))
+               (qq-chat--ensure-view))
              (cl-letf (((symbol-function 'qq-chat--open-buffer)
                         (lambda (_session) buffer))
                        ((symbol-function 'qq-api-cancel-request)
@@ -1516,6 +1682,7 @@
      (with-temp-buffer
        (qq-chat-mode)
        (setq qq-chat--session-key "group:20001")
+       (qq-chat--ensure-view)
        (appkit-chat-history-window-clear)
        (let ((buffer (current-buffer))
              fast-path-called
@@ -2078,6 +2245,28 @@
          (qq-chat--handle-state-change '(:type heartbeat :timestamp 1.0))
          (should-not events))))))
 
+(ert-deftest qq-chat-state-callback-enqueues-before-one-atomic-sync-request ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (let ((view (qq-chat--ensure-view))
+           calls)
+       (cl-letf (((symbol-function 'appkit-request-sync)
+                  (lambda (candidate &rest options)
+                    (should
+                     (equal (appkit-view-pending-events-snapshot candidate)
+                            '((:type connection :status ready))))
+                    (push (cons candidate options) calls)))
+                 ((symbol-function 'appkit-invalidate)
+                  (lambda (&rest _)
+                    (ert-fail "state callback split invalidation")))
+                 ((symbol-function 'appkit-schedule-sync)
+                  (lambda (&rest _)
+                    (ert-fail "state callback used bare scheduling"))))
+         (qq-chat--handle-state-change '(:type connection :status ready)))
+       (should (equal calls (list (list view :part 'frame))))))))
+
 (ert-deftest qq-chat-message-state-change-uses-one-projected-sync-path ()
   (qq-chat-test-with-reset
    (with-temp-buffer
@@ -2516,14 +2705,21 @@
      (setq qq-chat--session-key "private:10001")
      (qq-chat--set-history-window "m1" nil)
      (qq-chat-render)
-     (let (requested)
-       (cl-letf (((symbol-function 'appkit-invalidate)
-                  (lambda (_view &rest args)
-                    (setq requested (plist-get args :entries))))
+     (let ((view (appkit-current-view)) calls)
+       (cl-letf (((symbol-function 'appkit-request-sync)
+                  (lambda (candidate &rest options)
+                    (push (cons candidate options) calls)))
+                 ((symbol-function 'appkit-invalidate)
+                  (lambda (&rest _)
+                    (ert-fail "media callback split invalidation")))
                  ((symbol-function 'appkit-schedule-sync)
-                  (lambda (&rest _) nil)))
+                  (lambda (&rest _)
+                    (ert-fail "media callback used bare scheduling")))
+                 ((symbol-function 'qq-chat--sync-timeline)
+                  (lambda (&rest _)
+                    (ert-fail "media callback projected rows"))))
          (qq-chat--rerender-open-chats)
-         (should (equal '("m1") requested)))))))
+         (should (equal calls (list (list view :entries '("m1"))))))))))
 
 (ert-deftest qq-chat-compact-face-message-uses-image-display ()
   "Same-sender face continuations must not render plain [face:id] text."
@@ -3297,6 +3493,9 @@
                         (lambda (&rest _)
                           (qq-media-custom-face-label face 0))))
                (qq-chat-attach-custom-face)
+               ;; Media completion queues insertion on the captured view.
+               (should-not (qq-chat--current-input-segments))
+               (qq-chat-test-sync-until-idle)
                (let ((segments (qq-chat--current-input-segments)))
                  (should (= 1 (length segments)))
                  (should (equal "image" (alist-get 'type (car segments))))
@@ -3427,7 +3626,11 @@
          (qq-chat-send-message)
          (should (equal "" (appkit-chatbuf-input-string)))
          (should-not (appkit-chatbuf-aux-state))
-         (funcall error-fn nil "network failed"))
+         (funcall error-fn nil "network failed")
+         ;; Failure restores canonical draft state in the callback, but the
+         ;; composer projection is owned by the captured-view transaction.
+         (should-not (appkit-chatbuf-input-has-objects-p))
+         (qq-chat-test-sync-until-idle))
        (should (appkit-chatbuf-input-has-objects-p))
        (should (equal '("at")
                       (mapcar (lambda (segment) (alist-get 'type segment))
@@ -3787,7 +3990,6 @@
                                               (cons (quote data)
                                                     (list (cons (quote text)
                                                                 "old target")))))))))
-                    (qq-chat-render)
                     (when callback
                       (funcall callback
                                (list :added-count 1
@@ -3802,6 +4004,8 @@
          (qq-chat-goto-message "100" 'no-pop)
          (should (equal around-called "100"))
          (should-not load-older-called)
+         (should qq-chat--pending-jump-id)
+         (qq-chat-test-sync-until-idle)
          (should (equal "100"
                         (get-text-property (point) 'qq-chat-message-anchor)))
          (should-not qq-chat--pending-jump-id))))))
@@ -3825,6 +4029,8 @@
         (qq-chat--seek-history-for-jump
          "private:10001" "100" (current-buffer))
         (should (= requests 1))
+        (should-not failure)
+        (qq-chat-test-sync-until-idle)
         (should (equal failure '("100" "around window omitted target")))))))
 
 
@@ -4251,42 +4457,98 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
     (should-not (plist-member properties 'mouse-face))))
 
 (ert-deftest qq-chat-window-resize-refreshes-layout-only-when-width-changes ()
-  (with-temp-buffer
-    (qq-chat-mode)
-    (setq qq-chat--fill-column 70)
-    (let ((win (selected-window))
-          (refresh-count 0))
-      (cl-letf (((symbol-function 'qq-chat--render-window) (lambda () win))
-                ((symbol-function 'qq-chat--compute-fill-column)
-                 (lambda (&optional candidate)
-                   (should (eq candidate win))
-                   90))
-                ((symbol-function 'qq-chat--refresh-timeline-layout)
-                 (lambda () (cl-incf refresh-count))))
-        (qq-chat--on-window-size-change)
-        (should (= qq-chat--fill-column 90))
-        (should (= fill-column 90))
-        (should (= refresh-count 1))
-        (qq-chat--on-window-size-change)
-        (should (= refresh-count 1))))))
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001"
+           qq-chat--fill-column 70)
+     (let ((view (qq-chat--ensure-view))
+           (win (selected-window))
+           (real-request-sync (symbol-function 'appkit-request-sync))
+           calls
+           (timeline-syncs 0)
+           (frame-syncs 0))
+       (cl-letf (((symbol-function 'qq-chat--render-window) (lambda () win))
+                 ((symbol-function 'qq-chat--compute-fill-column)
+                  (lambda (&optional candidate)
+                    (should (eq candidate win))
+                    90))
+                 ((symbol-function 'appkit-request-sync)
+                  (lambda (candidate &rest options)
+                    (push (cons candidate options) calls)
+                    (apply real-request-sync candidate
+                           (append options '(:delay 60)))))
+                 ((symbol-function 'qq-chat--sync-timeline)
+                  (lambda (&rest _) (cl-incf timeline-syncs)))
+                 ((symbol-function 'qq-chat--update-frame)
+                  (lambda () (cl-incf frame-syncs))))
+         (qq-chat--on-window-size-change)
+         ;; Hooks only request work; geometry state belongs to the view sync.
+         (should (= qq-chat--fill-column 70))
+         (should
+          (equal calls (list (list view :part 'geometry :position t))))
+         (qq-chat-test-sync-invalidations)
+         (should (= qq-chat--fill-column 90))
+         (should (= fill-column 90))
+         (should (= timeline-syncs 1))
+         (should (= frame-syncs 1))
+         (setq calls nil)
+         (qq-chat--on-window-size-change)
+         (should-not calls))))))
 
 (ert-deftest qq-chat-text-scale-refreshes-pixel-alignment-at-same-width ()
-  (with-temp-buffer
-    (qq-chat-mode)
-    (should (= line-spacing 0))
-    (setq qq-chat--fill-column 90)
-    (let ((win (selected-window))
-          (refresh-count 0))
-      (cl-letf (((symbol-function 'qq-chat--render-window) (lambda () win))
-                ((symbol-function 'qq-chat--compute-fill-column)
-                 (lambda (&optional candidate)
-                   (should (eq candidate win))
-                   90))
-                ((symbol-function 'qq-chat--refresh-timeline-layout)
-                 (lambda () (cl-incf refresh-count))))
-        (qq-chat--on-text-scale-change)
-        (should (= qq-chat--fill-column 90))
-        (should (= refresh-count 1))))))
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (should (= line-spacing 0))
+     (setq qq-chat--session-key "private:10001"
+           qq-chat--fill-column 90)
+     (let ((view (qq-chat--ensure-view))
+           (win (selected-window))
+           (real-request-sync (symbol-function 'appkit-request-sync))
+           calls
+           (timeline-syncs 0))
+       (cl-letf (((symbol-function 'qq-chat--render-window) (lambda () win))
+                 ((symbol-function 'qq-chat--compute-fill-column)
+                  (lambda (&optional candidate)
+                    (should (eq candidate win))
+                    90))
+                 ((symbol-function 'appkit-request-sync)
+                  (lambda (candidate &rest options)
+                    (push (cons candidate options) calls)
+                    (apply real-request-sync candidate
+                           (append options '(:delay 60)))))
+                 ((symbol-function 'qq-chat--sync-timeline)
+                  (lambda (&rest _) (cl-incf timeline-syncs)))
+                 ((symbol-function 'qq-chat--update-frame) #'ignore))
+         (qq-chat--on-text-scale-change)
+         (should
+          (equal calls (list (list view :part 'geometry :position t))))
+         (should (= timeline-syncs 0))
+         (qq-chat-test-sync-invalidations)
+         (should (= qq-chat--fill-column 90))
+         (should (= timeline-syncs 1)))))))
+
+(ert-deftest qq-chat-geometry-hooks-ignore-detached-orphan-buffer ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (appkit-kill-view (qq-chat--ensure-view))
+     (let ((measurements 0))
+       (cl-letf (((symbol-function 'qq-chat--render-window)
+                  (lambda () (cl-incf measurements)))
+                 ((symbol-function 'qq-chat--compute-fill-column)
+                  (lambda (&optional _window) (cl-incf measurements)))
+                 ((symbol-function 'appkit-request-sync)
+                  (lambda (&rest _)
+                    (ert-fail "detached chat requested geometry sync")))
+                 ((symbol-function 'qq-chat--sync-timeline)
+                  (lambda (&rest _)
+                    (ert-fail "detached chat projected geometry"))))
+         (qq-chat--on-window-size-change)
+         (qq-chat--on-text-scale-change))
+       (should (= measurements 0))))))
 
 (ert-deftest qq-chat-history-window-slice-honors-exact-first-and-last ()
   (with-temp-buffer
@@ -4397,6 +4659,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
+    (qq-chat--ensure-view)
     (qq-chat--set-history-window "m10" "m20")
     (setq qq-chat--remote-latest-id "m24")
     (cl-letf (((symbol-function 'qq-api-fetch-history-page)
@@ -4421,6 +4684,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
+    (qq-chat--ensure-view)
     (qq-chat--set-history-window "m10" "m20")
     (should-not qq-chat--remote-latest-id)
     (cl-letf (((symbol-function 'qq-api-fetch-history-page)
@@ -4444,6 +4708,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
+    (qq-chat--ensure-view)
     (qq-chat--set-history-window "m10" "m20")
     (setq qq-chat--remote-latest-id "m99")
     (cl-letf (((symbol-function 'qq-api-fetch-history-page)
@@ -4591,6 +4856,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (qq-chat--seek-history-for-jump
          "group:20001" "m20" (current-buffer))
         (should (eq loading-during-request 'around))
+        (should-not failure)
+        (qq-chat-test-sync-until-idle)
         (should (equal failure '("m20" "network failure")))
         (should-not (appkit-chat-history-loading-p))
         (should-not (appkit-chat-history-request-owner))))))
@@ -4695,6 +4962,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                 ((symbol-function 'qq-chat--sync-timeline) #'ignore))
         (qq-chat-return-to-latest)
         (should (equal fetches '(("group:20001" nil))))
+        (should-not goto-id)
+        (qq-chat-test-sync-until-idle)
         (should (equal (appkit-chat-history-window-first-key)
                        "latest-first"))
         (should-not (appkit-chat-history-window-last-key))
@@ -4765,6 +5034,9 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                     :batch-oldest-message-id ,page-first
                     :batch-newest-message-id ,page-last))
          (should (equal qq-chat--remote-latest-id live-frontier))
+         (should-not goto-id)
+         (should-not marked)
+         (qq-chat-test-sync-until-idle)
          (should (equal goto-id live-frontier))
          (should (equal marked `(("group:20001" ,live-frontier))))
          (should-not (appkit-chat-history-request-owner))
@@ -4820,6 +5092,9 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                     :batch-message-ids nil
                     :batch-oldest-message-id nil
                     :batch-newest-message-id nil))
+         (should-not goto-id)
+         (should-not marked)
+         (qq-chat-test-sync-until-idle)
          (should (qq-chat--history-window-known-p))
          (should (equal (appkit-chat-history-window-first-key)
                         live-frontier))
@@ -4867,6 +5142,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                     :batch-message-ids nil
                     :batch-oldest-message-id nil
                     :batch-newest-message-id nil))
+         (should-not goto-called)
+         (qq-chat-test-sync-until-idle)
          (should (appkit-chat-history-window-empty-p))
          (should (appkit-chat-history-older-loaded-p))
          (should-not qq-chat--remote-latest-id)
@@ -4879,6 +5156,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
+    (qq-chat--ensure-view)
     (qq-chat--set-history-window "m10" "m20")
     (let ((qq-chat-history-auto-load-threshold 50)
           calls)
@@ -4891,6 +5169,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (qq-chat--maybe-auto-load-newer 800)
         (should-not calls)
         (qq-chat--maybe-auto-load-newer 975)
+        (should-not calls)
+        (qq-chat-test-sync-until-idle)
         (should (equal calls '(t)))
 
         ;; No-progress against a known different remote frontier suppresses
@@ -4898,12 +5178,14 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (setq calls nil)
         (appkit-chat-history-newer-stalled-set "m20")
         (qq-chat--maybe-auto-load-newer 975)
+        (qq-chat-test-sync-until-idle)
         (should-not calls)))))
 
 (ert-deftest qq-chat-window-scroll-loads-newer-from-selected-viewport-edge ()
   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
+    (qq-chat--ensure-view)
     (qq-chat--set-history-window "m10" "m20")
     (let ((window 'test-window)
           (buffer (current-buffer))
@@ -4928,12 +5210,15 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         ;; DISPLAY-START remains far from the footer; the viewport's lower
         ;; edge is what makes this selected-window scroll eligible.
         (qq-chat--window-scroll window 100)
+        (should-not calls)
+        (qq-chat-test-sync-until-idle)
         (should (equal calls '(t)))))))
 
 (ert-deftest qq-chat-window-scroll-loads-newer-and-reads-inactive-window ()
   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
+    (qq-chat--ensure-view)
     (qq-chat--set-history-window "m10" "m20")
     (let ((window 'inactive-window)
           (buffer (current-buffer))
@@ -4959,22 +5244,28 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                  (lambda (position) (setq read-position position))))
         (qq-chat--window-scroll window 100)
         (should (= read-position 700))
+        (should-not calls)
+        (qq-chat-test-sync-until-idle)
         (should (equal calls '(t)))))))
 
 (ert-deftest qq-chat-post-command-auto-loads-older-near-top ()
   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
+    (qq-chat--ensure-view)
     (qq-chat--set-history-window "m10" nil)
     (let ((inhibit-read-only t))
       (insert (make-string 3000 ?x)))
     (goto-char (point-min))
     (let ((qq-chat-history-auto-load-threshold 2000)
           called)
-      (cl-letf (((symbol-function 'appkit-chatbuf-point-in-input-p) (lambda () nil))
+      (cl-letf (((symbol-function 'appkit-chatbuf-point-in-input-p)
+                 (lambda (&optional _position) nil))
                 ((symbol-function 'qq-chat-load-older-messages)
                  (lambda (&optional quiet) (setq called quiet))))
         (qq-chat--maybe-auto-load-older)
+        (should-not called)
+        (qq-chat-test-sync-until-idle)
         (should (eq called t))))))
 
 (ert-deftest qq-chat-read-position-follows-cursor-without-regressing ()
@@ -5119,6 +5410,114 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                         "9007199254741001"))
          (should-not (appkit-chat-history-window-last-key)))))))
 
+(ert-deftest qq-chat-guild-forum-initial-load-uses-native-feed-cursor ()
+  (qq-chat-test-with-reset
+   (let* ((guild-id "9007199254740993")
+          (channel-id "9007199254741999")
+          (session-key
+           (qq-state-guild-channel-session-key guild-id channel-id))
+          forum-call navigation-call)
+     (qq-state-apply-guild-directory
+      `((guilds . (((guild_id . ,guild-id) (name . "Synthetic guild")
+                    (avatar_seq . "3") (pinned_at))))
+        (channels . (((guild_id . ,guild-id) (channel_id . ,channel-id)
+                      (guild_name . "Synthetic guild")
+                      (name . "Synthetic forum") (kind . "forum")
+                      (avatar_seq . "4") (pinned_at)
+                      (latest_sequence . "0"))))))
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key session-key)
+       (cl-letf (((symbol-function 'qq-api-fetch-guild-forum-page)
+                  (lambda (candidate cursor callback &optional _errback)
+                    (setq forum-call (list candidate cursor))
+                    (puthash
+                     session-key
+                     `(((id . "B_synthetic_old")
+                        (session-key . ,session-key)
+                        (message-type . "guild-forum-post")
+                        (time . 1783999999))
+                       ((id . "B_synthetic_new")
+                        (session-key . ,session-key)
+                        (message-type . "guild-forum-post")
+                        (time . 1784000000)))
+                     qq-state--messages-by-session)
+                    (funcall callback
+                             '((posts . (((post_id . "B_synthetic_new"))
+                                         ((post_id . "B_synthetic_old"))))
+                               (next_cursor . "page=synthetic-next")
+                               (finished . :false)))
+                    'forum-request))
+                 ((symbol-function 'qq-api-fetch-guild-navigation)
+                  (lambda (&rest args) (setq navigation-call args)))
+                 ((symbol-function 'qq-chat--sync-timeline) #'ignore)
+                 ((symbol-function 'qq-chat--update-frame) #'ignore))
+         (qq-chat--load-initial-history (current-buffer) session-key)
+         (should (equal forum-call (list session-key "")))
+         (should-not navigation-call)
+         (should (equal qq-chat--guild-forum-next-cursor
+                        "page=synthetic-next"))
+         (should-not (appkit-chat-history-older-loaded-p))
+         (should (equal (appkit-chat-history-window-first-key)
+                        "B_synthetic_old"))
+         (should-not (appkit-chat-history-window-last-key)))))))
+
+(ert-deftest qq-chat-guild-forum-older-load-consumes-next-opaque-cursor ()
+  (qq-chat-test-with-reset
+   (let* ((guild-id "9007199254740993")
+          (channel-id "9007199254741999")
+          (session-key
+           (qq-state-guild-channel-session-key guild-id channel-id))
+          call)
+     (qq-state-apply-guild-directory
+      `((guilds . (((guild_id . ,guild-id) (name . "Synthetic guild")
+                    (avatar_seq . "3") (pinned_at))))
+        (channels . (((guild_id . ,guild-id) (channel_id . ,channel-id)
+                      (guild_name . "Synthetic guild")
+                      (name . "Synthetic forum") (kind . "forum")
+                      (avatar_seq . "4") (pinned_at)
+                      (latest_sequence . "0"))))))
+     (puthash session-key
+              `(((id . "B_synthetic_first")
+                 (session-key . ,session-key)
+                 (message-type . "guild-forum-post")
+                 (time . 1784000000)))
+              qq-state--messages-by-session)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key session-key
+             qq-chat--guild-forum-next-cursor "page=synthetic-next")
+       (qq-chat--set-history-window "B_synthetic_first" nil)
+       (cl-letf (((symbol-function 'qq-api-fetch-guild-forum-page)
+                  (lambda (candidate cursor callback &optional _errback)
+                    (setq call (list candidate cursor))
+                    (puthash
+                     session-key
+                     `(((id . "B_synthetic_older")
+                        (session-key . ,session-key)
+                        (message-type . "guild-forum-post")
+                        (time . 1783999999))
+                       ((id . "B_synthetic_first")
+                        (session-key . ,session-key)
+                        (message-type . "guild-forum-post")
+                        (time . 1784000000)))
+                     qq-state--messages-by-session)
+                    (funcall callback
+                             '((posts . (((post_id . "B_synthetic_older"))))
+                               (next_cursor . nil)
+                               (finished . t)))
+                    'forum-request))
+                 ((symbol-function 'qq-chat--sync-timeline) #'ignore)
+                 ((symbol-function 'qq-chat--update-frame) #'ignore)
+                 ((symbol-function 'qq-chat--header-line-update) #'ignore))
+         (qq-chat-load-older-messages t)
+         (should (equal call
+                        (list session-key "page=synthetic-next")))
+         (should-not qq-chat--guild-forum-next-cursor)
+         (should (appkit-chat-history-older-loaded-p))
+         (should (equal (appkit-chat-history-window-first-key)
+                        "B_synthetic_older")))))))
+
 (ert-deftest qq-chat-guild-older-page-uses-contiguous-sequence-range ()
   (with-temp-buffer
     (qq-chat-mode)
@@ -5190,6 +5589,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                     :batch-message-ids (,first ,latest)
                     :batch-oldest-message-id ,first
                     :batch-newest-message-id ,latest))
+         (should-not marked)
+         (qq-chat-test-sync-until-idle)
          (should (qq-chat--history-window-known-p))
          (should (equal marked `(("private:10001" ,latest))))
          (should-not (appkit-chat-history-loading-p)))))))
@@ -5896,6 +6297,87 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                  '("9007199254743009336" "9007199254743009444")))
          (should (seq-every-p #'stringp captured-ids))
          (should-not qq-chat--message-selection))))))
+
+(ert-deftest qq-chat-forward-success-callback-requests-exact-appkit-rows ()
+  (qq-chat-test-with-reset
+   (let ((message-id "9007199254743009336"))
+     (qq-state-upsert-session
+      "group:20001"
+      '((title . "Source") (target-id . "20001") (type . group)) nil)
+     (puthash
+      "group:20001"
+      `(((server-id . ,message-id)
+         (sender-id . "10001") (sender-name . "Alice")
+         (time . 100) (raw-message . "first")))
+      qq-state--messages-by-session)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "group:20001")
+       (qq-chat--set-history-window message-id nil)
+       (qq-chat-render)
+       (goto-char (appkit-chat-timeline-key-position message-id))
+       (qq-chat-toggle-message-selection)
+       (let ((plan (qq-chat--current-forward-plan)) success-callback)
+         (cl-letf (((symbol-function 'qq-api-forward-messages-individually)
+                    (lambda (_source _target _ids callback &optional _errback)
+                      (setq success-callback callback)
+                      'forward-token)))
+           (qq-chat-forward-individually plan "group:30001"))
+         (let ((view (appkit-current-view))
+               (real-invalidate (symbol-function 'appkit-invalidate))
+               calls snapshot)
+           (should (string-match-p "forwarding" header-line-format))
+           (should
+            (get-text-property
+             (appkit-chat-timeline-key-position message-id)
+             'qq-chat-message-selected))
+           (cl-letf (((symbol-function 'appkit-request-sync)
+                      (lambda (candidate &rest options)
+                        (push (cons candidate options) calls)
+                        (apply real-invalidate candidate options)))
+                     ((symbol-function 'appkit-invalidate)
+                      (lambda (&rest _)
+                        (ert-fail "forward callback split invalidation")))
+                     ((symbol-function 'appkit-schedule-sync)
+                      (lambda (&rest _)
+                        (ert-fail "forward callback used bare scheduling")))
+                     ((symbol-function 'appkit-sync-invalidations)
+                      (lambda (&rest _)
+                        (ert-fail "forward callback flushed Appkit directly")))
+                     ((symbol-function 'appkit-chat-timeline-invalidate)
+                      (lambda (&rest _)
+                        (ert-fail "forward callback mutated timeline")))
+                     ((symbol-function 'qq-chat-render)
+                      (lambda () (ert-fail "forward callback rendered")))
+                     ((symbol-function 'qq-chat--sync-timeline)
+                      (lambda (&rest _)
+                        (ert-fail "forward callback projected rows")))
+                     ((symbol-function 'qq-chat--header-line-update)
+                      (lambda ()
+                        (ert-fail "forward callback mutated its header"))))
+             (funcall success-callback '((kind . "individual"))))
+           (should-not qq-chat--message-selection)
+           ;; Generated content and header remain untouched until the view sync.
+           (should
+            (get-text-property
+             (appkit-chat-timeline-key-position message-id)
+             'qq-chat-message-selected))
+           (should (string-match-p "forwarding" header-line-format))
+           (should
+            (equal calls
+                   (list (list view :part 'frame :entries (list message-id)))))
+           (setq snapshot
+                 (appkit-invalidations-take
+                  (appkit-view-invalidations view)))
+           (cl-letf (((symbol-function 'qq-chat-render)
+                      (lambda ()
+                        (ert-fail "forward sync widened to full render"))))
+             (qq-chat--sync-invalidations view snapshot))
+           (should-not
+            (get-text-property
+             (appkit-chat-timeline-key-position message-id)
+             'qq-chat-message-selected))
+           (should-not (string-match-p "forwarding" header-line-format))))))))
 
 (ert-deftest qq-chat-forward-callback-preserves-selection-added-in-flight ()
   (qq-chat-test-with-reset

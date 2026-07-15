@@ -419,11 +419,21 @@ generated-content mutation is owned by one Appkit content transaction."
     (when (memq 'header parts)
       (force-mode-line-update))))
 
+(defun qq-root--line-property (property &optional pos)
+  "Return text PROPERTY at POS or the beginning of POS's line.
+
+When POS is nil, use point."
+  (let ((probe (or pos (point))))
+    (or (get-text-property probe property)
+        (get-text-property
+         (save-excursion
+           (goto-char probe)
+           (line-beginning-position))
+         property))))
+
 (defun qq-root--session-key-at-point (&optional pos)
   "Return root session key at POS, or current point when POS is nil."
-  (let ((probe (or pos (point))))
-    (or (get-text-property probe 'qq-root-session-key)
-        (get-text-property (line-beginning-position) 'qq-root-session-key))))
+  (qq-root--line-property 'qq-root-session-key pos))
 
 (defun qq-root--session-at-point ()
   "Return root session object at point, or nil."
@@ -639,14 +649,16 @@ offered."
   (add-hook 'text-scale-mode-hook #'qq-root--on-text-scale-change nil t))
 
 (defun qq-root--live-view ()
-  "Return the live Appkit root view, or nil when the root is not open."
-  (when-let* ((buffer (get-buffer qq-root-buffer-name)))
-    (with-current-buffer buffer
-      (let ((view (appkit-current-view)))
-        (and (derived-mode-p 'qq-root-mode)
-             (appkit-view-live-p view)
-             (equal (appkit-view-id view) 'root)
-             view)))))
+  "Return the existing live Appkit root view, or nil.
+
+This lookup reads the current runtime registry directly.  It deliberately
+does not call `qq-runtime-app', because state and media hooks must not create
+an application session merely to discover that no root is open."
+  (when (appkit-app-live-p qq-runtime--app)
+    (when-let* ((view (appkit-view-for-id qq-runtime--app 'root)))
+      (and (with-current-buffer (appkit-view-buffer view)
+             (derived-mode-p 'qq-root-mode))
+           view))))
 
 (cl-defun qq-root--queue-invalidation
     (&key structure part parts entry entries position)

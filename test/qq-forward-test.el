@@ -82,21 +82,65 @@
     (should (eq (lookup-key qq-forward-mode-map (kbd "p")) #'qq-forward-previous-message))
     (should (eq (lookup-key qq-forward-mode-map (kbd "RET")) #'qq-forward-activate))))
 
-(ert-deftest qq-forward-layout-hooks-use-shared-chat-geometry ()
-  (with-temp-buffer
-    (qq-forward-mode)
-    (should (memq #'qq-forward--on-window-size-change
-                  window-size-change-functions))
-    (should (memq #'qq-forward--on-text-scale-change
-                  text-scale-mode-hook))
-    (let (calls)
-      (cl-letf (((symbol-function 'qq-chat-sync-timeline-geometry)
-                 (lambda (&rest keys)
-                   (push keys calls))))
-        (qq-forward--on-window-size-change)
-        (qq-forward--on-text-scale-change))
-      (should (equal (nreverse calls)
-                     '(nil (:reset t :force t)))))))
+(ert-deftest qq-forward-layout-hooks-request-coalesced-appkit-geometry-sync ()
+  (qq-forward-test--with-clean-viewers
+    (save-window-excursion
+      (let ((buffer
+             (qq-forward-open-segment
+              (qq-forward-test--inline-segment
+               (list (qq-forward-test--native-message "1" "first")
+                     (qq-forward-test--native-message "2" "second"))))))
+        (with-current-buffer buffer
+          (should (memq #'qq-forward--on-window-size-change
+                        window-size-change-functions))
+          (should (memq #'qq-forward--on-text-scale-change
+                        text-scale-mode-hook))
+          (let ((view (appkit-current-view))
+                (width 90)
+                sync-calls)
+            (setq qq-chat--fill-column 80
+                  fill-column 80)
+            (cl-letf (((symbol-function 'qq-chat--compute-fill-column)
+                       (lambda (&optional _window) width))
+                      ((symbol-function 'qq-forward--sync-timeline)
+                       (lambda (&rest keys) (push keys sync-calls))))
+              (qq-forward--on-window-size-change)
+              (let ((handle
+                     (appkit-invalidations-scheduled-handle
+                      (appkit-view-invalidations view))))
+                (should (appkit-handle-alive-p handle))
+                (qq-forward--on-text-scale-change)
+                (should-not sync-calls)
+                (should
+                 (eq handle
+                     (appkit-invalidations-scheduled-handle
+                      (appkit-view-invalidations view))))
+                (let ((pending (appkit-view-invalidations view)))
+                  (should (equal '(geometry)
+                                 (appkit-invalidations-parts pending)))
+                  (should (appkit-invalidations-position-p pending)))
+                (appkit-sync-invalidations view))
+              (should (= qq-chat--fill-column 90))
+              (should (= fill-column 90))
+              (should (= (length sync-calls) 1))
+              (should
+               (equal (plist-get (car sync-calls) :force-keys)
+                      '("1" "2")))
+              (should-not
+               (plist-get (car sync-calls) :changed-resources))
+              ;; An unchanged resize is inert, while text scale forces one
+              ;; more deferred projection for pixel-aligned avatars/media.
+              (qq-forward--on-window-size-change)
+              (should-not
+               (appkit-invalidations-scheduled-handle
+                (appkit-view-invalidations view)))
+              (qq-forward--on-text-scale-change)
+              (should (appkit-handle-alive-p
+                       (appkit-invalidations-scheduled-handle
+                        (appkit-view-invalidations view))))
+              (should (= (length sync-calls) 1))
+              (appkit-sync-invalidations view)
+              (should (= (length sync-calls) 2)))))))))
 
 (ert-deftest qq-forward-header-uses-a-live-timeline-only-view ()
   (qq-forward-test--with-clean-viewers
@@ -113,7 +157,8 @@
                 (should (equal (appkit-view-id view)
                                (qq-forward--view-id
                                 (qq-forward--source-buffer-key source))))
-                (should (equal (appkit-view-parts view) '(timeline)))
+                (should (equal (appkit-view-parts view)
+                               '(timeline geometry)))
                 (should-not (appkit-chatbuf-prompt-start-position))
                 (should-not (appkit-chatbuf-input-start-position)))
               (should (string-match-p
@@ -655,7 +700,8 @@ list are indistinguishable — both mean \"do not claim a count\"."
                 (qq-forward-test--inline-segment messages))))
           (with-current-buffer buffer
             (let ((view (appkit-current-view)))
-              (should (equal (appkit-view-parts view) '(timeline)))
+              (should (equal (appkit-view-parts view)
+                             '(timeline geometry)))
               (should (equal (appkit-chat-timeline-keys) '("1.2" "9")))
               (should-not
                (eq (appkit-chat-timeline-node "1.2")
@@ -850,22 +896,29 @@ list are indistinguishable — both mean \"do not claim a count\"."
                     (should (= 2 syncs))))))
             (should (= 3 request-count))))))))
 
-(ert-deftest qq-forward-dead-view-callback-is-inert ()
+(ert-deftest qq-forward-kill-view-cancels-request-and-late-callback-is-inert ()
   (qq-forward-test--with-clean-viewers
     (let ((source (qq-forward-test--message-source
                    "9007199254742007045" "20001"))
-          success)
+          success canceled)
       (cl-letf (((symbol-function 'qq-api-get-forward)
                  (lambda (_source callback &optional _error-callback)
                    (setq success callback)
                    'request-1))
-                ((symbol-function 'qq-api-cancel-request) #'ignore))
+                ((symbol-function 'qq-api-cancel-request)
+                 (lambda (request) (push request canceled))))
         (save-window-excursion
           (let ((buffer (qq-forward-open source)))
             (with-current-buffer buffer
-              (let ((view (appkit-current-view))
-                    (owner qq-forward--request-owner))
+              (let ((view (appkit-current-view)))
+                (should qq-forward--loading)
+                (should qq-forward--request-owner)
                 (appkit-kill-view view)
+                (should (buffer-live-p buffer))
+                (should (equal canceled '(request-1)))
+                (should-not qq-forward--loading)
+                (should-not qq-forward--request)
+                (should-not qq-forward--request-owner)
                 (funcall
                  success
                  (list (qq-forward-test--native-message "1" "too late")))
@@ -874,10 +927,76 @@ list are indistinguishable — both mean \"do not claim a count\"."
                  (appkit-view-for-id
                   (qq-runtime-app)
                   (qq-forward--view-id qq-forward--buffer-key)))
-                (should qq-forward--loading)
                 (should-not qq-forward--messages)
-                (should (eq owner qq-forward--request-owner))
-                (should (eq 'request-1 qq-forward--request))))))))))
+                (should-not qq-forward--loaded-p)
+                (should-not qq-forward--request-owner)
+                (should-not qq-forward--request)))))))))
+
+(ert-deftest qq-forward-geometry-callbacks-ignore-detached-orphan-buffer ()
+  (qq-forward-test--with-clean-viewers
+    (save-window-excursion
+      (let ((buffer
+             (qq-forward-open-segment
+              (qq-forward-test--inline-segment
+               (list (qq-forward-test--native-message "1" "loaded"))))))
+        (with-current-buffer buffer
+          (appkit-kill-view (appkit-current-view))
+          (should (buffer-live-p buffer))
+          (should-not (appkit-current-view))
+          (let ((measurements 0))
+            (cl-letf (((symbol-function 'qq-chat--compute-fill-column)
+                       (lambda (&optional _window)
+                         (cl-incf measurements)
+                         90))
+                      ((symbol-function 'appkit-request-sync)
+                       (lambda (&rest _args)
+                         (ert-fail "orphan requested Appkit sync")))
+                      ((symbol-function 'qq-forward--sync-timeline)
+                       (lambda (&rest _args)
+                         (ert-fail "orphan mutated its timeline"))))
+              (qq-forward--on-window-size-change)
+              (qq-forward--on-text-scale-change))
+            (should (zerop measurements))))))))
+
+(ert-deftest qq-forward-open-reuses-canonical-orphan-buffer-only ()
+  (qq-forward-test--with-clean-viewers
+    (let ((source-a (qq-forward-test--message-source
+                     "9007199254742007046" "20001"))
+          (source-b (qq-forward-test--message-source
+                     "9007199254742007046" "20002"))
+          (requests 0))
+      (cl-letf (((symbol-function 'qq-api-get-forward)
+                 (lambda (_source callback &optional _error-callback)
+                   (cl-incf requests)
+                   (funcall callback
+                            (list (qq-forward-test--native-message
+                                   "1" "loaded")))))
+                ;; Force the display-only names to collide.  Canonical buffer
+                ;; identity must still distinguish the two source locators.
+                ((symbol-function 'sxhash-equal) (lambda (_value) 1)))
+        (save-window-excursion
+          (let ((first (qq-forward-open source-a)))
+            (with-current-buffer first
+              (let ((old-view (appkit-current-view)))
+                (should qq-forward--loaded-p)
+                (appkit-kill-view old-view)
+                (should-not (appkit-current-view))))
+            (let ((second (qq-forward-open source-b)))
+              (should-not (eq first second))
+              (should-not (equal (buffer-name first) (buffer-name second)))
+              (with-current-buffer second
+                (should
+                 (equal qq-forward--buffer-key
+                        (qq-forward--source-buffer-key source-b))))
+              (let ((reopened (qq-forward-open source-a)))
+                (should (eq reopened first))
+                (should (= requests 2))
+                (with-current-buffer reopened
+                  (should (appkit-view-live-p (appkit-current-view)))
+                  (should qq-forward--loaded-p)
+                  (should
+                   (equal qq-forward--buffer-key
+                          (qq-forward--source-buffer-key source-a))))))))))))
 
 (ert-deftest qq-forward-reply-context-updates-without-replacing-row ()
   (qq-forward-test--with-clean-viewers
@@ -923,6 +1042,37 @@ list are indistinguishable — both mean \"do not claim a count\"."
                   (push-button (point))
                   (should (equal (appkit-chat-timeline-key-at-point)
                                  "1")))))))))))
+
+(ert-deftest qq-forward-media-callback-uses-atomic-appkit-request-sync ()
+  (qq-forward-test--with-clean-viewers
+    (save-window-excursion
+      (let ((buffer
+             (qq-forward-open-segment
+              (qq-forward-test--inline-segment
+               (list (qq-forward-test--native-message "1" "media"))))))
+        (with-current-buffer buffer
+          (let ((view (appkit-current-view))
+                calls)
+            (cl-letf (((symbol-function 'appkit-request-sync)
+                       (lambda (&rest args) (push args calls)))
+                      ((symbol-function 'appkit-invalidate)
+                       (lambda (&rest _args)
+                         (ert-fail "media callback split invalidation")))
+                      ((symbol-function 'appkit-schedule-sync)
+                       (lambda (&rest _args)
+                         (ert-fail "media callback split scheduling")))
+                      ((symbol-function 'qq-forward--sync-timeline)
+                       (lambda (&rest _args)
+                         (ert-fail "media callback mutated timeline"))))
+              (qq-forward--handle-media-cache-update "preview:media-a")
+              (should
+               (equal calls
+                      (list
+                       (list view :resource
+                             '(:media "preview:media-a")))))
+              (appkit-kill-view view)
+              (qq-forward--handle-media-cache-update "preview:media-a")
+              (should (= (length calls) 1)))))))))
 
 (ert-deftest qq-forward-media-cache-update-redisplays-only-affected-entry ()
   "Media invalidation redraws only its dependent keyed timeline row."

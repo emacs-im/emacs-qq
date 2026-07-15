@@ -16,6 +16,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
   `(let* ((qq-guilds-buffer-name
            (generate-new-buffer-name " *qq-guilds-test*"))
           (app (appkit-start-app 'qq :id (make-symbol "qq-guilds-test")))
+          (qq-runtime--app app)
           (buffer (get-buffer-create qq-guilds-buffer-name))
           view)
      (unwind-protect
@@ -75,6 +76,26 @@ Each item is either a channel id string or a cons of id and display name."
                (pinned_at)
                (latest_sequence . "23"))))
          channel-specs))))
+
+(defun qq-guilds-test--partial-directory (&optional guild-name)
+  "Return one channel whose Guild metadata is optional.
+
+When GUILD-NAME is non-nil, include the authoritative Guild object with that
+name; otherwise only the channel's fallback Guild name is present."
+  `((guilds
+     . ,(when guild-name
+          `(((guild_id . ,qq-guilds-test--guild-id)
+             (name . ,guild-name)
+             (avatar_seq . "3")
+             (pinned_at)))))
+    (channels . (((guild_id . ,qq-guilds-test--guild-id)
+                  (channel_id . ,qq-guilds-test--channel-id)
+                  (guild_name . "Fallback guild")
+                  (name . "General")
+                  (kind . "text")
+                  (avatar_seq . "4")
+                  (pinned_at)
+                  (latest_sequence . "23"))))))
 
 (defun qq-guilds-test--channel-id (index)
   "Return a canonical synthetic channel id for INDEX."
@@ -178,6 +199,60 @@ Each item is either a channel id string or a cons of id and display name."
         (kill-buffer buffer))
       (let ((qq-state-change-hook nil))
         (qq-state-reset)))))
+
+(ert-deftest qq-guilds-refresh-callback-syncs-only-its-dispatch-view ()
+  (qq-guilds-test-with-live-view
+    (let (success syncs)
+      (cl-letf (((symbol-function 'qq-api-refresh-guild-directory)
+                 (lambda (&optional callback _errback)
+                   (setq success callback)
+                   'guild-refresh-request))
+                ((symbol-function 'appkit-request-sync)
+                 (lambda (candidate &rest arguments)
+                   (push (cons candidate arguments) syncs)
+                   'owned-timer)))
+        (qq-guilds-refresh)
+        (should success)
+        (should qq-guilds--loading)
+        (should (cl-every (lambda (call) (eq (car call) view)) syncs))
+        (setq syncs nil)
+        (funcall success (qq-guilds-test--directory))
+        (should-not qq-guilds--loading)
+        (should-not qq-guilds--refresh-owner)
+        (should-not qq-guilds--refresh-request)
+        (should (= (length syncs) 1))
+        (should (eq view (caar syncs)))))))
+
+(ert-deftest qq-guilds-refresh-callback-rejects-replacement-view ()
+  (qq-guilds-test-with-live-view
+    (let (success failure syncs)
+      (cl-letf (((symbol-function 'qq-api-refresh-guild-directory)
+                 (lambda (&optional callback errback)
+                   (setq success callback
+                         failure errback)
+                   'guild-refresh-request))
+                ((symbol-function 'qq-api-cancel-request) #'ignore)
+                ((symbol-function 'appkit-request-sync)
+                 (lambda (candidate &rest arguments)
+                   (push (cons candidate arguments) syncs)
+                   'owned-timer)))
+        (qq-guilds-refresh)
+        (appkit-kill-view view)
+        (let ((replacement (qq-guilds--ensure-view))
+              (replacement-owner (list 'replacement-refresh)))
+          (should-not (eq replacement view))
+          (setq qq-guilds--refresh-owner replacement-owner
+                qq-guilds--refresh-request 'replacement-request
+                qq-guilds--loading t
+                qq-guilds--error "replacement state"
+                syncs nil)
+          (funcall success (qq-guilds-test--directory))
+          (funcall failure nil "stale failure")
+          (should (eq qq-guilds--refresh-owner replacement-owner))
+          (should (eq qq-guilds--refresh-request 'replacement-request))
+          (should qq-guilds--loading)
+          (should (equal qq-guilds--error "replacement state"))
+          (should-not syncs))))))
 
 (ert-deftest qq-guilds-sync-preserves-stable-node-identity-without-erasing ()
   (let ((qq-state-change-hook nil)
@@ -348,6 +423,70 @@ Each item is either a channel id string or a cons of id and display name."
                     qq-guilds--node-table)))))))
       (qq-state-reset))))
 
+(ert-deftest qq-guilds-orphan-metadata-upgrade-preserves-heading-identity ()
+  (let ((qq-state-change-hook nil))
+    (qq-state-reset)
+    (unwind-protect
+        (progn
+          (qq-state-apply-guild-directory
+           (qq-guilds-test--partial-directory))
+          (qq-guilds-test-with-live-view
+            (appkit-invalidate view :structure t :part 'directory)
+            (appkit-sync-invalidations view)
+            (let* ((heading-key
+                    (qq-guilds--guild-entry-key qq-guilds-test--guild-id))
+                   (heading-node
+                    (gethash heading-key qq-guilds--node-table)))
+              (should heading-node)
+              (goto-char (ewoc-location heading-node))
+              (should (equal heading-key (qq-guilds--entry-key-at-point)))
+              (should (string-match-p "Fallback guild" (buffer-string)))
+              (qq-state-apply-guild-directory
+               (qq-guilds-test--partial-directory "Hydrated guild"))
+              (appkit-invalidate view :structure t :part 'directory)
+              (appkit-sync-invalidations view)
+              (should
+               (eq heading-node
+                   (gethash heading-key qq-guilds--node-table)))
+              (should (equal heading-key (qq-guilds--entry-key-at-point)))
+              (should (string-match-p "Hydrated guild" (buffer-string)))
+              (should-not
+               (gethash (list 'orphan-guild qq-guilds-test--guild-id)
+                        qq-guilds--node-table)))))
+      (qq-state-reset))))
+
+(ert-deftest qq-guilds-renamed-buffer-hook-uses-the-registered-view ()
+  (qq-guilds-test-with-live-view
+    (let ((renamed (generate-new-buffer-name " *qq-guilds-renamed*"))
+          queued
+          owning-buffer)
+      (rename-buffer renamed)
+      (cl-letf (((symbol-function 'qq-runtime-app)
+                 (lambda ()
+                   (ert-fail "Guild hook started a runtime app")))
+                ((symbol-function 'qq-guilds--queue-view-sync)
+                 (lambda (candidate)
+                   (setq queued candidate
+                         owning-buffer (current-buffer)))))
+        (qq-guilds--handle-state-change
+         '(:type guild-directory-refreshed)))
+      (should (eq queued view))
+      (should (eq owning-buffer buffer))
+      (should (equal renamed (buffer-name buffer)))
+      (should-not (get-buffer qq-guilds-buffer-name)))))
+
+(ert-deftest qq-guilds-hook-does-not-create-a-runtime-app-when-closed ()
+  (let ((qq-runtime--app nil))
+    (cl-letf (((symbol-function 'qq-runtime-app)
+               (lambda ()
+                 (ert-fail "closed Guild hook created a runtime app")))
+              ((symbol-function 'qq-guilds--queue-view-sync)
+               (lambda (&rest _arguments)
+                 (ert-fail "closed Guild hook requested a sync"))))
+      (qq-guilds--handle-state-change
+       '(:type guild-directory-refreshed)))
+    (should-not qq-runtime--app)))
+
 (ert-deftest qq-guilds-dead-view-rejects-stale-refresh-and-state-events ()
   (let ((buffer (get-buffer-create qq-guilds-buffer-name)) queued cancelled)
     (unwind-protect
@@ -365,7 +504,7 @@ Each item is either a channel id string or a cons of id and display name."
               (appkit-kill-view view)
               (qq-guilds--handle-state-change
                '(:type guild-directory-refreshed))
-              (qq-guilds--finish-refresh buffer owner)
+              (qq-guilds--finish-refresh view buffer owner)
               (should-not queued)
               (should (eq cancelled 'dead-request))
               (should-not qq-guilds--loading)

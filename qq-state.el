@@ -1715,12 +1715,22 @@ pending message model."
 (defun qq-state--direct-message-match (messages message)
   "Return direct match in MESSAGES for normalized MESSAGE."
   (let ((server-id (alist-get 'server-id message))
-        (local-id (alist-get 'local-id message)))
+        (local-id (alist-get 'local-id message))
+        (id (alist-get 'id message)))
     (qq-state--find-message
      messages
      (lambda (it)
        (or (and server-id (equal (alist-get 'server-id it) server-id))
-           (and local-id (equal (alist-get 'local-id it) local-id)))))))
+           (and local-id (equal (alist-get 'local-id it) local-id))
+           ;; Some protocol domains, notably QQ Guild forum feeds, own
+           ;; stable opaque row identities which are neither message
+           ;; snowflakes nor optimistic local ids.
+           (and id
+                (null server-id)
+                (null local-id)
+                (null (alist-get 'server-id it))
+                (null (alist-get 'local-id it))
+                (equal (alist-get 'id it) id)))))))
 
 (defun qq-state--pending-segment-signature (segment)
   "Return stable optimistic reconciliation signature for one SEGMENT.
@@ -2395,6 +2405,104 @@ Return three values via `cl-values':
                :source 'event
                (when previous-anchor
                  (list :previous-anchor previous-anchor)))))
+    session-key))
+
+(defun qq-state--normalize-guild-forum-post (post)
+  "Normalize one validated closed QQ Guild forum POST."
+  (let* ((chat (alist-get 'chat post))
+         (guild-id (alist-get 'guild_id chat))
+         (channel-id (alist-get 'channel_id chat))
+         (session-key
+          (qq-state-guild-channel-session-key guild-id channel-id))
+         (sender (alist-get 'sender post))
+         (deleted-p (equal (alist-get 'state post) "deleted"))
+         (segments
+          (if deleted-p
+              '(((type . "text") (data . ((text . "[post deleted]")))))
+            (mapcar #'qq-state--emacs-search-segment-to-internal
+                    (alist-get 'segments post))))
+         (segment-preview (qq-state-message-preview-from-segments segments))
+         (title (alist-get 'title post))
+         (preview (if (string-empty-p title) segment-preview title)))
+    `((id . ,(alist-get 'post_id post))
+      ;; `server-id' is intentionally absent.  Forum post ids are opaque
+      ;; Feed identities, not NT message snowflakes.
+      (session-key . ,session-key)
+      (time . ,(alist-get 'created_at post))
+      (message-seq . nil)
+      (sender-id . ,(alist-get 'native_id sender))
+      (sender-native-id . ,(alist-get 'native_id sender))
+      (sender-name . ,(alist-get 'display_name sender))
+      (sender-secondary-name . nil)
+      (sender-card . nil)
+      (sender-nickname . nil)
+      (sender-remark . nil)
+      (sender-avatar-url . ,(alist-get 'avatar_url sender))
+      (self-p . nil)
+      (status . received)
+      (segments . ,segments)
+      (mention-kinds . nil)
+      (contains-mention-p . nil)
+      (raw-message . ,preview)
+      (preview . ,preview)
+      (message-type . "guild-forum-post")
+      (chat-type . "4")
+      (peer-uid . ,channel-id)
+      (peer-name . ,(qq-state--present-string
+                     (alist-get 'channel_name post)))
+      (guild-id . ,guild-id)
+      (channel-id . ,channel-id)
+      (user-id . nil)
+      (target-id . ,channel-id)
+      (forum-title . ,title)
+      (forum-comment-count . ,(alist-get 'comment_count post))
+      (forum-updated-at . ,(alist-get 'updated_at post))
+      (order . ,(qq-state--next-message-order))
+      (raw-event . ,(copy-tree post)))))
+
+(defun qq-state-merge-guild-forum-post (post)
+  "Merge validated closed QQ Guild forum POST into local state."
+  (let* ((normalized (qq-state--normalize-guild-forum-post post))
+         (session-key (alist-get 'session-key normalized)))
+    (cl-multiple-value-bind (merged mutation previous-anchor)
+        (qq-state--merge-normalized-message session-key normalized)
+      (when merged
+        (apply #'qq-state--emit
+               'message
+               :session-key session-key
+               :message (copy-tree merged)
+               :message-anchor (qq-state-message-anchor merged)
+               :mutation mutation
+               :source 'response
+               (when previous-anchor
+                 (list :previous-anchor previous-anchor)))))
+    session-key))
+
+(defun qq-state-replace-guild-forum-posts (session-key posts)
+  "Replace SESSION-KEY history with validated first-page forum POSTS.
+
+The first native Feed page is an authoritative snapshot.  Replacing the
+cache also removes legacy sequence-range rows which represented forum
+activity notifications rather than posts."
+  (let ((old-messages (gethash session-key qq-state--messages-by-session))
+        (normalized
+         (mapcar #'qq-state--normalize-guild-forum-post posts)))
+    (dolist (message old-messages)
+      (when-let* ((server-id (alist-get 'server-id message)))
+        (remhash server-id qq-state--message-session-index))
+      (when-let* ((local-id (alist-get 'local-id message)))
+        (remhash local-id qq-state--local-message-session-index)))
+    (dolist (message normalized)
+      (unless (equal (alist-get 'session-key message) session-key)
+        (error "qq: forum first page contains a contradictory session")))
+    (setq normalized (qq-state--sort-messages normalized))
+    (puthash session-key normalized qq-state--messages-by-session)
+    (qq-state--sync-session-summary session-key)
+    (qq-state--emit 'history
+                    :session-key session-key
+                    :messages (copy-tree normalized)
+                    :mutation 'history
+                    :source 'response)
     session-key))
 
 (defun qq-state-apply-guild-navigation (navigation)

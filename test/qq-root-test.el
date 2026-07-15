@@ -25,6 +25,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
   `(let* ((qq-root-buffer-name
            (generate-new-buffer-name " *qq-root-test*"))
           (app (appkit-start-app 'qq :id (make-symbol "qq-root-test")))
+          (qq-runtime--app app)
           (buffer (get-buffer-create qq-root-buffer-name))
           view)
      (unwind-protect
@@ -194,6 +195,23 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
   (with-temp-buffer
     (qq-root-mode)
     (should (eq buffer-undo-list t))))
+
+(ert-deftest qq-root-line-property-falls-back-on-the-probe-line ()
+  (with-temp-buffer
+    (insert "first row\nsecond row\n")
+    (add-text-properties
+     (point-min) (1+ (point-min))
+     '(qq-root-session-key "first"))
+    (save-excursion
+      (goto-char (point-min))
+      (forward-line 1)
+      (add-text-properties
+       (point) (1+ (point))
+       '(qq-root-session-key "second")))
+    (goto-char (point-min))
+    (forward-line 1)
+    (should (equal "first" (qq-root--session-key-at-point 4)))
+    (should (equal "second" (qq-root--session-key-at-point)))))
 
 (ert-deftest qq-root-search-chooses-session-before-message-search ()
   (qq-root-test-with-reset
@@ -504,6 +522,21 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
        (qq-root--handle-media-cache-update "avatar:1")
        (should-not (qq-root--reflow-visible))))))
 
+(ert-deftest qq-root-hooks-do-not-create-a-runtime-app-when-closed ()
+  (qq-root-test-with-reset
+   (let ((qq-runtime--app nil))
+     (cl-letf (((symbol-function 'qq-runtime-app)
+                (lambda ()
+                  (ert-fail "closed-root hook created a runtime app")))
+               ((symbol-function 'appkit-request-sync)
+                (lambda (&rest _args)
+                  (ert-fail "closed-root hook requested a sync"))))
+       (qq-root--handle-state-change '(:type connection))
+       (qq-root--handle-state-change
+        '(:type message :session-key "group:1"))
+       (qq-root--handle-media-cache-update "avatar:1"))
+     (should-not qq-runtime--app))))
+
 (ert-deftest qq-root-open-reattaches-and-reuses-one-appkit-view ()
   (qq-root-test-with-reset
    (qq-root-test-with-live-view
@@ -523,6 +556,49 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
        (save-window-excursion
          (qq-root-open))
        (setq reused (with-current-buffer buffer (appkit-current-view)))
+       (should (eq view reused))))))
+
+(ert-deftest qq-root-renamed-buffer-keeps-hooks-geometry-and-reopen-owned ()
+  (qq-root-test-with-reset
+   (qq-state-upsert-session
+    "private:1"
+    '((type . private) (target-id . "1") (title . "One"))
+    nil)
+   (qq-root-test-with-live-view
+     (let ((renamed (generate-new-buffer-name " *qq-root-renamed*"))
+           calls reopened reused)
+       (rename-buffer renamed)
+       (cl-letf (((symbol-function 'appkit-request-sync)
+                  (lambda (candidate &rest arguments)
+                    (push (cons candidate arguments) calls)
+                    'owned-timer))
+                 ((symbol-function 'qq-root--selected-window)
+                  (lambda () 'renamed-root-window))
+                 ((symbol-function 'qq-root--compute-fill-column)
+                  (lambda (&optional window)
+                    (should (eq window 'renamed-root-window))
+                    100)))
+         (qq-root--handle-state-change
+          '(:type action :session-key "private:1"))
+         (qq-root--handle-media-cache-update "avatar:1")
+         (should (qq-root--reflow-visible)))
+       (setq calls (nreverse calls))
+       (should (= 3 (length calls)))
+       (dolist (call calls)
+         (should (eq view (car call))))
+       (should
+        (equal '(session . "private:1")
+               (plist-get (cdr (nth 0 calls)) :entry)))
+       (should
+        (equal '((session . "private:1"))
+               (plist-get (cdr (nth 1 calls)) :entries)))
+       (should (eq 'geometry (plist-get (cdr (nth 2 calls)) :part)))
+       (should (eq t (plist-get (cdr (nth 2 calls)) :position)))
+       (save-window-excursion
+         (setq reopened (qq-root-open)))
+       (should (eq buffer reopened))
+       (should (equal renamed (buffer-name reopened)))
+       (setq reused (with-current-buffer reopened (appkit-current-view)))
        (should (eq view reused))))))
 
 (ert-deftest qq-root-sync-never-calls-force-window-update ()

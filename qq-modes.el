@@ -100,7 +100,8 @@ sessions because native QQ mentions are priority activity."
       (progn
         (appkit-mode-line-install 'qq-mode-line-format)
         (add-hook 'qq-state-change-hook #'qq-mode-line-update)
-        (qq-mode-line-update))
+        (qq-mode-line-update)
+        (force-mode-line-update t))
     (appkit-mode-line-uninstall 'qq-mode-line-format)
     (setq qq-mode-line-string "")
     (remove-hook 'qq-state-change-hook #'qq-mode-line-update)

@@ -11,8 +11,12 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'appkit-core)
+(require 'appkit-invalidation)
+(require 'appkit-transaction)
 (require 'qq-api)
 (require 'qq-media)
+(require 'qq-runtime)
 (require 'qq-state)
 (require 'qq-user-photo)
 (require 'appkit-ui)
@@ -23,6 +27,10 @@
 (declare-function qq-api-cancel-request "qq-api" (request-token))
 (declare-function qq-user-photo-make-button
                   "qq-user-photo" (start end user-id photo))
+
+(defconst qq-user--view-id 'user-profile
+  "Stable Appkit identity of the singleton user-profile view.")
+
 (defface qq-user-action-button
   '((t :inherit mode-line-inactive :weight semi-bold
        :box (:line-width -1 :style released-button)))
@@ -107,10 +115,19 @@
 (defvar-local qq-user--friend-add-state nil
   "One-use friend-add workflow attached to the current search result.")
 
+(defvar-local qq-user--media-hook-function nil
+  "View-owned media cache hook installed for this user buffer.")
+
 (defun qq-user--buffer-name (user-id)
   "Return profile buffer name for USER-ID."
   (ignore user-id)
   "*qq-user*")
+
+(defun qq-user--profile-key (&optional user-id)
+  "Return the stable presentation key for USER-ID's profile.
+
+USER-ID defaults to the opaque identity selected in the current buffer."
+  (list 'user-profile (or user-id qq-user--user-id)))
 
 (defun qq-user--present-string (value)
   "Return non-empty string VALUE, or nil."
@@ -270,9 +287,11 @@
   (equal (alist-get 'kind (alist-get 'relationship qq-user--profile))
          "friend"))
 
-(defun qq-user--friend-add-current-p (state user-id)
-  "Return non-nil when STATE still owns USER-ID in this user buffer."
-  (and (derived-mode-p 'qq-user-mode)
+(defun qq-user--friend-add-current-p (state user-id &optional view)
+  "Return non-nil when STATE still owns USER-ID and optional VIEW."
+  (and (or (null view) (qq-user--view-current-p view))
+       (derived-mode-p 'qq-user-mode)
+       (or (null view) (eq view (appkit-current-view)))
        (eq state qq-user--friend-add-state)
        (equal (qq-user--friend-add-state-user-id state) user-id)
        (equal user-id qq-user--user-id)))
@@ -312,24 +331,25 @@
                 (or (qq-user--friend-add-state-error state) "未知错误"))
         :face 'error)))))
 
-(defun qq-user--friend-add-fail (buffer state user-id _response reason)
-  "Finish STATE in BUFFER for USER-ID with terminal failure REASON."
+(defun qq-user--friend-add-fail
+    (view buffer state user-id _response reason)
+  "Finish STATE in BUFFER for USER-ID and VIEW with failure REASON."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (qq-user--friend-add-current-p state user-id)
+      (when (qq-user--friend-add-current-p state user-id view)
         (setf (qq-user--friend-add-state-request state) nil
               (qq-user--friend-add-state-candidate state) nil
               (qq-user--friend-add-state-preparation state) nil
               (qq-user--friend-add-state-status state) 'error
               (qq-user--friend-add-state-error state)
               (or reason "未知错误"))
-        (qq-user-render)))))
+        (when view (qq-user--request-sync view))))))
 
-(defun qq-user--friend-add-prepared (buffer state user-id result)
-  "Apply prepared friend-add RESULT to STATE in BUFFER for USER-ID."
+(defun qq-user--friend-add-prepared (view buffer state user-id result)
+  "Apply prepared friend-add RESULT to STATE in BUFFER for USER-ID and VIEW."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (qq-user--friend-add-current-p state user-id)
+      (when (qq-user--friend-add-current-p state user-id view)
         (setf (qq-user--friend-add-state-request state) nil
               (qq-user--friend-add-state-preparation state)
               (alist-get 'preparation result)
@@ -339,13 +359,14 @@
               (copy-sequence (alist-get 'questions result))
               (qq-user--friend-add-state-status state) 'prepared
               (qq-user--friend-add-state-error state) nil)
-        (qq-user-render)))))
+        (when view (qq-user--request-sync view))))))
 
 (defun qq-user--prepare-friend-add (state)
   "Consume STATE's candidate and request exact friend verification settings."
   (unless (eq (qq-user--friend-add-state-status state) 'candidate)
     (user-error "qq: this friend request is not awaiting preparation"))
-  (let ((candidate (qq-user--friend-add-state-candidate state))
+  (let ((view (qq-user--live-current-view))
+        (candidate (qq-user--friend-add-state-candidate state))
         (user-id qq-user--user-id)
         (buffer (current-buffer)))
     (unless candidate
@@ -354,21 +375,22 @@
     (setf (qq-user--friend-add-state-candidate state) nil
           (qq-user--friend-add-state-status state) 'preparing
           (qq-user--friend-add-state-error state) nil)
-    (qq-user-render)
+    (if view (qq-user--request-sync view) (qq-user-render))
     (condition-case error-data
         (let ((request
                (qq-api-friend-add-prepare
                 user-id candidate
                 (apply-partially #'qq-user--friend-add-prepared
-                                 buffer state user-id)
+                                 view buffer state user-id)
                 (apply-partially #'qq-user--friend-add-fail
-                                 buffer state user-id))))
-          (when (and (qq-user--friend-add-current-p state user-id)
+                                 view buffer state user-id))))
+          (when (and (qq-user--friend-add-current-p state user-id view)
                      (eq (qq-user--friend-add-state-status state) 'preparing))
             (setf (qq-user--friend-add-state-request state) request)))
       (error
        (qq-user--friend-add-fail
-        buffer state user-id nil (error-message-string error-data))))))
+        view buffer state user-id nil (error-message-string error-data))))
+    (when view (qq-user--sync-now view))))
 
 (defun qq-user--friend-group-choices ()
   "Return display-name to native category-id pairs for friend placement."
@@ -446,16 +468,16 @@ Return a closed alist containing `verification_message' and `answers'."
     (qzone_not_watch . ,(y-or-n-p "权限：不看对方的 QQ 空间？ "))
     (qzone_not_watched . ,(y-or-n-p "权限：不让对方看我的 QQ 空间？ "))))
 
-(defun qq-user--friend-add-submitted (buffer state user-id _result)
-  "Mark STATE in BUFFER as submitted for USER-ID."
+(defun qq-user--friend-add-submitted (view buffer state user-id _result)
+  "Mark STATE in BUFFER as submitted for USER-ID and VIEW."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (qq-user--friend-add-current-p state user-id)
+      (when (qq-user--friend-add-current-p state user-id view)
         (setf (qq-user--friend-add-state-request state) nil
               (qq-user--friend-add-state-preparation state) nil
               (qq-user--friend-add-state-status state) 'submitted
               (qq-user--friend-add-state-error state) nil)
-        (qq-user-render)
+        (when view (qq-user--request-sync view))
         (message "qq: 好友申请已发送")))))
 
 (defun qq-user--submit-friend-add (state)
@@ -467,6 +489,7 @@ Return a closed alist containing `verification_message' and `answers'."
          (remark (read-string "好友备注（可空）: "))
          (group-id (qq-user--read-friend-group-id))
          (permissions (qq-user--read-friend-permissions))
+         (view (qq-user--live-current-view))
          (user-id qq-user--user-id)
          (buffer (current-buffer))
          (options
@@ -487,26 +510,29 @@ Return a closed alist containing `verification_message' and `answers'."
         (setf (qq-user--friend-add-state-preparation state) nil
               (qq-user--friend-add-state-status state) 'submitting
               (qq-user--friend-add-state-error state) nil)
-        (qq-user-render)
+        (if view (qq-user--request-sync view) (qq-user-render))
         (condition-case error-data
             (let ((request
                    (qq-api-friend-add-submit
                     user-id preparation options
                     (apply-partially #'qq-user--friend-add-submitted
-                                     buffer state user-id)
+                                     view buffer state user-id)
                     (apply-partially #'qq-user--friend-add-fail
-                                     buffer state user-id))))
-              (when (and (qq-user--friend-add-current-p state user-id)
+                                     view buffer state user-id))))
+              (when (and (qq-user--friend-add-current-p state user-id view)
                          (eq (qq-user--friend-add-state-status state)
                              'submitting))
                 (setf (qq-user--friend-add-state-request state) request)))
           (error
            (qq-user--friend-add-fail
-            buffer state user-id nil (error-message-string error-data))))))))
+            view buffer state user-id nil
+            (error-message-string error-data))))
+        (when view (qq-user--sync-now view))))))
 
 (defun qq-user-add-friend ()
   "Advance the exact add-friend flow for the current search result."
   (interactive)
+  (qq-user--ensure-view)
   (when (qq-user--self-p)
     (user-error "qq: cannot add yourself as a friend"))
   (when (qq-user--friend-p)
@@ -668,14 +694,62 @@ Return a closed alist containing `verification_message' and `answers'."
            (insert signature "\n"))
          (insert "\n")
          (qq-user--insert-photo-wall)))
+       (add-text-properties
+        (point-min) (point-max)
+        (list 'qq-user-profile-key (qq-user--profile-key)
+              'rear-nonsticky '(qq-user-profile-key)))
        (goto-char (point-min))))
+   :anchor-property 'qq-user-profile-key
    :preserve-window-start t))
 
-(defun qq-user--request-current-p (buffer user-id owner)
-  "Return non-nil when OWNER still loads USER-ID in BUFFER."
-  (and (buffer-live-p buffer)
+(defun qq-user--view-current-p (view)
+  "Return non-nil when VIEW still owns this user-profile buffer."
+  (and (appkit-view-live-p view)
+       (equal (appkit-view-id view) qq-user--view-id)
+       (with-current-buffer (appkit-view-buffer view)
+         (and (derived-mode-p 'qq-user-mode)
+              (eq view (appkit-current-view))))))
+
+(defun qq-user--live-current-view ()
+  "Return the live user-profile view attached to this buffer, or nil."
+  (let ((view (appkit-current-view)))
+    (and (qq-user--view-current-p view) view)))
+
+(defun qq-user--live-view ()
+  "Return the registered live user-profile view without starting QQ."
+  (when (appkit-app-live-p qq-runtime--app)
+    (when-let* ((view (appkit-view-for-id qq-runtime--app qq-user--view-id)))
+      (and (qq-user--view-current-p view) view))))
+
+(cl-defun qq-user--request-sync (&optional view &key resource)
+  "Request one coalesced profile sync for live VIEW.
+
+RESOURCE identifies a presentation-only media dependency update."
+  (when-let* ((view (or view (qq-user--live-current-view))))
+    (if resource
+        (appkit-request-sync
+         view :entry (qq-user--profile-key) :resource resource)
+      (appkit-request-sync view :structure t :part 'profile))))
+
+(defun qq-user--sync-now (view)
+  "Consume pending invalidations for live user-profile VIEW."
+  (when (qq-user--view-current-p view)
+    (appkit-sync-invalidations view)))
+
+(defun qq-user--sync-invalidations (view invalidations)
+  "Render user profile VIEW from coalesced INVALIDATIONS."
+  (when (and (qq-user--view-current-p view)
+             (appkit-invalidations-any-p invalidations))
+    (appkit-with-content-update view
+      (qq-user-render))))
+
+(defun qq-user--request-current-p (view buffer user-id owner)
+  "Return non-nil when VIEW and OWNER still load USER-ID in BUFFER."
+  (and (qq-user--view-current-p view)
+       (eq (appkit-view-buffer view) buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-user-mode)
+              (eq view (appkit-current-view))
               (equal qq-user--user-id user-id)
               (eq qq-user--request-owner owner)))))
 
@@ -684,53 +758,71 @@ Return a closed alist containing `verification_message' and `answers'."
   (interactive)
   (unless qq-user--user-id
     (user-error "qq: this buffer has no user identity"))
-  (when qq-user--request
-    (qq-api-cancel-request qq-user--request))
-  (let ((buffer (current-buffer))
-        (user-id qq-user--user-id)
-        (owner (list 'user-profile qq-user--user-id)))
-    (setq qq-user--loading t
-          qq-user--error nil
-          qq-user--request nil
-          qq-user--request-owner owner)
-    (qq-user-render)
-    (let ((request
-           (qq-api-get-user
-            user-id
-            (lambda (profile)
-              (when (qq-user--request-current-p buffer user-id owner)
-                (with-current-buffer buffer
-                  (setq qq-user--profile profile
-                        qq-user--loading nil
-                        qq-user--error nil
-                        qq-user--request nil
-                        qq-user--request-owner nil)
-                  (qq-user-render))))
-            (lambda (response reason)
-              (when (qq-user--request-current-p buffer user-id owner)
-                (with-current-buffer buffer
-                  (setq qq-user--loading nil
-                        qq-user--error (format "Unable to load profile: %s"
-                                               (or reason "unknown error"))
-                        qq-user--request nil
-                        qq-user--request-owner nil)
-                  (qq-user-render)))
-              (qq-api--default-error response reason)))))
-      (when (eq qq-user--request-owner owner)
-        (setq qq-user--request request))))
-  (qq-user--refresh-like)
-  (qq-user--refresh-photos))
+  (let ((view (qq-user--ensure-view)))
+    (when qq-user--request
+      (qq-api-cancel-request qq-user--request))
+    (let ((buffer (current-buffer))
+          (user-id qq-user--user-id)
+          (owner (list 'user-profile qq-user--user-id)))
+      (setq qq-user--loading t
+            qq-user--error nil
+            qq-user--request nil
+            qq-user--request-owner owner)
+      (qq-user--request-sync view)
+      (condition-case error-data
+          (let ((request
+                 (qq-api-get-user
+                  user-id
+                  (lambda (profile)
+                    (when (qq-user--request-current-p
+                           view buffer user-id owner)
+                      (with-current-buffer buffer
+                        (setq qq-user--profile profile
+                              qq-user--loading nil
+                              qq-user--error nil
+                              qq-user--request nil
+                              qq-user--request-owner nil)
+                        (qq-user--request-sync view))))
+                  (lambda (response reason)
+                    (when (qq-user--request-current-p
+                           view buffer user-id owner)
+                      (with-current-buffer buffer
+                        (setq qq-user--loading nil
+                              qq-user--error
+                              (format "Unable to load profile: %s"
+                                      (or reason "unknown error"))
+                              qq-user--request nil
+                              qq-user--request-owner nil)
+                        (qq-user--request-sync view)
+                        (qq-api--default-error response reason)))))))
+            (when (eq qq-user--request-owner owner)
+              (setq qq-user--request request)))
+        (error
+         (when (qq-user--request-current-p view buffer user-id owner)
+           (setq qq-user--loading nil
+                 qq-user--error
+                 (format "Unable to load profile: %s"
+                         (error-message-string error-data))
+                 qq-user--request nil
+                 qq-user--request-owner nil)
+           (qq-user--request-sync view)))))
+    (qq-user--refresh-like view)
+    (qq-user--refresh-photos view)
+    (qq-user--sync-now view)))
 
-(defun qq-user--like-request-current-p (buffer user-id owner)
-  "Return non-nil when OWNER still loads likes for USER-ID in BUFFER."
-  (and (buffer-live-p buffer)
+(defun qq-user--like-request-current-p (view buffer user-id owner)
+  "Return non-nil when VIEW and OWNER load likes for USER-ID in BUFFER."
+  (and (qq-user--view-current-p view)
+       (eq (appkit-view-buffer view) buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-user-mode)
+              (eq view (appkit-current-view))
               (equal qq-user--user-id user-id)
               (eq qq-user--like-request-owner owner)))))
 
-(defun qq-user--refresh-like ()
-  "Refresh received profile-like count for the current user."
+(defun qq-user--refresh-like (&optional view)
+  "Refresh received profile-like count using the current user VIEW."
+  (setq view (or view (qq-user--ensure-view)))
   (when qq-user--like-request
     (qq-api-cancel-request qq-user--like-request))
   (let ((buffer (current-buffer))
@@ -741,41 +833,46 @@ Return a closed alist containing `verification_message' and `answers'."
           qq-user--like-error nil
           qq-user--like-request nil
           qq-user--like-request-owner owner)
-    (qq-user-render)
+    (qq-user--request-sync view)
     (let ((request
            (qq-api-get-user-like
             user-id
             (lambda (count)
-              (when (qq-user--like-request-current-p buffer user-id owner)
+              (when (qq-user--like-request-current-p
+                     view buffer user-id owner)
                 (with-current-buffer buffer
                   (setq qq-user--like-count count
                         qq-user--like-loading nil
                         qq-user--like-error nil
                         qq-user--like-request nil
                         qq-user--like-request-owner nil)
-                  (qq-user-render))))
+                  (qq-user--request-sync view))))
             (lambda (_response reason)
-              (when (qq-user--like-request-current-p buffer user-id owner)
+              (when (qq-user--like-request-current-p
+                     view buffer user-id owner)
                 (with-current-buffer buffer
                   (setq qq-user--like-count nil
                         qq-user--like-loading nil
                         qq-user--like-error (or reason "unknown error")
                         qq-user--like-request nil
                         qq-user--like-request-owner nil)
-                  (qq-user-render)))))))
+                  (qq-user--request-sync view)))))))
       (when (eq qq-user--like-request-owner owner)
         (setq qq-user--like-request request)))))
 
-(defun qq-user--photo-request-current-p (buffer user-id owner)
-  "Return non-nil when OWNER still loads photos for USER-ID in BUFFER."
-  (and (buffer-live-p buffer)
+(defun qq-user--photo-request-current-p (view buffer user-id owner)
+  "Return non-nil when VIEW and OWNER load photos for USER-ID in BUFFER."
+  (and (qq-user--view-current-p view)
+       (eq (appkit-view-buffer view) buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-user-mode)
+              (eq view (appkit-current-view))
               (equal qq-user--user-id user-id)
               (eq qq-user--photo-request-owner owner)))))
 
-(defun qq-user--refresh-photos ()
-  "Refresh inline photo-wall entries for the current user."
+(defun qq-user--refresh-photos (&optional view)
+  "Refresh inline photo-wall entries using the current user VIEW."
+  (setq view (or view (qq-user--ensure-view)))
   (when qq-user--photo-request
     (qq-api-cancel-request qq-user--photo-request))
   (let ((buffer (current-buffer))
@@ -786,28 +883,30 @@ Return a closed alist containing `verification_message' and `answers'."
           qq-user--photo-loaded nil
           qq-user--photo-request nil
           qq-user--photo-request-owner owner)
-    (qq-user-render)
+    (qq-user--request-sync view)
     (let ((request
            (qq-api-get-user-photo-wall
             user-id
             (lambda (photos)
-              (when (qq-user--photo-request-current-p buffer user-id owner)
+              (when (qq-user--photo-request-current-p
+                     view buffer user-id owner)
                 (with-current-buffer buffer
                   (setq qq-user--photos photos
                         qq-user--photo-loading nil
                         qq-user--photo-loaded t
                         qq-user--photo-request nil
                         qq-user--photo-request-owner nil)
-                  (qq-user-render))))
+                  (qq-user--request-sync view))))
             (lambda (_response _reason)
-              (when (qq-user--photo-request-current-p buffer user-id owner)
+              (when (qq-user--photo-request-current-p
+                     view buffer user-id owner)
                 (with-current-buffer buffer
                   (setq qq-user--photos nil
                         qq-user--photo-loading nil
                         qq-user--photo-loaded nil
                         qq-user--photo-request nil
                         qq-user--photo-request-owner nil)
-                  (qq-user-render)))))))
+                  (qq-user--request-sync view)))))))
       (when (eq qq-user--photo-request-owner owner)
         (setq qq-user--photo-request request)))))
 
@@ -818,11 +917,13 @@ Return a closed alist containing `verification_message' and `answers'."
     (user-error "qq: this buffer has no user identity"))
   (qq-chat-open (qq-state-session-key 'private qq-user--user-id)))
 
-(defun qq-user--send-like-request-current-p (buffer user-id owner)
-  "Return non-nil when OWNER still likes USER-ID in BUFFER."
-  (and (buffer-live-p buffer)
+(defun qq-user--send-like-request-current-p (view buffer user-id owner)
+  "Return non-nil when VIEW and OWNER still like USER-ID in BUFFER."
+  (and (qq-user--view-current-p view)
+       (eq (appkit-view-buffer view) buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-user-mode)
+              (eq view (appkit-current-view))
               (equal qq-user--user-id user-id)
               (eq qq-user--send-like-request-owner owner)))))
 
@@ -837,43 +938,45 @@ Return a closed alist containing `verification_message' and `answers'."
     (user-error "qq: 今日对该用户的资料点赞已达上限"))
   (when qq-user--send-like-request-owner
     (user-error "qq: profile like is already in progress"))
-  (let ((buffer (current-buffer))
-        (user-id qq-user--user-id)
-        (owner (list 'send-user-like qq-user--user-id)))
-    (setq qq-user--send-like-request nil
-          qq-user--send-like-request-owner owner)
-    (qq-user-render)
-    (let ((request
-           (qq-api-like-user
-            user-id
-            (lambda (result)
-              (when (qq-user--send-like-request-current-p
-                     buffer user-id owner)
-                (with-current-buffer buffer
-                  (setq qq-user--send-like-request nil
-                        qq-user--send-like-request-owner nil)
-                  (pcase (alist-get 'outcome result)
-                    ("liked"
-                     (qq-user--refresh-like)
-                     (qq-user-render)
-                     (message "qq: 已给 %s 的资料新增 1 个赞"
-                              (qq-user--display-name)))
-                    ("daily_limit"
-                     (setq qq-user--like-limit-date
-                           (format-time-string "%Y-%m-%d"))
-                     (qq-user-render)
-                     (message "qq: 今日对 %s 的资料点赞已达上限"
-                              (qq-user--display-name)))))))
-            (lambda (response reason)
-              (when (qq-user--send-like-request-current-p
-                     buffer user-id owner)
-                (with-current-buffer buffer
-                  (setq qq-user--send-like-request nil
-                        qq-user--send-like-request-owner nil)
-                  (qq-user-render)))
-              (qq-api--default-error response reason)))))
-      (when (eq qq-user--send-like-request-owner owner)
-        (setq qq-user--send-like-request request)))))
+  (let ((view (qq-user--ensure-view)))
+    (let ((buffer (current-buffer))
+          (user-id qq-user--user-id)
+          (owner (list 'send-user-like qq-user--user-id)))
+      (setq qq-user--send-like-request nil
+            qq-user--send-like-request-owner owner)
+      (qq-user--request-sync view)
+      (let ((request
+             (qq-api-like-user
+              user-id
+              (lambda (result)
+                (when (qq-user--send-like-request-current-p
+                       view buffer user-id owner)
+                  (with-current-buffer buffer
+                    (setq qq-user--send-like-request nil
+                          qq-user--send-like-request-owner nil)
+                    (pcase (alist-get 'outcome result)
+                      ("liked"
+                       (qq-user--refresh-like)
+                       (qq-user--request-sync view)
+                       (message "qq: 已给 %s 的资料新增 1 个赞"
+                                (qq-user--display-name)))
+                      ("daily_limit"
+                       (setq qq-user--like-limit-date
+                             (format-time-string "%Y-%m-%d"))
+                       (qq-user--request-sync view)
+                       (message "qq: 今日对 %s 的资料点赞已达上限"
+                                (qq-user--display-name)))))))
+              (lambda (response reason)
+                (when (qq-user--send-like-request-current-p
+                       view buffer user-id owner)
+                  (with-current-buffer buffer
+                    (setq qq-user--send-like-request nil
+                          qq-user--send-like-request-owner nil)
+                    (qq-user--request-sync view)
+                    (qq-api--default-error response reason)))))))
+        (when (eq qq-user--send-like-request-owner owner)
+          (setq qq-user--send-like-request request))))
+    (qq-user--sync-now view)))
 
 (defun qq-user-open-avatar ()
   "Open the current profile user's avatar."
@@ -907,7 +1010,7 @@ Return a closed alist containing `verification_message' and `answers'."
     (qq-user-photo-open-entry qq-user--user-id photo)))
 
 (defun qq-user--cancel-request ()
-  "Cancel the current user profile request when present."
+  "Cancel asynchronous work owned by the current user view."
   (when qq-user--request
     (qq-api-cancel-request qq-user--request))
   (when qq-user--like-request
@@ -927,23 +1030,91 @@ Return a closed alist containing `verification_message' and `answers'."
         qq-user--send-like-request-owner nil
         qq-user--photo-request nil
         qq-user--photo-request-owner nil
+        qq-user--loading nil
+        qq-user--like-loading nil
+        qq-user--photo-loading nil
         qq-user--search-result nil
         qq-user--friend-add-state nil))
+
+(defun qq-user--clear-view-data ()
+  "Clear account-scoped data projected by the current user view."
+  (setq qq-user--profile nil
+        qq-user--error nil
+        qq-user--like-count nil
+        qq-user--like-error nil
+        qq-user--like-limit-date nil
+        qq-user--photos nil
+        qq-user--photo-loaded nil
+        qq-user--search-result nil
+        qq-user--friend-add-state nil))
+
+(defun qq-user--reset-buffer-work (buffer)
+  "Reset requests, data, and media hook state retained by BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (derived-mode-p 'qq-user-mode)
+        (when qq-user--media-hook-function
+          (remove-hook 'qq-media-cache-update-hook
+                       qq-user--media-hook-function))
+        (setq qq-user--media-hook-function nil)
+        (qq-user--cancel-request)
+        (qq-user--clear-view-data)))))
+
+(defun qq-user--release-view-work (view buffer)
+  "Release BUFFER work when it is still owned by user-profile VIEW."
+  (when (and (buffer-live-p buffer)
+             (with-current-buffer buffer
+               (eq view (appkit-current-view))))
+    (qq-user--reset-buffer-work buffer)))
+
+(defun qq-user--setup-view (view)
+  "Reset replacement state and register lifecycle work for user VIEW."
+  (let ((buffer (appkit-view-buffer view)))
+    (qq-user--reset-buffer-work buffer)
+    (appkit-register-handle
+     view 'function
+     (apply-partially #'qq-user--release-view-work view buffer))
+    (let ((hook (apply-partially
+                 #'qq-user--handle-media-cache-update view)))
+      (with-current-buffer buffer
+        (setq qq-user--media-hook-function hook))
+      (appkit-register-handle
+       view 'hook
+       (list 'qq-media-cache-update-hook hook nil buffer))
+      (add-hook 'qq-media-cache-update-hook hook))))
+
+(defun qq-user--ensure-view ()
+  "Return the live Appkit view owning the current user buffer."
+  (unless qq-user--user-id
+    (error "QQ: cannot attach a user view without an opaque user identity"))
+  (let* ((app (qq-runtime-app))
+         (current (appkit-current-view)))
+    (cond
+     ((and (appkit-view-live-p current)
+           (eq app (appkit-view-app current))
+           (equal qq-user--view-id (appkit-view-id current)))
+      (setf (appkit-view-sync-function current)
+            #'qq-user--sync-invalidations
+            (appkit-view-parts current) '(profile))
+      current)
+     ((appkit-view-live-p current)
+      (error "QQ: user buffer belongs to another Appkit view"))
+     (t
+      (let ((view
+             (appkit-attach-view
+              :app app
+              :id qq-user--view-id
+              :mode 'qq-user-mode
+              :sync-function #'qq-user--sync-invalidations
+              :parts '(profile))))
+        (qq-user--setup-view view)
+        view)))))
 
 (defun qq-user--select-user (user-id)
   "Prepare the shared user buffer to display USER-ID."
   (unless (equal qq-user--user-id user-id)
     (qq-user--cancel-request)
-    (setq qq-user--profile nil
-          qq-user--loading nil
-          qq-user--error nil
-          qq-user--like-count nil
-          qq-user--like-loading nil
-          qq-user--like-error nil
-          qq-user--like-limit-date nil
-          qq-user--photos nil
-          qq-user--photo-loading nil
-          qq-user--photo-loaded nil))
+    (qq-user--clear-view-data))
   (setq qq-user--user-id user-id))
 
 (defun qq-user-button-backward ()
@@ -971,6 +1142,8 @@ Return a closed alist containing `verification_message' and `answers'."
   "Major mode for one native QQ user profile."
   (setq-local truncate-lines nil)
   (setq-local switch-to-buffer-preserve-window-point nil)
+  (setq-local header-line-format '(:eval (qq-user--header-line)))
+  (add-hook 'change-major-mode-hook #'qq-user--cancel-request nil t)
   (add-hook 'kill-buffer-hook #'qq-user--cancel-request nil t))
 
 ;;;###autoload
@@ -979,15 +1152,24 @@ Return a closed alist containing `verification_message' and `answers'."
   (interactive "sQQ number: ")
   (unless (qq-api-user-id-p user-id)
     (user-error "qq: user profile requires a decimal string user id"))
-  (let ((buffer (get-buffer-create (qq-user--buffer-name user-id))))
+  (let* ((app (qq-runtime-app))
+         (view
+          (appkit-open-view
+           :app app
+           :id qq-user--view-id
+           :mode 'qq-user-mode
+           :buffer-name (qq-user--buffer-name user-id)
+           :sync-function #'qq-user--sync-invalidations
+           :parts '(profile)
+           :setup #'qq-user--setup-view))
+         (buffer (appkit-view-buffer view)))
     (with-current-buffer buffer
-      (unless (derived-mode-p 'qq-user-mode)
-        (qq-user-mode))
       (qq-user--select-user user-id)
-      (qq-user-render)
       (when (and (null qq-user--profile)
                  (not qq-user--loading))
-        (qq-user-refresh)))
+        (qq-user-refresh))
+      (qq-user--request-sync view)
+      (qq-user--sync-now view))
     (pop-to-buffer buffer)
     buffer))
 
@@ -1021,10 +1203,18 @@ Return a closed alist containing `verification_message' and `answers'."
     (error "qq: invalid global-user search result"))
   (let* ((copy (copy-tree result))
          (user-id (alist-get 'user_id copy))
-         (buffer (get-buffer-create (qq-user--buffer-name user-id))))
+         (app (qq-runtime-app))
+         (view
+          (appkit-open-view
+           :app app
+           :id qq-user--view-id
+           :mode 'qq-user-mode
+           :buffer-name (qq-user--buffer-name user-id)
+           :sync-function #'qq-user--sync-invalidations
+           :parts '(profile)
+           :setup #'qq-user--setup-view))
+         (buffer (appkit-view-buffer view)))
     (with-current-buffer buffer
-      (unless (derived-mode-p 'qq-user-mode)
-        (qq-user-mode))
       (qq-user--select-user user-id)
       (when-let* ((old qq-user--friend-add-state)
                   (request (qq-user--friend-add-state-request old)))
@@ -1035,26 +1225,23 @@ Return a closed alist containing `verification_message' and `answers'."
              :user-id user-id
              :candidate (alist-get 'candidate copy)
              :status 'candidate))
-      (qq-user-render)
       (when (and (null qq-user--profile)
                  (not qq-user--loading))
-        (qq-user-refresh)))
+        (qq-user-refresh))
+      (qq-user--request-sync view)
+      (qq-user--sync-now view))
     (pop-to-buffer buffer)
     buffer))
 
-(defun qq-user--handle-media-cache-update (media-key)
-  "Rerender matching user buffers after MEDIA-KEY changes."
-  (when (stringp media-key)
-    (when-let* ((buffer (get-buffer (qq-user--buffer-name nil))))
-      (with-current-buffer buffer
-        (when (and (derived-mode-p 'qq-user-mode)
-                   (or (equal media-key (format "avatar:%s" qq-user--user-id))
-                       (string-prefix-p
-                        (format "photo-wall:%s:" qq-user--user-id)
-                        media-key)))
-          (qq-user-render))))))
-
-(add-hook 'qq-media-cache-update-hook #'qq-user--handle-media-cache-update)
+(defun qq-user--handle-media-cache-update (view media-key)
+  "Request a targeted VIEW update after MEDIA-KEY changes."
+  (when (and (stringp media-key) (qq-user--view-current-p view))
+    (with-current-buffer (appkit-view-buffer view)
+      (when (or (equal media-key (format "avatar:%s" qq-user--user-id))
+                (string-prefix-p
+                 (format "photo-wall:%s:" qq-user--user-id)
+                 media-key))
+        (qq-user--request-sync view :resource media-key)))))
 
 (provide 'qq-user)
 

@@ -69,7 +69,7 @@
 
 (defun qq-group-notices--notice-key (notice)
   "Return the stable presentation key for NOTICE."
-  (cons 'notice (alist-get 'notice_id notice)))
+  (list 'notice qq-group-notices--group-id (alist-get 'notice_id notice)))
 
 (defun qq-group-notices--note-entry (key text &optional type)
   "Return a status entry identified by KEY with TEXT and optional TYPE."
@@ -216,18 +216,39 @@
          (equal (appkit-view-id view) qq-group-notices--view-id)
          view)))
 
-(defun qq-group-notices--cancel-buffer-work (buffer)
-  "Cancel announcement work still owned by BUFFER."
+(defun qq-group-notices--release-buffer-work (view buffer)
+  "Release requests and account-scoped announcements owned by VIEW and BUFFER.
+
+The detached buffer retains its Appkit fingerprint and therefore cannot be
+attached to a different account runtime.  Clear both the model and generated
+presentation so that keeping the old buffer alive cannot expose content from
+the stopped account."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (derived-mode-p 'qq-group-notices-mode)
-        (qq-group-notices--cancel-request)))))
+        (unwind-protect
+            (qq-group-notices--cancel-request)
+          (unless (appkit-app-live-p (appkit-view-app view))
+            (setq qq-group-notices--group-id nil
+                  qq-group-notices--group-name nil))
+          (setq qq-group-notices--items nil
+                qq-group-notices--loading nil
+                qq-group-notices--error nil
+                qq-group-notices--request nil
+                qq-group-notices--request-owner nil
+                qq-group-notices--ewoc nil
+                qq-group-notices--node-table nil)
+          (let ((inhibit-read-only t))
+            (widen)
+            (erase-buffer)
+            (set-buffer-modified-p nil)))))))
 
 (defun qq-group-notices--setup-view (view)
   "Register lifecycle cleanup for newly attached VIEW."
   (appkit-register-handle
    view 'function
-   (apply-partially #'qq-group-notices--cancel-buffer-work
+   (apply-partially #'qq-group-notices--release-buffer-work
+                    view
                     (appkit-view-buffer view))))
 
 (defun qq-group-notices--ensure-view ()
@@ -342,8 +363,8 @@
                                       (or reason "未知错误"))
                               qq-group-notices--request nil
                               qq-group-notices--request-owner nil)
-			(qq-group-notices--request-sync view)))
-                    (qq-api--default-error response reason)))))
+			(qq-group-notices--request-sync view))
+                      (qq-api--default-error response reason))))))
             (when (eq qq-group-notices--request-owner owner)
               (setq qq-group-notices--request request)))
 	(error
@@ -367,7 +388,11 @@
   (when qq-group-notices--request
     (qq-api-cancel-request qq-group-notices--request))
   (setq qq-group-notices--request nil
-        qq-group-notices--request-owner nil))
+        qq-group-notices--request-owner nil
+        ;; A buffer may outlive its Appkit view.  Clearing the passive loading
+        ;; state lets a replacement view issue its own request instead of
+        ;; inheriting a request that no longer has a live owner.
+        qq-group-notices--loading nil))
 
 (defun qq-group-notices-button-backward ()
   "Move point to the previous announcement button."
