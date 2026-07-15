@@ -16,12 +16,16 @@
 (require 'ewoc)
 (require 'seq)
 (require 'subr-x)
+(require 'appkit-core)
 (require 'appkit-ewoc)
+(require 'appkit-invalidation)
 (require 'appkit-position)
+(require 'appkit-transaction)
 (require 'appkit-ui)
 (require 'appkit-view)
 (require 'qq-api)
 (require 'qq-media)
+(require 'qq-runtime)
 (require 'qq-state)
 
 (autoload 'qq-chat-open "qq-chat" nil t)
@@ -127,6 +131,9 @@
 (defvar-local qq-contacts--search-group-request nil)
 (defvar-local qq-contacts--search-stranger-request nil)
 (defvar-local qq-contacts--search-member-request nil)
+
+(defconst qq-contacts--view-id 'contacts
+  "Appkit identity of the singleton contacts directory view.")
 
 (defun qq-contacts--present-string (value)
   "Return non-empty string VALUE, or nil."
@@ -828,8 +835,7 @@
               (dolist (key keys)
                 (appkit-ewoc-invalidate-key
                  qq-contacts--ewoc qq-contacts--node-table key))))
-          (setq succeeded t)
-          (force-window-update (current-buffer)))
+          (setq succeeded t))
       (when snapshot
         (ignore-errors (appkit-position-restore snapshot)))
       (unless succeeded
@@ -863,7 +869,6 @@
                        :force-keys forced))))
             (setq qq-contacts--dirty nil)
             (qq-contacts--refresh-header-line)
-            (force-window-update (current-buffer))
             (dolist (window (get-buffer-window-list (current-buffer) nil t))
               (qq-contacts--ensure-window-avatars window))
             (setq succeeded t))
@@ -881,9 +886,18 @@
   "Return non-nil when the directory has a live display window."
   (window-live-p (get-buffer-window (current-buffer) t)))
 
+(defun qq-contacts--live-current-view ()
+  "Return this buffer's live contacts view without creating one."
+  (let ((view (appkit-current-view)))
+    (and (derived-mode-p 'qq-contacts-mode)
+         (appkit-view-live-p view)
+         (equal qq-contacts--view-id (appkit-view-id view))
+         view)))
+
 (defun qq-contacts--ensure-window-avatars (window)
   "Start avatar work only for directory rows visible in WINDOW."
-  (when (and (window-live-p window)
+  (when (and (qq-contacts--live-current-view)
+             (window-live-p window)
              (eq (window-buffer window) (current-buffer)))
     (let ((position (window-start window))
           (limit (or (window-end window t) (point-max)))
@@ -921,35 +935,99 @@
              (eq (window-buffer window) (current-buffer)))
     (qq-contacts--ensure-window-avatars window)))
 
+(defun qq-contacts--ensure-view ()
+  "Return the live Appkit view owning the current contacts buffer."
+  (let* ((app (qq-runtime-app))
+         (current (appkit-current-view)))
+    (cond
+     ((and (appkit-view-live-p current)
+           (eq app (appkit-view-app current))
+           (equal qq-contacts--view-id (appkit-view-id current)))
+      (setf (appkit-view-sync-function current)
+            #'qq-contacts--sync-invalidations
+            (appkit-view-parts current) '(directory))
+     current)
+     ((appkit-view-live-p current)
+      (error "QQ: contacts buffer belongs to a different Appkit view"))
+     (t
+      (let ((view
+             (appkit-attach-view
+              :app app
+              :id qq-contacts--view-id
+              :mode 'qq-contacts-mode
+              :sync-function #'qq-contacts--sync-invalidations
+              :parts '(directory))))
+        (qq-contacts--setup-view view)
+        view)))))
+
+(defun qq-contacts--cancel-buffer-work (buffer)
+  "Cancel asynchronous contacts work still owned by BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (derived-mode-p 'qq-contacts-mode)
+        (qq-contacts--cancel-refresh)
+        (qq-contacts--cancel-search)))))
+
+(defun qq-contacts--setup-view (view)
+  "Register lifecycle cleanup for newly attached contacts VIEW."
+  (appkit-register-handle
+   view 'function
+   (apply-partially #'qq-contacts--cancel-buffer-work
+                    (appkit-view-buffer view))))
+
+(defun qq-contacts--queue-view-sync (view &optional force-keys)
+  "Queue one coalesced directory sync for live VIEW.
+
+FORCE-KEYS identifies existing rows whose presentation resources changed."
+  (when (appkit-view-live-p view)
+    (if force-keys
+        (appkit-invalidate view :entries force-keys)
+      (appkit-invalidate view :structure t :part 'directory))
+    (appkit-schedule-sync view)))
+
 (defun qq-contacts--request-reconcile (&optional force-keys)
-  "Reconcile visible directory or mark it dirty, forcing FORCE-KEYS."
-  (if (qq-contacts--displayed-p)
-      (let ((width (qq-contacts--usable-width)))
-        (if (and force-keys
-                 (not qq-contacts--dirty)
-                 (not qq-contacts--rendering)
-                 (= width (or qq-contacts--fill-column 0)))
-            (qq-contacts--invalidate-keys force-keys)
-          (qq-contacts--reconcile force-keys)))
-    (qq-contacts--queue-force-keys force-keys)
-    (setq qq-contacts--dirty t)))
+  "Request a coalesced directory sync, forcing FORCE-KEYS when non-nil."
+  (qq-contacts--queue-view-sync (qq-contacts--ensure-view) force-keys))
+
+(defun qq-contacts--sync-invalidations (view invalidations)
+  "Consume coalesced Appkit INVALIDATIONS for contacts VIEW."
+  (when (appkit-view-live-p view)
+    (let ((force-keys (appkit-invalidations-entry-keys invalidations))
+          (full-p (or (appkit-invalidations-structure-p invalidations)
+                      (appkit-invalidations-parts invalidations)
+                      (appkit-invalidations-position-p invalidations))))
+      (when (or full-p force-keys)
+        (if (qq-contacts--displayed-p)
+            (appkit-with-content-update view
+              (let ((width (qq-contacts--usable-width)))
+                (if (and (not full-p)
+                         force-keys
+                         (not qq-contacts--dirty)
+                         (not qq-contacts--rendering)
+                         (= width (or qq-contacts--fill-column 0)))
+                    (qq-contacts--invalidate-keys force-keys)
+                  (qq-contacts--reconcile force-keys))))
+          (qq-contacts--queue-force-keys force-keys)
+          (setq qq-contacts--dirty t))))))
 
 (defun qq-contacts--window-buffer-change (window)
   "Flush deferred updates when WINDOW displays the directory."
-  (when (and (window-live-p window)
-             (eq (window-buffer window) (current-buffer)))
-    (let ((width (qq-contacts--usable-width)))
-      (when (or qq-contacts--dirty
-                qq-contacts--pending-force-keys
-                (/= width (or qq-contacts--fill-column 0)))
-        (qq-contacts--reconcile)))))
+  (when-let* ((view (qq-contacts--live-current-view)))
+    (when (and (window-live-p window)
+               (eq (window-buffer window) (current-buffer)))
+      (let ((width (qq-contacts--usable-width)))
+        (when (or qq-contacts--dirty
+                  qq-contacts--pending-force-keys
+                  (/= width (or qq-contacts--fill-column 0)))
+          (qq-contacts--queue-view-sync view))))))
 
 (defun qq-contacts--window-size-change (&optional _frame)
   "Reflow this directory after a visible window size change."
-  (when (qq-contacts--displayed-p)
-    (let ((width (qq-contacts--usable-width)))
-      (when (/= width (or qq-contacts--fill-column 0))
-        (qq-contacts--reconcile)))))
+  (when-let* ((view (qq-contacts--live-current-view)))
+    (when (qq-contacts--displayed-p)
+      (let ((width (qq-contacts--usable-width)))
+        (when (/= width (or qq-contacts--fill-column 0))
+          (qq-contacts--queue-view-sync view))))))
 
 (defun qq-contacts--set-view (view)
   "Select directory VIEW and reconcile."
@@ -1012,6 +1090,7 @@
   (and (buffer-live-p buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-contacts-mode)
+              (appkit-view-live-p (appkit-current-view))
               (eq owner qq-contacts--search-owner)
               (memq kind qq-contacts--search-pending)))))
 
@@ -1232,6 +1311,7 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
     ;; current search.  The API repeats this check at the transport boundary.
     (when (and (not (string-empty-p query)) (memq 'strangers kinds))
       (qq-api--stranger-search-owner-params query 50))
+    (qq-contacts--ensure-view)
     (if (string-empty-p query)
         (when (memq qq-contacts--view '(search members))
           (qq-contacts-clear-search))
@@ -1251,6 +1331,7 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
 
 (defun qq-contacts--load-more (kind)
   "Load the next exact native search page for KIND."
+  (qq-contacts--ensure-view)
   (unless (and (memq qq-contacts--view '(search members))
                qq-contacts--search-owner)
     (user-error "qq: there is no active directory search"))
@@ -1310,6 +1391,7 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
     (with-current-buffer buffer
       (unless (derived-mode-p 'qq-contacts-mode)
         (qq-contacts-mode))
+      (qq-contacts--ensure-view)
       (unless (memq qq-contacts--view '(search members))
         (setq qq-contacts--previous-view qq-contacts--view))
       (qq-contacts--cancel-search)
@@ -1354,7 +1436,7 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
   (if (gethash category-id qq-contacts--collapsed-categories)
       (remhash category-id qq-contacts--collapsed-categories)
     (puthash category-id t qq-contacts--collapsed-categories))
-  (qq-contacts--reconcile))
+  (qq-contacts--request-reconcile))
 
 (defun qq-contacts--activate-entry (entry)
   "Activate exact directory ENTRY stored by an action row."
@@ -1512,6 +1594,7 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
   (and (buffer-live-p buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-contacts-mode)
+              (appkit-view-live-p (appkit-current-view))
               (eq owner qq-contacts--refresh-owner)))))
 
 (defun qq-contacts--refresh-part-current-p (buffer owner kind)
@@ -1544,6 +1627,7 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
 (defun qq-contacts-refresh ()
   "Refresh exact friend categories and joined groups from Linux QQ."
   (interactive)
+  (qq-contacts--ensure-view)
   (qq-contacts--cancel-refresh)
   (let ((buffer (current-buffer))
         (owner (list 'contacts-refresh (float-time))))
@@ -1583,13 +1667,15 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
         buffer owner 'groups (error-message-string error-data))))))
 
 (defun qq-contacts--handle-state-change (event)
-  "Refresh the open directory after relevant state EVENT."
+  "Invalidate the open directory after relevant state EVENT."
   (when (memq (plist-get event :type)
               '(reset friends-refreshed groups-refreshed sessions-refreshed))
     (when-let* ((buffer (get-buffer qq-contacts-buffer-name)))
       (with-current-buffer buffer
-        (when (derived-mode-p 'qq-contacts-mode)
-          (qq-contacts--request-reconcile))))))
+        (let ((view (appkit-current-view)))
+          (when (and (derived-mode-p 'qq-contacts-mode)
+                     (appkit-view-live-p view))
+            (qq-contacts--queue-view-sync view)))))))
 
 (defun qq-contacts--handle-media-cache-update (media-key)
   "Invalidate the directory row identified by avatar MEDIA-KEY."
@@ -1606,8 +1692,10 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
         (let ((buffer (get-buffer qq-contacts-buffer-name)))
           (when (buffer-live-p buffer)
             (with-current-buffer buffer
-              (when (derived-mode-p 'qq-contacts-mode)
-                (qq-contacts--request-reconcile keys)))))))))
+              (let ((view (appkit-current-view)))
+                (when (and (derived-mode-p 'qq-contacts-mode)
+                           (appkit-view-live-p view))
+                  (qq-contacts--queue-view-sync view keys))))))))))
 
 (defvar qq-contacts-mode-map
   (let ((map (make-sparse-keymap)))
@@ -1699,13 +1787,24 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
 (defun qq-contacts-open ()
   "Open the persistent native QQ contacts directory."
   (interactive)
-  (let ((buffer (get-buffer-create qq-contacts-buffer-name)))
+  (let* ((app (qq-runtime-app))
+         (fresh-p (null (appkit-view-for-id app qq-contacts--view-id)))
+         (view
+          (appkit-open-view
+           :app app
+           :id qq-contacts--view-id
+           :mode 'qq-contacts-mode
+           :buffer-name qq-contacts-buffer-name
+           :sync-function #'qq-contacts--sync-invalidations
+           :parts '(directory)
+           :setup #'qq-contacts--setup-view
+           :select t))
+         (buffer (appkit-view-buffer view)))
     (with-current-buffer buffer
-      (unless (derived-mode-p 'qq-contacts-mode)
-        (qq-contacts-mode)))
-    (pop-to-buffer buffer)
-    (with-current-buffer buffer
-      (qq-contacts--reconcile)
+      (appkit-invalidate view :structure t :part 'directory)
+      (if fresh-p
+          (appkit-sync-invalidations view)
+        (appkit-schedule-sync view))
       (when (and (not qq-contacts--loading)
                  (or (not (qq-state-friend-categories-loaded-p))
                      (not (qq-state-groups-loaded-p)))

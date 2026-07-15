@@ -55,6 +55,31 @@
     (chat . ,chat)
     (read_state . ,(qq-api-test--read-state))))
 
+(defun qq-api-test--guild-message-event ()
+  "Return one strict synthetic QQ channel message event."
+  (copy-tree
+   '((post_type . "emacs_guild_message")
+    (chat . ((kind . "guild-channel")
+             (guild_id . "9007199254740993")
+             (channel_id . "9007199254741999")))
+    (message_id . "9007199254742999")
+    (message_sequence . "17")
+    (sent_at . 1784000000)
+    (channel_name . "Synthetic channel")
+    (sender . ((native_id . "u_synthetic_sender")
+               (user_id . nil)
+               (nickname . "Synthetic member")
+               (member_name . "")
+               (display_name . "Synthetic member")))
+    (outgoing . :false)
+    (state . "live")
+     (segments . (((kind . "text")
+                   (payload . ((text . "hello")))))))))
+
+(defun qq-api-test--guild-message-record ()
+  "Return the action-response form of the synthetic Guild message."
+  (assq-delete-all 'post_type (qq-api-test--guild-message-event)))
+
 (defun qq-api-test--mark-read-response (scope message-id unread-count)
   "Return a strict mark-read response for SCOPE and MESSAGE-ID.
 
@@ -428,6 +453,8 @@ The authoritative post-state reports UNREAD-COUNT."
   (let (success-fn events promotion-args)
     (cl-letf (((symbol-function 'qq-state-insert-pending-message)
                (lambda (&rest _args) '((local-id . "local-1"))))
+              ((symbol-function 'qq-state-session-sendable-p)
+               (lambda (_session-key) t))
               ((symbol-function 'qq-api-call)
                (lambda (_action _params callback &optional _errback)
                  (setq success-fn callback)))
@@ -542,6 +569,126 @@ The authoritative post-state reports UNREAD-COUNT."
       (should (equal (alist-get 'chat_type captured-params) "134"))
       (should (equal (alist-get 'peer_uid captured-params) "dev:a"))
       (should-not (alist-get 'user_id captured-params)))))
+
+(ert-deftest qq-api-send-message-uses-closed-guild-action-and-locator ()
+  (let (captured-action captured-params)
+    (cl-letf (((symbol-function 'qq-state-insert-pending-message)
+               (lambda (&rest _args) '((local-id . "local-1"))))
+              ((symbol-function 'qq-state-session-sendable-p)
+               (lambda (_session-key) t))
+              ((symbol-function 'qq-api-call)
+               (lambda (action params _callback &optional _errback)
+                 (setq captured-action action
+                       captured-params params))))
+      (qq-api-send-message
+       "guild:9007199254740993:channel:9007199254741999"
+       '(((type . "text") (data . ((text . "hello channel")))))
+       "hello channel")
+      (should (equal captured-action "emacs_send_guild_message"))
+      (should (equal (alist-get 'chat captured-params)
+                     '((kind . "guild-channel")
+                       (guild_id . "9007199254740993")
+                       (channel_id . "9007199254741999"))))
+      (should (equal (alist-get 'message captured-params)
+                     '(((type . "text")
+                        (data . ((text . "hello channel")))))))
+      (should-not (assq 'chat_type captured-params)))))
+
+(ert-deftest qq-api-guild-message-event-validates-and-dispatches-closed-shape ()
+  (let (delivered)
+    (cl-letf (((symbol-function 'qq-state-merge-guild-message)
+               (lambda (event) (setq delivered event))))
+      (let ((source (qq-api-test--guild-message-event)))
+        (qq-api-handle-event source)
+        (should (equal delivered source))
+        (setf (alist-get 'message_sequence source) 17)
+        (should-error (qq-api-handle-event source))))))
+
+(ert-deftest qq-api-guild-message-event-rejects-lossy-or-open-identities ()
+  (dolist (mutator
+           (list
+            (lambda (event)
+              (setf (alist-get 'guild_id (alist-get 'chat event))
+                    9007199254740992))
+            (lambda (event)
+              (setf (alist-get 'user_id (alist-get 'sender event)) "0"))
+            (lambda (event)
+              (nconc event '((extra . t))))))
+    (let ((event (qq-api-test--guild-message-event)))
+      (funcall mutator event)
+      (should-error (qq-api--validate-guild-message-event event)))))
+
+(ert-deftest qq-api-fetch-guild-navigation-applies-exact-channel-state ()
+  (let (captured-action captured-params applied delivered)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (action params callback &optional _errback)
+                 (setq captured-action action
+                       captured-params params)
+                 (funcall callback
+                          `((data
+                             . ((chat . ,(alist-get 'chat params))
+                                (unread_count . 6)
+                                (begin_sequence . "18")
+                                (navigation_sequences
+                                 . (((sequence . "19")
+                                     (native_kind . 7))))))))))
+              ((symbol-function 'qq-state-apply-guild-navigation)
+               (lambda (navigation) (setq applied navigation))))
+      (qq-api-fetch-guild-navigation
+       "guild:9007199254740993:channel:9007199254741999"
+       (lambda (navigation) (setq delivered navigation)))
+      (should (equal captured-action "emacs_get_guild_navigation"))
+      (should (equal (alist-get 'chat captured-params)
+                     '((kind . "guild-channel")
+                       (guild_id . "9007199254740993")
+                       (channel_id . "9007199254741999"))))
+      (should (equal applied delivered))
+      (should (= (alist-get 'unread_count delivered) 6)))))
+
+(ert-deftest qq-api-mark-guild-read-requires-authoritative-zero-or-nonzero-result ()
+  (let (captured-action applied)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (action params callback &optional _errback)
+                 (setq captured-action action)
+                 (funcall callback
+                          `((data
+                             . ((chat . ,(alist-get 'chat params))
+                                (unread_count . 0)
+                                (begin_sequence . "0")
+                                (navigation_sequences)))))))
+              ((symbol-function 'qq-state-apply-guild-navigation)
+               (lambda (navigation) (setq applied navigation))))
+      (qq-api-mark-guild-read
+       "guild:9007199254740993:channel:9007199254741999")
+      (should (equal captured-action "emacs_mark_guild_read"))
+      (should (= (alist-get 'unread_count applied) 0)))))
+
+(ert-deftest qq-api-fetch-guild-message-range-merges-only-matching-events ()
+  (let ((expected (qq-api-test--guild-message-record))
+        captured-action captured-params merged delivered)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (action params callback &optional _errback)
+                 (setq captured-action action
+                       captured-params params)
+                 (funcall callback
+                          `((data
+                             . ((messages
+                                 . (,expected))))))))
+              ((symbol-function 'qq-state-merge-guild-message)
+               (lambda (event) (push event merged)))
+              ((symbol-function 'qq-state-session)
+               (lambda (_session-key) '((channel-kind . "text")))))
+      (qq-api-fetch-guild-message-range
+       "guild:9007199254740993:channel:9007199254741999"
+       "10" "20" (lambda (messages) (setq delivered messages)))
+      (should (equal captured-action "emacs_get_guild_messages_by_range"))
+      (should (equal (alist-get 'channel_kind captured-params) "text"))
+      (should (equal (alist-get 'start_sequence captured-params) "10"))
+      (should (equal (alist-get 'end_sequence captured-params) "20"))
+      (should (= (length merged) 1))
+      (should (equal delivered (list expected)))
+      (should (equal (alist-get 'post_type (car merged))
+                     "emacs_guild_message")))))
 
 (ert-deftest qq-api-send-message-rejects-read-only-service-session ()
   (let (pending-called api-called)
@@ -794,6 +941,10 @@ The authoritative post-state reports UNREAD-COUNT."
       (case
        '((((kind . "group") (group_id . "20001")) . "group:20001")
          (((kind . "private") (user_id . "10001")) . "private:10001")
+         (((kind . "guild-channel")
+           (guild_id . "9007199254740993")
+           (channel_id . "9007199254741999"))
+          . "guild:9007199254740993:channel:9007199254741999")
          (((kind . "dataline")
            (peer_uid . "dev:a") (variant . "desktop"))
           . "dataline:desktop:dev:a")
@@ -2308,6 +2459,119 @@ The authoritative post-state reports UNREAD-COUNT."
       (should-not callback-called)
       (should (string-match-p "self_permission" reason)))))
 
+(ert-deftest qq-api-refresh-guild-directory-validates-and-applies-exact-identities ()
+  (let ((qq-state-change-hook nil)
+        action params callback-value)
+    (qq-state-reset)
+    (unwind-protect
+        (cl-letf (((symbol-function 'qq-api-call)
+                   (lambda (candidate-action candidate-params callback
+                            &optional _errback)
+                     (setq action candidate-action
+                           params candidate-params)
+                     (funcall
+                      callback
+                      '((data
+                         . ((guilds
+                             . (((guild_id . "9007199254740993")
+                                 (name . "Synthetic guild")
+                                 (avatar_seq . "3")
+                                 (pinned_at))))
+                            (channels
+                             . (((guild_id . "9007199254740993")
+                                 (channel_id . "9007199254741999")
+                                 (guild_name . "Synthetic guild")
+                                 (name . "General")
+                                 (kind . "text")
+                                 (avatar_seq . "4")
+                                 (pinned_at . "1784000000")
+                                 (latest_sequence . "23"))))))))
+                     'guild-request)))
+          (should
+           (eq (qq-api-refresh-guild-directory
+                (lambda (directory) (setq callback-value directory)))
+               'guild-request))
+          (should (equal action "emacs_get_guild_directory"))
+          (should-not params)
+          (should (equal callback-value (qq-state-guild-directory)))
+          (should
+           (equal (alist-get 'name
+                             (qq-state-guild-channel
+                              "9007199254740993" "9007199254741999"))
+                  "General")))
+      (qq-state-reset))))
+
+(ert-deftest qq-api-get-guild-member-profile-preserves-native-identities ()
+  (let (action params delivered)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (candidate-action candidate-params callback
+                        &optional _errback)
+                 (setq action candidate-action
+                       params candidate-params)
+                 (funcall callback
+                          '((data
+                             . ((guild_id . "9007199254740993")
+                                (native_id . "144115219000000001")
+                                (display_name . "Synthetic member")
+                                (nickname . "Synthetic nickname")
+                                (member_name . "Synthetic member")
+                                (avatar_url
+                                 . "https://example.invalid/avatar.jpg"))))))))
+      (qq-api-get-guild-member-profile
+       "9007199254740993"
+       "144115219000000001"
+       (lambda (profile) (setq delivered profile)))
+      (should (equal action "emacs_get_guild_member_profile"))
+      (should (equal params
+                     '((guild_id . "9007199254740993")
+                       (native_id . "144115219000000001"))))
+      (should (equal (alist-get 'avatar_url delivered)
+                     "https://example.invalid/avatar.jpg")))))
+
+(ert-deftest qq-api-guild-gray-tip-segment-is-closed-and-semantic ()
+  (let* ((event (qq-api-test--guild-message-event))
+         (segments
+          '(((kind . "gray-tip")
+             (payload . ((gray_tip_kind . "revoke")
+                         (text . "Synthetic member 撤回了一条消息")
+                         (native_id . "144115219000000001")))))))
+    (setf (alist-get 'segments event) segments)
+    (should (equal (alist-get 'segments
+                              (qq-api--validate-guild-message-event event))
+                   segments))
+    (setf (alist-get 'gray_tip_kind
+                     (alist-get 'payload (car (alist-get 'segments event))))
+          "unknown")
+    (should-error (qq-api--validate-guild-message-event event))))
+
+(ert-deftest qq-api-guild-directory-rejects-lossy-and-extra-fields ()
+  (dolist
+      (data
+       '(((guilds . (((guild_id . 9007199254740992)
+                      (name . "Guild") (avatar_seq . "1") (pinned_at))))
+          (channels))
+         ((guilds . (((guild_id . "9007199254740993")
+                      (name . "Guild") (avatar_seq . "1") (pinned_at)
+                      (extra . t))))
+          (channels))
+         ((guilds)
+          (channels . (((guild_id . "9007199254740993")
+                        (channel_id . "01") (guild_name . "Guild")
+                        (name . "General") (kind . "text") (avatar_seq . "1")
+                        (pinned_at) (latest_sequence . "0")))))))
+    (should-error (qq-api--validate-guild-directory-snapshot data))))
+
+(ert-deftest qq-api-guild-directory-rejects-unknown-channel-kind ()
+  (should-error
+   (qq-api--validate-guild-directory-snapshot
+    '((guilds . (((guild_id . "9007199254740993")
+                  (name . "Guild") (avatar_seq . "1") (pinned_at))))
+      (channels . (((guild_id . "9007199254740993")
+                    (channel_id . "9007199254741999")
+                    (guild_name . "Guild") (name . "Forum")
+                    (kind . "unknown") (avatar_seq . "1")
+                    (pinned_at) (latest_sequence . "0"))))))))
+
 (ert-deftest qq-api-bootstrap-normalizes-contacts-after-identity-and-names ()
   (let (order)
     (cl-letf (((symbol-function 'qq-api-refresh-status)
@@ -2324,12 +2588,16 @@ The authoritative post-state reports UNREAD-COUNT."
                (lambda (&optional callback _errback)
                  (push 'groups order)
                  (funcall callback 'groups)))
+              ((symbol-function 'qq-api-refresh-guild-directory)
+               (lambda (&optional callback _errback)
+                 (push 'guilds order)
+                 (funcall callback 'guilds)))
               ((symbol-function 'qq-api-refresh-recent-contacts)
                (lambda (&optional _callback _errback)
                  (push 'contacts order))))
       (qq-api-bootstrap)
       (should (equal (nreverse order)
-                     '(status login friends groups contacts))))))
+                     '(status login friends groups guilds contacts))))))
 
 (ert-deftest qq-api-handle-notice-dispatches-poke ()
   (let (received)

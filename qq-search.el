@@ -11,10 +11,17 @@
 
 (require 'cl-lib)
 (require 'button)
+(require 'ewoc)
 (require 'seq)
 (require 'subr-x)
+(require 'appkit-core)
+(require 'appkit-ewoc)
+(require 'appkit-invalidation)
+(require 'appkit-position)
+(require 'appkit-transaction)
 (require 'appkit-ui)
 (require 'qq-api)
+(require 'qq-runtime)
 (require 'qq-state)
 
 (declare-function qq-chat-open-message
@@ -35,6 +42,18 @@
 (defconst qq-search-buffer-name "*qq-search*"
   "Name of the session message-search buffer.")
 
+(cl-defstruct (qq-search--entry
+               (:constructor qq-search--entry-create))
+  key
+  type
+  object)
+
+(defvar-local qq-search--ewoc nil
+  "Persistent keyed EWOC used by the current search view.")
+
+(defvar-local qq-search--node-table nil
+  "Stable search entry key to EWOC node table.")
+
 (defvar-local qq-search--session-key nil)
 (defvar-local qq-search--query nil)
 (defvar-local qq-search--results nil)
@@ -48,6 +67,12 @@
 (defvar-local qq-search--request-owner nil)
 (defvar-local qq-search--pending-next-key nil
   "Result key after which navigation should resume once a page arrives.")
+(defvar-local qq-search--focus-first-result-p nil
+  "Non-nil when the next sync should select the first result.")
+
+(defun qq-search--view-id (session-key)
+  "Return Appkit view identity for SESSION-KEY search results."
+  (list 'search session-key))
 
 (defun qq-search--cancel-request ()
   "Cancel the current buffer's owned transport request, if any."
@@ -56,11 +81,13 @@
   (setq qq-search--request nil
         qq-search--request-owner nil))
 
-(defun qq-search--request-current-p (buffer session-key owner)
-  "Return non-nil when OWNER still owns BUFFER and SESSION-KEY."
-  (and (buffer-live-p buffer)
+(defun qq-search--request-current-p (view buffer session-key owner)
+  "Return non-nil when VIEW and OWNER still own BUFFER and SESSION-KEY."
+  (and (appkit-view-live-p view)
+       (eq (appkit-view-buffer view) buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-search-mode)
+              (eq view (appkit-current-view))
               (equal qq-search--session-key session-key)
               (eq qq-search--request-owner owner)))))
 
@@ -135,7 +162,8 @@ text in the results buffer can never receive search highlighting."
     (add-text-properties
      start (point)
      (list 'qq-search-result result
-           'qq-search-session-key qq-search--session-key))
+           'qq-search-session-key qq-search--session-key
+           'qq-search-result-key (qq-search--result-key result)))
     (appkit-ui-make-action-row
      start (point) result #'qq-search--open-result
      :help-echo "mouse-1 or RET: open this message")
@@ -157,6 +185,150 @@ text in the results buffer can never receive search highlighting."
               'face 'shadow)))
     (_
      (insert (propertize "\nm: load more\n" 'face 'shadow)))))
+
+(defun qq-search--project-entries ()
+  "Project current search state into stable keyed presentation entries."
+  (append
+   (list
+    (qq-search--entry-create
+     :key 'header
+     :type 'header
+     :object (list (qq-search--session-title)
+                   qq-search--query
+                   (length qq-search--results))))
+   (mapcar
+    (lambda (result)
+      (qq-search--entry-create
+       :key (cons 'result (qq-search--result-key result))
+       :type 'result
+       :object result))
+    qq-search--results)
+   (list
+    (qq-search--entry-create
+     :key 'status
+     :type 'status
+     :object (list qq-search--status qq-search--error
+                   (and qq-search--results t)
+                   qq-search--next-cursor)))))
+
+(defun qq-search--ewoc-printer (entry)
+  "Insert one projected search ENTRY."
+  (pcase (qq-search--entry-type entry)
+    ('header
+     (insert (propertize
+              (format "Search in %s\n" (qq-search--session-title))
+              'face 'bold))
+     (insert (format "Query: %s\nLoaded: %d\n\n"
+                     qq-search--query (length qq-search--results))))
+    ('result (qq-search--insert-result (qq-search--entry-object entry)))
+    ('status (qq-search--insert-status))
+    (type (error "qq: unknown search entry type %S" type))))
+
+(defun qq-search--live-current-view ()
+  "Return this buffer's live session-search view, or nil."
+  (let ((view (appkit-current-view)))
+    (and (derived-mode-p 'qq-search-mode)
+         (appkit-view-live-p view)
+         (equal (appkit-view-id view)
+                (qq-search--view-id qq-search--session-key))
+         view)))
+
+(defun qq-search--cancel-buffer-work (buffer)
+  "Cancel search work still owned by BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (derived-mode-p 'qq-search-mode)
+        (qq-search--cancel-request)))))
+
+(defun qq-search--setup-view (view)
+  "Register lifecycle cleanup for newly attached search VIEW."
+  (appkit-register-handle
+   view 'function
+   (apply-partially #'qq-search--cancel-buffer-work
+                    (appkit-view-buffer view))))
+
+(defun qq-search--ensure-view ()
+  "Return the live Appkit view owning the current search buffer."
+  (unless qq-search--session-key
+    (error "QQ: cannot attach a search view without a session identity"))
+  (let* ((app (qq-runtime-app))
+         (view-id (qq-search--view-id qq-search--session-key))
+         (current (appkit-current-view)))
+    (cond
+     ((and (appkit-view-live-p current)
+           (eq app (appkit-view-app current))
+           (equal view-id (appkit-view-id current)))
+      (setf (appkit-view-sync-function current)
+            #'qq-search--sync-invalidations
+            (appkit-view-parts current) '(results))
+      current)
+     ((appkit-view-live-p current)
+      (error "QQ: search buffer belongs to another Appkit view"))
+     (t
+      (let ((view
+             (appkit-attach-view
+              :app app
+              :id view-id
+              :mode 'qq-search-mode
+              :sync-function #'qq-search--sync-invalidations
+              :parts '(results))))
+        (qq-search--setup-view view)
+        view)))))
+
+(defun qq-search--request-sync (&optional view)
+  "Request a coalesced results sync for live VIEW."
+  (when-let* ((view (or view (qq-search--live-current-view))))
+    (appkit-request-sync view :structure t :part 'results)))
+
+(defun qq-search--pending-invalidations-p (view)
+  "Return non-nil when live VIEW has pending invalidations."
+  (and (appkit-view-live-p view)
+       (appkit-invalidations-any-p (appkit-view-invalidations view))))
+
+(defun qq-search--sync-now (view)
+  "Consume immediately available invalidations for VIEW.
+
+The bounded loop also handles synchronous transports that return several
+empty continuation pages while next-result navigation is pending."
+  (let ((remaining 64))
+    (while (and (> remaining 0)
+                (qq-search--pending-invalidations-p view))
+      (setq remaining (1- remaining))
+      (appkit-sync-invalidations view))
+    (when (and (= remaining 0)
+               (qq-search--pending-invalidations-p view))
+      (error "qq: search synchronization did not quiesce"))))
+
+(defun qq-search--sync-invalidations (view invalidations)
+  "Consume coalesced search INVALIDATIONS for VIEW."
+  (when (and (appkit-view-live-p view)
+             (or (appkit-invalidations-structure-p invalidations)
+                 (appkit-invalidations-parts invalidations)
+                 (appkit-invalidations-entry-keys invalidations)
+                 (appkit-invalidations-position-p invalidations)))
+    (let ((snapshot
+           (with-current-buffer (appkit-view-buffer view)
+             (appkit-position-capture
+              :anchor-property 'qq-search-result-key
+              :preserve-window-start t))))
+      (appkit-with-content-update view
+				  (unless qq-search--ewoc
+				    (erase-buffer)
+				    (setq qq-search--ewoc
+					  (ewoc-create #'qq-search--ewoc-printer nil nil t)))
+				  (setq qq-search--node-table
+					(appkit-ewoc-reconcile
+					 qq-search--ewoc
+					 (qq-search--project-entries)
+					 #'qq-search--entry-key
+					 :force-keys (appkit-invalidations-entry-keys invalidations)))
+				  (when snapshot
+				    (appkit-position-restore snapshot))
+				  (when (and qq-search--focus-first-result-p qq-search--results)
+				    (setq qq-search--focus-first-result-p nil)
+				    (goto-char (point-min))
+				    (qq-search--next-local-result))
+				  (qq-search--resume-pending-next)))))
 
 (defun qq-search--goto-result-key (key)
   "Move point to the result identified by KEY and return non-nil."
@@ -189,41 +361,18 @@ text in the results buffer can never receive search highlighting."
       (cond
        ((qq-search--next-local-result)
         (setq qq-search--pending-next-key nil))
+       ((or qq-search--request qq-search--request-owner
+            (eq qq-search--status 'loading))
+        nil)
        (qq-search--next-cursor
         (qq-search--start-request t))
        (t
         (setq qq-search--pending-next-key nil)
         (message "qq: reached end of search results"))))))
 
-(defun qq-search--render ()
-  "Render the current result list and paging state."
-  (let ((inhibit-read-only t)
-        (selected-key
-         (when-let* ((result (get-text-property (point) 'qq-search-result)))
-           (qq-search--result-key result))))
-    (erase-buffer)
-    (insert (propertize
-             (format "Search in %s\n" (qq-search--session-title))
-             'face 'bold))
-    (insert (format "Query: %s\nLoaded: %d\n\n"
-                    qq-search--query (length qq-search--results)))
-    (dolist (result qq-search--results)
-      (qq-search--insert-result result))
-    (qq-search--insert-status)
-    (goto-char (point-min))
-    (if selected-key
-        (let ((found nil))
-          (while (and (not found) (< (point) (point-max)))
-            (when-let* ((result (get-text-property (point) 'qq-search-result)))
-              (when (equal selected-key (qq-search--result-key result))
-                (setq found t)))
-            (unless found (forward-line 1))))
-      (when qq-search--results
-        (qq-search-next-result)))))
-
-(defun qq-search--page-succeeded (buffer session-key owner page)
-  "Apply PAGE when OWNER still owns BUFFER and SESSION-KEY."
-  (when (qq-search--request-current-p buffer session-key owner)
+(defun qq-search--page-succeeded (view buffer session-key owner page)
+  "Apply PAGE when VIEW and OWNER still own BUFFER and SESSION-KEY."
+  (when (qq-search--request-current-p view buffer session-key owner)
     (with-current-buffer buffer
       (setf (plist-get owner :pending) nil)
       (setq qq-search--request nil
@@ -234,17 +383,16 @@ text in the results buffer can never receive search highlighting."
             (setq qq-search--next-cursor (alist-get 'next_cursor page)
                   qq-search--status (if qq-search--next-cursor 'ready 'eof)
                   qq-search--error nil)
-            (qq-search--render)
-            (qq-search--resume-pending-next))
+            (qq-search--request-sync view))
         (error
          (setq qq-search--status 'error
                qq-search--error (error-message-string error-data)
                qq-search--pending-next-key nil)
-         (qq-search--render))))))
+         (qq-search--request-sync view))))))
 
-(defun qq-search--page-failed (buffer session-key owner _response reason)
-  "Record search failure REASON when OWNER still owns BUFFER."
-  (when (qq-search--request-current-p buffer session-key owner)
+(defun qq-search--page-failed (view buffer session-key owner _response reason)
+  "Record search failure REASON when VIEW and OWNER still own BUFFER."
+  (when (qq-search--request-current-p view buffer session-key owner)
     (with-current-buffer buffer
       (setf (plist-get owner :pending) nil)
       (setq qq-search--request nil
@@ -252,71 +400,73 @@ text in the results buffer can never receive search highlighting."
             qq-search--status 'error
             qq-search--error reason
             qq-search--pending-next-key nil)
-      (qq-search--render))))
+      (qq-search--request-sync view))))
 
 (defun qq-search--start-request (next-p)
   "Start an owned search request; continue a cursor when NEXT-P."
-  (when qq-search--request
-    (qq-api-cancel-request qq-search--request))
-  (let* ((buffer (current-buffer))
-         (session-key qq-search--session-key)
-         (owner (list :session-key session-key :pending t))
-         (cursor qq-search--next-cursor)
-         request)
-    (setq qq-search--request-owner owner
-          qq-search--request nil
-          qq-search--status 'loading
-          qq-search--error nil)
-    (qq-search--render)
-    (condition-case error-data
-        (progn
-          (when next-p
-            (unless cursor
-              (error "qq: message search has no continuation cursor"))
-            (when (gethash cursor qq-search--consumed-cursors)
-              (error "qq: message search repeated an already consumed cursor"))
-            (puthash cursor t qq-search--consumed-cursors)
-            ;; NapCat cursors own one native searchMore operation.  Consume
-            ;; before dispatch and never restore after failure or signal.
-            (setq qq-search--next-cursor nil))
-          (setq request
-                (if next-p
-                    (qq-api-search-messages-next
-                     session-key cursor 'summary
+  (let ((view (qq-search--ensure-view)))
+    (when qq-search--request
+      (qq-api-cancel-request qq-search--request))
+    (let* ((buffer (current-buffer))
+           (session-key qq-search--session-key)
+           (owner (list :session-key session-key :pending t))
+           (cursor qq-search--next-cursor)
+           request)
+      (setq qq-search--request-owner owner
+            qq-search--request nil
+            qq-search--status 'loading
+            qq-search--error nil)
+      (qq-search--request-sync view)
+      (condition-case error-data
+          (progn
+            (when next-p
+              (unless cursor
+		(error "qq: message search has no continuation cursor"))
+              (when (gethash cursor qq-search--consumed-cursors)
+		(error "qq: message search repeated an already consumed cursor"))
+              (puthash cursor t qq-search--consumed-cursors)
+              ;; NapCat cursors own one native searchMore operation.  Consume
+              ;; before dispatch and never restore after failure or signal.
+              (setq qq-search--next-cursor nil))
+            (setq request
+                  (if next-p
+                      (qq-api-search-messages-next
+                       session-key cursor 'summary
+                       (lambda (page)
+			 (qq-search--page-succeeded
+                          view buffer session-key owner page))
+                       (lambda (response reason)
+			 (qq-search--page-failed
+                          view buffer session-key owner response reason)))
+                    (qq-api-search-messages-start
+                     session-key qq-search--query
                      (lambda (page)
                        (qq-search--page-succeeded
-                        buffer session-key owner page))
+			view buffer session-key owner page))
                      (lambda (response reason)
                        (qq-search--page-failed
-                        buffer session-key owner response reason)))
-                  (qq-api-search-messages-start
-                   session-key qq-search--query
-                   (lambda (page)
-                     (qq-search--page-succeeded
-                      buffer session-key owner page))
-                   (lambda (response reason)
-                     (qq-search--page-failed
-                      buffer session-key owner response reason))
-                   qq-search-page-size)))
-          ;; A mocked or local transport may complete synchronously.  Store
-          ;; the token only while this exact owner remains pending.
-          (when (and (qq-search--request-current-p buffer session-key owner)
-                     (plist-get owner :pending))
-            (setq qq-search--request request))
-          request)
-      (error
-       (when (qq-search--request-current-p buffer session-key owner)
-         (setf (plist-get owner :pending) nil)
-         (setq qq-search--request nil
-               qq-search--request-owner nil
-               qq-search--next-cursor nil
-               qq-search--status 'error
-               qq-search--pending-next-key nil
-               qq-search--error
-               (format "dispatch failed: %s; press g to restart"
-                       (error-message-string error-data)))
-         (qq-search--render))
-       nil))))
+			view buffer session-key owner response reason))
+                     qq-search-page-size)))
+            ;; A mocked or local transport may complete synchronously.  Store
+            ;; the token only while this exact owner remains pending.
+            (when (and (qq-search--request-current-p
+			view buffer session-key owner)
+                       (plist-get owner :pending))
+              (setq qq-search--request request))
+            request)
+	(error
+	 (when (qq-search--request-current-p view buffer session-key owner)
+           (setf (plist-get owner :pending) nil)
+           (setq qq-search--request nil
+		 qq-search--request-owner nil
+		 qq-search--next-cursor nil
+		 qq-search--status 'error
+		 qq-search--pending-next-key nil
+		 qq-search--error
+		 (format "dispatch failed: %s; press g to restart"
+			 (error-message-string error-data)))
+           (qq-search--request-sync view))
+	 nil)))))
 
 (defun qq-search-search (query)
   "Replace this buffer with a server-backed search for QUERY."
@@ -331,16 +481,20 @@ text in the results buffer can never receive search highlighting."
   (when (> (length query) 512)
     (user-error "qq: search query must be at most 512 characters"))
   (qq-search--cancel-request)
-  (setq qq-search--query query
-        qq-search--results nil
-        qq-search--results-tail nil
-        qq-search--seen (make-hash-table :test #'equal)
-        qq-search--consumed-cursors (make-hash-table :test #'equal)
-        qq-search--next-cursor nil
-        qq-search--status 'loading
-        qq-search--error nil
-        qq-search--pending-next-key nil)
-  (qq-search--start-request nil))
+  (let ((view (qq-search--ensure-view)))
+    (setq qq-search--query query
+          qq-search--results nil
+          qq-search--results-tail nil
+          qq-search--seen (make-hash-table :test #'equal)
+          qq-search--consumed-cursors (make-hash-table :test #'equal)
+          qq-search--next-cursor nil
+          qq-search--status 'loading
+          qq-search--error nil
+          qq-search--pending-next-key nil
+          qq-search--focus-first-result-p t)
+    (let ((request (qq-search--start-request nil)))
+      (qq-search--sync-now view)
+      request)))
 
 (defun qq-search-load-more ()
   "Load the next server-owned result page."
@@ -352,9 +506,14 @@ text in the results buffer can never receive search highlighting."
     (user-error "qq: search failed; press g to restart from the first page"))
    ((not qq-search--next-cursor)
     (setq qq-search--status 'eof)
-    (qq-search--render)
+    (let ((view (qq-search--ensure-view)))
+      (qq-search--request-sync view)
+      (qq-search--sync-now view))
     (message "qq: reached end of search results"))
-   (t (qq-search--start-request t))))
+   (t
+    (let ((view (qq-search--ensure-view)))
+      (prog1 (qq-search--start-request t)
+        (qq-search--sync-now view))))))
 
 (defun qq-search-refresh ()
   "Restart the current search from the authoritative first page."
@@ -380,7 +539,9 @@ text in the results buffer can never receive search highlighting."
           (unless anchor
             (user-error "qq: cannot continue search navigation without an anchor"))
           (setq qq-search--pending-next-key (qq-search--result-key anchor))
-          (qq-search--start-request t)
+          (let ((view (qq-search--ensure-view)))
+            (qq-search--start-request t)
+            (qq-search--sync-now view))
           t))
        (t
         (message "qq: no next search result")
@@ -431,6 +592,8 @@ text in the results buffer can never receive search highlighting."
 (define-derived-mode qq-search-mode special-mode "QQ-Search"
   "Major mode for paginated QQ message-search results."
   (setq-local truncate-lines t)
+  (setq-local qq-search--ewoc nil)
+  (setq-local qq-search--node-table nil)
   (add-hook 'kill-buffer-hook #'qq-search--cancel-request nil t)
   (add-hook 'change-major-mode-hook #'qq-search--cancel-request nil t))
 
@@ -445,15 +608,30 @@ text in the results buffer can never receive search highlighting."
             (read-string "Search messages: " nil 'qq-search-history)))
   (unless (and (stringp query) (not (string-empty-p query)))
     (user-error "qq: empty search query"))
-  (let ((buffer (get-buffer-create qq-search-buffer-name)))
+  (let* ((app (qq-runtime-app))
+         (view-id (qq-search--view-id session-key))
+         (buffer (get-buffer-create qq-search-buffer-name)))
     (with-current-buffer buffer
       (unless (derived-mode-p 'qq-search-mode)
         (qq-search-mode))
-      (qq-search--cancel-request)
+      (when-let* ((current (appkit-current-view)))
+        (when (and (appkit-view-live-p current)
+                   (not (equal view-id (appkit-view-id current))))
+          (appkit-kill-view current)))
       (setq qq-search--session-key session-key))
-    (pop-to-buffer buffer)
+    (let ((view
+           (appkit-open-view
+            :app app
+            :id view-id
+            :mode 'qq-search-mode
+            :buffer-name qq-search-buffer-name
+            :sync-function #'qq-search--sync-invalidations
+            :parts '(results)
+            :setup #'qq-search--setup-view)))
+      (setq buffer (appkit-view-buffer view)))
     (with-current-buffer buffer
       (qq-search-search query))
+    (pop-to-buffer buffer)
     buffer))
 
 (provide 'qq-search)

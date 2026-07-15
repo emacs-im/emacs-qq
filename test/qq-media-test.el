@@ -263,6 +263,49 @@
        (should errback-called)
        (should-not (qq-media--resource-fetching-p "avatar:10001"))))))
 
+(ert-deftest qq-media-message-avatar-keeps-guild-and-qq-identities-disjoint ()
+  (let (guild-request user-request)
+    (cl-letf (((symbol-function 'qq-media-guild-member-avatar-image)
+               (lambda (guild-id native-id)
+                 (setq guild-request (list guild-id native-id))
+                 'guild-avatar))
+              ((symbol-function 'qq-media-avatar-image)
+               (lambda (user-id)
+                 (setq user-request user-id)
+                 'user-avatar)))
+      (should (eq (qq-media-message-avatar-image
+                   '((session-key
+                      . "guild:9007199254740993:channel:9007199254741999")
+                     (guild-id . "9007199254740993")
+                     (sender-native-id . "144115219000000001")
+                     (sender-id . "144115219000000001")))
+                  'guild-avatar))
+      (should (equal guild-request
+                     '("9007199254740993"
+                       "144115219000000001")))
+      (should-not user-request)
+      (should (eq (qq-media-message-avatar-image
+                   '((sender-id . "10001")))
+                  'user-avatar))
+      (should (equal user-request "10001")))))
+
+(ert-deftest qq-media-message-avatar-cache-key-keeps-native-identities-disjoint ()
+  (let ((guild-message
+         '((session-key
+            . "guild:9007199254740993:channel:9007199254741999")
+           (sender-native-id . "144115219000000001")
+           (sender-id . "144115219000000001"))))
+    (should
+     (equal
+      (qq-media-message-avatar-cache-key guild-message)
+      (concat "guild-member-avatar:9007199254740993:"
+              "144115219000000001")))
+    (should
+     (equal (qq-media-message-avatar-cache-key '((sender-id . "10001")))
+            "avatar:10001"))
+    (should-not
+     (qq-media-message-avatar-cache-key '((sender-id . "0"))))))
+
 (ert-deftest qq-media-normalize-custom-face-list-keeps-multiple-faces ()
   "A list of face alists must not collapse into one bogus entry."
   (let* ((faces '(((url . "https://a")

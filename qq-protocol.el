@@ -104,6 +104,13 @@ CONTEXT is included in protocol errors."
      (and (qq-protocol--closed-object-p value '(kind user_id))
           (qq-protocol--nonzero-decimal-string-p
            (alist-get 'user_id value))))
+    ("guild-channel"
+     (and (qq-protocol--closed-object-p
+           value '(kind guild_id channel_id))
+          (qq-protocol--nonzero-decimal-string-p
+           (alist-get 'guild_id value))
+          (qq-protocol--nonzero-decimal-string-p
+           (alist-get 'channel_id value))))
     ("dataline"
      (and (qq-protocol--closed-object-p
            value '(kind peer_uid variant))

@@ -2635,6 +2635,24 @@
           (button-activate button)))
       (should (equal opened-user-id "10001")))))
 
+(ert-deftest qq-chat-channel-sender-opens-native-member-profile ()
+  (let ((message
+         '((session-key
+            . "guild:9007199254740993:channel:9007199254741999")
+           (sender-native-id . "144115219000000001")
+           (sender-id . "144115219000000001")))
+        guild-opened
+        ordinary-opened)
+    (cl-letf (((symbol-function 'qq-guild-user-open)
+               (lambda (guild-id native-id)
+                 (setq guild-opened (list guild-id native-id))))
+              ((symbol-function 'qq-user-open)
+               (lambda (user-id) (setq ordinary-opened user-id))))
+      (qq-chat--open-message-sender-profile message))
+    (should (equal guild-opened
+                   '("9007199254740993" "144115219000000001")))
+    (should-not ordinary-opened)))
+
 (ert-deftest qq-chat-at-all-is-emphasized-but-not-a-user-link ()
   (let ((mention (qq-chat--segment-inline-string
                   '((type . "at") (data . ((qq . "all")))))))
@@ -4113,6 +4131,22 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
              (push-button button)
              (should (equal opened-user "10002")))))))))
 
+(ert-deftest qq-chat-projects-guild-avatar-as-native-media-dependency ()
+  (let ((message
+         '((session-key
+            . "guild:9007199254740993:channel:9007199254741999")
+           (sender-native-id . "144115219000000001")
+           (sender-id . "144115219000000001"))))
+    (should
+     (member
+      (list :media
+            (concat "guild-member-avatar:9007199254740993:"
+                    "144115219000000001"))
+      (qq-chat--message-dependency-keys message)))
+    (should-not
+     (member '(:media "avatar:144115219000000001")
+             (qq-chat--message-dependency-keys message)))))
+
 (ert-deftest qq-chat-history-header-right-aligns-time-through-appkit ()
   (with-temp-buffer
     (let ((inhibit-read-only t)
@@ -4184,6 +4218,26 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                     'highlight))
         (should-not (get-text-property 0 'mouse-face
                                       (plist-get prefixes :rest-body)))))))
+
+(ert-deftest qq-chat-avatar-prefixes-pass-the-whole-message-to-media ()
+  (let (delivered)
+    (cl-letf (((symbol-function 'qq-media-message-avatar-image)
+               (lambda (message)
+                 (setq delivered message)
+                 'guild-avatar))
+              ((symbol-function 'appkit-chat-avatar-two-line-pixel-size)
+               (lambda () 42))
+              ((symbol-function 'appkit-chat-avatar-prefixes)
+               (lambda (&rest _args)
+                 '(:header "TOP " :first-body "BOTTOM " :rest-body "  "))))
+      (let ((message
+             '((session-key
+                . "guild:9007199254740993:channel:9007199254741999")
+               (guild-id . "9007199254740993")
+               (sender-native-id . "144115219000000001")
+               (sender-id . "144115219000000001"))))
+        (qq-chat--message-avatar-prefixes message)
+        (should (eq delivered message))))))
 
 (ert-deftest qq-chat-message-hover-is-limited-to-interactive-children ()
   (let ((properties
@@ -4998,6 +5052,97 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                     (setq call (list session-key message-id)))))
          (qq-chat-read-all)
          (should (equal call (list "private:10001" latest))))))))
+
+(ert-deftest qq-chat-guild-initial-load-and-read-use-dedicated-native-actions ()
+  (let (initial ordinary marked)
+    (cl-letf (((symbol-function 'qq-chat--load-initial-guild-navigation)
+               (lambda (buffer session-key)
+                 (setq initial (list buffer session-key))))
+              ((symbol-function 'qq-chat--load-initial-ordinary-history)
+               (lambda (&rest args) (setq ordinary args)))
+              ((symbol-function 'qq-api-mark-guild-read)
+               (lambda (session-key &optional _callback _errback)
+                 (setq marked session-key))))
+      (with-temp-buffer
+        (setq-local qq-chat--session-key
+                    "guild:9007199254740993:channel:9007199254741999")
+        (qq-chat--load-initial-history (current-buffer) qq-chat--session-key)
+        (qq-chat-read-all)
+        (should (equal (cadr initial) qq-chat--session-key))
+        (should-not ordinary)
+        (should (equal marked qq-chat--session-key))))))
+
+(ert-deftest qq-chat-guild-initial-load-fetches-latest-native-sequence-page ()
+  (qq-chat-test-with-reset
+   (let* ((guild-id "9007199254740993")
+          (channel-id "9007199254741999")
+          (session-key
+           (qq-state-guild-channel-session-key guild-id channel-id))
+          range-call)
+     (qq-state-apply-guild-directory
+      `((guilds . (((guild_id . ,guild-id) (name . "Synthetic guild")
+                    (avatar_seq . "3") (pinned_at))))
+        (channels . (((guild_id . ,guild-id) (channel_id . ,channel-id)
+                      (guild_name . "Synthetic guild") (name . "General")
+                      (kind . "text")
+                      (avatar_seq . "4") (pinned_at)
+                      (latest_sequence . "431"))))))
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key session-key)
+       (cl-letf (((symbol-function 'qq-api-fetch-guild-navigation)
+                  (lambda (_session-key callback &optional _errback)
+                    (funcall callback
+                             `((chat . ((kind . "guild-channel")
+                                        (guild_id . ,guild-id)
+                                        (channel_id . ,channel-id)))
+                               (unread_count . 0)
+                               (begin_sequence . "431")
+                               (navigation_sequences)))
+                    'navigation-request))
+                 ((symbol-function 'qq-api-fetch-guild-message-range)
+                  (lambda (candidate start end callback &optional _errback)
+                    (setq range-call (list candidate start end))
+                    (funcall callback
+                             '(((message_id . "9007199254741001"))
+                               ((message_id . "9007199254741002"))))
+                    'range-request))
+                 ((symbol-function 'qq-chat--sync-timeline) #'ignore)
+                 ((symbol-function 'qq-chat--update-frame) #'ignore))
+         (qq-chat--load-initial-guild-navigation
+          (current-buffer) session-key)
+         (should (equal range-call (list session-key "412" "431")))
+         (should (equal qq-chat--guild-history-start-sequence "412"))
+         (should (equal qq-chat--guild-history-end-sequence "431"))
+         (should (equal qq-chat--remote-latest-id "9007199254741002"))
+         (should (equal (appkit-chat-history-window-first-key)
+                        "9007199254741001"))
+         (should-not (appkit-chat-history-window-last-key)))))))
+
+(ert-deftest qq-chat-guild-older-page-uses-contiguous-sequence-range ()
+  (with-temp-buffer
+    (qq-chat-mode)
+    (setq qq-chat--session-key
+          "guild:9007199254740993:channel:9007199254741999"
+          qq-chat--guild-history-start-sequence "412"
+          qq-chat--guild-history-end-sequence "431")
+    (qq-chat--set-history-window "9007199254741001" nil)
+    (let (range-call)
+      (cl-letf (((symbol-function 'qq-api-fetch-guild-message-range)
+                 (lambda (candidate start end callback &optional _errback)
+                   (setq range-call (list candidate start end))
+                   (funcall callback
+                            '(((message_id . "9007199254740999"))))
+                   'range-request))
+                ((symbol-function 'qq-chat--sync-timeline) #'ignore)
+                ((symbol-function 'qq-chat--update-frame) #'ignore)
+                ((symbol-function 'qq-chat--header-line-update) #'ignore))
+        (qq-chat-load-older-messages t)
+        (should (equal range-call
+                       (list qq-chat--session-key "392" "411")))
+        (should (equal qq-chat--guild-history-start-sequence "392"))
+        (should (equal (appkit-chat-history-window-first-key)
+                       "9007199254740999"))))))
 
 (ert-deftest qq-chat-read-all-unknown-window-fetches-before-marking-cache ()
   (qq-chat-test-with-reset

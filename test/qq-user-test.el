@@ -617,23 +617,112 @@
     (cl-letf (((symbol-function 'qq-state-self-user-id) (lambda () "10001")))
       (should-error (qq-user-like) :type 'user-error))))
 
-(ert-deftest qq-user-photo-render-has-no-inline-open-button ()
-  (with-temp-buffer
-    (qq-user-photo-mode)
-    (setq qq-user-photo--user-id "10001"
-          qq-user-photo--photos
+(defmacro qq-user-photo-test-with-view (&rest body)
+  "Evaluate BODY in a live Appkit photo-wall view.
+
+BODY may refer to the lexical variable `view'."
+  (declare (indent 0) (debug t))
+  `(let ((qq-runtime--app nil))
+     (unwind-protect
+         (with-temp-buffer
+           (qq-user-photo-mode)
+           (setq qq-user-photo--user-id "10001")
+           (let ((view (qq-user-photo--ensure-view)))
+             ,@body))
+       (qq-runtime-stop))))
+
+(defun qq-user-photo-test--sync (view)
+  "Synchronize pending photo-wall presentation state for VIEW."
+  (qq-user-photo--request-sync view)
+  (qq-user-photo--sync-now view))
+
+(ert-deftest qq-user-photo-sync-has-no-inline-open-button ()
+  (qq-user-photo-test-with-view
+    (setq qq-user-photo--photos
           '(((id . "p1")
              (original_url . "https://example.test/p1.jpg")
              (thumbnail_url . "https://example.test/p1-thumb.jpg"))))
     (cl-letf (((symbol-function 'qq-media-url-preview-display-string)
                (lambda (_key _url fallback) fallback)))
-      (qq-user-photo-render))
+      (qq-user-photo-test--sync view))
     (should (string-match-p "Photo 1" (buffer-string)))
     (should-not (string-match-p "\\[Open\\]" (buffer-string)))
     (should-not (string-match-p "g refresh" (buffer-string)))
     (goto-char (point-min))
     (search-forward "Photo 1")
     (should (equal (alist-get 'id (qq-user-photo--photo-at-point)) "p1"))))
+
+(ert-deftest qq-user-photo-refresh-retains-content-and-reuses-node ()
+  (qq-user-photo-test-with-view
+    (setq qq-user-photo--photos
+          '(((id . "p1")
+             (original_url . "https://example.test/p1.jpg")
+             (thumbnail_url . "https://example.test/old-thumb.jpg"))))
+    (cl-letf (((symbol-function 'qq-media-url-preview-display-string)
+               (lambda (_key url fallback) (format "%s <%s>" fallback url))))
+      (qq-user-photo-test--sync view)
+      (let ((key '(photo "10001" "p1"))
+            (success nil))
+        (let ((node (gethash key qq-user-photo--node-table)))
+          (should node)
+          (cl-letf (((symbol-function 'qq-api-get-user-photo-wall)
+                     (lambda (_user-id callback &optional _errback)
+                       (setq success callback)
+                       'photo-token)))
+            (qq-user-photo-refresh))
+          (should qq-user-photo--loading)
+          (should (string-match-p "Refreshing photo wall" (buffer-string)))
+          (should (string-match-p "old-thumb" (buffer-string)))
+          (let ((before (buffer-string))
+                (updated
+                 '(((id . "p1")
+                    (original_url . "https://example.test/p1.jpg")
+                    (thumbnail_url . "https://example.test/new-thumb.jpg")))))
+            (cl-letf (((symbol-function 'appkit-sync-invalidations)
+                       (lambda (&rest _arguments)
+                         (ert-fail "photo callback synchronized directly"))))
+              (funcall success updated))
+            (should (equal before (buffer-string)))
+            (should (equal "https://example.test/new-thumb.jpg"
+                           (qq-user-photo-preview-url
+                            (car qq-user-photo--photos))))
+            (cl-letf (((symbol-function 'erase-buffer)
+                       (lambda ()
+                         (ert-fail "incremental photo sync erased buffer"))))
+              (appkit-sync-invalidations view))
+            (should (eq node (gethash key qq-user-photo--node-table)))
+            (should (string-match-p "new-thumb" (buffer-string)))))))))
+
+(ert-deftest qq-user-photo-media-update-targets-one-stable-row ()
+  (qq-user-photo-test-with-view
+    (let* ((photo '((id . "p1")
+                    (original_url . "https://example.test/p1.jpg")
+                    (thumbnail_url . "https://example.test/p1-thumb.jpg")))
+           (qq-user-photo--photos (list photo))
+           (media-key (qq-user-photo-cache-key "10001" photo))
+           call)
+      (cl-letf (((symbol-function 'appkit-request-sync)
+                 (lambda (candidate &rest arguments)
+                   (setq call (cons candidate arguments)))))
+        (qq-user-photo--handle-media-cache-update media-key))
+      (should (eq view (car call)))
+      (should (equal '(photo "10001" "p1")
+                     (plist-get (cdr call) :entry)))
+      (should (equal media-key (plist-get (cdr call) :resource)))
+      (should-not (plist-get (cdr call) :structure)))))
+
+(ert-deftest qq-user-photo-dead-view-makes-media-update-inert ()
+  (qq-user-photo-test-with-view
+    (let* ((photo '((id . "p1")
+                    (original_url . "https://example.test/p1.jpg")
+                    (thumbnail_url . "https://example.test/p1-thumb.jpg")))
+           (qq-user-photo--photos (list photo))
+           (media-key (qq-user-photo-cache-key "10001" photo)))
+      (appkit-kill-view view)
+      (cl-letf (((symbol-function 'appkit-request-sync)
+                 (lambda (&rest _arguments)
+                   (ert-fail "dead photo view requested a media sync"))))
+        (qq-user-photo--handle-media-cache-update media-key)))))
 
 (provide 'qq-user-test)
 

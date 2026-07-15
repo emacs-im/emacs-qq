@@ -1141,15 +1141,82 @@ CACHE-KEY also records the resolved local resource in QQ's logical cache."
       ('dataline (user-error "qq: dataline sessions have no QQ avatar"))
       (_ (qq-media-open-user-avatar target-id)))))
 
+(defun qq-media--guild-member-avatar-key (guild-id native-id)
+  "Return the cache key for GUILD-ID member NATIVE-ID."
+  (format "guild-member-avatar:%s:%s" guild-id native-id))
+
+(defun qq-media--message-avatar-identity (message)
+  "Return the native avatar identity represented by MESSAGE.
+
+The result is either `(:guild-member GUILD-ID NATIVE-ID)' or
+`(:user USER-ID)'.  Guild member ids and ordinary QQ user ids deliberately
+remain disjoint: a Guild tiny id is not a QQ account id."
+  (if-let* ((session-key (alist-get 'session-key message))
+            ((eq (qq-state-session-key-type session-key) 'guild-channel))
+            (guild-id
+             (alist-get 'guild-id
+                        (qq-state-session-key-identity session-key)))
+            (native-id (alist-get 'sender-native-id message)))
+      (list :guild-member guild-id native-id)
+    (when-let* ((sender-id (or (alist-get 'sender-id message)
+                               (alist-get 'user-id message)))
+                ((not (equal (format "%s" sender-id) "0"))))
+      (list :user sender-id))))
+
+(defun qq-media-message-avatar-cache-key (message)
+  "Return the logical avatar cache key affecting MESSAGE, or nil."
+  (pcase (qq-media--message-avatar-identity message)
+    (`(:guild-member ,guild-id ,native-id)
+     (qq-media--guild-member-avatar-key guild-id native-id))
+    (`(:user ,user-id)
+     (format "avatar:%s" user-id))))
+
 (defun qq-media-open-message-avatar (message)
   "Open sender avatar for MESSAGE."
-  (let ((sender-id (or (alist-get 'sender-id message)
-                       (alist-get 'user-id message))))
-    (unless sender-id
-      (user-error "qq: message has no sender id"))
-    (when (equal (format "%s" sender-id) "0")
-      (user-error "qq: virtual sender has no avatar"))
-    (qq-media-open-user-avatar sender-id)))
+  (pcase (qq-media--message-avatar-identity message)
+    (`(:guild-member ,guild-id ,native-id)
+     (qq-media-open-guild-member-avatar guild-id native-id))
+    (`(:user ,user-id)
+     (qq-media-open-user-avatar user-id))
+    (_
+     (user-error "qq: message sender has no native avatar identity"))))
+
+(defun qq-media--guild-member-avatar-resource (profile)
+  "Return the avatar resource projected from Guild member PROFILE."
+  `((url . ,(alist-get 'avatar_url profile))))
+
+(defun qq-media-open-guild-member-avatar (guild-id native-id)
+  "Open the native channel avatar for GUILD-ID member NATIVE-ID."
+  (let ((key (qq-media--guild-member-avatar-key guild-id native-id)))
+    (qq-media--resolve-resource
+     key
+     (lambda (done)
+       (qq-api-get-guild-member-profile
+        guild-id native-id
+        (lambda (profile)
+          (funcall done (qq-media--guild-member-avatar-resource profile)))))
+     (lambda (resource)
+       (qq-media-open-resource resource 'image key)))))
+
+(defun qq-media-guild-member-avatar-image (guild-id native-id)
+  "Return the inline native avatar for GUILD-ID member NATIVE-ID."
+  (qq-media--ensure-resource-image
+   (qq-media--guild-member-avatar-key guild-id native-id)
+   (lambda (done error)
+     (qq-api-get-guild-member-profile
+      guild-id native-id
+      (lambda (profile)
+        (funcall done (qq-media--guild-member-avatar-resource profile)))
+      error))
+   qq-media-avatar-image-height))
+
+(defun qq-media-message-avatar-image (message)
+  "Return the identity-correct inline sender avatar for MESSAGE."
+  (pcase (qq-media--message-avatar-identity message)
+    (`(:guild-member ,guild-id ,native-id)
+     (qq-media-guild-member-avatar-image guild-id native-id))
+    (`(:user ,user-id)
+     (qq-media-avatar-image user-id))))
 
 (defun qq-media-avatar-image (user-id)
   "Return inline avatar image for USER-ID, triggering fetch when needed."

@@ -15,13 +15,25 @@
     (preview . ,preview)))
 
 (defmacro qq-search-test-with-buffer (&rest body)
-  "Evaluate BODY in an initialized search buffer."
-  `(with-temp-buffer
-     (qq-search-mode)
-     (setq qq-search--session-key "group:20001")
-     ,@body))
+  "Evaluate BODY in an initialized live Appkit search view.
 
-(ert-deftest qq-search-render-highlights-preview-only-and-has-no-open-button ()
+BODY may refer to the lexical variable `view'."
+  (declare (indent 0) (debug t))
+  `(let ((qq-runtime--app nil))
+     (unwind-protect
+         (with-temp-buffer
+           (qq-search-mode)
+           (setq qq-search--session-key "group:20001")
+           (let ((view (qq-search--ensure-view)))
+             ,@body))
+       (qq-runtime-stop))))
+
+(defun qq-search-test--sync (view)
+  "Synchronize pending search presentation state for VIEW."
+  (qq-search--request-sync view)
+  (qq-search--sync-now view))
+
+(ert-deftest qq-search-sync-highlights-preview-only-and-has-no-open-button ()
   (qq-search-test-with-buffer
    (setq qq-search--query "Alice"
          qq-search--results
@@ -29,7 +41,7 @@
          qq-search--seen (make-hash-table :test #'equal)
          qq-search--next-cursor nil
          qq-search--status 'eof)
-   (qq-search--render)
+   (qq-search-test--sync view)
    (goto-char (point-min))
    (qq-search-next-result)
    (beginning-of-line)
@@ -51,7 +63,7 @@
          qq-search--seen (make-hash-table :test #'equal)
          qq-search--next-cursor nil
          qq-search--status 'eof)
-   (qq-search--render)
+   (qq-search-test--sync view)
    (goto-char (point-min))
    (should (qq-search-next-result))
    (beginning-of-line)
@@ -83,7 +95,7 @@
          qq-search--seen (make-hash-table :test #'equal)
          qq-search--next-cursor nil
          qq-search--status 'eof)
-   (qq-search--render)
+   (qq-search-test--sync view)
    (goto-char (point-min))
    (should (qq-search-next-result))
    (end-of-line)
@@ -103,7 +115,7 @@
              qq-search--seen (make-hash-table :test #'equal)
              qq-search--next-cursor nil
              qq-search--status 'eof)
-       (qq-search--render)
+       (qq-search-test--sync view)
        (switch-to-buffer (current-buffer))
        (goto-char (point-min))
        (should (qq-search-next-result))
@@ -130,7 +142,7 @@
          qq-search--seen (make-hash-table :test #'equal)
          qq-search--next-cursor nil
          qq-search--status 'eof)
-   (qq-search--render)
+   (qq-search-test--sync view)
    (goto-char (point-min))
    (should-not (qq-search-previous-result))
    (should (= (point) (point-min)))))
@@ -275,11 +287,82 @@
            qq-search--seen (make-hash-table :test #'equal)
            qq-search--next-cursor nil
            qq-search--status 'eof)
-     (qq-search--render)
+     (qq-search-test--sync view)
+     (goto-char (point-min))
+     (should (qq-search-next-result))
      (cl-letf (((symbol-function 'qq-chat-open-message)
                 (lambda (&rest args) (setq call args))))
        (qq-search-open-result)
        (should (equal call '("group:20001" "11" "needle")))))))
+
+(ert-deftest qq-search-sync-reuses-result-nodes-without-incremental-erase ()
+  (qq-search-test-with-buffer
+    (let* ((first (qq-search-test--result "11" 100 "first"))
+           (second (qq-search-test--result "10" 90 "second"))
+           (first-key (cons 'result (qq-search--result-key first))))
+      (setq qq-search--query "result"
+            qq-search--results (list first)
+            qq-search--results-tail (last qq-search--results)
+            qq-search--seen (make-hash-table :test #'equal)
+            qq-search--status 'ready
+            qq-search--next-cursor "next")
+      (puthash (qq-search--result-key first) t qq-search--seen)
+      (qq-search-test--sync view)
+      (let ((first-node (gethash first-key qq-search--node-table)))
+        (should first-node)
+        (qq-search--append-results (list second))
+        (setq qq-search--status 'eof
+              qq-search--next-cursor nil)
+        (cl-letf (((symbol-function 'erase-buffer)
+                   (lambda ()
+                     (ert-fail "incremental search sync erased the buffer"))))
+          (qq-search--request-sync view)
+          (appkit-sync-invalidations view))
+        (should (eq first-node (gethash first-key qq-search--node-table)))
+        (should (string-match-p "Loaded: 2" (buffer-string)))
+        (should (string-match-p "second" (buffer-string)))))))
+
+(ert-deftest qq-search-api-callback-defers-presentation-to-view-sync ()
+  (qq-search-test-with-buffer
+    (let (success)
+      (cl-letf (((symbol-function 'qq-api-search-messages-start)
+                 (lambda (_session _query callback &optional _errback _limit)
+                   (setq success callback)
+                   'search-token)))
+        (qq-search-search "needle"))
+      (let ((before (buffer-string)))
+        (should (string-match-p "Loading" before))
+        (cl-letf (((symbol-function 'appkit-sync-invalidations)
+                   (lambda (&rest _arguments)
+                     (ert-fail "API callback synchronized presentation directly"))))
+          (funcall success
+                   `((results . (,(qq-search-test--result
+                                   "11" 100 "needle")))
+                     (next_cursor))))
+        (should (= (length qq-search--results) 1))
+        (should (equal before (buffer-string)))
+        (appkit-sync-invalidations view)
+        (should (string-match-p "needle" (buffer-string)))
+        (should (string-match-p "End of results" (buffer-string)))))))
+
+(ert-deftest qq-search-dead-view-makes-late-page-callback-inert ()
+  (qq-search-test-with-buffer
+    (let (success)
+      (cl-letf (((symbol-function 'qq-api-search-messages-start)
+                 (lambda (_session _query callback &optional _errback _limit)
+                   (setq success callback)
+                   'search-token)))
+        (qq-search-search "needle"))
+      (appkit-kill-view view)
+      (cl-letf (((symbol-function 'appkit-request-sync)
+                 (lambda (&rest _arguments)
+                   (ert-fail "late callback requested sync for a dead view"))))
+        (funcall success
+                 `((results . (,(qq-search-test--result
+                                 "11" 100 "stale")))
+                   (next_cursor))))
+      (should-not qq-search--results)
+      (should-not qq-search--request-owner))))
 
 (provide 'qq-search-test)
 

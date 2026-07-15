@@ -11,10 +11,16 @@
 
 (require 'button)
 (require 'cl-lib)
+(require 'ewoc)
 (require 'subr-x)
-(require 'qq-api)
+(require 'appkit-core)
+(require 'appkit-ewoc)
+(require 'appkit-invalidation)
 (require 'appkit-position)
+(require 'appkit-transaction)
 (require 'appkit-view)
+(require 'qq-api)
+(require 'qq-runtime)
 
 (declare-function qq-user-open "qq-user" (user-id))
 
@@ -22,6 +28,23 @@
   '((t :inherit bold :height 1.1))
   "Face used for group-notice titles."
   :group 'qq)
+
+(cl-defstruct (qq-group-notices--entry
+               (:constructor qq-group-notices--entry-create))
+  key
+  type
+  object
+  index
+  text)
+
+(defconst qq-group-notices--view-id 'group-notices
+  "Appkit identity of the singleton group-notices view.")
+
+(defvar-local qq-group-notices--ewoc nil
+  "Persistent keyed EWOC used by the announcement view.")
+
+(defvar-local qq-group-notices--node-table nil
+  "Stable announcement key to EWOC node table.")
 
 (defvar-local qq-group-notices--group-id nil
   "Group whose announcements are displayed in this buffer.")
@@ -43,6 +66,47 @@
 
 (defvar-local qq-group-notices--request-owner nil
   "Opaque owner of the active announcement request.")
+
+(defun qq-group-notices--notice-key (notice)
+  "Return the stable presentation key for NOTICE."
+  (cons 'notice (alist-get 'notice_id notice)))
+
+(defun qq-group-notices--note-entry (key text &optional type)
+  "Return a status entry identified by KEY with TEXT and optional TYPE."
+  (qq-group-notices--entry-create
+   :key (cons 'note key) :type (or type 'note) :text text))
+
+(defun qq-group-notices--project-entries ()
+  "Project announcement state into stable keyed presentation entries."
+  (let (entries)
+    (when qq-group-notices--loading
+      (push (qq-group-notices--note-entry
+             'loading
+             (if qq-group-notices--items
+                 "正在刷新群公告…"
+               "正在加载群公告…"))
+            entries))
+    (when qq-group-notices--error
+      (push (qq-group-notices--note-entry
+             'error qq-group-notices--error 'error-note)
+            entries))
+    (when qq-group-notices--items
+      (push (qq-group-notices--note-entry
+             'instructions "g 刷新 · RET/TAB 打开发布者 · q 退出")
+            entries)
+      (cl-loop for notice in qq-group-notices--items
+               for index from 1
+               do (push (qq-group-notices--entry-create
+                         :key (qq-group-notices--notice-key notice)
+                         :type 'notice
+                         :object notice
+                         :index index)
+                        entries)))
+    (unless (or qq-group-notices--loading
+                qq-group-notices--error
+                qq-group-notices--items)
+      (push (qq-group-notices--note-entry 'empty "暂无群公告。") entries))
+    (nreverse entries)))
 
 (defun qq-group-notices--buffer-name ()
   "Return the shared announcement buffer name."
@@ -91,7 +155,8 @@
 
 (defun qq-group-notices--insert-item (notice index)
   "Insert announcement NOTICE at one-based INDEX."
-  (let ((title (alist-get 'title notice))
+  (let ((start (point))
+        (title (alist-get 'title notice))
         (sender-id (alist-get 'sender_id notice))
         (read-count (alist-get 'read_count notice))
         (images (alist-get 'images notice)))
@@ -114,44 +179,126 @@
       (insert "\n")
       (add-text-properties meta-start (point) '(face shadow)))
     (let ((text (alist-get 'text notice)))
-      (unless (string-empty-p text)
+      (unless (string-empty-p (or text ""))
         (insert text "\n")))
     (when images
       (cl-loop for image in images
                for image-index from 1
                do (insert (qq-group-notices--image-label image image-index) " "))
       (insert "\n"))
-    (insert "\n")))
+    (insert "\n")
+    (add-text-properties
+     start (point)
+     (list 'qq-group-notice-key (qq-group-notices--notice-key notice)))))
 
-(defun qq-group-notices-render ()
-  "Render the current read-only announcement view."
-  (interactive)
-  (appkit-position-render-preserving
-   (lambda ()
-     (let ((inhibit-read-only t))
-       (erase-buffer)
-       (setq-local header-line-format '(:eval (qq-group-notices--header-line)))
-       (cond
-        (qq-group-notices--loading
-         (appkit-view-insert-note-line "正在加载群公告…"))
-        (qq-group-notices--error
-         (appkit-view-insert-note-line qq-group-notices--error :face 'error))
-        ((null qq-group-notices--items)
-         (appkit-view-insert-note-line "暂无群公告。"))
-        (t
-         (appkit-view-insert-note-line "g 刷新 · RET/TAB 打开发布者 · q 退出")
-         (insert "\n")
-         (cl-loop for notice in qq-group-notices--items
-                  for index from 1
-                  do (qq-group-notices--insert-item notice index))))
-       (goto-char (point-min))))
-   :preserve-window-start t))
+(defun qq-group-notices--ewoc-printer (entry)
+  "Insert one projected announcement ENTRY."
+  (pcase (qq-group-notices--entry-type entry)
+    ('notice
+     (qq-group-notices--insert-item
+      (qq-group-notices--entry-object entry)
+      (qq-group-notices--entry-index entry)))
+    ((or 'note 'error-note)
+     (appkit-view-insert-note-line
+      (or (qq-group-notices--entry-text entry) "")
+      :face (if (eq (qq-group-notices--entry-type entry) 'error-note)
+                'error
+              'shadow)
+      :line-properties
+      (list 'qq-group-notice-key (qq-group-notices--entry-key entry))))
+    (type (error "qq: unknown group notice entry type %S" type))))
 
-(defun qq-group-notices--request-current-p (buffer group-id owner)
-  "Return non-nil when OWNER still loads GROUP-ID in BUFFER."
-  (and (buffer-live-p buffer)
+(defun qq-group-notices--live-current-view ()
+  "Return this buffer's live group-notices view, or nil."
+  (let ((view (appkit-current-view)))
+    (and (derived-mode-p 'qq-group-notices-mode)
+         (appkit-view-live-p view)
+         (equal (appkit-view-id view) qq-group-notices--view-id)
+         view)))
+
+(defun qq-group-notices--cancel-buffer-work (buffer)
+  "Cancel announcement work still owned by BUFFER."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (derived-mode-p 'qq-group-notices-mode)
+        (qq-group-notices--cancel-request)))))
+
+(defun qq-group-notices--setup-view (view)
+  "Register lifecycle cleanup for newly attached VIEW."
+  (appkit-register-handle
+   view 'function
+   (apply-partially #'qq-group-notices--cancel-buffer-work
+                    (appkit-view-buffer view))))
+
+(defun qq-group-notices--ensure-view ()
+  "Return the live Appkit view owning the current announcement buffer."
+  (let* ((app (qq-runtime-app))
+         (current (appkit-current-view)))
+    (cond
+     ((and (appkit-view-live-p current)
+           (eq app (appkit-view-app current))
+           (equal qq-group-notices--view-id (appkit-view-id current)))
+      (setf (appkit-view-sync-function current)
+            #'qq-group-notices--sync-invalidations
+            (appkit-view-parts current) '(notices))
+      current)
+     ((appkit-view-live-p current)
+      (error "QQ: group-notices buffer belongs to another Appkit view"))
+     (t
+      (let ((view
+             (appkit-attach-view
+              :app app
+              :id qq-group-notices--view-id
+              :mode 'qq-group-notices-mode
+              :sync-function #'qq-group-notices--sync-invalidations
+              :parts '(notices))))
+        (qq-group-notices--setup-view view)
+        view)))))
+
+(defun qq-group-notices--request-sync (&optional view)
+  "Request a coalesced announcement sync for live VIEW."
+  (when-let* ((view (or view (qq-group-notices--live-current-view))))
+    (appkit-request-sync view :structure t :part 'notices)))
+
+(defun qq-group-notices--sync-now (view)
+  "Consume pending invalidations for live VIEW immediately."
+  (when (appkit-view-live-p view)
+    (appkit-sync-invalidations view)))
+
+(defun qq-group-notices--sync-invalidations (view invalidations)
+  "Consume coalesced announcement INVALIDATIONS for VIEW."
+  (when (and (appkit-view-live-p view)
+             (or (appkit-invalidations-structure-p invalidations)
+                 (appkit-invalidations-parts invalidations)
+                 (appkit-invalidations-entry-keys invalidations)
+                 (appkit-invalidations-position-p invalidations)))
+    (let ((snapshot
+           (with-current-buffer (appkit-view-buffer view)
+             (appkit-position-capture
+              :anchor-property 'qq-group-notice-key
+              :preserve-window-start t))))
+      (appkit-with-content-update view
+				  (unless qq-group-notices--ewoc
+				    (erase-buffer)
+				    (setq qq-group-notices--ewoc
+					  (ewoc-create #'qq-group-notices--ewoc-printer nil nil t)))
+				  (setq qq-group-notices--node-table
+					(appkit-ewoc-reconcile
+					 qq-group-notices--ewoc
+					 (qq-group-notices--project-entries)
+					 #'qq-group-notices--entry-key
+					 :force-keys (appkit-invalidations-entry-keys invalidations)))
+				  (force-mode-line-update)
+				  (when snapshot
+				    (appkit-position-restore snapshot))))))
+
+(defun qq-group-notices--request-current-p (view buffer group-id owner)
+  "Return non-nil when VIEW and OWNER still load GROUP-ID in BUFFER."
+  (and (appkit-view-live-p view)
+       (eq (appkit-view-buffer view) buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-group-notices-mode)
+              (eq view (appkit-current-view))
               (equal qq-group-notices--group-id group-id)
               (eq qq-group-notices--request-owner owner)))))
 
@@ -160,53 +307,60 @@
   (interactive)
   (unless qq-group-notices--group-id
     (user-error "qq: this buffer has no group identity"))
-  (when qq-group-notices--request
-    (qq-api-cancel-request qq-group-notices--request))
-  (let ((buffer (current-buffer))
-        (group-id qq-group-notices--group-id)
-        (owner (list 'group-notices qq-group-notices--group-id)))
-    (setq qq-group-notices--loading t
-          qq-group-notices--error nil
-          qq-group-notices--request nil
-          qq-group-notices--request-owner owner)
-    (qq-group-notices-render)
-    (condition-case error-data
-        (let ((request
-               (qq-api-get-group-notices
-                group-id
-                (lambda (notices)
-                  (when (qq-group-notices--request-current-p
-                         buffer group-id owner)
-                    (with-current-buffer buffer
-                      (setq qq-group-notices--items notices
-                            qq-group-notices--loading nil
-                            qq-group-notices--error nil
-                            qq-group-notices--request nil
-                            qq-group-notices--request-owner nil)
-                      (qq-group-notices-render))))
-                (lambda (response reason)
-                  (when (qq-group-notices--request-current-p
-                         buffer group-id owner)
-                    (with-current-buffer buffer
-                      (setq qq-group-notices--loading nil
-                            qq-group-notices--error
-                            (format "无法加载群公告：%s"
-                                    (or reason "未知错误"))
-                            qq-group-notices--request nil
-                            qq-group-notices--request-owner nil)
-                      (qq-group-notices-render)))
-                  (qq-api--default-error response reason)))))
-          (when (eq qq-group-notices--request-owner owner)
-            (setq qq-group-notices--request request)))
-      (error
-       (when (qq-group-notices--request-current-p buffer group-id owner)
-         (setq qq-group-notices--loading nil
-               qq-group-notices--error
-               (format "无法加载群公告：%s"
-                       (error-message-string error-data))
-               qq-group-notices--request nil
-               qq-group-notices--request-owner nil)
-         (qq-group-notices-render))))))
+  (let ((view (qq-group-notices--ensure-view)))
+    (when qq-group-notices--request
+      (qq-api-cancel-request qq-group-notices--request))
+    (let ((buffer (current-buffer))
+          (group-id qq-group-notices--group-id)
+          (owner (list 'group-notices qq-group-notices--group-id)))
+      (setq qq-group-notices--loading t
+            qq-group-notices--error nil
+            qq-group-notices--request nil
+            qq-group-notices--request-owner owner)
+      (qq-group-notices--request-sync view)
+      (condition-case error-data
+          (let ((request
+		 (qq-api-get-group-notices
+                  group-id
+                  (lambda (notices)
+                    (when (qq-group-notices--request-current-p
+                           view buffer group-id owner)
+                      (with-current-buffer buffer
+			(setq qq-group-notices--items notices
+                              qq-group-notices--loading nil
+                              qq-group-notices--error nil
+                              qq-group-notices--request nil
+                              qq-group-notices--request-owner nil)
+			(qq-group-notices--request-sync view))))
+                  (lambda (response reason)
+                    (when (qq-group-notices--request-current-p
+                           view buffer group-id owner)
+                      (with-current-buffer buffer
+			(setq qq-group-notices--loading nil
+                              qq-group-notices--error
+                              (format "无法加载群公告：%s"
+                                      (or reason "未知错误"))
+                              qq-group-notices--request nil
+                              qq-group-notices--request-owner nil)
+			(qq-group-notices--request-sync view)))
+                    (qq-api--default-error response reason)))))
+            (when (eq qq-group-notices--request-owner owner)
+              (setq qq-group-notices--request request)))
+	(error
+	 (when (qq-group-notices--request-current-p
+		view buffer group-id owner)
+           (with-current-buffer buffer
+             (setq qq-group-notices--loading nil
+                   qq-group-notices--error
+                   (format "无法加载群公告：%s"
+                           (error-message-string error-data))
+                   qq-group-notices--request nil
+                   qq-group-notices--request-owner nil)
+             (qq-group-notices--request-sync view)))))
+      ;; This command is an explicit presentation boundary.  A synchronous
+      ;; transport completion is therefore visible before it returns, while an
+      ;; asynchronous completion only queues a later coalesced sync.
+      (qq-group-notices--sync-now view))))
 
 (defun qq-group-notices--cancel-request ()
   "Cancel and forget the active announcement request."
@@ -233,6 +387,9 @@
   "Major mode for a read-only QQ group announcement list."
   (setq-local truncate-lines nil)
   (setq-local switch-to-buffer-preserve-window-point nil)
+  (setq-local header-line-format '(:eval (qq-group-notices--header-line)))
+  (setq-local qq-group-notices--ewoc nil)
+  (setq-local qq-group-notices--node-table nil)
   (add-hook 'change-major-mode-hook #'qq-group-notices--cancel-request nil t)
   (add-hook 'kill-buffer-hook #'qq-group-notices--cancel-request nil t))
 
@@ -242,10 +399,18 @@
   (interactive "sQQ group number: ")
   (unless (qq-api-group-id-p group-id)
     (user-error "qq: group notices require a canonical uint32 group id"))
-  (let ((buffer (get-buffer-create (qq-group-notices--buffer-name))))
+  (let* ((app (qq-runtime-app))
+         (view
+          (appkit-open-view
+           :app app
+           :id qq-group-notices--view-id
+           :mode 'qq-group-notices-mode
+           :buffer-name (qq-group-notices--buffer-name)
+           :sync-function #'qq-group-notices--sync-invalidations
+           :parts '(notices)
+           :setup #'qq-group-notices--setup-view))
+         (buffer (appkit-view-buffer view)))
     (with-current-buffer buffer
-      (unless (derived-mode-p 'qq-group-notices-mode)
-        (qq-group-notices-mode))
       (unless (equal qq-group-notices--group-id group-id)
         (qq-group-notices--cancel-request)
         (setq qq-group-notices--items nil
@@ -253,10 +418,12 @@
               qq-group-notices--error nil))
       (setq qq-group-notices--group-id group-id
             qq-group-notices--group-name group-name)
-      (qq-group-notices-render)
       (when (and (null qq-group-notices--items)
                  (not qq-group-notices--loading))
-        (qq-group-notices-refresh)))
+        (qq-group-notices-refresh))
+      (unless qq-group-notices--loading
+        (qq-group-notices--request-sync view)
+        (qq-group-notices--sync-now view)))
     (pop-to-buffer buffer)
     buffer))
 

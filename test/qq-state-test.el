@@ -108,6 +108,26 @@
   (should-error (qq-state-session-key-identity "service:"))
   (should-error (qq-state-session-key-identity "private:not-a-number")))
 
+(ert-deftest qq-state-guild-channel-key-round-trips-two-arbitrary-size-identities ()
+  (let* ((guild-id "9007199254740993")
+         (channel-id "9007199254741999")
+         (key (qq-state-guild-channel-session-key guild-id channel-id)))
+    (should (equal key
+                   "guild:9007199254740993:channel:9007199254741999"))
+    (should
+     (equal (qq-state-session-key-identity key)
+            `((type . guild-channel)
+              (target-id . ,channel-id)
+              (chat-type . "4")
+              (peer-uid . ,channel-id)
+              (variant . nil)
+              (guild-id . ,guild-id)
+              (channel-id . ,channel-id))))
+    (should-not (qq-state-session-sendable-p key))
+    (dolist (bad '("0" "01" "" "native-id" 9007199254740992))
+      (should-error (qq-state-guild-channel-session-key bad channel-id))
+      (should-error (qq-state-guild-channel-session-key guild-id bad)))))
+
 (ert-deftest qq-state-upsert-keeps-key-identity-and-private-native-uid ()
   (qq-test-with-reset
    (qq-state-upsert-session
@@ -135,6 +155,21 @@
   (should-not (qq-state-session-sendable-p "service:u_mail"))
   (should-not (qq-state-session-sendable-p "unknown:target"))
   (should-not (qq-state-session-sendable-p nil)))
+
+(ert-deftest qq-state-only-text-guild-channels-have-a-message-composer ()
+  (qq-test-with-reset
+   (let ((guild-id "9007199254740993")
+         (text-id "9007199254741999")
+         (forum-id "9007199254742000"))
+     (qq-state-apply-guild-directory
+      `((guilds . (((guild_id . ,guild-id))))
+        (channels
+         . (((guild_id . ,guild-id) (channel_id . ,text-id) (kind . "text"))
+            ((guild_id . ,guild-id) (channel_id . ,forum-id) (kind . "forum"))))))
+     (should (qq-state-session-sendable-p
+              (qq-state-guild-channel-session-key guild-id text-id)))
+     (should-not (qq-state-session-sendable-p
+                  (qq-state-guild-channel-session-key guild-id forum-id))))))
 
 (ert-deftest qq-state-friend-categories-preserve-order-flatten-and-copy ()
   (qq-test-with-reset
@@ -179,17 +214,146 @@
                   '("20002" "20001")))
    (should (= (qq-state-group-count) 2))))
 
+(ert-deftest qq-state-guild-directory-preserves-hierarchy-and-copy-boundaries ()
+  (qq-test-with-reset
+   (let* ((guild-id "9007199254740993")
+          (channel-id "9007199254741999")
+          (source
+           `((guilds . (((guild_id . ,guild-id)
+                         (name . "Synthetic guild")
+                         (avatar_seq . "3")
+                         (pinned_at))))
+             (channels . (((guild_id . ,guild-id)
+                           (channel_id . ,channel-id)
+                           (guild_name . "Synthetic guild")
+                           (name . "General")
+                           (kind . "text")
+                           (avatar_seq . "4")
+                           (pinned_at . "1784000000")
+                           (latest_sequence . "23")))))))
+     (qq-state-apply-guild-directory source)
+     (should (qq-state-guild-directory-loaded-p))
+     (should (equal (qq-state-guild guild-id)
+                    (car (alist-get 'guilds source))))
+     (should (equal (alist-get 'name
+                               (qq-state-guild-channel guild-id channel-id))
+                    "General"))
+     (setf (alist-get 'name (car (alist-get 'channels source))) "mutated")
+     (should (equal (alist-get 'name
+                               (qq-state-guild-channel guild-id channel-id))
+                    "General"))
+     (let ((key (qq-state-guild-channel-session-key guild-id channel-id)))
+       (qq-state-upsert-session key nil nil)
+       (should (equal (alist-get 'title (qq-state-session key))
+                      "Synthetic guild · #General"))
+       (should (qq-state-session-sendable-p key))))))
+
 (ert-deftest qq-state-reset-clears-directory-order-and-categories ()
   (let ((qq-state-change-hook nil))
     (qq-state-apply-friend-categories
      '(((category_id . 1) (friends . (((user_id . "10001")))))))
     (qq-state-apply-groups '(((group_id . "20001"))))
+    (qq-state-apply-guild-directory
+     '((guilds . (((guild_id . "30001")))) (channels)))
     (qq-state-reset)
     (should-not (qq-state-friend-categories))
     (should-not (qq-state-friends))
     (should-not (qq-state-groups))
+    (should-not (alist-get 'guilds (qq-state-guild-directory)))
+    (should-not (qq-state-guild-directory-loaded-p))
     (should (= (qq-state-friend-count) 0))
     (should (= (qq-state-group-count) 0))))
+
+(ert-deftest qq-state-merge-guild-message-preserves-native-identities-and-segments ()
+  (qq-test-with-reset
+   (let* ((guild-id "9007199254740993")
+          (channel-id "9007199254741999")
+          (message-id "9007199254742999")
+          (event
+           `((post_type . "emacs_guild_message")
+             (chat . ((kind . "guild-channel")
+                      (guild_id . ,guild-id)
+                      (channel_id . ,channel-id)))
+             (message_id . ,message-id)
+             (message_sequence . "17")
+             (sent_at . 1784000000)
+             (channel_name . "Synthetic channel")
+             (sender . ((native_id . "u_synthetic_sender")
+                        (user_id . nil)
+                        (nickname . "Synthetic member")
+                        (member_name . "Member card")
+                        (display_name . "Member card")))
+             (outgoing . :false)
+             (state . "live")
+             (segments . (((kind . "text")
+                           (payload . ((text . "hello"))))))))
+          (session-key (qq-state-merge-guild-message event))
+          (message (car (qq-state-session-messages session-key))))
+     (should (equal session-key
+                    "guild:9007199254740993:channel:9007199254741999"))
+     (should (equal (alist-get 'server-id message) message-id))
+     (should (equal (alist-get 'message-seq message) "17"))
+     (should (equal (alist-get 'sender-id message) "u_synthetic_sender"))
+     (should (equal (alist-get 'sender-card message) "Member card"))
+     (should (equal (alist-get 'peer-uid message) channel-id))
+     (should (equal (alist-get 'guild-id message) guild-id))
+     (should (equal (alist-get 'segments message)
+                    '(((type . "text") (data . ((text . "hello")))))))
+     (should (equal (alist-get 'last-message-preview
+                               (qq-state-session session-key))
+                    "hello")))))
+
+(ert-deftest qq-state-guild-revoke-segment-becomes-a-gray-tip-row ()
+  (qq-test-with-reset
+   (let* ((event
+           '((post_type . "emacs_guild_message")
+             (chat . ((kind . "guild-channel")
+                      (guild_id . "9007199254740993")
+                      (channel_id . "9007199254741999")))
+             (message_id . "9007199254742999")
+             (message_sequence . "17")
+             (sent_at . 1784000000)
+             (channel_name . "Synthetic channel")
+             (sender . ((native_id . "144115219000000001")
+                        (user_id . nil)
+                        (nickname . "Synthetic member")
+                        (member_name . "Synthetic member")
+                        (display_name . "Synthetic member")))
+             (outgoing . :false)
+             (state . "live")
+             (segments
+              . (((kind . "gray-tip")
+                  (payload . ((gray_tip_kind . "revoke")
+                              (text . "Synthetic member 撤回了一条消息")
+                              (native_id . "144115219000000001"))))))))
+          (session-key (qq-state-merge-guild-message event))
+          (message (car (qq-state-session-messages session-key))))
+     (should (qq-state-gray-tip-message-p message))
+     (should (equal (alist-get 'preview message)
+                    "Synthetic member 撤回了一条消息"))
+     (should (equal (alist-get 'kind
+                               (qq-state-gray-tip-message-data message))
+                    "revoke")))))
+
+(ert-deftest qq-state-apply-guild-navigation-updates-authoritative-unread-count ()
+  (qq-test-with-reset
+   (let* ((guild-id "9007199254740993")
+          (channel-id "9007199254741999")
+          (session-key
+           (qq-state-apply-guild-navigation
+            `((chat . ((kind . "guild-channel")
+                       (guild_id . ,guild-id)
+                       (channel_id . ,channel-id)))
+              (unread_count . 6)
+              (begin_sequence . "18")
+              (navigation_sequences
+               . (((sequence . "19") (native_kind . 7)))))))
+          (session (qq-state-session session-key)))
+     (should (= (alist-get 'unread-count session) 6))
+     (should (equal (alist-get 'first-unread-message-seq session) "18"))
+     (should-not (alist-get 'read-position-available session))
+     (should (equal (alist-get 'guild-navigation-sequences session)
+                    '(((sequence . "19") (native_kind . 7))))))))
 
 (ert-deftest qq-state-recent-snapshot-membership-is-not-session-existence ()
   (qq-test-with-reset

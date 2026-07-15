@@ -39,6 +39,7 @@
 (autoload 'qq-forward-insert-segment "qq-forward")
 (autoload 'qq-forward-event-segment-to-internal "qq-forward")
 (autoload 'qq-user-open "qq-user" nil t)
+(autoload 'qq-guild-user-open "qq-guild-user" nil t)
 (autoload 'qq-group-open "qq-group" nil t)
 (autoload 'qq-search-open "qq-search" nil t)
 (autoload 'qq-red-packet-open "qq-red-packet" nil t)
@@ -50,6 +51,7 @@
 (declare-function qq-forward-event-segment-to-internal
                   "qq-forward" (segment session-key))
 (declare-function qq-user-open "qq-user" (user-id))
+(declare-function qq-guild-user-open "qq-guild-user" (guild-id native-id))
 (declare-function qq-group-open "qq-group" (group-id))
 (declare-function qq-search-open "qq-search" (session-key &optional query))
 (declare-function qq-red-packet-open
@@ -153,6 +155,12 @@ This NapCat/read-state frontier remains client-owned.  Protocol-independent
 window edges, loading ownership, exhaustion, and stalls live in AppKit's
 buffer-local continuous history controller.")
 
+(defvar-local qq-chat--guild-history-start-sequence nil
+  "Lowest native Guild sequence covered by the current history window.")
+
+(defvar-local qq-chat--guild-history-end-sequence nil
+  "Highest native Guild sequence covered by the current history window.")
+
 (defvar-local qq-chat--initial-history-owner nil
   "Opaque owner token for the active initial-history request chain.")
 
@@ -168,7 +176,9 @@ buffer-local continuous history controller.")
 (defun qq-chat--reset-history-state ()
   "Reset current buffer history paging state."
   (appkit-chat-history-reset-state)
-  (setq qq-chat--remote-latest-id nil))
+  (setq qq-chat--remote-latest-id nil
+        qq-chat--guild-history-start-sequence nil
+        qq-chat--guild-history-end-sequence nil))
 
 (defun qq-chat--set-history-window (first-message-id last-message-id)
   "Project one contiguous history window from FIRST-MESSAGE-ID through LAST.
@@ -267,6 +277,9 @@ stale network failure can never overwrite newer user input.")
 
 (defvar-local qq-chat--last-read-target-id nil
   "Newest server message id submitted from this buffer's cursor.")
+
+(defvar-local qq-chat--guild-read-request-p nil
+  "Non-nil while this channel buffer is marking its native Guild peer read.")
 
 (defvar qq-chat-timeline-mode-map
   (let ((map (make-sparse-keymap)))
@@ -546,6 +559,25 @@ line; nil keeps service rows such as poke strictly one-line."
         (format "%s • %s" primary secondary)
       primary)))
 
+(defun qq-chat--open-message-sender-profile (message)
+  "Open MESSAGE sender in its exact native identity domain."
+  (let ((session-key (or (alist-get 'session-key message)
+                         qq-chat--session-key)))
+    (if (and session-key
+             (eq (qq-state-session-key-type session-key) 'guild-channel))
+        (let* ((identity (qq-state-session-key-identity session-key))
+               (guild-id (alist-get 'guild-id identity))
+               (native-id (alist-get 'sender-native-id message)))
+          (unless (and (qq-protocol--nonzero-decimal-string-p guild-id)
+                       (qq-protocol--nonzero-decimal-string-p native-id))
+            (user-error "qq: channel message sender has no native profile identity"))
+          (qq-guild-user-open guild-id native-id))
+      (let ((sender-id (alist-get 'sender-id message)))
+        (unless (and (qq-api-user-id-p sender-id)
+                     (not (equal sender-id "0")))
+          (user-error "qq: sender has no user profile"))
+        (qq-user-open sender-id)))))
+
 (defun qq-chat--insert-message-sender (message face)
   "Insert sender label for MESSAGE using FACE.
 
@@ -554,12 +586,7 @@ available."
   (let* ((parts (qq-chat--message-sender-display-parts message))
          (primary (car parts))
          (secondary (cdr parts))
-         (sender-id (alist-get 'sender-id message))
-         (action (lambda ()
-                   (if (and (qq-api-user-id-p sender-id)
-                            (not (equal sender-id "0")))
-                       (qq-user-open sender-id)
-                     (user-error "qq: sender has no user profile"))))
+         (action (lambda () (qq-chat--open-message-sender-profile message)))
          (help-echo "Open sender profile")
          (properties '(read-only t front-sticky t rear-nonsticky (read-only))))
     (appkit-ui-insert-action-button
@@ -807,11 +834,29 @@ canonical session timeline are compared."
   "Advance native read position through MESSAGE.
 
 With FORCE, submit even when this buffer already requested the same target."
-  (when-let* ((message-id (alist-get 'server-id message))
-              ((qq-api-message-id-p message-id))
-              ((or force (qq-chat--read-target-needed-p message-id))))
-    (setq qq-chat--last-read-target-id message-id)
-    (qq-api-mark-message-read qq-chat--session-key message-id)))
+  (if (eq (qq-state-session-key-type qq-chat--session-key) 'guild-channel)
+      (let ((unread (alist-get 'unread-count
+                               (qq-state-session qq-chat--session-key))))
+        (when (and (integerp unread) (> unread 0)
+                   (not qq-chat--guild-read-request-p))
+          (let ((buffer (current-buffer)))
+            (setq qq-chat--guild-read-request-p t)
+            (qq-api-mark-guild-read
+             qq-chat--session-key
+             (lambda (_navigation)
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (setq qq-chat--guild-read-request-p nil))))
+             (lambda (response reason)
+               (when (buffer-live-p buffer)
+                 (with-current-buffer buffer
+                   (setq qq-chat--guild-read-request-p nil)))
+               (qq-api--default-error response reason))))))
+    (when-let* ((message-id (alist-get 'server-id message))
+                ((qq-api-message-id-p message-id))
+                ((or force (qq-chat--read-target-needed-p message-id))))
+      (setq qq-chat--last-read-target-id message-id)
+      (qq-api-mark-message-read qq-chat--session-key message-id))))
 
 (defun qq-chat--manage-read-position (&optional position)
   "Advance read state to the message represented by POSITION.
@@ -1722,11 +1767,10 @@ Order (telega-inspired):
 
 (defun qq-chat--message-media-cache-keys (message)
   "Return media cache keys that can affect MESSAGE rendering."
-  (let ((sender-id (or (alist-get 'sender-id message)
-                       (alist-get 'user-id message)))
-        keys)
-    (when sender-id
-      (push (format "avatar:%s" sender-id) keys))
+  (let (keys)
+    (when-let* ((avatar-key
+                 (qq-media-message-avatar-cache-key message)))
+      (push avatar-key keys))
     (dolist (part (alist-get 'parts
                              (qq-state-gray-tip-message-data message)))
       (when (equal (alist-get 'type part) "user")
@@ -3648,9 +3692,7 @@ on the first inline line when the body is pure inline content."
 (defun qq-chat--message-avatar-prefixes (message)
   "Return shared telega-style two-line avatar prefixes for MESSAGE."
   (let* ((sender-id (alist-get 'sender-id message))
-         (image (and sender-id
-                     (not (equal (format "%s" sender-id) "0"))
-                     (qq-media-avatar-image sender-id)))
+         (image (qq-media-message-avatar-image message))
          (prefixes
           (appkit-chat-avatar-prefixes
            image "@"
@@ -4632,9 +4674,14 @@ search highlights; `qq-chat-search-cancel' owns full result-state cleanup."
   (interactive)
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
-  (if (qq-chat--msg-filter-active-p)
-      (qq-chat-filter-refresh)
-    (qq-chat-return-to-latest t)))
+  (cond
+   ((qq-chat--msg-filter-active-p)
+    (qq-chat-filter-refresh))
+   ((eq (qq-state-session-key-type qq-chat--session-key) 'guild-channel)
+    (qq-chat--load-initial-guild-navigation
+     (current-buffer) qq-chat--session-key))
+   (t
+    (qq-chat-return-to-latest t))))
 
 (defun qq-chat--note-history-window (meta &optional remote-latest-id)
   "Project the one around-message history slice described by META.
@@ -4685,6 +4732,9 @@ batch is authoritative latest history."
       (unless quiet (message "qq: latest history is already loaded")))
      ((appkit-chat-history-loading-p)
       (unless quiet (message "qq: history load already in progress")))
+     ((eq (qq-state-session-key-type qq-chat--session-key) 'guild-channel)
+      (qq-chat--load-initial-guild-navigation
+       (current-buffer) qq-chat--session-key))
      (t
       (qq-chat--cancel-initial-history-request)
       (let ((session-key qq-chat--session-key)
@@ -4817,6 +4867,9 @@ than jumping across an unfilled cached gap."
   (cond
    ((appkit-chat-history-loading-p)
     (message "qq: history load already in progress"))
+   ((eq (qq-state-session-key-type qq-chat--session-key) 'guild-channel)
+    (qq-chat--load-initial-guild-navigation
+     (current-buffer) qq-chat--session-key))
    ((and (not force)
          (qq-chat--history-window-known-p)
          (not (qq-chat--history-window-partial-p)))
@@ -4887,10 +4940,61 @@ than jumping across an unfilled cached gap."
                (qq-chat--update-frame)
                (qq-api--default-error response reason)))))))))))
 
+(defun qq-chat--load-older-guild-messages (&optional quiet)
+  "Extend the current Guild sequence range toward older messages."
+  (unless (qq-protocol--decimal-string-p
+           qq-chat--guild-history-start-sequence)
+    (user-error "qq: Guild history range is not initialized; refresh first"))
+  (if (equal qq-chat--guild-history-start-sequence "0")
+      (progn
+        (appkit-chat-history-older-loaded-set t)
+        (unless quiet (message "qq: reached beginning of channel history")))
+    (let* ((session-key qq-chat--session-key)
+           (end-sequence
+            (qq-chat--guild-sequence-offset
+             qq-chat--guild-history-start-sequence -1))
+           (start-sequence (qq-chat--guild-page-start end-sequence))
+           (buffer (current-buffer))
+           (owner (list 'older-guild-history session-key start-sequence)))
+      (appkit-chat-history-request-begin 'older owner)
+      (qq-chat--update-frame)
+      (qq-api-fetch-guild-message-range
+       session-key start-sequence end-sequence
+       (lambda (records)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (when (and (equal qq-chat--session-key session-key)
+                        (appkit-chat-history-request-current-p owner))
+               (appkit-chat-history-request-end owner)
+               (let* ((ids (qq-chat--guild-record-ids records))
+                      (oldest (or (car ids)
+                                  (appkit-chat-history-window-first-key))))
+                 (setq qq-chat--guild-history-start-sequence start-sequence)
+                 (appkit-chat-history-older-loaded-set
+                  (equal start-sequence "0"))
+                 (when oldest
+                   (qq-chat--set-history-window oldest nil))
+                 (qq-chat--header-line-update)
+                 (qq-chat--update-frame)
+                 (qq-chat--sync-timeline)
+                 (unless quiet
+                   (message "qq: loaded %d older channel message%s"
+                            (length records)
+                            (if (= (length records) 1) "" "s"))))))))
+       (lambda (response reason)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (when (and (equal qq-chat--session-key session-key)
+                        (appkit-chat-history-request-current-p owner))
+               (appkit-chat-history-request-end owner)
+               (qq-chat--update-frame)
+               (qq-api--default-error response reason)))))))))
+
 (defun qq-chat-load-older-messages (&optional quiet)
   "Extend the current contiguous history window by one older page.
 
-Uses the current window's first exact string id as NapCat `message_seq'."
+Ordinary chats page by exact snowflake cursor.  Guild channels page by their
+independent native sequence range."
   (interactive)
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
@@ -4903,6 +5007,8 @@ Uses the current window's first exact string id as NapCat `message_seq'."
     (unless quiet (message "qq: no older messages available")))
    ((appkit-chat-history-loading-p)
     (unless quiet (message "qq: history load already in progress")))
+   ((eq (qq-state-session-key-type qq-chat--session-key) 'guild-channel)
+    (qq-chat--load-older-guild-messages quiet))
    (t
     (qq-chat--cancel-initial-history-request)
     (let* ((session-key qq-chat--session-key)
@@ -5189,12 +5295,15 @@ Clicking an existing reaction chip performs add/remove toggle instead."
   (interactive)
   (let* ((message (or (qq-chat--message-at-point)
                       (user-error "qq: no message at point")))
-         (user-id (or (get-text-property
-                       (point) 'qq-chat-gray-tip-user-id)
-                      (alist-get 'sender-id message))))
-    (unless (and (qq-api-user-id-p user-id) (not (equal user-id "0")))
-      (user-error "qq: message sender has no user profile"))
-    (qq-user-open user-id)))
+         (gray-tip-user-id (get-text-property
+                            (point) 'qq-chat-gray-tip-user-id)))
+    (if gray-tip-user-id
+        (progn
+          (unless (and (qq-api-user-id-p gray-tip-user-id)
+                       (not (equal gray-tip-user-id "0")))
+            (user-error "qq: service message has no user profile"))
+          (qq-user-open gray-tip-user-id))
+      (qq-chat--open-message-sender-profile message))))
 
 (defun qq-chat-open-peer-user ()
   "Open the current private peer's user page."
@@ -5256,7 +5365,11 @@ This is the QQ counterpart of `telega-chatbuf-read-all': when an around
 window is partial, fetch the real latest page before submitting its exact
 opaque message id."
   (interactive)
-  (qq-chat-return-to-latest nil t))
+  (if (eq (qq-state-session-key-type qq-chat--session-key) 'guild-channel)
+      (qq-api-mark-guild-read
+       qq-chat--session-key
+       (lambda (_navigation) (message "qq: channel marked read")))
+    (qq-chat-return-to-latest nil t)))
 
 (defun qq-chat--poke-session (session-key)
   "Return poke-capable SESSION-KEY metadata, or signal `user-error'."
@@ -5433,6 +5546,7 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (setq-local qq-chat--forward-request-owner nil)
   (setq-local qq-chat--forward-plan-owner (list 'forward-plan-owner))
   (setq-local qq-chat--last-read-target-id nil)
+  (setq-local qq-chat--guild-read-request-p nil)
   (setq-local qq-chat--fill-column nil)
   (setq-local appkit-media-card-fallback-context-function
               #'qq-chat--media-card-fallback-context)
@@ -5638,7 +5752,7 @@ never installed."
         (setq qq-chat--initial-history-request request)))
     request))
 
-(defun qq-chat--load-initial-history (buffer session-key)
+(defun qq-chat--load-initial-ordinary-history (buffer session-key)
   "Load SESSION-KEY around its official QQ read position when available."
   (let ((owner (list :kind 'initial-history
                      :session-key session-key
@@ -5686,6 +5800,121 @@ never installed."
         (with-current-buffer buffer
           (setq qq-chat--initial-history-request request)))
       request)))
+
+(defun qq-chat--guild-sequence-offset (sequence delta)
+  "Return decimal SEQUENCE shifted by integer DELTA, saturating at zero.
+
+Guild message sequences are counters, not snowflake message identities.
+Emacs integer arithmetic is arbitrary precision, so this never rounds them."
+  (unless (and (qq-protocol--decimal-string-p sequence) (integerp delta))
+    (error "qq: invalid Guild sequence arithmetic operands"))
+  (number-to-string (max 0 (+ (string-to-number sequence) delta))))
+
+(defun qq-chat--guild-page-start (end-sequence)
+  "Return the inclusive page start ending at END-SEQUENCE."
+  (qq-chat--guild-sequence-offset
+   end-sequence (- 1 (max 1 qq-history-fetch-count))))
+
+(defun qq-chat--guild-record-ids (records)
+  "Return exact message ids from validated Guild RECORDS."
+  (mapcar (lambda (record) (alist-get 'message_id record)) records))
+
+(defun qq-chat--complete-initial-guild-navigation
+    (buffer session-key owner start-sequence end-sequence records)
+  "Finish initial Guild OWNER after loading RECORDS for an exact range."
+  (when (qq-chat--initial-history-request-current-p buffer session-key owner)
+    (with-current-buffer buffer
+      (appkit-chat-history-request-end owner)
+      (setq qq-chat--initial-history-owner nil
+            qq-chat--initial-history-request nil)
+      (let* ((ids (qq-chat--guild-record-ids records))
+             (oldest (car ids))
+             (latest (car (last ids))))
+        (setq qq-chat--remote-latest-id latest
+              qq-chat--guild-history-start-sequence start-sequence
+              qq-chat--guild-history-end-sequence end-sequence)
+        (appkit-chat-history-older-loaded-set
+         (equal start-sequence "0"))
+        (if oldest
+            (qq-chat--set-history-window oldest nil)
+          (qq-chat--set-empty-history-window))
+        (qq-chat--update-frame)
+        (qq-chat--sync-timeline)
+        (goto-char (or (appkit-chatbuf-input-start-position) (point-max)))))))
+
+(defun qq-chat--load-initial-guild-range
+    (buffer session-key owner end-sequence)
+  "Load the latest Guild page ending at END-SEQUENCE for OWNER."
+  (let ((start-sequence (qq-chat--guild-page-start end-sequence)))
+    (if (equal end-sequence "0")
+        (qq-chat--complete-initial-guild-navigation
+         buffer session-key owner "0" "0" nil)
+      (let ((pending t)
+            request)
+        (setq request
+              (qq-api-fetch-guild-message-range
+               session-key start-sequence end-sequence
+               (lambda (records)
+                 (setq pending nil)
+                 (qq-chat--complete-initial-guild-navigation
+                  buffer session-key owner start-sequence end-sequence records))
+               (lambda (response reason)
+                 (setq pending nil)
+                 (qq-chat--fail-initial-history-load
+                  buffer session-key owner response reason))))
+        (when (and pending
+                   (qq-chat--initial-history-request-current-p
+                    buffer session-key owner))
+          (with-current-buffer buffer
+            (setq qq-chat--initial-history-request request)))
+        request))))
+
+(defun qq-chat--load-initial-guild-navigation (buffer session-key)
+  "Load authoritative Guild navigation before showing live channel messages."
+  (let ((owner (list :kind 'initial-guild-navigation
+                     :session-key session-key)))
+    (with-current-buffer buffer
+      (when qq-chat--initial-history-request
+        (qq-api-cancel-request qq-chat--initial-history-request))
+      (appkit-chat-history-window-clear)
+      (setq qq-chat--initial-history-owner owner
+            qq-chat--initial-history-request nil)
+      (appkit-chat-history-request-begin 'initial owner)
+      (qq-chat--sync-timeline :messages nil)
+      (qq-chat--update-frame))
+    (let ((pending t)
+          request)
+      (setq request
+            (qq-api-fetch-guild-navigation
+             session-key
+             (lambda (_navigation)
+               (setq pending nil)
+               (let* ((identity (qq-state-session-key-identity session-key))
+                      (channel
+                       (qq-state-guild-channel
+                        (alist-get 'guild-id identity)
+                        (alist-get 'channel-id identity)))
+                      (latest (alist-get 'latest_sequence channel)))
+                 (unless (qq-protocol--decimal-string-p latest)
+                   (error "qq: Guild channel lacks latest_sequence"))
+                 (qq-chat--load-initial-guild-range
+                  buffer session-key owner latest)))
+             (lambda (response reason)
+               (setq pending nil)
+               (qq-chat--fail-initial-history-load
+                buffer session-key owner response reason))))
+      (when (and pending
+                 (qq-chat--initial-history-request-current-p
+                  buffer session-key owner))
+        (with-current-buffer buffer
+          (setq qq-chat--initial-history-request request)))
+      request)))
+
+(defun qq-chat--load-initial-history (buffer session-key)
+  "Load the protocol-specific initial position for SESSION-KEY."
+  (if (eq (qq-state-session-key-type session-key) 'guild-channel)
+      (qq-chat--load-initial-guild-navigation buffer session-key)
+    (qq-chat--load-initial-ordinary-history buffer session-key)))
 
 (defun qq-chat--open-buffer (session-key)
   "Create or reuse SESSION-KEY's chat view without loading history."

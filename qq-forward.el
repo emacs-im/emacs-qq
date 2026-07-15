@@ -714,13 +714,55 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
                   (appkit-invalidations-position-p invalidations))
           (qq-forward--sync-timeline))))))
 
-(defun qq-forward--request-current-p (buffer source owner)
-  "Return non-nil when OWNER still owns SOURCE in forward BUFFER."
-  (and (buffer-live-p buffer)
+(defun qq-forward--request-timeline-sync (view)
+  "Request one coalesced structural timeline sync for live VIEW."
+  (appkit-request-sync view :structure t :part 'timeline))
+
+(defun qq-forward--apply-load-event (event)
+  "Apply one owner-checked forward load EVENT to viewer-local domain state."
+  (pcase (plist-get event :type)
+    ('load-start
+     (setq qq-forward--loading t
+           qq-forward--error nil))
+    ('load-success
+     (setq qq-forward--messages (plist-get event :messages)
+           qq-forward--loaded-p t
+           qq-forward--loading nil
+           qq-forward--error nil
+           qq-forward--request nil
+           qq-forward--request-owner nil))
+    ('load-error
+     (setq qq-forward--loading nil
+           qq-forward--error (plist-get event :error)
+           qq-forward--request nil
+           qq-forward--request-owner nil))
+    (type
+     (error "qq: unknown forward load event %S" type))))
+
+(defun qq-forward--request-current-p (view buffer source owner)
+  "Return non-nil when live VIEW still owns SOURCE and OWNER in BUFFER."
+  (and (appkit-view-live-p view)
+       (eq buffer (appkit-view-buffer view))
+       (buffer-live-p buffer)
        (with-current-buffer buffer
          (and (derived-mode-p 'qq-forward-mode)
+              (eq view (appkit-current-view))
               (equal qq-forward--source source)
               (eq qq-forward--request-owner owner)))))
+
+(defun qq-forward--accept-request-event
+    (view buffer source owner event)
+  "Apply terminal EVENT for VIEW, BUFFER, SOURCE, and OWNER.
+
+The event is accepted only while VIEW still owns SOURCE and OWNER in BUFFER.
+The callback boundary updates viewer-local domain state and requests an Appkit
+sync; timeline mutation remains owned by `qq-forward--sync-invalidations'."
+  (when (qq-forward--request-current-p view buffer source owner)
+    (appkit-with-live-view view
+      (when (qq-forward--request-current-p view buffer source owner)
+        (qq-forward--apply-load-event event)
+        (qq-forward--request-timeline-sync view)
+        t))))
 
 (defun qq-forward--cancel-request ()
   "Cancel and forget the active native forward request."
@@ -740,68 +782,60 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
 
 (defun qq-forward--load-remote ()
   "Start an owner-scoped remote load for the current viewer."
-  (let* ((buffer (current-buffer))
+  (let* ((view (qq-forward--ensure-view))
+         (buffer (current-buffer))
          (source (copy-tree qq-forward--source))
          (owner (list 'forward-request source)))
     (unless source
       (user-error "qq: this viewer has no remote forward reference"))
     (qq-forward--cancel-request)
-    (setq qq-forward--loading t
-          qq-forward--error nil
-          qq-forward--request-owner owner)
-    (qq-forward--sync-timeline)
+    (setq qq-forward--request-owner owner)
+    (qq-forward--apply-load-event '(:type load-start))
+    (qq-forward--request-timeline-sync view)
     (condition-case error-data
         (let ((request
                 (qq-api-get-forward
                  source
                  (lambda (raw-messages)
-                   (when (qq-forward--request-current-p buffer source owner)
-                     (with-current-buffer buffer
-                       (setq qq-forward--request nil
-                             qq-forward--request-owner nil)
-                       (condition-case error-data
-                           (let ((messages
-                                  (qq-forward--normalize-messages
-                                   raw-messages)))
-                             (setq qq-forward--messages messages
-                                   qq-forward--loaded-p t
-                                   qq-forward--loading nil
-                                   qq-forward--error nil)
-                             (qq-forward--sync-timeline))
-                         (error
-                          (setq qq-forward--loading nil
-                                qq-forward--error
-                                (error-message-string error-data))
-                          (qq-forward--sync-timeline))))))
+                   (when (qq-forward--request-current-p
+                          view buffer source owner)
+                     (let ((event
+                            (condition-case error-data
+                                (list
+                                 :type 'load-success
+                                 :messages
+                                 (qq-forward--normalize-messages raw-messages))
+                              (error
+                               (list
+                                :type 'load-error
+                                :error
+                                (error-message-string error-data))))))
+                       (qq-forward--accept-request-event
+                        view buffer source owner event))))
                  (lambda (response reason)
-                   (when (qq-forward--request-current-p buffer source owner)
-                     (with-current-buffer buffer
-                       (setq qq-forward--loading nil
-                             qq-forward--error
-                             (qq-forward--error-text response reason)
-                             qq-forward--request nil
-                             qq-forward--request-owner nil)
-                       (qq-forward--sync-timeline)))))))
+                   (qq-forward--accept-request-event
+                    view buffer source owner
+                    (list :type 'load-error
+                          :error
+                          (qq-forward--error-text response reason)))))))
           ;; A synchronous callback may already have released OWNER.
           (when (eq qq-forward--request-owner owner)
             (setq qq-forward--request request)))
       (error
-       (when (qq-forward--request-current-p buffer source owner)
-         (setq qq-forward--loading nil
-               qq-forward--error (error-message-string error-data)
-               qq-forward--request nil
-               qq-forward--request-owner nil)
-         (qq-forward--sync-timeline))))))
+       (qq-forward--accept-request-event
+        view buffer source owner
+        (list :type 'load-error
+              :error (error-message-string error-data)))))))
 
 (defun qq-forward--load-inline ()
   "Render the authoritative inline subtree in the current viewer."
-  (qq-forward--cancel-request)
-  (setq qq-forward--messages
-        (qq-forward--normalize-messages qq-forward--inline-content)
-        qq-forward--loaded-p t
-        qq-forward--loading nil
-        qq-forward--error nil)
-  (qq-forward--sync-timeline))
+  (let ((view (qq-forward--ensure-view)))
+    (qq-forward--cancel-request)
+    (qq-forward--apply-load-event
+     (list :type 'load-success
+           :messages
+           (qq-forward--normalize-messages qq-forward--inline-content)))
+    (qq-forward--request-timeline-sync view)))
 
 (defun qq-forward-refresh ()
   "Refresh the current merged-forward viewer.
@@ -928,6 +962,7 @@ records issue a fresh `emacs_get_forward' request."
          (app (qq-runtime-app))
          (view-id (qq-forward--view-id buffer-key))
          (existing (appkit-view-for-id app view-id))
+         (view existing)
          (buffer (or (and existing (appkit-view-buffer existing))
                      (generate-new-buffer (qq-forward--buffer-name name-key)))))
     (with-current-buffer buffer
@@ -946,13 +981,14 @@ records issue a fresh `emacs_get_forward' request."
               qq-forward--inline-p inline-p
               qq-forward--inline-content (and inline-p
                                               (copy-tree inline-content)))
-        (appkit-attach-view
-         :app app
-         :id view-id
-         :state buffer-key
-         :mode 'qq-forward-mode
-         :sync-function #'qq-forward--sync-invalidations
-         :parts '(timeline)))
+        (setq view
+              (appkit-attach-view
+               :app app
+               :id view-id
+               :state buffer-key
+               :mode 'qq-forward-mode
+               :sync-function #'qq-forward--sync-invalidations
+               :parts '(timeline))))
       (unless (equal qq-forward--buffer-key buffer-key)
         (error "qq: appkit returned a mismatched forward view"))
       (if inline-p
@@ -965,6 +1001,8 @@ records issue a fresh `emacs_get_forward' request."
     (pop-to-buffer buffer)
     (with-current-buffer buffer
       (qq-forward--on-window-size-change))
+    (unless existing
+      (appkit-sync-invalidations view))
     buffer))
 
 ;;;###autoload

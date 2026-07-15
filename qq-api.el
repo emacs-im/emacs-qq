@@ -13,11 +13,15 @@
 (require 'subr-x)
 (require 'qq-customize)
 (require 'qq-protocol)
+
+(declare-function qq-state-apply-guild-directory "qq-state" (directory))
+(declare-function qq-state-apply-guild-navigation "qq-state" (navigation))
 (require 'qq-state)
 (require 'qq-transport)
 
 (declare-function qq-transport-cancel "qq-transport" (echo))
 (declare-function qq-state-apply-poke-notice "qq-state" (notice))
+(declare-function qq-state-merge-guild-message "qq-state" (event))
 
 (defvar qq-api--read-operations (make-hash-table :test #'equal)
   "In-flight mark-read operations keyed by session key.
@@ -671,7 +675,7 @@ segments.  A resolve action result itself must be terminal or available."
                "mface" "mail" "wallet" "music" "poke" "dice" "rps" "contact"
                "location" "json" "card" "xml" "markdown" "miniapp"
                "onlinefile" "flashtransfer" "video" "forward"
-               "forward-card" "unsupported"))
+               "forward-card" "gray-tip" "unsupported"))
       (qq-api--signal-schema-error
        protocol-p "qq: %s has unsupported native kind %S" context kind))
     (pcase kind
@@ -771,8 +775,21 @@ segments.  A resolve action result itself must be terminal or available."
                 protocol-p "qq: %s wallet.%s.%s must be an integer"
                 context key number-key)))
            (qq-api--validate-string-fields
-            presentation '(title sub_title content notice)
-            context protocol-p))))
+           presentation '(title sub_title content notice)
+           context protocol-p))))
+      ("gray-tip"
+       (unless (qq-api--exact-object-keys-p
+                payload '(gray_tip_kind text native_id))
+         (qq-api--signal-schema-error
+          protocol-p "qq: %s gray-tip payload has invalid fields" context))
+       (unless (equal (alist-get 'gray_tip_kind payload) "revoke")
+         (qq-api--signal-schema-error
+          protocol-p "qq: %s gray-tip kind is invalid" context))
+       (dolist (key '(text native_id))
+         (unless (qq-api-non-empty-string-p (alist-get key payload))
+           (qq-api--signal-schema-error
+            protocol-p "qq: %s gray-tip.%s must be non-empty"
+            context key))))
       ("video"
        (unless (qq-api--exact-object-keys-p
                 payload '(file remote)
@@ -1145,6 +1162,106 @@ segments.  A resolve action result itself must be terminal or available."
          (pinned . ,(alist-get 'pinned group))
          (self_permission . ,(alist-get 'self_permission group)))))))
 
+(defun qq-api--validate-guild-directory-snapshot (data)
+  "Validate and copy exact native QQ Guild directory DATA."
+  (unless (qq-api--exact-object-keys-p data '(guilds channels))
+    (error "qq: emacs_get_guild_directory returned an invalid object"))
+  (let ((guilds (alist-get 'guilds data))
+        (channels (alist-get 'channels data))
+        (seen-guilds (make-hash-table :test #'equal))
+        (seen-channels (make-hash-table :test #'equal)))
+    (unless (and (listp guilds) (listp channels))
+      (error "qq: Guild directory members must be arrays"))
+    (cl-labels
+        ((decimal (value context &optional zero)
+           (unless (if zero
+                       (qq-protocol--decimal-string-p value)
+                     (qq-protocol--nonzero-decimal-string-p value))
+             (error "qq: %s must be an original decimal string" context)))
+         (pin (value context)
+           (unless (or (null value)
+                       (qq-protocol--decimal-string-p value))
+             (error "qq: %s must be a decimal string or null" context))))
+      (cl-loop
+       for guild in guilds
+       for index from 0
+       do
+       (let ((context (format "emacs_get_guild_directory.guilds[%d]" index)))
+         (unless (qq-api--exact-object-keys-p
+                  guild '(guild_id name avatar_seq pinned_at))
+           (error "qq: %s has invalid fields" context))
+         (let ((guild-id (alist-get 'guild_id guild)))
+           (decimal guild-id (concat context ".guild_id"))
+           (when (gethash guild-id seen-guilds)
+             (error "qq: Guild directory duplicated guild_id %s" guild-id))
+           (puthash guild-id t seen-guilds))
+         (unless (stringp (alist-get 'name guild))
+           (error "qq: %s.name must be a string" context))
+         (decimal (alist-get 'avatar_seq guild)
+                  (concat context ".avatar_seq") t)
+         (pin (alist-get 'pinned_at guild) (concat context ".pinned_at"))))
+      (cl-loop
+       for channel in channels
+       for index from 0
+       do
+       (let ((context (format "emacs_get_guild_directory.channels[%d]" index)))
+         (unless (qq-api--exact-object-keys-p
+                  channel '(guild_id channel_id guild_name name kind avatar_seq
+                                      pinned_at latest_sequence))
+           (error "qq: %s has invalid fields" context))
+         (let* ((guild-id (alist-get 'guild_id channel))
+                (channel-id (alist-get 'channel_id channel))
+                (key (cons guild-id channel-id)))
+           (decimal guild-id (concat context ".guild_id"))
+           (decimal channel-id (concat context ".channel_id"))
+           (when (gethash key seen-channels)
+             (error "qq: Guild directory duplicated channel identity"))
+           (puthash key t seen-channels))
+         (dolist (field '(guild_name name))
+           (unless (stringp (alist-get field channel))
+             (error "qq: %s.%s must be a string" context field)))
+         (unless (member (alist-get 'kind channel)
+                         '("text" "forum" "live" "application" "schedule"))
+           (error "qq: %s.kind is invalid" context))
+         (decimal (alist-get 'avatar_seq channel)
+                  (concat context ".avatar_seq") t)
+         (pin (alist-get 'pinned_at channel) (concat context ".pinned_at"))
+         (decimal (alist-get 'latest_sequence channel)
+                  (concat context ".latest_sequence") t)))
+      (copy-tree data))))
+
+(defun qq-api--validate-guild-navigation (navigation expected-chat)
+  "Validate Guild NAVIGATION and require EXPECTED-CHAT identity."
+  (unless (qq-api--exact-object-keys-p
+           navigation
+           '(chat unread_count begin_sequence navigation_sequences))
+    (error "qq: Guild navigation has invalid fields"))
+  (let ((chat (qq-api-validate-forward-session-locator
+               (alist-get 'chat navigation) "Guild navigation chat" t)))
+    (unless (and (equal (alist-get 'kind chat) "guild-channel")
+                 (equal chat expected-chat))
+      (error "qq: Guild navigation returned a contradictory channel identity")))
+  (unless (qq-protocol--nonnegative-safe-integer-p
+           (alist-get 'unread_count navigation))
+    (error "qq: Guild navigation unread_count must be a safe non-negative integer"))
+  (unless (qq-protocol--decimal-string-p
+           (alist-get 'begin_sequence navigation))
+    (error "qq: Guild navigation begin_sequence must be a decimal string"))
+  (let ((sequences (alist-get 'navigation_sequences navigation)))
+    (unless (and (listp sequences) (proper-list-p sequences))
+      (error "qq: Guild navigation_sequences must be an array"))
+    (cl-loop
+     for entry in sequences
+     for index from 0
+     do
+     (unless (qq-api--exact-object-keys-p entry '(sequence native_kind))
+       (error "qq: Guild navigation_sequences[%d] has invalid fields" index))
+     (unless (qq-protocol--decimal-string-p (alist-get 'sequence entry))
+       (error "qq: Guild navigation_sequences[%d].sequence is invalid" index))
+     (unless (integerp (alist-get 'native_kind entry))
+       (error "qq: Guild navigation_sequences[%d].native_kind is invalid" index))))
+  (copy-tree navigation))
+
 (defun qq-api--snapshot-live-subscribers (request)
   "Return active subscribers owned by authoritative REQUEST."
   (seq-filter #'qq-api--snapshot-subscription-active-p
@@ -1302,6 +1419,137 @@ segments.  A resolve action result itself must be terminal or available."
    #'qq-state-apply-groups
    callback errback))
 
+(defun qq-api-refresh-guild-directory (&optional callback errback)
+  "Refresh the native QQ Guild directory, then call CALLBACK with it."
+  (interactive)
+  (qq-api-call
+   "emacs_get_guild_directory" '()
+   (lambda (response)
+     (condition-case error-data
+         (let ((directory
+                (qq-api--validate-guild-directory-snapshot
+                 (qq-api--response-data response))))
+           (qq-state-apply-guild-directory directory)
+           (when callback (funcall callback directory)))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   errback))
+
+(defun qq-api--validate-guild-member-profile (profile guild-id native-id)
+  "Validate closed PROFILE for GUILD-ID and NATIVE-ID."
+  (unless (qq-api--exact-object-keys-p
+           profile '(guild_id native_id display_name nickname member_name
+                               avatar_url))
+    (error "qq: invalid native Guild member profile shape"))
+  (unless (and (equal (alist-get 'guild_id profile) guild-id)
+               (equal (alist-get 'native_id profile) native-id)
+               (qq-api-non-empty-string-p (alist-get 'display_name profile))
+               (stringp (alist-get 'nickname profile))
+               (stringp (alist-get 'member_name profile))
+               (stringp (alist-get 'avatar_url profile))
+               (string-match-p "\\`https://" (alist-get 'avatar_url profile)))
+    (error "qq: invalid native Guild member profile identity or fields"))
+  (copy-tree profile))
+
+(defun qq-api-get-guild-member-profile
+    (guild-id native-id callback &optional errback)
+  "Fetch NATIVE-ID's authoritative simple profile in GUILD-ID."
+  (unless (qq-protocol--nonzero-decimal-string-p guild-id)
+    (user-error "qq: Guild member profile requires a native Guild id"))
+  (unless (qq-protocol--nonzero-decimal-string-p native-id)
+    (user-error "qq: Guild member profile requires a native tinyId"))
+  (qq-api-call
+   "emacs_get_guild_member_profile"
+   `((guild_id . ,guild-id) (native_id . ,native-id))
+   (lambda (response)
+     (condition-case error-data
+         (funcall callback
+                  (qq-api--validate-guild-member-profile
+                   (qq-api--response-data response) guild-id native-id))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   errback))
+
+(defun qq-api-fetch-guild-navigation (session-key callback &optional errback)
+  "Fetch and apply authoritative Guild navigation for SESSION-KEY."
+  (unless (eq (qq-state-session-key-type session-key) 'guild-channel)
+    (user-error "qq: Guild navigation requires a channel session"))
+  (let ((chat (qq-api--session-emacs-locator session-key)))
+    (qq-api-call
+     "emacs_get_guild_navigation" `((chat . ,chat))
+     (lambda (response)
+       (condition-case error-data
+           (let ((navigation
+                  (qq-api--validate-guild-navigation
+                   (qq-api--response-data response) chat)))
+             (qq-state-apply-guild-navigation navigation)
+             (when callback (funcall callback navigation)))
+         (error
+          (funcall (or errback #'qq-api--default-error)
+                   response (error-message-string error-data)))))
+     errback)))
+
+(defun qq-api-mark-guild-read (session-key &optional callback errback)
+  "Mark Guild channel SESSION-KEY read and apply the returned navigation."
+  (unless (eq (qq-state-session-key-type session-key) 'guild-channel)
+    (user-error "qq: Guild read requires a channel session"))
+  (let ((chat (qq-api--session-emacs-locator session-key)))
+    (qq-api-call
+     "emacs_mark_guild_read" `((chat . ,chat))
+     (lambda (response)
+       (condition-case error-data
+           (let ((navigation
+                  (qq-api--validate-guild-navigation
+                   (qq-api--response-data response) chat)))
+             (qq-state-apply-guild-navigation navigation)
+             (when callback (funcall callback navigation)))
+         (error
+          (funcall (or errback #'qq-api--default-error)
+                   response (error-message-string error-data)))))
+     errback)))
+
+(defun qq-api-fetch-guild-message-range
+    (session-key start-sequence end-sequence callback &optional errback)
+  "Fetch exact Guild SESSION-KEY messages from START-SEQUENCE to END-SEQUENCE."
+  (unless (eq (qq-state-session-key-type session-key) 'guild-channel)
+    (user-error "qq: Guild range history requires a channel session"))
+  (dolist (sequence (list start-sequence end-sequence))
+    (unless (qq-protocol--decimal-string-p sequence)
+      (user-error "qq: Guild history sequences must be decimal strings")))
+  (let* ((chat (qq-api--session-emacs-locator session-key))
+         (channel-kind
+          (alist-get 'channel-kind (qq-state-session session-key))))
+    (unless (member channel-kind '("text" "forum"))
+      (user-error "qq: this channel kind has no message timeline"))
+    (qq-api-call
+     "emacs_get_guild_messages_by_range"
+     `((chat . ,chat)
+       (channel_kind . ,channel-kind)
+       (start_sequence . ,start-sequence)
+       (end_sequence . ,end-sequence))
+     (lambda (response)
+       (condition-case error-data
+           (let ((data (qq-api--response-data response)))
+             (unless (qq-api--exact-object-keys-p data '(messages))
+               (error "qq: Guild history range has invalid fields"))
+             (let ((messages (alist-get 'messages data)))
+               (unless (and (listp messages) (proper-list-p messages))
+                 (error "qq: Guild history messages must be an array"))
+               (dolist (record messages)
+                 (let ((validated
+                        (qq-api--validate-guild-message-record record)))
+                   (unless (equal (alist-get 'chat validated) chat)
+                     (error "qq: Guild history returned a contradictory channel"))
+                   (qq-state-merge-guild-message
+                    (cons '(post_type . "emacs_guild_message") validated))))
+               (when callback (funcall callback (copy-tree messages)))))
+         (error
+          (funcall (or errback #'qq-api--default-error)
+                   response (error-message-string error-data)))))
+     errback)))
+
 (defun qq-api-bootstrap ()
   "Run initial bootstrap in dependency order.
 
@@ -1312,12 +1560,18 @@ self message as incoming or store a weaker sender display name."
   (qq-api-refresh-status)
   (cl-labels
       ((recent () (qq-api-refresh-recent-contacts))
-       (groups ()
-         (qq-api-refresh-joined-groups
-          (lambda (_groups) (recent))
+       (guilds ()
+         (qq-api-refresh-guild-directory
+          (lambda (_directory) (recent))
           (lambda (response reason)
             (qq-api--default-error response reason)
             (recent))))
+       (groups ()
+         (qq-api-refresh-joined-groups
+          (lambda (_groups) (guilds))
+          (lambda (response reason)
+            (qq-api--default-error response reason)
+            (guilds))))
        (friends ()
          (qq-api-refresh-friend-categories
           (lambda (_friends) (groups))
@@ -1345,6 +1599,10 @@ self message as incoming or store a weaker sender display name."
     (pcase type
       ('group
        `((group_id . ,target-id)))
+      ('guild-channel
+       `((chat_type . ,(alist-get 'chat-type identity))
+         (peer_uid . ,(alist-get 'peer-uid identity))
+         (guild_id . ,(alist-get 'guild-id identity))))
       ('dataline
        `((chat_type . ,(alist-get 'chat-type identity))
          (peer_uid . ,(alist-get 'peer-uid identity))))
@@ -1387,6 +1645,10 @@ NapCat throws when `message_seq' is unknown or the page is empty
       ('service
        `((kind . "service")
          (peer_uid . ,(alist-get 'peer-uid identity))))
+      ('guild-channel
+       `((kind . "guild-channel")
+         (guild_id . ,(alist-get 'guild-id identity))
+         (channel_id . ,(alist-get 'channel-id identity))))
       (_ (error "qq: unsupported Emacs session type %s" type)))))
 
 (defun qq-api--session-emacs-params (session-key)
@@ -1517,6 +1779,10 @@ peer UIDs stay strings and are never interpreted as QQ numbers."
      (qq-state-session-key 'group (alist-get 'group_id locator)))
     ("private"
      (qq-state-session-key 'private (alist-get 'user_id locator)))
+    ("guild-channel"
+     (qq-state-guild-channel-session-key
+      (alist-get 'guild_id locator)
+      (alist-get 'channel_id locator)))
     ("dataline"
      (qq-state-session-key 'dataline
                            (alist-get 'peer_uid locator)
@@ -1534,6 +1800,8 @@ NapCat resolves the kernel first-unread sequence to the hard-cut NT snowflake
 in `first_unread.message_id'.  CALLBACK receives the validated raw read-state
 payload.  Fetching alone does not mutate local unread state: callers that own a
 freshness barrier decide whether the response may be applied."
+  (when (eq (qq-state-session-key-type session-key) 'guild-channel)
+    (user-error "qq: use Guild navigation for channel read state"))
   (let ((handle-error (or errback #'qq-api--default-error)))
     (qq-api-call
      "emacs_get_read_state"
@@ -1571,6 +1839,8 @@ COUNT overrides `qq-history-fetch-count' when non-nil (used by jump seek).
 CALLBACK receives the merge-history plist
 \(`:added-count', `:message-count', `:oldest-message-id', …).
 ERRBACK receives (RESPONSE REASON)."
+  (when (eq (qq-state-session-key-type session-key) 'guild-channel)
+    (user-error "qq: channel history requires an explicit native sequence range"))
   (let* ((type (alist-get 'type
                           (qq-state-session-key-identity session-key)))
          (action (pcase type
@@ -1845,6 +2115,8 @@ parent message id, or a different interface."
 Fork action: older+newer pages around the NT snowflake center (telega around).
 CALLBACK receives the merge-history plist.  ERRBACK receives
 `(RESPONSE REASON)' when the exact around request fails."
+  (when (eq (qq-state-session-key-type session-key) 'guild-channel)
+    (user-error "qq: channel history requires an explicit native sequence range"))
   (let ((n (max 1 (or count
                       (and (boundp 'qq-chat-jump-history-count)
                            qq-chat-jump-history-count)
@@ -2005,9 +2277,14 @@ is stored as the message `server-id' and becomes the timeline anchor."
   (unless (qq-state-session-sendable-p session-key)
     (user-error "qq: this session is read-only"))
   (let* ((segments (copy-tree (or segments '())))
-         (params (append
-                  (qq-api--session-request-params session-key)
-                  `((message . ,segments))))
+         (guild-p (eq (qq-state-session-key-type session-key) 'guild-channel))
+         (action (if guild-p "emacs_send_guild_message" "send_msg"))
+         (params (if guild-p
+                     `((chat . ,(qq-api--session-emacs-locator session-key))
+                       (message . ,segments))
+                   (append
+                    (qq-api--session-request-params session-key)
+                    `((message . ,segments)))))
          ;; Build and validate request parameters before adding timeline state:
          ;; a synchronous caller error must not leave a permanent pending row.
          (pending (qq-state-insert-pending-message session-key segments raw-message))
@@ -2022,7 +2299,7 @@ is stored as the message `server-id' and becomes the timeline anchor."
       (condition-case err
           (qq-api--call-with-materialization-owner
            session-key
-           "send_msg"
+           action
            params
            (lambda (response request-owner)
              ;; Protocol decoding and state promotion belong to the send
@@ -2034,7 +2311,7 @@ is stored as the message `server-id' and becomes the timeline anchor."
                             (message-id
                              (qq-api-validate-message-id
                               (alist-get 'message_id data nil nil #'eq)
-                              "send_msg response" t)))
+                              (format "%s response" action) t)))
                        (qq-state-mark-pending-message-sent
                         session-key local-id message-id request-owner)
                        t)
@@ -3550,6 +3827,71 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
   "Handle websocket REQUEST event."
   (qq-state-add-request request))
 
+(defun qq-api--validate-guild-message-event (event)
+  "Validate and copy one closed QQ channel message EVENT."
+  (unless (qq-api--exact-object-keys-p
+           event
+           '(post_type chat message_id message_sequence sent_at channel_name
+             sender outgoing state segments))
+    (error "qq: guild message event has invalid fields"))
+  (unless (equal (alist-get 'post_type event) "emacs_guild_message")
+    (error "qq: guild message event has invalid post_type"))
+  (let ((chat (qq-api-validate-forward-session-locator
+               (alist-get 'chat event) "guild message chat" t)))
+    (unless (equal (alist-get 'kind chat) "guild-channel")
+      (error "qq: guild message chat must be a guild-channel locator")))
+  (qq-api-validate-message-id
+   (alist-get 'message_id event) "guild message event" t)
+  (unless (qq-protocol--decimal-string-p
+           (alist-get 'message_sequence event))
+    (error "qq: guild message sequence must be a decimal string"))
+  (unless (and (integerp (alist-get 'sent_at event))
+               (>= (alist-get 'sent_at event) 0))
+    (error "qq: guild message sent_at must be a non-negative integer"))
+  (unless (stringp (alist-get 'channel_name event))
+    (error "qq: guild message channel_name must be a string"))
+  (let ((sender (alist-get 'sender event)))
+    (unless (qq-api--exact-object-keys-p
+             sender '(native_id user_id nickname member_name display_name))
+      (error "qq: guild message sender has invalid fields"))
+    (unless (qq-api-non-empty-string-p (alist-get 'native_id sender))
+      (error "qq: guild message sender.native_id must be non-empty"))
+    (let ((user-id (alist-get 'user_id sender)))
+      (unless (or (null user-id)
+                  (qq-protocol--nonzero-decimal-string-p user-id))
+        (error "qq: guild message sender.user_id must be positive decimal or null")))
+    (dolist (key '(nickname member_name))
+      (unless (stringp (alist-get key sender))
+        (error "qq: guild message sender.%s must be a string" key)))
+    (unless (qq-api-non-empty-string-p (alist-get 'display_name sender))
+      (error "qq: guild message sender.display_name must be non-empty")))
+  (unless (memq (alist-get 'outgoing event) '(t :false))
+    (error "qq: guild message outgoing must be a boolean"))
+  (unless (member (alist-get 'state event) '("live" "recalled"))
+    (error "qq: guild message state is invalid"))
+  (let ((segments (alist-get 'segments event)))
+    (unless (and (listp segments) (proper-list-p segments))
+      (error "qq: guild message segments must be an array"))
+    (when (and (equal (alist-get 'state event) "recalled") segments)
+      (error "qq: recalled guild message must not contain segments"))
+    (cl-loop for segment in segments
+             for index from 0
+             do (qq-api--validate-native-forward-segment
+                 segment (format "guild message segments[%d]" index) t)))
+  (copy-tree event))
+
+(defun qq-api--validate-guild-message-record (record)
+  "Validate a closed Guild message RECORD returned by an action."
+  (unless (qq-api--exact-object-keys-p
+           record
+           '(chat message_id message_sequence sent_at channel_name sender
+             outgoing state segments))
+    (error "qq: Guild message record has invalid fields"))
+  (let* ((event (cons '(post_type . "emacs_guild_message")
+                      (copy-tree record)))
+         (_validated (qq-api--validate-guild-message-event event)))
+    (copy-tree record)))
+
 (defun qq-api-handle-event (event)
   "Handle websocket EVENT emitted by transport."
   (pcase (alist-get 'post_type event)
@@ -3561,6 +3903,9 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
      (qq-api--handle-notice event))
     ("request"
      (qq-api--handle-request event))
+    ("emacs_guild_message"
+     (qq-state-merge-guild-message
+      (qq-api--validate-guild-message-event event)))
     (_ nil)))
 
 (add-hook 'qq-transport-event-hook #'qq-api-handle-event)

@@ -69,6 +69,14 @@ future request must accept its own authoritative reaction snapshot unchanged.")
   "Joined group codes in the authoritative snapshot order.")
 (defvar qq-state--groups-loaded-p nil
   "Non-nil after an authoritative joined-group snapshot was applied.")
+(defvar qq-state--guilds-by-id (make-hash-table :test #'equal))
+(defvar qq-state--guild-order nil
+  "Guild IDs in the authoritative Linux QQ message-list order.")
+(defvar qq-state--guild-channels-by-key (make-hash-table :test #'equal))
+(defvar qq-state--guild-channel-order nil
+  "Composite Guild channel keys in authoritative Linux QQ order.")
+(defvar qq-state--guild-directory-loaded-p nil
+  "Non-nil after an authoritative QQ Guild directory snapshot was applied.")
 (defvar qq-state--requests nil)
 (defvar qq-state--message-session-index (make-hash-table :test #'equal))
 (defvar qq-state--local-message-session-index (make-hash-table :test #'equal))
@@ -240,6 +248,9 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   (setq qq-state--friend-categories-loaded-p nil)
   (setq qq-state--group-order nil)
   (setq qq-state--groups-loaded-p nil)
+  (setq qq-state--guild-order nil)
+  (setq qq-state--guild-channel-order nil)
+  (setq qq-state--guild-directory-loaded-p nil)
   (setq qq-state--message-order-counter 0)
   (setq qq-state--local-message-counter 0)
   (setq qq-state--session-summary-observation-clock 0)
@@ -253,6 +264,8 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   (clrhash qq-state--materialization-request-owners)
   (clrhash qq-state--friends-by-id)
   (clrhash qq-state--groups-by-id)
+  (clrhash qq-state--guilds-by-id)
+  (clrhash qq-state--guild-channels-by-key)
   (clrhash qq-state--message-session-index)
   (clrhash qq-state--local-message-session-index)
   (qq-state--emit 'reset))
@@ -349,6 +362,15 @@ independent of unread state ownership."
     (_ (error "qq: dataline session requires desktop or mobile variant, got %S"
               variant))))
 
+(defun qq-state-guild-channel-session-key (guild-id channel-id)
+  "Build a canonical channel session key from GUILD-ID and CHANNEL-ID."
+  (unless (qq-protocol--nonzero-decimal-string-p guild-id)
+    (error "qq: Guild identity requires a canonical nonzero decimal string"))
+  (unless (qq-protocol--nonzero-decimal-string-p channel-id)
+    (error "qq: Guild channel identity requires a canonical nonzero decimal string"))
+  (format "guild:%s:channel:%s"
+          guild-id channel-id))
+
 (defun qq-state-session-key (type target-id &optional variant)
   "Build a canonical session key from TYPE, TARGET-ID, and VARIANT.
 
@@ -385,7 +407,7 @@ The result contains `type', `target-id', `chat-type', `peer-uid', and
 they are never split, normalized, escaped, or reconstructed from metadata."
   (unless (stringp session-key)
     (error "qq: session key must be a string, got %S" session-key))
-  (let (type target-id chat-type peer-uid variant)
+  (let (type target-id chat-type peer-uid variant guild-id)
     (cond
      ((string-prefix-p "private:" session-key)
       (setq type 'private
@@ -395,6 +417,15 @@ they are never split, normalized, escaped, or reconstructed from metadata."
       (setq type 'group
             target-id (substring session-key (length "group:"))
             chat-type "2"))
+     ((string-match
+       "\\`guild:\\([1-9][0-9]*\\):channel:\\([1-9][0-9]*\\)\\'"
+       session-key)
+      (setq type 'guild-channel
+            guild-id (match-string 1 session-key)
+            target-id (match-string 2 session-key)
+            chat-type "4"
+            peer-uid target-id
+            variant nil))
      ((string-prefix-p "dataline:desktop:" session-key)
       (setq type 'dataline
             target-id (substring session-key (length "dataline:desktop:"))
@@ -419,6 +450,11 @@ they are never split, normalized, escaped, or reconstructed from metadata."
        (unless (qq-protocol--decimal-string-p target-id)
          (error "qq: malformed canonical %s session key %S"
                 type session-key)))
+      ('guild-channel
+       (unless (and (qq-protocol--nonzero-decimal-string-p guild-id)
+                    (qq-protocol--nonzero-decimal-string-p target-id))
+         (error "qq: malformed canonical Guild channel session key %S"
+                session-key)))
       ((or 'dataline 'service)
        (unless (and (stringp peer-uid) (not (string-empty-p peer-uid)))
          (error "qq: malformed canonical %s session key %S"
@@ -427,7 +463,10 @@ they are never split, normalized, escaped, or reconstructed from metadata."
       (target-id . ,target-id)
       (chat-type . ,chat-type)
       (peer-uid . ,peer-uid)
-      (variant . ,variant))))
+      (variant . ,variant)
+      ,@(when (eq type 'guild-channel)
+          `((guild-id . ,guild-id)
+            (channel-id . ,target-id))))))
 
 (defun qq-state-session-key-type (session-key)
   "Return session type symbol extracted from SESSION-KEY."
@@ -436,8 +475,17 @@ they are never split, normalized, escaped, or reconstructed from metadata."
 (defun qq-state-session-sendable-p (session-key)
   "Return non-nil when SESSION-KEY supports outbound messages."
   (condition-case nil
-      (memq (qq-state-session-key-type session-key)
-            '(private group dataline))
+      (let* ((identity (qq-state-session-key-identity session-key))
+             (type (alist-get 'type identity)))
+        (pcase type
+          ((or 'private 'group 'dataline) t)
+          ('guild-channel
+           (equal
+            (alist-get
+             'kind
+             (gethash session-key qq-state--guild-channels-by-key))
+            "text"))
+          (_ nil)))
     (error nil)))
 
 (defun qq-state-session-key-target-id (session-key)
@@ -466,12 +514,26 @@ they are never split, normalized, escaped, or reconstructed from metadata."
                     name)))
         (qq-state--normalize-id target-id))))
 
+(defun qq-state--cached-guild-channel-title (guild-id channel-id)
+  "Return the cached display title for GUILD-ID and CHANNEL-ID."
+  (let* ((key (qq-state-guild-channel-session-key guild-id channel-id))
+         (channel (gethash key qq-state--guild-channels-by-key))
+         (guild-name (and channel (alist-get 'guild_name channel)))
+         (channel-name (and channel (alist-get 'name channel))))
+    (if (and (stringp guild-name) (not (string-empty-p guild-name))
+             (stringp channel-name) (not (string-empty-p channel-name)))
+        (format "%s · #%s" guild-name channel-name)
+      (or channel-name channel-id))))
+
 (defun qq-state--default-session-title (session)
   "Return default title for SESSION using local caches."
   (let ((target-id (alist-get 'target-id session)))
     (pcase (alist-get 'type session)
       ('group
        (qq-state--cached-group-title target-id))
+      ('guild-channel
+       (qq-state--cached-guild-channel-title
+        (alist-get 'guild-id session) target-id))
       ('dataline
        (or (qq-state--first-present-string
             (alist-get 'peer-name session)
@@ -1500,6 +1562,11 @@ identify that exact group session."
       ("wallet"
        `((type . "wallet")
          (data . ,(copy-tree payload))))
+      ("gray-tip"
+       `((type . "gray-tip")
+         (data . ((text . ,(alist-get 'text payload))
+                  (kind . ,(alist-get 'gray_tip_kind payload))
+                  (native-id . ,(alist-get 'native_id payload))))))
       ("unsupported"
        `((type . "__unsupported")
          (data . ((native_keys . ,(copy-tree
@@ -2254,6 +2321,107 @@ Return three values via `cl-values':
                  :source 'event
                  (when previous-anchor
                    (list :previous-anchor previous-anchor))))))
+    session-key))
+
+(defun qq-state--normalize-guild-message (event)
+  "Normalize one validated closed QQ channel message EVENT."
+  (let* ((chat (alist-get 'chat event))
+         (guild-id (alist-get 'guild_id chat))
+         (channel-id (alist-get 'channel_id chat))
+         (session-key
+          (qq-state-guild-channel-session-key guild-id channel-id))
+         (sender (alist-get 'sender event))
+         (sender-id (or (alist-get 'user_id sender)
+                        (alist-get 'native_id sender)))
+         (sender-name (alist-get 'display_name sender))
+         (recalled-p (equal (alist-get 'state event) "recalled"))
+         (segments
+          (unless recalled-p
+            (mapcar #'qq-state--emacs-search-segment-to-internal
+                    (alist-get 'segments event))))
+         (mention-kinds (qq-state--mention-kinds-from-segments segments))
+         (self-p (eq (alist-get 'outgoing event) t))
+         (preview (if recalled-p
+                      "[message recalled]"
+                    (qq-state-message-preview-from-segments segments))))
+    `((id . ,(alist-get 'message_id event))
+      (server-id . ,(alist-get 'message_id event))
+      (session-key . ,session-key)
+      (time . ,(alist-get 'sent_at event))
+      (message-seq . ,(alist-get 'message_sequence event))
+      (sender-id . ,sender-id)
+      (sender-native-id . ,(alist-get 'native_id sender))
+      (sender-name . ,sender-name)
+      (sender-secondary-name . nil)
+      (sender-card . ,(qq-state--present-string
+                       (alist-get 'member_name sender)))
+      (sender-nickname . ,(qq-state--present-string
+                           (alist-get 'nickname sender)))
+      (sender-remark . nil)
+      (self-p . ,self-p)
+      (status . ,(cond (recalled-p 'recalled)
+                       (self-p 'sent)
+                       (t 'received)))
+      (segments . ,segments)
+      (mention-kinds . ,mention-kinds)
+      (contains-mention-p . ,(and mention-kinds t))
+      (raw-message . ,preview)
+      (preview . ,preview)
+      (message-type . "guild-channel")
+      (chat-type . "4")
+      (peer-uid . ,channel-id)
+      (peer-name . ,(qq-state--present-string
+                     (alist-get 'channel_name event)))
+      (guild-id . ,guild-id)
+      (channel-id . ,channel-id)
+      (user-id . ,(alist-get 'user_id sender))
+      (target-id . ,channel-id)
+      (order . ,(qq-state--next-message-order))
+      (raw-event . ,(copy-tree event)))))
+
+(defun qq-state-merge-guild-message (event)
+  "Merge validated closed QQ channel message EVENT into local state."
+  (let* ((normalized (qq-state--normalize-guild-message event))
+         (session-key (alist-get 'session-key normalized)))
+    (cl-multiple-value-bind (merged mutation previous-anchor)
+        (qq-state--merge-normalized-message session-key normalized)
+      (when merged
+        (apply #'qq-state--emit
+               'message
+               :session-key session-key
+               :message (copy-tree merged)
+               :message-anchor (qq-state-message-anchor merged)
+               :mutation mutation
+               :source 'event
+               (when previous-anchor
+                 (list :previous-anchor previous-anchor)))))
+    session-key))
+
+(defun qq-state-apply-guild-navigation (navigation)
+  "Apply validated authoritative Guild NAVIGATION to its channel session."
+  (let* ((chat (alist-get 'chat navigation))
+         (session-key
+          (qq-state-guild-channel-session-key
+           (alist-get 'guild_id chat)
+           (alist-get 'channel_id chat)))
+         (unread (alist-get 'unread_count navigation))
+         (begin (alist-get 'begin_sequence navigation))
+         (first-sequence (and (> unread 0)
+                              (not (equal begin "0"))
+                              begin)))
+    (qq-state-upsert-session
+     session-key
+     `((unread-count . ,unread)
+       (first-unread-message-id . nil)
+       (first-unread-message-seq . ,first-sequence)
+       (read-position-available . nil)
+       (guild-navigation-sequences
+        . ,(copy-tree (alist-get 'navigation_sequences navigation))))
+     nil)
+    (qq-state--emit 'session
+                    :session-key session-key
+                    :session (qq-state-session session-key)
+                    :mutation 'read)
     session-key))
 
 (defun qq-state-apply-poke-notice (notice)
@@ -3072,6 +3240,68 @@ order are retained exactly as supplied by the native snapshot."
 (defun qq-state-group-count ()
   "Return the number of joined groups in the authoritative snapshot."
   (length qq-state--group-order))
+
+(defun qq-state-apply-guild-directory (directory)
+  "Replace the authoritative Guild DIRECTORY caches.
+
+DIRECTORY is an alist containing ordered `guilds' and `channels' lists."
+  (let ((guilds (alist-get 'guilds directory))
+        (channels (alist-get 'channels directory)))
+    (setq qq-state--guild-directory-loaded-p t
+          qq-state--guild-order nil
+          qq-state--guild-channel-order nil)
+    (clrhash qq-state--guilds-by-id)
+    (clrhash qq-state--guild-channels-by-key)
+    (dolist (guild guilds)
+      (let ((guild-id (alist-get 'guild_id guild)))
+        (push guild-id qq-state--guild-order)
+        (puthash guild-id (copy-tree guild) qq-state--guilds-by-id)))
+    (setq qq-state--guild-order (nreverse qq-state--guild-order))
+    (dolist (channel channels)
+      (let* ((guild-id (alist-get 'guild_id channel))
+             (channel-id (alist-get 'channel_id channel))
+             (key (qq-state-guild-channel-session-key guild-id channel-id)))
+        (push key qq-state--guild-channel-order)
+        (puthash key (copy-tree channel) qq-state--guild-channels-by-key)
+        (when (gethash key qq-state--sessions)
+          (qq-state-upsert-session
+           key `((title . ,(qq-state--cached-guild-channel-title
+                            guild-id channel-id))
+                 (guild-name . ,(alist-get 'guild_name channel))
+                 (channel-name . ,(alist-get 'name channel))
+                 (channel-kind . ,(alist-get 'kind channel)))
+           nil))))
+    (setq qq-state--guild-channel-order
+          (nreverse qq-state--guild-channel-order))
+    (qq-state--emit 'guild-directory-refreshed
+                    :guild-count (length guilds)
+                    :channel-count (length channels))
+    (qq-state-guild-directory)))
+
+(defun qq-state-guild-directory ()
+  "Return a copy of the ordered authoritative Guild directory."
+  `((guilds . ,(mapcar
+                (lambda (guild-id)
+                  (copy-tree (gethash guild-id qq-state--guilds-by-id)))
+                qq-state--guild-order))
+    (channels . ,(mapcar
+                  (lambda (key)
+                    (copy-tree (gethash key qq-state--guild-channels-by-key)))
+                  qq-state--guild-channel-order))))
+
+(defun qq-state-guild-directory-loaded-p ()
+  "Return non-nil once the authoritative Guild directory has loaded."
+  qq-state--guild-directory-loaded-p)
+
+(defun qq-state-guild (guild-id)
+  "Return cached Guild metadata for GUILD-ID."
+  (copy-tree (gethash guild-id qq-state--guilds-by-id)))
+
+(defun qq-state-guild-channel (guild-id channel-id)
+  "Return cached channel metadata for GUILD-ID and CHANNEL-ID."
+  (copy-tree
+   (gethash (qq-state-guild-channel-session-key guild-id channel-id)
+            qq-state--guild-channels-by-key)))
 
 (defun qq-state-add-request (request)
   "Append REQUEST event to local request list."

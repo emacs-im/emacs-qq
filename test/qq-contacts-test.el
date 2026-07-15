@@ -391,8 +391,9 @@
     (unwind-protect
         (with-current-buffer buffer
           (qq-contacts-mode)
-          (cl-letf (((symbol-function 'qq-contacts--request-reconcile)
-                     (lambda (&optional keys) (setq forced keys))))
+          (qq-contacts--ensure-view)
+          (cl-letf (((symbol-function 'qq-contacts--queue-view-sync)
+                     (lambda (_view &optional keys) (setq forced keys))))
             (qq-contacts--handle-media-cache-update "avatar:10001")
             (should (equal forced '((friend . "10001")
                                     (member . "10001")
@@ -405,36 +406,151 @@
 (ert-deftest qq-contacts-visible-avatar-update-invalidates-only-target-rows ()
   (with-temp-buffer
     (qq-contacts-mode)
-    (setq qq-contacts--fill-column 80)
-    (let (invalidated)
-      (cl-letf (((symbol-function 'qq-contacts--displayed-p) (lambda () t))
-                ((symbol-function 'qq-contacts--usable-width) (lambda () 80))
-                ((symbol-function 'qq-contacts--project-entries)
-                 (lambda () (ert-fail "avatar update rebuilt full projection")))
-                ((symbol-function 'qq-contacts--invalidate-keys)
-                 (lambda (keys) (setq invalidated keys))))
-        (qq-contacts--request-reconcile
-         '((friend . "10001") (member . "10001")))
-        (should (equal invalidated
-                       '((friend . "10001") (member . "10001"))))))))
+    (let ((view (qq-contacts--ensure-view)))
+      (setq qq-contacts--fill-column 80)
+      (let (invalidated)
+        (cl-letf (((symbol-function 'qq-contacts--displayed-p) (lambda () t))
+                  ((symbol-function 'qq-contacts--usable-width) (lambda () 80))
+                  ((symbol-function 'qq-contacts--project-entries)
+                   (lambda ()
+                     (ert-fail "avatar update rebuilt full projection")))
+                  ((symbol-function 'qq-contacts--invalidate-keys)
+                   (lambda (keys) (setq invalidated keys))))
+          (qq-contacts--request-reconcile
+           '((friend . "10001") (member . "10001")))
+          (appkit-sync-invalidations view)
+          (should (equal invalidated
+                         '((friend . "10001")
+                           (member . "10001")))))))))
 
 (ert-deftest qq-contacts-hidden-avatar-update-retains-forced-row-keys ()
   (qq-contacts-test-with-state
    (with-temp-buffer
      (qq-contacts-mode)
-     (cl-letf (((symbol-function 'qq-contacts--displayed-p) (lambda () nil)))
-       (qq-contacts--request-reconcile '((group . "20002"))))
-     (should qq-contacts--dirty)
-     (should (equal qq-contacts--pending-force-keys '((group . "20002"))))
-     (let (forced)
-       (cl-letf (((symbol-function 'appkit-ewoc-reconcile)
-                  (lambda (_ewoc _entries _key-function &rest args)
-                    (setq forced (plist-get args :force-keys))
-                    (make-hash-table :test #'equal))))
-         (qq-contacts--reconcile))
-       (should (equal forced '((group . "20002"))))
-       (should-not qq-contacts--pending-force-keys)
-       (should-not qq-contacts--dirty)))))
+     (let ((view (qq-contacts--ensure-view)))
+       (cl-letf (((symbol-function 'qq-contacts--displayed-p)
+                  (lambda () nil)))
+         (qq-contacts--request-reconcile '((group . "20002"))))
+       (appkit-sync-invalidations view)
+       (should qq-contacts--dirty)
+       (should (equal qq-contacts--pending-force-keys
+                      '((group . "20002"))))
+       (let (forced)
+         (cl-letf (((symbol-function 'appkit-ewoc-reconcile)
+                    (lambda (_ewoc _entries _key-function &rest args)
+                      (setq forced (plist-get args :force-keys))
+                      (make-hash-table :test #'equal))))
+           (qq-contacts--reconcile))
+         (should (equal forced '((group . "20002"))))
+         (should-not qq-contacts--pending-force-keys)
+         (should-not qq-contacts--dirty))))))
+
+(ert-deftest qq-contacts-state-and-completion-coalesce-one-appkit-sync ()
+  (let ((buffer (get-buffer-create qq-contacts-buffer-name))
+        sync-count)
+    (unwind-protect
+        (with-current-buffer buffer
+          (qq-contacts-mode)
+          (let* ((view (qq-contacts--ensure-view))
+                 (owner (list 'synthetic-refresh-owner)))
+            (setq qq-contacts--refresh-owner owner
+                  qq-contacts--refresh-parts '(friends)
+                  qq-contacts--refresh-pending 1
+                  qq-contacts--loading t)
+            (cl-letf (((symbol-function 'qq-contacts--displayed-p)
+                       (lambda () t))
+                      ((symbol-function 'qq-contacts--reconcile)
+                       (lambda (&optional _keys)
+                         (setq sync-count (1+ (or sync-count 0))))))
+              ;; One native response first publishes authoritative state and
+              ;; then settles the per-request loading owner.  Repeated state
+              ;; notifications before the timer fires still form one snapshot.
+              (qq-contacts--handle-state-change '(:type friends-refreshed))
+              (qq-contacts--handle-state-change '(:type friends-refreshed))
+              (qq-contacts--finish-refresh-part buffer owner 'friends)
+              (should-not sync-count)
+              (appkit-sync-invalidations view)
+              (should (= sync-count 1))
+              (should-not qq-contacts--loading)
+              (should-not qq-contacts--refresh-owner))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest qq-contacts-dead-view-rejects-state-media-and-search-callbacks ()
+  (let ((buffer (get-buffer-create qq-contacts-buffer-name)) queued)
+    (unwind-protect
+        (with-current-buffer buffer
+          (qq-contacts-mode)
+          (let ((view (qq-contacts--ensure-view))
+                (refresh-owner (list 'dead-refresh))
+                (search-owner (list 'dead-search)))
+            (setq qq-contacts--refresh-owner refresh-owner
+                  qq-contacts--refresh-parts '(friends)
+                  qq-contacts--refresh-pending 1
+                  qq-contacts--loading t
+                  qq-contacts--search-owner search-owner
+                  qq-contacts--search-pending '(friends))
+            (appkit-kill-view view)
+            (cl-letf (((symbol-function 'qq-contacts--queue-view-sync)
+                       (lambda (&rest _args) (setq queued t))))
+              (qq-contacts--handle-state-change '(:type friends-refreshed))
+              (qq-contacts--handle-media-cache-update "avatar:10001")
+              (qq-contacts--finish-refresh-part
+               buffer refresh-owner 'friends)
+              (qq-contacts--finish-search-page
+               buffer search-owner 'friends nil
+               '((results . (((kind . "friend")
+                              (user_id . "10001")
+                              (uid . "native-10001"))))
+                 (next_cursor)))
+              (should-not queued)
+              (should-not qq-contacts--loading)
+              (should-not qq-contacts--refresh-owner)
+              (should-not qq-contacts--refresh-parts)
+              (should-not qq-contacts--search-owner)
+              (should-not qq-contacts--search-pending)
+              (should-not qq-contacts--search-friends))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest qq-contacts-dead-view-makes-window-callbacks-inert ()
+  (with-temp-buffer
+    (qq-contacts-mode)
+    (let* ((view (qq-contacts--ensure-view))
+           (app (appkit-view-app view))
+           queued
+           avatar-started)
+      (let ((inhibit-read-only t))
+        (insert "Synthetic friend\n")
+        (add-text-properties
+         (point-min) (point-max)
+         '(qq-contacts-row-type friend
+           qq-contacts-object ((user_id . "10001")))))
+      (setq qq-contacts--dirty t
+            qq-contacts--fill-column 80)
+      (appkit-kill-view view)
+      (cl-letf (((symbol-function 'window-live-p) (lambda (_window) t))
+                ((symbol-function 'window-buffer)
+                 (lambda (_window) (current-buffer)))
+                ((symbol-function 'window-start)
+                 (lambda (_window) (point-min)))
+                ((symbol-function 'window-end)
+                 (lambda (&rest _args) (point-max)))
+                ((symbol-function 'qq-contacts--displayed-p) (lambda () t))
+                ((symbol-function 'qq-contacts--usable-width) (lambda () 100))
+                ((symbol-function 'qq-contacts--ensure-view)
+                 (lambda () (ert-fail "window callback reattached view")))
+                ((symbol-function 'qq-contacts--queue-view-sync)
+                 (lambda (&rest _args) (setq queued t)))
+                ((symbol-function 'qq-media-avatar-image)
+                 (lambda (&rest _args) (setq avatar-started t))))
+        (qq-contacts--window-buffer-change 'synthetic-window)
+        (qq-contacts--window-size-change)
+        (qq-contacts--window-scroll 'synthetic-window nil))
+      (should-not queued)
+      (should-not avatar-started)
+      (should-not (appkit-current-view))
+      (should-not (appkit-view-for-id app qq-contacts--view-id)))))
 
 (ert-deftest qq-contacts-reconcile-preserves-force-keys-queued-during-render ()
   (qq-contacts-test-with-state
@@ -536,6 +652,7 @@
 (ert-deftest qq-contacts-duplicate-continuation-settles-pending-section ()
   (with-temp-buffer
     (qq-contacts-mode)
+    (qq-contacts--ensure-view)
     (let* ((owner (list 'synthetic-search-owner))
            (existing
             '(((kind . "friend")
@@ -581,7 +698,8 @@
     (unwind-protect
         (with-current-buffer buffer
           (qq-contacts-mode)
-          (cl-letf (((symbol-function 'qq-contacts--request-reconcile)
+          (qq-contacts--ensure-view)
+          (cl-letf (((symbol-function 'qq-contacts--queue-view-sync)
                      (lambda (&rest _args)
                        (setq reconciles (1+ (or reconciles 0))))))
             (qq-contacts--handle-state-change '(:type session))

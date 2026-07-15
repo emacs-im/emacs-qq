@@ -13,22 +13,28 @@
 (require 'ewoc)
 (require 'seq)
 (require 'subr-x)
+(require 'appkit-core)
+(require 'appkit-invalidation)
+(require 'appkit-transaction)
 (require 'appkit-view)
 (require 'appkit-position)
 (require 'appkit-ewoc)
 (require 'qq-api)
 (require 'qq-chat)
 (require 'qq-media)
+(require 'qq-runtime)
 (require 'qq-state)
 
 (autoload 'qq-user-open "qq-user" nil t)
 (autoload 'qq-group-open "qq-group" nil t)
 (autoload 'qq-search-open "qq-search" nil t)
 (autoload 'qq-contacts-open "qq-contacts" nil t)
+(autoload 'qq-guilds-open "qq-guilds" nil t)
 (declare-function qq-user-open "qq-user" (user-id))
 (declare-function qq-group-open "qq-group" (group-id))
 (declare-function qq-search-open "qq-search" (session-key &optional query))
 (declare-function qq-contacts-open "qq-contacts" ())
+(declare-function qq-guilds-open "qq-guilds" ())
 
 (defconst qq-root-buffer-name "*qq-root*"
   "Name of the emacs-qq root buffer.")
@@ -365,46 +371,53 @@ message title rather than like dimmed preview content."
             (qq-root--session-entry-key (alist-get 'key session)))
           (qq-state-sessions)))
 
-(defun qq-root--sync (&optional force-keys)
-  "Reconcile the persistent root view, invalidating FORCE-KEYS.
+(defun qq-root--sync-invalidations (view invalidations)
+  "Synchronize VIEW from coalesced Appkit INVALIDATIONS.
 
-Rows whose data and position are unchanged retain their EWOC nodes."
+Structural, whole-entries, and geometry changes reconcile the stable-key
+EWOC.  Entry-only changes invalidate just the named nodes; position-only
+changes still pass through semantic position capture and restoration.  All
+generated-content mutation is owned by one Appkit content transaction."
   (unless (ewoc-p qq-root--ewoc)
     (error "qq: root view is not initialized"))
-  (let ((snapshot
-         (appkit-position-capture
-          :anchor-property 'qq-root-session-key
-          :preserve-window-start t))
-        (inhibit-read-only t)
-        (buffer-undo-list t))
-    (setq-local qq-root--fill-column (qq-root--stable-fill-column))
-    (with-silent-modifications
-      (setq qq-root--node-table
-            (appkit-ewoc-reconcile
-             qq-root--ewoc
-             (qq-root--project-entries)
-             #'qq-root--entry-key
-             :force-keys force-keys)))
-    (when snapshot
-      (appkit-position-restore snapshot))
-    (force-mode-line-update)
-    (force-window-update (current-buffer))))
-
-(defun qq-root--invalidate (keys)
-  "Invalidate persistent root rows identified by KEYS."
-  (let ((snapshot
-         (appkit-position-capture
-          :anchor-property 'qq-root-session-key
-          :preserve-window-start t))
-        (inhibit-read-only t)
-        (buffer-undo-list t))
-    (with-silent-modifications
-      (dolist (key keys)
-        (appkit-ewoc-invalidate-key
-         qq-root--ewoc qq-root--node-table key)))
-    (when snapshot
-      (appkit-position-restore snapshot))
-    (force-window-update (current-buffer))))
+  (let* ((parts (appkit-invalidations-parts invalidations))
+         (entries (appkit-invalidations-entry-keys invalidations))
+         (entries-part-p (memq 'entries parts))
+         (geometry-p (memq 'geometry parts))
+         (position-p (appkit-invalidations-position-p invalidations))
+         (reconcile-p
+          (or (appkit-invalidations-structure-p invalidations)
+              entries-part-p
+              geometry-p)))
+    (when (or reconcile-p entries position-p)
+      (appkit-with-content-update view
+        (let ((snapshot
+               (appkit-position-capture
+                :anchor-property 'qq-root-session-key
+                :preserve-window-start t)))
+          (when geometry-p
+            (setq-local qq-root--fill-column (qq-root--stable-fill-column)))
+          (with-silent-modifications
+            (if reconcile-p
+                (setq qq-root--node-table
+                      (appkit-ewoc-reconcile
+                       qq-root--ewoc
+                       (qq-root--project-entries)
+                       #'qq-root--entry-key
+                       :force-keys
+                       (if geometry-p
+                           (delete-dups
+                            (append entries (qq-root--session-entry-keys)))
+                         entries)))
+              (dolist (key entries)
+                (appkit-ewoc-invalidate-key
+                 qq-root--ewoc qq-root--node-table key))))
+          (when snapshot
+            (appkit-position-restore snapshot)))))
+    ;; `header-line-format' is an :eval form, so this asks Emacs to reevaluate
+    ;; it without forcing every window displaying the root buffer to update.
+    (when (memq 'header parts)
+      (force-mode-line-update))))
 
 (defun qq-root--session-key-at-point (&optional pos)
   "Return root session key at POS, or current point when POS is nil."
@@ -585,6 +598,7 @@ offered."
     (define-key map (kbd "g") #'qq-root-refresh)
     (define-key map (kbd "s") #'qq-root-search)
     (define-key map (kbd "c") #'qq-contacts-open)
+    (define-key map (kbd "G") #'qq-guilds-open)
     (define-key map (kbd "/") #'qq-root-open-session)
     (define-key map (kbd "RET") #'qq-root-open-at-point)
     (define-key map (kbd "a") #'qq-root-open-avatar-at-point)
@@ -624,22 +638,62 @@ offered."
             #'qq-root--on-window-size-change nil t)
   (add-hook 'text-scale-mode-hook #'qq-root--on-text-scale-change nil t))
 
+(defun qq-root--live-view ()
+  "Return the live Appkit root view, or nil when the root is not open."
+  (when-let* ((buffer (get-buffer qq-root-buffer-name)))
+    (with-current-buffer buffer
+      (let ((view (appkit-current-view)))
+        (and (derived-mode-p 'qq-root-mode)
+             (appkit-view-live-p view)
+             (equal (appkit-view-id view) 'root)
+             view)))))
+
+(cl-defun qq-root--queue-invalidation
+    (&key structure part parts entry entries position)
+  "Queue one coalesced root invalidation when its view is live.
+
+STRUCTURE, PART, PARTS, ENTRY, ENTRIES, and POSITION are forwarded to
+`appkit-request-sync'."
+  (when-let* ((view (qq-root--live-view)))
+    (appkit-request-sync
+     view
+     :structure structure
+     :part part
+     :parts parts
+     :entry entry
+     :entries entries
+     :position position)
+    view))
+
 (defun qq-root-open ()
   "Open the emacs-qq root buffer."
   (interactive)
-  (let ((buffer (get-buffer-create qq-root-buffer-name)))
+  (let* ((app (qq-runtime-app))
+         (existing (appkit-view-for-id app 'root))
+         (view
+          (appkit-open-view
+           :app app
+           :id 'root
+           :mode 'qq-root-mode
+           :buffer-name qq-root-buffer-name
+           :sync-function #'qq-root--sync-invalidations
+           :parts '(header entries geometry)
+           :select t))
+         (buffer (appkit-view-buffer view)))
     (with-current-buffer buffer
-      (unless (derived-mode-p 'qq-root-mode)
-        (qq-root-mode)))
-    (pop-to-buffer buffer)
-    (with-current-buffer buffer
-      (qq-root--reflow-visible t)
+      (unless existing
+        ;; A newly attached (including reattached) view gets one explicit
+        ;; initial projection after it has a real display window.
+        (appkit-invalidate view :structure t :part 'header)
+        (appkit-sync-invalidations view))
+      (qq-root--reflow-visible nil)
       (unless (qq-root--session-key-at-point)
         (goto-char (point-min))
-        (qq-root-button-forward)))))
+        (qq-root-button-forward)))
+    buffer))
 
 (defun qq-root--reflow-visible (&optional force)
-  "Reflow root from its real display window when width changed.
+  "Queue root geometry invalidation when its visible width changed.
 
 When FORCE is non-nil, invalidate rows even when the width is unchanged so
 pixel-valued alignment follows text scaling."
@@ -648,9 +702,9 @@ pixel-valued alignment follows text scaling."
                          (qq-root--display-window)))
                 (next (qq-root--compute-fill-column win)))
       (when (or force (not (equal next qq-root--fill-column)))
-        (setq-local qq-root--fill-column next)
-        (qq-root--sync (and force (qq-root--session-entry-keys)))
-        t))))
+        (and (qq-root--queue-invalidation
+              :part 'geometry :position t)
+             t)))))
 
 (defun qq-root--on-window-size-change (&optional _frame)
   "Reflow a visible root buffer after its window geometry changes."
@@ -659,22 +713,6 @@ pixel-valued alignment follows text scaling."
 (defun qq-root--on-text-scale-change ()
   "Reflow a visible root buffer after text scaling changes."
   (qq-root--reflow-visible t))
-
-(defun qq-root--sync-open-root ()
-  "Synchronize the live root buffer."
-  (let ((buffer (get-buffer qq-root-buffer-name)))
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (when (derived-mode-p 'qq-root-mode)
-          (qq-root--sync))))))
-
-(defun qq-root--invalidate-open-root (keys)
-  "Invalidate KEYS in the live root buffer."
-  (let ((buffer (get-buffer qq-root-buffer-name)))
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (when (derived-mode-p 'qq-root-mode)
-          (qq-root--invalidate keys))))))
 
 (defun qq-root--session-avatar-media-key (session)
   "Return the exact avatar cache key used by SESSION, or nil."
@@ -687,21 +725,13 @@ pixel-valued alignment follows text scaling."
 
 (defun qq-root--handle-media-cache-update (media-key)
   "Invalidate root rows whose avatar is identified by MEDIA-KEY."
-  (when (stringp media-key)
+  (when (and (stringp media-key) (qq-root--live-view))
     (let (keys)
       (dolist (session (qq-state-sessions))
         (when (equal media-key (qq-root--session-avatar-media-key session))
           (push (qq-root--session-entry-key (alist-get 'key session)) keys)))
       (when keys
-        (qq-root--invalidate-open-root keys)))))
-
-(defun qq-root--refresh-header ()
-  "Refresh the root header without touching persistent entries."
-  (when-let* ((buffer (get-buffer qq-root-buffer-name)))
-    (with-current-buffer buffer
-      (when (derived-mode-p 'qq-root-mode)
-        (force-mode-line-update)
-        (force-window-update buffer)))))
+        (qq-root--queue-invalidation :entries keys)))))
 
 (defun qq-root--handle-state-change (event)
   "Apply state EVENT to the persistent root view."
@@ -709,14 +739,18 @@ pixel-valued alignment follows text scaling."
         (session-key (plist-get event :session-key)))
     (pcase type
       ((or 'connection 'self-info)
-       (qq-root--refresh-header))
+       (qq-root--queue-invalidation :part 'header))
       ('action
        (when session-key
-         (qq-root--invalidate-open-root
-          (list (qq-root--session-entry-key session-key)))))
-      ((or 'reset 'session 'message 'history 'sessions-refreshed
-           'friends-refreshed 'groups-refreshed)
-       (qq-root--sync-open-root)))))
+         (qq-root--queue-invalidation
+          :entry (qq-root--session-entry-key session-key))))
+      ((or 'session 'message 'history)
+       (qq-root--queue-invalidation
+        :structure t
+        :entry (and session-key
+                    (qq-root--session-entry-key session-key))))
+      ((or 'reset 'sessions-refreshed 'friends-refreshed 'groups-refreshed)
+       (qq-root--queue-invalidation :structure t)))))
 
 (add-hook 'qq-media-cache-update-hook #'qq-root--handle-media-cache-update)
 (add-hook 'qq-state-change-hook #'qq-root--handle-state-change)

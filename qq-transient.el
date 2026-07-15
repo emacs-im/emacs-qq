@@ -25,6 +25,7 @@
 (require 'qq-state)
 (require 'qq-user)
 (require 'qq-group)
+(require 'qq-guilds)
 
 (declare-function qq-connect "qq")
 (declare-function qq-disconnect "qq")
@@ -381,6 +382,7 @@ Prefer this over inline button rows."
      :inapt-if qq-transient--root-info-inapt-p)
     ("I" "My profile" qq-root-open-self-user)
     ("d" "Contacts" qq-contacts-open)
+    ("G" "QQ Guilds" qq-guilds-open)
     ("/" "Find session…" qq-root-open-session)
     ("s" "Search messages…" qq-root-search)
     ("u" "Next unread" qq-root-next-unread)]

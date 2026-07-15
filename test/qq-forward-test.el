@@ -67,6 +67,11 @@
          (progn ,@body)
        (qq-forward-test--kill-viewers))))
 
+(defun qq-forward-test--sync-buffer (buffer)
+  "Synchronously consume pending invalidations for forward BUFFER."
+  (with-current-buffer buffer
+    (appkit-sync-invalidations (appkit-current-view))))
+
 (ert-deftest qq-forward-mode-has-special-navigation-bindings ()
   (with-temp-buffer
     (qq-forward-mode)
@@ -685,18 +690,21 @@ list are indistinguishable — both mean \"do not claim a count\"."
                 (should (string-match-p "Loading chat history"
                                         (buffer-string)))
                 (funcall success nil)
+                (appkit-sync-invalidations (appkit-current-view))
                 (should (eq status-node
                             (appkit-chat-timeline-node
                              qq-forward--status-row-key)))
                 (should (string-match-p "empty chat history"
                                         (buffer-string)))
                 (qq-forward-refresh)
+                (appkit-sync-invalidations (appkit-current-view))
                 (should (eq status-node
                             (appkit-chat-timeline-node
                              qq-forward--status-row-key)))
                 (should (string-match-p "Loading chat history"
                                         (buffer-string)))
                 (funcall errback nil "native failure")
+                (appkit-sync-invalidations (appkit-current-view))
                 (should (eq status-node
                             (appkit-chat-timeline-node
                              qq-forward--status-row-key)))
@@ -721,6 +729,7 @@ list are indistinguishable — both mean \"do not claim a count\"."
             (funcall success
                      (list (qq-forward-test--native-message "1" "a")
                            (qq-forward-test--native-message "2" "b")))
+            (qq-forward-test--sync-buffer buffer)
             (with-current-buffer buffer
               (let* ((keys '("1" "2"))
                      (nodes (mapcar #'appkit-chat-timeline-node keys)))
@@ -739,6 +748,7 @@ list are indistinguishable — both mean \"do not claim a count\"."
                   (should (equal (appkit-chat-timeline-key-at-point)
                                  "2"))
                   (funcall errback nil "refresh failure")
+                  (appkit-sync-invalidations (appkit-current-view))
                   (should-not qq-forward--loading)
                   (should (equal (appkit-chat-timeline-keys)
                                  (append keys
@@ -782,6 +792,93 @@ list are indistinguishable — both mean \"do not claim a count\"."
               (should (equal canceled '(request-2 request-1))))
             (kill-buffer buffer)))))))
 
+(ert-deftest qq-forward-api-callbacks-request-one-coalesced-view-sync ()
+  (qq-forward-test--with-clean-viewers
+    (let ((source (qq-forward-test--message-source
+                   "9007199254742007044" "20001"))
+          success errback
+          (request-count 0))
+      (cl-letf (((symbol-function 'qq-api-get-forward)
+                 (lambda (_source callback &optional error-callback)
+                   (setq success callback
+                         errback error-callback)
+                   (intern (format "request-%d" (cl-incf request-count)))))
+                ((symbol-function 'qq-api-cancel-request) #'ignore))
+        (save-window-excursion
+          (let ((buffer (qq-forward-open source)))
+            (with-current-buffer buffer
+              (let ((view (appkit-current-view))
+                    (syncs 0))
+                (cl-letf (((symbol-function 'qq-forward--sync-timeline)
+                           (lambda (&rest _args) (cl-incf syncs))))
+                  (qq-forward-refresh)
+                  (let ((handle
+                         (appkit-invalidations-scheduled-handle
+                          (appkit-view-invalidations view))))
+                    (should (appkit-handle-alive-p handle))
+                    (funcall
+                     success
+                     (list (qq-forward-test--native-message "1" "accepted")))
+                    (should qq-forward--loaded-p)
+                    (should-not qq-forward--loading)
+                    (should (equal "1" (alist-get 'id
+                                                   (car qq-forward--messages))))
+                    (should (zerop syncs))
+                    (should
+                     (eq handle
+                         (appkit-invalidations-scheduled-handle
+                          (appkit-view-invalidations view))))
+                    (let ((pending (appkit-view-invalidations view)))
+                      (should (appkit-invalidations-structure-p pending))
+                      (should (equal '(timeline)
+                                     (appkit-invalidations-parts pending))))
+                    (appkit-sync-invalidations view)
+                    (should (= 1 syncs)))
+                  (qq-forward-refresh)
+                  (let ((handle
+                         (appkit-invalidations-scheduled-handle
+                          (appkit-view-invalidations view))))
+                    (funcall errback nil "native failure")
+                    (should-not qq-forward--loading)
+                    (should (equal "native failure" qq-forward--error))
+                    (should (= 1 syncs))
+                    (should
+                     (eq handle
+                         (appkit-invalidations-scheduled-handle
+                          (appkit-view-invalidations view))))
+                    (appkit-sync-invalidations view)
+                    (should (= 2 syncs))))))
+            (should (= 3 request-count))))))))
+
+(ert-deftest qq-forward-dead-view-callback-is-inert ()
+  (qq-forward-test--with-clean-viewers
+    (let ((source (qq-forward-test--message-source
+                   "9007199254742007045" "20001"))
+          success)
+      (cl-letf (((symbol-function 'qq-api-get-forward)
+                 (lambda (_source callback &optional _error-callback)
+                   (setq success callback)
+                   'request-1))
+                ((symbol-function 'qq-api-cancel-request) #'ignore))
+        (save-window-excursion
+          (let ((buffer (qq-forward-open source)))
+            (with-current-buffer buffer
+              (let ((view (appkit-current-view))
+                    (owner qq-forward--request-owner))
+                (appkit-kill-view view)
+                (funcall
+                 success
+                 (list (qq-forward-test--native-message "1" "too late")))
+                (should-not (appkit-current-view))
+                (should-not
+                 (appkit-view-for-id
+                  (qq-runtime-app)
+                  (qq-forward--view-id qq-forward--buffer-key)))
+                (should qq-forward--loading)
+                (should-not qq-forward--messages)
+                (should (eq owner qq-forward--request-owner))
+                (should (eq 'request-1 qq-forward--request))))))))))
+
 (ert-deftest qq-forward-reply-context-updates-without-replacing-row ()
   (qq-forward-test--with-clean-viewers
     (let ((source (qq-forward-test--message-source
@@ -805,12 +902,14 @@ list are indistinguishable — both mean \"do not claim a count\"."
           (save-window-excursion
             (let ((buffer (qq-forward-open source)))
               (funcall success (snapshot "original"))
+              (qq-forward-test--sync-buffer buffer)
               (with-current-buffer buffer
                 (let ((reply-node (appkit-chat-timeline-node "2")))
                   (should (string-match-p "↪ Alice: original"
                                           (buffer-string)))
                   (qq-forward-refresh)
                   (funcall success (snapshot "edited"))
+                  (appkit-sync-invalidations (appkit-current-view))
                   (should (eq reply-node
                               (appkit-chat-timeline-node "2")))
                   (should (string-match-p "↪ Alice: edited"
