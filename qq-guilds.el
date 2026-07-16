@@ -6,17 +6,13 @@
 
 ;;; Code:
 
-(require 'button)
 (require 'cl-lib)
-(require 'ewoc)
 (require 'seq)
 (require 'subr-x)
 (require 'appkit-core)
-(require 'appkit-ewoc)
+(require 'appkit-directory)
 (require 'appkit-invalidation)
-(require 'appkit-position)
 (require 'appkit-transaction)
-(require 'appkit-view)
 (require 'qq-api)
 (require 'qq-chat)
 (require 'qq-guild-channel)
@@ -41,24 +37,8 @@
 (defvar-local qq-guilds--error nil)
 (defvar-local qq-guilds--refresh-owner nil)
 (defvar-local qq-guilds--refresh-request nil)
-(defvar-local qq-guilds--ewoc nil
-  "Persistent EWOC containing Guild directory entries.")
-(defvar-local qq-guilds--node-table nil
-  "Stable Guild directory entry key to EWOC node table.")
-(defvar-local qq-guilds--collapsed-guilds nil
-  "Set of collapsed Guild IDs in the current directory view.")
 (defvar-local qq-guilds--filter nil
   "Case-insensitive substring filter for the current directory view.")
-
-(cl-defstruct (qq-guilds--entry
-               (:constructor qq-guilds--entry-create))
-  key
-  type
-  text
-  face
-  guild-id
-  expanded-p
-  channel)
 
 (defconst qq-guilds--view-id 'guilds
   "Appkit identity of the singleton QQ Guild directory view.")
@@ -106,57 +86,19 @@
       name
     (format "%s" (or fallback "未命名"))))
 
-(defun qq-guilds--insert-guild (entry key)
-  "Insert one foldable Guild heading ENTRY carrying stable KEY."
-  (let* ((guild-id (qq-guilds--entry-guild-id entry))
-         (expanded-p (qq-guilds--entry-expanded-p entry))
-         (start (point)))
-    (insert (if expanded-p "▾ " "▸ ")
-            (qq-guilds--entry-text entry))
-    (make-text-button
-     start (point)
-     'follow-link t
-     'face (qq-guilds--entry-face entry)
-     'mouse-face 'highlight
-     'help-echo (if expanded-p "折叠 QQ 频道" "展开 QQ 频道")
-     'qq-guild-id guild-id
-     'action (lambda (button)
-               (qq-guilds-toggle-guild
-                (button-get button 'qq-guild-id))))
-    (insert "\n")
-    (add-text-properties
-     start (point)
-     (list 'qq-guilds-key key
-           'qq-guild-id guild-id
-           'qq-guild-action 'toggle))))
-
-(defun qq-guilds--insert-channel (channel key)
-  "Insert one clickable CHANNEL row carrying stable KEY."
-  (let* ((guild-id (alist-get 'guild_id channel))
+(defun qq-guilds--insert-channel (_surface entry)
+  "Insert the application-owned content of channel ENTRY."
+  (let* ((channel (appkit-directory-entry-payload entry))
+         (guild-id (alist-get 'guild_id channel))
          (channel-id (alist-get 'channel_id channel))
          (name (alist-get 'name channel))
          (kind (alist-get 'kind channel))
          (session
           (qq-state-session
            (qq-state-guild-channel-session-key guild-id channel-id)))
-         (unread (or (alist-get 'unread-count session) 0))
-         (start (point)))
-    (insert "    " (qq-guild-channel-type-icon kind) " "
+         (unread (or (alist-get 'unread-count session) 0)))
+    (insert (qq-guild-channel-type-icon kind) " "
             (qq-guilds--display-name name channel-id))
-    (make-text-button
-     start (point)
-     'follow-link t
-     'face 'qq-guilds-channel
-     'mouse-face 'highlight
-     'help-echo (format "打开%s频道 %s · %s"
-                        (qq-guild-channel-type-label kind)
-                        (alist-get 'guild_name channel) name)
-     'qq-guild-id guild-id
-     'qq-guild-channel-id channel-id
-     'action (lambda (button)
-               (qq-guilds-open-channel
-                (button-get button 'qq-guild-id)
-                (button-get button 'qq-guild-channel-id))))
     (insert (propertize
              (format "  %s" (qq-guild-channel-type-label kind))
              'face 'shadow))
@@ -165,47 +107,32 @@
     (when (> unread 0)
       (insert (propertize (format "  %d 未读" unread)
                           'face 'font-lock-warning-face)))
-    (insert "\n")
-    (add-text-properties
-     start (point)
-     (list 'qq-guilds-key key
-           'qq-guild-id guild-id
-           'qq-guild-channel-id channel-id
-           'qq-guild-action 'open))))
+    (insert "\n")))
 
-(defun qq-guilds--entry-printer (entry)
-  "Insert one persistent Guild directory ENTRY."
-  (let ((key (qq-guilds--entry-key entry)))
-    (pcase (qq-guilds--entry-type entry)
-      ('guild
-       (qq-guilds--insert-guild entry key))
-      ('category
-       (appkit-view-insert-heading-line
-        (qq-guilds--entry-text entry)
-        :face (qq-guilds--entry-face entry)
-        :line-properties (list 'qq-guilds-key key)))
-      ('note
-       (appkit-view-insert-note-line
-        (qq-guilds--entry-text entry)
-        :face (qq-guilds--entry-face entry)
-        :line-properties (list 'qq-guilds-key key)))
-      ('channel
-       (qq-guilds--insert-channel (qq-guilds--entry-channel entry) key))
-      ('blank
-       (insert (propertize "\n" 'qq-guilds-key key)))
-      (type (error "QQ: unknown Guild directory entry type %S" type)))))
+(defun qq-guilds--activate-channel (_surface entry)
+  "Open the QQ Guild channel carried by directory ENTRY."
+  (let ((channel (appkit-directory-entry-payload entry)))
+    (qq-guilds-open-channel
+     (alist-get 'guild_id channel)
+     (alist-get 'channel_id channel))))
+
+(defun qq-guilds--fold-changed (_surface _entry _expanded-p)
+  "Synchronize the current directory after an Appkit fold changed."
+  (let ((view (qq-guilds--ensure-view)))
+    (appkit-request-sync view :structure t :part 'directory)
+    (appkit-sync-invalidations view)))
 
 (defun qq-guilds--project-status-entry ()
   "Return the current transient status entry, or nil."
   (cond
    (qq-guilds--loading
-    (qq-guilds--entry-create
-     :key 'status :type 'note
-     :text "  正在读取 Linux QQ 频道目录…" :face 'shadow))
+    (appkit-directory-entry-create
+     :key 'status :role 'note
+     :label "正在读取 Linux QQ 频道目录…" :indent 2 :face 'shadow))
    (qq-guilds--error
-    (qq-guilds--entry-create
-     :key 'status :type 'note
-     :text (concat "  " qq-guilds--error) :face 'error))))
+    (appkit-directory-entry-create
+     :key 'status :role 'note
+     :label qq-guilds--error :indent 2 :face 'error))))
 
 (defun qq-guilds--matches-p (&rest values)
   "Return non-nil when current filter matches one of VALUES."
@@ -248,11 +175,12 @@ GUILD-MATCH-P means the parent Guild itself matched the active filter."
 (defun qq-guilds--project-guild-group (guild categories channel-table)
   "Project GUILD, CATEGORIES, and CHANNEL-TABLE into stable entries."
   (let* ((guild-id (alist-get 'guild_id guild))
+         (guild-key (qq-guilds--guild-entry-key guild-id))
          (guild-name (qq-guilds--display-name (alist-get 'name guild) guild-id))
          (guild-match-p (qq-guilds--matches-p guild-name))
          (expanded-p
-          (or qq-guilds--filter
-              (not (gethash guild-id qq-guilds--collapsed-guilds))))
+          (appkit-directory-fold-expanded-p
+           (appkit-directory-surface) guild-key t qq-guilds--filter))
          (visible-categories
           (seq-keep
            (lambda (category)
@@ -266,43 +194,90 @@ GUILD-MATCH-P means the parent Guild itself matched the active filter."
          entries)
     (when visible-p
       (push
-       (qq-guilds--entry-create
-        :key (qq-guilds--guild-entry-key guild-id)
-        :type 'guild :text guild-name :face 'qq-guilds-title
-        :guild-id guild-id :expanded-p expanded-p)
+       (appkit-directory-entry-create
+        :key guild-key :role 'section :label guild-name
+        :face 'qq-guilds-title
+        :foldable-p t :fold-key guild-key
+        :fold-default-expanded-p t :expanded-p expanded-p
+        :fold-locked-reason
+        (and qq-guilds--filter
+             "qq: clear the directory filter before folding")
+        :help-echo (if expanded-p "折叠 QQ 频道" "展开 QQ 频道")
+        :properties (list 'qq-guild-id guild-id))
        entries)
       (when expanded-p
         (if visible-categories
             (dolist (pair visible-categories)
               (let ((category (car pair))
                     (channels (cdr pair)))
-                (unless (eq (alist-get 'uncategorized category) t)
-                  (push
-                   (qq-guilds--entry-create
-                    :key (qq-guilds--category-entry-key
-                          guild-id (alist-get 'category_id category))
-                    :type 'category
-                    :text (format "    ── %s ──"
-                                  (qq-guilds--display-name
-                                   (alist-get 'name category)
-                                   (alist-get 'category_id category)))
-                    :face 'shadow)
-                   entries))
-                (dolist (channel channels)
-                  (push
-                   (qq-guilds--entry-create
-                    :key (qq-guilds--channel-entry-key
-                          guild-id (alist-get 'channel_id channel))
-                    :type 'channel :channel channel)
-                   entries))))
+                (let* ((uncategorized-p
+                        (eq (alist-get 'uncategorized category) t))
+                       (category-key
+                        (qq-guilds--category-entry-key
+                         guild-id (alist-get 'category_id category)))
+                       (category-expanded-p
+                        (or uncategorized-p
+                            (appkit-directory-fold-expanded-p
+                             (appkit-directory-surface)
+                             category-key t qq-guilds--filter))))
+                  (unless uncategorized-p
+                    (push
+                     (appkit-directory-entry-create
+                      :key category-key :role 'group
+                      :section-key guild-key
+                      :label (qq-guilds--display-name
+                              (alist-get 'name category)
+                              (alist-get 'category_id category))
+                      :indent 4 :face 'shadow
+                      :foldable-p t :fold-key category-key
+                      :fold-default-expanded-p t
+                      :expanded-p category-expanded-p
+                      :fold-locked-reason
+                      (and qq-guilds--filter
+                           "qq: clear the directory filter before folding")
+                      :help-echo
+                      (if category-expanded-p "折叠频道分类" "展开频道分类"))
+                     entries))
+                  (when category-expanded-p
+                    (dolist (channel channels)
+                      (let ((channel-id (alist-get 'channel_id channel))
+                            (kind (alist-get 'kind channel)))
+                        (push
+                         (appkit-directory-entry-create
+                          :key (qq-guilds--channel-entry-key
+                                guild-id channel-id)
+                          :role 'item :section-key guild-key
+                          :group-key category-key
+                          :indent (if uncategorized-p 4 6)
+                          :item-p t
+                          :unread-p
+                          (> (or (alist-get
+                                  'unread-count
+                                  (qq-state-session
+                                   (qq-state-guild-channel-session-key
+                                    guild-id channel-id)))
+                                 0)
+                             0)
+                          :payload channel
+                          :face 'qq-guilds-channel
+                          :help-echo
+                          (format "打开%s频道 %s · %s"
+                                  (qq-guild-channel-type-label kind)
+                                  (alist-get 'guild_name channel)
+                                  (alist-get 'name channel))
+                          :properties
+                          (list 'qq-guild-id guild-id
+                                'qq-guild-channel-id channel-id))
+                         entries)))))))
           (push
-           (qq-guilds--entry-create
-            :key (list 'guild-empty guild-id) :type 'note
-            :text "    暂无匹配的子频道" :face 'shadow)
+           (appkit-directory-entry-create
+            :key (list 'guild-empty guild-id) :role 'note
+            :section-key guild-key
+            :label "暂无匹配的子频道" :indent 4 :face 'shadow)
            entries)))
       (push
-       (qq-guilds--entry-create
-        :key (list 'guild-gap guild-id) :type 'blank)
+       (appkit-directory-entry-create
+        :key (list 'guild-gap guild-id) :role 'spacer)
        entries))
     (nreverse entries)))
 
@@ -334,36 +309,28 @@ GUILD-MATCH-P means the parent Guild itself matched the active filter."
       (setq entries
             (nconc entries
                    (list
-                    (qq-guilds--entry-create
-                     :key 'empty :type 'note
-                     :text "  没有可见的 QQ 频道。" :face 'shadow)))))
+                    (appkit-directory-entry-create
+                     :key 'empty :role 'note
+                     :label "没有可见的 QQ 频道。" :indent 2
+                     :face 'shadow)))))
     (when (and qq-guilds--filter guilds
                (not (seq-some
                      (lambda (entry)
-                       (eq (qq-guilds--entry-type entry) 'guild))
+                       (eq (appkit-directory-entry-role entry) 'section))
                      entries)))
       (setq entries
             (nconc entries
                    (list
-                    (qq-guilds--entry-create
-                     :key 'filter-empty :type 'note
-                     :text "  没有匹配的频道或子频道。" :face 'shadow)))))
+                    (appkit-directory-entry-create
+                     :key 'filter-empty :role 'note
+                     :label "没有匹配的频道或子频道。" :indent 2
+                     :face 'shadow)))))
     entries))
 
 (defun qq-guilds--reconcile-directory ()
-  "Reconcile the persistent EWOC with the current projected directory."
-  (setq qq-guilds--node-table
-        (appkit-ewoc-reconcile
-         qq-guilds--ewoc (qq-guilds--project-entries)
-         #'qq-guilds--entry-key)))
-
-(defun qq-guilds--entry-key-at-point (&optional position)
-  "Return the stable Guild entry key at POSITION or point."
-  (let ((probe (or position (point))))
-    (or (get-text-property probe 'qq-guilds-key)
-        (save-excursion
-          (goto-char probe)
-          (get-text-property (line-beginning-position) 'qq-guilds-key)))))
+  "Reconcile the Appkit directory with the current QQ projection."
+  (appkit-directory-reconcile
+   (appkit-directory-surface) (qq-guilds--project-entries)))
 
 (defun qq-guilds--view-current-p (view buffer)
   "Return non-nil when VIEW still owns Guild directory BUFFER."
@@ -442,8 +409,7 @@ buffer has been renamed."
 
 (defun qq-guilds--sync-invalidations (view invalidations)
   "Consume coalesced Appkit INVALIDATIONS for Guild directory VIEW."
-  (unless (ewoc-p qq-guilds--ewoc)
-    (error "QQ: Guild directory view is not initialized"))
+  (appkit-directory-surface)
   (let* ((parts (appkit-invalidations-parts invalidations))
          (position-p (appkit-invalidations-position-p invalidations))
          (reconcile-p
@@ -452,15 +418,8 @@ buffer has been renamed."
     (when (and (appkit-view-live-p view)
                (or reconcile-p position-p))
       (appkit-with-content-update view
-        (let ((snapshot
-               (appkit-position-capture
-                :anchor-property 'qq-guilds-key
-                :preserve-window-start t)))
-          (when reconcile-p
-            (with-silent-modifications
-              (qq-guilds--reconcile-directory)))
-          (when snapshot
-            (appkit-position-restore snapshot)))))
+        (when reconcile-p
+          (qq-guilds--reconcile-directory))))
     ;; The header is an :eval form and reflects loading/error state without
     ;; forcing redisplay of every window showing the directory.
     (when (or reconcile-p (memq 'header parts))
@@ -537,16 +496,16 @@ buffer has been renamed."
 (defun qq-guilds-toggle-guild (&optional guild-id)
   "Toggle GUILD-ID, or the Guild heading at point."
   (interactive)
-  (let* ((key (qq-guilds--entry-key-at-point))
-         (id (or guild-id
-                 (and (eq (car-safe key) 'guild) (cdr key))
-                 (user-error "qq: point is not on a QQ 频道 heading"))))
-    (if (gethash id qq-guilds--collapsed-guilds)
-        (remhash id qq-guilds--collapsed-guilds)
-      (puthash id t qq-guilds--collapsed-guilds))
-    (let ((view (qq-guilds--ensure-view)))
-      (appkit-request-sync view :structure t :part 'directory)
-      (appkit-sync-invalidations view))))
+  (let* ((key (if guild-id
+                  (qq-guilds--guild-entry-key guild-id)
+                (appkit-directory-key-at-point)))
+         (surface (appkit-directory-surface))
+         (entry (and key
+                     (appkit-directory-entry-for-key surface key))))
+    (unless (and entry
+                 (eq (appkit-directory-entry-role entry) 'section))
+      (user-error "qq: point is not on a QQ 频道 heading"))
+    (appkit-directory-activate-entry surface entry)))
 
 (defun qq-guilds-filter (query)
   "Filter the QQ Guild directory by substring QUERY."
@@ -567,19 +526,6 @@ buffer has been renamed."
   (let ((view (qq-guilds--ensure-view)))
     (appkit-request-sync view :structure t :part 'directory)
     (appkit-sync-invalidations view)))
-
-(defun qq-guilds-activate ()
-  "Activate the fold or channel action at point."
-  (interactive)
-  (pcase (get-text-property (line-beginning-position) 'qq-guild-action)
-    ('toggle
-     (qq-guilds-toggle-guild
-      (get-text-property (line-beginning-position) 'qq-guild-id)))
-    ('open
-     (qq-guilds-open-channel
-      (get-text-property (line-beginning-position) 'qq-guild-id)
-      (get-text-property (line-beginning-position) 'qq-guild-channel-id)))
-    (_ (user-error "qq: no action at point"))))
 
 (defun qq-guilds-open-channel (guild-id channel-id)
   "Open the channel identified by GUILD-ID and CHANNEL-ID."
@@ -605,36 +551,25 @@ buffer has been renamed."
 
 (defvar qq-guilds-mode-map
   (let ((map (make-sparse-keymap)))
-    (set-keymap-parent map special-mode-map)
+    (set-keymap-parent map appkit-directory-mode-map)
     (define-key map (kbd "g") #'qq-guilds-refresh)
     (define-key map (kbd "/") #'qq-guilds-filter)
     (define-key map (kbd "C-c C-k") #'qq-guilds-clear-filter)
-    (define-key map (kbd "n") #'forward-button)
-    (define-key map (kbd "p") #'backward-button)
-    (define-key map (kbd "TAB") #'qq-guilds-toggle-guild)
-    (define-key map (kbd "RET") #'qq-guilds-activate)
-    (define-key map (kbd "q") #'quit-window)
     map))
 
-(define-derived-mode qq-guilds-mode special-mode "QQ-Guilds"
+(define-derived-mode qq-guilds-mode appkit-directory-mode "QQ-Guilds"
   "Major mode for the hierarchical QQ Guild directory."
-  (setq buffer-read-only t
-        truncate-lines t)
-  (buffer-disable-undo)
-  (setq-local buffer-undo-list t)
   (setq-local qq-guilds--loading nil)
   (setq-local qq-guilds--error nil)
   (setq-local qq-guilds--refresh-owner nil)
   (setq-local qq-guilds--refresh-request nil)
-  (setq-local qq-guilds--node-table (make-hash-table :test #'equal))
-  (setq-local qq-guilds--collapsed-guilds (make-hash-table :test #'equal))
   (setq-local qq-guilds--filter nil)
   (setq-local header-line-format '(:eval (qq-guilds--header-line)))
-  (let ((inhibit-read-only t)
-        (buffer-undo-list t))
-    (erase-buffer)
-    (setq-local qq-guilds--ewoc
-                (ewoc-create #'qq-guilds--entry-printer nil nil t)))
+  (appkit-directory-configure
+   (appkit-directory-surface)
+   :item-inserter #'qq-guilds--insert-channel
+   :activate-function #'qq-guilds--activate-channel
+   :fold-function #'qq-guilds--fold-changed)
   (add-hook 'change-major-mode-hook #'qq-guilds--cancel-refresh nil t)
   (add-hook 'kill-buffer-hook #'qq-guilds--cancel-refresh nil t))
 

@@ -95,7 +95,11 @@ Each item is either a channel id string or a cons of id and display name."
   "Return a canonical synthetic channel id for INDEX."
   (format "900719925475%04d" index))
 
-(ert-deftest qq-guilds-renders-hierarchy-with-a-line-scoped-channel-button ()
+(defun qq-guilds-test--node-table ()
+  "Return the current Appkit directory node table."
+  (appkit-directory-surface-node-table (appkit-directory-surface)))
+
+(ert-deftest qq-guilds-renders-hierarchy-with-native-directory-rows ()
   (let ((qq-state-change-hook nil))
     (qq-state-reset)
     (unwind-protect
@@ -107,14 +111,14 @@ Each item is either a channel id string or a cons of id and display name."
             (goto-char (point-min))
             (should (search-forward "Synthetic guild" nil t))
             (should (search-forward "# General" nil t))
-            (let* ((button (button-at (1- (point))))
-                   (end (button-end button)))
-              (should button)
-              (should (equal (button-get button 'qq-guild-id)
+            (let ((position (1- (point))))
+              (should-not (button-at position))
+              (should (equal (get-text-property position 'qq-guild-id)
                              qq-guilds-test--guild-id))
-              (should (equal (button-get button 'qq-guild-channel-id)
+              (should (equal (get-text-property
+                              position 'qq-guild-channel-id)
                              qq-guilds-test--channel-id))
-              (should-not (get-text-property end 'mouse-face)))
+              (should-not (get-text-property position 'mouse-face)))
             (should (search-forward "文字" nil t))))
       (qq-state-reset))))
 
@@ -131,16 +135,19 @@ Each item is either a channel id string or a cons of id and display name."
             (let ((heading-node
                    (gethash
                     (qq-guilds--guild-entry-key qq-guilds-test--guild-id)
-                    qq-guilds--node-table)))
+                    (qq-guilds-test--node-table))))
               (qq-guilds-toggle-guild qq-guilds-test--guild-id)
               (should-not (string-match-p "# General" (buffer-string)))
               (should
                (eq heading-node
                    (gethash
                     (qq-guilds--guild-entry-key qq-guilds-test--guild-id)
-                    qq-guilds--node-table)))
-              (should (gethash qq-guilds-test--guild-id
-                               qq-guilds--collapsed-guilds))
+                    (qq-guilds-test--node-table))))
+              (should-not
+               (appkit-directory-fold-expanded-p
+                (appkit-directory-surface)
+                (qq-guilds--guild-entry-key qq-guilds-test--guild-id)
+                t))
               (qq-guilds-toggle-guild qq-guilds-test--guild-id)
               (should (string-match-p "# General" (buffer-string))))))
       (qq-state-reset))))
@@ -169,12 +176,29 @@ Each item is either a channel id string or a cons of id and display name."
                        (string-match "Information" (buffer-string))))
             (should (< (string-match "Information" (buffer-string))
                        (string-match "# Announcements" (buffer-string))))
+            (goto-char
+             (ewoc-location
+              (gethash
+               (qq-guilds--category-entry-key
+                qq-guilds-test--guild-id "7")
+               (qq-guilds-test--node-table))))
+            (appkit-directory-activate)
+            (should-not (string-match-p "# Announcements" (buffer-string)))
             (qq-guilds-filter "announce")
             (should-not (string-match-p "# General" (buffer-string)))
             (should (string-match-p "# Announcements" (buffer-string)))
             (should (string-match-p "/announce/" (qq-guilds--header-line)))
             (qq-guilds-clear-filter)
-            (should (string-match-p "# General" (buffer-string)))))
+            (should (string-match-p "# General" (buffer-string)))
+            (should-not (string-match-p "# Announcements" (buffer-string)))
+            (goto-char
+             (ewoc-location
+              (gethash
+               (qq-guilds--category-entry-key
+                qq-guilds-test--guild-id "7")
+               (qq-guilds-test--node-table))))
+            (appkit-directory-activate)
+            (should (string-match-p "# Announcements" (buffer-string)))))
       (qq-state-reset))))
 
 (ert-deftest qq-guilds-routes-closed-channel-kinds-by-capability ()
@@ -363,12 +387,12 @@ Each item is either a channel id string or a cons of id and display name."
             (let ((guild-node
                    (gethash
                     (qq-guilds--guild-entry-key qq-guilds-test--guild-id)
-                    qq-guilds--node-table))
+                    (qq-guilds-test--node-table)))
                   (channel-node
                    (gethash
                     (qq-guilds--channel-entry-key
                      qq-guilds-test--guild-id first-id)
-                    qq-guilds--node-table)))
+                    (qq-guilds-test--node-table))))
               (should guild-node)
               (should channel-node)
               (qq-state-apply-guild-directory
@@ -383,13 +407,13 @@ Each item is either a channel id string or a cons of id and display name."
                (eq guild-node
                    (gethash
                     (qq-guilds--guild-entry-key qq-guilds-test--guild-id)
-                    qq-guilds--node-table)))
+                    (qq-guilds-test--node-table))))
               (should
                (eq channel-node
                    (gethash
                     (qq-guilds--channel-entry-key
                      qq-guilds-test--guild-id first-id)
-                    qq-guilds--node-table)))
+                    (qq-guilds-test--node-table))))
               (should (string-match-p "# Renamed" (buffer-string)))
               (should (string-match-p
                        (regexp-quote (format "# Channel %s" second-id))
@@ -410,7 +434,7 @@ Each item is either a channel id string or a cons of id and display name."
                    (gethash
                     (qq-guilds--channel-entry-key
                      qq-guilds-test--guild-id qq-guilds-test--channel-id)
-                    qq-guilds--node-table)))
+                    (qq-guilds-test--node-table))))
               (setq qq-guilds--loading t)
               (appkit-invalidate view :structure t :part 'directory)
               (appkit-sync-invalidations view)
@@ -422,7 +446,7 @@ Each item is either a channel id string or a cons of id and display name."
                    (gethash
                     (qq-guilds--channel-entry-key
                      qq-guilds-test--guild-id qq-guilds-test--channel-id)
-                    qq-guilds--node-table)))
+                    (qq-guilds-test--node-table))))
               (setq qq-guilds--loading nil
                     qq-guilds--error "读取频道目录失败: synthetic")
               (appkit-invalidate view :structure t :part 'directory)
@@ -436,7 +460,7 @@ Each item is either a channel id string or a cons of id and display name."
                    (gethash
                     (qq-guilds--channel-entry-key
                      qq-guilds-test--guild-id qq-guilds-test--channel-id)
-                    qq-guilds--node-table))))))
+                    (qq-guilds-test--node-table)))))))
       (qq-state-reset))))
 
 (ert-deftest qq-guilds-initial-loading-does-not-project-an-empty-flash ()
@@ -449,8 +473,8 @@ Each item is either a channel id string or a cons of id and display name."
           (appkit-sync-invalidations view)
           (should (string-match-p "正在读取" (buffer-string)))
           (should-not (string-match-p "没有可见" (buffer-string)))
-          (should (gethash 'status qq-guilds--node-table))
-          (should-not (gethash 'empty qq-guilds--node-table)))
+          (should (gethash 'status (qq-guilds-test--node-table)))
+          (should-not (gethash 'empty (qq-guilds-test--node-table))))
       (qq-state-reset))))
 
 (ert-deftest qq-guilds-reconcile-preserves-semantic-point-and-window-start ()
@@ -479,10 +503,12 @@ Each item is either a channel id string or a cons of id and display name."
                 (set-window-buffer window buffer)
                 (select-window window)
                 (goto-char
-                 (ewoc-location (gethash target-key qq-guilds--node-table)))
+                 (ewoc-location
+                  (gethash target-key (qq-guilds-test--node-table))))
                 (set-window-start
                  window
-                 (ewoc-location (gethash deleted-key qq-guilds--node-table))
+                 (ewoc-location
+                  (gethash deleted-key (qq-guilds-test--node-table)))
                  t)
                 (let* ((window-start-line
                         (line-number-at-pos (window-start window)))
@@ -494,7 +520,7 @@ Each item is either a channel id string or a cons of id and display name."
                                 (list target-id)
                                 (seq-drop remaining 15)
                                 (list added-id))))
-                  (should (equal target-key (qq-guilds--entry-key-at-point)))
+                  (should (equal target-key (appkit-directory-key-at-point)))
                   (should (> window-start-line 1))
                   (qq-state-apply-guild-directory
                    (qq-guilds-test--directory-with-channels new-order))
@@ -505,16 +531,17 @@ Each item is either a channel id string or a cons of id and display name."
                     (appkit-invalidate view :structure t :part 'directory)
                     (appkit-sync-invalidations view))
                   (should (equal target-key
-                                 (qq-guilds--entry-key-at-point)))
+                                 (appkit-directory-key-at-point)))
                   (should
                    (= window-start-line
                       (line-number-at-pos (window-start window))))
-                  (should-not (gethash deleted-key qq-guilds--node-table))
+                  (should-not
+                   (gethash deleted-key (qq-guilds-test--node-table)))
                   (should
                    (gethash
                     (qq-guilds--channel-entry-key
                      qq-guilds-test--guild-id added-id)
-                    qq-guilds--node-table)))))))
+                    (qq-guilds-test--node-table))))))))
       (qq-state-reset))))
 
 (ert-deftest qq-guilds-renamed-buffer-hook-uses-the-registered-view ()
