@@ -667,11 +667,19 @@ their cached segment predates the richer poke renderer."
   (when (qq-state-poke-message-p message)
     (copy-tree (alist-get 'poke-recall-reference message))))
 
-(defun qq-state--validate-poke-recall-context (reference session-key)
+(defun qq-state--validate-poke-recall-context
+    (reference session-key &optional authoritative-private-p
+               expected-private-peer-uid)
   "Return REFERENCE when its native Peer belongs to SESSION-KEY.
 
 Group peers are their decimal group IDs.  Private peers are opaque NT UIDs;
-the session must already own that exact UID before a recall can be sent."
+the session must already own that exact UID before a recall can be sent.
+
+AUTHORITATIVE-PRIVATE-P is reserved for an inbound fork-authored poke notice.
+Such a notice may supply the first private UID, but can never replace an
+existing one.  EXPECTED-PRIVATE-PEER-UID, when non-nil, is an independently
+authenticated recent-contact UID that the notice must match before either is
+committed."
   (when reference
     (unless session-key
       (error "qq: poke recall reference has no conversation"))
@@ -691,10 +699,22 @@ the session must already own that exact UID before a recall can be sent."
         ('private
          (unless (= chat-type 1)
            (error "qq: private poke recall reference has non-private peer"))
-         (unless (and (stringp known-peer-uid)
-                      (not (string-empty-p known-peer-uid)))
-           (error "qq: private poke recall requires the session's exact peer UID"))
-         (unless (equal peer-uid known-peer-uid)
+         (when expected-private-peer-uid
+           (setq expected-private-peer-uid
+                 (qq-state--canonical-peer-uid
+                  expected-private-peer-uid "private poke context"))
+           (unless (equal peer-uid expected-private-peer-uid)
+             (error "qq: private poke recall reference contradicts its contact UID")))
+         (if (and (stringp known-peer-uid)
+                  (not (string-empty-p known-peer-uid)))
+             (unless (equal peer-uid known-peer-uid)
+               (error "qq: private poke recall reference does not match %s"
+                      session-key))
+           (unless authoritative-private-p
+             (error
+              "qq: private poke recall requires the session's exact peer UID")))
+         (unless (and (stringp peer-uid)
+                      (not (string-empty-p peer-uid)))
            (error "qq: private poke recall reference does not match %s"
                   session-key)))
         (_
@@ -1270,8 +1290,12 @@ the natural-language fragments.  The complete original notice remains in
       (detail . ,(and (cdr texts) (string-join (cdr texts) "")))
       (texts . ,texts))))
 
-(defun qq-state--normalize-poke-notice (notice &optional expected-session-key)
-  "Normalize a live or historical POKE NOTICE into a timeline message."
+(defun qq-state--normalize-poke-notice
+    (notice &optional expected-session-key expected-private-peer-uid)
+  "Normalize a live or historical POKE NOTICE into a timeline message.
+
+EXPECTED-PRIVATE-PEER-UID is trusted recent-contact context used to validate a
+structured latest poke before that contact has mutated the session store."
   (let* ((group-id (qq-state--normalize-id (alist-get 'group_id notice)))
          (local-marker-cell (assq 'emacs_local_p notice))
          (recall-reference-cell (assq 'recall_reference notice))
@@ -1311,7 +1335,12 @@ the natural-language fragments.  The complete original notice remains in
             derived-session-key))
          (recall-reference
           (qq-state--validate-poke-recall-context
-           unscoped-recall-reference session-key))
+           unscoped-recall-reference session-key t
+           expected-private-peer-uid))
+         (peer-uid
+          (and (null group-id)
+               recall-reference
+               (alist-get 'peer_uid (alist-get 'peer recall-reference))))
          (actor-id (qq-state--normalize-id
                     (or (alist-get 'sender_id notice)
                         (alist-get 'user_id notice))))
@@ -1364,6 +1393,7 @@ the natural-language fragments.  The complete original notice remains in
             (raw-message . ,body)
             (preview . ,body)
             (message-type . ,(if group-id "group" "private"))
+            (peer-uid . ,peer-uid)
             (group-id . ,group-id)
             (user-id . ,actor-id)
             (target-id . ,target-id)
@@ -1426,11 +1456,16 @@ identify that exact group session."
       (order . ,(qq-state--next-message-order))
       (raw-event . ,(copy-tree notice)))))
 
-(defun qq-state--normalize-raw-message (message &optional expected-session-key)
-  "Normalize raw OneBot MESSAGE into local store shape."
+(defun qq-state--normalize-raw-message
+    (message &optional expected-session-key expected-private-peer-uid)
+  "Normalize raw OneBot MESSAGE into local store shape.
+
+EXPECTED-PRIVATE-PEER-UID constrains a private payload without supplying any
+missing wire identity."
   (cond
    ((qq-state--poke-notice-p message)
-    (qq-state--normalize-poke-notice message expected-session-key))
+    (qq-state--normalize-poke-notice
+     message expected-session-key expected-private-peer-uid))
    ((qq-state--gray-tip-notice-p message)
     (qq-state--normalize-gray-tip-notice message expected-session-key))
    (t
@@ -1472,6 +1507,11 @@ identify that exact group session."
                   (t 'received)))
          (time (qq-state--normalize-time (alist-get 'time message)))
          (target-id (alist-get 'target-id session-identity)))
+    (when (and expected-private-peer-uid
+               (eq (alist-get 'type session-identity) 'private)
+               peer-uid
+               (not (equal peer-uid expected-private-peer-uid)))
+      (error "qq: private latest message contradicts its contact UID"))
     `((id . ,server-id)
       (server-id . ,server-id)
       (session-key . ,session-key)
@@ -2594,7 +2634,10 @@ Return a plist:
   :session-key, :message-count (batch size), :added-count (new server ids),
   :oldest-message-id (after merge).  Chat uses `:added-count' to detect
   beginning-of-history when NapCat returns only already-cached rows."
-  (qq-state-upsert-session session-key nil nil)
+  ;; Validate routing without creating a session.  The history page is
+  ;; prepared entirely in local copies and commits only after every row has
+  ;; passed identity validation.
+  (qq-state-session-key-identity session-key)
   (let* ((messages
           (copy-tree
            (or (gethash session-key qq-state--messages-by-session) '())))
@@ -2616,8 +2659,14 @@ Return a plist:
           (when local-id (puthash local-id tail local-cells)))
         (setq tail (cdr tail))))
     (dolist (raw-message batch)
-      (let* ((normalized
-              (qq-state--normalize-raw-message raw-message session-key))
+      (let* ((expected-private-peer-uid
+              (and (eq (qq-state-session-key-type session-key) 'private)
+                   (or (alist-get 'peer-uid session-fields)
+                       (alist-get
+                        'peer-uid (gethash session-key qq-state--sessions)))))
+             (normalized
+              (qq-state--normalize-raw-message
+               raw-message session-key expected-private-peer-uid))
              (server-id (alist-get 'server-id normalized))
              (direct-cell (and server-id (gethash server-id server-cells)))
              (pending
@@ -2672,9 +2721,8 @@ Return a plist:
           (when-let* ((value (alist-get key merged)))
             (setf (alist-get key session-fields nil nil #'eq) value)))))
     (setq messages (qq-state--sort-messages messages))
+    (qq-state-upsert-session session-key session-fields nil)
     (puthash session-key messages qq-state--messages-by-session)
-    (when session-fields
-      (qq-state-upsert-session session-key session-fields nil))
     (qq-state--reindex-session-messages session-key messages)
     (qq-state--sync-session-summary session-key)
     (setq batch-ids (delete-dups (nreverse batch-ids)))
@@ -3135,8 +3183,16 @@ In particular, a structured `lastestMsg' is fully normalized before any of
 its session metadata can be committed."
   (when-let* ((session-key (qq-state--recent-contact-session-key contact)))
     (let* ((identity (qq-state-session-key-identity session-key))
+           (session-type (alist-get 'type identity))
            (chat-type (alist-get 'chat-type identity))
-           (peer-uid (alist-get 'peer-uid identity))
+           ;; A private key intentionally contains only the peer UIN.  Its
+           ;; opaque UID must come directly from the official contact payload;
+           ;; deriving it from peerUin would corrupt recall capabilities.
+           (peer-uid
+            (if (eq session-type 'private)
+                (qq-state--canonical-peer-uid
+                 (alist-get 'peerUid contact) "private recent contact")
+              (alist-get 'peer-uid identity)))
            (peer-uin (qq-state--normalize-id (alist-get 'peerUin contact)))
            (target-id (alist-get 'target-id identity))
            (msg-time (qq-state--normalize-time (alist-get 'msgTime contact)))
@@ -3155,10 +3211,19 @@ its session metadata can be committed."
           (unless (and (stringp embedded-seq)
                        (equal embedded-seq msg-seq))
             (error "qq: recent contact msgSeq disagrees with latest message")))
-        (when (and msg-id
-                   (not (alist-get 'message_id message-copy nil nil #'eq))
-                   (not (alist-get 'id message-copy nil nil #'eq)))
-          (push (cons 'message_id msg-id) message-copy))
+        (if (qq-state--poke-notice-p message-copy)
+            ;; Authoritative pokes deliberately carry their snowflake only in
+            ;; recall_reference.  Do not reintroduce the forbidden legacy
+            ;; top-level message_id while completing a recent-contact row.
+            (let ((reference-id
+                   (alist-get
+                    'message_id (alist-get 'recall_reference message-copy))))
+              (when (and msg-id reference-id (not (equal msg-id reference-id)))
+                (error "qq: recent contact msgId disagrees with latest poke")))
+          (when (and msg-id
+                     (not (alist-get 'message_id message-copy nil nil #'eq))
+                     (not (alist-get 'id message-copy nil nil #'eq)))
+            (push (cons 'message_id msg-id) message-copy)))
         (when (and msg-seq
                    (not (alist-get 'message_seq message-copy nil nil #'eq)))
           (push (cons 'message_seq msg-seq) message-copy))
@@ -3196,7 +3261,9 @@ its session metadata can be committed."
          (last-message-self-p . nil))
        :normalized-message
        (and message-copy
-            (qq-state--normalize-raw-message message-copy session-key))
+            (qq-state--normalize-raw-message
+             message-copy session-key
+             (and (eq session-type 'private) peer-uid)))
        :unread-entry-p (and unread-entry t)
        :unread-count (and unread-entry (cdr unread-entry))
        :at-me-seq

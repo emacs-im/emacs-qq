@@ -22,6 +22,19 @@
              (guild_id . "")))
     (valid_before . 4102444800)))
 
+(defun qq-state-test--private-poke-notice
+    (peer-uin peer-uid message-id)
+  "Return an anonymized authoritative private poke fixture."
+  `((time . 1710000001)
+    (post_type . "notice")
+    (notice_type . "notify")
+    (sub_type . "poke")
+    (user_id . ,peer-uin)
+    (sender_id . ,peer-uin)
+    (target_id . "90001")
+    (recall_reference
+     . ,(qq-state-test--poke-recall-reference message-id 1 peer-uid))))
+
 (defun qq-state-test--group-message
     (message-id time text &optional sender-name message-seq)
   "Return a raw group message fixture with MESSAGE-ID, TIME, TEXT, and sequence."
@@ -529,6 +542,68 @@
      (qq-state-test--poke-recall-reference
       "9007199254741007701" 1 "u_private_alice")))))
 
+(ert-deftest qq-state-authoritative-private-poke-first-binds-exact-peer-uid ()
+  (qq-test-with-reset
+   (let* ((peer-uin "11001")
+          (peer-uid "uid:private:alpha")
+          (message-id "9007199254741007711")
+          (message
+           (qq-state-apply-poke-notice
+            (qq-state-test--private-poke-notice
+             peer-uin peer-uid message-id)))
+          (session (qq-state-session "private:11001")))
+     (should (equal (alist-get 'server-id message) message-id))
+     (should (equal (alist-get 'peer-uid message) peer-uid))
+     (should (equal (alist-get 'peer-uid session) peer-uid))
+     (should (= (length (qq-state-session-messages "private:11001")) 1)))))
+
+(ert-deftest qq-state-private-poke-history-first-binds-exact-peer-uid ()
+  (qq-test-with-reset
+   (let ((peer-uid "uid:private:history"))
+     (qq-state-merge-history
+      "private:11002"
+      (list
+       (qq-state-test--private-poke-notice
+        "11002" peer-uid "9007199254741007712")))
+     (let ((message (car (qq-state-session-messages "private:11002"))))
+       (should (equal (alist-get 'peer-uid message) peer-uid))
+       (should (equal (alist-get 'peer-uid
+                                 (qq-state-session "private:11002"))
+                      peer-uid))))
+   ;; A single history transaction cannot collect two contradictory UIDs.
+   (should-error
+    (qq-state-merge-history
+     "private:11007"
+     (list
+      (qq-state-test--private-poke-notice
+       "11007" "uid:private:first" "9007199254741007715")
+      (qq-state-test--private-poke-notice
+       "11007" "uid:private:second" "9007199254741007716"))))
+   (should-not (qq-state-session "private:11007"))
+   (should-not (qq-state-session-messages "private:11007"))))
+
+(ert-deftest qq-state-private-poke-rejects-stored-uid-mismatch-atomically ()
+  (qq-test-with-reset
+   (qq-state-upsert-session
+    "private:11003"
+    '((title . "Peer") (peer-uid . "uid:private:expected"))
+    nil)
+   (let ((before (qq-state-session "private:11003")))
+     (should-error
+      (qq-state-apply-poke-notice
+       (qq-state-test--private-poke-notice
+        "11003" "uid:private:wrong" "9007199254741007713")))
+     (should (equal (qq-state-session "private:11003") before))
+     (should-not (qq-state-session-messages "private:11003"))
+     (should-error
+      (qq-state-merge-history
+       "private:11003"
+       (list
+        (qq-state-test--private-poke-notice
+         "11003" "uid:private:wrong" "9007199254741007714"))))
+     (should (equal (qq-state-session "private:11003") before))
+     (should-not (qq-state-session-messages "private:11003")))))
+
 (ert-deftest qq-state-apply-poke-notice-uses-id-fallback-in-group ()
   (qq-test-with-reset
    (qq-state-set-self-info '((user_id . "90001") (nickname . "我")))
@@ -927,6 +1002,7 @@
   (qq-test-with-reset
    (qq-state-apply-recent-contacts
     '(((chatType . 1)
+       (peerUid . "uid:private:alpha")
        (peerUin . "10001")
        (remark . "Alice")
        (peerName . "Alice Nick")
@@ -944,10 +1020,68 @@
                      (data . ((text . "hello from napcat"))))))))))
    (let ((session (qq-state-session "private:10001")))
      (should (equal (alist-get 'title session) "Alice"))
+     (should (equal (alist-get 'peer-uid session) "uid:private:alpha"))
      (should (equal (alist-get 'last-message-id session) "42"))
      (should (equal (alist-get 'last-message-seq session) "10001"))
      (should (equal (alist-get 'last-message-preview session)
                     "hello from napcat")))))
+
+(ert-deftest qq-state-private-recent-contact-requires-official-peer-uid ()
+  (qq-test-with-reset
+   (dolist (bad-peer-uid '(nil "" 11004))
+     (should-error
+      (qq-state-apply-recent-contacts
+       `(((chatType . 1)
+          (peerUid . ,bad-peer-uid)
+          (peerUin . "11004")
+          (peerName . "Peer")
+          (msgTime . "1710000000")
+          (msgId . "9007199254741007720")
+          (msgSeq . "10001")
+          (lastestMsg . nil)))))
+     (should-not (qq-state-session "private:11004")))))
+
+(ert-deftest qq-state-private-recent-latest-poke-binds-uid-atomically ()
+  (qq-test-with-reset
+   (let ((peer-uid "uid:private:recent")
+         (message-id "9007199254741007721"))
+     (qq-state-apply-recent-contacts
+      `(((chatType . 1)
+         (peerUid . ,peer-uid)
+         (peerUin . "11005")
+         (peerName . "Peer")
+         (msgTime . "1710000001")
+         (msgId . ,message-id)
+         (msgSeq . "10002")
+         (lastestMsg
+          . ,(qq-state-test--private-poke-notice
+              "11005" peer-uid message-id)))))
+     (let* ((session (qq-state-session "private:11005"))
+            (messages (qq-state-session-messages "private:11005"))
+            (message (car messages)))
+       (should (= (length messages) 1))
+       (should (equal (alist-get 'peer-uid session) peer-uid))
+       (should (equal (alist-get 'peer-uid message) peer-uid))
+       (should (equal (alist-get 'server-id message) message-id))
+       (should-not (assq 'message_id (alist-get 'raw-event message)))))))
+
+(ert-deftest qq-state-private-recent-latest-poke-rejects-uid-mismatch-atomically ()
+  (qq-test-with-reset
+   (should-error
+    (qq-state-apply-recent-contacts
+     `(((chatType . 1)
+        (peerUid . "uid:private:contact")
+        (peerUin . "11006")
+        (peerName . "Peer")
+        (msgTime . "1710000001")
+        (msgId . "9007199254741007722")
+        (msgSeq . "10003")
+        (lastestMsg
+         . ,(qq-state-test--private-poke-notice
+             "11006" "uid:private:notice"
+             "9007199254741007722"))))))
+   (should-not (qq-state-session "private:11006"))
+   (should-not (qq-state-session-messages "private:11006"))))
 
 (ert-deftest qq-state-recent-contact-requires-one-exact-native-sequence ()
   (qq-test-with-reset
@@ -990,6 +1124,7 @@
     '((user_id . "90001") (nickname . "Me")))
    (qq-state-apply-recent-contacts
     '(((chatType . 1)
+       (peerUid . "uid:private:alpha")
        (peerUin . "10001")
        (peerName . "Alice")
        (msgTime . "1710000000")
@@ -2025,6 +2160,7 @@
   (qq-test-with-reset
    (qq-state-apply-recent-contacts
     '(((chatType . 1)
+       (peerUid . "uid:private:beta")
        (peerUin . "10002")
        (remark . "Bob")
        (msgTime . "1710000001")
