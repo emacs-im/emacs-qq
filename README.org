@@ -66,6 +66,17 @@ NapCat 暴露的全部 OneBot action。
 - ~messagePostFormat = array~
 - ~reportSelfMessage = true~
 
+** Evil
+
+加载 Evil 时，~emacs-qq~ 会自动安装独立的 modal bindings；普通 mode map 仍然是
+Emacs state 的接口。默认使用 normal state，可以通过 ~qq-evil-initial-state~ 或
+~qq-evil-enable-integration~ 调整。
+
+只读界面保留 ~gg~、~G~、~n~、~N~ 等原生 Evil 移动和搜索语义；~gr~ 刷新，
+~gj~ / ~gk~ 在应用项目间移动，~RET~ 执行当前项目。聊天时间线使用 ~r~ 回复、
+~dd~ 删除、~R~ 转发、~gq~ 跳到被回复消息。切换到 Emacs state 后，原有的单键
+~g~、~n~、~p~ 等绑定仍保持不变。
+
 * 联系人与资料
 
 在主界面按 ~c~ 打开 ~*qq-contacts*~。

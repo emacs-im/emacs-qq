@@ -43,6 +43,7 @@
 (require 'qq-transient)
 (require 'qq-notifications)
 (require 'qq-modes)
+(require 'qq-evil)
 
 (defconst qq--client-major-modes
   '(qq-chat-mode
