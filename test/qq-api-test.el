@@ -3357,6 +3357,26 @@ The authoritative post-state reports UNREAD-COUNT."
      (qq-api-validate-native-forward-messages (list recalled-nonempty))
      :type 'user-error)))
 
+(ert-deftest qq-api-native-forward-sender-accepts-only-https-avatar-url ()
+  (dolist (sender
+           '(((kind . "user")
+              (user_id . "10001")
+              (name . "Alice")
+              (avatar_url . "https://example.test/alice.png"))
+             ((kind . "anonymous")
+              (name . "Visitor")
+              (avatar_url . "https://example.test/visitor.png"))))
+    (let ((message (qq-api-test--native-message "1" nil)))
+      (setf (alist-get 'sender message) sender)
+      (should (qq-api-validate-native-forward-messages (list message)))))
+  (dolist (avatar-url '("" "http://example.test/avatar.png"
+                        "file:///tmp/avatar.png"))
+    (let ((message (qq-api-test--native-message "1" nil)))
+      (setf (alist-get 'avatar_url (alist-get 'sender message)) avatar-url)
+      (should-error
+       (qq-api-validate-native-forward-messages (list message))
+       :type 'user-error))))
+
 (ert-deftest qq-api-native-forward-card-presentation-is-closed-and-may-be-empty ()
   (let ((message
          (qq-api-test--native-message

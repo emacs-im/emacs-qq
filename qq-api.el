@@ -953,7 +953,8 @@ segments.  A resolve action result itself must be terminal or available."
   (let ((sender (alist-get 'sender message)))
     (pcase (and (qq-api--single-alist-p sender) (alist-get 'kind sender))
       ("user"
-       (unless (qq-api--exact-object-keys-p sender '(kind user_id name))
+       (unless (qq-api--exact-object-keys-p
+                sender '(kind user_id name) '(avatar_url))
          (qq-api--signal-schema-error
           protocol-p "qq: %s user sender has invalid fields" context))
        (unless (qq-api-user-id-p (alist-get 'user_id sender))
@@ -961,10 +962,23 @@ segments.  A resolve action result itself must be terminal or available."
           protocol-p "qq: %s sender.user_id must be decimal" context))
        (unless (stringp (alist-get 'name sender))
          (qq-api--signal-schema-error
-          protocol-p "qq: %s sender.name must be a string" context)))
+          protocol-p "qq: %s sender.name must be a string" context))
+       (when (assq 'avatar_url sender)
+         (unless (and (qq-api-non-empty-string-p
+                       (alist-get 'avatar_url sender))
+                      (string-match-p
+                       "\\`https://" (alist-get 'avatar_url sender)))
+           (qq-api--signal-schema-error
+            protocol-p "qq: %s sender.avatar_url must be HTTPS" context))))
       ("anonymous"
-       (unless (and (qq-api--exact-object-keys-p sender '(kind name))
-                    (stringp (alist-get 'name sender)))
+       (unless (and (qq-api--exact-object-keys-p
+                     sender '(kind name) '(avatar_url))
+                    (stringp (alist-get 'name sender))
+                    (or (not (assq 'avatar_url sender))
+                        (and (qq-api-non-empty-string-p
+                              (alist-get 'avatar_url sender))
+                             (string-match-p
+                              "\\`https://" (alist-get 'avatar_url sender)))))
          (qq-api--signal-schema-error
           protocol-p "qq: %s anonymous sender is invalid" context)))
       (_

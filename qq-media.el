@@ -1244,23 +1244,44 @@ remain disjoint: a Guild tiny id is not a QQ account id."
                 ((not (equal (format "%s" sender-id) "0"))))
       (list :user sender-id))))
 
+(defun qq-media--message-snapshot-avatar-url (message)
+  "Return MESSAGE's authoritative non-Guild snapshot avatar URL, or nil.
+
+Merged-forward nodes carry per-entry avatar URLs because their projected QQ
+UIN can be a repeated fallback shared by unrelated authors.  Guild messages
+retain their native member cache identity and its existing URL handling."
+  (let ((identity (qq-media--message-avatar-identity message))
+        (url (alist-get 'sender-avatar-url message)))
+    (and (not (eq (car-safe identity) :guild-member))
+         (appkit-media-url-present-p url)
+         url)))
+
+(defun qq-media--message-snapshot-avatar-key (message)
+  "Return the URL-scoped avatar cache key for MESSAGE, or nil."
+  (when-let* ((url (qq-media--message-snapshot-avatar-url message)))
+    (format "message-avatar-url:%s" url)))
+
 (defun qq-media-message-avatar-cache-key (message)
   "Return the logical avatar cache key affecting MESSAGE, or nil."
-  (pcase (qq-media--message-avatar-identity message)
-    (`(:guild-member ,guild-id ,native-id)
-     (qq-media--guild-member-avatar-key guild-id native-id))
-    (`(:user ,user-id)
-     (format "avatar:%s" user-id))))
+  (or (qq-media--message-snapshot-avatar-key message)
+      (pcase (qq-media--message-avatar-identity message)
+        (`(:guild-member ,guild-id ,native-id)
+         (qq-media--guild-member-avatar-key guild-id native-id))
+        (`(:user ,user-id)
+         (format "avatar:%s" user-id)))))
 
 (defun qq-media-open-message-avatar (message)
   "Open sender avatar for MESSAGE."
-  (pcase (qq-media--message-avatar-identity message)
-    (`(:guild-member ,guild-id ,native-id)
-     (qq-media-open-guild-member-avatar guild-id native-id))
-    (`(:user ,user-id)
-     (qq-media-open-user-avatar user-id))
-    (_
-     (user-error "qq: message sender has no native avatar identity"))))
+  (if-let* ((url (qq-media--message-snapshot-avatar-url message))
+            (key (qq-media--message-snapshot-avatar-key message)))
+      (qq-media-open-image-url key url)
+    (pcase (qq-media--message-avatar-identity message)
+      (`(:guild-member ,guild-id ,native-id)
+       (qq-media-open-guild-member-avatar guild-id native-id))
+      (`(:user ,user-id)
+       (qq-media-open-user-avatar user-id))
+      (_
+       (user-error "qq: message sender has no native avatar identity")))))
 
 (defun qq-media--guild-member-avatar-resource (profile)
   "Return the avatar resource projected from Guild member PROFILE."
@@ -1294,8 +1315,17 @@ remain disjoint: a Guild tiny id is not a QQ account id."
 (defun qq-media-message-avatar-image (message)
   "Return the identity-correct inline sender avatar for MESSAGE."
   (let ((identity (qq-media--message-avatar-identity message))
-        (avatar-url (alist-get 'sender-avatar-url message)))
-    (pcase identity
+        (avatar-url (alist-get 'sender-avatar-url message))
+        (snapshot-url (qq-media--message-snapshot-avatar-url message)))
+    (cond
+     (snapshot-url
+      (qq-media--ensure-resource-image
+       (qq-media--message-snapshot-avatar-key message)
+       (lambda (done _error)
+         (funcall done `((url . ,snapshot-url))))
+       qq-media-avatar-image-height))
+     (t
+      (pcase identity
       (`(:guild-member ,guild-id ,native-id)
        (if (appkit-media-url-present-p avatar-url)
            (qq-media--ensure-resource-image
@@ -1305,7 +1335,7 @@ remain disjoint: a Guild tiny id is not a QQ account id."
             qq-media-avatar-image-height)
          (qq-media-guild-member-avatar-image guild-id native-id)))
       (`(:user ,user-id)
-       (qq-media-avatar-image user-id)))))
+       (qq-media-avatar-image user-id)))))))
 
 (defun qq-media-avatar-image (user-id)
   "Return inline avatar image for USER-ID, triggering fetch when needed."

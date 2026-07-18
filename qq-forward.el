@@ -341,18 +341,21 @@ snapshot is remote-only."
   (pcase (alist-get 'kind sender)
     ("user"
      (let ((id (alist-get 'user_id sender))
-           (name (alist-get 'name sender)))
+           (name (alist-get 'name sender))
+           (avatar-url (alist-get 'avatar_url sender)))
        (list id (or (qq-forward--present-string name) id "unknown")
-             name nil)))
+             name nil avatar-url)))
     ("anonymous"
-     (let ((name (alist-get 'name sender)))
+     (let ((name (alist-get 'name sender))
+           (avatar-url (alist-get 'avatar_url sender)))
        (list nil (or (qq-forward--present-string name) "anonymous")
-             name nil)))))
+             name nil avatar-url)))))
 
 (defun qq-forward--normalized-message
     (source segments entry-id server-id time sender-fields state origin)
   "Build one viewer-local message from a validated native snapshot."
-  (pcase-let ((`(,sender-id ,sender-name ,sender-nickname ,sender-card)
+  (pcase-let ((`(,sender-id ,sender-name ,sender-nickname ,sender-card
+                              ,sender-avatar-url)
                sender-fields))
     (let* ((segments (copy-tree segments))
            (recalled (equal state "recalled"))
@@ -368,6 +371,7 @@ snapshot is remote-only."
         (sender-card . ,sender-card)
         (sender-nickname . ,sender-nickname)
         (sender-remark . nil)
+        (sender-avatar-url . ,sender-avatar-url)
         (self-p . nil)
         (status . ,(if recalled 'recalled 'received))
         (segments . ,(if recalled nil segments))

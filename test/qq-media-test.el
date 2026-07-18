@@ -389,6 +389,39 @@
                      '((url . "https://example.invalid/forum-avatar.png"))))
       (should-not profile-request))))
 
+(ert-deftest qq-media-forward-avatar-uses-url-instead-of-repeated-user-id ()
+  (let ((url "https://example.test/forward-node.png")
+        fetch-key fetch-resource user-request)
+    (cl-letf (((symbol-function 'qq-media--ensure-resource-image)
+               (lambda (key fetch _height &optional _factory)
+                 (setq fetch-key key)
+                 (funcall fetch
+                          (lambda (resource) (setq fetch-resource resource))
+                          #'ignore)
+                 'forward-avatar))
+              ((symbol-function 'qq-media-avatar-image)
+               (lambda (user-id) (setq user-request user-id))))
+      (should
+       (eq
+        (qq-media-message-avatar-image
+         `((sender-id . "1094950020")
+           (sender-avatar-url . ,url)))
+        'forward-avatar))
+      (should (equal fetch-key (concat "message-avatar-url:" url)))
+      (should (equal fetch-resource `((url . ,url))))
+      (should-not user-request))))
+
+(ert-deftest qq-media-forward-avatar-cache-keys-are-url-scoped ()
+  (let ((first
+         '((sender-id . "1094950020")
+           (sender-avatar-url . "https://example.test/first.png")))
+        (second
+         '((sender-id . "1094950020")
+           (sender-avatar-url . "https://example.test/second.png"))))
+    (should-not
+     (equal (qq-media-message-avatar-cache-key first)
+            (qq-media-message-avatar-cache-key second)))))
+
 (ert-deftest qq-media-message-avatar-cache-key-keeps-native-identities-disjoint ()
   (let ((guild-message
          '((session-key

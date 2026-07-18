@@ -324,6 +324,21 @@ list are indistinguishable — both mean \"do not claim a count\"."
     (should (equal (alist-get 'preview message) "[message recalled]"))
     (should (equal (alist-get 'origin message) '((kind . "unknown"))))))
 
+(ert-deftest qq-forward-message-mapper-preserves-node-avatar-url ()
+  (let* ((avatar-url "https://example.test/forward-node.png")
+         (message
+          (qq-forward-native-message-to-internal
+           (qq-forward-test--native-message
+            "2" "hello"
+            :sender `((kind . "anonymous")
+                      (name . "Visitor")
+                      (avatar_url . ,avatar-url))))))
+    (should-not (alist-get 'sender-id message))
+    (should (equal (alist-get 'sender-avatar-url message) avatar-url))
+    (should
+     (equal (qq-media-message-avatar-cache-key message)
+            (concat "message-avatar-url:" avatar-url)))))
+
 (ert-deftest qq-forward-video-mapper-preserves-remote-state-and-resolver ()
   (dolist (case
            '(("available" "https://example.test/video.mp4" nil)
