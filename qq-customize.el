@@ -21,6 +21,61 @@
   :type 'string
   :group 'qq)
 
+(defcustom qq-gateway-websocket-url "ws://127.0.0.1:3002/"
+  "Native nt-gateway websocket endpoint used by emacs-qq.
+
+The Gateway is a long-lived process which owns zero or more QQ account
+runtimes.  Closing this websocket only disconnects this Emacs client; it does
+not stop or log out any managed account."
+  :type 'string
+  :group 'qq)
+
+(defcustom qq-gateway-auth-token-file
+  (locate-user-emacs-file "qq/gateway-token")
+  "File containing the native Gateway authentication token.
+
+The token is read only while opening a Gateway connection and is sent in the
+first `gateway.hello' request.  It must be a single non-whitespace value of at
+least 32 bytes.  On Unix the file must not be accessible by group or other
+users, matching nt-gateway's own validation."
+  :type 'file
+  :group 'qq)
+
+(defcustom qq-gateway-client-name "emacs-qq"
+  "Client name sent in the native Gateway handshake."
+  :type 'string
+  :group 'qq)
+
+(defcustom qq-gateway-request-timeout 30
+  "Seconds before an unanswered native Gateway request fails locally.
+
+Nil disables request timeouts."
+  :type '(choice (const :tag "Disabled" nil)
+                 (number :tag "Seconds"))
+  :group 'qq)
+
+(defcustom qq-gateway-ready-timeout 10
+  "Seconds to wait for `gateway.ready' after a successful handshake.
+
+The server sends this authoritative snapshot immediately after the
+`gateway.hello' response.  Nil disables this additional protocol timeout."
+  :type '(choice (const :tag "Disabled" nil)
+                 (number :tag "Seconds"))
+  :group 'qq)
+
+(defcustom qq-gateway-reconnect-delay 3
+  "Seconds before reconnecting the native Gateway websocket."
+  :type 'number
+  :group 'qq)
+
+(defcustom qq-gateway-reconnect-max-attempts nil
+  "Maximum native Gateway reconnect attempts before stopping.
+
+Set to nil to retry indefinitely.  The counter is reset only after an
+authenticated `gateway.ready' snapshot, not merely when the socket opens."
+  :type '(choice (const :tag "Unlimited" nil) integer)
+  :group 'qq)
+
 (defcustom qq-onebot-token nil
   "OneBot access token for NapCat.
 
