@@ -69,8 +69,8 @@
                   "qq-api" (source-session-key target-session-key message-ids
                                                 callback &optional errback))
 (declare-function qq-api-cancel-request "qq-api" (request-token))
-(declare-function qq-api-send-poke
-                  "qq-api" (session-key target-id &optional callback errback))
+(declare-function qq-backend-send-poke
+                  "qq-backend" (session-key target-id &optional callback errback))
 (declare-function qq-api-recall-poke
                   "qq-api" (session-key recall-reference
                                          &optional callback errback))
@@ -6024,7 +6024,7 @@ paths before reaching this validator."
   "Poke TARGET-ID in SESSION-KEY using the strict peer/target contract."
   (qq-chat--validate-poke-target
    (qq-chat--poke-session session-key) target-id)
-  (qq-api-send-poke
+  (qq-backend-send-poke
    session-key target-id
    (lambda (_response)
      (message "qq: poke sent"))))
