@@ -186,6 +186,9 @@
         (qq-gateway-transport--gateway-instance-id nil)
         (qq-gateway-transport--capabilities nil)
         (qq-gateway-transport--ready-accounts nil)
+        (qq-gateway-transport-event-hook nil)
+        (qq-gateway-transport-protocol-error-hook nil)
+        (qq-gateway-transport-state-hook nil)
         (qq-gateway-request-timeout nil)
         (qq-gateway-ready-timeout nil)
         callbacks
