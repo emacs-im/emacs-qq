@@ -574,6 +574,33 @@ backend receipt; ERRBACK receives backend failure details."
         message set callback
         (or errback #'qq-backend--default-gateway-error))))))
 
+(defun qq-backend-set-message-todo
+    (message operation &optional callback errback)
+  "Apply todo OPERATION to normalized group MESSAGE through its backend.
+
+OPERATION must be one of `set', `complete', or `cancel'.  CALLBACK receives
+the successful closed backend receipt; ERRBACK receives failure details."
+  (unless (listp message)
+    (user-error "qq: Todo action requires a normalized message"))
+  (unless (memq operation '(set complete cancel))
+    (user-error "qq: Unknown message todo operation %S" operation))
+  (let ((session-key (alist-get 'session-key message))
+        (message-id (alist-get 'server-id message)))
+    (unless (and session-key
+                 (eq (qq-state-session-key-type session-key) 'group)
+                 (qq-api-message-id-p message-id))
+      (user-error "qq: Todo action requires exact group message identity"))
+    (pcase (qq-backend--validate qq-backend)
+      ('onebot
+       (qq-api-set-message-todo
+        `((message_id . ,message-id)
+          (chat . ,(qq-api-chat-locator session-key)))
+        operation callback errback))
+      ('gateway
+       (qq-gateway-message-set-todo
+        message operation callback
+        (or errback #'qq-backend--default-gateway-error))))))
+
 (defun qq-backend-recall-poke (message &optional callback errback)
   "Recall normalized poke MESSAGE through its selected backend capability.
 

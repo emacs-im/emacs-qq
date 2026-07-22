@@ -116,6 +116,11 @@
   (not (qq-chat--message-essence-capable-p
         (qq-transient--message-at-point))))
 
+(defun qq-transient--todo-inapt-p ()
+  "Return non-nil when mutating todo at point is unavailable."
+  (not (qq-chat--message-todo-capable-p
+        (qq-transient--message-at-point))))
+
 (defun qq-transient--no-message-selection-p ()
   "Return non-nil when there are no selected message memberships to clear."
   (null qq-chat--message-selection))
@@ -225,6 +230,17 @@
 ;; Use an explicit (autoload SYMBOL FILE nil t) cookie instead; the real
 ;; definition runs only after this file loads and (require 'transient).
 
+;;;###autoload(autoload 'qq-chat-message-todo-transient "qq-transient" nil t)
+(transient-define-prefix qq-chat-message-todo-transient ()
+  "Todo actions for the QQ group message at point."
+  [["Todo"
+    ("s" "Set" qq-chat-set-message-todo
+     :inapt-if qq-transient--todo-inapt-p)
+    ("c" "Complete" qq-chat-complete-message-todo
+     :inapt-if qq-transient--todo-inapt-p)
+    ("x" "Cancel" qq-chat-cancel-message-todo
+     :inapt-if qq-transient--todo-inapt-p)]])
+
 ;;;###autoload(autoload 'qq-chat-message-transient "qq-transient" nil t)
 (transient-define-prefix qq-chat-message-transient ()
   "Message actions for the QQ chat message at point.
@@ -243,6 +259,8 @@ Prefer this over inline button rows."
      :inapt-if qq-transient--reaction-inapt-p)
     ("e" "Toggle essence" qq-chat-toggle-message-essence
      :inapt-if qq-transient--essence-inapt-p)
+    ("t" "Todo…" qq-chat-message-todo-transient
+     :inapt-if qq-transient--todo-inapt-p)
     ("P" "Poke sender" qq-chat-poke-sender
      :inapt-if qq-transient--poke-sender-inapt-p)
     ("a" "Open avatar" qq-chat-open-avatar-at-point

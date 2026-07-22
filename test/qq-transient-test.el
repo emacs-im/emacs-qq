@@ -33,6 +33,10 @@
   (should (commandp #'qq-transient-forward-merged))
   (should (commandp #'qq-chat-toggle-message-selection))
   (should (commandp #'qq-chat-toggle-message-essence))
+  (should (commandp #'qq-chat-set-message-todo))
+  (should (commandp #'qq-chat-complete-message-todo))
+  (should (commandp #'qq-chat-cancel-message-todo))
+  (should (commandp #'qq-chat-message-todo-transient))
   (should (commandp #'qq-chat-clear-message-selection))
   (should (commandp #'qq-chat-attach-transient))
   (should (commandp #'qq-root-transient)))
@@ -45,6 +49,30 @@
            objects)))
     (should essence)
     (should (eq (oref essence command) 'qq-chat-toggle-message-essence))))
+
+(ert-deftest qq-transient-message-prefix-exposes-closed-todo-actions ()
+  (let* ((message-objects (transient-suffixes 'qq-chat-message-transient))
+         (todo-entry
+          (seq-find
+           (lambda (suffix) (equal (oref suffix key) "t"))
+           message-objects))
+         (todo-objects (transient-suffixes 'qq-chat-message-todo-transient))
+         (commands
+          (seq-keep
+           (lambda (suffix)
+             (when (memq (oref suffix command)
+                         '(qq-chat-set-message-todo
+                           qq-chat-complete-message-todo
+                           qq-chat-cancel-message-todo))
+               (cons (oref suffix key) (oref suffix command))))
+           todo-objects)))
+    (should todo-entry)
+    (should (eq (oref todo-entry command) 'qq-chat-message-todo-transient))
+    (should (= (length commands) 3))
+    (should (eq (cdr (assoc "s" commands)) 'qq-chat-set-message-todo))
+    (should
+     (eq (cdr (assoc "c" commands)) 'qq-chat-complete-message-todo))
+    (should (eq (cdr (assoc "x" commands)) 'qq-chat-cancel-message-todo))))
 
 (ert-deftest qq-transient-forward-interface-has-no-legacy-mark-commands ()
   (should-not (fboundp 'qq-chat-forward-message))

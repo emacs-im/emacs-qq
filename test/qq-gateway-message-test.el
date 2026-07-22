@@ -9,7 +9,7 @@
 (defconst qq-gateway-message-test-capabilities
   '("message.send" "message.send_text" "message.poke"
     "message.recall_poke" "message.recall" "message.set_reaction"
-    "message.set_essence" "message.get_history")
+    "message.set_essence" "message.set_todo" "message.get_history")
   "Native Gateway capabilities exercised by message tests.")
 
 (defun qq-gateway-message-test-account
@@ -831,6 +831,95 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (should-not (alist-get 'essence-p projected))
           (should (= (alist-get 'essence-changed-at projected)
                      1784700000)))))))
+
+(ert-deftest qq-gateway-message-todo-keeps-exact-target-and-operation ()
+  (qq-gateway-message-test-with-state
+    (qq-gateway-message--handle-event
+     "message.received"
+     (qq-gateway-message-test-event
+      :conversation
+      '((kind . "group") (group_uin . "8209413637")
+        (group_name . "Protocol Lab") (sender_card . "Alice"))))
+    (let* ((message
+            (car (qq-state-session-messages "group:8209413637")))
+           calls receipts)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (push (list method (copy-tree params)) calls)
+                   (funcall
+                    callback
+                    `((account_id . "slot-a")
+                      (generation . "7")
+                      (group_uin . "8209413637")
+                      (message_id . "7348923749823749823")
+                      (sequence . "9007199254740999")
+                      (operation . ,(alist-get 'operation params))))
+                   (format "todo-%s" (alist-get 'operation params)))))
+        (dolist (operation '(set complete cancel))
+          (should
+           (equal
+            (qq-gateway-message-set-todo
+             message operation
+             (lambda (receipt) (push receipt receipts)))
+            (format "todo-%s" operation)))))
+      (should
+       (equal
+        (nreverse calls)
+        '(("message.set_todo"
+           ((account_id . "slot-a")
+            (conversation . ((kind . "group")
+                             (group_uin . "8209413637")))
+            (message . ((message_id . "7348923749823749823")
+                        (sequence . "9007199254740999")))
+            (operation . "set")))
+          ("message.set_todo"
+           ((account_id . "slot-a")
+            (conversation . ((kind . "group")
+                             (group_uin . "8209413637")))
+            (message . ((message_id . "7348923749823749823")
+                        (sequence . "9007199254740999")))
+            (operation . "complete")))
+          ("message.set_todo"
+           ((account_id . "slot-a")
+            (conversation . ((kind . "group")
+                             (group_uin . "8209413637")))
+            (message . ((message_id . "7348923749823749823")
+                        (sequence . "9007199254740999")))
+            (operation . "cancel"))))))
+      (should
+       (equal (mapcar (lambda (receipt) (alist-get 'operation receipt))
+                      (nreverse receipts))
+              '("set" "complete" "cancel"))))))
+
+(ert-deftest qq-gateway-message-todo-receipt-is-closed-and-generation-owned ()
+  (let ((receipt
+         '((account_id . "slot-a")
+           (generation . "7")
+           (group_uin . "8209413637")
+           (message_id . "7348923749823749823")
+           (sequence . "9007199254740999")
+           (operation . "set"))))
+    (should
+     (equal
+      (qq-gateway-message--validate-todo-receipt
+       receipt '("slot-a" . "7") "8209413637"
+       "7348923749823749823" "9007199254740999" "set")
+      receipt))
+    (let ((stale (copy-tree receipt)))
+      (setf (alist-get 'generation stale) "8")
+      (should-error
+       (qq-gateway-message--validate-todo-receipt
+        stale '("slot-a" . "7") "8209413637"
+        "7348923749823749823" "9007199254740999" "set")))
+    (let ((open (append (copy-tree receipt) '((done . t)))))
+      (should-error
+       (qq-gateway-message--validate-todo-receipt
+        open '("slot-a" . "7") "8209413637"
+        "7348923749823749823" "9007199254740999" "set")))))
 
 (ert-deftest qq-gateway-message-recall-poke-sends-original-gray-tip-metadata ()
   (qq-gateway-message-test-with-state

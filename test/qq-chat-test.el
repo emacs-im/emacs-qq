@@ -3029,6 +3029,52 @@
            (setf (alist-get 'native-random message) 4294967295)
            (should (qq-chat--message-essence-capable-p message))))))))
 
+(ert-deftest qq-chat-todo-commands-route-all-closed-operations ()
+  (qq-chat-test-with-reset
+   (let ((qq-backend 'onebot))
+     (qq-state-upsert-session
+      "group:20001"
+      '((type . group) (title . "Group") (target-id . "20001"))
+      nil)
+     (let ((message '((server-id . "9007199254741004001")
+                      (session-key . "group:20001")))
+           calls)
+       (with-temp-buffer
+         (qq-chat-mode)
+         (setq qq-chat--session-key "group:20001")
+         (cl-letf (((symbol-function 'qq-backend-set-message-todo)
+                    (lambda (selected operation &rest _)
+                      (push (list selected operation) calls))))
+           (qq-chat-set-message-todo message)
+           (qq-chat-complete-message-todo message)
+           (qq-chat-cancel-message-todo message))
+         (should
+          (equal (mapcar #'cadr (nreverse calls))
+                 '(set complete cancel))))))))
+
+(ert-deftest qq-chat-gateway-todo-capability-requires-sequence-and-owner ()
+  (qq-chat-test-with-reset
+   (let ((qq-backend 'gateway))
+     (qq-state-upsert-session
+      "group:20001"
+      '((type . group) (title . "Group") (target-id . "20001"))
+      nil)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "group:20001")
+       (cl-letf (((symbol-function 'qq-gateway-current-account-owner)
+                  (lambda () '("slot-a" . "7"))))
+         (let ((message
+                '((server-id . "9007199254741004001")
+                  (session-key . "group:20001")
+                  (gateway-account-id . "slot-a")
+                  (gateway-generation . "7"))))
+           (should-not (qq-chat--message-todo-capable-p message))
+           (setf (alist-get 'message-seq message) "9007199254740999")
+           (should (qq-chat--message-todo-capable-p message))
+           (setf (alist-get 'gateway-generation message) "8")
+           (should-not (qq-chat--message-todo-capable-p message))))))))
+
 (ert-deftest qq-chat-filter-snapshot-builds-reference-without-caching-message ()
   (qq-chat-test-with-reset
    (with-temp-buffer

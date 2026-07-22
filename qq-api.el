@@ -3030,6 +3030,57 @@ it; later notices always win."
            (funcall callback response)))
        (or errback #'qq-api--default-error)))))
 
+(defun qq-api--validate-message-todo-receipt
+    (data group-id message-id operation)
+  "Validate closed todo DATA for GROUP-ID, MESSAGE-ID, and OPERATION."
+  (unless (qq-api--exact-object-keys-p
+           data '(group_id message_id message_seq operation))
+    (error "qq: emacs_set_group_todo returned invalid fields"))
+  (unless (and (equal (alist-get 'group_id data) group-id)
+               (equal (alist-get 'message_id data) message-id)
+               (qq-protocol--nonzero-decimal-string-p
+                (alist-get 'message_seq data))
+               (equal (alist-get 'operation data) operation))
+    (error "qq: emacs_set_group_todo contradicted its request"))
+  (copy-tree data))
+
+(defun qq-api-set-message-todo
+    (reference operation &optional callback errback)
+  "Apply todo OPERATION to the group message in closed REFERENCE.
+
+OPERATION must be one of `set', `complete', or `cancel'.  The NapCat fork
+resolves REFERENCE's exact snowflake to the native message sequence and
+returns a closed receipt; no numeric message-id conversion is permitted."
+  (unless (memq operation '(set complete cancel))
+    (user-error "qq: unknown group todo operation %S" operation))
+  (let* ((context
+          (qq-api--message-mutation-context
+           reference "message todo reference"))
+         (reference (plist-get context :reference))
+         (message-id (plist-get context :message-id))
+         (chat (alist-get 'chat reference)))
+    (unless (equal (alist-get 'kind chat) "group")
+      (user-error "qq: todo actions require a group message reference"))
+    (let ((group-id (alist-get 'group_id chat))
+          (operation-name (symbol-name operation)))
+      (qq-api-call
+       "emacs_set_group_todo"
+       `((group_id . ,group-id)
+         (message_id . ,message-id)
+         (operation . ,operation-name))
+       (lambda (response)
+         (condition-case error-data
+             (let ((receipt
+                    (qq-api--validate-message-todo-receipt
+                     (qq-api--response-data response)
+                     group-id message-id operation-name)))
+               (when callback
+                 (funcall callback receipt)))
+           (error
+            (funcall (or errback #'qq-api--default-error)
+                     response (error-message-string error-data)))))
+       (or errback #'qq-api--default-error)))))
+
 (defun qq-api-set-group-name
     (group-id name &optional callback errback)
   "Set GROUP-ID's public NAME through NapCat OneBot.
