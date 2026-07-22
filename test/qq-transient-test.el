@@ -32,9 +32,19 @@
   (should (commandp #'qq-transient-forward-individually))
   (should (commandp #'qq-transient-forward-merged))
   (should (commandp #'qq-chat-toggle-message-selection))
+  (should (commandp #'qq-chat-toggle-message-essence))
   (should (commandp #'qq-chat-clear-message-selection))
   (should (commandp #'qq-chat-attach-transient))
   (should (commandp #'qq-root-transient)))
+
+(ert-deftest qq-transient-message-prefix-exposes-essence-toggle ()
+  (let* ((objects (transient-suffixes 'qq-chat-message-transient))
+         (essence
+          (seq-find
+           (lambda (suffix) (equal (oref suffix key) "e"))
+           objects)))
+    (should essence)
+    (should (eq (oref essence command) 'qq-chat-toggle-message-essence))))
 
 (ert-deftest qq-transient-forward-interface-has-no-legacy-mark-commands ()
   (should-not (fboundp 'qq-chat-forward-message))

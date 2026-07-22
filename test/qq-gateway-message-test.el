@@ -9,7 +9,7 @@
 (defconst qq-gateway-message-test-capabilities
   '("message.send" "message.send_text" "message.poke"
     "message.recall_poke" "message.recall" "message.set_reaction"
-    "message.get_history")
+    "message.set_essence" "message.get_history")
   "Native Gateway capabilities exercised by message tests.")
 
 (defun qq-gateway-message-test-account
@@ -115,6 +115,29 @@
         (is_add . ,is-add)
         (count . ,count)))))
 
+(cl-defun qq-gateway-message-test-essence
+    (&key
+     (account-id "slot-a") (generation "7")
+     (group-uin "8209413637") (sequence "9007199254740999")
+     (random 7) (is-set t) (sender-uin "10001")
+     (operator-uin "10002") (changed-at 1784700000)
+     (operator-nickname "Moderator") (sender-nickname "Alice"))
+  "Return one authoritative native Gateway group essence event payload."
+  `((account_id . ,account-id)
+    (generation . ,generation)
+    (essence
+     . ((conversation . ((kind . "group") (group_uin . ,group-uin)))
+        (sequence . ,sequence)
+        (random . ,random)
+        (is_set . ,is-set)
+        (sender_uin . ,sender-uin)
+        (operator_uin . ,operator-uin)
+        (changed_at . ,changed-at)
+        ,@(when operator-nickname
+            `((operator_nickname . ,operator-nickname)))
+        ,@(when sender-nickname
+            `((sender_nickname . ,sender-nickname)))))))
+
 (cl-defun qq-gateway-message-test-history-result
     (messages start-sequence end-sequence
               &key (response-start start-sequence)
@@ -149,6 +172,10 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
          (qq-gateway-message--pending-recalls
           (make-hash-table :test #'equal))
          (qq-gateway-message--pending-reactions
+          (make-hash-table :test #'equal))
+         (qq-gateway-message--pending-essences
+          (make-hash-table :test #'equal))
+         (qq-gateway-message--essence-revisions
           (make-hash-table :test #'equal))
          (qq-gateway-message--pending-sends
           (make-hash-table :test #'equal))
@@ -355,6 +382,57 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
       (should (= (hash-table-count
                   qq-gateway-message--pending-reactions)
                  0)))))
+
+(ert-deftest qq-gateway-message-essence-validator-rejects-lossy-or-invented-id ()
+  (let* ((numeric (qq-gateway-message-test-essence))
+         (essence (alist-get 'essence numeric)))
+    (setf (alist-get 'sequence essence) 9007199254740999)
+    (should-error (qq-gateway-message--validate-essence-data numeric)))
+  (let* ((invented (qq-gateway-message-test-essence))
+         (essence (alist-get 'essence invented)))
+    (setf (alist-get 'essence invented)
+          (append essence
+                  '((message_id . "7348923749823749823"))))
+    (should-error (qq-gateway-message--validate-essence-data invented))))
+
+(ert-deftest qq-gateway-message-essence-applies-authoritative-metadata ()
+  (qq-gateway-message-test-with-state
+    (qq-gateway-message--handle-event
+     "message.received"
+     (qq-gateway-message-test-event
+      :conversation
+      '((kind . "group") (group_uin . "8209413637")
+        (group_name . "Protocol Lab") (sender_card . "Alice"))))
+    (qq-gateway-message--handle-event
+     "message.essence_changed"
+     (qq-gateway-message-test-essence))
+    (let ((message
+           (car (qq-state-session-messages "group:8209413637"))))
+      (should (eq (alist-get 'essence-p message) t))
+      (should (equal (alist-get 'essence-sender-id message) "10001"))
+      (should (equal (alist-get 'essence-operator-id message) "10002"))
+      (should (= (alist-get 'essence-changed-at message) 1784700000))
+      (should (equal (alist-get 'essence-operator-nickname message)
+                     "Moderator")))))
+
+(ert-deftest qq-gateway-message-native-target-essence-waits-for-message ()
+  (qq-gateway-message-test-with-state
+    (qq-gateway-message--handle-event
+     "message.essence_changed"
+     (qq-gateway-message-test-essence :is-set :false))
+    (should (= (hash-table-count qq-gateway-message--pending-essences) 1))
+    (should (= (hash-table-count qq-gateway-message--essence-revisions) 1))
+    (qq-gateway-message--handle-event
+     "message.received"
+     (qq-gateway-message-test-event
+      :conversation
+      '((kind . "group") (group_uin . "8209413637")
+        (group_name . "Protocol Lab") (sender_card . "Alice"))))
+    (let ((message
+           (car (qq-state-session-messages "group:8209413637"))))
+      (should-not (alist-get 'essence-p message))
+      (should (equal (alist-get 'essence-operator-id message) "10002"))
+      (should (= (hash-table-count qq-gateway-message--pending-essences) 0)))))
 
 (ert-deftest qq-gateway-message-direct-private-recall-marks-exact-message ()
   (qq-gateway-message-test-with-state
@@ -668,6 +746,92 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (should (= (alist-get 'count reaction) 1))
           (should (alist-get 'chosen-p reaction)))))))
 
+(ert-deftest qq-gateway-message-essence-send-keeps-exact-native-target ()
+  (qq-gateway-message-test-with-state
+    (qq-gateway-message--handle-event
+     "message.received"
+     (qq-gateway-message-test-event
+      :random 4277998232
+      :conversation
+      '((kind . "group") (group_uin . "8209413637")
+        (group_name . "Protocol Lab") (sender_card . "Alice"))))
+    (let* ((session-key "group:8209413637")
+           (message (car (qq-state-session-messages session-key)))
+           sent-method sent-params callback-result)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall callback
+                            '((account_id . "slot-a")
+                              (generation . "7")
+                              (message_id . "7348923749823749823")
+                              (sequence . "9007199254740999")
+                              (random . 4277998232)
+                              (set . t)))
+                   "request-essence")))
+        (should
+         (equal
+          (qq-gateway-message-set-essence
+           message t (lambda (result) (setq callback-result result)))
+          "request-essence"))
+        (should (equal sent-method "message.set_essence"))
+        (should
+         (equal
+          sent-params
+          '((account_id . "slot-a")
+            (conversation . ((kind . "group")
+                             (group_uin . "8209413637")))
+            (message . ((message_id . "7348923749823749823")
+                        (sequence . "9007199254740999")
+                        (random . 4277998232)))
+            (set . t))))
+        (should (equal (alist-get 'message_id callback-result)
+                       "7348923749823749823"))
+        (should
+         (eq (alist-get
+              'essence-p
+              (car (qq-state-session-messages session-key)))
+             t))))))
+
+(ert-deftest qq-gateway-message-authoritative-essence-beats-racing-receipt ()
+  (qq-gateway-message-test-with-state
+    (qq-gateway-message--handle-event
+     "message.received"
+     (qq-gateway-message-test-event
+      :conversation
+      '((kind . "group") (group_uin . "8209413637")
+        (group_name . "Protocol Lab") (sender_card . "Alice"))))
+    (let* ((session-key "group:8209413637")
+           (message (car (qq-state-session-messages session-key)))
+           response-callback)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (setq response-callback callback)
+                   "request-essence")))
+        (qq-gateway-message-set-essence message t)
+        (qq-gateway-message--handle-event
+         "message.essence_changed"
+         (qq-gateway-message-test-essence :is-set :false))
+        (funcall response-callback
+                 '((account_id . "slot-a")
+                   (generation . "7")
+                   (message_id . "7348923749823749823")
+                   (sequence . "9007199254740999")
+                   (random . 7)
+                   (set . t)))
+        (let ((projected (car (qq-state-session-messages session-key))))
+          (should-not (alist-get 'essence-p projected))
+          (should (= (alist-get 'essence-changed-at projected)
+                     1784700000)))))))
+
 (ert-deftest qq-gateway-message-recall-poke-sends-original-gray-tip-metadata ()
   (qq-gateway-message-test-with-state
     (qq-gateway-message--handle-event
@@ -906,6 +1070,14 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (qq-gateway-message-revoke-projection)
     (should-not (qq-gateway-message-live-frontier "private:10001"))))
 
+(ert-deftest qq-gateway-message-revoke-clears-essence-correlation ()
+  (qq-gateway-message-test-with-state
+    (puthash '(owner target) t qq-gateway-message--pending-essences)
+    (puthash '(owner target) 3 qq-gateway-message--essence-revisions)
+    (qq-gateway-message-revoke-projection)
+    (should (= (hash-table-count qq-gateway-message--pending-essences) 0))
+    (should (= (hash-table-count qq-gateway-message--essence-revisions) 0))))
+
 (ert-deftest qq-gateway-message-history-request-preserves-large-sequences ()
   (qq-gateway-message-test-with-state
     (let (sent-method sent-params callback-meta)
@@ -1060,6 +1232,42 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (should (= (alist-get 'count reaction) 6)))
         (should (= (hash-table-count
                     qq-gateway-message--pending-reactions)
+                   0))))))
+
+(ert-deftest qq-gateway-message-history-applies-earlier-native-essence ()
+  (qq-gateway-message-test-with-state
+    (qq-gateway-message--handle-event
+     "message.essence_changed"
+     (qq-gateway-message-test-essence
+      :sequence "100" :random 4294967295 :sender-nickname nil))
+    (let* ((message
+            (alist-get
+             'message
+             (qq-gateway-message-test-event
+              :sequence "100" :random 4294967295
+              :conversation
+              '((kind . "group")
+                (group_uin . "8209413637")
+                (group_name . "Protocol Lab")
+                (sender_card . "Alice")))))
+           (result (qq-gateway-message-test-history-result
+                    (list message) "100" "100")))
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (funcall callback result)
+                   "request-history")))
+        (qq-gateway-message-get-history
+         "group:8209413637" "100" "100")
+        (let ((projected
+               (car (qq-state-session-messages "group:8209413637"))))
+          (should (eq (alist-get 'essence-p projected) t))
+          (should (= (alist-get 'native-random projected) 4294967295)))
+        (should (= (hash-table-count
+                    qq-gateway-message--pending-essences)
                    0))))))
 
 (ert-deftest qq-gateway-message-history-malformed-page-is-not-partially-merged ()

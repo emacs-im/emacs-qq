@@ -46,6 +46,12 @@ from authoritative Linux QQ observations.")
 (defvar qq-api--request-finalizers (make-hash-table :test #'equal)
   "Cleanup callbacks keyed by live transport request token.")
 
+(defvar qq-api--pending-essences (make-hash-table :test #'equal)
+  "OneBot essence notices awaiting their exact cached message.")
+
+(defvar qq-api--essence-revisions (make-hash-table :test #'equal)
+  "Authoritative OneBot essence-notice revision per exact message.")
+
 (cl-defstruct (qq-api--snapshot-request
                (:constructor qq-api--snapshot-request-create))
   resource
@@ -2254,6 +2260,7 @@ ERRBACK receives (RESPONSE REASON)."
               (messages (alist-get 'messages data nil nil #'eq))
               (meta (qq-state-merge-history
                      session-key messages request-owner)))
+         (qq-api--apply-pending-essences session-key)
          (when callback
            (funcall callback meta))))
      errback)))
@@ -2521,6 +2528,7 @@ CALLBACK receives the merge-history plist.  ERRBACK receives
                             (and (listp data) data)))
               (meta (qq-state-merge-history
                      session-key messages request-owner)))
+         (qq-api--apply-pending-essences session-key)
          (when callback
            (funcall callback meta))))
      errback)))
@@ -2809,6 +2817,105 @@ index contradiction is rejected before any remote side effect."
           :message-id message-id
           :session-key session-key)))
 
+(defun qq-api--canonical-onebot-decimal (value predicate context)
+  "Return exact decimal VALUE accepted by PREDICATE for CONTEXT.
+
+Legacy OneBot UIN fields may still arrive as exact JSON integers.  Snowflake
+message ids never pass through this compatibility helper."
+  (let ((candidate
+         (cond
+          ((stringp value) value)
+          ((integerp value) (number-to-string value))
+          (t nil))))
+    (unless (and candidate (funcall predicate candidate))
+      (error "qq: %s must be a canonical decimal identity" context))
+    candidate))
+
+(defun qq-api--validate-essence-notice (notice)
+  "Validate OneBot essence NOTICE and return normalized projection data."
+  (let* ((sub-type (alist-get 'sub_type notice))
+         (message-id (alist-get 'message_id notice))
+         (group-id
+          (qq-api--canonical-onebot-decimal
+           (alist-get 'group_id notice) #'qq-api-group-id-p
+           "essence notice group_id"))
+         (sender-id
+          (qq-api--canonical-onebot-decimal
+           (alist-get 'sender_id notice) #'qq-api-user-id-p
+           "essence notice sender_id"))
+         (operator-id
+          (qq-api--canonical-onebot-decimal
+           (alist-get 'operator_id notice) #'qq-api-user-id-p
+           "essence notice operator_id"))
+         (changed-at (alist-get 'time notice)))
+    (qq-api-validate-message-id message-id "essence notice" t)
+    (unless (member sub-type '("add" "delete"))
+      (error "qq: essence notice sub_type must be add or delete"))
+    (unless (and (integerp changed-at) (> changed-at 0))
+      (error "qq: essence notice time must be a positive integer"))
+    `((session-key . ,(qq-state-session-key 'group group-id))
+      (message-id . ,message-id)
+      (set . ,(equal sub-type "add"))
+      (sender-id . ,sender-id)
+      (operator-id . ,operator-id)
+      (changed-at . ,changed-at))))
+
+(defun qq-api--apply-message-essence-state
+    (session-key message-id set &optional notice source)
+  "Apply essence SET to cached MESSAGE-ID in SESSION-KEY.
+
+Return the merged normalized message, or nil when the target is not loaded.
+NOTICE carries authoritative actor metadata; SOURCE labels the state event."
+  (when-let* ((message
+               (seq-find
+                (lambda (candidate)
+                  (equal (alist-get 'server-id candidate) message-id))
+                (qq-state-session-messages session-key))))
+    (let ((patched (copy-tree message)))
+      (setf (alist-get 'essence-p patched nil nil #'eq) (and set t))
+      (when notice
+        (setf (alist-get 'essence-sender-id patched nil nil #'eq)
+              (alist-get 'sender-id notice)
+              (alist-get 'essence-operator-id patched nil nil #'eq)
+              (alist-get 'operator-id notice)
+              (alist-get 'essence-changed-at patched nil nil #'eq)
+              (alist-get 'changed-at notice)))
+      (cl-multiple-value-bind (merged mutation previous-anchor)
+          (qq-state--merge-normalized-message session-key patched)
+        (when merged
+          (apply #'qq-state--emit
+                 'message
+                 :session-key session-key
+                 :message (copy-tree merged)
+                 :message-anchor (qq-state-message-anchor merged)
+                 :mutation mutation
+                 :source (or source 'notice)
+                 (when previous-anchor
+                   (list :previous-anchor previous-anchor))))
+        merged))))
+
+(defun qq-api--apply-pending-essences (session-key)
+  "Apply OneBot essence notices whose exact target loaded in SESSION-KEY."
+  (dolist (message (qq-state-session-messages session-key))
+    (when-let* ((message-id (alist-get 'server-id message))
+                (key (cons session-key message-id))
+                (notice (gethash key qq-api--pending-essences)))
+      (remhash key qq-api--pending-essences)
+      (qq-api--apply-message-essence-state
+       session-key message-id (alist-get 'set notice) notice 'notice))))
+
+(defun qq-api--project-essence-notice (notice)
+  "Project authoritative OneBot essence NOTICE or retain it until history."
+  (let* ((data (qq-api--validate-essence-notice notice))
+         (session-key (alist-get 'session-key data))
+         (message-id (alist-get 'message-id data))
+         (key (cons session-key message-id)))
+    (puthash key (1+ (gethash key qq-api--essence-revisions 0))
+             qq-api--essence-revisions)
+    (unless (qq-api--apply-message-essence-state
+             session-key message-id (alist-get 'set data) data 'notice)
+      (puthash key (copy-tree data) qq-api--pending-essences))))
+
 (defun qq-api-delete-message (reference &optional callback errback)
   "Recall the exact message in closed locator-qualified REFERENCE.
 
@@ -2889,6 +2996,36 @@ notice reconciles it with the authoritative aggregate count."
               (user_id . ,self-id)
               (is_add . ,(if set t :false))
               (likes . (((emoji_id . ,emoji-id)))))))
+         (when callback
+           (funcall callback response)))
+       (or errback #'qq-api--default-error)))))
+
+(defun qq-api-set-message-essence
+    (reference set &optional callback errback)
+  "Set or remove the group message in closed REFERENCE as essence.
+
+REFERENCE retains the original NT snowflake string.  The action receipt only
+permits an optimistic local flag when no authoritative essence notice raced
+it; later notices always win."
+  (let* ((context
+          (qq-api--message-mutation-context
+           reference "message essence reference"))
+         (reference (plist-get context :reference))
+         (message-id (plist-get context :message-id))
+         (session-key (plist-get context :session-key))
+         (chat (alist-get 'chat reference))
+         (set (and set t)))
+    (unless (equal (alist-get 'kind chat) "group")
+      (user-error "qq: essence actions require a group message reference"))
+    (let* ((key (cons session-key message-id))
+           (start-revision (gethash key qq-api--essence-revisions 0)))
+      (qq-api-call
+       (if set "set_essence_msg" "delete_essence_msg")
+       `((message_id . ,message-id))
+       (lambda (response)
+         (when (= start-revision (gethash key qq-api--essence-revisions 0))
+           (qq-api--apply-message-essence-state
+            session-key message-id set nil 'response))
          (when callback
            (funcall callback response)))
        (or errback #'qq-api--default-error)))))
@@ -4208,6 +4345,8 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
      (qq-state-apply-emoji-like-notice
       (qq-state-session-key 'group (alist-get 'group_id notice))
       notice))
+    ("essence"
+     (qq-api--project-essence-notice notice))
     ("notify"
      (pcase (alist-get 'sub_type notice)
        ("input_status"
@@ -4293,7 +4432,8 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
   (when (eq qq-backend 'onebot)
     (pcase (alist-get 'post_type event)
       ((or "message" "message_sent")
-       (qq-state-merge-live-message event))
+       (when-let* ((session-key (qq-state-merge-live-message event)))
+         (qq-api--apply-pending-essences session-key)))
       ("meta_event"
        (qq-api--handle-meta-event event))
       ("notice"
@@ -4305,7 +4445,14 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
         (qq-api--validate-guild-message-event event)))
       (_ nil))))
 
+(defun qq-api--handle-state-reset (event)
+  "Clear OneBot essence correlation when state EVENT is a reset."
+  (when (eq (plist-get event :type) 'reset)
+    (clrhash qq-api--pending-essences)
+    (clrhash qq-api--essence-revisions)))
+
 (add-hook 'qq-transport-event-hook #'qq-api-handle-event)
+(add-hook 'qq-state-change-hook #'qq-api--handle-state-reset)
 
 (provide 'qq-api)
 

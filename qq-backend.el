@@ -244,6 +244,31 @@ receipt; ERRBACK receives backend failure details."
         message emoji-id set callback
         (or errback #'qq-backend--default-gateway-error))))))
 
+(defun qq-backend-set-message-essence
+    (message set &optional callback errback)
+  "Set or remove normalized group MESSAGE as essence through its backend.
+
+SET non-nil marks the message as essence.  CALLBACK receives the successful
+backend receipt; ERRBACK receives backend failure details."
+  (unless (listp message)
+    (user-error "qq: Essence action requires a normalized message"))
+  (let ((session-key (alist-get 'session-key message))
+        (message-id (alist-get 'server-id message)))
+    (unless (and session-key
+                 (eq (qq-state-session-key-type session-key) 'group)
+                 (qq-api-message-id-p message-id))
+      (user-error "qq: Essence action requires exact group message identity"))
+    (pcase (qq-backend--validate qq-backend)
+      ('onebot
+       (qq-api-set-message-essence
+        `((message_id . ,message-id)
+          (chat . ,(qq-api-chat-locator session-key)))
+        set callback errback))
+      ('gateway
+       (qq-gateway-message-set-essence
+        message set callback
+        (or errback #'qq-backend--default-gateway-error))))))
+
 (defun qq-backend-recall-poke (message &optional callback errback)
   "Recall normalized poke MESSAGE through its selected backend capability.
 

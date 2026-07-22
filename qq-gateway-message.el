@@ -41,6 +41,14 @@
   (make-hash-table :test #'equal)
   "Sequence-scoped reaction events awaiting a projected message.")
 
+(defvar qq-gateway-message--pending-essences
+  (make-hash-table :test #'equal)
+  "Native target-scoped essence events awaiting a projected message.")
+
+(defvar qq-gateway-message--essence-revisions
+  (make-hash-table :test #'equal)
+  "Authoritative essence-event revision observed per native target.")
+
 (defvar qq-gateway-message--pending-sends
   (make-hash-table :test #'equal)
   "Client-sequence receipts awaiting an authoritative self message event.")
@@ -366,6 +374,46 @@
   (qq-gateway-message--validate-reaction (alist-get 'reaction data))
   (copy-tree data))
 
+(defun qq-gateway-message--validate-essence (essence)
+  "Validate and copy one authoritative group ESSENCE event."
+  (unless (qq-gateway-message--closed-object-p
+           essence
+           '(conversation sequence random is_set sender_uin operator_uin
+             changed_at)
+           '(operator_nickname sender_nickname))
+    (error "qq: Gateway essence snapshot has invalid fields"))
+  (let ((conversation (alist-get 'conversation essence)))
+    (unless (and (qq-gateway--exact-object-keys-p
+                  conversation '(kind group_uin))
+                 (equal (alist-get 'kind conversation) "group")
+                 (qq-gateway--canonical-decimal-p
+                  (alist-get 'group_uin conversation)))
+      (error "qq: Gateway essence conversation must identify an exact group")))
+  (unless (qq-gateway--canonical-decimal-p (alist-get 'sequence essence))
+    (error "qq: Gateway essence sequence must be exact decimal string"))
+  (unless (qq-gateway-message--uint32-p (alist-get 'random essence))
+    (error "qq: Gateway essence random must be uint32"))
+  (unless (memq (alist-get 'is_set essence) '(t :false))
+    (error "qq: Gateway essence direction must be JSON boolean"))
+  (dolist (key '(sender_uin operator_uin))
+    (unless (qq-gateway--canonical-decimal-p (alist-get key essence))
+      (error "qq: Gateway essence %s must be exact decimal string" key)))
+  (unless (and (qq-gateway-message--uint32-p
+                (alist-get 'changed_at essence))
+               (> (alist-get 'changed_at essence) 0))
+    (error "qq: Gateway essence changed_at must be positive uint32"))
+  (dolist (key '(operator_nickname sender_nickname))
+    (when (assq key essence)
+      (unless (qq-gateway--non-empty-string-p (alist-get key essence))
+        (error "qq: Gateway essence %s must be non-empty string" key))))
+  (copy-tree essence))
+
+(defun qq-gateway-message--validate-essence-data (data)
+  "Validate and copy outer authoritative essence event DATA."
+  (qq-gateway-message--validate-owner-data data 'essence)
+  (qq-gateway-message--validate-essence (alist-get 'essence data))
+  (copy-tree data))
+
 (defun qq-gateway-message--event-owner (data)
   "Return `(ACCOUNT-ID . GENERATION)' carried by event DATA."
   (cons (alist-get 'account_id data) (alist-get 'generation data)))
@@ -384,6 +432,8 @@ Shared `qq-state' is left to the caller's backend-switch or reset transaction."
   (clrhash qq-gateway-message--peer-uin-by-uid)
   (clrhash qq-gateway-message--pending-recalls)
   (clrhash qq-gateway-message--pending-reactions)
+  (clrhash qq-gateway-message--pending-essences)
+  (clrhash qq-gateway-message--essence-revisions)
   (clrhash qq-gateway-message--pending-sends)
   (clrhash qq-gateway-message--live-frontiers)
   nil)
@@ -672,6 +722,11 @@ SESSION-KEY must equal the conversation recorded with the send receipt."
   "Return reaction key for OWNER, GROUP-UIN, and exact SEQUENCE."
   (list (car owner) (cdr owner) group-uin sequence))
 
+(defun qq-gateway-message--pending-essence-key
+    (owner group-uin sequence random)
+  "Return essence key for OWNER, GROUP-UIN, SEQUENCE, and RANDOM."
+  (list (car owner) (cdr owner) group-uin sequence random))
+
 (defun qq-gateway-message--validate-pending-recall (owner normalized)
   "Reject a pending recall that contradicts OWNER's NORMALIZED message."
   (when-let* ((conversation-key
@@ -736,6 +791,40 @@ SESSION-KEY must equal the conversation recorded with the send receipt."
       (qq-gateway-message--apply-reaction reaction merged))
     (remhash key qq-gateway-message--pending-reactions)))
 
+(defun qq-gateway-message--apply-essence-state
+    (message set &optional essence source)
+  "Apply essence SET state to MESSAGE and publish it from SOURCE.
+
+When ESSENCE is non-nil, retain its authoritative actor and timestamp
+metadata.  A synchronous action receipt intentionally changes only the
+optimistic boolean; the later push remains authoritative."
+  (let ((patched (copy-tree message)))
+    (setf (alist-get 'essence-p patched nil nil #'eq) (and set t))
+    (when essence
+      (setf (alist-get 'essence-sender-id patched nil nil #'eq)
+            (alist-get 'sender_uin essence)
+            (alist-get 'essence-operator-id patched nil nil #'eq)
+            (alist-get 'operator_uin essence)
+            (alist-get 'essence-changed-at patched nil nil #'eq)
+            (alist-get 'changed_at essence)
+            (alist-get 'essence-operator-nickname patched nil nil #'eq)
+            (alist-get 'operator_nickname essence)
+            (alist-get 'essence-sender-nickname patched nil nil #'eq)
+            (alist-get 'sender_nickname essence)))
+    (qq-gateway-message--merge-normalized patched (or source 'event))))
+
+(defun qq-gateway-message--apply-pending-essence (owner normalized merged)
+  "Apply the latest essence event awaiting OWNER's MERGED message."
+  (when-let* ((group-uin (alist-get 'group-id normalized))
+              (sequence (alist-get 'message-seq normalized))
+              (random (alist-get 'native-random normalized))
+              (key (qq-gateway-message--pending-essence-key
+                    owner group-uin sequence random))
+              (essence (gethash key qq-gateway-message--pending-essences)))
+    (remhash key qq-gateway-message--pending-essences)
+    (qq-gateway-message--apply-essence-state
+     merged (eq (alist-get 'is_set essence) t) essence 'event)))
+
 (defun qq-gateway-message--project-message (data)
   "Project selected-account native message event DATA."
   (let* ((owner (qq-gateway-message--event-owner data))
@@ -747,6 +836,7 @@ SESSION-KEY must equal the conversation recorded with the send receipt."
      owner (alist-get 'message data) normalized)
     (qq-gateway-message--apply-pending-recall owner normalized merged)
     (qq-gateway-message--apply-pending-reactions owner normalized merged)
+    (qq-gateway-message--apply-pending-essence owner normalized merged)
     (when frontier
       (puthash (alist-get 'session-key normalized) frontier
                qq-gateway-message--live-frontiers))
@@ -811,6 +901,15 @@ responses never advance this observation; only `message.received' events do."
   (seq-find (lambda (message)
               (equal (alist-get 'message-seq message) sequence))
             (qq-state-session-messages session-key)))
+
+(defun qq-gateway-message--message-by-native-target
+    (session-key sequence random)
+  "Return cached message in SESSION-KEY matching SEQUENCE and RANDOM."
+  (seq-find
+   (lambda (message)
+     (and (equal (alist-get 'message-seq message) sequence)
+          (equal (alist-get 'native-random message) random)))
+   (qq-state-session-messages session-key)))
 
 (defun qq-gateway-message--project-recall (data)
   "Project selected-account native recall event DATA."
@@ -907,6 +1006,31 @@ responses never advance this observation; only `message.received' events do."
         (puthash key (append pending (list (copy-tree reaction)))
                  qq-gateway-message--pending-reactions)))))
 
+(defun qq-gateway-message--project-essence (data)
+  "Project selected-account authoritative group essence event DATA."
+  (let* ((owner (qq-gateway-message--event-owner data))
+         (_owner (qq-gateway-message--ensure-projection-owner owner))
+         (essence (alist-get 'essence data))
+         (conversation (alist-get 'conversation essence))
+         (group-uin (alist-get 'group_uin conversation))
+         (sequence (alist-get 'sequence essence))
+         (random (alist-get 'random essence))
+         (session-key (qq-state-session-key 'group group-uin))
+         (key (qq-gateway-message--pending-essence-key
+               owner group-uin sequence random))
+         (message (qq-gateway-message--message-by-native-target
+                   session-key sequence random)))
+    (puthash key (1+ (or (gethash key qq-gateway-message--essence-revisions)
+                         0))
+             qq-gateway-message--essence-revisions)
+    (if message
+        (qq-gateway-message--apply-essence-state
+         message (eq (alist-get 'is_set essence) t) essence 'event)
+      (puthash
+       key
+       (copy-tree essence)
+       qq-gateway-message--pending-essences))))
+
 (defun qq-gateway-message--projection-error (event data error-data)
   "Publish projection ERROR-DATA for validated EVENT and DATA."
   (let ((reason (error-message-string error-data)))
@@ -917,7 +1041,7 @@ responses never advance this observation; only `message.received' events do."
 (defun qq-gateway-message--handle-event (event data)
   "Validate native message EVENT with DATA and project the selected owner."
   (when (member event '("message.received" "message.recalled" "message.poked"
-                        "message.reaction_changed"))
+                        "message.reaction_changed" "message.essence_changed"))
     (condition-case error-data
         (let ((validated
                (pcase event
@@ -928,7 +1052,9 @@ responses never advance this observation; only `message.received' events do."
                  ("message.poked"
                   (qq-gateway-message--validate-poke-data data))
                  ("message.reaction_changed"
-                  (qq-gateway-message--validate-reaction-data data)))))
+                  (qq-gateway-message--validate-reaction-data data))
+                 ("message.essence_changed"
+                  (qq-gateway-message--validate-essence-data data)))))
           (qq-gateway--run-hook
            'qq-gateway-message-event-hook event (copy-tree validated))
           (when (qq-gateway-message--selected-owner-p validated)
@@ -941,7 +1067,9 @@ responses never advance this observation; only `message.received' events do."
                   ("message.poked"
                    (qq-gateway-message--project-poke validated))
                   ("message.reaction_changed"
-                   (qq-gateway-message--project-reaction validated)))
+                   (qq-gateway-message--project-reaction validated))
+                  ("message.essence_changed"
+                   (qq-gateway-message--project-essence validated)))
               (error
                (qq-gateway-message--projection-error
                 event validated projection-error)))))
@@ -1199,7 +1327,8 @@ Return a list of `(NATIVE-MESSAGE . NORMALIZED-MESSAGE)' pairs."
           (qq-gateway-message--finalize-message-context
            owner native normalized)
           (qq-gateway-message--apply-pending-recall owner normalized merged)
-          (qq-gateway-message--apply-pending-reactions owner normalized merged))
+          (qq-gateway-message--apply-pending-reactions owner normalized merged)
+          (qq-gateway-message--apply-pending-essence owner normalized merged))
         (unless (gethash message-id known-ids)
           (cl-incf added)
           (puthash message-id t known-ids))
@@ -1614,6 +1743,80 @@ local delta with QQ's authoritative aggregate count."
            errback "invalid_gateway_result" "%s"
            (error-message-string error-data)))))
      errback)))
+
+(defun qq-gateway-message--validate-essence-receipt
+    (receipt owner message-id sequence random set)
+  "Validate essence RECEIPT for OWNER and the exact native target."
+  (unless (qq-gateway--exact-object-keys-p
+           receipt
+           '(account_id generation message_id sequence random set))
+    (error "qq: Gateway essence receipt has invalid fields"))
+  (unless (and (equal (alist-get 'account_id receipt) (car owner))
+               (equal (alist-get 'generation receipt) (cdr owner))
+               (equal (alist-get 'message_id receipt) message-id)
+               (equal (alist-get 'sequence receipt) sequence)
+               (equal (alist-get 'random receipt) random)
+               (eq (alist-get 'set receipt) (if set t :false)))
+    (error "qq: Gateway essence receipt contradicts request"))
+  (copy-tree receipt))
+
+(defun qq-gateway-message-set-essence
+    (message set &optional callback errback)
+  "Set or remove native group MESSAGE as an essence message.
+
+SET non-nil sets the essence flag.  CALLBACK receives the validated
+synchronous receipt.  The later `message.essence_changed' event is
+authoritative and suppresses a racing optimistic receipt update."
+  (let* ((owner (or (qq-gateway-current-account-owner)
+                    (user-error "qq: Select a Gateway account first")))
+         (_owner (qq-gateway-message--ensure-projection-owner owner))
+         (session-key (alist-get 'session-key message))
+         (message-id (alist-get 'server-id message))
+         (sequence (alist-get 'message-seq message))
+         (random (alist-get 'native-random message))
+         (group-uin (and session-key
+                         (qq-state-session-key-target-id session-key)))
+         (set (and set t)))
+    (unless (and session-key
+                 (eq (qq-state-session-key-type session-key) 'group)
+                 (qq-gateway--canonical-decimal-p group-uin)
+                 (qq-gateway--canonical-decimal-p message-id)
+                 (qq-gateway--canonical-decimal-p sequence)
+                 (qq-gateway-message--uint32-p random))
+      (user-error "qq: Native essence requires exact group message identity"))
+    (unless (and (equal (alist-get 'gateway-account-id message) (car owner))
+                 (equal (alist-get 'gateway-generation message) (cdr owner)))
+      (user-error "qq: Essence message belongs to another Gateway generation"))
+    (let* ((target-key (qq-gateway-message--pending-essence-key
+                        owner group-uin sequence random))
+           (start-revision
+            (gethash target-key qq-gateway-message--essence-revisions 0)))
+      (qq-gateway--send
+       "message.set_essence"
+       `((account_id . ,(car owner))
+         (conversation . ((kind . "group") (group_uin . ,group-uin)))
+         (message . ((message_id . ,message-id)
+                     (sequence . ,sequence)
+                     (random . ,random)))
+         (set . ,(if set t :false)))
+       (lambda (raw-result)
+         (condition-case error-data
+             (let ((receipt
+                    (qq-gateway-message--validate-essence-receipt
+                     raw-result owner message-id sequence random set)))
+               (unless (equal owner (qq-gateway-current-account-owner))
+                 (error "qq: Gateway account generation changed during essence action"))
+               (when (= start-revision
+                        (gethash target-key
+                                 qq-gateway-message--essence-revisions 0))
+                 (qq-gateway-message--apply-essence-state
+                  message set nil 'request))
+               (qq-gateway--invoke callback receipt))
+           (error
+            (qq-gateway--client-error
+             errback "invalid_gateway_result" "%s"
+             (error-message-string error-data)))))
+       errback))))
 
 (defun qq-gateway-message--validate-recall-receipt
     (receipt owner message-id sequence)
