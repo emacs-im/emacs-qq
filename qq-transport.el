@@ -35,6 +35,11 @@
   (or qq-transport--connecting
       (and qq-transport--ws (websocket-openp qq-transport--ws))))
 
+(defun qq-transport--publish-connection-status (status)
+  "Publish OneBot transport STATUS only while OneBot owns shared state."
+  (when (eq qq-backend 'onebot)
+    (qq-state-set-connection-status status)))
+
 (defun qq-transport--next-echo ()
   "Return a new OneBot echo token."
   (format "qq-%d" (cl-incf qq-transport--echo-counter)))
@@ -73,7 +78,7 @@
              (> next-attempt max-attempts))
         (progn
           (setq qq-transport--stopping t)
-          (qq-state-set-connection-status 'disconnected)
+          (qq-transport--publish-connection-status 'disconnected)
           (message "qq: reached reconnect attempt limit (%d)" max-attempts))
       (setq qq-transport--reconnect-attempt next-attempt)
       (setq qq-transport--reconnect-timer
@@ -84,7 +89,7 @@
                (setq qq-transport--reconnect-timer nil)
                (unless qq-transport--stopping
                  (qq-transport--connect)))))
-      (qq-state-set-connection-status 'reconnecting)
+      (qq-transport--publish-connection-status 'reconnecting)
       (message "qq: reconnecting in %.1fs (attempt %d)"
                (max 0.2 (float qq-transport-reconnect-delay))
                next-attempt))))
@@ -163,7 +168,7 @@ When SCHEDULE-RECONNECT is non-nil, queue a reconnect attempt."
         (unless qq-transport--stopping
           (qq-transport--schedule-reconnect)))
     (qq-transport--clear-reconnect-timer)
-    (qq-state-set-connection-status 'disconnected)))
+    (qq-transport--publish-connection-status 'disconnected)))
 
 (defun qq-transport-stop ()
   "Stop websocket transport and cancel reconnects."
@@ -248,7 +253,7 @@ is ignored."
       (setq qq-transport--connection-owner owner)
       (setq qq-transport--connecting t)
       (setq qq-transport--stopping nil)
-      (qq-state-set-connection-status 'connecting)
+      (qq-transport--publish-connection-status 'connecting)
       (condition-case err
           (let ((socket
                  (websocket-open
@@ -259,7 +264,7 @@ is ignored."
                       (setq qq-transport--ws ws)
                       (setq qq-transport--connecting nil)
                       (setq qq-transport--reconnect-attempt 0)
-                      (qq-state-set-connection-status 'open)
+                      (qq-transport--publish-connection-status 'open)
                       (message "qq: websocket opened")))
                   :on-message
                   (lambda (ws frame)

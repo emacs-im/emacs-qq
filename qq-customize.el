@@ -16,6 +16,19 @@
   "QQ client for Emacs backed by NapCat."
   :group 'comm)
 
+(defcustom qq-backend 'onebot
+  "Protocol backend used by the interactive emacs-qq client.
+
+`onebot' connects directly to NapCat's OneBot websocket.  `gateway' connects
+to the long-lived native nt-gateway websocket and projects only the account
+selected by this Emacs client.  This is explicit Emacs state; process
+environment variables never select a backend.  Use `qq-switch-backend' while a
+client session is running so account-scoped buffers and projections are
+revoked before the new backend starts."
+  :type '(choice (const :tag "NapCat OneBot" onebot)
+                 (const :tag "Native nt-gateway" gateway))
+  :group 'qq)
+
 (defcustom qq-onebot-websocket-url "ws://127.0.0.1:3001/"
   "NapCat OneBot websocket endpoint used by emacs-qq."
   :type 'string

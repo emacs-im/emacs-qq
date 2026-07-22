@@ -26,6 +26,7 @@
 (require 'appkit-ui)
 (require 'appkit-view)
 (require 'qq-api)
+(require 'qq-backend)
 (require 'qq-completion)
 (require 'qq-customize)
 (require 'qq-media)
@@ -3943,7 +3944,7 @@ on the first inline line when the body is pure inline content."
     (when (y-or-n-p (format "Recall message %s? " message-id))
       (if poke-p
           (qq-api-recall-poke qq-chat--session-key recall-reference)
-        (qq-api-delete-message (qq-chat--message-reference message))))))
+        (qq-backend-recall-message message)))))
 
 (defun qq-chat--message-title-face (message)
   "Return sender title face for MESSAGE."
@@ -5575,7 +5576,7 @@ resolved at restoration time.  Return non-nil only when restoration happened."
             (appkit-chatbuf-aux-reset)
             (qq-chat--render-canonical-input)
             (qq-chat--update-frame)
-            (qq-api-send-message
+            (qq-backend-send-message
              session-key send-segments raw-message
              (lambda (_response)
                (when (buffer-live-p buffer)

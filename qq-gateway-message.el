@@ -15,6 +15,7 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
+(require 'qq-customize)
 (require 'qq-gateway)
 (require 'qq-state)
 
@@ -272,16 +273,33 @@
 
 (defun qq-gateway-message--selected-owner-p (data)
   "Return non-nil when event DATA belongs to the exact selected generation."
-  (equal (qq-gateway-message--event-owner data)
-         (qq-gateway-current-account-owner)))
+  (and (eq qq-backend 'gateway)
+       (equal (qq-gateway-message--event-owner data)
+              (qq-gateway-current-account-owner))))
 
-(defun qq-gateway-message--clear-projection-state ()
-  "Clear timeline state and all correlation owned by the old projection."
+(defun qq-gateway-message-revoke-projection ()
+  "Revoke native projection ownership and all private correlation caches.
+
+Shared `qq-state' is left to the caller's backend-switch or reset transaction."
   (setq qq-gateway-message--projection-owner nil)
   (clrhash qq-gateway-message--peer-uin-by-uid)
   (clrhash qq-gateway-message--pending-recalls)
   (clrhash qq-gateway-message--pending-sends)
+  nil)
+
+(defun qq-gateway-message--clear-projection-state ()
+  "Clear timeline state and all correlation owned by the old projection."
+  (qq-gateway-message-revoke-projection)
   (qq-state-reset))
+
+(defun qq-gateway-message-deactivate-projection ()
+  "Release native projection state without disturbing another backend.
+
+Shared `qq-state' is reset only when the Gateway currently owns it.  Private
+correlation caches are always revoked."
+  (if qq-gateway-message--projection-owner
+      (qq-gateway-message--clear-projection-state)
+    (qq-gateway-message-revoke-projection)))
 
 (defun qq-gateway-message--sync-self-info (account)
   "Project selected native ACCOUNT identity into shared QQ state."
@@ -310,6 +328,8 @@
 
 (defun qq-gateway-message--ensure-projection-owner (owner)
   "Ensure shared QQ state is exclusively owned by native OWNER."
+  (unless (eq qq-backend 'gateway)
+    (error "qq: Native Gateway does not own the active client backend"))
   (unless (equal owner (qq-gateway-current-account-owner))
     (error "qq: Gateway event owner is not the selected account generation"))
   (unless (equal owner qq-gateway-message--projection-owner)
@@ -319,6 +339,13 @@
     (qq-gateway-message--sync-self-info account)
     (qq-gateway-message--sync-connection-status account))
   owner)
+
+(defun qq-gateway-message-activate-projection ()
+  "Claim the selected Gateway account for shared state when available."
+  (unless (eq qq-backend 'gateway)
+    (user-error "qq: Select the native Gateway backend first"))
+  (when-let* ((owner (qq-gateway-current-account-owner)))
+    (qq-gateway-message--ensure-projection-owner owner)))
 
 (defun qq-gateway-message--endpoint-self-p (endpoint account)
   "Return non-nil when ENDPOINT identifies selected ACCOUNT."
@@ -669,32 +696,38 @@ SESSION-KEY must equal the conversation recorded with the send receipt."
 (defun qq-gateway-message--handle-account-change (reason account-id)
   "Keep projection ownership aligned after account change REASON/ACCOUNT-ID."
   (ignore reason)
-  (let ((selected (qq-gateway-current-account-owner)))
-    (cond
-     ((null selected)
-      (when qq-gateway-message--projection-owner
-        (qq-gateway-message--clear-projection-state)))
-     ((not (equal selected qq-gateway-message--projection-owner))
-      (qq-gateway-message--ensure-projection-owner selected))
-     ((or (null account-id)
-          (equal account-id (car selected)))
-      (let ((account (qq-gateway-current-account)))
-        (qq-gateway-message--sync-self-info account)
-        (qq-gateway-message--sync-connection-status account))))))
+  (if (not (eq qq-backend 'gateway))
+      (qq-gateway-message-revoke-projection)
+    (let ((selected (qq-gateway-current-account-owner)))
+      (cond
+       ((null selected)
+        (when qq-gateway-message--projection-owner
+          (qq-gateway-message--clear-projection-state)))
+       ((not (equal selected qq-gateway-message--projection-owner))
+        (qq-gateway-message--ensure-projection-owner selected))
+       ((or (null account-id)
+            (equal account-id (car selected)))
+        (let ((account (qq-gateway-current-account)))
+          (qq-gateway-message--sync-self-info account)
+          (qq-gateway-message--sync-connection-status account)))))))
 
 (defun qq-gateway-message--handle-selection-change (_old-account-id new-account-id)
   "Move projected state ownership to selected NEW-ACCOUNT-ID."
-  (if new-account-id
-      (let ((owner (qq-gateway-current-account-owner)))
-        (unless (and owner (equal (car owner) new-account-id))
-          (error "qq: Gateway selection has no matching account snapshot"))
-        (qq-gateway-message--ensure-projection-owner owner))
-    (when qq-gateway-message--projection-owner
-      (qq-gateway-message--clear-projection-state))))
+  (cond
+   ((not (eq qq-backend 'gateway))
+   (qq-gateway-message-revoke-projection))
+   (new-account-id
+    (let ((owner (qq-gateway-current-account-owner)))
+      (unless (and owner (equal (car owner) new-account-id))
+        (error "qq: Gateway selection has no matching account snapshot"))
+      (qq-gateway-message--ensure-projection-owner owner)))
+   (qq-gateway-message--projection-owner
+    (qq-gateway-message--clear-projection-state))))
 
 (defun qq-gateway-message--handle-transport-state (_state)
   "Refresh shared status after a native transport state transition."
-  (when (and qq-gateway-message--projection-owner
+  (when (and (eq qq-backend 'gateway)
+             qq-gateway-message--projection-owner
              (equal qq-gateway-message--projection-owner
                     (qq-gateway-current-account-owner)))
     (qq-gateway-message--sync-connection-status

@@ -29,6 +29,7 @@
 (require 'qq-gateway-message)
 (require 'qq-gateway-directory)
 (require 'qq-api)
+(require 'qq-backend)
 (require 'qq-chat)
 (require 'qq-search)
 (require 'qq-media)
@@ -207,28 +208,48 @@ current, detached, or legacy QQ buffers created by shutdown/kill hooks."
 
 ;;;###autoload
 (defun qq-connect ()
-  "Start emacs-qq websocket transport."
+  "Start the selected emacs-qq backend transport."
   (interactive)
-  (qq-transport-start))
+  (qq-backend-connect))
 
 ;;;###autoload
 (defun qq-disconnect ()
-  "Stop emacs-qq websocket transport."
+  "Stop the selected Emacs transport without changing remote account state."
   (interactive)
-  (qq-transport-stop))
+  (qq-backend-disconnect))
 
 ;;;###autoload
 (defun qq-refresh ()
-  "Refresh runtime data from NapCat.
+  "Refresh runtime data from the selected backend.
 
 When transport is not connected yet, start it and wait for bootstrap.
 When transport is already open, request a fresh snapshot immediately."
   (interactive)
-  (if (qq-transport-running-p)
-      (qq-api-refresh)
+  (if (qq-backend-running-p)
+      (qq-backend-refresh)
     (progn
       (qq-connect)
-      (message "qq: connecting; initial refresh will run after lifecycle.connect"))))
+      (message "qq: connecting; initial refresh will run when the backend is ready"))))
+
+;;;###autoload
+(defun qq-switch-backend (backend)
+  "Reset the client projection, select BACKEND, and open emacs-qq.
+
+BACKEND is `onebot' or `gateway'.  Switching disconnects only the previous
+Emacs transport.  In particular, it never stops or logs out an account owned
+by the long-lived native Gateway."
+  (interactive
+   (list
+    (intern
+     (completing-read
+      "QQ backend: " '("onebot" "gateway") nil t nil nil
+      (symbol-name qq-backend)))))
+  (unless (memq backend '(onebot gateway))
+    (user-error "qq: Unknown backend %S" backend))
+  (unless (eq backend qq-backend)
+    (qq-reset-session-state)
+    (setq qq-backend backend))
+  (qq))
 
 ;;;###autoload
 (defun qq-reset-session-state ()
@@ -252,7 +273,9 @@ Appkit detaches renamed views; legacy QQ major modes are included too."
                 (qq-notifications-reset-session-state))
             (qq-media-clear-cache))
         (unwind-protect
-            (qq-state-reset)
+            (progn
+              (qq-backend-reset-session-state)
+              (qq-state-reset))
           (unwind-protect
               (qq--drain-reset-resources buffers)
             (unwind-protect

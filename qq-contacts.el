@@ -24,6 +24,7 @@
 (require 'appkit-ui)
 (require 'appkit-view)
 (require 'qq-api)
+(require 'qq-backend)
 (require 'qq-media)
 (require 'qq-runtime)
 (require 'qq-state)
@@ -1640,9 +1641,9 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
         qq-contacts--refresh-parts nil
         qq-contacts--loading nil)
   (when qq-contacts--friend-request
-    (qq-api-cancel-request qq-contacts--friend-request))
+    (qq-backend-cancel-request qq-contacts--friend-request))
   (when qq-contacts--group-request
-    (qq-api-cancel-request qq-contacts--group-request))
+    (qq-backend-cancel-request qq-contacts--group-request))
   (setq qq-contacts--friend-request nil
         qq-contacts--group-request nil))
 
@@ -1695,7 +1696,7 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
       (qq-contacts--queue-view-sync view)
       (condition-case error-data
           (let ((request
-                 (qq-api-refresh-friend-categories
+                 (qq-backend-refresh-friend-categories
                   (lambda (_categories)
                     (qq-contacts--finish-refresh-part
                      view buffer owner 'friends))
@@ -1710,7 +1711,7 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
           view buffer owner 'friends (error-message-string error-data))))
       (condition-case error-data
           (let ((request
-                 (qq-api-refresh-joined-groups
+                 (qq-backend-refresh-joined-groups
                   (lambda (_groups)
                     (qq-contacts--finish-refresh-part
                      view buffer owner 'groups))
