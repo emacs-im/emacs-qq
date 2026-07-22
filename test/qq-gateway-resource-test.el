@@ -8,7 +8,8 @@
 
 (defconst qq-gateway-resource-test-capabilities
   '("resource.list" "resource.stage_local" "resource.derive_record"
-    "resource.status"
+    "resource.derive_playable_record" "resource.open_local"
+    "resource.close_local" "resource.status"
     "resource.release" "resource.import.list_sources"
     "resource.import.list_images" "resource.import.stage_image"))
 
@@ -198,6 +199,112 @@
                        "invalid_gateway_result"))
         (should (string-match-p "reused its source identity" (cadr failure)))
         (should-not (qq-gateway-resource "res-source-wav"))))))
+
+(ert-deftest qq-gateway-resource-derive-playable-record-keeps-native-source-distinct ()
+  (qq-gateway-resource-test-with-state
+    (puthash "res-source-silk"
+             (qq-gateway-resource-test-ready "res-source-silk")
+             qq-gateway-resource--resources)
+    (let (sent-method sent-params delivered)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-resource-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall
+                    callback
+                    `((resource
+                       . ,(qq-gateway-resource-test-snapshot
+                           :resource-id "res-derived-wav"
+                           :suggested-name "voice.wav"
+                           :size "1964"))))
+                   "derive-playable-request")))
+        (should
+         (equal
+          (qq-gateway-resource-derive-playable-record
+           "res-source-silk" "voice.wav"
+           (lambda (snapshot) (setq delivered snapshot)))
+          "derive-playable-request"))
+        (should (equal sent-method "resource.derive_playable_record"))
+        (should
+         (equal sent-params
+                '((source_resource_id . "res-source-silk")
+                  (suggested_name . "voice.wav"))))
+        (should (equal (alist-get 'resource_id delivered) "res-derived-wav"))
+        (should (qq-gateway-resource "res-source-silk"))
+        (should (qq-gateway-resource "res-derived-wav"))))))
+
+(ert-deftest qq-gateway-resource-local-access-is-one-shot-and-never-a-snapshot-field ()
+  (qq-gateway-resource-test-with-state
+    (let ((path (make-temp-file "qq-local-access-" nil ".wav" "RIFF"))
+          calls grant close-receipt)
+      (unwind-protect
+          (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                     (lambda () t))
+                    ((symbol-function 'qq-gateway-transport-capabilities)
+                     (lambda () qq-gateway-resource-test-capabilities))
+                    ((symbol-function 'qq-gateway-transport-send)
+                     (lambda (method params callback _errback &optional _early)
+                       (push (list method params) calls)
+                       (pcase method
+                         ("resource.open_local"
+                          (funcall
+                           callback
+                           `((access
+                              . ((access_id
+                                  . "access-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+                                 (resource_id . "res-playable")
+                                 (path . ,path)
+                                 (expires_at . 1784703600))))))
+                         ("resource.close_local"
+                          (funcall
+                           callback
+                           '((access_id
+                              . "access-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+                             (closed . t)))))
+                       method)))
+            (qq-gateway-resource-open-local
+             "res-playable" (lambda (access) (setq grant access)))
+            (should (equal (alist-get 'path grant) path))
+            (should (equal (alist-get 'resource_id grant) "res-playable"))
+            (should (integerp (alist-get 'expires_at grant)))
+            (qq-gateway-resource-close-local
+             (alist-get 'access_id grant)
+             (lambda (receipt) (setq close-receipt receipt)))
+            (should (eq (alist-get 'closed close-receipt) t))
+            (should
+             (member
+              '("resource.open_local" ((resource_id . "res-playable")))
+              calls))
+            (should
+             (member
+              '("resource.close_local"
+                ((access_id
+                  . "access-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")))
+              calls))
+            (should-not
+             (assq 'path (qq-gateway-resource-test-ready "res-playable"))))
+        (delete-file path)))))
+
+(ert-deftest qq-gateway-resource-await-ready-observes-terminal-projection-once ()
+  (qq-gateway-resource-test-with-state
+    (puthash "res-await"
+             (qq-gateway-resource-test-snapshot :resource-id "res-await")
+             qq-gateway-resource--resources)
+    (let (delivered failure)
+      (qq-gateway-resource-await-ready
+       "res-await"
+       (lambda (resource) (push resource delivered))
+       (lambda (body reason) (setq failure (list body reason))))
+      (qq-gateway-resource--upsert
+       (qq-gateway-resource-test-ready "res-await") 'changed)
+      (qq-gateway-resource--upsert
+       (qq-gateway-resource-test-ready "res-await") 'duplicate)
+      (should (= (length delivered) 1))
+      (should (equal (alist-get 'phase (car delivered)) "ready"))
+      (should-not failure))))
 
 (ert-deftest qq-gateway-resource-events-do-not-regress-terminal-state ()
   (qq-gateway-resource-test-with-state
