@@ -14,6 +14,7 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
+(require 'qq-customize)
 (require 'qq-gateway-message)
 (require 'qq-state)
 
@@ -457,10 +458,19 @@
     (clrhash qq-gateway-directory--member-pages))
   owner)
 
+(defun qq-gateway-directory-reset ()
+  "Revoke native directory request ownership and member caches."
+  (setq qq-gateway-directory--cache-owner nil)
+  (clrhash qq-gateway-directory--active-requests)
+  (clrhash qq-gateway-directory--member-pages)
+  nil)
+
 (defun qq-gateway-directory--handle-account-context (&rest _arguments)
   "Revoke directory caches after a selected account context change."
-  (qq-gateway-directory--set-cache-owner
-   (qq-gateway-current-account-owner)))
+  (if (eq qq-backend 'gateway)
+      (qq-gateway-directory--set-cache-owner
+       (qq-gateway-current-account-owner))
+    (qq-gateway-directory-reset)))
 
 (defun qq-gateway-directory--begin-request (resource owner)
   "Return and register the newest request token for RESOURCE and OWNER."

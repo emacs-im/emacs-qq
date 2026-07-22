@@ -16,6 +16,7 @@
 (require 'appkit-chat-completion)
 (require 'appkit-chat-emoji)
 (require 'qq-api)
+(require 'qq-backend)
 (require 'qq-media)
 (require 'qq-state)
 
@@ -259,7 +260,7 @@ member model; a later explicit completion command owns presentation."
                               :group-id group-id
                               :query query))
             (puthash query owner qq-completion--member-pending)
-            (qq-api-search-group-members
+            (qq-backend-search-group-members
              group-id query
              (lambda (members)
                (when (buffer-live-p buffer)
@@ -356,7 +357,7 @@ member model; a later explicit completion command owns presentation."
   "Cancel and forget the current buffer's poke-target search."
   (when qq-completion--poke-request
     (when-let* ((token (plist-get qq-completion--poke-request :token)))
-      (qq-api-cancel-request token)))
+      (qq-backend-cancel-request token)))
   (setq qq-completion--poke-request nil))
 
 (defun qq-completion--poke-candidate-user-id (candidate)
@@ -507,7 +508,7 @@ member model; a later explicit completion command owns presentation."
       (setq qq-completion--poke-request owner)
       (condition-case error-data
           (setq token
-                (qq-api-search-group-members
+                (qq-backend-search-group-members
                  group-id query
                  (lambda (members)
                    (qq-completion--group-poke-search-succeeded

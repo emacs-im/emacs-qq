@@ -112,6 +112,10 @@ barrier before mutating state or choosing a timeline position."
   "Call OneBot ACTION with PARAMS and CALLBACK.
 
 ERRBACK falls back to `qq-api--default-error'."
+  (unless (eq qq-backend 'onebot)
+    (user-error
+     "qq: OneBot action %s is unavailable while backend is %s"
+     action qq-backend))
   (qq-transport-send action params callback (or errback #'qq-api--default-error)))
 
 (defun qq-api--run-request-finalizer (request-token)
@@ -2805,8 +2809,11 @@ index contradiction is rejected before any remote side effect."
           :message-id message-id
           :session-key session-key)))
 
-(defun qq-api-delete-message (reference)
-  "Recall the exact message in closed locator-qualified REFERENCE."
+(defun qq-api-delete-message (reference &optional callback errback)
+  "Recall the exact message in closed locator-qualified REFERENCE.
+
+CALLBACK receives the successful OneBot response after local state updates;
+ERRBACK follows ordinary `qq-api-call' conventions."
   (let* ((context
           (qq-api--message-mutation-context reference "delete_msg reference"))
          (message-id (plist-get context :message-id))
@@ -2814,8 +2821,11 @@ index contradiction is rejected before any remote side effect."
     (qq-api-call
      "delete_msg"
      `((message_id . ,message-id))
-     (lambda (_response)
-       (qq-state-apply-recall session-key message-id)))))
+     (lambda (response)
+       (qq-state-apply-recall session-key message-id)
+       (when callback
+         (funcall callback response)))
+     errback)))
 
 (defun qq-api-recall-poke
     (session-key recall-reference &optional callback errback)
@@ -4280,19 +4290,20 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
 
 (defun qq-api-handle-event (event)
   "Handle websocket EVENT emitted by transport."
-  (pcase (alist-get 'post_type event)
-    ((or "message" "message_sent")
-     (qq-state-merge-live-message event))
-    ("meta_event"
-     (qq-api--handle-meta-event event))
-    ("notice"
-     (qq-api--handle-notice event))
-    ("request"
-     (qq-api--handle-request event))
-    ("emacs_guild_message"
-     (qq-state-merge-guild-message
-      (qq-api--validate-guild-message-event event)))
-    (_ nil)))
+  (when (eq qq-backend 'onebot)
+    (pcase (alist-get 'post_type event)
+      ((or "message" "message_sent")
+       (qq-state-merge-live-message event))
+      ("meta_event"
+       (qq-api--handle-meta-event event))
+      ("notice"
+       (qq-api--handle-notice event))
+      ("request"
+       (qq-api--handle-request event))
+      ("emacs_guild_message"
+       (qq-state-merge-guild-message
+        (qq-api--validate-guild-message-event event)))
+      (_ nil))))
 
 (add-hook 'qq-transport-event-hook #'qq-api-handle-event)
 
