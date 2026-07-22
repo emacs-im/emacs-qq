@@ -256,6 +256,218 @@ backend failure response and reason."
         session-key message callback
         (or errback #'qq-backend--default-gateway-error))))))
 
+(defun qq-backend--message-at-sequence (session-key sequence)
+  "Return SESSION-KEY message carrying exact SEQUENCE, or nil."
+  (seq-find
+   (lambda (message)
+     (equal (alist-get 'message-seq message) sequence))
+   (qq-state-session-messages session-key)))
+
+(defun qq-backend-history-frontier (session-key)
+  "Return the selected backend's exact known history frontier.
+
+For the native Gateway the result is a plist containing `:sequence' and,
+when known, `:message-id'.  Group `latest_sequence' is authoritative and is
+advanced by a newer live event.  Private history deliberately exposes only a
+live sequence observed by this Gateway projection because neither Lagrange nor
+the QQ C2C history method provides a latest cursor.  `:empty-p' or
+`:unavailable-reason' explains a result without a sequence."
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot nil)
+    ('gateway
+     (let* ((identity (qq-state-session-key-identity session-key))
+            (kind (alist-get 'type identity))
+            (target-id (alist-get 'target-id identity))
+            (live (qq-gateway-message-live-frontier session-key))
+            (live-sequence (alist-get 'sequence live)))
+       (unless (memq kind '(private group))
+         (user-error "qq: Native Gateway history supports private and group chats"))
+       (pcase kind
+         ('private
+          (if live-sequence
+              (list :backend 'gateway
+                    :sequence live-sequence
+                    :message-id (alist-get 'message_id live)
+                    :source 'live-event)
+            (list :backend 'gateway
+                  :unavailable-reason 'private-latest-sequence)))
+         ('group
+          (let* ((group (qq-state-group target-id))
+                 (directory-sequence (alist-get 'latest_sequence group))
+                 sequence source)
+            (when (and directory-sequence
+                       (not (qq-gateway--canonical-decimal-p
+                             directory-sequence t)))
+              (error "qq: Gateway group latest_sequence is not exact"))
+            (cond
+             ((and live-sequence
+                   (or (null directory-sequence)
+                       (qq-gateway--decimal-less-p
+                        directory-sequence live-sequence)))
+              (setq sequence live-sequence source 'live-event))
+             (directory-sequence
+              (setq sequence directory-sequence source 'group-directory)))
+            (cond
+             (sequence
+              (let ((message
+                     (or (and (equal sequence live-sequence) live)
+                         (qq-backend--message-at-sequence
+                          session-key sequence))))
+                (list :backend 'gateway
+                      :sequence sequence
+                      :message-id (or (alist-get 'message_id message)
+                                      (alist-get 'server-id message))
+                      :source source
+                      :authoritative-p t)))
+             (group
+              (list :backend 'gateway :empty-p t
+                    :source 'group-directory :authoritative-p t))
+             (t
+              (list :backend 'gateway
+                    :unavailable-reason 'group-directory))))))))))
+
+(defun qq-backend-history-range-before (start-sequence count)
+  "Return native history range before exact START-SEQUENCE, or nil at zero."
+  (qq-gateway-message--validate-sequence
+   start-sequence "Current history start sequence")
+  (qq-gateway-message--validate-history-count count)
+  (unless (equal start-sequence "0")
+    (qq-gateway-message-history-range-ending-at
+     (qq-gateway-message--decimal-subtract-small start-sequence 1)
+     count)))
+
+(defun qq-backend-history-range-after
+    (end-sequence count &optional maximum-sequence)
+  "Return native history range after END-SEQUENCE, optionally capped at MAXIMUM.
+
+All sequence values stay canonical decimal strings.  Return nil when MAXIMUM
+is already covered."
+  (qq-gateway-message--validate-sequence
+   end-sequence "Current history end sequence")
+  (qq-gateway-message--validate-history-count count)
+  (when maximum-sequence
+    (qq-gateway-message--validate-sequence
+     maximum-sequence "Known latest history sequence"))
+  (unless (and maximum-sequence
+               (not (qq-gateway--decimal-less-p
+                     end-sequence maximum-sequence)))
+    (let* ((start-sequence
+            (qq-gateway-message--decimal-add-small end-sequence 1))
+           (candidate-end
+            (qq-gateway-message--decimal-add-small
+             start-sequence (1- count)))
+           (range-end
+            (if (and maximum-sequence
+                     (qq-gateway--decimal-less-p
+                      maximum-sequence candidate-end))
+                maximum-sequence
+              candidate-end)))
+      (qq-gateway-message--validate-history-range
+       start-sequence range-end))))
+
+(defun qq-backend--gateway-history-meta (meta &rest properties)
+  "Return Gateway history META prefixed with backend PROPERTIES."
+  (append (list :backend 'gateway) properties (copy-sequence meta)))
+
+(defun qq-backend-fetch-history-range
+    (session-key start-sequence end-sequence callback &optional errback properties)
+  "Fetch one native Gateway history range for SESSION-KEY.
+
+START-SEQUENCE and END-SEQUENCE are inclusive exact strings.  CALLBACK receives
+merge metadata prefixed by optional plist PROPERTIES.  The returned request is
+tagged for cancellation across later backend changes."
+  (unless (eq (qq-backend--validate qq-backend) 'gateway)
+    (user-error "qq: Explicit sequence ranges belong to the native Gateway"))
+  (qq-backend--wrap-request
+   'gateway
+   (qq-gateway-message-get-history
+    session-key start-sequence end-sequence
+    (lambda (meta)
+      (qq-gateway--invoke
+       callback
+       (apply #'qq-backend--gateway-history-meta meta properties)))
+    (or errback #'qq-backend--default-gateway-error))))
+
+(defun qq-backend-fetch-latest-history
+    (session-key callback &optional errback count)
+  "Fetch the selected backend's latest known history for SESSION-KEY.
+
+Native group history uses the directory's exact latest sequence.  Native
+private history uses only a live observed sequence; when none exists CALLBACK
+receives metadata with `:history-frontier-unavailable' instead of a guessed
+request."
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot
+     (qq-backend--wrap-request
+      'onebot
+      (qq-api-fetch-older-history
+       session-key nil callback errback count)))
+    ('gateway
+     (let* ((frontier (qq-backend-history-frontier session-key))
+            (sequence (plist-get frontier :sequence)))
+       (cond
+        (sequence
+         (pcase-let ((`(,start-sequence . ,end-sequence)
+                      (qq-gateway-message-history-range-ending-at
+                       sequence
+                       (min 100 (max 1 (or count qq-history-fetch-count))))))
+           (qq-backend-fetch-history-range
+            session-key start-sequence end-sequence callback errback
+            (list :history-at-latest-p t :history-frontier frontier))))
+        ((plist-get frontier :empty-p)
+         (qq-gateway--invoke
+          callback
+          (qq-backend--gateway-history-meta
+           (list :session-key session-key
+                 :message-count 0 :added-count 0 :batch-message-ids nil)
+           :history-at-latest-p t :history-at-oldest-p t
+           :history-frontier frontier))
+         nil)
+        (t
+         (qq-gateway--invoke
+          callback
+          (qq-backend--gateway-history-meta
+           (list :session-key session-key
+                 :message-count 0 :added-count 0 :batch-message-ids nil)
+           :history-frontier-unavailable
+           (plist-get frontier :unavailable-reason)
+           :history-frontier frontier))
+         nil))))))
+
+(defun qq-backend-fetch-history-around
+    (session-key message-id callback &optional errback count)
+  "Fetch selected-backend history around exact MESSAGE-ID in SESSION-KEY."
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot
+     (qq-backend--wrap-request
+      'onebot
+      (qq-api-fetch-history-around
+       session-key message-id callback errback count)))
+    ('gateway
+     (let* ((message
+             (seq-find
+              (lambda (candidate)
+                (equal (alist-get 'server-id candidate) message-id))
+              (qq-state-session-messages session-key)))
+            (sequence (alist-get 'message-seq message)))
+       (if (not sequence)
+           (qq-gateway--client-error
+            (or errback #'qq-backend--default-gateway-error)
+            "history_sequence_unavailable"
+            "Native Gateway can seek only a cached message carrying sequence metadata")
+         (pcase-let ((`(,start-sequence . ,end-sequence)
+                      (qq-gateway-message-history-range-around
+                       sequence
+                       (min 100 (max 1 (or count qq-history-fetch-count))))))
+           (qq-backend-fetch-history-range
+            session-key start-sequence end-sequence callback errback
+            (list :history-target-message-id message-id))))))))
+
+(defun qq-backend-history-exhausted-error-p (response reason)
+  "Return non-nil when selected backend RESPONSE and REASON mean history EOF."
+  (and (eq (qq-backend--validate qq-backend) 'onebot)
+       (qq-api--history-exhausted-error-p response reason)))
+
 (defun qq-backend-supports-p (capability)
   "Return non-nil when selected backend supports product CAPABILITY."
   (pcase (qq-backend--validate qq-backend)

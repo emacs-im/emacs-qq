@@ -40,6 +40,10 @@
   (make-hash-table :test #'equal)
   "Client-sequence receipts awaiting an authoritative self message event.")
 
+(defvar qq-gateway-message--live-frontiers
+  (make-hash-table :test #'equal)
+  "Newest live message identity and sequence observed per projected session.")
+
 (defconst qq-gateway-message--max-uint64-decimal
   "18446744073709551615"
   "Largest sequence accepted by the native Gateway protocol.")
@@ -285,6 +289,7 @@ Shared `qq-state' is left to the caller's backend-switch or reset transaction."
   (clrhash qq-gateway-message--peer-uin-by-uid)
   (clrhash qq-gateway-message--pending-recalls)
   (clrhash qq-gateway-message--pending-sends)
+  (clrhash qq-gateway-message--live-frontiers)
   nil)
 
 (defun qq-gateway-message--clear-projection-state ()
@@ -600,11 +605,48 @@ SESSION-KEY must equal the conversation recorded with the send receipt."
   (let* ((owner (qq-gateway-message--event-owner data))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
          (normalized (qq-gateway-message--normalize-message data))
+         (frontier (qq-gateway-message--plan-live-frontier normalized))
          (merged (qq-gateway-message--merge-normalized normalized 'event)))
     (qq-gateway-message--finalize-message-context
      owner (alist-get 'message data) normalized)
     (qq-gateway-message--apply-pending-recall owner normalized merged)
+    (when frontier
+      (puthash (alist-get 'session-key normalized) frontier
+               qq-gateway-message--live-frontiers))
     merged))
+
+(defun qq-gateway-message--plan-live-frontier (normalized)
+  "Return a new live frontier for NORMALIZED, or nil when it cannot advance.
+
+An equal sequence carrying a different message id is a protocol contradiction.
+The caller commits the returned value only after the timeline projection has
+completed, so a failed projection cannot advance this side index."
+  (let* ((session-key (alist-get 'session-key normalized))
+         (message-id (alist-get 'server-id normalized))
+         (sequence (alist-get 'message-seq normalized))
+         (current (gethash session-key qq-gateway-message--live-frontiers))
+         (current-sequence (alist-get 'sequence current)))
+    (cond
+     ((null current)
+      `((message_id . ,message-id) (sequence . ,sequence)))
+     ((equal current-sequence sequence)
+      (unless (equal (alist-get 'message_id current) message-id)
+        (error "qq: Gateway live sequence maps to different message ids"))
+      nil)
+     ((qq-gateway--decimal-less-p current-sequence sequence)
+      `((message_id . ,message-id) (sequence . ,sequence)))
+     (t nil))))
+
+(defun qq-gateway-message-live-frontier (session-key)
+  "Return selected-generation live frontier for SESSION-KEY, or nil.
+
+The result contains exact string `message_id' and `sequence' fields.  History
+responses never advance this observation; only `message.received' events do."
+  (when (and (eq qq-backend 'gateway)
+             qq-gateway-message--projection-owner
+             (equal qq-gateway-message--projection-owner
+                    (qq-gateway-current-account-owner)))
+    (copy-tree (gethash session-key qq-gateway-message--live-frontiers))))
 
 (defun qq-gateway-message--private-session-by-uid (peer-uid)
   "Return current private session key for exact PEER-UID, or nil."
@@ -762,6 +804,31 @@ are represented as Emacs integers."
       (setq carry (/ carry 10)))
     (apply #'string result)))
 
+(defun qq-gateway-message--decimal-subtract-small (value subtrahend)
+  "Return canonical decimal VALUE minus non-negative small SUBTRAHEND.
+
+The result saturates at zero.  VALUE is never coerced to an Emacs number."
+  (unless (and (qq-gateway--canonical-decimal-p value t)
+               (integerp subtrahend) (>= subtrahend 0))
+    (error "qq: Invalid decimal subtraction operands"))
+  (let ((small (number-to-string subtrahend)))
+    (if (or (qq-gateway--decimal-less-p value small)
+            (equal value small))
+        "0"
+      (let ((borrow subtrahend)
+            result)
+        (dolist (digit (nreverse (string-to-list value)))
+          (let* ((subdigit (% borrow 10))
+                 (next-borrow (/ borrow 10))
+                 (difference (- (- digit ?0) subdigit)))
+            (when (< difference 0)
+              (setq difference (+ difference 10)
+                    next-borrow (1+ next-borrow)))
+            (push (+ ?0 difference) result)
+            (setq borrow next-borrow)))
+        (setq result (string-trim-left (apply #'string result) "0+"))
+        (if (string-empty-p result) "0" result)))))
+
 (defun qq-gateway-message--validate-sequence (value context)
   "Return exact sequence VALUE after validation for CONTEXT."
   (unless (and (qq-gateway--canonical-decimal-p value t)
@@ -782,6 +849,40 @@ are represented as Emacs integers."
          end-sequence)
     (user-error "qq: Native Gateway history range is limited to 100 messages"))
   (cons start-sequence end-sequence))
+
+(defun qq-gateway-message--validate-history-count (count)
+  "Return history page COUNT after native range validation."
+  (unless (and (integerp count) (<= 1 count 100))
+    (user-error "qq: Native Gateway history count must be between 1 and 100"))
+  count)
+
+(defun qq-gateway-message-history-range-ending-at (end-sequence count)
+  "Return inclusive COUNT-wide range ending at exact END-SEQUENCE.
+
+The start saturates at zero, so a sequence near the beginning may yield a
+shorter range."
+  (qq-gateway-message--validate-sequence end-sequence "History page end")
+  (qq-gateway-message--validate-history-count count)
+  (let ((start-sequence
+         (qq-gateway-message--decimal-subtract-small
+          end-sequence (1- count))))
+    (qq-gateway-message--validate-history-range
+     start-sequence end-sequence)))
+
+(defun qq-gateway-message-history-range-around (sequence count)
+  "Return an inclusive COUNT-wide range containing exact SEQUENCE.
+
+The target is centered when possible.  Close to zero, the whole range shifts
+right instead of becoming shorter."
+  (qq-gateway-message--validate-sequence sequence "History center sequence")
+  (qq-gateway-message--validate-history-count count)
+  (let* ((start-sequence
+          (qq-gateway-message--decimal-subtract-small
+           sequence (/ (1- count) 2)))
+         (end-sequence
+          (qq-gateway-message--decimal-add-small start-sequence (1- count))))
+    (qq-gateway-message--validate-history-range
+     start-sequence end-sequence)))
 
 (defun qq-gateway-message--validate-history-result
     (result owner start-sequence end-sequence)

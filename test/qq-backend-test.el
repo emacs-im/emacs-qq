@@ -114,6 +114,8 @@
          (make-hash-table :test #'equal))
         (qq-gateway-message--pending-sends
          (make-hash-table :test #'equal))
+        (qq-gateway-message--live-frontiers
+         (make-hash-table :test #'equal))
         (qq-gateway-accounts-changed-hook nil)
         (qq-gateway-current-account-changed-hook nil)
         observed)
@@ -245,6 +247,95 @@
                 "recall-request"))
         (should (equal (car call) "group:8209413637"))
         (should (eq (cadr call) message))))))
+
+(ert-deftest qq-backend-gateway-history-frontier-prefers-newer-live-sequence ()
+  (let ((qq-backend 'gateway))
+    (cl-letf (((symbol-function 'qq-state-group)
+               (lambda (_group-id) '((latest_sequence . "9007199254740999"))))
+              ((symbol-function 'qq-gateway-message-live-frontier)
+               (lambda (_session-key)
+                 '((message_id . "7348923749823749823")
+                   (sequence . "9007199254741001")))))
+      (let ((frontier
+             (qq-backend-history-frontier "group:8209413637")))
+        (should (equal (plist-get frontier :sequence)
+                       "9007199254741001"))
+        (should (equal (plist-get frontier :message-id)
+                       "7348923749823749823"))
+        (should (eq (plist-get frontier :source) 'live-event))))))
+
+(ert-deftest qq-backend-gateway-history-ranges-stay-exact-and-bounded ()
+  (should
+   (equal (qq-backend-history-range-before
+           "9007199254741000" 20)
+          '("9007199254740980" . "9007199254740999")))
+  (should
+   (equal (qq-backend-history-range-after
+           "9007199254740999" 20 "9007199254741005")
+          '("9007199254741000" . "9007199254741005")))
+  (should-not (qq-backend-history-range-before "0" 20))
+  (should-not
+   (qq-backend-history-range-after "100" 20 "100")))
+
+(ert-deftest qq-backend-gateway-latest-history-uses-authoritative-range ()
+  (let ((qq-backend 'gateway) sent properties callback-meta)
+    (cl-letf (((symbol-function 'qq-backend-history-frontier)
+               (lambda (_session-key)
+                 '(:backend gateway :sequence "9007199254741005"
+                   :authoritative-p t)))
+              ((symbol-function 'qq-backend-fetch-history-range)
+               (lambda (_session start end callback _errback metadata)
+                 (setq sent (cons start end) properties metadata)
+                 (funcall callback '(:message-count 0 :batch-message-ids nil))
+                 (qq-backend-request-create
+                  :backend 'gateway :token "history-request"))))
+      (let ((request
+             (qq-backend-fetch-latest-history
+              "group:8209413637"
+              (lambda (meta) (setq callback-meta meta)) nil 20)))
+        (should (qq-backend-request-p request))
+        (should (equal sent
+                       '("9007199254740986" . "9007199254741005")))
+        (should (eq (plist-get properties :history-at-latest-p) t))
+        (should (= (plist-get callback-meta :message-count) 0))))))
+
+(ert-deftest qq-backend-gateway-private-latest-never-guesses-a-sequence ()
+  (let ((qq-backend 'gateway) callback-meta fetched)
+    (cl-letf (((symbol-function 'qq-backend-history-frontier)
+               (lambda (_session-key)
+                 '(:backend gateway
+                   :unavailable-reason private-latest-sequence)))
+              ((symbol-function 'qq-backend-fetch-history-range)
+               (lambda (&rest _) (setq fetched t))))
+      (should-not
+       (qq-backend-fetch-latest-history
+        "private:10001" (lambda (meta) (setq callback-meta meta))))
+      (should-not fetched)
+      (should (eq (plist-get callback-meta :history-frontier-unavailable)
+                  'private-latest-sequence)))))
+
+(ert-deftest qq-backend-gateway-around-requires-cached-exact-sequence ()
+  (let ((qq-backend 'gateway) range failure)
+    (cl-letf (((symbol-function 'qq-state-session-messages)
+               (lambda (_session-key)
+                 '(((server-id . "7348923749823749823")
+                    (message-seq . "9007199254740999")))))
+              ((symbol-function 'qq-backend-fetch-history-range)
+               (lambda (_session start end _callback _errback _properties)
+                 (setq range (cons start end))
+                 "history-request")))
+      (should
+       (equal
+        (qq-backend-fetch-history-around
+         "private:10001" "7348923749823749823" #'ignore nil 20)
+        "history-request"))
+      (should
+       (equal range
+              '("9007199254740990" . "9007199254741009")))
+      (qq-backend-fetch-history-around
+       "private:10001" "missing" #'ignore
+       (lambda (_body reason) (setq failure reason)) 20)
+      (should (string-match-p "cached message" failure)))))
 
 (ert-deftest qq-backend-gateway-bootstrap-coalesces-one-owner ()
   (let ((qq-backend 'gateway)
