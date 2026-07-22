@@ -1818,6 +1818,70 @@ authoritative and suppresses a racing optimistic receipt update."
              (error-message-string error-data)))))
        errback))))
 
+(defun qq-gateway-message--validate-todo-receipt
+    (receipt owner group-uin message-id sequence operation)
+  "Validate todo RECEIPT against OWNER and its exact group message target."
+  (unless (qq-gateway--exact-object-keys-p
+           receipt
+           '(account_id generation group_uin message_id sequence operation))
+    (error "qq: Gateway todo receipt has invalid fields"))
+  (unless (and (equal (alist-get 'account_id receipt) (car owner))
+               (equal (alist-get 'generation receipt) (cdr owner))
+               (equal (alist-get 'group_uin receipt) group-uin)
+               (equal (alist-get 'message_id receipt) message-id)
+               (equal (alist-get 'sequence receipt) sequence)
+               (equal (alist-get 'operation receipt) operation))
+    (error "qq: Gateway todo receipt contradicts request"))
+  (copy-tree receipt))
+
+(defun qq-gateway-message-set-todo
+    (message operation &optional callback errback)
+  "Apply todo OPERATION to native group MESSAGE.
+
+OPERATION is one of `set', `complete', or `cancel'.  CALLBACK receives the
+validated synchronous receipt.  No local todo state is invented because the
+native query/event semantics are not yet part of the closed Gateway protocol."
+  (unless (memq operation '(set complete cancel))
+    (user-error "qq: Unknown native todo operation %S" operation))
+  (let* ((owner (or (qq-gateway-current-account-owner)
+                    (user-error "qq: Select a Gateway account first")))
+         (_owner (qq-gateway-message--ensure-projection-owner owner))
+         (session-key (alist-get 'session-key message))
+         (message-id (alist-get 'server-id message))
+         (sequence (alist-get 'message-seq message))
+         (group-uin (and session-key
+                         (qq-state-session-key-target-id session-key)))
+         (operation-name (symbol-name operation)))
+    (unless (and session-key
+                 (eq (qq-state-session-key-type session-key) 'group)
+                 (qq-gateway--canonical-decimal-p group-uin)
+                 (qq-gateway--canonical-decimal-p message-id)
+                 (qq-gateway--canonical-decimal-p sequence))
+      (user-error "qq: Native todo requires exact group message identity"))
+    (unless (and (equal (alist-get 'gateway-account-id message) (car owner))
+                 (equal (alist-get 'gateway-generation message) (cdr owner)))
+      (user-error "qq: Todo message belongs to another Gateway generation"))
+    (qq-gateway--send
+     "message.set_todo"
+     `((account_id . ,(car owner))
+       (conversation . ((kind . "group") (group_uin . ,group-uin)))
+       (message . ((message_id . ,message-id) (sequence . ,sequence)))
+       (operation . ,operation-name))
+     (lambda (raw-result)
+       (condition-case error-data
+           (let ((receipt
+                  (qq-gateway-message--validate-todo-receipt
+                   raw-result owner group-uin message-id sequence
+                   operation-name)))
+             (unless (equal owner (qq-gateway-current-account-owner))
+               (error "qq: Gateway account generation changed during todo action"))
+             (qq-gateway--invoke callback receipt))
+         (error
+          (qq-gateway--client-error
+           errback "invalid_gateway_result" "%s"
+           (error-message-string error-data)))))
+     errback)))
+
 (defun qq-gateway-message--validate-recall-receipt
     (receipt owner message-id sequence)
   "Validate recall RECEIPT for OWNER, MESSAGE-ID, and SEQUENCE."

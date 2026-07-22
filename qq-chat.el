@@ -45,6 +45,7 @@
 (autoload 'qq-search-open "qq-search" nil t)
 (autoload 'qq-red-packet-open "qq-red-packet" nil t)
 (autoload 'qq-chat-forward-transient "qq-transient" nil t)
+(autoload 'qq-chat-message-todo-transient "qq-transient" nil t)
 
 (declare-function qq-forward-segment-p "qq-forward" (segment))
 (declare-function qq-forward-insert-segment
@@ -62,6 +63,7 @@
 (declare-function qq-chat-attach-transient "qq-transient" (&rest args))
 (declare-function qq-chat-transient "qq-transient" (&rest args))
 (declare-function qq-chat-forward-transient "qq-transient" (&rest args))
+(declare-function qq-chat-message-todo-transient "qq-transient" (&rest args))
 (declare-function qq-api-forward-messages-individually
                   "qq-api" (source-session-key target-session-key message-ids
                                                 callback &optional errback))
@@ -3816,6 +3818,23 @@ a replacement runtime generation."
                 (qq-gateway-current-account-owner))))
          (_ nil))))
 
+(defun qq-chat--message-todo-capable-p (message)
+  "Return non-nil when MESSAGE supports a group todo mutation."
+  (and (listp message)
+       (eq (alist-get 'type (qq-chat--session)) 'group)
+       (qq-api-message-id-p (alist-get 'server-id message))
+       (not (qq-state-message-recalled-p message))
+       (pcase qq-backend
+         ('onebot t)
+         ('gateway
+          (and (qq-protocol--nonzero-decimal-string-p
+                (alist-get 'message-seq message))
+               (equal
+                (cons (alist-get 'gateway-account-id message)
+                      (alist-get 'gateway-generation message))
+                (qq-gateway-current-account-owner))))
+         (_ nil))))
+
 (defun qq-chat--message-reference (message)
   "Return MESSAGE's closed locator-qualified mutation reference.
 
@@ -3868,6 +3887,34 @@ buffer session with a detached message id after the fact."
      (lambda (_response)
        (message "qq: essence message %s"
                 (if set "set" "removed"))))))
+
+(defun qq-chat--mutate-message-todo (operation &optional message)
+  "Apply todo OPERATION to MESSAGE or the message at point."
+  (let* ((message (or message
+                      (qq-chat--message-at-point)
+                      (user-error "qq: no message at point")))
+         (_capable
+          (or (qq-chat--message-todo-capable-p message)
+              (user-error "qq: todo requires a live group message"))))
+    (qq-backend-set-message-todo
+     message operation
+     (lambda (_receipt)
+       (message "qq: message todo %s" operation)))))
+
+(defun qq-chat-set-message-todo (&optional message)
+  "Set MESSAGE or the message at point as a group todo."
+  (interactive)
+  (qq-chat--mutate-message-todo 'set message))
+
+(defun qq-chat-complete-message-todo (&optional message)
+  "Complete the group todo for MESSAGE or the message at point."
+  (interactive)
+  (qq-chat--mutate-message-todo 'complete message))
+
+(defun qq-chat-cancel-message-todo (&optional message)
+  "Cancel the group todo for MESSAGE or the message at point."
+  (interactive)
+  (qq-chat--mutate-message-todo 'cancel message))
 
 (defun qq-chat--insert-essence-line (message prefix-state properties)
   "Insert an essence badge for MESSAGE using PREFIX-STATE and PROPERTIES."

@@ -3000,6 +3000,76 @@ The authoritative post-state reports UNREAD-COUNT."
        (should-not (alist-get 'essence-p message))
        (should (= (alist-get 'essence-changed-at message) 1710000300))))))
 
+(ert-deftest qq-api-message-todo-uses-closed-napcat-fork-contract ()
+  (let (calls receipts)
+    (qq-api-test-with-reset
+     (cl-letf (((symbol-function 'qq-api-call)
+                (lambda (action params callback &optional _errback)
+                  (push (list action (copy-tree params)) calls)
+                  (funcall
+                   callback
+                   `((data
+                      . ((group_id . ,(alist-get 'group_id params))
+                         (message_id . ,(alist-get 'message_id params))
+                         (message_seq . "9007199254740999")
+                         (operation . ,(alist-get 'operation params))))))
+                  'todo-request)))
+       (dolist (operation '(set complete cancel))
+         (should
+          (eq
+           (qq-api-set-message-todo
+            (qq-api-test--message-reference
+             'group "20001" "9007199254741004001")
+            operation
+            (lambda (receipt) (push receipt receipts)))
+           'todo-request)))))
+    (should
+     (equal
+      (nreverse calls)
+      '(("emacs_set_group_todo"
+         ((group_id . "20001")
+          (message_id . "9007199254741004001")
+          (operation . "set")))
+        ("emacs_set_group_todo"
+         ((group_id . "20001")
+          (message_id . "9007199254741004001")
+          (operation . "complete")))
+        ("emacs_set_group_todo"
+         ((group_id . "20001")
+          (message_id . "9007199254741004001")
+          (operation . "cancel"))))))
+    (should
+     (equal (mapcar (lambda (receipt) (alist-get 'operation receipt))
+                    (nreverse receipts))
+            '("set" "complete" "cancel"))))
+  (should-error
+   (qq-api-set-message-todo
+    (qq-api-test--message-reference
+     'group "20001" "9007199254741004001")
+    'finish)
+   :type 'user-error)
+  (should-error
+   (qq-api-set-message-todo
+    (qq-api-test--message-reference
+     'private "10001" "9007199254741004001")
+    'set)
+   :type 'user-error)
+  (should-error
+   (qq-api--validate-message-todo-receipt
+    '((group_id . "20001")
+      (message_id . "9007199254741004001")
+      (message_seq . 9007199254740999)
+      (operation . "set"))
+    "20001" "9007199254741004001" "set"))
+  (should-error
+   (qq-api--validate-message-todo-receipt
+    '((group_id . "20001")
+      (message_id . "9007199254741004001")
+      (message_seq . "9007199254740999")
+      (operation . "set")
+      (finished . :false))
+    "20001" "9007199254741004001" "set")))
+
 (ert-deftest qq-api-group-settings-use-napcat-string-contracts ()
   (let (calls callbacks)
     (cl-letf (((symbol-function 'qq-api-call)

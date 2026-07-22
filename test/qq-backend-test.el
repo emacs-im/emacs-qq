@@ -599,6 +599,49 @@
                            (group_id . "8209413637"))))))
         (should-not (nth 1 call))))))
 
+(ert-deftest qq-backend-gateway-todo-routes-whole-message-and-operation ()
+  (let ((qq-backend 'gateway) calls)
+    (cl-letf (((symbol-function 'qq-gateway-message-set-todo)
+               (lambda (message operation &optional callback errback)
+                 (push (list message operation callback errback) calls)
+                 (format "todo-%s" operation))))
+      (let ((message
+             '((session-key . "group:8209413637")
+               (server-id . "7348923749823749823")
+               (message-seq . "9007199254740999"))))
+        (dolist (operation '(set complete cancel))
+          (should
+           (equal (qq-backend-set-message-todo message operation)
+                  (format "todo-%s" operation))))
+        (dolist (call calls)
+          (should (eq (nth 0 call) message))
+          (should (functionp (nth 3 call))))))))
+
+(ert-deftest qq-backend-onebot-todo-retains-closed-reference ()
+  (let ((qq-backend 'onebot) call)
+    (cl-letf (((symbol-function 'qq-api-set-message-todo)
+               (lambda (reference operation &optional callback errback)
+                 (setq call (list reference operation callback errback))
+                 "onebot-todo")))
+      (let ((message
+             '((session-key . "group:8209413637")
+               (server-id . "7348923749823749823"))))
+        (should
+         (equal (qq-backend-set-message-todo message 'complete)
+                "onebot-todo"))
+        (should
+         (equal (nth 0 call)
+                '((message_id . "7348923749823749823")
+                  (chat . ((kind . "group")
+                           (group_id . "8209413637"))))))
+        (should (eq (nth 1 call) 'complete))))
+    (should-error
+     (qq-backend-set-message-todo
+      '((session-key . "group:8209413637")
+        (server-id . "7348923749823749823"))
+      'finish)
+     :type 'user-error)))
+
 (ert-deftest qq-backend-gateway-poke-recall-routes-whole-message ()
   (let ((qq-backend 'gateway) call)
     (cl-letf (((symbol-function 'qq-state-poke-message-p) (lambda (_message) t))
