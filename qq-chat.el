@@ -3594,8 +3594,12 @@ Prefer a short name; never dump full URLs or CQ blobs into the timeline."
 Keep this short — size is useful; internal sub_type / emoji ids are not."
   (let* ((data (alist-get 'data segment))
          (size (qq-chat--format-byte-size (or (alist-get 'file_size data)
-                                              (alist-get 'file-size data)))))
-    (or size "")))
+                                              (alist-get 'file-size data))))
+         (duration (alist-get 'duration_seconds data))
+         (duration-text
+          (when (and (integerp duration) (> duration 0))
+            (format "%d:%02d" (/ duration 60) (% duration 60)))))
+    (string-join (delq nil (list duration-text size)) " · ")))
 
 (defun qq-chat--segment-media-card-kind (segment)
   "Return shared media card kind for OneBot SEGMENT."

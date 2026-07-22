@@ -4156,6 +4156,18 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
             (appkit-media-card-call-action 'open context))
           (should (equal opened-segment segment)))))))
 
+(ert-deftest qq-chat-native-record-meta-shows-closed-duration ()
+  (should
+   (equal
+    (qq-chat--segment-media-meta-line
+     '((type . "record") (data . ((duration_seconds . 65)))))
+    "1:05"))
+  (should
+   (equal
+    (qq-chat--segment-media-meta-line
+     '((type . "record") (data . ((duration_seconds . 0)))))
+    "")))
+
 (ert-deftest qq-chat-media-card-captures-exact-account-owner ()
   "Closing a view keeps app ownership; a same-id app cannot take it over."
   (let* ((old-app (appkit-start-app 'qq :id 'default :shutdown #'ignore))
