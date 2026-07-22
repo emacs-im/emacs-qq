@@ -109,14 +109,21 @@ behalf of one caller."
 
 (defun qq-gateway-attachment--validate-use (use)
   "Validate and copy attachment USE."
-  (unless (and (qq-gateway--exact-object-keys-p
-                use '(kind summary sub_type))
-               (equal (alist-get 'kind use) "image")
-               (qq-gateway--non-empty-string-p (alist-get 'summary use))
-               (<= (length (string-to-list (alist-get 'summary use))) 128)
-               (not (string-match-p "[[:cntrl:]]" (alist-get 'summary use)))
-               (qq-gateway-attachment--uint32-p (alist-get 'sub_type use)))
-    (error "qq: Gateway attachment use is malformed"))
+  (pcase (alist-get 'kind use)
+    ("image"
+     (unless (and (qq-gateway--exact-object-keys-p
+                   use '(kind summary sub_type))
+                  (qq-gateway--non-empty-string-p (alist-get 'summary use))
+                  (<= (length (string-to-list (alist-get 'summary use))) 128)
+                  (not (string-match-p
+                        "[[:cntrl:]]" (alist-get 'summary use)))
+                  (qq-gateway-attachment--uint32-p
+                   (alist-get 'sub_type use)))
+       (error "qq: Gateway image attachment use is malformed")))
+    ("record"
+     (unless (qq-gateway--exact-object-keys-p use '(kind))
+       (error "qq: Gateway record attachment use is malformed")))
+    (_ (error "qq: Gateway attachment use has unknown kind")))
   (copy-tree use))
 
 (defun qq-gateway-attachment--validate-snapshot (snapshot)
@@ -352,24 +359,21 @@ behalf of one caller."
       (_ (user-error
           "qq: Prepared attachments support only private or group chats")))))
 
-(defun qq-gateway-attachment-prepare-image
-    (session-key resource-id &optional summary sub-type callback errback)
-  "Prepare staged RESOURCE-ID as an image for SESSION-KEY.
+(defun qq-gateway-attachment--prepare
+    (session-key resource-id use media-name callback errback)
+  "Prepare RESOURCE-ID for SESSION-KEY with closed USE.
 
-CALLBACK receives the validated queued snapshot.  Progress and completion are
-projected through `qq-gateway-attachment-changed-hook'."
+MEDIA-NAME is used only in local errors.  CALLBACK receives the validated
+queued snapshot; later progress is projected through
+`qq-gateway-attachment-changed-hook'."
   (let* ((owner (or (qq-gateway-current-account-owner)
                     (user-error "qq: Select a QQ account first")))
          (resource (qq-gateway-resource resource-id))
          (conversation
-          (qq-gateway-attachment--conversation-params session-key))
-         (summary (or summary "[图片]"))
-         (sub-type (or sub-type 0))
-         (use `((kind . "image")
-                (summary . ,summary)
-                (sub_type . ,sub-type))))
+          (qq-gateway-attachment--conversation-params session-key)))
     (unless (and resource (equal (alist-get 'phase resource) "ready"))
-      (user-error "qq: Image preparation requires a ready staged resource"))
+      (user-error "qq: %s preparation requires a ready staged resource"
+                  media-name))
     (qq-gateway-attachment--validate-use use)
     (qq-gateway--send
      "attachment.prepare"
@@ -397,6 +401,29 @@ projected through `qq-gateway-attachment-changed-hook'."
            errback "invalid_gateway_result" "%s"
            (error-message-string error-data)))))
      errback)))
+
+(defun qq-gateway-attachment-prepare-image
+    (session-key resource-id &optional summary sub-type callback errback)
+  "Prepare staged RESOURCE-ID as an image for SESSION-KEY.
+
+CALLBACK receives the validated queued snapshot.  Progress and completion are
+projected through `qq-gateway-attachment-changed-hook'."
+  (qq-gateway-attachment--prepare
+   session-key resource-id
+   `((kind . "image")
+     (summary . ,(or summary "[图片]"))
+     (sub_type . ,(or sub-type 0)))
+   "Image" callback errback))
+
+(defun qq-gateway-attachment-prepare-record
+    (session-key resource-id &optional callback errback)
+  "Prepare staged RESOURCE-ID as native Silk for SESSION-KEY.
+
+The staged resource must already contain message-ready Tencent Silk.  Audio
+conversion creates a separate derived resource and is not implicit here.
+CALLBACK receives the validated queued snapshot."
+  (qq-gateway-attachment--prepare
+   session-key resource-id '((kind . "record")) "Record" callback errback))
 
 (defun qq-gateway-attachment-status
     (attachment-id &optional callback errback)
@@ -702,13 +729,18 @@ best-effort releases any resource or attachment already created for it."
       operation)))
 
 (defun qq-gateway-attachment-assert-sendable
-    (attachment-id session-key owner)
-  "Return ATTACHMENT-ID after strict SESSION-KEY and OWNER checks."
+    (attachment-id session-key owner &optional expected-use)
+  "Return ATTACHMENT-ID after strict SESSION-KEY and OWNER checks.
+
+EXPECTED-USE defaults to image and may be \"record\"."
   (unless (qq-gateway-attachment--id-p attachment-id)
-    (user-error "qq: Image segment lacks an opaque attachment ID"))
-  (let ((snapshot (qq-gateway-attachment attachment-id))
+    (user-error "qq: Media segment lacks an opaque attachment ID"))
+  (let ((expected-use (or expected-use "image"))
+        (snapshot (qq-gateway-attachment attachment-id))
         (conversation
          (qq-gateway-attachment--conversation-params session-key)))
+    (unless (member expected-use '("image" "record"))
+      (error "qq: Unknown prepared attachment use %S" expected-use))
     (unless snapshot
       (user-error "qq: Prepared attachment %s is not projected" attachment-id))
     (unless (equal (alist-get 'phase snapshot) "ready")
@@ -718,8 +750,8 @@ best-effort releases any resource or attachment already created for it."
       (user-error "qq: Prepared attachment belongs to another account generation"))
     (unless (equal (alist-get 'conversation snapshot) conversation)
       (user-error "qq: Prepared attachment belongs to another conversation"))
-    (unless (equal (alist-get 'kind (alist-get 'use snapshot)) "image")
-      (user-error "qq: Prepared attachment is not an image"))
+    (unless (equal (alist-get 'kind (alist-get 'use snapshot)) expected-use)
+      (user-error "qq: Prepared attachment is not %s" expected-use))
     attachment-id))
 
 (defun qq-gateway-attachment--request-resync (reason)

@@ -46,6 +46,23 @@
     (updated_at . 1784700001)
     (error)))
 
+(defun qq-gateway-message-test-ready-record (&optional attachment-id)
+  "Return one ready group-record attachment fixture."
+  `((attachment_id
+     . ,(or attachment-id "att-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeef"))
+    (resource_id . "res-record-wire")
+    (account_id . "slot-a")
+    (generation . "7")
+    (conversation . ((kind . "group") (group_uin . "8209413637")))
+    (use . ((kind . "record")))
+    (phase . "ready")
+    (bytes_done . "0")
+    (bytes_total . "3")
+    (fast_path . t)
+    (created_at . 1784700000)
+    (updated_at . 1784700001)
+    (error)))
+
 (cl-defun qq-gateway-message-test-event
     (&key
      (account-id "slot-a") (generation "7")
@@ -647,6 +664,28 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (should pending)
           (should (equal (alist-get 'segments pending)
                          optimistic-segments)))))))
+
+(ert-deftest qq-gateway-message-serializes-record-attachment-id-only ()
+  (qq-gateway-message-test-with-state
+    (let ((attachment-id "att-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeef"))
+      (qq-gateway-attachment--upsert
+       (qq-gateway-message-test-ready-record attachment-id) 'test)
+      (should
+       (equal
+        (qq-gateway-message--outgoing-segments
+         "group:8209413637"
+         `(((type . "record")
+            (data . ((attachment_id . ,attachment-id)))))
+         '("slot-a" . "7"))
+        `(((kind . "record")
+           (payload . ((attachment_id . ,attachment-id)))))))
+      (should-error
+       (qq-gateway-message--outgoing-segments
+        "group:8209413637"
+        `(((type . "image")
+           (data . ((attachment_id . ,attachment-id)))))
+        '("slot-a" . "7"))
+       :type 'user-error))))
 
 (ert-deftest qq-gateway-message-send-rejects-non-base-face-before-pending ()
   (qq-gateway-message-test-with-state
