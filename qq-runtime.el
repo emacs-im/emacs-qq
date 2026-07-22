@@ -11,14 +11,14 @@
 
 (require 'appkit-core)
 
-(declare-function qq-backend-disconnect "qq-backend")
+(declare-function qq-native-disconnect "qq-native")
 (declare-function qq-transport-stop "qq-transport")
 
 (defun qq-runtime--shutdown (_app)
   "Stop transport resources owned by the default QQ app session."
   (cond
-   ((fboundp 'qq-backend-disconnect)
-    (qq-backend-disconnect))
+   ((fboundp 'qq-native-disconnect)
+    (qq-native-disconnect))
    ((fboundp 'qq-transport-stop)
     (qq-transport-stop))))
 

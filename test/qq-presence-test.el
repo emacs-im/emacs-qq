@@ -15,7 +15,7 @@
              (qq-presence-do-not-disturb . "do_not_disturb")
              (qq-presence-invisible . "invisible")))
     (let (called)
-      (cl-letf (((symbol-function 'qq-backend-set-presence)
+      (cl-letf (((symbol-function 'qq-native-set-presence)
                  (lambda (presence callback _errback)
                    (setq called presence)
                    (funcall callback `((presence . ,presence)))
@@ -25,7 +25,7 @@
 
 (ert-deftest qq-presence-custom-keeps-u32-face-id-and-wording ()
   (let (called delivered)
-    (cl-letf (((symbol-function 'qq-backend-set-presence)
+    (cl-letf (((symbol-function 'qq-native-set-presence)
                (lambda (presence callback _errback)
                  (setq called presence)
                  (funcall callback `((presence . ,presence)))
@@ -43,7 +43,7 @@
 
 (ert-deftest qq-presence-rejects-open-or-out-of-range-values-locally ()
   (let ((called nil))
-    (cl-letf (((symbol-function 'qq-backend-set-presence)
+    (cl-letf (((symbol-function 'qq-native-set-presence)
                (lambda (&rest _arguments) (setq called t))))
       (should-error
        (qq-presence-set '((kind . "away") (raw_status . 30)))

@@ -115,14 +115,12 @@ barrier before mutating state or choosing a timeline position."
                ""))))
 
 (defun qq-api-call (action params callback &optional errback)
-  "Call OneBot ACTION with PARAMS and CALLBACK.
+  "Reject the removed v1 OneBot ACTION.
 
-ERRBACK falls back to `qq-api--default-error'."
-  (unless (eq qq-backend 'onebot)
-    (user-error
-     "qq: OneBot action %s is unavailable while backend is %s"
-     action qq-backend))
-  (qq-transport-send action params callback (or errback #'qq-api--default-error)))
+PARAMS, CALLBACK, and ERRBACK remain in the dormant v1 signature only while
+callers are migrated to native operations."
+  (ignore params callback errback)
+  (user-error "qq: OneBot action %s was removed in emacs-qq v2" action))
 
 (defun qq-api--run-request-finalizer (request-token)
   "Run and forget cleanup registered for REQUEST-TOKEN."
@@ -4747,22 +4745,9 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
     (copy-tree record)))
 
 (defun qq-api-handle-event (event)
-  "Handle websocket EVENT emitted by transport."
-  (when (eq qq-backend 'onebot)
-    (pcase (alist-get 'post_type event)
-      ((or "message" "message_sent")
-       (when-let* ((session-key (qq-state-merge-live-message event)))
-         (qq-api--apply-pending-essences session-key)))
-      ("meta_event"
-       (qq-api--handle-meta-event event))
-      ("notice"
-       (qq-api--handle-notice event))
-      ("request"
-       (qq-api--handle-request event))
-      ("emacs_guild_message"
-       (qq-state-merge-guild-message
-        (qq-api--validate-guild-message-event event)))
-      (_ nil))))
+  "Ignore dormant v1 OneBot EVENT in emacs-qq v2."
+  (ignore event)
+  nil)
 
 (defun qq-api--handle-state-reset (event)
   "Clear OneBot essence correlation when state EVENT is a reset."

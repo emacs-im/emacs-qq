@@ -541,7 +541,7 @@ AFTER is an opaque cursor returned by the previous page.  LIMIT defaults to
           (setq qq-gateway-resource--resync-request-id request-id))))))
 
 (defun qq-gateway-resource--handle-event (event data)
-  "Project native Gateway resource EVENT with DATA."
+  "Project native service resource EVENT with DATA."
   (condition-case error-data
       (pcase event
         ("gateway.ready"

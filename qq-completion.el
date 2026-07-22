@@ -16,7 +16,7 @@
 (require 'appkit-chat-completion)
 (require 'appkit-chat-emoji)
 (require 'qq-api)
-(require 'qq-backend)
+(require 'qq-native)
 (require 'qq-media)
 (require 'qq-state)
 
@@ -260,7 +260,7 @@ member model; a later explicit completion command owns presentation."
                               :group-id group-id
                               :query query))
             (puthash query owner qq-completion--member-pending)
-            (qq-backend-search-group-members
+            (qq-native-search-group-members
              group-id query
              (lambda (members)
                (when (buffer-live-p buffer)
@@ -357,7 +357,7 @@ member model; a later explicit completion command owns presentation."
   "Cancel and forget the current buffer's poke-target search."
   (when qq-completion--poke-request
     (when-let* ((token (plist-get qq-completion--poke-request :token)))
-      (qq-backend-cancel-request token)))
+      (qq-native-cancel-request token)))
   (setq qq-completion--poke-request nil))
 
 (defun qq-completion--poke-candidate-user-id (candidate)
@@ -488,7 +488,7 @@ member model; a later explicit completion command owns presentation."
           (string-trim
            (read-string "Search group member: " initial-user-id
                         'qq-completion--poke-search-history))))
-    (unless (qq-api-group-id-p group-id)
+    (unless (qq-native-group-id-p group-id)
       (user-error "qq: group poke requires a canonical group id"))
     (when (string-empty-p query)
       (user-error "qq: group poke requires a non-empty member search"))
@@ -508,7 +508,7 @@ member model; a later explicit completion command owns presentation."
       (setq qq-completion--poke-request owner)
       (condition-case error-data
           (setq token
-                (qq-backend-search-group-members
+                (qq-native-search-group-members
                  group-id query
                  (lambda (members)
                    (qq-completion--group-poke-search-succeeded

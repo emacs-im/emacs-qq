@@ -6,7 +6,7 @@
 
 ;; Versioned request/response/event transport for the native nt-gateway.
 ;; This is deliberately separate from `qq-transport': OneBot echoes and
-;; native Gateway request IDs have different envelopes and lifecycle rules.
+;; native service request IDs have different envelopes and lifecycle rules.
 
 ;;; Code:
 
@@ -20,13 +20,13 @@
   "Native Gateway protocol version implemented by this client.")
 
 (defvar qq-gateway-transport-event-hook nil
-  "Hook called with EVENT and DATA for each native Gateway event.")
+  "Hook called with EVENT and DATA for each native service event.")
 
 (defvar qq-gateway-transport-protocol-error-hook nil
-  "Hook called with one unsolicited native Gateway error body.")
+  "Hook called with one unsolicited native service error body.")
 
 (defvar qq-gateway-transport-state-hook nil
-  "Hook called with the new native Gateway transport state.")
+  "Hook called with the new native service connection state.")
 
 (defvar qq-gateway-transport--ws nil)
 (defvar qq-gateway-transport--connecting nil)
@@ -45,7 +45,7 @@
 (defvar qq-gateway-transport--ready-accounts nil)
 
 (defun qq-gateway-transport-state ()
-  "Return the current native Gateway transport state."
+  "Return the current native service connection state."
   qq-gateway-transport--state)
 
 (defun qq-gateway-transport-gateway-instance-id ()
@@ -61,14 +61,14 @@
   (copy-tree qq-gateway-transport--ready-accounts))
 
 (defun qq-gateway-transport-running-p ()
-  "Return non-nil while the native Gateway transport is active."
+  "Return non-nil while the native service connection is active."
   (or qq-gateway-transport--connecting
       (and qq-gateway-transport--ws
            (websocket-openp qq-gateway-transport--ws))
       (timerp qq-gateway-transport--reconnect-timer)))
 
 (defun qq-gateway-transport-ready-p ()
-  "Return non-nil when native Gateway business requests may be sent."
+  "Return non-nil when native service business requests may be sent."
   (and (eq qq-gateway-transport--state 'ready)
        qq-gateway-transport--ws
        (websocket-openp qq-gateway-transport--ws)))
@@ -87,7 +87,7 @@
    arguments))
 
 (defun qq-gateway-transport--set-state (state)
-  "Publish native Gateway transport STATE when it changes."
+  "Publish native service connection STATE when it changes."
   (unless (eq state qq-gateway-transport--state)
     (setq qq-gateway-transport--state state)
     (qq-gateway-transport--run-hook
@@ -95,7 +95,7 @@
   state)
 
 (defun qq-gateway-transport--next-request-id ()
-  "Return a fresh opaque native Gateway request ID."
+  "Return a fresh opaque native service request ID."
   (format "emacs-qq-%d" (cl-incf qq-gateway-transport--request-counter)))
 
 (defun qq-gateway-transport--json-encode (object)
@@ -106,7 +106,7 @@
     (json-encode object)))
 
 (defun qq-gateway-transport--json-decode (text)
-  "Decode native Gateway JSON TEXT into alists and lists."
+  "Decode native service JSON TEXT into alists and lists."
   (json-parse-string text
                      :object-type 'alist
                      :array-type 'list
@@ -134,12 +134,12 @@
                       (string-lessp (symbol-name left) (symbol-name right)))))))
 
 (defun qq-gateway-transport--read-auth-token ()
-  "Read and validate `qq-gateway-auth-token-file'."
-  (let ((path (and (stringp qq-gateway-auth-token-file)
-                   (expand-file-name qq-gateway-auth-token-file))))
+  "Read and validate `qq-native-auth-token-file'."
+  (let ((path (and (stringp qq-native-auth-token-file)
+                   (expand-file-name qq-native-auth-token-file))))
     (unless (and path (file-regular-p path))
       (user-error "qq: Gateway token file is not a regular file: %s"
-                  (or path qq-gateway-auth-token-file)))
+                  (or path qq-native-auth-token-file)))
     (when (and (memq system-type '(gnu gnu/linux gnu/kfreebsd berkeley-unix
                                    darwin cygwin))
                (let ((mode (file-modes path)))
@@ -191,7 +191,7 @@ REASON is a human-readable failure.  Return non-nil when ID was pending."
     t))
 
 (defun qq-gateway-transport-cancel (id)
-  "Forget pending native Gateway request ID without invoking callbacks."
+  "Forget pending native service request ID without invoking callbacks."
   (when-let* ((entry (gethash id qq-gateway-transport--pending)))
     (remhash id qq-gateway-transport--pending)
     (qq-gateway-transport--cancel-entry-timer entry)
@@ -245,7 +245,7 @@ returns."
           ((eq owned-socket socket))))))
 
 (defun qq-gateway-transport--clear-reconnect-timer ()
-  "Cancel the current native Gateway reconnect timer."
+  "Cancel the current native service reconnect timer."
   (when (timerp qq-gateway-transport--reconnect-timer)
     (cancel-timer qq-gateway-transport--reconnect-timer))
   (setq qq-gateway-transport--reconnect-timer nil))
@@ -267,17 +267,17 @@ returns."
 (defun qq-gateway-transport--start-ready-timer ()
   "Start the current connection's `gateway.ready' deadline."
   (qq-gateway-transport--clear-ready-timer)
-  (when (and (numberp qq-gateway-ready-timeout)
-             (> qq-gateway-ready-timeout 0))
+  (when (and (numberp qq-native-ready-timeout)
+             (> qq-native-ready-timeout 0))
     (let ((owner qq-gateway-transport--connection-owner))
       (setq qq-gateway-transport--ready-timer
-            (run-at-time qq-gateway-ready-timeout nil
+            (run-at-time qq-native-ready-timeout nil
                          #'qq-gateway-transport--ready-timeout owner)))))
 
 (defun qq-gateway-transport--schedule-reconnect ()
-  "Schedule a native Gateway reconnect when policy permits."
+  "Schedule a native service reconnect when policy permits."
   (let ((next-attempt (1+ qq-gateway-transport--reconnect-attempt))
-        (max-attempts qq-gateway-reconnect-max-attempts))
+        (max-attempts qq-native-reconnect-max-attempts))
     (if (and (integerp max-attempts) (> next-attempt max-attempts))
         (progn
           (setq qq-gateway-transport--stopping t)
@@ -287,14 +287,14 @@ returns."
       (setq qq-gateway-transport--reconnect-attempt next-attempt)
       (setq qq-gateway-transport--reconnect-timer
             (run-at-time
-             (max 0.2 (float qq-gateway-reconnect-delay)) nil
+             (max 0.2 (float qq-native-reconnect-delay)) nil
              (lambda ()
                (setq qq-gateway-transport--reconnect-timer nil)
                (unless qq-gateway-transport--stopping
                  (qq-gateway-transport--connect)))))
       (qq-gateway-transport--set-state 'reconnecting)
       (message "qq: reconnecting to Gateway in %.1fs (attempt %d)"
-               (max 0.2 (float qq-gateway-reconnect-delay)) next-attempt))))
+               (max 0.2 (float qq-native-reconnect-delay)) next-attempt))))
 
 (defun qq-gateway-transport--disconnect (&optional reconnect)
   "Disconnect only this Emacs Gateway client.
@@ -392,12 +392,12 @@ FORMAT-STRING and ARGUMENTS describe the violation."
             qq-gateway-transport--reconnect-attempt 0)
       (qq-gateway-transport--clear-ready-timer)
       (qq-gateway-transport--set-state 'ready)
-      (message "qq: native Gateway ready"))
+      (message "qq: native service ready"))
     (qq-gateway-transport--run-hook
      'qq-gateway-transport-event-hook event data)))
 
 (defun qq-gateway-transport--handle-payload (payload)
-  "Validate and dispatch one decoded native Gateway PAYLOAD."
+  "Validate and dispatch one decoded native service PAYLOAD."
   (unless (listp payload)
     (error "Gateway envelope must be an object"))
   (pcase (alist-get 'kind payload)
@@ -420,7 +420,7 @@ FORMAT-STRING and ARGUMENTS describe the violation."
 
 (defun qq-gateway-transport-send
     (method params &optional callback errback allow-before-ready)
-  "Send native Gateway METHOD with PARAMS.
+  "Send native service METHOD with PARAMS.
 
 CALLBACK receives the successful result object.  ERRBACK receives the
 protocol error body (or nil) and a human-readable reason.  Return the opaque
@@ -442,7 +442,7 @@ machinery used only for the initial `gateway.hello' request."
       (setq quit-flag nil)
       (signal 'quit nil))
     (let* ((id (qq-gateway-transport--next-request-id))
-           (timeout qq-gateway-request-timeout)
+           (timeout qq-native-request-timeout)
            timer
            (entry (list :method method :success callback :error errback
                         :timer nil))
@@ -495,7 +495,7 @@ machinery used only for the initial `gateway.hello' request."
           (qq-gateway-transport-send
            "gateway.hello"
            `((protocol_version . ,qq-gateway-transport-protocol-version)
-             (client_name . ,qq-gateway-client-name)
+             (client_name . ,qq-native-client-name)
              (auth_token . ,token))
            (lambda (result)
              (if (and (listp result)
@@ -519,7 +519,7 @@ machinery used only for the initial `gateway.hello' request."
     (clear-string token)))
 
 (defun qq-gateway-transport--connect ()
-  "Open and authenticate the native Gateway websocket when needed."
+  "Open and authenticate the native service websocket when needed."
   (unless (qq-gateway-transport-running-p)
     ;; Resolve credentials before publishing a connecting owner.  A local
     ;; configuration error is terminal until the user calls start again.
@@ -534,7 +534,7 @@ machinery used only for the initial `gateway.hello' request."
             (condition-case socket-error
                 (let ((socket
                        (websocket-open
-                        qq-gateway-websocket-url
+                        qq-native-websocket-url
                         :on-open
                         (lambda (ws)
                           (when (qq-gateway-transport--connection-current-p
@@ -588,7 +588,7 @@ machinery used only for the initial `gateway.hello' request."
                 (error-message-string error-data))))))
 
 (defun qq-gateway-transport-start ()
-  "Start the native Gateway websocket without starting an account runtime."
+  "Start the native service websocket without starting an account runtime."
   (interactive)
   (setq qq-gateway-transport--stopping nil)
   (unless (timerp qq-gateway-transport--reconnect-timer)
@@ -596,12 +596,12 @@ machinery used only for the initial `gateway.hello' request."
   (qq-gateway-transport--connect))
 
 (defun qq-gateway-transport-stop ()
-  "Stop this Emacs websocket without stopping any Gateway account."
+  "Stop this Emacs websocket without stopping any QQ account."
   (interactive)
   (setq qq-gateway-transport--stopping t
         qq-gateway-transport--reconnect-attempt 0)
   (qq-gateway-transport--disconnect nil)
-  (message "qq: native Gateway transport stopped; accounts remain managed"))
+  (message "qq: native service connection stopped; accounts remain managed"))
 
 (provide 'qq-gateway-transport)
 

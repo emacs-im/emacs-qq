@@ -1,4 +1,4 @@
-;;; qq-gateway.el --- Native Gateway account lifecycle client -*- lexical-binding: t; -*-
+;;; qq-gateway.el --- Native QQ account lifecycle client -*- lexical-binding: t; -*-
 
 ;; Author: 0WD0 <wd.1105848296@gmail.com>
 
@@ -18,7 +18,7 @@
 (defconst qq-gateway--account-phases
   '("stopped" "starting" "login_required" "logging_in" "online"
     "reconnecting" "stopping" "logged_out" "failed")
-  "Closed account phase vocabulary for native Gateway protocol v1.")
+  "Closed account phase vocabulary for native service protocol v1.")
 
 (defvar qq-gateway-accounts-changed-hook nil
   "Hook called with REASON and ACCOUNT-ID after the local registry changes.
@@ -57,7 +57,7 @@ ACCOUNT-ID is nil for an authoritative full-registry replacement.")
     (condition-case error-data
         (apply callback arguments)
       (error
-       (message "qq: Gateway account callback failed: %s"
+       (message "qq: QQ account callback failed: %s"
                 (error-message-string error-data))))))
 
 (defun qq-gateway--client-error (errback code format-string &rest arguments)
@@ -113,7 +113,7 @@ The comparison never coerces either protocol value to an Emacs number."
   "Validate and copy a login CHALLENGE, or return nil."
   (when challenge
     (unless (listp challenge)
-      (error "qq: Gateway account challenge must be an object or null"))
+      (error "qq: QQ account challenge must be an object or null"))
     (let ((kind (alist-get 'kind challenge)))
       (pcase kind
         ("captcha"
@@ -134,7 +134,7 @@ The comparison never coerces either protocol value to an Emacs number."
          (unless (qq-gateway--exact-object-keys-p
                   challenge '(kind challenge_id))
            (error "qq: Gateway unusual-device challenge has invalid fields")))
-        (_ (error "qq: Gateway account challenge has unknown kind %S" kind)))
+        (_ (error "qq: QQ account challenge has unknown kind %S" kind)))
       (unless (qq-gateway--non-empty-string-p
                (alist-get 'challenge_id challenge))
         (error "qq: Gateway challenge_id must be a non-empty string"))
@@ -146,7 +146,7 @@ The comparison never coerces either protocol value to an Emacs number."
     (unless (and (qq-gateway--exact-object-keys-p problem '(code message))
                  (qq-gateway--non-empty-string-p (alist-get 'code problem))
                  (qq-gateway--non-empty-string-p (alist-get 'message problem)))
-      (error "qq: Gateway account problem is malformed"))
+      (error "qq: QQ account problem is malformed"))
     (copy-tree problem)))
 
 (defun qq-gateway--validate-account (snapshot)
@@ -154,7 +154,7 @@ The comparison never coerces either protocol value to an Emacs number."
   (unless (qq-gateway--exact-object-keys-p
            snapshot
            '(account_id label phase uin uid generation challenge problem))
-    (error "qq: Gateway account snapshot has invalid fields"))
+    (error "qq: QQ account snapshot has invalid fields"))
   (let ((account-id (alist-get 'account_id snapshot))
         (label (alist-get 'label snapshot nil nil #'eq))
         (phase (alist-get 'phase snapshot))
@@ -162,20 +162,20 @@ The comparison never coerces either protocol value to an Emacs number."
         (uid (alist-get 'uid snapshot nil nil #'eq))
         (generation (alist-get 'generation snapshot)))
     (unless (qq-gateway--non-empty-string-p account-id)
-      (error "qq: Gateway account_id must be a non-empty opaque string"))
+      (error "qq: QQ account_id must be a non-empty opaque string"))
     (unless (or (null label)
                 (and (qq-gateway--non-empty-string-p label)
                      (equal label (string-trim label))
                      (<= (length label) 128)))
-      (error "qq: Gateway account label is invalid"))
+      (error "qq: QQ account label is invalid"))
     (unless (member phase qq-gateway--account-phases)
-      (error "qq: Gateway account phase is invalid"))
+      (error "qq: QQ account phase is invalid"))
     (unless (or (null uin) (qq-gateway--canonical-decimal-p uin))
-      (error "qq: Gateway account UIN must be an exact decimal string or null"))
+      (error "qq: QQ account UIN must be an exact decimal string or null"))
     (unless (or (null uid) (qq-gateway--non-empty-string-p uid))
-      (error "qq: Gateway account UID must be an opaque string or null"))
+      (error "qq: QQ account UID must be an opaque string or null"))
     (unless (qq-gateway--canonical-decimal-p generation t)
-      (error "qq: Gateway account generation must be a decimal string"))
+      (error "qq: QQ account generation must be a decimal string"))
     (qq-gateway--validate-challenge
      (alist-get 'challenge snapshot nil nil #'eq))
     (qq-gateway--validate-problem
@@ -211,7 +211,7 @@ The comparison never coerces either protocol value to an Emacs number."
   "Select ACCOUNT-ID locally and publish an exact selection change."
   (when account-id
     (unless (gethash account-id qq-gateway--accounts)
-      (user-error "qq: Gateway account does not exist: %s" account-id)))
+      (user-error "qq: QQ account does not exist: %s" account-id)))
   (unless (equal account-id qq-gateway--current-account-id)
     (let ((old qq-gateway--current-account-id))
       (setq qq-gateway--current-account-id account-id)
@@ -244,17 +244,17 @@ The comparison never coerces either protocol value to an Emacs number."
             (when-let* ((current (qq-gateway-current-account)))
               (qq-gateway--account-display-name current))))
       (cdr (assoc
-            (completing-read (or prompt "Gateway account: ")
+            (completing-read (or prompt "QQ account: ")
                              choices nil t nil nil default)
             choices)))))
 
 ;;;###autoload
 (defun qq-gateway-account-select (account-id)
   "Select managed ACCOUNT-ID for this Emacs client's chat projection."
-  (interactive (list (qq-gateway--read-account-id "Select Gateway account: ")))
+  (interactive (list (qq-gateway--read-account-id "Select QQ account: ")))
   (qq-gateway--set-current-account account-id)
   (when (called-interactively-p 'interactive)
-    (message "qq: selected Gateway account %s" account-id))
+    (message "qq: selected QQ account %s" account-id))
   account-id)
 
 (defun qq-gateway--maybe-select-single-account ()
@@ -273,7 +273,7 @@ The comparison never coerces either protocol value to an Emacs number."
       (let* ((snapshot (qq-gateway--validate-account raw))
              (account-id (alist-get 'account_id snapshot)))
         (when (gethash account-id next)
-          (error "qq: Duplicate Gateway account ID %s" account-id))
+          (error "qq: Duplicate QQ account ID %s" account-id))
         (puthash account-id snapshot next)
         (push account-id order)))
     (setq qq-gateway--accounts next
@@ -319,10 +319,10 @@ The comparison never coerces either protocol value to an Emacs number."
 (defun qq-gateway--validate-account-list-result (result)
   "Validate and return accounts carried by account.list RESULT."
   (unless (qq-gateway--exact-object-keys-p result '(accounts))
-    (error "qq: Gateway account.list result has invalid fields"))
+    (error "qq: QQ account.list result has invalid fields"))
   (let ((accounts (alist-get 'accounts result nil nil #'eq)))
     (unless (listp accounts)
-      (error "qq: Gateway account.list accounts must be an array"))
+      (error "qq: QQ account.list accounts must be an array"))
     accounts))
 
 (defun qq-gateway--method-available-p (method)
@@ -410,7 +410,7 @@ When REMOVE-P is non-nil, remove the returned snapshot instead of merging it."
 
 ;;;###autoload
 (defun qq-gateway-account-create (label &optional callback errback)
-  "Create a persistent Gateway account slot with optional LABEL.
+  "Create a persistent QQ account slot with optional LABEL.
 
 CALLBACK receives its snapshot; ERRBACK receives a failure body and reason."
   (interactive
@@ -460,7 +460,7 @@ PRESENCE.  The receipt acknowledges the command; it is not an authoritative
 account snapshot."
   (unless (qq-gateway--exact-object-keys-p
            result '(account_id generation presence))
-    (error "qq: Gateway account.set_presence result has invalid fields"))
+    (error "qq: QQ account.set_presence result has invalid fields"))
   (let ((returned-account-id (alist-get 'account_id result))
         (returned-generation (alist-get 'generation result))
         (returned-presence
@@ -491,7 +491,7 @@ or store presence in the local account snapshot."
          presence "account presence" 'user-error))
   (let* ((account
           (or (qq-gateway-account account-id)
-              (user-error "qq: Gateway account does not exist: %s" account-id)))
+              (user-error "qq: QQ account does not exist: %s" account-id)))
          (generation (alist-get 'generation account))
          (owner (cons account-id generation)))
     (qq-gateway--send
@@ -507,7 +507,7 @@ or store presence in the local account snapshot."
                               (and current
                                    (cons account-id
                                          (alist-get 'generation current)))))
-               (error "qq: Gateway account generation changed before presence acknowledgement"))
+               (error "qq: QQ account generation changed before presence acknowledgement"))
              (qq-gateway--invoke callback receipt))
          (error
           (qq-gateway--client-error
@@ -686,7 +686,7 @@ CALLBACK receives the snapshot; ERRBACK receives a failure body and reason."
 CALLBACK receives the snapshot; ERRBACK receives a failure body and reason."
   (interactive
    (let ((account-id (qq-gateway--read-account-id "Log out account: ")))
-     (unless (yes-or-no-p (format "Log Gateway account %s out of QQ? " account-id))
+     (unless (yes-or-no-p (format "Log QQ account %s out of QQ? " account-id))
        (user-error "qq: Account logout cancelled"))
      (list account-id #'qq-gateway--interactive-success
            #'qq-gateway--interactive-error)))
@@ -702,7 +702,7 @@ reason."
   (interactive
    (let ((account-id (qq-gateway--read-account-id "Remove account slot: ")))
      (unless (yes-or-no-p
-              (format "Permanently remove Gateway account slot %s? " account-id))
+              (format "Permanently remove QQ account slot %s? " account-id))
        (user-error "qq: Account removal cancelled"))
      (list account-id #'qq-gateway--interactive-success
            #'qq-gateway--interactive-error)))
@@ -711,7 +711,7 @@ reason."
 
 ;;;###autoload
 (defun qq-gateway-connect ()
-  "Connect to the long-lived native Gateway without starting an account."
+  "Connect to the long-lived native service without starting an account."
   (interactive)
   (qq-gateway-transport-start))
 
@@ -722,7 +722,7 @@ reason."
   (qq-gateway-transport-stop))
 
 (defun qq-gateway--handle-event (event data)
-  "Project native Gateway EVENT with DATA into the account registry."
+  "Project native service EVENT with DATA into the account registry."
   (condition-case error-data
       (pcase event
         ("gateway.ready"
@@ -759,7 +759,7 @@ reason."
             (qq-gateway-refresh-accounts
              nil
              (lambda (_error failure)
-               (message "qq: Gateway account resync failed: %s" failure))
+               (message "qq: QQ account resync failed: %s" failure))
              'resync)))))
 
 (add-hook 'qq-gateway-transport-event-hook #'qq-gateway--handle-event)

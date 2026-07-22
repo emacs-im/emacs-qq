@@ -157,8 +157,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
 (defmacro qq-gateway-message-test-with-state (&rest body)
   "Run BODY with one selected account and isolated message projection state."
   (declare (indent 0) (debug t))
-  `(let ((qq-backend 'gateway)
-         (qq-gateway--accounts (make-hash-table :test #'equal))
+  `(let ((qq-gateway--accounts (make-hash-table :test #'equal))
          (qq-gateway--account-order nil)
          (qq-gateway--current-account-id nil)
          (qq-gateway--gateway-instance-id nil)
