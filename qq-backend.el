@@ -199,8 +199,8 @@ and reason."
   "Send SEGMENTS to SESSION-KEY through the selected backend.
 
 RAW-MESSAGE retains the OneBot optimistic rendering override.  The native
-Gateway accepts closed text, group mention, and reply segments, then promotes
-its pending row from the later authoritative self event."
+Gateway accepts closed text, base face, group mention, and reply segments,
+then promotes its pending row from the later authoritative self event."
   (pcase (qq-backend--validate qq-backend)
     ('onebot
      (qq-api-send-message
@@ -454,7 +454,7 @@ request.  ERRBACK handles failure and COUNT limits the requested page size."
     ('onebot t)
      ('gateway
       (memq capability
-            '(contacts group-members send-text send-message reply mention
+            '(contacts group-members send-text send-message face reply mention
               recall explicit-history)))))
 
 (defun qq-backend--gateway-bootstrap-complete (owner failed-p)

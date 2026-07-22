@@ -147,6 +147,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                . ((target
                    . ((kind . "unresolved")
                       (message_id . "7348923749823749111"))))))
+            '((kind . "face") (payload . ((id . "178"))))
             '((kind . "unsupported")
               (payload
                . ((native_keys . ("text.pb_reserve"))
@@ -179,11 +180,13 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (should (equal (alist-get 'mention-kinds message) '(at-me)))
         (should (eq (alist-get 'status message) 'received))
         (should (equal (mapcar (lambda (it) (alist-get 'type it)) internal)
-                       '("text" "at" "reply" "__unsupported")))
+                       '("text" "at" "reply" "face" "__unsupported")))
         (should
          (equal
           (alist-get 'message_id (alist-get 'data (nth 2 internal)))
           "7348923749823749111"))
+        (should (equal (alist-get 'id (alist-get 'data (nth 3 internal)))
+                       "178"))
         (should (equal (alist-get 'title (qq-state-session session-key))
                        "Protocol Lab"))))))
 
@@ -332,7 +335,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (should (eq (alist-get 'status message) 'sent))
           (should (= (hash-table-count qq-gateway-message--pending-sends) 0)))))))
 
-(ert-deftest qq-gateway-message-send-projects-reply-mention-and-text ()
+(ert-deftest qq-gateway-message-send-projects-closed-rich-segments ()
   (qq-gateway-message-test-with-state
     (let ((now (floor (float-time))) sent-method sent-params)
       (qq-gateway-message--handle-event
@@ -349,6 +352,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                 (data . ((id . "7348923749823749823"))))
                ((type . "at")
                 (data . ((qq . "10001") (name . "Alice"))))
+               ((type . "face") (data . ((id . "178"))))
                ((type . "text") (data . ((text . " hello")))))))
         (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                    (lambda () t))
@@ -389,6 +393,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                    (payload
                     . ((target . ((kind . "user") (uin . "10001")))
                        (display . "Alice"))))
+                  ((kind . "face") (payload . ((id . "178"))))
                   ((kind . "text")
                    (payload . ((text . " hello")))))))))
           (let ((pending
@@ -399,6 +404,25 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
             (should pending)
             (should (equal (alist-get 'segments pending) segments)))
           (should (= (hash-table-count qq-gateway-message--pending-sends) 1)))))))
+
+(ert-deftest qq-gateway-message-send-rejects-non-base-face-before-pending ()
+  (qq-gateway-message-test-with-state
+    (let ((sent nil))
+      (cl-letf (((symbol-function 'qq-gateway-transport-send)
+                 (lambda (&rest _arguments) (setq sent t))))
+        (should-error
+         (qq-gateway-message-send
+          "private:10001"
+          '(((type . "face") (data . ((id . "260"))))))
+         :type 'user-error)
+        (should-not sent)
+        (should-not (qq-state-session-messages "private:10001"))))))
+
+(ert-deftest qq-gateway-message-validator-rejects-non-base-face ()
+  (let ((event
+         (qq-gateway-message-test-event
+          :segments '(((kind . "face") (payload . ((id . "260"))))))))
+    (should-error (qq-gateway-message--validate-message-data event))))
 
 (ert-deftest qq-gateway-message-send-rejects-unresolved-reply-before-pending ()
   (qq-gateway-message-test-with-state
