@@ -715,6 +715,73 @@ receipt."
    "group.set_member_special_title" group-uin target-uin
    'special_title 'title special-title callback errback))
 
+(defun qq-gateway-directory--validate-group-member-kick-receipt
+    (receipt owner group-uin target-uin reject-add-request)
+  "Validate member-kick RECEIPT against its exact request and OWNER."
+  (unless (qq-gateway--exact-object-keys-p
+           receipt
+           '(account_id generation group_uin target_uin reject_add_request))
+    (error "qq: Gateway group-member kick receipt has invalid fields"))
+  (unless (and (equal (alist-get 'account_id receipt) (car owner))
+               (equal (alist-get 'generation receipt) (cdr owner))
+               (equal (alist-get 'group_uin receipt) group-uin)
+               (equal (alist-get 'target_uin receipt) target-uin)
+               (equal (alist-get 'reject_add_request receipt)
+                      reject-add-request))
+    (error "qq: Gateway group-member kick receipt contradicts request"))
+  (copy-tree receipt))
+
+(defun qq-gateway-directory--remove-group-member (group-uin target-uin)
+  "Remove cached TARGET-UIN from GROUP-UIN exactly once.
+
+Return non-nil only when an existing member was removed.  An absent page or
+member is left untouched, and no incomplete directory state is invented."
+  (when-let* ((page (gethash group-uin
+                             qq-gateway-directory--member-pages))
+              (members (alist-get 'members page))
+              (member
+               (seq-find
+                (lambda (candidate)
+                  (equal (alist-get 'user_id candidate) target-uin))
+                members)))
+    (setf (alist-get 'members page nil nil #'eq) (delq member members))
+    (setf (alist-get 'member_count page nil nil #'eq)
+          (max 0 (1- (alist-get 'member_count page))))
+    t))
+
+(defun qq-gateway-directory-kick-group-member
+    (group-uin target-uin reject-add-request &optional callback errback)
+  "Remove TARGET-UIN from GROUP-UIN through the native Gateway."
+  (unless (qq-gateway--canonical-decimal-p group-uin)
+    (user-error "qq: Group kick requires an exact group UIN"))
+  (unless (qq-gateway--canonical-decimal-p target-uin)
+    (user-error "qq: Group kick requires an exact target UIN"))
+  (let* ((owner (or (qq-gateway-current-account-owner)
+                    (user-error "qq: Select a Gateway account first")))
+         (_projection (qq-gateway-message--ensure-projection-owner owner))
+         (wire-reject (if reject-add-request t :false)))
+    (qq-gateway--send
+     "group.kick_member"
+     `((account_id . ,(car owner))
+       (group_uin . ,group-uin)
+       (target_uin . ,target-uin)
+       (reject_add_request . ,wire-reject))
+     (lambda (raw-result)
+       (condition-case error-data
+           (let ((receipt
+                  (qq-gateway-directory--validate-group-member-kick-receipt
+                   raw-result owner group-uin target-uin wire-reject)))
+             (unless (equal owner (qq-gateway-current-account-owner))
+               (error
+                "qq: Gateway account generation changed during group-member kick"))
+             (qq-gateway-directory--remove-group-member group-uin target-uin)
+             (qq-gateway--invoke callback receipt))
+         (error
+          (qq-gateway--client-error
+           errback "invalid_gateway_result" "%s"
+           (error-message-string error-data)))))
+     errback)))
+
 (defun qq-gateway-directory-list-group-members
     (group-uin callback &optional errback refresh)
   "List exact GROUP-UIN members and call CALLBACK with mapped members.

@@ -10,7 +10,7 @@
   '("contact.list_friends" "contact.list_groups"
     "contact.list_group_members" "group.set_name" "group.set_remark"
     "group.set_whole_mute" "group.set_member_card"
-    "group.set_member_special_title")
+    "group.set_member_special_title" "group.kick_member")
   "Native contact capabilities exercised by directory tests.")
 
 (defun qq-gateway-directory-test-account
@@ -385,6 +385,73 @@
                    "request")))
         (qq-gateway-directory-set-group-member-card
          "8209413637" "10002" "Ferris"
+         (lambda (_receipt) (setq success t))
+         (lambda (_body reason) (setq failure reason))))
+      (should-not success)
+      (should (string-match-p "contradicts request" failure)))))
+
+(ert-deftest qq-gateway-directory-kick-removes-cached-member-exactly-once ()
+  (qq-gateway-directory-test-with-state
+    (let (calls receipts)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-directory-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (push (list method params) calls)
+                   (funcall
+                    callback
+                    (if (equal method "contact.list_group_members")
+                        (qq-gateway-directory-test-members-result)
+                      '((account_id . "slot-a") (generation . "7")
+                        (group_uin . "8209413637")
+                        (target_uin . "10002")
+                        (reject_add_request . t))))
+                   method)))
+        (qq-gateway-directory-list-group-members "8209413637" #'ignore)
+        (dotimes (_ 2)
+          (qq-gateway-directory-kick-group-member
+           "8209413637" "10002" t
+           (lambda (receipt) (push receipt receipts)))))
+      (should (= (length receipts) 2))
+      (let ((page (qq-gateway-directory-group-member-page "8209413637")))
+        (should (= (alist-get 'member_count page) 2))
+        (should (= (length (alist-get 'members page)) 2))
+        (should-not
+         (seq-find (lambda (member)
+                     (equal (alist-get 'user_id member) "10002"))
+                   (alist-get 'members page))))
+      (should
+       (equal
+        (nreverse calls)
+        '(("contact.list_group_members"
+           ((account_id . "slot-a") (group_uin . "8209413637")
+            (refresh . :false)))
+          ("group.kick_member"
+           ((account_id . "slot-a") (group_uin . "8209413637")
+            (target_uin . "10002") (reject_add_request . t)))
+          ("group.kick_member"
+           ((account_id . "slot-a") (group_uin . "8209413637")
+            (target_uin . "10002") (reject_add_request . t)))))))))
+
+(ert-deftest qq-gateway-directory-kick-rejects-contradictory-bool ()
+  (qq-gateway-directory-test-with-state
+    (let (success failure)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-directory-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (funcall callback
+                            '((account_id . "slot-a") (generation . "7")
+                              (group_uin . "8209413637")
+                              (target_uin . "10002")
+                              (reject_add_request . t)))
+                   "request")))
+        (qq-gateway-directory-kick-group-member
+         "8209413637" "10002" nil
          (lambda (_receipt) (setq success t))
          (lambda (_body reason) (setq failure reason))))
       (should-not success)

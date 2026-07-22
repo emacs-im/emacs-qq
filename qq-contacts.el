@@ -650,14 +650,14 @@
             'qq-contacts-row-type 'member
             'qq-contacts-object member
             'qq-contacts-item-id user-id)
-      :help-echo "RET: 打开私聊 · C: 修改群名片 · T: 修改专属头衔")
+      :help-echo "RET: 打开私聊 · C: 修改群名片 · T: 修改专属头衔 · K: 移出群聊")
      :indent 2
      :width (or (qq-contacts--entry-width entry) 80)
      :icon-slot-width qq-contacts--icon-slot-width
      :context-width-spec '(0.45 18 42))
     (appkit-ui-make-action-row
      start (point) entry #'qq-contacts--activate-entry
-     :help-echo "RET: 打开私聊 · C: 修改群名片 · T: 修改专属头衔"
+     :help-echo "RET: 打开私聊 · C: 修改群名片 · T: 修改专属头衔 · K: 移出群聊"
      :mouse-face 'highlight)))
 
 (defun qq-contacts--stranger-name (stranger)
@@ -1643,6 +1643,45 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
           "专属头衔已清除"
         "专属头衔已更新")))))
 
+(defun qq-contacts--apply-group-member-kick
+    (buffer member display-name _receipt)
+  "Remove confirmed MEMBER from BUFFER when it still owns that exact row."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and (derived-mode-p 'qq-contacts-mode)
+                 (memq member qq-contacts--search-members))
+        (setq qq-contacts--search-members
+              (delq member qq-contacts--search-members))
+        (qq-contacts--queue-view-sync (qq-contacts--live-current-view))
+        (message "qq: 已将 %s 移出群聊" display-name)))))
+
+(defun qq-contacts-kick-member-at-point (reject-add-request)
+  "Remove the group member at point after an explicit confirmation.
+
+When REJECT-ADD-REQUEST is non-nil, reject a later application from the same
+user as part of the same backend operation."
+  (interactive
+   (let* ((member (qq-contacts--group-member-at-point))
+          (display-name (qq-contacts--member-name member))
+          (user-id (alist-get 'user_id member))
+          (group-name (or (qq-contacts--present-string
+                           (alist-get 'group_name member))
+                          (alist-get 'group_id member))))
+     (unless (yes-or-no-p
+              (format "确认将 %s（QQ %s）移出群聊 %s？ "
+                      display-name user-id group-name))
+       (user-error "qq: 已取消移出群聊"))
+     (list (y-or-n-p "同时拒绝该用户再次申请加群？ "))))
+  (let* ((member (qq-contacts--group-member-at-point))
+         (group-id (alist-get 'group_id member))
+         (user-id (alist-get 'user_id member))
+         (display-name (qq-contacts--member-name member)))
+    (qq-backend-kick-group-member
+     group-id user-id reject-add-request
+     (apply-partially
+      #'qq-contacts--apply-group-member-kick
+      (current-buffer) member display-name))))
+
 (defun qq-contacts--item-positions ()
   "Return ordered buffer positions of actionable directory rows."
   (let ((position (point-min)) positions)
@@ -1820,6 +1859,7 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
     (define-key map (kbd "w") #'qq-contacts-copy-id-at-point)
     (define-key map (kbd "C") #'qq-contacts-set-member-card-at-point)
     (define-key map (kbd "T") #'qq-contacts-set-member-special-title-at-point)
+    (define-key map (kbd "K") #'qq-contacts-kick-member-at-point)
     (define-key map (kbd "t") #'qq-contacts-toggle-category)
     (define-key map (kbd "n") #'qq-contacts-next-item)
     (define-key map (kbd "p") #'qq-contacts-previous-item)

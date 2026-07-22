@@ -3017,7 +3017,10 @@ The authoritative post-state reports UNREAD-COUNT."
        "20001" "10002" "" (lambda (_response) (push 'card callbacks)))
       (qq-api-set-group-member-special-title
        "20001" "10002" "Maintainer"
-       (lambda (_response) (push 'title callbacks))))
+       (lambda (_response) (push 'title callbacks)))
+      (qq-api-kick-group-member
+       "20001" "10002" t
+       (lambda (_response) (push 'kick callbacks))))
     (should
      (equal
       (nreverse calls)
@@ -3031,15 +3034,21 @@ The authoritative post-state reports UNREAD-COUNT."
          ((group_id . "20001") (user_id . "10002") (card . "")))
         ("set_group_special_title"
          ((group_id . "20001") (user_id . "10002")
-          (special_title . "Maintainer"))))))
+          (special_title . "Maintainer")))
+        ("set_group_kick"
+         ((group_id . "20001") (user_id . "10002")
+          (reject_add_request . t))))))
     (should (equal (sort callbacks
                          (lambda (left right)
                            (string< (symbol-name left) (symbol-name right))))
-                   '(card mute name remark title)))
+                   '(card kick mute name remark title)))
     (should-error (qq-api-set-group-name "20001" "") :type 'user-error)
     (should-error (qq-api-set-group-remark 20001 "Work") :type 'user-error)
     (should-error
      (qq-api-set-group-member-card "20001" 10002 "Card")
+     :type 'user-error)
+    (should-error
+     (qq-api-kick-group-member "4294967296" "10002" nil)
      :type 'user-error)))
 
 (ert-deftest qq-api-send-poke-builds-group-request-and-local-notice ()

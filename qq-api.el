@@ -3121,6 +3121,27 @@ An empty SPECIAL-TITLE clears it.  CALLBACK receives the successful response."
        (funcall callback response)))
    (or errback #'qq-api--default-error)))
 
+(defun qq-api-kick-group-member
+    (group-id user-id reject-add-request &optional callback errback)
+  "Remove USER-ID from GROUP-ID through NapCat OneBot.
+
+When REJECT-ADD-REQUEST is non-nil, also reject a later application from the
+same user.  CALLBACK receives the successful response."
+  (unless (qq-api-group-id-p group-id)
+    (user-error "qq: group kick requires a canonical uint32 group UIN"))
+  (unless (qq-api-user-id-p user-id)
+    (user-error "qq: group kick requires a canonical decimal user UIN"))
+  (setq reject-add-request (and reject-add-request t))
+  (qq-api-call
+   "set_group_kick"
+   `((group_id . ,group-id)
+     (user_id . ,user-id)
+     (reject_add_request . ,(if reject-add-request t :false)))
+   (lambda (response)
+     (when callback
+       (funcall callback response)))
+   (or errback #'qq-api--default-error)))
+
 (defun qq-api-get-avatar (user-id callback &optional errback no-cache)
   "Fetch avatar resource for USER-ID and pass it to CALLBACK."
   (qq-api-call
