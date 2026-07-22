@@ -140,6 +140,12 @@
        (unless (and (qq-gateway--exact-object-keys-p payload '(text))
                     (stringp (alist-get 'text payload)))
          (error "qq: Gateway text segment is malformed")))
+      ("face"
+       (let ((id (alist-get 'id payload)))
+         (unless (and (qq-gateway--exact-object-keys-p payload '(id))
+                      (qq-gateway--canonical-decimal-p id t)
+                      (qq-gateway--decimal-less-p id "260"))
+           (error "qq: Gateway base face segment is malformed"))))
       ("at"
        (unless (qq-gateway-message--closed-object-p payload '(qq) '(name))
          (error "qq: Gateway at segment has invalid fields"))
@@ -1122,8 +1128,16 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
                          (qq-gateway--non-empty-string-p
                           (alist-get 'text data)))
               (user-error "qq: Native Gateway text segment is malformed"))
-            `((kind . "text")
+           `((kind . "text")
               (payload . ((text . ,(alist-get 'text data))))))
+           ("face"
+            (let ((id (alist-get 'id data)))
+              (unless (and (qq-gateway--exact-object-keys-p data '(id))
+                           (qq-gateway--canonical-decimal-p id t)
+                           (qq-gateway--decimal-less-p id "260"))
+                (user-error
+                 "qq: Native Gateway base face ID must be between 0 and 259"))
+              `((kind . "face") (payload . ((id . ,id))))))
            ("at"
             (unless group-p
               (user-error "qq: Native Gateway mentions require a group chat"))
@@ -1213,9 +1227,10 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
     (session-key segments &optional raw-message callback errback)
   "Send closed SEGMENTS to native private/group SESSION-KEY.
 
-Supported elements are text, group mention, and reply.  Reply metadata is
-resolved only from an exact message owned by the selected Gateway generation.
-RAW-MESSAGE is an optional optimistic rendering override."
+Supported elements are text, base face (ID 0 through 259), group mention, and
+reply.  Reply metadata is resolved only from an exact message owned by the
+selected Gateway generation.  RAW-MESSAGE is an optional optimistic rendering
+override."
   (let* ((owner (or (qq-gateway-current-account-owner)
                     (user-error "qq: Select a Gateway account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))

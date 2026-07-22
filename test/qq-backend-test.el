@@ -220,6 +220,7 @@
                 (data . ((id . "7348923749823749823"))))
                ((type . "at")
                 (data . ((qq . "10002") (name . "Alice"))))
+               ((type . "face") (data . ((id . "178"))))
                ((type . "text") (data . ((text . "hello")))))))
         (should
          (equal
