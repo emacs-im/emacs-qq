@@ -163,6 +163,11 @@
     (when changed
       (qq-gateway--run-hook 'qq-gateway-resource-changed-hook reason nil))))
 
+(defun qq-gateway-resource-reset ()
+  "Forget the client resource projection without mutating service state."
+  (setq qq-gateway-resource--gateway-instance-id nil)
+  (qq-gateway-resource--clear 'reset))
+
 (defun qq-gateway-resource--replace (snapshots reason)
   "Atomically replace resources with SNAPSHOTS for REASON."
   (unless (listp snapshots)

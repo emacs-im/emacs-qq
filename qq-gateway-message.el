@@ -17,6 +17,7 @@
 (require 'subr-x)
 (require 'qq-customize)
 (require 'qq-gateway)
+(require 'qq-gateway-attachment)
 (require 'qq-protocol)
 (require 'qq-state)
 
@@ -1485,6 +1486,15 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
                      . ((kind . ,(if (equal qq "all") "all" "user"))
                         ,@(unless (equal qq "all") `((uin . ,qq)))))
                     ,@(when name `((display . ,name))))))))
+           ("image"
+            (unless (qq-gateway--exact-object-keys-p data '(attachment_id))
+              (user-error
+               "qq: Native image requires one prepared attachment ID"))
+            (let ((attachment-id (alist-get 'attachment_id data)))
+              (qq-gateway-attachment-assert-sendable
+               attachment-id session-key owner)
+              `((kind . "image")
+                (payload . ((attachment_id . ,attachment-id))))))
            ("reply"
             (cl-incf reply-count)
             (when (> reply-count 1)
@@ -1552,13 +1562,16 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
          (signal (car error-data) (cdr error-data)))))))
 
 (defun qq-gateway-message-send
-    (session-key segments &optional raw-message callback errback)
+    (session-key segments &optional raw-message callback errback
+                 optimistic-segments)
   "Send closed SEGMENTS to native private/group SESSION-KEY.
 
 Supported elements are text, base face (ID 0 through 259), group mention, and
-reply.  Reply metadata is resolved only from an exact message owned by the
-selected Gateway generation.  RAW-MESSAGE is an optional optimistic rendering
-override."
+reply, plus already prepared images.  Reply metadata is resolved only from an
+exact message owned by the selected account generation.  RAW-MESSAGE is an
+optional optimistic rendering override.  OPTIMISTIC-SEGMENTS, when non-nil,
+are stored in the pending row instead of protocol-ready SEGMENTS so local
+image previews never enter the wire request."
   (let* ((owner (or (qq-gateway-current-account-owner)
                     (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
@@ -1566,7 +1579,7 @@ override."
           (qq-gateway-message--outgoing-segments session-key segments owner))
          (conversation (qq-gateway-message--conversation-params session-key)))
     (qq-gateway-message--send-request
-     session-key segments raw-message "message.send"
+     session-key (or optimistic-segments segments) raw-message "message.send"
      `((conversation . ,conversation)
        (segments . ,native-segments))
      callback errback)))
