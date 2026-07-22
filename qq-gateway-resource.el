@@ -37,6 +37,21 @@
        (> (length value) 4)
        (not (string-match-p "[[:space:][:cntrl:]]" value))))
 
+(defun qq-gateway-resource--prefixed-digest-id-p (value prefix)
+  "Return non-nil when VALUE is PREFIX followed by one SHA-256-shaped token."
+  (and (stringp value)
+       (string-prefix-p prefix value)
+       (qq-gateway-resource--hex-digest-p
+        (substring value (length prefix)) 64)))
+
+(defun qq-gateway-resource--import-source-id-p (value)
+  "Return non-nil when VALUE is an opaque LinuxQQ import-source identity."
+  (qq-gateway-resource--prefixed-digest-id-p value "src-linuxqq-"))
+
+(defun qq-gateway-resource--import-candidate-id-p (value)
+  "Return non-nil when VALUE is an opaque LinuxQQ import-candidate identity."
+  (qq-gateway-resource--prefixed-digest-id-p value "imp-linuxqq-"))
+
 (defun qq-gateway-resource--hex-digest-p (value length)
   "Return non-nil when VALUE is a lowercase hexadecimal digest of LENGTH."
   (and (stringp value)
@@ -311,6 +326,161 @@ validated staging snapshot; ERRBACK follows the Gateway convention."
            errback "invalid_gateway_result" "%s"
            (error-message-string error-data)))))
      errback)))
+
+(defun qq-gateway-resource--validate-import-source (source)
+  "Validate and copy one closed native-cache SOURCE snapshot."
+  (unless (qq-gateway--exact-object-keys-p source '(source_id layout kinds))
+    (error "qq: Gateway native-cache source has invalid fields"))
+  (unless (qq-gateway-resource--import-source-id-p
+           (alist-get 'source_id source))
+    (error "qq: Gateway native-cache source identity is malformed"))
+  (unless (equal (alist-get 'layout source) "linuxqq.nt_data.images.v1")
+    (error "qq: Gateway native-cache source layout is unsupported"))
+  (unless (equal (alist-get 'kinds source) '("image"))
+    (error "qq: Gateway native-cache source kinds are unsupported"))
+  (copy-tree source))
+
+(defun qq-gateway-resource--validate-import-candidate (candidate)
+  "Validate and copy one closed native image CANDIDATE snapshot."
+  (unless (qq-gateway--exact-object-keys-p
+           candidate
+           '(candidate_id layout family month suggested_name size expected_md5))
+    (error "qq: Gateway native image candidate has invalid fields"))
+  (unless (qq-gateway-resource--import-candidate-id-p
+           (alist-get 'candidate_id candidate))
+    (error "qq: Gateway native image candidate identity is malformed"))
+  (unless (equal (alist-get 'layout candidate) "linuxqq.nt_data.images.v1")
+    (error "qq: Gateway native image candidate layout is unsupported"))
+  (unless (member (alist-get 'family candidate)
+                  '("picture" "received_emoji"))
+    (error "qq: Gateway native image candidate family is unsupported"))
+  (unless (string-match-p
+           "\\`[0-9]\\{4\\}-\\(?:0[1-9]\\|1[0-2]\\)\\'"
+           (alist-get 'month candidate))
+    (error "qq: Gateway native image candidate month is malformed"))
+  (unless (qq-gateway-resource--safe-name-p
+           (alist-get 'suggested_name candidate))
+    (error "qq: Gateway native image candidate name is unsafe"))
+  (unless (qq-gateway--canonical-decimal-p (alist-get 'size candidate))
+    (error "qq: Gateway native image candidate size is malformed"))
+  (unless (qq-gateway-resource--hex-digest-p
+           (alist-get 'expected_md5 candidate) 32)
+    (error "qq: Gateway native image candidate MD5 is malformed"))
+  (copy-tree candidate))
+
+(defun qq-gateway-resource-import-sources (&optional callback errback)
+  "List configured read-only native-cache sources.
+
+CALLBACK receives closed, pathless source snapshots."
+  (qq-gateway--send
+   "resource.import.list_sources" nil
+   (lambda (result)
+     (condition-case error-data
+         (progn
+           (unless (qq-gateway--exact-object-keys-p result '(sources))
+             (error "qq: Gateway native-cache source result has invalid fields"))
+           (let ((sources (alist-get 'sources result))
+                 seen validated)
+             (unless (listp sources)
+               (error "qq: Gateway native-cache sources must be an array"))
+             (dolist (source sources)
+               (let* ((source (qq-gateway-resource--validate-import-source source))
+                      (source-id (alist-get 'source_id source)))
+                 (when (member source-id seen)
+                   (error "qq: Gateway native-cache sources contain duplicates"))
+                 (push source-id seen)
+                 (push source validated)))
+             (qq-gateway--invoke callback (nreverse validated))))
+       (error
+        (qq-gateway--client-error
+         errback "invalid_gateway_result" "%s"
+         (error-message-string error-data)))))
+   errback))
+
+(defun qq-gateway-resource-import-images
+    (source-id &optional after limit callback errback)
+  "List one page of image candidates from native SOURCE-ID.
+
+AFTER is an opaque cursor returned by the previous page.  LIMIT defaults to
+100 and must be between 1 and 1000.  CALLBACK receives the validated page."
+  (unless (qq-gateway-resource--import-source-id-p source-id)
+    (user-error "qq: Native-cache source ID is malformed"))
+  (when (and after
+             (not (qq-gateway-resource--import-candidate-id-p after)))
+    (user-error "qq: Native-cache image cursor is malformed"))
+  (setq limit (or limit 100))
+  (unless (and (integerp limit) (<= 1 limit 1000))
+    (user-error "qq: Native-cache image page size must be between 1 and 1000"))
+  (qq-gateway--send
+   "resource.import.list_images"
+   `((source_id . ,source-id) (after . ,after) (limit . ,limit))
+   (lambda (result)
+     (condition-case error-data
+         (progn
+           (unless (qq-gateway--exact-object-keys-p
+                    result '(source_id candidates next))
+             (error "qq: Gateway native image page has invalid fields"))
+           (unless (equal (alist-get 'source_id result) source-id)
+             (error "qq: Gateway native image page contradicts its source"))
+           (let ((candidates (alist-get 'candidates result))
+                 (next (alist-get 'next result))
+                 seen validated)
+             (unless (listp candidates)
+               (error "qq: Gateway native image candidates must be an array"))
+             (when (and next
+                        (not (qq-gateway-resource--import-candidate-id-p next)))
+               (error "qq: Gateway native image next cursor is malformed"))
+             (dolist (candidate candidates)
+               (let* ((candidate
+                       (qq-gateway-resource--validate-import-candidate candidate))
+                      (candidate-id (alist-get 'candidate_id candidate)))
+                 (when (member candidate-id seen)
+                   (error "qq: Gateway native image page contains duplicates"))
+                 (push candidate-id seen)
+                 (push candidate validated)))
+             (qq-gateway--invoke
+              callback
+              `((source_id . ,source-id)
+                (candidates . ,(nreverse validated))
+                (next . ,next)))))
+       (error
+        (qq-gateway--client-error
+         errback "invalid_gateway_result" "%s"
+         (error-message-string error-data)))))
+   errback))
+
+(defun qq-gateway-resource-import-image
+    (source-id candidate-id &optional callback errback)
+  "Stage native image CANDIDATE-ID from SOURCE-ID into Resource Store."
+  (unless (qq-gateway-resource--import-source-id-p source-id)
+    (user-error "qq: Native-cache source ID is malformed"))
+  (unless (qq-gateway-resource--import-candidate-id-p candidate-id)
+    (user-error "qq: Native-cache image candidate ID is malformed"))
+  (qq-gateway--send
+   "resource.import.stage_image"
+   `((source_id . ,source-id) (candidate_id . ,candidate-id))
+   (lambda (result)
+     (condition-case error-data
+         (progn
+           (unless (qq-gateway--exact-object-keys-p
+                    result '(source_id candidate_id resource))
+             (error "qq: Gateway native image stage result has invalid fields"))
+           (unless (and (equal (alist-get 'source_id result) source-id)
+                        (equal (alist-get 'candidate_id result) candidate-id))
+             (error "qq: Gateway native image stage identity contradicts request"))
+           (let ((snapshot
+                  (qq-gateway-resource--validate-snapshot
+                   (alist-get 'resource result))))
+             (unless (equal (alist-get 'phase snapshot) "staging")
+               (error "qq: Gateway native image stage response is not staging"))
+             (setq snapshot
+                   (qq-gateway-resource--upsert snapshot 'native-import-response))
+             (qq-gateway--invoke callback snapshot)))
+       (error
+        (qq-gateway--client-error
+         errback "invalid_gateway_result" "%s"
+         (error-message-string error-data)))))
+   errback))
 
 (defun qq-gateway-resource-status
     (resource-id &optional callback errback)
