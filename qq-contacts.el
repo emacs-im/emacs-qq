@@ -619,11 +619,13 @@
   "Return secondary line text for native group MEMBER."
   (let ((card (qq-contacts--present-string (alist-get 'card member)))
         (remark (qq-contacts--present-string (alist-get 'remark member)))
-        (nickname (qq-contacts--present-string (alist-get 'nickname member))))
+        (nickname (qq-contacts--present-string (alist-get 'nickname member)))
+        (title (qq-contacts--present-string (alist-get 'title member))))
     (string-join
      (delq nil
            (list (and nickname (not (equal nickname card)) nickname)
                  (and remark (not (member remark (list card nickname))) remark)
+                 (and title (format "头衔 %s" title))
                  (format "QQ %s" (alist-get 'user_id member))
                  (and (eq (alist-get 'is_friend member) t) "好友")))
      " · ")))
@@ -648,14 +650,14 @@
             'qq-contacts-row-type 'member
             'qq-contacts-object member
             'qq-contacts-item-id user-id)
-      :help-echo "mouse-1 or RET: 打开私聊")
+      :help-echo "RET: 打开私聊 · C: 修改群名片 · T: 修改专属头衔")
      :indent 2
      :width (or (qq-contacts--entry-width entry) 80)
      :icon-slot-width qq-contacts--icon-slot-width
      :context-width-spec '(0.45 18 42))
     (appkit-ui-make-action-row
      start (point) entry #'qq-contacts--activate-entry
-     :help-echo "mouse-1 or RET: 打开私聊"
+     :help-echo "RET: 打开私聊 · C: 修改群名片 · T: 修改专属头衔"
      :mouse-face 'highlight)))
 
 (defun qq-contacts--stranger-name (stranger)
@@ -1436,8 +1438,8 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
   (interactive
    (list (read-string "群号: ")
          (read-string "搜索群成员: " nil 'qq-contacts-search-history)))
-  (unless (qq-api-group-id-p group-id)
-    (user-error "qq: group member search requires a canonical uint32 group UIN"))
+  (unless (qq-backend-group-id-p group-id)
+    (user-error "qq: group member search requires an exact backend group id"))
   (setq query (string-trim (or query "")))
   (when (string-empty-p query)
     (user-error "qq: group member search query cannot be empty"))
@@ -1588,6 +1590,58 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
     (user-error "qq: point is not on a global QQ user result"))
   (qq-user-open-search-result (qq-contacts--object-at-point))
   (qq-user-add-friend))
+
+(defun qq-contacts--group-member-at-point ()
+  "Return the exact group member at point, or signal a user error."
+  (unless (eq (qq-contacts--line-property 'qq-contacts-row-type) 'member)
+    (user-error "qq: point is not on a group member"))
+  (qq-contacts--object-at-point))
+
+(defun qq-contacts--apply-group-member-setting
+    (buffer member field value message-text _receipt)
+  "Apply confirmed FIELD VALUE to MEMBER when BUFFER still owns it."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and (derived-mode-p 'qq-contacts-mode)
+                 (memq member qq-contacts--search-members))
+        (setf (alist-get field member nil nil #'eq)
+              (and (not (string-empty-p value)) value))
+        (qq-contacts--queue-view-sync (qq-contacts--live-current-view))
+        (message "qq: %s" message-text)))))
+
+(defun qq-contacts-set-member-card-at-point (card)
+  "Set or clear the group member CARD at point."
+  (interactive
+   (let ((member (qq-contacts--group-member-at-point)))
+     (list (read-string "群名片（留空清除）: "
+                        (or (alist-get 'card member) "")))))
+  (let* ((member (qq-contacts--group-member-at-point))
+         (group-id (alist-get 'group_id member))
+         (user-id (alist-get 'user_id member)))
+    (qq-backend-set-group-member-card
+     group-id user-id card
+     (apply-partially
+      #'qq-contacts--apply-group-member-setting
+      (current-buffer) member 'card card
+      (if (string-empty-p card) "群名片已清除" "群名片已更新")))))
+
+(defun qq-contacts-set-member-special-title-at-point (special-title)
+  "Set or clear the group member SPECIAL-TITLE at point."
+  (interactive
+   (let ((member (qq-contacts--group-member-at-point)))
+     (list (read-string "专属头衔（留空清除）: "
+                        (or (alist-get 'title member) "")))))
+  (let* ((member (qq-contacts--group-member-at-point))
+         (group-id (alist-get 'group_id member))
+         (user-id (alist-get 'user_id member)))
+    (qq-backend-set-group-member-special-title
+     group-id user-id special-title
+     (apply-partially
+      #'qq-contacts--apply-group-member-setting
+      (current-buffer) member 'title special-title
+      (if (string-empty-p special-title)
+          "专属头衔已清除"
+        "专属头衔已更新")))))
 
 (defun qq-contacts--item-positions ()
   "Return ordered buffer positions of actionable directory rows."
@@ -1764,6 +1818,8 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
     (define-key map (kbd "+") #'qq-contacts-add-friend-at-point)
     (define-key map (kbd "a") #'qq-contacts-open-avatar-at-point)
     (define-key map (kbd "w") #'qq-contacts-copy-id-at-point)
+    (define-key map (kbd "C") #'qq-contacts-set-member-card-at-point)
+    (define-key map (kbd "T") #'qq-contacts-set-member-special-title-at-point)
     (define-key map (kbd "t") #'qq-contacts-toggle-category)
     (define-key map (kbd "n") #'qq-contacts-next-item)
     (define-key map (kbd "p") #'qq-contacts-previous-item)

@@ -266,6 +266,46 @@
                     (mute "8209413637" t)))))
       (qq-state-reset))))
 
+(ert-deftest qq-backend-group-member-settings-route-wide-native-identities ()
+  (let ((qq-backend 'gateway) calls callbacks)
+    (cl-letf
+        (((symbol-function 'qq-gateway-directory-set-group-member-card)
+          (lambda (group-id user-id value callback &optional _errback)
+            (push (list 'card group-id user-id value) calls)
+            (funcall callback '((card . "Ferris")))
+            "card-request"))
+         ((symbol-function
+           'qq-gateway-directory-set-group-member-special-title)
+          (lambda (group-id user-id value callback &optional _errback)
+            (push (list 'title group-id user-id value) calls)
+            (funcall callback '((special_title . "Maintainer")))
+            "title-request")))
+      (let ((card-request
+             (qq-backend-set-group-member-card
+              "8209413637" "9007199254741001" "Ferris"
+              (lambda (_receipt) (push 'card callbacks))))
+            (title-request
+             (qq-backend-set-group-member-special-title
+              "8209413637" "9007199254741001" "Maintainer"
+              (lambda (_receipt) (push 'title callbacks)))))
+        (should (equal (qq-backend-request-token card-request)
+                       "card-request"))
+        (should (equal (qq-backend-request-token title-request)
+                       "title-request"))))
+    (should (equal (nreverse calls)
+                   '((card "8209413637" "9007199254741001" "Ferris")
+                     (title "8209413637" "9007199254741001"
+                            "Maintainer"))))
+    (should (equal (sort callbacks
+                         (lambda (left right)
+                           (string< (symbol-name left) (symbol-name right))))
+                   '(card title)))
+    (should (qq-backend-group-id-p "8209413637"))
+    (should (qq-backend-user-id-p "9007199254741001")))
+  (let ((qq-backend 'onebot))
+    (should-not (qq-backend-group-id-p "8209413637"))
+    (should (qq-backend-user-id-p "9007199254741001"))))
+
 (ert-deftest qq-backend-gateway-member-search-filters-cached-exact-ids ()
   (let ((qq-backend 'gateway) result fetched)
     (cl-letf (((symbol-function 'qq-gateway-directory-group-member-page)

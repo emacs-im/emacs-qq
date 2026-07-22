@@ -80,6 +80,15 @@ the native Gateway carries Lagrange's wider decimal group UIN as a string."
     ('onebot (qq-api-group-id-p value))
     ('gateway (qq-gateway--canonical-decimal-p value))))
 
+(defun qq-backend-user-id-p (value)
+  "Return non-nil when VALUE is an exact user UIN for the selected backend.
+
+Both backends carry user UINs as decimal strings; unlike NapCat group codes,
+the OneBot user-id boundary is not artificially narrowed to uint32."
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot (qq-api-user-id-p value))
+    ('gateway (qq-gateway--canonical-decimal-p value))))
+
 (defun qq-backend-connect ()
   "Connect the selected backend without changing remote account lifecycle."
   (qq-backend-activate)
@@ -334,6 +343,50 @@ and reason."
       'gateway
       (qq-gateway-directory-set-group-whole-mute
        group-id enabled callback
+       (or errback #'qq-backend--default-gateway-error))))))
+
+(defun qq-backend-set-group-member-card
+    (group-id user-id card &optional callback errback)
+  "Set or clear USER-ID's CARD in GROUP-ID through the selected backend."
+  (unless (qq-backend-group-id-p group-id)
+    (user-error "qq: Group member card requires an exact backend group id"))
+  (unless (qq-backend-user-id-p user-id)
+    (user-error "qq: Group member card requires an exact backend user id"))
+  (unless (stringp card)
+    (user-error "qq: Group member card must be a string"))
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot
+     (qq-backend--wrap-request
+      'onebot
+      (qq-api-set-group-member-card
+       group-id user-id card callback errback)))
+    ('gateway
+     (qq-backend--wrap-request
+      'gateway
+      (qq-gateway-directory-set-group-member-card
+       group-id user-id card callback
+       (or errback #'qq-backend--default-gateway-error))))))
+
+(defun qq-backend-set-group-member-special-title
+    (group-id user-id special-title &optional callback errback)
+  "Set or clear USER-ID's SPECIAL-TITLE in GROUP-ID through the backend."
+  (unless (qq-backend-group-id-p group-id)
+    (user-error "qq: Special title requires an exact backend group id"))
+  (unless (qq-backend-user-id-p user-id)
+    (user-error "qq: Special title requires an exact backend user id"))
+  (unless (stringp special-title)
+    (user-error "qq: Special title must be a string"))
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot
+     (qq-backend--wrap-request
+      'onebot
+      (qq-api-set-group-member-special-title
+       group-id user-id special-title callback errback)))
+    ('gateway
+     (qq-backend--wrap-request
+      'gateway
+      (qq-gateway-directory-set-group-member-special-title
+       group-id user-id special-title callback
        (or errback #'qq-backend--default-gateway-error))))))
 
 (defun qq-backend-send-message
@@ -674,8 +727,9 @@ request.  ERRBACK handles failure and COUNT limits the requested page size."
     ('onebot t)
      ('gateway
       (memq capability
-            '(contacts group-members send-text send-message face reply mention
-              poke recall explicit-history)))))
+            '(contacts group-members group-settings group-member-settings
+              send-text send-message face reply mention poke recall
+              explicit-history)))))
 
 (defun qq-backend--gateway-bootstrap-complete (owner failed-p)
   "Complete one Gateway bootstrap part for OWNER, recording FAILED-P."

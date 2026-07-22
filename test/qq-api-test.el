@@ -3012,7 +3012,12 @@ The authoritative post-state reports UNREAD-COUNT."
       (qq-api-set-group-remark
        "20001" "Work" (lambda (_response) (push 'remark callbacks)))
       (qq-api-set-group-whole-mute
-       "20001" nil (lambda (_response) (push 'mute callbacks))))
+       "20001" nil (lambda (_response) (push 'mute callbacks)))
+      (qq-api-set-group-member-card
+       "20001" "10002" "" (lambda (_response) (push 'card callbacks)))
+      (qq-api-set-group-member-special-title
+       "20001" "10002" "Maintainer"
+       (lambda (_response) (push 'title callbacks))))
     (should
      (equal
       (nreverse calls)
@@ -3021,13 +3026,21 @@ The authoritative post-state reports UNREAD-COUNT."
         ("set_group_remark"
          ((group_id . "20001") (remark . "Work")))
         ("set_group_whole_ban"
-         ((group_id . "20001") (enable . :false))))))
+         ((group_id . "20001") (enable . :false)))
+        ("set_group_card"
+         ((group_id . "20001") (user_id . "10002") (card . "")))
+        ("set_group_special_title"
+         ((group_id . "20001") (user_id . "10002")
+          (special_title . "Maintainer"))))))
     (should (equal (sort callbacks
                          (lambda (left right)
                            (string< (symbol-name left) (symbol-name right))))
-                   '(mute name remark)))
+                   '(card mute name remark title)))
     (should-error (qq-api-set-group-name "20001" "") :type 'user-error)
-    (should-error (qq-api-set-group-remark 20001 "Work") :type 'user-error)))
+    (should-error (qq-api-set-group-remark 20001 "Work") :type 'user-error)
+    (should-error
+     (qq-api-set-group-member-card "20001" 10002 "Card")
+     :type 'user-error)))
 
 (ert-deftest qq-api-send-poke-builds-group-request-and-local-notice ()
   (let (captured-action captured-params applied)
