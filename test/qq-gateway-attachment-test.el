@@ -1,4 +1,4 @@
-;;; qq-gateway-attachment-test.el --- Tests for prepared images -*- lexical-binding: t; -*-
+;;; qq-gateway-attachment-test.el --- Tests for prepared attachments -*- lexical-binding: t; -*-
 
 ;;; Code:
 
@@ -8,6 +8,9 @@
 
 (defconst qq-gateway-attachment-test-id
   "att-11111111-2222-4333-8444-555555555555")
+
+(defconst qq-gateway-attachment-test-record-id
+  "att-11111111-2222-4333-8444-555555555556")
 
 (cl-defun qq-gateway-attachment-test-snapshot
     (&key
@@ -44,6 +47,14 @@
   (qq-gateway-attachment-test-snapshot
    :attachment-id (or attachment-id qq-gateway-attachment-test-id)
    :resource-id (or resource-id "res-image-a")
+   :phase "ready" :fast-path t :updated-at 1784700001))
+
+(defun qq-gateway-attachment-test-ready-record ()
+  "Return one fast-path ready native-record fixture."
+  (qq-gateway-attachment-test-snapshot
+   :attachment-id qq-gateway-attachment-test-record-id
+   :resource-id "res-record-a"
+   :use '((kind . "record"))
    :phase "ready" :fast-path t :updated-at 1784700001))
 
 (defun qq-gateway-attachment-test-account ()
@@ -89,7 +100,12 @@
     (should-error (qq-gateway-attachment--validate-snapshot snapshot))
     (setq snapshot (qq-gateway-attachment-test-ready))
     (setf (alist-get 'generation snapshot) 7)
-    (should-error (qq-gateway-attachment--validate-snapshot snapshot))))
+    (should-error (qq-gateway-attachment--validate-snapshot snapshot)))
+  (let ((record (qq-gateway-attachment-test-ready-record)))
+    (should (qq-gateway-attachment--validate-snapshot record))
+    (setf (alist-get 'use record)
+          '((kind . "record") (summary . "must-not-exist")))
+    (should-error (qq-gateway-attachment--validate-snapshot record))))
 
 (ert-deftest qq-gateway-attachment-validator-rejects-phase-contradictions ()
   (let ((ready (qq-gateway-attachment-test-ready))
@@ -168,6 +184,37 @@
                        '((kind . "group") (group_uin . "8209413637"))))
         (should (equal (alist-get 'generation delivered) "7"))))))
 
+(ert-deftest qq-gateway-attachment-prepare-record-sends-only-closed-use ()
+  (qq-gateway-attachment-test-with-state
+    (puthash "res-record-a"
+             '((resource_id . "res-record-a") (phase . "ready"))
+             qq-gateway-resource--resources)
+    (let (method params delivered)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p) (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () '("attachment.prepare")))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (wire-method wire-params success _failure
+                                      &optional _early)
+                   (setq method wire-method params wire-params)
+                   (funcall
+                    success
+                    `((attachment
+                       . ,(qq-gateway-attachment-test-snapshot
+                           :attachment-id qq-gateway-attachment-test-record-id
+                           :resource-id "res-record-a"
+                           :use '((kind . "record"))))))
+                   "prepare-record-request")))
+        (should
+         (equal
+          (qq-gateway-attachment-prepare-record
+           "group:8209413637" "res-record-a"
+           (lambda (snapshot) (setq delivered snapshot)))
+          "prepare-record-request"))
+        (should (equal method "attachment.prepare"))
+        (should (equal (alist-get 'use params) '((kind . "record"))))
+        (should (equal (alist-get 'use delivered) '((kind . "record"))))))))
+
 (ert-deftest qq-gateway-attachment-sendable-checks-owner-and-conversation ()
   (qq-gateway-attachment-test-with-state
     (qq-gateway-attachment--upsert
@@ -184,6 +231,19 @@
     (should-error
      (qq-gateway-attachment-assert-sendable
       qq-gateway-attachment-test-id "group:10001" '("slot-a" . "7"))
+     :type 'user-error)
+    (qq-gateway-attachment--upsert
+     (qq-gateway-attachment-test-ready-record) 'ready-record)
+    (should
+     (equal
+      (qq-gateway-attachment-assert-sendable
+       qq-gateway-attachment-test-record-id
+       "group:8209413637" '("slot-a" . "7") "record")
+      qq-gateway-attachment-test-record-id))
+    (should-error
+     (qq-gateway-attachment-assert-sendable
+      qq-gateway-attachment-test-record-id
+      "group:8209413637" '("slot-a" . "7"))
      :type 'user-error)))
 
 (ert-deftest qq-gateway-attachment-await-observer-is-explicitly-cancellable ()

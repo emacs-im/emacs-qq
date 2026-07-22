@@ -1495,6 +1495,15 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
                attachment-id session-key owner)
               `((kind . "image")
                 (payload . ((attachment_id . ,attachment-id))))))
+           ("record"
+            (unless (qq-gateway--exact-object-keys-p data '(attachment_id))
+              (user-error
+               "qq: Native record requires one prepared attachment ID"))
+            (let ((attachment-id (alist-get 'attachment_id data)))
+              (qq-gateway-attachment-assert-sendable
+               attachment-id session-key owner "record")
+              `((kind . "record")
+                (payload . ((attachment_id . ,attachment-id))))))
            ("reply"
             (cl-incf reply-count)
             (when (> reply-count 1)
@@ -1566,12 +1575,12 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
                  optimistic-segments)
   "Send closed SEGMENTS to native private/group SESSION-KEY.
 
-Supported elements are text, base face (ID 0 through 259), group mention, and
-reply, plus already prepared images.  Reply metadata is resolved only from an
-exact message owned by the selected account generation.  RAW-MESSAGE is an
-optional optimistic rendering override.  OPTIMISTIC-SEGMENTS, when non-nil,
-are stored in the pending row instead of protocol-ready SEGMENTS so local
-image previews never enter the wire request."
+Supported elements are text, base face (ID 0 through 259), group mention,
+reply, and already prepared image/record attachments.  Reply metadata is
+resolved only from an exact message owned by the selected account generation.
+RAW-MESSAGE is an optional optimistic rendering override.
+OPTIMISTIC-SEGMENTS, when non-nil, are stored in the pending row instead of
+protocol-ready SEGMENTS so local media previews never enter the wire request."
   (let* ((owner (or (qq-gateway-current-account-owner)
                     (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
