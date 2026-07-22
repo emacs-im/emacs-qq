@@ -1262,6 +1262,74 @@ marked failed.  The later exact self `message.received' event promotes it."
      (text . ,text))
    callback errback))
 
+(defun qq-gateway-message--validate-poke-receipt (receipt owner target-uin)
+  "Validate poke RECEIPT for exact OWNER and TARGET-UIN."
+  (unless (qq-gateway--exact-object-keys-p
+           receipt '(account_id generation target_uin))
+    (error "qq: Gateway poke receipt has invalid fields"))
+  (unless (and (equal (alist-get 'account_id receipt) (car owner))
+               (equal (alist-get 'generation receipt) (cdr owner))
+               (equal (alist-get 'target_uin receipt) target-uin)
+               (qq-gateway--canonical-decimal-p
+                (alist-get 'target_uin receipt)))
+    (error "qq: Gateway poke receipt contradicts request"))
+  (copy-tree receipt))
+
+(defun qq-gateway-message-send-poke
+    (session-key target-uin &optional callback errback)
+  "Poke exact TARGET-UIN in native private/group SESSION-KEY.
+
+CALLBACK receives an account/generation-scoped acknowledgement.  QQ's empty
+OIDB response carries no message identity or server timestamp, so the local
+gray-tip row remains explicitly optimistic until a later native event can
+replace it."
+  (let* ((session (or (qq-state-session session-key)
+                      (user-error "qq: Poke requires an existing session")))
+         (kind (alist-get 'type session))
+         (peer-uin (alist-get 'target-id session))
+         (owner (or (qq-gateway-current-account-owner)
+                    (user-error "qq: Select a Gateway account first")))
+         (_owner (qq-gateway-message--ensure-projection-owner owner)))
+    (unless (and (memq kind '(private group))
+                 (qq-gateway--canonical-decimal-p peer-uin))
+      (user-error "qq: Native Gateway poke requires a private/group UIN"))
+    (unless (qq-gateway--canonical-decimal-p target-uin)
+      (user-error "qq: Native Gateway poke target must be an exact UIN"))
+    (qq-gateway--send
+     "message.poke"
+     `((account_id . ,(car owner))
+       (conversation
+        . ((kind . ,(symbol-name kind))
+           (,(if (eq kind 'group) 'group_uin 'peer_uin) . ,peer-uin)))
+       (target_uin . ,target-uin))
+     (lambda (raw-result)
+       (condition-case error-data
+           (let ((receipt
+                  (qq-gateway-message--validate-poke-receipt
+                   raw-result owner target-uin)))
+             (unless (equal owner (qq-gateway-current-account-owner))
+               (error "qq: Gateway account generation changed during poke"))
+             (when-let* ((self-id (qq-state-self-user-id)))
+               (qq-state-apply-poke-notice
+                `((time . ,(truncate (float-time)))
+                  (emacs_local_p . t)
+                  (post_type . "notice")
+                  (notice_type . "notify")
+                  (sub_type . "poke")
+                  ,@(if (eq kind 'group)
+                        `((group_id . ,peer-uin)
+                          (user_id . ,self-id)
+                          (target_id . ,target-uin))
+                      `((user_id . ,peer-uin)
+                        (sender_id . ,self-id)
+                        (target_id . ,target-uin))))))
+             (qq-gateway--invoke callback receipt))
+         (error
+          (qq-gateway--client-error
+           errback "invalid_gateway_result" "%s"
+           (error-message-string error-data)))))
+     errback)))
+
 (defun qq-gateway-message--validate-recall-receipt
     (receipt owner message-id sequence)
   "Validate recall RECEIPT for OWNER, MESSAGE-ID, and SEQUENCE."

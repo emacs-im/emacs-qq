@@ -7,7 +7,8 @@
 (require 'qq-gateway-message)
 
 (defconst qq-gateway-message-test-capabilities
-  '("message.send" "message.send_text" "message.recall" "message.get_history")
+  '("message.send" "message.send_text" "message.poke" "message.recall"
+    "message.get_history")
   "Native Gateway capabilities exercised by message tests.")
 
 (defun qq-gateway-message-test-account
@@ -438,6 +439,46 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
          :type 'user-error)
         (should-not sent)
         (should-not (qq-state-session-messages "private:10001"))))))
+
+(ert-deftest qq-gateway-message-poke-uses-exact-uin-and-local-gray-tip ()
+  (qq-gateway-message-test-with-state
+    (qq-state-upsert-session
+     "group:8209413637"
+     '((type . group) (target-id . "8209413637") (title . "Protocol Lab")))
+    (let (sent-method sent-params applied callback-result)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall callback
+                            '((account_id . "slot-a")
+                              (generation . "7")
+                              (target_uin . "9007199254741001")))
+                   "request-poke"))
+                ((symbol-function 'qq-state-apply-poke-notice)
+                 (lambda (notice) (setq applied notice))))
+        (should
+         (equal
+          (qq-gateway-message-send-poke
+           "group:8209413637" "9007199254741001"
+           (lambda (result) (setq callback-result result)))
+          "request-poke"))
+        (should (equal sent-method "message.poke"))
+        (should
+         (equal sent-params
+                '((account_id . "slot-a")
+                  (conversation
+                   . ((kind . "group") (group_uin . "8209413637")))
+                  (target_uin . "9007199254741001"))))
+        (should (equal (alist-get 'target_id applied)
+                       "9007199254741001"))
+        (should (equal (alist-get 'group_id applied) "8209413637"))
+        (should (equal (alist-get 'user_id applied) "10002"))
+        (should (equal (alist-get 'target_uin callback-result)
+                       "9007199254741001"))))))
 
 (ert-deftest qq-gateway-message-self-event-before-receipt-still-rekeys ()
   (qq-gateway-message-test-with-state

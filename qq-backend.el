@@ -210,6 +210,17 @@ then promotes its pending row from the later authoritative self event."
       session-key segments raw-message callback
       (or errback #'qq-backend--default-gateway-error)))))
 
+(defun qq-backend-send-poke
+    (session-key target-id &optional callback errback)
+  "Poke TARGET-ID in SESSION-KEY through the selected backend."
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot
+     (qq-api-send-poke session-key target-id callback errback))
+    ('gateway
+     (qq-gateway-message-send-poke
+      session-key target-id callback
+      (or errback #'qq-backend--default-gateway-error)))))
+
 (defun qq-backend-recall-message (message &optional callback errback)
   "Recall normalized MESSAGE through the selected backend.
 
@@ -455,7 +466,7 @@ request.  ERRBACK handles failure and COUNT limits the requested page size."
      ('gateway
       (memq capability
             '(contacts group-members send-text send-message face reply mention
-              recall explicit-history)))))
+              poke recall explicit-history)))))
 
 (defun qq-backend--gateway-bootstrap-complete (owner failed-p)
   "Complete one Gateway bootstrap part for OWNER, recording FAILED-P."

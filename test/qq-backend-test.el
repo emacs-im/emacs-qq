@@ -231,6 +231,19 @@
         (should (eq (nth 1 sent) segments))
         (should (equal (nth 2 sent) "optimistic"))))))
 
+(ert-deftest qq-backend-gateway-poke-routes-exact-target ()
+  (let ((qq-backend 'gateway) call)
+    (cl-letf (((symbol-function 'qq-gateway-message-send-poke)
+               (lambda (session-key target-id &optional callback errback)
+                 (setq call (list session-key target-id callback errback))
+                 "poke-request")))
+      (should
+       (equal (qq-backend-send-poke "group:8209413637" "10002")
+              "poke-request"))
+      (should (equal (nth 0 call) "group:8209413637"))
+      (should (equal (nth 1 call) "10002"))
+      (should (functionp (nth 3 call))))))
+
 (ert-deftest qq-backend-recall-dispatches-the-owned-native-message ()
   (let ((qq-backend 'gateway) call)
     (cl-letf (((symbol-function 'qq-gateway-message-recall)
