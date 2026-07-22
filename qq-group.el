@@ -4,8 +4,9 @@
 
 ;;; Commentary:
 
-;; Telega-style group profile page backed by the strict `emacs_get_group'
-;; action.  Unknown native enum values remain visible as numeric codes.
+;; Telega-style group profile page backed by the selected OneBot or native
+;; Gateway backend.  Unknown native enum values remain visible as numeric
+;; codes.
 
 ;;; Code:
 
@@ -16,6 +17,7 @@
 (require 'appkit-invalidation)
 (require 'appkit-transaction)
 (require 'qq-api)
+(require 'qq-backend)
 (require 'qq-media)
 (require 'qq-runtime)
 (require 'qq-state)
@@ -29,8 +31,6 @@
 (declare-function qq-user-open "qq-user" (user-id))
 (declare-function qq-group-notices-open
                   "qq-group-notices" (group-id &optional group-name))
-(declare-function qq-api-cancel-request "qq-api" (request-token))
-
 (defconst qq-group--view-id 'group-profile
   "Stable Appkit identity of the singleton group-profile view.")
 
@@ -180,6 +180,77 @@ GROUP-ID defaults to the identity selected in the current buffer."
   (require 'qq-group-notices)
   (qq-group-notices-open qq-group--group-id (qq-group--display-name)))
 
+(defun qq-group--setting-current-p (buffer group-id)
+  "Return non-nil when BUFFER still displays GROUP-ID."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and (derived-mode-p 'qq-group-mode)
+              (equal qq-group--group-id group-id)))))
+
+(defun qq-group--apply-setting (buffer group-id field value message-text _receipt)
+  "Apply confirmed FIELD VALUE to GROUP-ID's profile in BUFFER."
+  (when (qq-group--setting-current-p buffer group-id)
+    (with-current-buffer buffer
+      (setf (alist-get field qq-group--profile nil nil #'eq) value)
+      (qq-group--request-sync)
+      (message "qq: %s" message-text))))
+
+(defun qq-group-set-name (name)
+  "Set the current group's public NAME through the selected backend."
+  (interactive
+   (list (read-string "新群名称: "
+                      (alist-get 'name qq-group--profile))))
+  (unless qq-group--group-id
+    (user-error "qq: this buffer has no group identity"))
+  (unless (and (stringp name) (not (string-empty-p name)))
+    (user-error "qq: group name must be a non-empty string"))
+  (qq-backend-set-group-name
+   qq-group--group-id name
+   (apply-partially #'qq-group--apply-setting
+                    (current-buffer) qq-group--group-id 'name name
+                    "群名称已更新")))
+
+(defun qq-group-set-remark (remark)
+  "Set or clear the current group's account-local REMARK."
+  (interactive
+   (list (read-string "群备注（留空清除）: "
+                      (or (alist-get 'remark qq-group--profile) ""))))
+  (unless qq-group--group-id
+    (user-error "qq: this buffer has no group identity"))
+  (unless (stringp remark)
+    (user-error "qq: group remark must be a string"))
+  (qq-backend-set-group-remark
+   qq-group--group-id remark
+   (apply-partially #'qq-group--apply-setting
+                    (current-buffer) qq-group--group-id 'remark
+                    (and (not (string-empty-p remark)) remark)
+                    (if (string-empty-p remark)
+                        "群备注已清除"
+                      "群备注已更新"))))
+
+(defun qq-group--apply-whole-mute
+    (buffer group-id enabled _receipt)
+  "Apply confirmed whole-mute ENABLED state in BUFFER for GROUP-ID."
+  (when (qq-group--setting-current-p buffer group-id)
+    (with-current-buffer buffer
+      (let ((mute (copy-tree (or (alist-get 'mute qq-group--profile) '()))))
+        (setf (alist-get 'all_until mute nil nil #'eq)
+              (and enabled #xffffffff))
+        (setf (alist-get 'mute qq-group--profile nil nil #'eq) mute))
+      (qq-group--request-sync)
+      (message "qq: 已%s全员禁言" (if enabled "开启" "关闭")))))
+
+(defun qq-group-set-whole-mute (enabled)
+  "Set the current group's whole-group mute state to ENABLED."
+  (interactive (list (y-or-n-p "开启全员禁言？")))
+  (unless qq-group--group-id
+    (user-error "qq: this buffer has no group identity"))
+  (setq enabled (and enabled t))
+  (qq-backend-set-group-whole-mute
+   qq-group--group-id enabled
+   (apply-partially #'qq-group--apply-whole-mute
+                    (current-buffer) qq-group--group-id enabled)))
+
 (defun qq-group--insert-action-buttons ()
   "Insert primary group action buttons."
   (insert "  ")
@@ -207,6 +278,18 @@ GROUP-ID defaults to the identity selected in the current buffer."
   (appkit-ui-insert-action-button
    " 复制群号 " #'qq-group-copy-id
    :face 'qq-group-action-button :help-echo "复制群号 (w)")
+  (insert "\n  ")
+  (appkit-ui-insert-action-button
+   " 修改群名 " #'qq-group-set-name
+   :face 'qq-group-action-button :help-echo "修改群名称 (N)")
+  (insert "  ")
+  (appkit-ui-insert-action-button
+   " 修改备注 " #'qq-group-set-remark
+   :face 'qq-group-action-button :help-echo "修改群备注 (R)")
+  (insert "  ")
+  (appkit-ui-insert-action-button
+   " 全员禁言 " #'qq-group-set-whole-mute
+   :face 'qq-group-action-button :help-echo "开启或关闭全员禁言 (M)")
   (insert "\n"))
 
 (defun qq-group-render ()
@@ -246,7 +329,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
          (insert "\n")
          (qq-group--insert-action-buttons)
          (appkit-view-insert-note-line
-          "g 刷新 · m 群聊 · s 搜索成员 · n 群公告 · a 头像 · o 群主 · w 复制 · q 退出")
+          "g 刷新 · N 群名 · R 备注 · M 全员禁言 · m 群聊 · s 成员 · n 公告 · q 退出")
          (insert "\n")
          (appkit-view-insert-heading-line "资料" :face 'bold)
          (let ((name (qq-group--present-string
@@ -280,6 +363,12 @@ GROUP-ID defaults to the identity selected in the current buffer."
           "我的权限" (qq-group--permission-label
                       (alist-get 'self_permission qq-group--profile)))
          (when-let* ((mute (alist-get 'mute qq-group--profile)))
+           (qq-group--insert-field
+            "全员禁言"
+            (if (let ((until (alist-get 'all_until mute)))
+                  (and (integerp until) (> until 0)))
+                "是"
+              "否"))
            (qq-group--insert-field
             "全员禁言至" (qq-group--timestamp-label (alist-get 'all_until mute)))
            (qq-group--insert-field
@@ -376,7 +465,7 @@ RESOURCE identifies a presentation-only media dependency update."
     (user-error "qq: this buffer has no group identity"))
   (let ((view (qq-group--ensure-view)))
     (when qq-group--request
-      (qq-api-cancel-request qq-group--request))
+      (qq-backend-cancel-request qq-group--request))
     (let ((buffer (current-buffer))
           (group-id qq-group--group-id)
           (owner (list 'group-profile qq-group--group-id)))
@@ -387,7 +476,7 @@ RESOURCE identifies a presentation-only media dependency update."
       (qq-group--request-sync view)
       (condition-case error-data
           (let ((request
-                 (qq-api-get-group
+                 (qq-backend-get-group
                   group-id
                   (lambda (profile)
                     (when (qq-group--request-current-p
@@ -427,7 +516,7 @@ RESOURCE identifies a presentation-only media dependency update."
 (defun qq-group--cancel-request ()
   "Cancel the active group-profile request."
   (when qq-group--request
-    (qq-api-cancel-request qq-group--request))
+    (qq-backend-cancel-request qq-group--request))
   (setq qq-group--request nil
         qq-group--request-owner nil
         qq-group--loading nil))
@@ -520,6 +609,9 @@ RESOURCE identifies a presentation-only media dependency update."
     (define-key map (kbd "n") #'qq-group-open-notices)
     (define-key map (kbd "o") #'qq-group-open-owner)
     (define-key map (kbd "w") #'qq-group-copy-id)
+    (define-key map (kbd "N") #'qq-group-set-name)
+    (define-key map (kbd "R") #'qq-group-set-remark)
+    (define-key map (kbd "M") #'qq-group-set-whole-mute)
     (define-key map (kbd "TAB") #'forward-button)
     (define-key map (kbd "<backtab>") #'qq-group-button-backward)
     (define-key map (kbd "q") #'quit-window)
@@ -536,10 +628,10 @@ RESOURCE identifies a presentation-only media dependency update."
 
 ;;;###autoload
 (defun qq-group-open (group-id)
-  "Open the native group profile for canonical uint32 string GROUP-ID."
+  "Open the native group profile for exact backend string GROUP-ID."
   (interactive "sQQ group number: ")
-  (unless (qq-api-group-id-p group-id)
-    (user-error "qq: group profile requires a canonical uint32 group id"))
+  (unless (qq-backend-group-id-p group-id)
+    (user-error "qq: group profile requires an exact backend group id"))
   (let* ((app (qq-runtime-app))
          (view
           (appkit-open-view

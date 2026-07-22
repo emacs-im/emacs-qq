@@ -3030,6 +3030,56 @@ it; later notices always win."
            (funcall callback response)))
        (or errback #'qq-api--default-error)))))
 
+(defun qq-api-set-group-name
+    (group-id name &optional callback errback)
+  "Set GROUP-ID's public NAME through NapCat OneBot.
+
+CALLBACK receives the successful OneBot response."
+  (unless (qq-api-group-id-p group-id)
+    (user-error "qq: group name requires a canonical uint32 group UIN"))
+  (unless (and (stringp name) (not (string-empty-p name)))
+    (user-error "qq: group name must be a non-empty string"))
+  (qq-api-call
+   "set_group_name"
+   `((group_id . ,group-id) (group_name . ,name))
+   (lambda (response)
+     (when callback
+       (funcall callback response)))
+   (or errback #'qq-api--default-error)))
+
+(defun qq-api-set-group-remark
+    (group-id remark &optional callback errback)
+  "Set or clear GROUP-ID's account-local REMARK through NapCat OneBot.
+
+An empty REMARK clears it.  CALLBACK receives the successful response."
+  (unless (qq-api-group-id-p group-id)
+    (user-error "qq: group remark requires a canonical uint32 group UIN"))
+  (unless (stringp remark)
+    (user-error "qq: group remark must be a string"))
+  (qq-api-call
+   "set_group_remark"
+   `((group_id . ,group-id) (remark . ,remark))
+   (lambda (response)
+     (when callback
+       (funcall callback response)))
+   (or errback #'qq-api--default-error)))
+
+(defun qq-api-set-group-whole-mute
+    (group-id enabled &optional callback errback)
+  "Set GROUP-ID's whole-group mute state to ENABLED through NapCat OneBot.
+
+CALLBACK receives the successful OneBot response."
+  (unless (qq-api-group-id-p group-id)
+    (user-error "qq: group whole mute requires a canonical uint32 group UIN"))
+  (setq enabled (and enabled t))
+  (qq-api-call
+   "set_group_whole_ban"
+   `((group_id . ,group-id) (enable . ,(if enabled t :false)))
+   (lambda (response)
+     (when callback
+       (funcall callback response)))
+   (or errback #'qq-api--default-error)))
+
 (defun qq-api-get-avatar (user-id callback &optional errback no-cache)
   "Fetch avatar resource for USER-ID and pass it to CALLBACK."
   (qq-api-call

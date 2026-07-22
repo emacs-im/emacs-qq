@@ -123,7 +123,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
 (ert-deftest qq-group-refresh-handles-synchronous-response-ownership ()
   (qq-group-test-with-profile-view
     (cl-letf (((symbol-function 'qq-group-render) #'ignore)
-              ((symbol-function 'qq-api-get-group)
+              ((symbol-function 'qq-backend-get-group)
                (lambda (_group-id callback &optional _errback)
                  (funcall callback (copy-tree qq-group-test--profile))
                  'request)))
@@ -151,10 +151,44 @@ BODY may refer to the lexical variables `buffer' and `view'."
         (push-button (button-at (1- (point))))
         (should (equal call '("20001" "synthetic member")))))))
 
+(ert-deftest qq-group-setting-commands-update-current-profile-after-receipts ()
+  (with-temp-buffer
+    (qq-group-mode)
+    (setq qq-group--group-id "20001"
+          qq-group--profile (copy-tree qq-group-test--profile))
+    (let (calls)
+      (cl-letf
+          (((symbol-function 'qq-backend-set-group-name)
+            (lambda (group-id value callback &optional _errback)
+              (push (list 'name group-id value) calls)
+              (funcall callback '((status . "ok")))))
+           ((symbol-function 'qq-backend-set-group-remark)
+            (lambda (group-id value callback &optional _errback)
+              (push (list 'remark group-id value) calls)
+              (funcall callback '((status . "ok")))))
+           ((symbol-function 'qq-backend-set-group-whole-mute)
+            (lambda (group-id value callback &optional _errback)
+              (push (list 'mute group-id value) calls)
+              (funcall callback '((status . "ok")))))
+           ((symbol-function 'message) #'ignore))
+        (qq-group-set-name "New Name")
+        (qq-group-set-remark "")
+        (qq-group-set-whole-mute t))
+      (should (equal (alist-get 'name qq-group--profile) "New Name"))
+      (should-not (alist-get 'remark qq-group--profile))
+      (should (= (alist-get 'all_until
+                            (alist-get 'mute qq-group--profile))
+                 #xffffffff))
+      (should
+       (equal (nreverse calls)
+              '((name "20001" "New Name")
+                (remark "20001" "")
+                (mute "20001" t)))))))
+
 (ert-deftest qq-group-refresh-settles-synchronous-dispatch-error ()
   (qq-group-test-with-profile-view
     (cl-letf (((symbol-function 'qq-group-render) #'ignore)
-              ((symbol-function 'qq-api-get-group)
+              ((symbol-function 'qq-backend-get-group)
                (lambda (&rest _args) (error "synthetic dispatch failure"))))
       (qq-group-refresh)
       (should-not qq-group--loading)
@@ -196,7 +230,13 @@ BODY may refer to the lexical variables `buffer' and `view'."
   (should (eq (lookup-key qq-group-mode-map (kbd "s"))
               #'qq-group-search-members))
   (should (eq (lookup-key qq-group-mode-map (kbd "n"))
-              #'qq-group-open-notices)))
+              #'qq-group-open-notices))
+  (should (eq (lookup-key qq-group-mode-map (kbd "N"))
+              #'qq-group-set-name))
+  (should (eq (lookup-key qq-group-mode-map (kbd "R"))
+              #'qq-group-set-remark))
+  (should (eq (lookup-key qq-group-mode-map (kbd "M"))
+              #'qq-group-set-whole-mute)))
 
 (ert-deftest qq-group-reuses-one-profile-buffer-like-telega ()
   (should (equal (qq-group--buffer-name "20001") "*qq-group*"))
@@ -245,7 +285,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
             qq-group--loading t
             qq-group--request 'old-group-request
             qq-group--request-owner 'old-owner)
-      (cl-letf (((symbol-function 'qq-api-cancel-request)
+      (cl-letf (((symbol-function 'qq-backend-cancel-request)
                  (lambda (request) (push request cancelled))))
         (appkit-kill-view view)
         (should (member 'old-group-request cancelled))
@@ -287,11 +327,11 @@ BODY may refer to the lexical variables `buffer' and `view'."
 (ert-deftest qq-group-dead-view-makes-late-profile-response-inert ()
   (qq-group-test-with-profile-view
     (let (success)
-      (cl-letf (((symbol-function 'qq-api-get-group)
+      (cl-letf (((symbol-function 'qq-backend-get-group)
                  (lambda (_group-id callback &optional _errback)
                    (setq success callback)
                    'group-token))
-                ((symbol-function 'qq-api-cancel-request) #'ignore))
+                ((symbol-function 'qq-backend-cancel-request) #'ignore))
         (qq-group-refresh)
         (appkit-kill-view view)
         (let ((replacement (qq-group--ensure-view))
@@ -312,7 +352,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
 (ert-deftest qq-group-profile-callback-uses-atomic-appkit-request-sync ()
   (qq-group-test-with-profile-view
     (let (success calls)
-      (cl-letf (((symbol-function 'qq-api-get-group)
+      (cl-letf (((symbol-function 'qq-backend-get-group)
                  (lambda (_group-id callback &optional _errback)
                    (setq success callback)
                    'group-token)))
