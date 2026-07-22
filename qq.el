@@ -44,6 +44,7 @@
 (require 'qq-contacts)
 (require 'qq-guilds)
 (require 'qq-root)
+(require 'qq-presence)
 (require 'qq-transient)
 (require 'qq-notifications)
 (require 'qq-modes)

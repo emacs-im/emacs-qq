@@ -42,7 +42,57 @@
   (should (commandp #'qq-chat-friend-pin-transient))
   (should (commandp #'qq-chat-clear-message-selection))
   (should (commandp #'qq-chat-attach-transient))
+  (should (commandp #'qq-presence-transient))
   (should (commandp #'qq-root-transient)))
+
+(ert-deftest qq-transient-root-exposes-closed-presence-menu ()
+  (cl-letf (((symbol-function 'qq-connect)
+             (lambda () (interactive)))
+            ((symbol-function 'qq-disconnect)
+             (lambda () (interactive)))
+            ((symbol-function 'qq-reset-session-state)
+             (lambda () (interactive))))
+    (let* ((root-objects (transient-suffixes 'qq-root-transient))
+           (presence-entry
+            (seq-find
+             (lambda (suffix) (equal (oref suffix key) "p"))
+             root-objects))
+           (presence-objects (transient-suffixes 'qq-presence-transient))
+           (commands
+            (seq-keep
+             (lambda (suffix)
+               (when (memq (oref suffix command)
+                           '(qq-presence-online
+                             qq-presence-q-me
+                             qq-presence-away
+                             qq-presence-busy
+                             qq-presence-do-not-disturb
+                             qq-presence-invisible
+                             qq-presence-custom))
+                 (cons (oref suffix key) (oref suffix command))))
+             presence-objects)))
+      (should presence-entry)
+      (should (eq (oref presence-entry command) 'qq-presence-transient))
+      (should (eq (oref presence-entry inapt-if)
+                  'qq-transient--presence-inapt-p))
+      (should (= (length commands) 7))
+      (dolist (expected
+               '(("o" . qq-presence-online)
+                 ("q" . qq-presence-q-me)
+                 ("a" . qq-presence-away)
+                 ("b" . qq-presence-busy)
+                 ("d" . qq-presence-do-not-disturb)
+                 ("i" . qq-presence-invisible)
+                 ("c" . qq-presence-custom)))
+        (should (eq (cdr (assoc (car expected) commands))
+                    (cdr expected))))
+      (dolist (suffix
+               (seq-filter
+                (lambda (candidate)
+                  (memq (oref candidate command) (mapcar #'cdr commands)))
+                presence-objects))
+        (should (eq (oref suffix inapt-if)
+                    'qq-transient--presence-inapt-p))))))
 
 (ert-deftest qq-transient-message-prefix-exposes-essence-toggle ()
   (let* ((objects (transient-suffixes 'qq-chat-message-transient))

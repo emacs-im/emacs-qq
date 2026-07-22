@@ -335,6 +335,41 @@
                      (list backend "9007199254740999" t)))
       (should (eq (alist-get 'pinned callback-value) t)))))
 
+(ert-deftest qq-backend-presence-routes-both-backends-with-request-origin ()
+  (dolist (backend '(onebot gateway))
+    (let ((qq-backend backend) called callback-value)
+      (cl-letf (((symbol-function 'qq-api-set-presence)
+                 (lambda (presence callback &optional _errback)
+                   (setq called (list 'onebot presence))
+                   (funcall callback `((presence . ,presence)))
+                   "onebot-presence"))
+                ((symbol-function 'qq-gateway-current-account-owner)
+                 (lambda () '("slot-a" . "7")))
+                ((symbol-function 'qq-gateway-account-set-presence)
+                 (lambda (account-id presence callback &optional _errback)
+                   (setq called (list 'gateway account-id presence))
+                   (funcall callback
+                            `((account_id . ,account-id)
+                              (generation . "7")
+                              (presence . ,presence)))
+                   "gateway-presence")))
+        (let* ((presence '((kind . "away")))
+               (request
+                (qq-backend-set-presence
+                 presence
+                 (lambda (receipt) (setq callback-value receipt)))))
+          (should (eq (qq-backend-request-backend request) backend))
+          (should
+           (equal (qq-backend-request-token request)
+                  (format "%s-presence" backend)))
+          (should
+           (equal called
+                  (if (eq backend 'onebot)
+                      (list 'onebot presence)
+                    (list 'gateway "slot-a" presence))))
+          (should
+           (equal (alist-get 'presence callback-value) presence)))))))
+
 (ert-deftest qq-backend-group-leave-routes-both-backends-and-converges-state ()
   (dolist (backend '(onebot gateway))
     (let ((qq-backend backend)

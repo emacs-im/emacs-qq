@@ -3239,6 +3239,39 @@ The authoritative post-state reports UNREAD-COUNT."
       '((user_id . "9007199254741000") (pinned . t))
       "9007199254740999" t))))
 
+(ert-deftest qq-api-presence-uses-closed-napcat-fork-contract ()
+  (let (calls delivered failures)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (action params callback &optional _errback)
+                 (push (list action params) calls)
+                 (funcall callback `((data . ,params)))
+                 'presence-request)))
+      (should
+       (eq (qq-api-set-presence
+            '((kind . "away"))
+            (lambda (receipt) (setq delivered receipt)))
+           'presence-request))
+      (qq-api-set-presence
+       '((kind . "custom") (face_id . 4294967295)
+         (wording . "writing Emacs Lisp"))
+       #'ignore))
+    (should
+     (equal
+      (nreverse calls)
+      '(("emacs_set_presence" ((presence (kind . "away"))))
+        ("emacs_set_presence"
+         ((presence (kind . "custom") (face_id . 4294967295)
+                    (wording . "writing Emacs Lisp")))))))
+    (should (equal delivered '((presence (kind . "away")))))
+    (should-error
+     (qq-api-set-presence '((kind . "away") (raw_status . 30)))
+     :type 'user-error)
+    (condition-case error-data
+        (qq-api--validate-presence-receipt
+         '((presence (kind . "busy"))) '((kind . "away")))
+      (error (setq failures error-data)))
+    (should failures)))
+
 (ert-deftest qq-api-send-poke-builds-group-request-and-local-notice ()
   (let (captured-action captured-params applied)
     (qq-state-reset)
