@@ -731,6 +731,112 @@
         (should (eq (nth 2 call) t))
         (should (functionp (nth 4 call)))))))
 
+(ert-deftest qq-native-read-reports-coalesce-to-newest-exact-sequence ()
+  (let ((qq-native--read-operations (make-hash-table :test #'equal))
+        (qq-native--read-operation-counter 0)
+        calls completed)
+    (cl-letf (((symbol-function 'qq-gateway-message-mark-read)
+               (lambda (message &optional callback errback)
+                 (setq calls
+                       (append calls
+                               (list (list message callback errback))))
+                 (format "read-%d" (length calls)))))
+      (let* ((base
+              '((session-key . "group:8209413637")
+                (server-id . "7348923749823749823")
+                (message-seq . "9007199254740999")))
+             (newest (copy-tree base))
+             (middle (copy-tree base)))
+        (setf (alist-get 'server-id newest) "7348923749823749825"
+              (alist-get 'message-seq newest) "9007199254741001"
+              (alist-get 'server-id middle) "7348923749823749824"
+              (alist-get 'message-seq middle) "9007199254741000")
+        (let ((token
+               (qq-native-mark-message-read
+                base (lambda (_receipt) (push 'base completed)))))
+          (should
+           (equal
+            (qq-native-mark-message-read
+             newest (lambda (_receipt) (push 'newest completed)))
+            token))
+          ;; A later-but-not-newest intent cannot replace the queued frontier.
+          (should
+           (equal
+            (qq-native-mark-message-read
+             middle (lambda (_receipt) (push 'middle completed)))
+            token)))
+        (should (= (length calls) 1))
+        (funcall
+         (nth 1 (car calls))
+         '((read_through_sequence . "9007199254740999")))
+        (should (= (length calls) 2))
+        (should (eq (car (cadr calls)) newest))
+        (should (equal (alist-get 'message-seq (car (cadr calls)))
+                       "9007199254741001"))
+        (funcall
+         (nth 1 (cadr calls))
+         '((read_through_sequence . "9007199254741001")))
+        (should (equal (nreverse completed) '(base newest)))
+        (should (= (hash-table-count qq-native--read-operations) 0))))))
+
+(ert-deftest qq-native-account-switch-revokes-stale-read-callback ()
+  (let ((qq-native--read-operations (make-hash-table :test #'equal))
+        (qq-native--read-operation-counter 0)
+        calls completed)
+    (cl-letf (((symbol-function 'qq-gateway-message-mark-read)
+               (lambda (message &optional callback errback)
+                 (setq calls
+                       (append calls
+                               (list (list message callback errback))))
+                 (format "read-%d" (length calls)))))
+      (let* ((old
+              '((session-key . "group:8209413637")
+                (server-id . "7348923749823749823")
+                (message-seq . "9007199254740999")))
+             (new (copy-tree old)))
+        (setf (alist-get 'server-id new) "7348923749823749824"
+              (alist-get 'message-seq new) "9007199254741000")
+        (qq-native-mark-message-read
+         old (lambda (_receipt) (push 'old completed)))
+        (qq-native--revoke-read-operations "slot-a" "slot-b")
+        (qq-native-mark-message-read
+         new (lambda (_receipt) (push 'new completed)))
+        (should (= (length calls) 2))
+        ;; The retired generation's callback cannot settle the new operation.
+        (funcall (nth 1 (car calls)) '((read_through_sequence . "1")))
+        (should-not completed)
+        (should (= (hash-table-count qq-native--read-operations) 1))
+        (funcall (nth 1 (cadr calls)) '((read_through_sequence . "2")))
+        (should (equal completed '(new)))
+        (should (= (hash-table-count qq-native--read-operations) 0))))))
+
+(ert-deftest qq-native-read-capability-requires-current-closed-message-owner ()
+  (let ((message
+         '((session-key . "private:10001")
+           (server-id . "7348923749823749823")
+           (message-seq . "9007199254740999")
+           (native-sent-at . 1784700000)
+           (peer-uid . "u_peer")
+           (gateway-account-id . "slot-a")
+           (gateway-generation . "7"))))
+    (cl-letf (((symbol-function 'qq-native-ready-p) (lambda () t))
+              ((symbol-function 'qq-gateway-transport-capabilities)
+               (lambda () '("message.mark_read")))
+              ((symbol-function 'qq-gateway-current-account-owner)
+               (lambda () '("slot-a" . "7")))
+              ((symbol-function 'qq-gateway-current-account)
+               (lambda () '((phase . "online")))))
+      (should (qq-native-message-read-capable-p message))
+      (let ((stale (copy-tree message)))
+        (setf (alist-get 'gateway-generation stale) "6")
+        (should-not (qq-native-message-read-capable-p stale)))
+      (let ((missing-time (copy-tree message)))
+        (setf (alist-get 'native-sent-at missing-time) nil)
+        (should-not (qq-native-message-read-capable-p missing-time)))
+      (let ((service (copy-tree message)))
+        (setf (alist-get 'session-key service) "service:u_peer")
+        (should-not (qq-native-message-read-capable-p service))))))
+
 (ert-deftest qq-native-essence-routes-whole-message ()
   (let (call)
     (cl-letf (((symbol-function 'qq-gateway-message-set-essence)

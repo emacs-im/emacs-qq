@@ -940,8 +940,19 @@ With FORCE, submit even when this buffer already requested the same target."
     (when-let* ((message-id (alist-get 'server-id message))
                 ((qq-api-message-id-p message-id))
                 ((or force (qq-chat--read-target-needed-p message-id))))
-      (setq qq-chat--last-read-target-id message-id)
-      (qq-api-mark-message-read qq-chat--session-key message-id))))
+      (if (not (qq-native-message-read-capable-p message))
+          (when force
+            (user-error
+             "qq: this message lacks a reportable native read cursor"))
+        (let ((buffer (current-buffer))
+              (session-key qq-chat--session-key))
+          (qq-native-mark-message-read
+           message
+           (lambda (_receipt)
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (when (equal qq-chat--session-key session-key)
+                   (setq qq-chat--last-read-target-id message-id)))))))))))
 
 (defun qq-chat--manage-read-position (&optional position)
   "Advance read state to the message represented by POSITION.
@@ -5361,8 +5372,6 @@ than jumping across an unfilled cached gap."
   (interactive)
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
-  (when mark-read
-    (user-error "qq: Native mark-read is not implemented yet"))
   (when (qq-chat--msg-filter-active-p)
     (qq-chat--deactivate-filter)
     (qq-chat-render))

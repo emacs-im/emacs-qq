@@ -5025,18 +5025,36 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
       nil)
      (puthash
       "group:20001"
-      `(((server-id . ,first) (time . 1) (raw-message . "first"))
-        ((server-id . ,second) (time . 2) (raw-message . "second"))
-        ((server-id . ,third) (time . 3) (raw-message . "third")))
+      `(((server-id . ,first) (session-key . "group:20001")
+         (message-seq . "1") (group-id . "20001")
+         (gateway-account-id . "slot-a") (gateway-generation . "7")
+         (time . 1) (raw-message . "first"))
+        ((server-id . ,second) (session-key . "group:20001")
+         (message-seq . "2") (group-id . "20001")
+         (gateway-account-id . "slot-a") (gateway-generation . "7")
+         (time . 2) (raw-message . "second"))
+        ((server-id . ,third) (session-key . "group:20001")
+         (message-seq . "3") (group-id . "20001")
+         (gateway-account-id . "slot-a") (gateway-generation . "7")
+         (time . 3) (raw-message . "third")))
       qq-state--messages-by-session)
      (with-temp-buffer
        (qq-chat-mode)
        (setq qq-chat--session-key "group:20001")
        (qq-chat--set-history-window first nil)
        (qq-chat-render)
-       (cl-letf (((symbol-function 'qq-api-mark-message-read)
-                  (lambda (session-key message-id)
-                    (setq calls (append calls (list (list session-key message-id)))))))
+       (cl-letf (((symbol-function 'qq-native-message-read-capable-p)
+                  (lambda (_message) t))
+                 ((symbol-function 'qq-native-mark-message-read)
+                  (lambda (message &optional callback _errback)
+                    (setq calls
+                          (append
+                           calls
+                           (list (list (alist-get 'session-key message)
+                                       (alist-get 'server-id message)))))
+                    (when callback
+                      (funcall callback '((read_through_sequence . "1"))))
+                    "read-request")))
          ;; An already-read row does not move the native boundary backward.
          (goto-char (point-min))
          (search-forward "first")
