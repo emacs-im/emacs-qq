@@ -112,7 +112,17 @@ Preferred keys (callers should populate when applicable):
 `:message'        normalized message alist (copy)
 `:message-anchor' stable timeline key (server-id or local-id)
 `:previous-anchor' prior key when rekeying (pending local-id → snowflake)"
-  (run-hook-with-args 'qq-state-change-hook (append (list :type type) plist)))
+  (let ((event (append (list :type type) plist)))
+    (run-hook-wrapped
+     'qq-state-change-hook
+     (lambda (function value)
+       (condition-case error-data
+           (funcall function (copy-tree value))
+         (error
+          (message "qq: State change hook %S failed: %s"
+                   function (error-message-string error-data))))
+       nil)
+     event)))
 
 (defun qq-state-message-anchor (message)
   "Return stable timeline anchor for MESSAGE.
@@ -578,6 +588,8 @@ they are never split, normalized, escaped, or reconstructed from metadata."
       (last-message-order . nil)
       (last-message-seq . nil)
       (last-message-id . nil)
+      (last-message-gateway-account-id . nil)
+      (last-message-status . nil)
       (oldest-message-id . nil))))
 
 (defun qq-state--merge-alists (old new)
@@ -2009,7 +2021,10 @@ fallback describes the already accepted exact message."
       (last-message-sender-name
        . ,(unless special-p (alist-get 'sender-name message)))
       (last-message-self-p
-       . ,(and (not special-p) (alist-get 'self-p message) t)))))
+       . ,(and (not special-p) (alist-get 'self-p message) t))
+      (last-message-gateway-account-id
+       . ,(alist-get 'gateway-account-id message))
+      (last-message-status . ,(alist-get 'status message)))))
 
 (defun qq-state--latest-summary-message (messages)
   "Return the newest summary candidate in normalized MESSAGES.
@@ -3137,6 +3152,147 @@ canonical history."
                       :observation-token observation-token
                       :message-patch patch)
       nil))))
+
+(defun qq-state--closed-plist-p (value required optional)
+  "Return non-nil when plist VALUE has unique REQUIRED and OPTIONAL keys."
+  (and (proper-list-p value)
+       (zerop (% (length value) 2))
+       (let ((keys (cl-loop for (key _item) on value by #'cddr
+                            collect key)))
+         (and (cl-every #'keywordp keys)
+              (= (length keys) (length (delete-dups (copy-sequence keys))))
+              (cl-every (lambda (key) (memq key keys)) required)
+              (cl-every (lambda (key) (memq key (append required optional)))
+                        keys)))))
+
+(defun qq-state--native-recent-read-cursor-p (cursor)
+  "Return non-nil when CURSOR is closed confirmed native read metadata."
+  (and (or (qq-protocol--closed-object-p
+            cursor
+            '(read_through_message_id read_through_sequence))
+           (qq-protocol--closed-object-p
+            cursor
+            '(read_through_message_id read_through_sequence
+              server_read_sequence)))
+       (qq-protocol-message-id-p
+        (alist-get 'read_through_message_id cursor))
+       (qq-protocol--nonzero-decimal-string-p
+        (alist-get 'read_through_sequence cursor))
+       (or (not (assq 'server_read_sequence cursor))
+           (and (qq-protocol--nonzero-decimal-string-p
+                 (alist-get 'server_read_sequence cursor))
+                (<= (qq-protocol-decimal-string-compare
+                     (alist-get 'read_through_sequence cursor)
+                     (alist-get 'server_read_sequence cursor))
+                    0)))))
+
+(defun qq-state--prepare-native-recent-conversation (entry)
+  "Validate and isolate one normalized native recent conversation ENTRY."
+  (unless (qq-state--closed-plist-p
+           entry
+           '(:session-key :message :activity-revision :pinned-known-p
+             :pinned :read-cursor-known-p :read-cursor)
+           nil)
+    (error "qq: native recent conversation has invalid domain fields"))
+  (let* ((session-key (plist-get entry :session-key))
+         (identity (qq-state-session-key-identity session-key))
+         (session-type (alist-get 'type identity))
+         (message (copy-tree (plist-get entry :message)))
+         (revision (plist-get entry :activity-revision))
+         (pinned-known-p (plist-get entry :pinned-known-p))
+         (pinned (plist-get entry :pinned))
+         (read-cursor-known-p (plist-get entry :read-cursor-known-p))
+         (read-cursor (copy-tree (plist-get entry :read-cursor))))
+    (unless (memq session-type '(private group))
+      (error "qq: native recent conversation has unsupported session %S"
+             session-key))
+    (unless (and (listp message)
+                 (equal (alist-get 'session-key message) session-key)
+                 (qq-protocol-message-id-p (alist-get 'server-id message))
+                 (integerp (alist-get 'time message))
+                 (>= (alist-get 'time message) 0)
+                 (qq-protocol--decimal-string-p
+                  (alist-get 'message-seq message))
+                 (stringp (alist-get 'gateway-account-id message))
+                 (not (string-empty-p
+                       (alist-get 'gateway-account-id message))))
+      (error "qq: native recent conversation has malformed normalized message"))
+    (unless (qq-protocol--nonzero-decimal-string-p revision)
+      (error "qq: native recent conversation revision is malformed"))
+    (unless (memq pinned-known-p '(nil t))
+      (error "qq: native recent conversation pin ownership is malformed"))
+    (when (and pinned-known-p (not (memq pinned '(t :false))))
+      (error "qq: native recent conversation pin state is malformed"))
+    (unless (memq read-cursor-known-p '(nil t))
+      (error "qq: native recent conversation cursor ownership is malformed"))
+    (when (and read-cursor-known-p
+               (not (qq-state--native-recent-read-cursor-p read-cursor)))
+      (error "qq: native recent conversation read cursor is malformed"))
+    (when (and (not read-cursor-known-p) read-cursor)
+      (error "qq: unowned native recent read cursor must be absent"))
+    (let ((peer-name (qq-state--present-string
+                      (alist-get 'peer-name message))))
+      (list
+       :session-key session-key
+       :message message
+       :metadata
+       `(,@(when peer-name `((title . ,peer-name)
+                             (peer-name . ,peer-name)))
+         ,@(when-let* ((peer-uid (alist-get 'peer-uid message)))
+             `((peer-uid . ,peer-uid)))
+         ,@(when-let* ((peer-uin (alist-get 'peer-uin message)))
+             `((peer-uin . ,peer-uin)))
+         (recent-activity-revision . ,revision)
+         ,@(when read-cursor-known-p
+             `((native-read-cursor . ,read-cursor)))
+         ,@(when pinned-known-p `((pinned . ,pinned))))))))
+
+(defun qq-state-apply-recent-conversations
+    (entries &optional summary-observation-token)
+  "Atomically apply normalized native recent conversation ENTRIES.
+
+ENTRIES contain root-summary messages prepared by the native facade.  This
+operation never inserts those messages into the canonical timeline, replays a
+message patch journal, or infers unread state.  A confirmed `read_cursor' is
+stored only as opaque `native-read-cursor' session metadata.
+
+The page order authoritatively replaces `qq-state-recent-session-keys'.
+SUMMARY-OBSERVATION-TOKEN is captured before asynchronous dispatch, so a live
+message observed later keeps ownership of a newer root summary."
+  (unless (proper-list-p entries)
+    (error "qq: native recent conversations must be a proper list"))
+  (let* ((token (or summary-observation-token
+                    (qq-state-session-summary-observation-start)))
+         (prepared
+          (mapcar #'qq-state--prepare-native-recent-conversation entries))
+         (keys (mapcar (lambda (entry) (plist-get entry :session-key))
+                       prepared))
+         (unique (delete-dups (copy-sequence keys))))
+    (unless (= (length keys) (length unique))
+      (error "qq: native recent conversations duplicate a session"))
+    ;; Stage against a shallow table copy.  Every touched session is copied by
+    ;; `qq-state-upsert-session', so failure cannot mutate a shared value.
+    (let ((staged-sessions (copy-hash-table qq-state--sessions)))
+      (let ((qq-state--sessions staged-sessions))
+        (dolist (entry prepared)
+          (let ((session-key (plist-get entry :session-key))
+                (message (plist-get entry :message)))
+            (qq-state-upsert-session
+             session-key (plist-get entry :metadata) nil)
+            (qq-state--apply-session-summary
+             session-key (qq-state--message-summary-fields message) token)))
+        (setq staged-sessions qq-state--sessions))
+      ;; Commit the staged session table and authoritative key projection as
+      ;; one mutation boundary, then publish one coarse refresh notification.
+      (let ((key-set (make-hash-table :test #'equal)))
+        (dolist (session-key keys)
+          (puthash session-key t key-set))
+        (setq qq-state--sessions staged-sessions
+              qq-state--recent-session-keys (copy-sequence keys)
+              qq-state--recent-session-key-set key-set)))
+    (qq-state--emit 'sessions-refreshed :count (length prepared)
+                    :source 'response)
+    (qq-state-sessions)))
 
 (defun qq-state--recent-contact-title (contact session-key)
   "Return display title for recent CONTACT in SESSION-KEY."

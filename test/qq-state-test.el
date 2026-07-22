@@ -13,6 +13,22 @@
          (progn ,@body)
        (qq-state-reset))))
 
+(ert-deftest qq-state-change-hook-errors-are-isolated-after-commit ()
+  (qq-test-with-reset
+   (let (seen)
+     ;; `add-hook' prepends, so register the observer first to make the failing
+     ;; consumer run before it.
+     (add-hook 'qq-state-change-hook
+               (lambda (event) (setq seen event)))
+     (add-hook 'qq-state-change-hook
+               (lambda (event)
+                 (plist-put event :status 'corrupted)
+                 (error "broken state consumer")))
+     (should (eq (qq-state-set-connection-status 'ready) 'ready))
+     (should (eq (qq-state-connection-status) 'ready))
+     (should (eq (plist-get seen :type) 'connection))
+     (should (eq (plist-get seen :status) 'ready)))))
+
 (defun qq-state-test--poke-recall-reference
     (message-id chat-type peer-uid)
   "Return a strict native poke recall reference for tests."
@@ -66,6 +82,54 @@
       (lastestMsg
        . ,(qq-state-test--group-message
            message-id time text nil sequence)))))
+
+(cl-defun qq-state-test--native-recent-message
+    (&key
+     (session-key "group:20001")
+     (message-id "7348923749823749823")
+     (time 1784700000)
+     (sequence "9007199254740999")
+     (text "native recent")
+     (peer-name "Native Group"))
+  "Return one normalized native recent root-summary message fixture."
+  (let* ((identity (qq-state-session-key-identity session-key))
+         (type (alist-get 'type identity))
+         (target-id (alist-get 'target-id identity)))
+    `((id . ,message-id)
+      (server-id . ,message-id)
+      (session-key . ,session-key)
+      (time . ,time)
+      (message-seq . ,sequence)
+      (gateway-account-id . "slot-a")
+      (sender-id . "10001")
+      (sender-name . "Alice")
+      (self-p . nil)
+      (status . received)
+      (segments . (((type . "text") (data . ((text . ,text))))))
+      (raw-message . ,text)
+      (preview . ,text)
+      (message-type . ,(symbol-name type))
+      (peer-uid . ,(and (eq type 'private) "u_peer"))
+      (peer-uin . ,(and (eq type 'private) target-id))
+      (peer-name . ,peer-name)
+      (group-id . ,(and (eq type 'group) target-id))
+      (target-id . ,target-id))))
+
+(cl-defun qq-state-test--native-recent-entry
+    (&key
+     (message (qq-state-test--native-recent-message))
+     (revision "12")
+     pinned-known-p
+     (pinned :false)
+     read-cursor)
+  "Return one state-domain native recent entry fixture."
+  (list :session-key (alist-get 'session-key message)
+        :message (copy-tree message)
+        :activity-revision revision
+        :pinned-known-p pinned-known-p
+        :pinned pinned
+        :read-cursor-known-p (and read-cursor t)
+        :read-cursor (copy-tree read-cursor)))
 
 (ert-deftest qq-state-session-key-normalizes-type-and-id ()
   (qq-test-with-reset
@@ -438,6 +502,120 @@
    (let ((copy (qq-state-recent-session-keys)))
      (setcar copy "changed")
      (should (equal (qq-state-recent-session-keys) '("group:20001"))))))
+
+(ert-deftest qq-state-native-recent-page-is-atomic-before-first-commit ()
+  (qq-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Before")
+      (unread-count . 4)
+      (last-message-id . "7348923749823749800")
+      (last-message-time . 1784699900)
+      (last-message-preview . "before"))
+    nil)
+   (let* ((before (qq-state-session "group:20001"))
+          (valid (qq-state-test--native-recent-entry))
+          (bad-message
+           (qq-state-test--native-recent-message
+            :session-key "group:20002"
+            :message-id "7348923749823749824"))
+          (bad (qq-state-test--native-recent-entry :message bad-message)))
+     ;; Keep a closed entry but contradict its normalized message/session.
+     (plist-put bad :session-key "group:20003")
+     (should-error
+      (qq-state-apply-recent-conversations (list valid bad) 5))
+     (should (equal (qq-state-session "group:20001") before))
+     (should-not (qq-state-session "group:20002"))
+     (should-not (qq-state-recent-session-keys)))))
+
+(ert-deftest qq-state-native-recent-does-not-overwrite-newer-live-summary ()
+  (qq-test-with-reset
+   (let* ((stale-token (qq-state-session-summary-observation-start))
+          (stale
+           (qq-state-test--native-recent-entry
+            :message
+            (qq-state-test--native-recent-message
+             :message-id "7348923749823749823"
+             :time 1784700000 :sequence "100" :text "stale"))))
+     (qq-state-merge-live-message
+      (qq-state-test--group-message
+       "7348923749823749824" 1784700001 "live" "Bob" "101"))
+     (qq-state-apply-recent-conversations (list stale) stale-token)
+     (let ((session (qq-state-session "group:20001")))
+       (should (equal (alist-get 'last-message-id session)
+                      "7348923749823749824"))
+       (should (equal (alist-get 'last-message-preview session) "live"))
+       (should (equal (alist-get 'last-message-sender-name session) "Bob"))
+       (should (qq-state-session-recent-p "group:20001"))))))
+
+(ert-deftest qq-state-native-recent-preserves-stable-account-provenance ()
+  (qq-test-with-reset
+   (qq-state-apply-recent-conversations
+    (list
+     (qq-state-test--native-recent-entry
+      :message
+      (qq-state-test--native-recent-message
+       :text "from prior runtime")))
+    1)
+   (let ((session (qq-state-session "group:20001")))
+     (should (equal (alist-get 'last-message-preview session)
+                    "from prior runtime"))
+     (should (equal (alist-get 'last-message-gateway-account-id session)
+                    "slot-a"))
+     ;; Recent root summaries intentionally do not widen canonical history.
+     (should-not (qq-state-session-messages "group:20001")))))
+
+(ert-deftest qq-state-native-recent-cursor-never-infers-unread-state ()
+  (qq-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((unread-count . 9)
+      (first-unread-message-id . "7348923749823749700")
+      (first-unread-message-seq . "90")
+      (read-position-available . t))
+    nil)
+   (let ((cursor
+          '((read_through_message_id . "7348923749823749800")
+            (read_through_sequence . "99")
+            (server_read_sequence . "100"))))
+     (qq-state-apply-recent-conversations
+      (list (qq-state-test--native-recent-entry :read-cursor cursor)) 1)
+     (let ((session (qq-state-session "group:20001")))
+       (should (= (alist-get 'unread-count session) 9))
+       (should (equal (alist-get 'first-unread-message-id session)
+                      "7348923749823749700"))
+       (should (equal (alist-get 'first-unread-message-seq session) "90"))
+       (should (alist-get 'read-position-available session))
+       (should (equal (alist-get 'native-read-cursor session) cursor)))
+     ;; Cursor absence means the service has not observed one; it is not an
+     ;; authoritative command to erase already confirmed metadata.
+     (qq-state-apply-recent-conversations
+      (list (qq-state-test--native-recent-entry))
+      (qq-state-session-summary-observation-start))
+     (should (equal (alist-get 'native-read-cursor
+                               (qq-state-session "group:20001"))
+                    cursor)))))
+
+(ert-deftest qq-state-native-recent-keys-and-known-pin-are-authoritative ()
+  (qq-test-with-reset
+   (let* ((first (qq-state-test--native-recent-entry
+                  :pinned-known-p t :pinned t))
+          (second-message
+           (qq-state-test--native-recent-message
+            :session-key "group:20002"
+            :message-id "7348923749823749824"))
+          (second (qq-state-test--native-recent-entry
+                   :message second-message)))
+     (qq-state-apply-recent-conversations (list first second) 1)
+     (should (equal (qq-state-recent-session-keys)
+                    '("group:20001" "group:20002")))
+     (should (eq (alist-get 'pinned (qq-state-session "group:20001")) t))
+     ;; Unknown pin state in a later page preserves the last confirmed value.
+     (qq-state-apply-recent-conversations
+      (list (qq-state-test--native-recent-entry)) 2)
+     (should (equal (qq-state-recent-session-keys) '("group:20001")))
+     (should-not (qq-state-session-recent-p "group:20002"))
+     (should (eq (alist-get 'pinned (qq-state-session "group:20001")) t)))))
 
 (ert-deftest qq-state-apply-input-status-tracks-and-clears ()
   "NapCat input_status maps to telega-like session actions."

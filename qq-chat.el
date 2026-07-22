@@ -948,11 +948,15 @@ With FORCE, submit even when this buffer already requested the same target."
               (session-key qq-chat--session-key))
           (qq-native-mark-message-read
            message
-           (lambda (_receipt)
+           (lambda (receipt)
              (when (buffer-live-p buffer)
                (with-current-buffer buffer
                  (when (equal qq-chat--session-key session-key)
-                   (setq qq-chat--last-read-target-id message-id)))))))))))
+                   ;; A newer queued cursor may subsume this caller.  The
+                   ;; accepted receipt, not the captured request, is therefore
+                   ;; the confirmed local boundary.
+                   (setq qq-chat--last-read-target-id
+                         (alist-get 'read_through_message_id receipt))))))))))))
 
 (defun qq-chat--manage-read-position (&optional position)
   "Advance read state to the message represented by POSITION.
@@ -3624,7 +3628,7 @@ Keep this short — size is useful; internal sub_type / emoji ids are not."
 
 CAPABILITIES defaults to the centralized `qq-media' action/status model.
 The exact account app is captured while rendering; later actions never resolve
-a replacement runtime generation."
+a replacement app instance."
   (let* ((view (appkit-current-view))
          (owner (and (appkit-view-live-p view)
                      (eq (appkit-app-kind (appkit-view-app view)) 'qq)
@@ -3811,6 +3815,14 @@ a replacement runtime generation."
        (qq-protocol-message-id-p (alist-get 'server-id message))
        (not (qq-state-message-recalled-p message))))
 
+(defun qq-chat--message-current-account-p (message)
+  "Return non-nil when MESSAGE belongs to the selected Gateway account slot."
+  (let ((account-id (and (listp message)
+                         (alist-get 'gateway-account-id message))))
+    (and (stringp account-id)
+         (not (string-empty-p account-id))
+         (equal account-id (qq-gateway-current-account-id)))))
+
 (defun qq-chat--message-essence-capable-p (message)
   "Return non-nil when MESSAGE supports an essence mutation."
   (and (listp message)
@@ -3821,10 +3833,7 @@ a replacement runtime generation."
         (alist-get 'message-seq message))
        (let ((random (alist-get 'native-random message)))
          (and (integerp random) (<= 0 random #xffffffff)))
-       (equal
-        (cons (alist-get 'gateway-account-id message)
-              (alist-get 'gateway-generation message))
-        (qq-gateway-current-account-owner))))
+       (qq-chat--message-current-account-p message)))
 
 (defun qq-chat--friend-pin-target ()
   "Return the current private friend's exact UIN, or signal `user-error'."
@@ -3873,10 +3882,7 @@ a replacement runtime generation."
        (not (qq-state-message-recalled-p message))
        (qq-protocol--nonzero-decimal-string-p
         (alist-get 'message-seq message))
-       (equal
-        (cons (alist-get 'gateway-account-id message)
-              (alist-get 'gateway-generation message))
-        (qq-gateway-current-account-owner))))
+       (qq-chat--message-current-account-p message)))
 
 (defun qq-chat--message-reference (message)
   "Return MESSAGE's closed locator-qualified mutation reference.

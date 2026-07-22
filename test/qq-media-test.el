@@ -666,6 +666,64 @@
       (should (= 5 (length final)))
       (should (= 5 (length qq-media--custom-faces))))))
 
+(ert-deftest qq-media-custom-face-sync-page-adopts-async-next-page-token ()
+  "A synchronous full page must not overwrite its asynchronous successor."
+  (let ((qq-media-custom-face-count 2)
+        (qq-media-custom-face-count-max 4)
+        (qq-media--account-generation 12)
+        (qq-media--custom-faces nil)
+        (qq-media--custom-faces-fetched-at nil)
+        (qq-media--custom-face-waiters nil)
+        (qq-media--custom-face-refresh-owner nil)
+        counts
+        first-errback
+        second-success
+        second-errback
+        cancelled
+        delivered)
+    (cl-letf (((symbol-function 'qq-api-fetch-custom-face-info)
+               (lambda (callback &optional errback count)
+                 (push count counts)
+                 (if (= count 2)
+                     (progn
+                       (setq first-errback errback)
+                       (funcall callback
+                                '(((md5 . "first"))
+                                  ((md5 . "second"))))
+                       'first-page-request)
+                   (setq second-success callback
+                         second-errback errback)
+                   'second-page-request)))
+              ((symbol-function 'qq-api-cancel-request)
+               (lambda (token)
+                 (push token cancelled)
+                 ;; A completed first page may synchronously report
+                 ;; cancellation while the second page already owns the chain.
+                 (pcase token
+                   ('first-page-request
+                    (funcall first-errback nil "cancelled"))
+                   ('second-page-request
+                    (funcall second-errback nil "cancelled"))))))
+      (qq-media-ensure-custom-faces
+       (lambda (faces) (setq delivered faces)))
+      (should (equal '(2 4) (nreverse counts)))
+      (should (eq 'second-page-request
+                  (plist-get qq-media--custom-face-refresh-owner :token)))
+      (should (equal '(first-page-request) cancelled))
+
+      ;; Account reset must cancel the currently adopted second-page request,
+      ;; not the synchronously completed first page.
+      (qq-media--revoke-custom-face-work)
+      (should (equal '(second-page-request first-page-request) cancelled))
+      (should-not qq-media--custom-face-refresh-owner)
+      (should-not qq-media--custom-face-waiters)
+
+      ;; A late completion from the cancelled current page is also stale.
+      (funcall second-success '(((md5 . "late"))))
+      (should-not delivered)
+      (should-not qq-media--custom-faces)
+      (should-not qq-media--custom-faces-fetched-at))))
+
 (ert-deftest qq-media-custom-face-to-segment-personal-sticker ()
   "Personal favorites become image segments with sub_type 1."
   (let* ((file (make-temp-file "qq-fav" nil ".jpg"))
@@ -1597,15 +1655,15 @@
                              (media_id . ,media-id)))))
          (qq-media--native-record-playbacks (make-hash-table :test #'equal))
          (qq-gateway-media--media (make-hash-table :test #'equal))
-         (account-owner '("10001" . "9")))
+         (account-id "10001"))
     (puthash media-id
              `((media_id . ,media-id)
                (phase . "materializing")
                (bytes_done . "4096")
                (bytes_total . "8192"))
              qq-gateway-media--media)
-    (cl-letf (((symbol-function 'qq-gateway-current-account-owner)
-               (lambda () account-owner))
+    (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+               (lambda () account-id))
               ((symbol-function 'qq-gateway-transport-ready-p)
                (lambda () t))
               ((symbol-function 'qq-gateway--method-available-p)
@@ -1634,10 +1692,10 @@
                              (media_id . ,media-id)))))
          (qq-media--native-record-playbacks (make-hash-table :test #'equal))
          (qq-media--native-record-current-id nil)
-         (account-owner '("10001" . "11"))
+         (account-id "10001")
          operation prepared-id)
-    (cl-letf (((symbol-function 'qq-gateway-current-account-owner)
-               (lambda () account-owner))
+    (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+               (lambda () account-id))
               ((symbol-function 'qq-media-native-record-playback-available-p)
                (lambda () t))
               ((symbol-function 'qq-gateway-media-prepare-record-playback)
@@ -1647,7 +1705,7 @@
                        (qq-gateway-media-operation-create
                         :active-p t
                         :media-id called-media-id
-                        :owner account-owner))))
+                        :account-id account-id))))
               ((symbol-function 'qq-media--notify-native-record-state)
                #'ignore)
               ((symbol-function 'message) #'ignore))
@@ -1722,20 +1780,20 @@
          (owner (appkit-start-app 'qq :id 'record-owner :shutdown #'ignore))
          (qq-media--native-record-playbacks (make-hash-table :test #'equal))
          (qq-media--native-record-current-id nil)
-         (account-owner '("10001" . "13"))
+         (account-id "10001")
          operation)
     (unwind-protect
-        (cl-letf (((symbol-function 'qq-gateway-current-account-owner)
-                   (lambda () account-owner))
+        (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+                   (lambda () account-id))
                   ((symbol-function 'qq-media-native-record-playback-available-p)
                    (lambda () t))
                   ((symbol-function 'qq-gateway-media-prepare-record-playback)
                    (lambda (called-media-id _callback &optional _errback)
                      (setq operation
-                           (qq-gateway-media-operation-create
-                            :active-p t
-                            :media-id called-media-id
-                            :owner account-owner))))
+                            (qq-gateway-media-operation-create
+                             :active-p t
+                             :media-id called-media-id
+                             :account-id account-id))))
                   ((symbol-function 'qq-media--notify-native-record-state)
                    #'ignore))
           (qq-media-play-native-record segment :owner owner)

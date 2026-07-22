@@ -15,24 +15,22 @@
   "Native contact capabilities exercised by directory tests.")
 
 (defun qq-gateway-directory-test-account
-    (&optional account-id generation uin uid)
+    (&optional account-id uin uid)
   "Return an online test account with exact identity fields."
   `((account_id . ,(or account-id "slot-a"))
     (label . "Primary")
     (phase . "online")
     (uin . ,(or uin "10002"))
     (uid . ,(or uid "u_self"))
-    (generation . ,(or generation "7"))
     (challenge)
     (problem)))
 
 (defun qq-gateway-directory-test-friends-result ()
   "Return one closed friend-list result."
-  (copy-tree
+  (qq-gateway-value-copy
    '((account_id . "slot-a")
-    (generation . "7")
     (friends
-     . (((uid . "u_alice")
+     . [((uid . "u_alice")
          (uin . "9007199254740999")
          (category_id . 7)
          (nickname . "Alice")
@@ -49,18 +47,17 @@
          (personal_sign)
          (qid)
          (age)
-         (gender))))
+         (gender))])
     (categories
-     . (((id . 7) (name . "Work") (member_count . 1) (sort_id . 20))
-        ((id . 3) (name . "Other") (member_count . 1) (sort_id . 21)))))))
+     . [((id . 7) (name . "Work") (member_count . 1) (sort_id . 20))
+        ((id . 3) (name . "Other") (member_count . 1) (sort_id . 21))]))))
 
 (defun qq-gateway-directory-test-groups-result ()
   "Return one closed joined-group result."
-  (copy-tree
+  (qq-gateway-value-copy
    '((account_id . "slot-a")
-    (generation . "7")
     (groups
-     . (((group_uin . "8209413637")
+     . [((group_uin . "8209413637")
          (owner_uid . "u_self")
          (name . "Protocol Lab")
          (member_count . 3)
@@ -71,16 +68,15 @@
          (announcement . "Welcome")
          (remark . "Lab")
          (last_speak_time . 1784700000)
-         (latest_sequence . 123)))))))
+         (latest_sequence . 123))]))))
 
 (defun qq-gateway-directory-test-members-result ()
   "Return one closed group-member result."
-  (copy-tree
+  (qq-gateway-value-copy
    '((account_id . "slot-a")
-    (generation . "7")
     (group_uin . "8209413637")
     (members
-     . (((uid . "u_owner")
+     . [((uid . "u_owner")
          (uin . "10001")
          (nickname . "Owner")
          (member_card . "Boss")
@@ -109,7 +105,7 @@
          (permission . ((kind . "unknown") (code . 99)))
          (join_timestamp . 5)
          (last_message_timestamp . 6)
-         (shut_up_timestamp . 0))))
+         (shut_up_timestamp . 0))])
     (member_count . 3)
     (member_list_change_sequence . 11)
     (member_card_sequence . 12))))
@@ -132,12 +128,13 @@
           (make-hash-table :test #'equal))
          (qq-gateway-message--pending-sends
           (make-hash-table :test #'equal))
-         (qq-gateway-directory--request-counter 0)
          (qq-gateway-directory--active-requests
           (make-hash-table :test #'equal))
          (qq-gateway-directory--member-pages
           (make-hash-table :test #'equal))
          (qq-gateway-directory--cache-owner nil)
+         (qq-gateway-directory--observed-account-id nil)
+         (qq-gateway-directory--observed-account-phase nil)
          (qq-gateway-transport--state 'ready)
          (qq-state-change-hook nil))
      (unwind-protect
@@ -146,9 +143,88 @@
            (qq-gateway--replace-accounts
             (list (qq-gateway-directory-test-account)) 'ready "gateway-test")
            (qq-gateway-message--ensure-projection-owner
-            (qq-gateway-current-account-owner))
+            (qq-gateway-current-account-id))
            ,@body)
        (qq-state-reset))))
+
+(ert-deftest qq-gateway-directory-wire-arrays-and-nullables-are-distinct ()
+  (let* ((friends-result (qq-gateway-directory-test-friends-result))
+         (friends (alist-get 'friends friends-result))
+         (categories (alist-get 'categories friends-result)))
+    (setf (alist-get 'friends friends-result) (vconcat friends)
+          (alist-get 'categories friends-result) (vconcat categories)
+          (alist-get 'remark (aref friends 0)) qq-gateway-wire-null)
+    (let ((validated
+           (qq-gateway-directory--validate-friends-result
+            friends-result "slot-a")))
+      (should (listp (alist-get 'friends validated)))
+      (should (listp (alist-get 'categories validated)))
+      (should (null (alist-get 'remark
+                               (car (alist-get 'friends validated))))))
+    (setf (alist-get 'remark (aref friends 0)) [])
+    (should-error
+     (qq-gateway-directory--validate-friends-result
+      friends-result "slot-a")
+     :type 'error)
+    (setf (alist-get 'friends friends-result) qq-gateway-wire-null)
+    (should-error
+     (qq-gateway-directory--validate-friends-result
+      friends-result "slot-a")
+     :type 'error))
+  (let ((groups-result (qq-gateway-directory-test-groups-result)))
+    (setf (alist-get 'groups groups-result)
+          (vconcat (alist-get 'groups groups-result)))
+    (should
+     (listp
+      (alist-get
+       'groups
+       (qq-gateway-directory--validate-groups-result
+        groups-result "slot-a"))))
+    (setf (alist-get 'groups groups-result) qq-gateway-wire-null)
+    (should-error
+     (qq-gateway-directory--validate-groups-result
+      groups-result "slot-a")
+     :type 'error))
+  (let ((members-result (qq-gateway-directory-test-members-result)))
+    (setf (alist-get 'members members-result)
+          (vconcat (alist-get 'members members-result)))
+    (should
+     (listp
+      (alist-get
+       'members
+       (qq-gateway-directory--validate-members-result
+        members-result "slot-a" "8209413637"))))
+    (setf (alist-get 'members members-result) qq-gateway-wire-null)
+    (should-error
+     (qq-gateway-directory--validate-members-result
+      members-result "slot-a" "8209413637")
+     :type 'error)))
+
+(ert-deftest qq-gateway-directory-validator-and-page-own-strings ()
+  (qq-gateway-directory-test-with-state
+    (let* ((result (qq-gateway-directory-test-members-result))
+           (raw-uid (copy-sequence "u_owner"))
+           (owner "slot-a"))
+      (setf (alist-get 'uid (aref (alist-get 'members result) 0)) raw-uid)
+      (let ((validated
+             (qq-gateway-directory--validate-members-result
+              result owner "8209413637")))
+        (qq-gateway-directory--set-cache-owner owner)
+        (qq-gateway-directory--project-members validated owner)
+        (aset (alist-get 'uid (car (alist-get 'members validated))) 0 ?X)
+        (let* ((page
+                (qq-gateway-directory-group-member-page "8209413637"))
+               (first (car (alist-get 'members page))))
+          (aset (alist-get 'user_id first) 0 ?X)))
+      (should (equal raw-uid "u_owner"))
+      (should (equal
+               (alist-get
+                'user_id
+                (car
+                 (alist-get
+                  'members
+                  (qq-gateway-directory-group-member-page "8209413637"))))
+               "10001")))))
 
 (ert-deftest qq-gateway-directory-friends-project-exact-order-and-identities ()
   (qq-gateway-directory-test-with-state
@@ -193,7 +269,7 @@
 (ert-deftest qq-gateway-directory-friend-count-drift-is-preserved ()
   (qq-gateway-directory-test-with-state
     (let ((result (qq-gateway-directory-test-friends-result)) callback-value)
-      (setf (alist-get 'member_count (car (alist-get 'categories result))) 2)
+      (setf (alist-get 'member_count (aref (alist-get 'categories result) 0)) 2)
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-gateway-transport-capabilities)
@@ -211,7 +287,7 @@
 (ert-deftest qq-gateway-directory-friend-unknown-category-is-atomic ()
   (qq-gateway-directory-test-with-state
     (let ((result (qq-gateway-directory-test-friends-result)) failure)
-      (setf (alist-get 'category_id (car (alist-get 'friends result))) 99)
+      (setf (alist-get 'category_id (aref (alist-get 'friends result) 0)) 99)
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-gateway-transport-capabilities)
@@ -254,7 +330,7 @@
           (should (equal (alist-get 'latest_sequence group) "123"))
           (should (= (alist-get 'max_member_count group) 500)))))))
 
-(ert-deftest qq-gateway-directory-group-settings-validate-generation-receipts ()
+(ert-deftest qq-gateway-directory-group-settings-validate-owned-receipts ()
   (qq-gateway-directory-test-with-state
     (let (calls receipts)
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
@@ -268,16 +344,16 @@
                     callback
                     (pcase method
                       ("group.set_name"
-                       '((account_id . "slot-a") (generation . "7")
+                       '((account_id . "slot-a")
                          (group_uin . "8209413637") (name . "New Name")))
                       ("group.set_remark"
-                       '((account_id . "slot-a") (generation . "7")
+                       '((account_id . "slot-a")
                          (group_uin . "8209413637") (remark . "")))
                       ("group.set_whole_mute"
-                       '((account_id . "slot-a") (generation . "7")
+                       '((account_id . "slot-a")
                          (group_uin . "8209413637") (enabled . :false)))
                       ("group.set_pinned"
-                       '((account_id . "slot-a") (generation . "7")
+                       '((account_id . "slot-a")
                          (group_uin . "8209413637") (pinned . t)))))
                    method)))
         (qq-gateway-directory-set-group-name
@@ -305,7 +381,7 @@
            ((account_id . "slot-a") (group_uin . "8209413637")
             (pinned . t)))))))))
 
-(ert-deftest qq-gateway-directory-friend-pinned-validates-generation-and-uins ()
+(ert-deftest qq-gateway-directory-friend-pinned-validates-owner-and-uins ()
   (qq-gateway-directory-test-with-state
     (let (sent callback-value)
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
@@ -317,7 +393,7 @@
                    (setq sent (list method params))
                    (funcall
                     callback
-                    '((account_id . "slot-a") (generation . "7")
+                    '((account_id . "slot-a")
                       (friend_uin . "9007199254740999") (pinned . :false)))
                    "friend-pin-request")))
         (should
@@ -336,7 +412,7 @@
                      "9007199254740999"))
       (should (eq (alist-get 'pinned callback-value) :false)))))
 
-(ert-deftest qq-gateway-directory-group-setting-rejects-stale-generation ()
+(ert-deftest qq-gateway-directory-group-setting-rejects-wrong-account ()
   (qq-gateway-directory-test-with-state
     (let (success failure)
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
@@ -346,7 +422,7 @@
                 ((symbol-function 'qq-gateway-transport-send)
                  (lambda (_method _params callback _errback &optional _early)
                    (funcall callback
-                            '((account_id . "slot-a") (generation . "6")
+                            '((account_id . "slot-b")
                               (group_uin . "8209413637") (name . "Stale")))
                    "request")))
         (qq-gateway-directory-set-group-name
@@ -367,7 +443,7 @@
                    (setq sent-method method sent-params params)
                    (funcall
                     callback
-                    '((account_id . "slot-a") (generation . "7")
+                    '((account_id . "slot-a")
                       (group_uin . "8209413637")
                       (title . "今日已打卡")
                       (keep_day_text . "连续 7 天")
@@ -399,7 +475,7 @@
                  (lambda (_method _params callback _errback &optional _early)
                    (funcall
                     callback
-                    '((account_id . "slot-a") (generation . "7")
+                    '((account_id . "slot-a")
                       (group_uin . "8209413637") (title . "ok")
                       (keep_day_text . "") (group_rank_text . "")
                       (clock_in_timestamp . 0) (detail_url . "")
@@ -423,7 +499,7 @@
                    (setq sent-method method sent-params params)
                    (funcall
                     callback
-                    '((account_id . "slot-a") (generation . "7")
+                    '((account_id . "slot-a")
                       (group_uin . "8209413637") (can_at_all . t)
                       (remain_at_all_count_for_uin . 3)
                       (remain_at_all_count_for_group . 9)))
@@ -445,15 +521,15 @@
   (qq-gateway-directory-test-with-state
     (dolist
         (result
-         '(((account_id . "slot-a") (generation . "7")
+         '(((account_id . "slot-a")
             (group_uin . "8209413637") (can_at_all . :false)
             (remain_at_all_count_for_uin . 3)
             (remain_at_all_count_for_group . 9) (unexpected . t))
-           ((account_id . "slot-a") (generation . "7")
+           ((account_id . "slot-a")
             (group_uin . "8209413637") (can_at_all)
             (remain_at_all_count_for_uin . 3)
             (remain_at_all_count_for_group . 9))
-           ((account_id . "slot-a") (generation . "7")
+           ((account_id . "slot-a")
             (group_uin . "8209413637") (can_at_all . t)
             (remain_at_all_count_for_uin . 4294967296)
             (remain_at_all_count_for_group . 9))))
@@ -477,7 +553,7 @@
   (qq-gateway-directory-test-with-state
     (let (sent-method sent-params callback-value)
       (qq-gateway-directory--set-cache-owner
-       (qq-gateway-current-account-owner))
+       (qq-gateway-current-account-id))
       (puthash "8209413637" '((member_count . 3))
                qq-gateway-directory--member-pages)
       (puthash 'groups 'old-group-list
@@ -492,7 +568,7 @@
                  (lambda (method params callback _errback &optional _early)
                    (setq sent-method method sent-params params)
                    (funcall callback
-                            '((account_id . "slot-a") (generation . "7")
+                            '((account_id . "slot-a")
                               (group_uin . "8209413637")))
                    "leave-request")))
         (should
@@ -516,7 +592,7 @@
   (qq-gateway-directory-test-with-state
     (let (success failure)
       (qq-gateway-directory--set-cache-owner
-       (qq-gateway-current-account-owner))
+       (qq-gateway-current-account-id))
       (puthash "8209413637" '((member_count . 3))
                qq-gateway-directory--member-pages)
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
@@ -526,7 +602,7 @@
                 ((symbol-function 'qq-gateway-transport-send)
                  (lambda (_method _params callback _errback &optional _early)
                    (funcall callback
-                            '((account_id . "slot-a") (generation . "7")
+                            '((account_id . "slot-a")
                               (group_uin . "8209413637")
                               (is_dismiss . :false)))
                    "request")))
@@ -554,11 +630,11 @@
                       ("contact.list_group_members"
                        (qq-gateway-directory-test-members-result))
                       ("group.set_member_card"
-                       '((account_id . "slot-a") (generation . "7")
+                       '((account_id . "slot-a")
                          (group_uin . "8209413637")
                          (target_uin . "10002") (card . "")))
                       ("group.set_member_special_title"
-                       '((account_id . "slot-a") (generation . "7")
+                       '((account_id . "slot-a")
                          (group_uin . "8209413637")
                          (target_uin . "10002")
                          (special_title . "Lead")))))
@@ -601,7 +677,7 @@
                 ((symbol-function 'qq-gateway-transport-send)
                  (lambda (_method _params callback _errback &optional _early)
                    (funcall callback
-                            '((account_id . "slot-a") (generation . "7")
+                            '((account_id . "slot-a")
                               (group_uin . "8209413637")
                               (target_uin . "10003") (card . "Ferris")))
                    "request")))
@@ -626,7 +702,7 @@
                     callback
                     (if (equal method "contact.list_group_members")
                         (qq-gateway-directory-test-members-result)
-                      '((account_id . "slot-a") (generation . "7")
+                      '((account_id . "slot-a")
                         (group_uin . "8209413637")
                         (target_uin . "10002")
                         (reject_add_request . t))))
@@ -667,7 +743,7 @@
                 ((symbol-function 'qq-gateway-transport-send)
                  (lambda (_method _params callback _errback &optional _early)
                    (funcall callback
-                            '((account_id . "slot-a") (generation . "7")
+                            '((account_id . "slot-a")
                               (group_uin . "8209413637")
                               (target_uin . "10002")
                               (reject_add_request . t)))
@@ -725,7 +801,7 @@
 (ert-deftest qq-gateway-directory-members-reject-numeric-identity ()
   (qq-gateway-directory-test-with-state
     (let ((result (qq-gateway-directory-test-members-result)) failure)
-      (setf (alist-get 'uin (car (alist-get 'members result))) 10001)
+      (setf (alist-get 'uin (aref (alist-get 'members result) 0)) 10001)
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-gateway-transport-capabilities)
@@ -766,7 +842,7 @@
 
 (ert-deftest qq-gateway-directory-newest-request-owns-projection ()
   (qq-gateway-directory-test-with-state
-    (let (calls first-failure callbacks)
+    (let (calls first-failure callbacks cancelled)
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-gateway-transport-capabilities)
@@ -774,12 +850,15 @@
                 ((symbol-function 'qq-gateway-transport-send)
                  (lambda (_method _params callback errback &optional _early)
                    (setq calls (append calls (list (cons callback errback))))
-                   (format "request-%d" (length calls)))))
+                   (format "request-%d" (length calls))))
+                ((symbol-function 'qq-gateway-transport-cancel)
+                 (lambda (token) (push token cancelled) t)))
         (qq-gateway-directory-refresh-friends
          (lambda (_) (push 'first callbacks))
          (lambda (_body reason) (setq first-failure reason)))
         (qq-gateway-directory-refresh-friends
          (lambda (_) (push 'second callbacks)) #'ignore t)
+        (should (equal cancelled '("request-1")))
         (funcall (car (nth 0 calls))
                  (qq-gateway-directory-test-friends-result))
         (should (string-match-p "superseded" first-failure))
@@ -789,9 +868,33 @@
         (should (equal callbacks '(second)))
         (should (qq-state-friend-categories-loaded-p))))))
 
+(ert-deftest qq-gateway-directory-synchronous-settlement-cancels-returned-token ()
+  (qq-gateway-directory-test-with-state
+    (let (delivered cancelled)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-directory-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (funcall callback
+                            (qq-gateway-directory-test-friends-result))
+                   "already-completed"))
+                ((symbol-function 'qq-gateway-transport-cancel)
+                 (lambda (token) (setq cancelled token) t)))
+        (should
+         (equal
+          (qq-gateway-directory-refresh-friends
+           (lambda (categories) (setq delivered categories)))
+          "already-completed")))
+      (should delivered)
+      (should (equal cancelled "already-completed"))
+      (should-not (gethash 'friends
+                           qq-gateway-directory--active-requests)))))
+
 (ert-deftest qq-gateway-directory-account-switch-rejects-stale-response ()
   (qq-gateway-directory-test-with-state
-    (let (response-callback failure)
+    (let (response-callback failure cancelled)
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-gateway-transport-capabilities)
@@ -799,33 +902,55 @@
                 ((symbol-function 'qq-gateway-transport-send)
                  (lambda (_method _params callback _errback &optional _early)
                    (setq response-callback callback)
-                   "request-friends")))
+                   "request-friends"))
+                ((symbol-function 'qq-gateway-transport-cancel)
+                 (lambda (token) (setq cancelled token) t)))
         (qq-gateway-directory-refresh-friends
          nil (lambda (_body reason) (setq failure reason)))
         (qq-gateway--upsert-account
          (qq-gateway-directory-test-account
-          "slot-b" "11" "10003" "u_other_self")
+          "slot-b" "10003" "u_other_self")
          'changed)
         (qq-gateway-account-select "slot-b")
+        (qq-gateway-directory--handle-account-selection "slot-a" "slot-b")
+        (should (equal cancelled "request-friends"))
         (funcall response-callback
                  (qq-gateway-directory-test-friends-result))
-        (should (string-match-p "changed owner" failure))
+        (should (string-match-p "account changed" failure))
         (should-not (qq-state-friend-categories-loaded-p))))))
 
-(ert-deftest qq-gateway-directory-generation-change-clears-member-cache ()
+(ert-deftest qq-gateway-directory-online-phase-exit-cancels-native-session-cache ()
   (qq-gateway-directory-test-with-state
-    (setq qq-gateway-directory--cache-owner '("slot-a" . "7"))
-    (puthash "8209413637" '((members . test))
-             qq-gateway-directory--member-pages)
-    (puthash 'friends 'old-token qq-gateway-directory--active-requests)
-    (qq-gateway--upsert-account
-     (qq-gateway-directory-test-account
-      "slot-a" "8" "10002" "u_self")
-     'changed)
-    (qq-gateway-directory--handle-account-context 'changed "slot-a")
-    (should (equal qq-gateway-directory--cache-owner '("slot-a" . "8")))
-    (should (= (hash-table-count qq-gateway-directory--member-pages) 0))
-    (should (= (hash-table-count qq-gateway-directory--active-requests) 0))))
+    (let ((qq-gateway-directory--cache-owner "slot-a")
+          (qq-gateway-directory--observed-account-id "slot-a")
+          (qq-gateway-directory--observed-account-phase "online")
+          cancelled failure)
+      (puthash "8209413637" '((members . test))
+               qq-gateway-directory--member-pages)
+      (let ((request
+             (qq-gateway-directory--request-record-create
+              :resource 'friends :owner "slot-a" :state 'active
+              :transport-token "old-token"
+              :errback (lambda (_body reason) (setq failure reason)))))
+        (puthash 'friends request qq-gateway-directory--active-requests)
+        (let ((account (qq-gateway-directory-test-account)))
+          (setf (alist-get 'phase account) "stopped")
+          (qq-gateway--upsert-account account 'changed))
+        (cl-letf (((symbol-function 'qq-gateway-transport-cancel)
+                   (lambda (token) (setq cancelled token) t)))
+          (qq-gateway-directory--handle-account-registry-change
+           'changed "slot-a"))
+        (should (equal qq-gateway-directory--cache-owner "slot-a"))
+        (should (equal cancelled "old-token"))
+        (should (eq (qq-gateway-directory--request-record-state request)
+                    'cancelled))
+        (should (string-match-p "Native Session changed" failure))
+        (should (= (hash-table-count
+                    qq-gateway-directory--member-pages)
+                   0))
+        (should (= (hash-table-count
+                    qq-gateway-directory--active-requests)
+                   0))))))
 
 (provide 'qq-gateway-directory-test)
 

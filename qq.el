@@ -15,7 +15,7 @@
 ;; - select and control complete lifecycles for multiple QQ accounts
 ;; - browse recent sessions in an appkit-backed root buffer
 ;; - open chat buffers, fetch history, and exchange structured messages
-;; - keep exact account-generation state updated from protocol events
+;; - keep stable managed-account state updated from closed protocol events
 ;; - transient menus for root / chat / message / attachments
 
 ;;; Code:
@@ -25,10 +25,12 @@
 (require 'qq-customize)
 (require 'qq-runtime)
 (require 'qq-state)
+(require 'qq-gateway-rpc)
 (require 'qq-gateway)
 (require 'qq-gateway-resource)
 (require 'qq-gateway-media)
 (require 'qq-gateway-message)
+(require 'qq-gateway-conversation)
 (require 'qq-gateway-directory)
 (require 'qq-native)
 (require 'qq-chat)
