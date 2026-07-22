@@ -318,6 +318,21 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (push '(file_uuid . "must-stay-native") (alist-get 'payload record))
     (should-error (qq-gateway-message--validate-segment record))))
 
+(ert-deftest qq-gateway-message-record-retains-only-opaque-media-handle ()
+  (let* ((media-id "media-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+         (record `((kind . "record")
+                   (payload . ((duration_seconds . 17)
+                               (media_id . ,media-id)))))
+         (validated (qq-gateway-message--validate-segment record))
+         (internal (qq-gateway-message--segment-to-internal validated)))
+    (should (equal (alist-get 'media_id (alist-get 'data internal)) media-id))
+    (dolist (malformed '("media-short" 7 nil))
+      (let ((copy (copy-tree record)))
+        (setf (alist-get 'media_id (alist-get 'payload copy)) malformed)
+        (should-error (qq-gateway-message--validate-segment copy))))
+    (push '(file_uuid . "must-stay-native") (alist-get 'payload record))
+    (should-error (qq-gateway-message--validate-segment record))))
+
 (ert-deftest qq-gateway-message-projects-private-peer-by-self-endpoint ()
   (qq-gateway-message-test-with-state
     (qq-gateway-message--handle-event

@@ -18,6 +18,7 @@
 (require 'qq-customize)
 (require 'qq-gateway)
 (require 'qq-gateway-attachment)
+(require 'qq-gateway-media)
 (require 'qq-protocol)
 (require 'qq-state)
 
@@ -181,11 +182,14 @@
                        (alist-get 'message_id target)))
            (error "qq: Gateway reply target is malformed"))))
       ("record"
-       (unless (and (qq-gateway--exact-object-keys-p
-                     payload '(duration_seconds))
+       (unless (and (qq-gateway-message--closed-object-p
+                     payload '(duration_seconds) '(media_id))
                     (qq-gateway-message--uint32-p
                      (alist-get 'duration_seconds payload)))
-         (error "qq: Gateway record segment is malformed")))
+         (error "qq: Gateway record segment is malformed"))
+       (when (assq 'media_id payload)
+         (unless (qq-gateway-media--id-p (alist-get 'media_id payload))
+           (error "qq: Gateway record media_id is malformed"))))
       ("unsupported"
        (unless (qq-gateway-message--closed-object-p
                 payload '(native_keys summary) '(raw))
