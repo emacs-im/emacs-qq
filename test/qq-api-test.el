@@ -3204,6 +3204,41 @@ The authoritative post-state reports UNREAD-COUNT."
      (qq-api--validate-group-pinned-receipt
       '((group_id . "20002") (pinned . t)) "20001" t))))
 
+(ert-deftest qq-api-friend-pinned-uses-closed-napcat-fork-contract ()
+  (let (calls delivered)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (action params callback &optional _errback)
+                 (push (list action params) calls)
+                 (funcall callback `((data . ,params)))
+                 'friend-pin-request)))
+      (should
+       (eq (qq-api-set-friend-pinned
+            "9007199254740999" t
+            (lambda (receipt) (setq delivered receipt)))
+           'friend-pin-request))
+      (qq-api-set-friend-pinned "9007199254740999" nil #'ignore))
+    (should
+     (equal
+      (nreverse calls)
+      '(("emacs_set_friend_pinned"
+         ((user_id . "9007199254740999") (pinned . t)))
+        ("emacs_set_friend_pinned"
+         ((user_id . "9007199254740999") (pinned . :false))))))
+    (should
+     (equal delivered
+            '((user_id . "9007199254740999") (pinned . t))))
+    (should-error
+     (qq-api-set-friend-pinned 9007199254740999 t)
+     :type 'user-error)
+    (should-error
+     (qq-api--validate-friend-pinned-receipt
+      '((user_id . "9007199254740999") (pinned . t) (uid . "u_friend"))
+      "9007199254740999" t))
+    (should-error
+     (qq-api--validate-friend-pinned-receipt
+      '((user_id . "9007199254741000") (pinned . t))
+      "9007199254740999" t))))
+
 (ert-deftest qq-api-send-poke-builds-group-request-and-local-notice ()
   (let (captured-action captured-params applied)
     (qq-state-reset)

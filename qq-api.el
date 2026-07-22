@@ -3098,6 +3098,36 @@ CALLBACK receives the successful OneBot response."
        (funcall callback response)))
    (or errback #'qq-api--default-error)))
 
+(defun qq-api--validate-friend-pinned-receipt (data user-id pinned)
+  "Validate closed friend pinned DATA against USER-ID and PINNED."
+  (unless (qq-api--exact-object-keys-p data '(user_id pinned))
+    (error "qq: emacs_set_friend_pinned returned invalid fields"))
+  (unless (and (equal (alist-get 'user_id data) user-id)
+               (equal (alist-get 'pinned data) pinned))
+    (error "qq: emacs_set_friend_pinned contradicted its request"))
+  (copy-tree data))
+
+(defun qq-api-set-friend-pinned
+    (user-id pinned &optional callback errback)
+  "Set USER-ID's friend conversation PINNED state through the NapCat fork."
+  (unless (qq-api-user-id-p user-id)
+    (user-error "qq: friend pinned state requires an exact user UIN"))
+  (setq pinned (if pinned t :false))
+  (qq-api-call
+   "emacs_set_friend_pinned"
+   `((user_id . ,user-id) (pinned . ,pinned))
+   (lambda (response)
+     (condition-case error-data
+         (let ((receipt
+                (qq-api--validate-friend-pinned-receipt
+                 (qq-api--response-data response) user-id pinned)))
+           (when callback
+             (funcall callback receipt)))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   (or errback #'qq-api--default-error)))
+
 (defun qq-api-set-group-remark
     (group-id remark &optional callback errback)
   "Set or clear GROUP-ID's account-local REMARK through NapCat OneBot.

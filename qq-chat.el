@@ -3818,6 +3818,45 @@ a replacement runtime generation."
                 (qq-gateway-current-account-owner))))
          (_ nil))))
 
+(defun qq-chat--friend-pin-target ()
+  "Return the current private friend's exact UIN, or signal `user-error'."
+  (let* ((session (or (qq-chat--session)
+                      (user-error "qq: this buffer has no session")))
+         (user-id (or (alist-get 'peer-uin session)
+                      (alist-get 'target-id session))))
+    (unless (eq (alist-get 'type session) 'private)
+      (user-error "qq: conversation pinning here requires a private chat"))
+    (unless (qq-backend-user-id-p user-id)
+      (user-error "qq: private chat has no exact peer UIN"))
+    (unless (qq-state-friend user-id)
+      (user-error "qq: conversation pinning requires a current friend"))
+    user-id))
+
+(defun qq-chat--friend-pin-capable-p ()
+  "Return non-nil when the current chat targets an authoritative friend."
+  (condition-case nil
+      (progn (qq-chat--friend-pin-target) t)
+    (user-error nil)))
+
+(defun qq-chat--set-friend-pinned (pinned)
+  "Set the current friend conversation's PINNED state explicitly."
+  (let ((user-id (qq-chat--friend-pin-target)))
+    (qq-backend-set-friend-pinned
+     user-id pinned
+     (lambda (_receipt)
+       (message "qq: friend conversation %s"
+                (if pinned "pinned" "unpinned"))))))
+
+(defun qq-chat-pin-friend ()
+  "Pin the current friend conversation."
+  (interactive)
+  (qq-chat--set-friend-pinned t))
+
+(defun qq-chat-unpin-friend ()
+  "Unpin the current friend conversation."
+  (interactive)
+  (qq-chat--set-friend-pinned nil))
+
 (defun qq-chat--message-todo-capable-p (message)
   "Return non-nil when MESSAGE supports a group todo mutation."
   (and (listp message)
