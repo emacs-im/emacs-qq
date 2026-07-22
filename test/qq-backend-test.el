@@ -112,6 +112,8 @@
          (make-hash-table :test #'equal))
         (qq-gateway-message--pending-recalls
          (make-hash-table :test #'equal))
+        (qq-gateway-message--pending-reactions
+         (make-hash-table :test #'equal))
         (qq-gateway-message--pending-sends
          (make-hash-table :test #'equal))
         (qq-gateway-message--live-frontiers
@@ -139,6 +141,8 @@
         (qq-gateway-message--peer-uin-by-uid
          (make-hash-table :test #'equal))
         (qq-gateway-message--pending-recalls
+         (make-hash-table :test #'equal))
+        (qq-gateway-message--pending-reactions
          (make-hash-table :test #'equal))
         (qq-gateway-message--pending-sends
          (make-hash-table :test #'equal))
@@ -243,6 +247,44 @@
       (should (equal (nth 0 call) "group:8209413637"))
       (should (equal (nth 1 call) "10002"))
       (should (functionp (nth 3 call))))))
+
+(ert-deftest qq-backend-gateway-reaction-routes-whole-message ()
+  (let ((qq-backend 'gateway) call)
+    (cl-letf (((symbol-function 'qq-gateway-message-set-reaction)
+               (lambda (message emoji-id set &optional callback errback)
+                 (setq call (list message emoji-id set callback errback))
+                 "reaction-request")))
+      (let ((message
+             '((session-key . "group:8209413637")
+               (server-id . "7348923749823749823")
+               (message-seq . "9007199254740999"))))
+        (should
+         (equal (qq-backend-set-message-reaction message "178" t)
+                "reaction-request"))
+        (should (eq (nth 0 call) message))
+        (should (equal (nth 1 call) "178"))
+        (should (eq (nth 2 call) t))
+        (should (functionp (nth 4 call)))))))
+
+(ert-deftest qq-backend-onebot-reaction-retains-closed-reference ()
+  (let ((qq-backend 'onebot) call)
+    (cl-letf (((symbol-function 'qq-api-set-message-emoji-like)
+               (lambda (reference emoji-id set &optional callback errback)
+                 (setq call (list reference emoji-id set callback errback))
+                 "onebot-reaction")))
+      (let ((message
+             '((session-key . "group:8209413637")
+               (server-id . "7348923749823749823"))))
+        (should
+         (equal (qq-backend-set-message-reaction message "178" nil)
+                "onebot-reaction"))
+        (should
+         (equal (nth 0 call)
+                '((message_id . "7348923749823749823")
+                  (chat . ((kind . "group")
+                           (group_id . "8209413637"))))))
+        (should (equal (nth 1 call) "178"))
+        (should-not (nth 2 call))))))
 
 (ert-deftest qq-backend-gateway-poke-recall-routes-whole-message ()
   (let ((qq-backend 'gateway) call)

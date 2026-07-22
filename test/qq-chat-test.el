@@ -2928,16 +2928,17 @@
      (qq-chat-mode)
      (setq qq-chat--session-key "group:20001")
      (let (called)
-       (cl-letf (((symbol-function 'qq-api-set-message-emoji-like)
-                  (lambda (reference emoji-id set &rest _)
-                    (setq called (list reference emoji-id set)))))
+       (cl-letf (((symbol-function 'qq-backend-set-message-reaction)
+                  (lambda (message emoji-id set &rest _)
+                    (setq called (list message emoji-id set)))))
          (qq-chat-toggle-message-reaction
           "9007199254741004001" "178"))
-       (should (equal called
-                      '(((message_id . "9007199254741004001")
-                         (chat . ((kind . "group")
-                                  (group_id . "20001"))))
-                        "178" nil)))))))
+       (should (equal (alist-get 'server-id (nth 0 called))
+                      "9007199254741004001"))
+       (should (equal (alist-get 'session-key (nth 0 called))
+                      "group:20001"))
+       (should (equal (nth 1 called) "178"))
+       (should-not (nth 2 called))))))
 
 (ert-deftest qq-chat-react-command-adds-picked-face ()
   (qq-chat-test-with-reset
@@ -2951,15 +2952,13 @@
        (qq-chat-mode)
        (setq qq-chat--session-key "group:20001")
        (let (called)
-         (cl-letf (((symbol-function 'qq-api-set-message-emoji-like)
-                    (lambda (reference emoji-id set &rest _)
-                      (setq called (list reference emoji-id set)))))
+         (cl-letf (((symbol-function 'qq-backend-set-message-reaction)
+                    (lambda (selected emoji-id set &rest _)
+                      (setq called (list selected emoji-id set)))))
            (qq-chat-react-to-message "178" message))
-         (should (equal called
-                        '(((message_id . "9007199254741004001")
-                           (chat . ((kind . "group")
-                                    (group_id . "20001"))))
-                          "178" t))))))))
+         (should (eq (nth 0 called) message))
+         (should (equal (nth 1 called) "178"))
+         (should (eq (nth 2 called) t)))))))
 
 (ert-deftest qq-chat-filter-snapshot-builds-reference-without-caching-message ()
   (qq-chat-test-with-reset

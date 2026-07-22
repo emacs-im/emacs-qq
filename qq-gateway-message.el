@@ -37,6 +37,10 @@
   (make-hash-table :test #'equal)
   "Sequence-scoped recalls awaiting a message in the current projection.")
 
+(defvar qq-gateway-message--pending-reactions
+  (make-hash-table :test #'equal)
+  "Sequence-scoped reaction events awaiting a projected message.")
+
 (defvar qq-gateway-message--pending-sends
   (make-hash-table :test #'equal)
   "Client-sequence receipts awaiting an authoritative self message event.")
@@ -320,6 +324,48 @@
   (qq-gateway-message--validate-poke (alist-get 'poke data))
   (copy-tree data))
 
+(defun qq-gateway-message--validate-reaction (reaction)
+  "Validate and copy one authoritative group REACTION event."
+  (unless (qq-gateway-message--closed-object-p
+           reaction
+           '(conversation sequence operator_uid emoji_id emoji_type is_add count)
+           '(operator_uin))
+    (error "qq: Gateway reaction snapshot has invalid fields"))
+  (let ((conversation (alist-get 'conversation reaction)))
+    (unless (and (qq-gateway--exact-object-keys-p
+                  conversation '(kind group_uin))
+                 (equal (alist-get 'kind conversation) "group")
+                 (qq-gateway--canonical-decimal-p
+                  (alist-get 'group_uin conversation)))
+      (error "qq: Gateway reaction conversation must identify an exact group")))
+  (unless (qq-gateway--canonical-decimal-p (alist-get 'sequence reaction))
+    (error "qq: Gateway reaction sequence must be exact decimal string"))
+  (unless (qq-gateway--non-empty-string-p (alist-get 'operator_uid reaction))
+    (error "qq: Gateway reaction operator UID must be opaque string"))
+  (when (assq 'operator_uin reaction)
+    (unless (qq-gateway--canonical-decimal-p
+             (alist-get 'operator_uin reaction))
+      (error "qq: Gateway reaction operator UIN must be exact decimal string")))
+  (let* ((emoji-id (alist-get 'emoji_id reaction))
+         (emoji-type (alist-get 'emoji_type reaction))
+         (expected-type (and (stringp emoji-id)
+                             (if (<= (length emoji-id) 3) "1" "2"))))
+    (unless (and (qq-gateway--canonical-decimal-p emoji-id t)
+                 (member emoji-type '("1" "2"))
+                 (equal emoji-type expected-type))
+      (error "qq: Gateway reaction emoji identity is malformed")))
+  (unless (memq (alist-get 'is_add reaction) '(t :false))
+    (error "qq: Gateway reaction direction must be JSON boolean"))
+  (unless (qq-gateway-message--uint32-p (alist-get 'count reaction))
+    (error "qq: Gateway reaction count must be uint32"))
+  (copy-tree reaction))
+
+(defun qq-gateway-message--validate-reaction-data (data)
+  "Validate and copy outer authoritative reaction event DATA."
+  (qq-gateway-message--validate-owner-data data 'reaction)
+  (qq-gateway-message--validate-reaction (alist-get 'reaction data))
+  (copy-tree data))
+
 (defun qq-gateway-message--event-owner (data)
   "Return `(ACCOUNT-ID . GENERATION)' carried by event DATA."
   (cons (alist-get 'account_id data) (alist-get 'generation data)))
@@ -337,6 +383,7 @@ Shared `qq-state' is left to the caller's backend-switch or reset transaction."
   (setq qq-gateway-message--projection-owner nil)
   (clrhash qq-gateway-message--peer-uin-by-uid)
   (clrhash qq-gateway-message--pending-recalls)
+  (clrhash qq-gateway-message--pending-reactions)
   (clrhash qq-gateway-message--pending-sends)
   (clrhash qq-gateway-message--live-frontiers)
   nil)
@@ -621,6 +668,10 @@ SESSION-KEY must equal the conversation recorded with the send receipt."
   "Return sequence recall key for OWNER, CONVERSATION-KEY, and SEQUENCE."
   (list (car owner) (cdr owner) conversation-key sequence))
 
+(defun qq-gateway-message--pending-reaction-key (owner group-uin sequence)
+  "Return reaction key for OWNER, GROUP-UIN, and exact SEQUENCE."
+  (list (car owner) (cdr owner) group-uin sequence))
+
 (defun qq-gateway-message--validate-pending-recall (owner normalized)
   "Reject a pending recall that contradicts OWNER's NORMALIZED message."
   (when-let* ((conversation-key
@@ -649,6 +700,42 @@ SESSION-KEY must equal the conversation recorded with the send receipt."
       (remhash key qq-gateway-message--pending-recalls)
       (qq-state-apply-recall (alist-get 'session-key merged) message-id))))
 
+(defun qq-gateway-message--reaction-notice (reaction message)
+  "Return legacy state notice for authoritative REACTION on MESSAGE."
+  (let* ((conversation (alist-get 'conversation reaction))
+         (group-uin (alist-get 'group_uin conversation))
+         (account (qq-gateway-current-account))
+         (operator-uin
+          (or (alist-get 'operator_uin reaction)
+              (and (equal (alist-get 'operator_uid reaction)
+                          (alist-get 'uid account))
+                   (alist-get 'uin account)))))
+    `((notice_type . "group_msg_emoji_like")
+      (group_id . ,group-uin)
+      (message_id . ,(alist-get 'server-id message))
+      ,@(when operator-uin `((user_id . ,operator-uin)))
+      (is_add . ,(alist-get 'is_add reaction))
+      (likes . (((emoji_id . ,(alist-get 'emoji_id reaction))
+                 (emoji_type . ,(alist-get 'emoji_type reaction))
+                 (count . ,(alist-get 'count reaction))))))))
+
+(defun qq-gateway-message--apply-reaction (reaction message)
+  "Apply authoritative REACTION to projected MESSAGE."
+  (qq-state-apply-emoji-like-notice
+   (alist-get 'session-key message)
+   (qq-gateway-message--reaction-notice reaction message)))
+
+(defun qq-gateway-message--apply-pending-reactions (owner normalized merged)
+  "Apply reaction events awaiting OWNER's MERGED NORMALIZED message."
+  (when-let* ((group-uin (alist-get 'group-id normalized))
+              (sequence (alist-get 'message-seq normalized))
+              (key (qq-gateway-message--pending-reaction-key
+                    owner group-uin sequence))
+              (reactions (gethash key qq-gateway-message--pending-reactions)))
+    (dolist (reaction reactions)
+      (qq-gateway-message--apply-reaction reaction merged))
+    (remhash key qq-gateway-message--pending-reactions)))
+
 (defun qq-gateway-message--project-message (data)
   "Project selected-account native message event DATA."
   (let* ((owner (qq-gateway-message--event-owner data))
@@ -659,6 +746,7 @@ SESSION-KEY must equal the conversation recorded with the send receipt."
     (qq-gateway-message--finalize-message-context
      owner (alist-get 'message data) normalized)
     (qq-gateway-message--apply-pending-recall owner normalized merged)
+    (qq-gateway-message--apply-pending-reactions owner normalized merged)
     (when frontier
       (puthash (alist-get 'session-key normalized) frontier
                qq-gateway-message--live-frontiers))
@@ -800,6 +888,25 @@ responses never advance this observation; only `message.received' events do."
             (raw_info . ,(qq-gateway-message--poke-raw-info poke)))))
     (qq-state-apply-poke-notice notice)))
 
+(defun qq-gateway-message--project-reaction (data)
+  "Project selected-account authoritative group reaction event DATA."
+  (let* ((owner (qq-gateway-message--event-owner data))
+         (_owner (qq-gateway-message--ensure-projection-owner owner))
+         (reaction (alist-get 'reaction data))
+         (conversation (alist-get 'conversation reaction))
+         (group-uin (alist-get 'group_uin conversation))
+         (sequence (alist-get 'sequence reaction))
+         (session-key (qq-state-session-key 'group group-uin))
+         (message (qq-gateway-message--message-by-sequence
+                   session-key sequence)))
+    (if message
+        (qq-gateway-message--apply-reaction reaction message)
+      (let* ((key (qq-gateway-message--pending-reaction-key
+                   owner group-uin sequence))
+             (pending (gethash key qq-gateway-message--pending-reactions)))
+        (puthash key (append pending (list (copy-tree reaction)))
+                 qq-gateway-message--pending-reactions)))))
+
 (defun qq-gateway-message--projection-error (event data error-data)
   "Publish projection ERROR-DATA for validated EVENT and DATA."
   (let ((reason (error-message-string error-data)))
@@ -809,7 +916,8 @@ responses never advance this observation; only `message.received' events do."
 
 (defun qq-gateway-message--handle-event (event data)
   "Validate native message EVENT with DATA and project the selected owner."
-  (when (member event '("message.received" "message.recalled" "message.poked"))
+  (when (member event '("message.received" "message.recalled" "message.poked"
+                        "message.reaction_changed"))
     (condition-case error-data
         (let ((validated
                (pcase event
@@ -818,7 +926,9 @@ responses never advance this observation; only `message.received' events do."
                  ("message.recalled"
                   (qq-gateway-message--validate-recall-data data))
                  ("message.poked"
-                  (qq-gateway-message--validate-poke-data data)))))
+                  (qq-gateway-message--validate-poke-data data))
+                 ("message.reaction_changed"
+                  (qq-gateway-message--validate-reaction-data data)))))
           (qq-gateway--run-hook
            'qq-gateway-message-event-hook event (copy-tree validated))
           (when (qq-gateway-message--selected-owner-p validated)
@@ -829,7 +939,9 @@ responses never advance this observation; only `message.received' events do."
                   ("message.recalled"
                    (qq-gateway-message--project-recall validated))
                   ("message.poked"
-                   (qq-gateway-message--project-poke validated)))
+                   (qq-gateway-message--project-poke validated))
+                  ("message.reaction_changed"
+                   (qq-gateway-message--project-reaction validated)))
               (error
                (qq-gateway-message--projection-error
                 event validated projection-error)))))
@@ -1086,7 +1198,8 @@ Return a list of `(NATIVE-MESSAGE . NORMALIZED-MESSAGE)' pairs."
             (qq-state--merge-normalized-message session-key normalized)
           (qq-gateway-message--finalize-message-context
            owner native normalized)
-          (qq-gateway-message--apply-pending-recall owner normalized merged))
+          (qq-gateway-message--apply-pending-recall owner normalized merged)
+          (qq-gateway-message--apply-pending-reactions owner normalized merged))
         (unless (gethash message-id known-ids)
           (cl-incf added)
           (puthash message-id t known-ids))
@@ -1420,6 +1533,81 @@ replace it."
                       `((user_id . ,peer-uin)
                         (sender_id . ,self-id)
                         (target_id . ,target-uin))))))
+             (qq-gateway--invoke callback receipt))
+         (error
+          (qq-gateway--client-error
+           errback "invalid_gateway_result" "%s"
+           (error-message-string error-data)))))
+     errback)))
+
+(defun qq-gateway-message--validate-reaction-receipt
+    (receipt owner message-id sequence emoji-id set)
+  "Validate RECEIPT for OWNER, MESSAGE-ID, SEQUENCE, EMOJI-ID, and SET."
+  (unless (qq-gateway--exact-object-keys-p
+           receipt
+           '(account_id generation message_id sequence emoji_id set))
+    (error "qq: Gateway reaction receipt has invalid fields"))
+  (unless (and (equal (alist-get 'account_id receipt) (car owner))
+               (equal (alist-get 'generation receipt) (cdr owner))
+               (equal (alist-get 'message_id receipt) message-id)
+               (equal (alist-get 'sequence receipt) sequence)
+               (equal (alist-get 'emoji_id receipt) emoji-id)
+               (eq (alist-get 'set receipt) (if set t :false)))
+    (error "qq: Gateway reaction receipt contradicts request"))
+  (copy-tree receipt))
+
+(defun qq-gateway-message-set-reaction
+    (message emoji-id set &optional callback errback)
+  "Add or remove EMOJI-ID on native group MESSAGE.
+
+SET non-nil adds the reaction.  CALLBACK receives the validated synchronous
+receipt; the later `message.reaction_changed' event reconciles the optimistic
+local delta with QQ's authoritative aggregate count."
+  (let* ((owner (or (qq-gateway-current-account-owner)
+                    (user-error "qq: Select a Gateway account first")))
+         (_owner (qq-gateway-message--ensure-projection-owner owner))
+         (session-key (alist-get 'session-key message))
+         (message-id (alist-get 'server-id message))
+         (sequence (alist-get 'message-seq message))
+         (group-uin (and session-key
+                         (qq-state-session-key-target-id session-key)))
+         (set (and set t)))
+    (unless (and session-key
+                 (eq (qq-state-session-key-type session-key) 'group)
+                 (qq-gateway--canonical-decimal-p group-uin)
+                 (qq-gateway--canonical-decimal-p message-id)
+                 (qq-gateway--canonical-decimal-p sequence))
+      (user-error "qq: Native reaction requires exact group message identity"))
+    (unless (and (equal (alist-get 'gateway-account-id message) (car owner))
+                 (equal (alist-get 'gateway-generation message) (cdr owner)))
+      (user-error "qq: Reaction message belongs to another Gateway generation"))
+    (setq emoji-id (format "%s" emoji-id))
+    (qq-gateway-message--validate-sequence emoji-id "Reaction emoji ID")
+    (qq-gateway--send
+     "message.set_reaction"
+     `((account_id . ,(car owner))
+       (conversation . ((kind . "group") (group_uin . ,group-uin)))
+       (message . ((message_id . ,message-id) (sequence . ,sequence)))
+       (emoji_id . ,emoji-id)
+       (set . ,(if set t :false)))
+     (lambda (raw-result)
+       (condition-case error-data
+           (let ((receipt
+                  (qq-gateway-message--validate-reaction-receipt
+                   raw-result owner message-id sequence emoji-id set)))
+             (unless (equal owner (qq-gateway-current-account-owner))
+               (error "qq: Gateway account generation changed during reaction"))
+             (when-let* ((self-id (qq-state-self-user-id)))
+               (qq-state-apply-emoji-like-notice
+                session-key
+                `((notice_type . "group_msg_emoji_like")
+                  (group_id . ,group-uin)
+                  (message_id . ,message-id)
+                  (user_id . ,self-id)
+                  (is_add . ,(if set t :false))
+                  (likes . (((emoji_id . ,emoji-id)
+                             (emoji_type
+                              . ,(if (<= (length emoji-id) 3) "1" "2"))))))))
              (qq-gateway--invoke callback receipt))
          (error
           (qq-gateway--client-error
