@@ -7,7 +7,7 @@
 (require 'qq-gateway-message)
 
 (defconst qq-gateway-message-test-capabilities
-  '("message.send_text" "message.recall")
+  '("message.send_text" "message.recall" "message.get_history")
   "Native Gateway capabilities exercised by message tests.")
 
 (defun qq-gateway-message-test-account
@@ -70,6 +70,22 @@
         (author_uid . ,author-uid)
         (operator_uid . ,operator-uid)
         (tip . ,tip)))))
+
+(cl-defun qq-gateway-message-test-history-result
+    (messages start-sequence end-sequence
+              &key (response-start start-sequence)
+              (response-end end-sequence) (unsupported-count 0))
+  "Return a closed history result containing MESSAGES.
+
+START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
+  `((account_id . "slot-a")
+    (generation . "7")
+    (requested_start_sequence . ,start-sequence)
+    (requested_end_sequence . ,end-sequence)
+    (response_start_sequence . ,response-start)
+    (response_end_sequence . ,response-end)
+    (unsupported_message_count . ,unsupported-count)
+    (messages . ,(copy-tree messages))))
 
 (defmacro qq-gateway-message-test-with-state (&rest body)
   "Run BODY with one selected account and isolated message projection state."
@@ -450,6 +466,287 @@
         (should
          (equal (alist-get 'conversation sent-params)
                 '((kind . "private") (peer_uin . "10001"))))))))
+
+(ert-deftest qq-gateway-message-history-range-stays-exact-decimal ()
+  (should
+   (equal
+    (qq-gateway-message--decimal-add-small "18446744073709551516" 99)
+    "18446744073709551615"))
+  (should
+   (equal
+    (qq-gateway-message--validate-history-range
+     "18446744073709551516" "18446744073709551615")
+    '("18446744073709551516" . "18446744073709551615")))
+  (should (equal (qq-gateway-message--validate-history-range "0" "99")
+                 '("0" . "99")))
+  (dolist (range '((0 "1") ("00" "1") ("2" "1")
+                   ("0" "100")
+                   ("18446744073709551616" "18446744073709551616")))
+    (should-error
+     (qq-gateway-message--validate-history-range (car range) (cadr range))
+     :type 'user-error)))
+
+(ert-deftest qq-gateway-message-history-request-preserves-large-sequences ()
+  (qq-gateway-message-test-with-state
+    (let (sent-method sent-params callback-meta)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall
+                    callback
+                    (qq-gateway-message-test-history-result
+                     nil "18446744073709551516" "18446744073709551615"))
+                   "request-history")))
+        (should
+         (equal
+          (qq-gateway-message-get-history
+           "group:8209413637"
+           "18446744073709551516" "18446744073709551615"
+           (lambda (meta) (setq callback-meta meta)))
+          "request-history"))
+        (should (equal sent-method "message.get_history"))
+        (should
+         (equal
+          sent-params
+          '((account_id . "slot-a")
+            (conversation . ((kind . "group")
+                             (group_uin . "8209413637")))
+            (start_sequence . "18446744073709551516")
+            (end_sequence . "18446744073709551615"))))
+        (should (equal (plist-get callback-meta :message-count) 0))
+        (should
+         (equal (plist-get callback-meta :requested-start-sequence)
+                "18446744073709551516"))))))
+
+(ert-deftest qq-gateway-message-history-merges-once-and-deduplicates-live-row ()
+  (qq-gateway-message-test-with-state
+    (let* ((conversation
+            '((kind . "group")
+              (group_uin . "8209413637")
+              (group_name . "Protocol Lab")
+              (sender_card . "Alice")))
+           (newer-event
+            (qq-gateway-message-test-event
+             :message-id "7348923749823749824"
+             :sequence "101" :conversation conversation))
+           (older
+            (alist-get
+             'message
+             (qq-gateway-message-test-event
+              :message-id "7348923749823749823"
+              :sequence "100" :sent-at 1784699999
+              :conversation conversation)))
+           (newer (alist-get 'message newer-event))
+           history-events callback-meta)
+      (qq-gateway-message--handle-event "message.received" newer-event)
+      (add-hook 'qq-state-change-hook
+                (lambda (event)
+                  (when (eq (plist-get event :type) 'history)
+                    (push event history-events))))
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (funcall
+                    callback
+                    (qq-gateway-message-test-history-result
+                     (list older newer) "100" "101"
+                     :unsupported-count 2))
+                   "request-history")))
+        (qq-gateway-message-get-history
+         "group:8209413637" "100" "101"
+         (lambda (meta) (setq callback-meta meta)))
+        (should (= (length (qq-state-session-messages
+                            "group:8209413637"))
+                   2))
+        (should (= (plist-get callback-meta :message-count) 2))
+        (should (= (plist-get callback-meta :added-count) 1))
+        (should (= (plist-get callback-meta :unsupported-message-count) 2))
+        (should (= (length history-events) 1))
+        (should
+         (equal (plist-get (car history-events) :batch-message-ids)
+                '("7348923749823749823" "7348923749823749824")))))))
+
+(ert-deftest qq-gateway-message-history-applies-earlier-sequence-recall ()
+  (qq-gateway-message-test-with-state
+    (qq-gateway-message--handle-event
+     "message.recalled"
+     (qq-gateway-message-test-recall
+      :target '((kind . "sequence") (sequence . "100"))))
+    (let* ((message
+            (alist-get
+             'message
+             (qq-gateway-message-test-event
+              :sequence "100"
+              :conversation
+              '((kind . "group")
+                (group_uin . "8209413637")
+                (group_name . "Protocol Lab")
+                (sender_card . "Alice")))))
+           (result (qq-gateway-message-test-history-result
+                    (list message) "100" "100")))
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (funcall callback result)
+                   "request-history")))
+        (qq-gateway-message-get-history
+         "group:8209413637" "100" "100")
+        (should
+         (qq-state-message-recalled-p
+          (car (qq-state-session-messages "group:8209413637"))))
+        (should (= (hash-table-count qq-gateway-message--pending-recalls) 0))))))
+
+(ert-deftest qq-gateway-message-history-malformed-page-is-not-partially-merged ()
+  (qq-gateway-message-test-with-state
+    (let* ((conversation
+            '((kind . "group")
+              (group_uin . "8209413637")
+              (group_name . "Protocol Lab")
+              (sender_card . "Alice")))
+           (valid
+            (alist-get
+             'message
+             (qq-gateway-message-test-event
+              :message-id "7348923749823749823"
+              :sequence "100" :conversation conversation)))
+           (invalid
+            (alist-get
+             'message
+             (qq-gateway-message-test-event
+              :message-id 7348923749823749824
+              :sequence "101" :conversation conversation)))
+           failure)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (funcall
+                    callback
+                    (qq-gateway-message-test-history-result
+                     (list valid invalid) "100" "101"))
+                   "request-history")))
+        (qq-gateway-message-get-history
+         "group:8209413637" "100" "101" nil
+         (lambda (_body reason) (setq failure reason)))
+        (should (string-match-p "message_id" failure))
+        (should-not (qq-state-sessions))))))
+
+(ert-deftest qq-gateway-message-history-rejects-cross-conversation-page ()
+  (qq-gateway-message-test-with-state
+    (let* ((group-message
+            (alist-get
+             'message
+             (qq-gateway-message-test-event
+              :sequence "100"
+              :conversation
+              '((kind . "group")
+                (group_uin . "8209413637")
+                (group_name . "Protocol Lab")
+                (sender_card . "Alice")))))
+           (initial-order qq-state--message-order-counter)
+           failure)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (funcall
+                    callback
+                    (qq-gateway-message-test-history-result
+                     (list group-message) "100" "100"))
+                   "request-history")))
+        (qq-gateway-message-get-history
+         "private:10001" "100" "100" nil
+         (lambda (_body reason) (setq failure reason)))
+        (should (string-match-p "requested conversation" failure))
+        (should-not (qq-state-sessions))
+        (should (= qq-state--message-order-counter initial-order))))))
+
+(ert-deftest qq-gateway-message-history-stale-owner-cannot-mutate-state ()
+  (qq-gateway-message-test-with-state
+    (let (response-callback failure)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (setq response-callback callback)
+                   "request-history")))
+        (qq-gateway-message-get-history
+         "group:8209413637" "100" "100" nil
+         (lambda (_body reason) (setq failure reason)))
+        (qq-gateway--upsert-account
+         (qq-gateway-message-test-account
+          "slot-b" "11" "10003" "u_other_self")
+         'changed)
+        (qq-gateway-account-select "slot-b")
+        (funcall
+         response-callback
+         (qq-gateway-message-test-history-result nil "100" "100"))
+        (should (string-match-p "generation changed" failure))
+        (should-not (qq-state-sessions))))))
+
+(ert-deftest qq-gateway-message-history-recovers-lost-self-event ()
+  (qq-gateway-message-test-with-state
+    (let ((now (floor (float-time))) local-id)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method _params callback _errback &optional _early)
+                   (pcase method
+                     ("message.send_text"
+                      (funcall callback
+                               `((account_id . "slot-a")
+                                 (generation . "7")
+                                 (sent_at . ,now)
+                                 (server_sequence . "8765432109")
+                                 (client_sequence . "42001")
+                                 (random . 123))))
+                     ("message.get_history"
+                      (let ((message
+                             (alist-get
+                              'message
+                              (qq-gateway-message-test-event
+                               :sent-at now
+                               :sender '((uin . "10002") (uid . "u_self"))
+                               :recipient '((uin . "10001") (uid . "u_peer"))
+                               :sequence "8765432109"
+                               :client-sequence "42001"
+                               :random 123))))
+                        (funcall
+                         callback
+                         (qq-gateway-message-test-history-result
+                          (list message) "8765432109" "8765432109")))))
+                   (concat "request-" method))))
+        (qq-gateway-message-send-text "private:10001" "hello")
+        (setq local-id
+              (alist-get 'local-id
+                         (car (qq-state-session-messages "private:10001"))))
+        (qq-gateway-message-get-history
+         "private:10001" "8765432109" "8765432109")
+        (let* ((messages (qq-state-session-messages "private:10001"))
+               (message (car messages)))
+          (should (= (length messages) 1))
+          (should (equal (alist-get 'local-id message) local-id))
+          (should (equal (alist-get 'server-id message)
+                         "7348923749823749823"))
+          (should (= (hash-table-count qq-gateway-message--pending-sends) 0)))))))
 
 (ert-deftest qq-gateway-message-malformed-event-is-protocol-violation ()
   (qq-gateway-message-test-with-state
