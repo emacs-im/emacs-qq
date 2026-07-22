@@ -106,6 +106,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (make-hash-table :test #'equal))
          (qq-gateway-message--pending-sends
           (make-hash-table :test #'equal))
+         (qq-gateway-message--live-frontiers
+          (make-hash-table :test #'equal))
          (qq-gateway-message-event-hook nil)
          (qq-gateway-message-projection-error-hook nil)
          (qq-gateway-transport--state 'ready)
@@ -486,6 +488,48 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (should-error
      (qq-gateway-message--validate-history-range (car range) (cadr range))
      :type 'user-error)))
+
+(ert-deftest qq-gateway-message-history-page-arithmetic-never-coerces-sequence ()
+  (should
+   (equal
+    (qq-gateway-message-history-range-ending-at
+     "18446744073709551615" 100)
+    '("18446744073709551516" . "18446744073709551615")))
+  (should
+   (equal (qq-gateway-message-history-range-ending-at "12" 20)
+          '("0" . "12")))
+  (should
+   (equal (qq-gateway-message-history-range-around "2" 20)
+          '("0" . "19")))
+  (should
+   (equal
+    (qq-gateway-message-history-range-around "9007199254740999" 20)
+    '("9007199254740990" . "9007199254741009")))
+  (should-error
+   (qq-gateway-message-history-range-ending-at "99" 101)
+   :type 'user-error))
+
+(ert-deftest qq-gateway-message-live-frontier-uses-events-not-history ()
+  (qq-gateway-message-test-with-state
+    (qq-gateway-message--handle-event
+     "message.received"
+     (qq-gateway-message-test-event
+      :message-id "7348923749823749823" :sequence "100"))
+    (should
+     (equal (qq-gateway-message-live-frontier "private:10001")
+            '((message_id . "7348923749823749823")
+              (sequence . "100"))))
+    (qq-gateway-message--handle-event
+     "message.received"
+     (qq-gateway-message-test-event
+      :message-id "7348923749823749822" :sequence "99"
+      :client-sequence "9007199254741000"))
+    (should
+     (equal (alist-get 'sequence
+                       (qq-gateway-message-live-frontier "private:10001"))
+            "100"))
+    (qq-gateway-message-revoke-projection)
+    (should-not (qq-gateway-message-live-frontier "private:10001"))))
 
 (ert-deftest qq-gateway-message-history-request-preserves-large-sequences ()
   (qq-gateway-message-test-with-state
