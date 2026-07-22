@@ -196,6 +196,33 @@ BODY may refer to the lexical variables `buffer' and `view'."
       (should-not qq-group--request-owner)
       (should (string-match-p "synthetic dispatch failure" qq-group--error)))))
 
+(ert-deftest qq-group-clock-in-reports-native-structured-result ()
+  (with-temp-buffer
+    (qq-group-mode)
+    (setq qq-group--group-id "8209413637"
+          qq-group--profile (copy-tree qq-group-test--profile))
+    (let (called reported)
+      (cl-letf (((symbol-function 'qq-backend-clock-in-group)
+                 (lambda (group-id callback &optional _errback)
+                   (setq called group-id)
+                   (funcall
+                    callback
+                    '((account_id . "slot-a") (generation . "7")
+                      (group_uin . "8209413637")
+                      (title . "今日已打卡")
+                      (keep_day_text . "连续 7 天")
+                      (group_rank_text . "群排名 2")
+                      (clock_in_timestamp . 1784700000)
+                      (detail_url . "https://qun.qq.com/clock-in")))))
+                ((symbol-function 'message)
+                 (lambda (format-string &rest arguments)
+                   (setq reported (apply #'format format-string arguments)))))
+        (qq-group-clock-in))
+      (should (equal called "8209413637"))
+      (should (string-match-p "今日已打卡" reported))
+      (should (string-match-p "连续 7 天" reported))
+      (should (string-match-p "群排名 2" reported)))))
+
 (ert-deftest qq-group-mode-cancels-request-before-major-mode-change ()
   (with-temp-buffer
     (qq-group-mode)
@@ -236,7 +263,9 @@ BODY may refer to the lexical variables `buffer' and `view'."
   (should (eq (lookup-key qq-group-mode-map (kbd "R"))
               #'qq-group-set-remark))
   (should (eq (lookup-key qq-group-mode-map (kbd "M"))
-              #'qq-group-set-whole-mute)))
+              #'qq-group-set-whole-mute))
+  (should (eq (lookup-key qq-group-mode-map (kbd "S"))
+              #'qq-group-clock-in)))
 
 (ert-deftest qq-group-reuses-one-profile-buffer-like-telega ()
   (should (equal (qq-group--buffer-name "20001") "*qq-group*"))

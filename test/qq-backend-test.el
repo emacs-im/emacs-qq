@@ -232,7 +232,12 @@
                 (lambda (group-id value callback &optional _errback)
                   (push (list 'mute group-id value) calls)
                   (funcall callback '((enabled . t)))
-                  "mute-request")))
+                  "mute-request"))
+               ((symbol-function 'qq-gateway-directory-clock-in-group)
+                (lambda (group-id callback &optional _errback)
+                  (push (list 'clock-in group-id) calls)
+                  (funcall callback '((title . "今日已打卡")))
+                  "clock-in-request")))
             (let ((name-request
                    (qq-backend-set-group-name
                     "8209413637" "New"
@@ -244,13 +249,19 @@
                   (mute-request
                    (qq-backend-set-group-whole-mute
                     "8209413637" t
-                    (lambda (_receipt) (push 'mute callbacks)))))
+                    (lambda (_receipt) (push 'mute callbacks))))
+                  (clock-in-request
+                   (qq-backend-clock-in-group
+                    "8209413637"
+                    (lambda (_receipt) (push 'clock-in callbacks)))))
               (should (equal (qq-backend-request-token name-request)
                              "name-request"))
               (should (equal (qq-backend-request-token remark-request)
                              "remark-request"))
               (should (equal (qq-backend-request-token mute-request)
-                             "mute-request"))))
+                             "mute-request"))
+              (should (equal (qq-backend-request-token clock-in-request)
+                             "clock-in-request"))))
           (let ((group (qq-state-group "8209413637")))
             (should (equal (alist-get 'group_name group) "New"))
             (should-not (alist-get 'group_remark group)))
@@ -258,12 +269,13 @@
                                (lambda (left right)
                                  (string< (symbol-name left)
                                           (symbol-name right))))
-                         '(mute name remark)))
+                         '(clock-in mute name remark)))
           (should
            (equal (nreverse calls)
                   '((name "8209413637" "New")
                     (remark "8209413637" "")
-                    (mute "8209413637" t)))))
+                    (mute "8209413637" t)
+                    (clock-in "8209413637")))))
       (qq-state-reset))))
 
 (ert-deftest qq-backend-group-member-settings-route-wide-native-identities ()

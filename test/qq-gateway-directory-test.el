@@ -10,7 +10,7 @@
   '("contact.list_friends" "contact.list_groups"
     "contact.list_group_members" "group.set_name" "group.set_remark"
     "group.set_whole_mute" "group.set_member_card"
-    "group.set_member_special_title" "group.kick_member")
+    "group.set_member_special_title" "group.kick_member" "group.clock_in")
   "Native contact capabilities exercised by directory tests.")
 
 (defun qq-gateway-directory-test-account
@@ -315,6 +315,62 @@
          (lambda (_body reason) (setq failure reason))))
       (should-not success)
       (should (string-match-p "contradicts request" failure)))))
+
+(ert-deftest qq-gateway-directory-clock-in-validates-structured-receipt ()
+  (qq-gateway-directory-test-with-state
+    (let (sent-method sent-params callback-value)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-directory-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall
+                    callback
+                    '((account_id . "slot-a") (generation . "7")
+                      (group_uin . "8209413637")
+                      (title . "今日已打卡")
+                      (keep_day_text . "连续 7 天")
+                      (group_rank_text . "群排名 2")
+                      (clock_in_timestamp . 1784700000)
+                      (detail_url . "https://qun.qq.com/clock-in")))
+                   "clock-in-request")))
+        (should
+         (equal
+          (qq-gateway-directory-clock-in-group
+           "8209413637" (lambda (receipt) (setq callback-value receipt)))
+          "clock-in-request")))
+      (should (equal sent-method "group.clock_in"))
+      (should
+       (equal sent-params
+              '((account_id . "slot-a") (group_uin . "8209413637"))))
+      (should (equal (alist-get 'title callback-value) "今日已打卡"))
+      (should (= (alist-get 'clock_in_timestamp callback-value)
+                 1784700000)))))
+
+(ert-deftest qq-gateway-directory-clock-in-rejects-open-result ()
+  (qq-gateway-directory-test-with-state
+    (let (success failure)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-directory-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (funcall
+                    callback
+                    '((account_id . "slot-a") (generation . "7")
+                      (group_uin . "8209413637") (title . "ok")
+                      (keep_day_text . "") (group_rank_text . "")
+                      (clock_in_timestamp . 0) (detail_url . "")
+                      (unexpected . t)))
+                   "request")))
+        (qq-gateway-directory-clock-in-group
+         "8209413637" (lambda (_receipt) (setq success t))
+         (lambda (_body reason) (setq failure reason))))
+      (should-not success)
+      (should (string-match-p "invalid fields" failure)))))
 
 (ert-deftest qq-gateway-directory-group-member-settings-update-owned-page ()
   (qq-gateway-directory-test-with-state

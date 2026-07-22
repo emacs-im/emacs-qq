@@ -635,6 +635,51 @@ CALLBACK receives the validated generation-owned receipt."
    "group.set_whole_mute" group-uin 'enabled
    (if enabled t :false) callback errback))
 
+(defun qq-gateway-directory--validate-group-clock-in-receipt
+    (receipt owner group-uin)
+  "Validate a closed group clock-in RECEIPT for OWNER and GROUP-UIN."
+  (qq-gateway-directory--validate-owner
+   receipt owner
+   '(account_id generation group_uin title keep_day_text group_rank_text
+     clock_in_timestamp detail_url)
+   "group clock-in receipt")
+  (unless (equal (alist-get 'group_uin receipt) group-uin)
+    (error "qq: Gateway group clock-in receipt contradicts request"))
+  (dolist (field '(title keep_day_text group_rank_text detail_url))
+    (unless (stringp (alist-get field receipt))
+      (error "qq: Gateway group clock-in receipt %s must be string" field)))
+  (unless (qq-gateway-directory--uint32-p
+           (alist-get 'clock_in_timestamp receipt))
+    (error "qq: Gateway group clock-in timestamp must be uint32"))
+  (copy-tree receipt))
+
+(defun qq-gateway-directory-clock-in-group
+    (group-uin &optional callback errback)
+  "Clock the selected Gateway account into exact GROUP-UIN."
+  (unless (qq-gateway--canonical-decimal-p group-uin)
+    (user-error "qq: Group clock-in requires an exact group UIN"))
+  (let* ((owner (or (qq-gateway-current-account-owner)
+                    (user-error "qq: Select a Gateway account first")))
+         (_projection (qq-gateway-message--ensure-projection-owner owner)))
+    (qq-gateway--send
+     "group.clock_in"
+     `((account_id . ,(car owner))
+       (group_uin . ,group-uin))
+     (lambda (raw-result)
+       (condition-case error-data
+           (let ((receipt
+                  (qq-gateway-directory--validate-group-clock-in-receipt
+                   raw-result owner group-uin)))
+             (unless (equal owner (qq-gateway-current-account-owner))
+               (error
+                "qq: Gateway account generation changed during group clock-in"))
+             (qq-gateway--invoke callback receipt))
+         (error
+          (qq-gateway--client-error
+           errback "invalid_gateway_result" "%s"
+           (error-message-string error-data)))))
+     errback)))
+
 (defun qq-gateway-directory--validate-group-member-setting-receipt
     (receipt owner group-uin target-uin field expected)
   "Validate one group-member setting RECEIPT against its closed request."
