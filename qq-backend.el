@@ -221,6 +221,29 @@ then promotes its pending row from the later authoritative self event."
       session-key target-id callback
       (or errback #'qq-backend--default-gateway-error)))))
 
+(defun qq-backend-set-message-reaction
+    (message emoji-id set &optional callback errback)
+  "Add or remove EMOJI-ID on normalized group MESSAGE through its backend.
+
+SET non-nil adds the reaction.  CALLBACK receives the successful backend
+receipt; ERRBACK receives backend failure details."
+  (unless (listp message)
+    (user-error "qq: Reaction requires a normalized message"))
+  (let ((session-key (alist-get 'session-key message))
+        (message-id (alist-get 'server-id message)))
+    (unless (and session-key (stringp message-id))
+      (user-error "qq: Reaction requires exact session and message identity"))
+    (pcase (qq-backend--validate qq-backend)
+      ('onebot
+       (qq-api-set-message-emoji-like
+        `((message_id . ,message-id)
+          (chat . ,(qq-api-chat-locator session-key)))
+        emoji-id set callback errback))
+      ('gateway
+       (qq-gateway-message-set-reaction
+        message emoji-id set callback
+        (or errback #'qq-backend--default-gateway-error))))))
+
 (defun qq-backend-recall-poke (message &optional callback errback)
   "Recall normalized poke MESSAGE through its selected backend capability.
 

@@ -3828,8 +3828,8 @@ buffer session with a detached message id after the fact."
                          (user-error "qq: reactions require a live group message")))
          (reaction (qq-chat--reaction-by-emoji-id message emoji-id))
          (set (not (and reaction (alist-get 'chosen-p reaction)))))
-    (qq-api-set-message-emoji-like
-     (qq-chat--message-reference message) emoji-id set
+    (qq-backend-set-message-reaction
+     message emoji-id set
      (lambda (_response)
        (message "qq: reaction %s (%s)"
                 (if set "added" "removed") emoji-id)))))
@@ -5887,8 +5887,8 @@ Clicking an existing reaction chip performs add/remove toggle instead."
          (emoji-id (format "%s" (or face-id
                                     (qq-chat--read-base-face-id
                                      "React with QQ face: ")))))
-    (qq-api-set-message-emoji-like
-     (qq-chat--message-reference message) emoji-id t
+    (qq-backend-set-message-reaction
+     message emoji-id t
      (lambda (_response)
        (message "qq: reaction added (%s)" emoji-id)))))
 
