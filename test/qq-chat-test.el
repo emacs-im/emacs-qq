@@ -3038,21 +3038,21 @@
             (if (= chat-type 2) "group:20001" "private:10001"))
            (message
            `((server-id . ,(alist-get 'message_id reference))
+             (session-key . ,qq-chat--session-key)
              (self-p . t)
              (poke-recall-reference . ,reference)
              (segments . (((type . "poke"))))))
-          recalled-reference
+          recalled-message
           ordinary-delete-called)
       (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
-                ((symbol-function 'qq-api-recall-poke)
-                 (lambda (session-key value &rest _)
-                   (setq recalled-reference (list session-key value))))
+                ((symbol-function 'qq-backend-recall-poke)
+                 (lambda (value &rest _)
+                   (setq recalled-message value)))
                 ((symbol-function 'qq-api-delete-message)
                  (lambda (&rest _)
                    (setq ordinary-delete-called t))))
         (qq-chat--delete-message-internal message))
-      (should (equal recalled-reference
-                     (list qq-chat--session-key reference)))
+      (should (eq recalled-message message))
       (should-not ordinary-delete-called))))
 
 (ert-deftest qq-chat-recalls-ordinary-message-with-closed-reference ()
@@ -3080,7 +3080,7 @@
     (cl-letf (((symbol-function 'y-or-n-p)
                (lambda (&rest _)
                  (setq prompted t)))
-              ((symbol-function 'qq-api-recall-poke)
+              ((symbol-function 'qq-backend-recall-poke)
                (lambda (&rest _)
                  (setq api-called t))))
       (should-error (qq-chat--delete-message-internal message)
@@ -3107,7 +3107,7 @@
               ((symbol-function 'y-or-n-p)
                (lambda (&rest _)
                  (setq prompted t)))
-              ((symbol-function 'qq-api-recall-poke)
+              ((symbol-function 'qq-backend-recall-poke)
                (lambda (&rest _)
                  (setq api-called t))))
       (setq failure

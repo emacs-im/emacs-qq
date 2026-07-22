@@ -221,6 +221,25 @@ then promotes its pending row from the later authoritative self event."
       session-key target-id callback
       (or errback #'qq-backend--default-gateway-error)))))
 
+(defun qq-backend-recall-poke (message &optional callback errback)
+  "Recall normalized poke MESSAGE through its selected backend capability.
+
+CALLBACK receives the successful response; ERRBACK receives failure details."
+  (unless (qq-state-poke-message-p message)
+    (user-error "qq: Poke recall requires a normalized poke message"))
+  (let ((session-key (alist-get 'session-key message))
+        (reference (qq-state-poke-recall-reference message)))
+    (unless (and session-key reference)
+      (user-error "qq: Poke has no native recall capability"))
+    (pcase (qq-backend--validate qq-backend)
+      ('onebot
+       (qq-api-recall-poke
+        session-key reference callback errback))
+      ('gateway
+       (qq-gateway-message-recall-poke
+        message callback
+        (or errback #'qq-backend--default-gateway-error))))))
+
 (defun qq-backend-recall-message (message &optional callback errback)
   "Recall normalized MESSAGE through the selected backend.
 

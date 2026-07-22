@@ -7,8 +7,8 @@
 (require 'qq-gateway-message)
 
 (defconst qq-gateway-message-test-capabilities
-  '("message.send" "message.send_text" "message.poke" "message.recall"
-    "message.get_history")
+  '("message.send" "message.send_text" "message.poke"
+    "message.recall_poke" "message.recall" "message.get_history")
   "Native Gateway capabilities exercised by message tests.")
 
 (defun qq-gateway-message-test-account
@@ -71,6 +71,29 @@
         (author_uid . ,author-uid)
         (operator_uid . ,operator-uid)
         (tip . ,tip)))))
+
+(cl-defun qq-gateway-message-test-poke
+    (&key
+     (account-id "slot-a") (generation "7")
+     (message-id "7348923749823749823") (sent-at 1784700000)
+     (sequence "9007199254740999") (group-uin "8209413637")
+     (actor-uin "10002") (target-uin "9007199254741001")
+     (tips-sequence "9007199254741007") (valid-before 1784700120))
+  "Return one authoritative native Gateway group poke event payload."
+  `((account_id . ,account-id)
+    (generation . ,generation)
+    (poke
+     . ((message_id . ,message-id)
+        (sent_at . ,sent-at)
+        (sequence . ,sequence)
+        (conversation . ((kind . "group") (group_uin . ,group-uin)))
+        (actor_uin . ,actor-uin)
+        (target_uin . ,target-uin)
+        (action . "戳了戳")
+        (action_image_url . "https://example.invalid/poke.png")
+        (suffix . "的肩膀")
+        (recall . ((tips_sequence . ,tips-sequence)
+                   (valid_before . ,valid-before)))))))
 
 (cl-defun qq-gateway-message-test-history-result
     (messages start-sequence end-sequence
@@ -479,6 +502,90 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (should (equal (alist-get 'user_id applied) "10002"))
         (should (equal (alist-get 'target_uin callback-result)
                        "9007199254741001"))))))
+
+(ert-deftest qq-gateway-message-authoritative-poke-promotes-local-gray-tip ()
+  (qq-gateway-message-test-with-state
+    (qq-state-upsert-session
+     "group:8209413637"
+     '((type . group) (target-id . "8209413637") (title . "Protocol Lab")))
+    (cl-letf (((symbol-function 'float-time)
+               (lambda (&optional _time) 1784700000))
+              ((symbol-function 'qq-gateway-transport-ready-p)
+               (lambda () t))
+              ((symbol-function 'qq-gateway-transport-capabilities)
+               (lambda () qq-gateway-message-test-capabilities))
+              ((symbol-function 'qq-gateway-transport-send)
+               (lambda (_method _params callback _errback &optional _early)
+                 (funcall callback
+                          '((account_id . "slot-a")
+                            (generation . "7")
+                            (target_uin . "9007199254741001")))
+                 "request-poke")))
+      (qq-gateway-message-send-poke
+       "group:8209413637" "9007199254741001")
+      (qq-gateway-message--handle-event
+       "message.poked" (qq-gateway-message-test-poke))
+      (let* ((messages
+              (qq-state-session-messages "group:8209413637"))
+             (message (car messages))
+             (raw-event (alist-get 'raw-event message)))
+        (should (= (length messages) 1))
+        (should (equal (alist-get 'server-id message)
+                       "7348923749823749823"))
+        (should (equal (alist-get 'message_id
+                                  (alist-get 'gateway_recall raw-event))
+                       "7348923749823749823"))
+        (should (equal (alist-get 'tips_sequence
+                                  (alist-get 'gateway_recall raw-event))
+                       "9007199254741007"))
+        (should (equal (alist-get 'image-url
+                                  (qq-state-poke-message-data message))
+                       "https://example.invalid/poke.png"))))))
+
+(ert-deftest qq-gateway-message-poke-event-rejects-numeric-identity ()
+  (let ((event (qq-gateway-message-test-poke)))
+    (setf (alist-get 'actor_uin (alist-get 'poke event))
+          9007199254740999)
+    (should-error (qq-gateway-message--validate-poke-data event))))
+
+(ert-deftest qq-gateway-message-recall-poke-sends-original-gray-tip-metadata ()
+  (qq-gateway-message-test-with-state
+    (qq-gateway-message--handle-event
+     "message.poked" (qq-gateway-message-test-poke))
+    (let* ((session-key "group:8209413637")
+           (message (car (qq-state-session-messages session-key)))
+           sent-method sent-params)
+      (cl-letf (((symbol-function 'float-time)
+                 (lambda (&optional _time) 1784700001))
+                ((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall callback
+                            '((account_id . "slot-a")
+                              (generation . "7")
+                              (message_id . "7348923749823749823")
+                              (sequence . "9007199254740999")))
+                   "request-poke-recall")))
+        (should (equal (qq-gateway-message-recall-poke message)
+                       "request-poke-recall"))
+        (should (equal sent-method "message.recall_poke"))
+        (should
+         (equal
+          sent-params
+          '((account_id . "slot-a")
+            (conversation . ((kind . "group")
+                             (group_uin . "8209413637")))
+            (poke . ((message_id . "7348923749823749823")
+                     (sequence . "9007199254740999")
+                     (sent_at . 1784700000)
+                     (tips_sequence . "9007199254741007"))))))
+        (should
+         (qq-state-message-recalled-p
+          (car (qq-state-session-messages session-key))))))))
 
 (ert-deftest qq-gateway-message-self-event-before-receipt-still-rekeys ()
   (qq-gateway-message-test-with-state
