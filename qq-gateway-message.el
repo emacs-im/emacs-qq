@@ -17,6 +17,7 @@
 (require 'subr-x)
 (require 'qq-customize)
 (require 'qq-gateway)
+(require 'qq-protocol)
 (require 'qq-state)
 
 (defvar qq-gateway-message-event-hook nil
@@ -275,6 +276,48 @@
   "Validate and copy outer recall event DATA."
   (qq-gateway-message--validate-owner-data data 'recall)
   (qq-gateway-message--validate-recall (alist-get 'recall data))
+  (copy-tree data))
+
+(defun qq-gateway-message--validate-poke (poke)
+  "Validate and copy one authoritative group POKE snapshot."
+  (unless (qq-gateway-message--closed-object-p
+           poke
+           '(message_id sent_at sequence conversation actor_uin target_uin
+             recall)
+           '(action action_image_url suffix))
+    (error "qq: Gateway poke snapshot has invalid fields"))
+  (dolist (key '(message_id sequence actor_uin target_uin))
+    (unless (qq-gateway--canonical-decimal-p (alist-get key poke))
+      (error "qq: Gateway poke %s must be exact decimal string" key)))
+  (unless (and (integerp (alist-get 'sent_at poke))
+               (> (alist-get 'sent_at poke) 0))
+    (error "qq: Gateway poke sent_at must be positive integer"))
+  (let ((conversation (alist-get 'conversation poke)))
+    (unless (and (qq-gateway--exact-object-keys-p
+                  conversation '(kind group_uin))
+                 (equal (alist-get 'kind conversation) "group")
+                 (qq-gateway--canonical-decimal-p
+                  (alist-get 'group_uin conversation)))
+      (error "qq: Gateway poke conversation must identify an exact group")))
+  (dolist (key '(action action_image_url suffix))
+    (when (assq key poke)
+      (unless (qq-gateway--non-empty-string-p (alist-get key poke))
+        (error "qq: Gateway poke %s must be non-empty string" key))))
+  (let ((recall (alist-get 'recall poke)))
+    (unless (and (qq-gateway--exact-object-keys-p
+                  recall '(tips_sequence valid_before))
+                 (qq-gateway--canonical-decimal-p
+                  (alist-get 'tips_sequence recall))
+                 (integerp (alist-get 'valid_before recall))
+                 (> (alist-get 'valid_before recall)
+                    (alist-get 'sent_at poke)))
+      (error "qq: Gateway poke recall capability is malformed")))
+  (copy-tree poke))
+
+(defun qq-gateway-message--validate-poke-data (data)
+  "Validate and copy outer authoritative poke event DATA."
+  (qq-gateway-message--validate-owner-data data 'poke)
+  (qq-gateway-message--validate-poke (alist-get 'poke data))
   (copy-tree data))
 
 (defun qq-gateway-message--event-owner (data)
@@ -711,6 +754,52 @@ responses never advance this observation; only `message.received' events do."
        (copy-tree recall)
        qq-gateway-message--pending-recalls))))
 
+(defun qq-gateway-message--poke-raw-info (poke)
+  "Return shared renderer decoration items for validated POKE."
+  (delq
+   nil
+   (list
+    (when-let* ((action (alist-get 'action poke)))
+      `((type . "text") (txt . ,action)))
+    (when-let* ((image-url (alist-get 'action_image_url poke)))
+      `((type . "img") (src . ,image-url)))
+    (when-let* ((suffix (alist-get 'suffix poke)))
+      `((type . "text") (txt . ,suffix))))))
+
+(defun qq-gateway-message--project-poke (data)
+  "Project selected-account authoritative group poke event DATA."
+  (let* ((owner (qq-gateway-message--event-owner data))
+         (_owner (qq-gateway-message--ensure-projection-owner owner))
+         (poke (alist-get 'poke data))
+         (conversation (alist-get 'conversation poke))
+         (group-uin (alist-get 'group_uin conversation))
+         (recall (alist-get 'recall poke))
+         (message-id (alist-get 'message_id poke))
+         (notice
+          `((time . ,(alist-get 'sent_at poke))
+            (post_type . "notice")
+            (notice_type . "notify")
+            (sub_type . "poke")
+            (group_id . ,group-uin)
+            (user_id . ,(alist-get 'actor_uin poke))
+            (target_id . ,(alist-get 'target_uin poke))
+            (recall_reference
+             . ((message_id . ,message-id)
+                (peer . ((chat_type . 2)
+                         (peer_uid . ,group-uin)
+                         (guild_id . "")))
+                (valid_before . ,(alist-get 'valid_before recall))))
+            (gateway_recall
+             . ((account_id . ,(car owner))
+                (generation . ,(cdr owner))
+                (conversation . ,(copy-tree conversation))
+                (message_id . ,message-id)
+                (sequence . ,(alist-get 'sequence poke))
+                (sent_at . ,(alist-get 'sent_at poke))
+                (tips_sequence . ,(alist-get 'tips_sequence recall))))
+            (raw_info . ,(qq-gateway-message--poke-raw-info poke)))))
+    (qq-state-apply-poke-notice notice)))
+
 (defun qq-gateway-message--projection-error (event data error-data)
   "Publish projection ERROR-DATA for validated EVENT and DATA."
   (let ((reason (error-message-string error-data)))
@@ -720,19 +809,27 @@ responses never advance this observation; only `message.received' events do."
 
 (defun qq-gateway-message--handle-event (event data)
   "Validate native message EVENT with DATA and project the selected owner."
-  (when (member event '("message.received" "message.recalled"))
+  (when (member event '("message.received" "message.recalled" "message.poked"))
     (condition-case error-data
         (let ((validated
-               (if (equal event "message.received")
-                   (qq-gateway-message--validate-message-data data)
-                 (qq-gateway-message--validate-recall-data data))))
+               (pcase event
+                 ("message.received"
+                  (qq-gateway-message--validate-message-data data))
+                 ("message.recalled"
+                  (qq-gateway-message--validate-recall-data data))
+                 ("message.poked"
+                  (qq-gateway-message--validate-poke-data data)))))
           (qq-gateway--run-hook
            'qq-gateway-message-event-hook event (copy-tree validated))
           (when (qq-gateway-message--selected-owner-p validated)
             (condition-case projection-error
-                (if (equal event "message.received")
-                    (qq-gateway-message--project-message validated)
-                  (qq-gateway-message--project-recall validated))
+                (pcase event
+                  ("message.received"
+                   (qq-gateway-message--project-message validated))
+                  ("message.recalled"
+                   (qq-gateway-message--project-recall validated))
+                  ("message.poked"
+                   (qq-gateway-message--project-poke validated)))
               (error
                (qq-gateway-message--projection-error
                 event validated projection-error)))))
@@ -1397,6 +1494,77 @@ authoritative recall fact."
              errback "invalid_gateway_result" "%s"
              (error-message-string result-error)))))
        errback))))
+
+(defun qq-gateway-message--validate-poke-recall-metadata (message owner)
+  "Return MESSAGE's native group poke recall metadata for exact OWNER."
+  (let* ((raw-event (alist-get 'raw-event message))
+         (metadata (and (listp raw-event)
+                        (alist-get 'gateway_recall raw-event))))
+    (unless (and (qq-gateway--exact-object-keys-p
+                  metadata
+                  '(account_id generation conversation message_id sequence
+                    sent_at tips_sequence))
+                 (equal (alist-get 'account_id metadata) (car owner))
+                 (equal (alist-get 'generation metadata) (cdr owner))
+                 (equal (alist-get 'message_id metadata)
+                        (alist-get 'server-id message))
+                 (qq-gateway--canonical-decimal-p
+                  (alist-get 'sequence metadata))
+                 (integerp (alist-get 'sent_at metadata))
+                 (> (alist-get 'sent_at metadata) 0)
+                 (qq-gateway--canonical-decimal-p
+                  (alist-get 'tips_sequence metadata)))
+      (user-error "qq: Poke lacks exact native Gateway recall metadata"))
+    (let ((conversation (alist-get 'conversation metadata)))
+      (unless (and (qq-gateway--exact-object-keys-p
+                    conversation '(kind group_uin))
+                   (equal (alist-get 'kind conversation) "group")
+                   (equal (qq-state-session-key
+                           'group (alist-get 'group_uin conversation))
+                          (alist-get 'session-key message)))
+        (user-error "qq: Poke recall metadata contradicts its group session")))
+    (copy-tree metadata)))
+
+(defun qq-gateway-message-recall-poke
+    (message &optional callback errback)
+  "Recall authoritative group poke MESSAGE through the selected Gateway.
+
+CALLBACK receives the validated receipt; ERRBACK receives failure details."
+  (let* ((owner (or (qq-gateway-current-account-owner)
+                    (user-error "qq: Select a Gateway account first")))
+         (_owner (qq-gateway-message--ensure-projection-owner owner))
+         (reference (qq-state-poke-recall-reference message))
+         (metadata
+          (qq-gateway-message--validate-poke-recall-metadata message owner))
+         (message-id (alist-get 'message_id metadata))
+         (sequence (alist-get 'sequence metadata)))
+    (unless reference
+      (user-error "qq: Poke has no native recall capability"))
+    (when (qq-protocol-poke-recall-reference-expired-p reference)
+      (user-error "qq: 戳一戳已超过 2 分钟撤回期限"))
+    (qq-gateway--send
+     "message.recall_poke"
+     `((account_id . ,(car owner))
+       (conversation . ,(copy-tree (alist-get 'conversation metadata)))
+       (poke . ((message_id . ,message-id)
+                (sequence . ,sequence)
+                (sent_at . ,(alist-get 'sent_at metadata))
+                (tips_sequence . ,(alist-get 'tips_sequence metadata)))))
+     (lambda (result)
+       (condition-case result-error
+           (let ((receipt
+                  (qq-gateway-message--validate-recall-receipt
+                   result owner message-id sequence)))
+             (unless (equal owner (qq-gateway-current-account-owner))
+               (error "qq: Gateway account generation changed during poke recall"))
+             (qq-state-apply-recall
+              (alist-get 'session-key message) message-id)
+             (qq-gateway--invoke callback receipt))
+         (error
+          (qq-gateway--client-error
+           errback "invalid_gateway_result" "%s"
+           (error-message-string result-error)))))
+     errback)))
 
 (add-hook 'qq-gateway-transport-event-hook
           #'qq-gateway-message--handle-event t)

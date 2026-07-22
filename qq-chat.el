@@ -71,9 +71,8 @@
 (declare-function qq-api-cancel-request "qq-api" (request-token))
 (declare-function qq-backend-send-poke
                   "qq-backend" (session-key target-id &optional callback errback))
-(declare-function qq-api-recall-poke
-                  "qq-api" (session-key recall-reference
-                                         &optional callback errback))
+(declare-function qq-backend-recall-poke
+                  "qq-backend" (message &optional callback errback))
 
 (defvar-local qq-chat--session-key nil
   "Session key associated with the current chat buffer.")
@@ -3992,7 +3991,7 @@ on the first inline line when the body is pure inline content."
       (user-error "qq: 戳一戳已超过 2 分钟撤回期限"))
     (when (y-or-n-p (format "Recall message %s? " message-id))
       (if poke-p
-          (qq-api-recall-poke qq-chat--session-key recall-reference)
+          (qq-backend-recall-poke message)
         (qq-backend-recall-message message)))))
 
 (defun qq-chat--message-title-face (message)
