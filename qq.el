@@ -27,6 +27,7 @@
 (require 'qq-state)
 (require 'qq-gateway)
 (require 'qq-gateway-resource)
+(require 'qq-gateway-media)
 (require 'qq-gateway-message)
 (require 'qq-gateway-directory)
 (require 'qq-native)

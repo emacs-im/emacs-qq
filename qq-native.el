@@ -20,6 +20,7 @@
 (require 'qq-gateway-attachment)
 (require 'qq-gateway-directory)
 (require 'qq-gateway-message)
+(require 'qq-gateway-media)
 (require 'qq-gateway-transport)
 (require 'qq-protocol)
 (require 'qq-state)
@@ -935,6 +936,7 @@ request.  ERRBACK handles failure and COUNT limits the requested page size."
   (setq qq-native--bootstrap-owner nil
         qq-native--bootstrap-pending 0)
   (qq-gateway-attachment-reset)
+  (qq-gateway-media-reset)
   (qq-gateway-resource-reset)
   (qq-gateway-directory-reset)
   (qq-gateway-message-revoke-projection))
