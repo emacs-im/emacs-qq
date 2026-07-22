@@ -680,6 +680,51 @@ CALLBACK receives the validated generation-owned receipt."
            (error-message-string error-data)))))
      errback)))
 
+(defun qq-gateway-directory--validate-group-at-all-remaining-receipt
+    (receipt owner group-uin)
+  "Validate a closed @all quota RECEIPT for OWNER and GROUP-UIN."
+  (qq-gateway-directory--validate-owner
+   receipt owner
+   '(account_id generation group_uin can_at_all
+     remain_at_all_count_for_uin remain_at_all_count_for_group)
+   "group @all remaining receipt")
+  (unless (equal (alist-get 'group_uin receipt) group-uin)
+    (error "qq: Gateway group @all remaining receipt contradicts request"))
+  (unless (memq (alist-get 'can_at_all receipt) '(t :false))
+    (error "qq: Gateway group @all availability must be boolean"))
+  (dolist (field '(remain_at_all_count_for_uin
+                   remain_at_all_count_for_group))
+    (unless (qq-gateway-directory--uint32-p (alist-get field receipt))
+      (error "qq: Gateway group @all %s must be uint32" field)))
+  (copy-tree receipt))
+
+(defun qq-gateway-directory-get-group-at-all-remaining
+    (group-uin &optional callback errback)
+  "Fetch live @all availability and quotas for exact GROUP-UIN."
+  (unless (qq-gateway--canonical-decimal-p group-uin)
+    (user-error "qq: Group @all quota requires an exact group UIN"))
+  (let* ((owner (or (qq-gateway-current-account-owner)
+                    (user-error "qq: Select a Gateway account first")))
+         (_projection (qq-gateway-message--ensure-projection-owner owner)))
+    (qq-gateway--send
+     "group.get_at_all_remaining"
+     `((account_id . ,(car owner))
+       (group_uin . ,group-uin))
+     (lambda (raw-result)
+       (condition-case error-data
+           (let ((receipt
+                  (qq-gateway-directory--validate-group-at-all-remaining-receipt
+                   raw-result owner group-uin)))
+             (unless (equal owner (qq-gateway-current-account-owner))
+               (error
+                "qq: Gateway account generation changed during group @all query"))
+             (qq-gateway--invoke callback receipt))
+         (error
+          (qq-gateway--client-error
+           errback "invalid_gateway_result" "%s"
+           (error-message-string error-data)))))
+     errback)))
+
 (defun qq-gateway-directory--validate-group-leave-receipt
     (receipt owner group-uin)
   "Validate a closed group-leave RECEIPT for OWNER and GROUP-UIN."

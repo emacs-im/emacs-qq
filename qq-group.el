@@ -282,6 +282,26 @@ GROUP-ID defaults to the identity selected in the current buffer."
    (apply-partially #'qq-group--finish-clock-in
                     (current-buffer) qq-group--group-id)))
 
+(defun qq-group--finish-at-all-remaining (buffer group-id receipt)
+  "Report @all quota RECEIPT when BUFFER still owns exact GROUP-ID."
+  (when (qq-group--setting-current-p buffer group-id)
+    (with-current-buffer buffer
+      (message
+       "qq: %s使用 @全体；个人剩余 %d 次，群剩余 %d 次"
+       (if (eq (alist-get 'can_at_all receipt) t) "可以" "当前不可")
+       (alist-get 'remain_at_all_count_for_uin receipt)
+       (alist-get 'remain_at_all_count_for_group receipt)))))
+
+(defun qq-group-show-at-all-remaining ()
+  "Show live @all availability and quotas for the current group."
+  (interactive)
+  (unless qq-group--group-id
+    (user-error "qq: this buffer has no group identity"))
+  (qq-backend-get-group-at-all-remaining
+   qq-group--group-id
+   (apply-partially #'qq-group--finish-at-all-remaining
+                    (current-buffer) qq-group--group-id)))
+
 (defun qq-group--finish-leave (buffer group-id _receipt)
   "Close BUFFER after confirmed leave when it still owns exact GROUP-ID."
   (when (qq-group--setting-current-p buffer group-id)
@@ -352,6 +372,10 @@ GROUP-ID defaults to the identity selected in the current buffer."
    :face 'qq-group-action-button :help-echo "群打卡 (S)")
   (insert "  ")
   (appkit-ui-insert-action-button
+   " @全体额度 " #'qq-group-show-at-all-remaining
+   :face 'qq-group-action-button :help-echo "查询 @全体剩余额度 (@)")
+  (insert "  ")
+  (appkit-ui-insert-action-button
    " 退出群聊 " #'qq-group-leave
    :face 'qq-group-destructive-action-button :help-echo "退出群聊 (L)")
   (insert "\n"))
@@ -393,7 +417,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
          (insert "\n")
          (qq-group--insert-action-buttons)
          (appkit-view-insert-note-line
-          "g 刷新 · N 群名 · R 备注 · M 全员禁言 · S 群打卡 · L 退出群聊 · s 成员（结果页 C 名片 / T 头衔 / K 移出） · q 关闭")
+          "g 刷新 · N 群名 · R 备注 · M 全员禁言 · S 群打卡 · @ 全体额度 · L 退出群聊 · s 成员（结果页 C 名片 / T 头衔 / K 移出） · q 关闭")
          (insert "\n")
          (appkit-view-insert-heading-line "资料" :face 'bold)
          (let ((name (qq-group--present-string
@@ -677,6 +701,7 @@ RESOURCE identifies a presentation-only media dependency update."
     (define-key map (kbd "R") #'qq-group-set-remark)
     (define-key map (kbd "M") #'qq-group-set-whole-mute)
     (define-key map (kbd "S") #'qq-group-clock-in)
+    (define-key map (kbd "@") #'qq-group-show-at-all-remaining)
     (define-key map (kbd "L") #'qq-group-leave)
     (define-key map (kbd "TAB") #'forward-button)
     (define-key map (kbd "<backtab>") #'qq-group-button-backward)

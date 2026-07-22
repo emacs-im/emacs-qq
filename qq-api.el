@@ -3095,6 +3095,41 @@ CALLBACK receives NapCat's successful response."
        (funcall callback response)))
    (or errback #'qq-api--default-error)))
 
+(defun qq-api--validate-group-at-all-remaining (data)
+  "Validate and copy NapCat's closed group @all remaining DATA."
+  (unless (qq-api--exact-object-keys-p
+           data
+           '(can_at_all remain_at_all_count_for_group
+                        remain_at_all_count_for_uin))
+    (error "qq: get_group_at_all_remain returned invalid fields"))
+  (unless (memq (alist-get 'can_at_all data) '(t :false))
+    (error "qq: get_group_at_all_remain.can_at_all must be boolean"))
+  (dolist (field '(remain_at_all_count_for_group
+                   remain_at_all_count_for_uin))
+    (unless (qq-api--uint32-p (alist-get field data))
+      (error "qq: get_group_at_all_remain.%s must be uint32" field)))
+  (copy-tree data))
+
+(defun qq-api-get-group-at-all-remaining
+    (group-id callback &optional errback)
+  "Fetch GROUP-ID's live @all availability and remaining quotas.
+
+CALLBACK receives NapCat's validated closed data object."
+  (unless (qq-api-group-id-p group-id)
+    (user-error "qq: group @all quota requires a canonical uint32 group UIN"))
+  (qq-api-call
+   "get_group_at_all_remain"
+   `((group_id . ,group-id))
+   (lambda (response)
+     (condition-case error-data
+         (funcall callback
+                  (qq-api--validate-group-at-all-remaining
+                   (qq-api--response-data response)))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   (or errback #'qq-api--default-error)))
+
 (defun qq-api-leave-group
     (group-id &optional callback errback)
   "Leave GROUP-ID through NapCat OneBot without requesting group dismissal.

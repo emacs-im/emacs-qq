@@ -318,6 +318,49 @@
             (should (qq-state-group "20002")))
         (qq-state-reset)))))
 
+(ert-deftest qq-backend-group-at-all-query-routes-both-backends ()
+  (dolist (backend '(onebot gateway))
+    (let ((qq-backend backend)
+          (group-id (if (eq backend 'onebot) "20001" "8209413637"))
+          called callback-value)
+      (cl-letf
+          (((symbol-function 'qq-api-get-group-at-all-remaining)
+            (lambda (candidate callback &optional _errback)
+              (setq called (list 'onebot candidate))
+              (funcall
+               callback
+               '((can_at_all . :false)
+                 (remain_at_all_count_for_group . 9)
+                 (remain_at_all_count_for_uin . 3)))
+              "onebot-at-all"))
+           ((symbol-function
+             'qq-gateway-directory-get-group-at-all-remaining)
+            (lambda (candidate callback &optional _errback)
+              (setq called (list 'gateway candidate))
+              (funcall
+               callback
+               `((account_id . "slot-a") (generation . "7")
+                 (group_uin . ,candidate) (can_at_all . t)
+                 (remain_at_all_count_for_uin . 3)
+                 (remain_at_all_count_for_group . 9)))
+              "gateway-at-all")))
+        (let ((request
+               (qq-backend-get-group-at-all-remaining
+                group-id (lambda (receipt) (setq callback-value receipt)))))
+          (should (eq (qq-backend-request-backend request) backend))
+          (should
+           (equal (qq-backend-request-token request)
+                  (if (eq backend 'onebot)
+                      "onebot-at-all"
+                    "gateway-at-all")))))
+      (should (equal called (list backend group-id)))
+      (should (= (alist-get 'remain_at_all_count_for_uin callback-value) 3))
+      (should (= (alist-get 'remain_at_all_count_for_group callback-value) 9))))
+  (let ((qq-backend 'onebot))
+    (should-error
+     (qq-backend-get-group-at-all-remaining "8209413637" #'ignore)
+     :type 'user-error)))
+
 (ert-deftest qq-backend-group-leave-does-not-invent-unloaded-directory ()
   (let ((qq-backend 'onebot))
     (unwind-protect

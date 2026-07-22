@@ -3061,6 +3061,48 @@ The authoritative post-state reports UNREAD-COUNT."
     (should-error (qq-api-clock-in-group 20001) :type 'user-error)
     (should-error (qq-api-leave-group 20001) :type 'user-error)))
 
+(ert-deftest qq-api-group-at-all-remaining-validates-closed-result ()
+  (let (action params delivered)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (candidate-action candidate-params callback
+                                         &optional _errback)
+                 (setq action candidate-action
+                       params candidate-params)
+                 (funcall
+                  callback
+                  '((data . ((can_at_all . :false)
+                             (remain_at_all_count_for_group . 9)
+                             (remain_at_all_count_for_uin . 3)))))
+                 'quota-request)))
+      (should
+       (eq (qq-api-get-group-at-all-remaining
+            "20001" (lambda (value) (setq delivered value)))
+           'quota-request)))
+    (should (equal action "get_group_at_all_remain"))
+    (should (equal params '((group_id . "20001"))))
+    (should (eq (alist-get 'can_at_all delivered) :false))
+    (should (= (alist-get 'remain_at_all_count_for_group delivered) 9))
+    (should (= (alist-get 'remain_at_all_count_for_uin delivered) 3))
+    (should-error
+     (qq-api-get-group-at-all-remaining 20001 #'ignore)
+     :type 'user-error))
+  (dolist
+      (invalid
+       '(((can_at_all . t)
+          (remain_at_all_count_for_group . 9)
+          (remain_at_all_count_for_uin . 3)
+          (unexpected . t))
+         ((can_at_all)
+          (remain_at_all_count_for_group . 9)
+          (remain_at_all_count_for_uin . 3))
+         ((can_at_all . t)
+          (remain_at_all_count_for_group . -1)
+          (remain_at_all_count_for_uin . 3))
+         ((can_at_all . t)
+          (remain_at_all_count_for_group . 9)
+          (remain_at_all_count_for_uin . 4294967296))))
+    (should-error (qq-api--validate-group-at-all-remaining invalid))))
+
 (ert-deftest qq-api-send-poke-builds-group-request-and-local-notice ()
   (let (captured-action captured-params applied)
     (qq-state-reset)

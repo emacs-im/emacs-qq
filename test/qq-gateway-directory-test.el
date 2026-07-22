@@ -11,7 +11,7 @@
     "contact.list_group_members" "group.set_name" "group.set_remark"
     "group.set_whole_mute" "group.set_member_card"
     "group.set_member_special_title" "group.kick_member" "group.clock_in"
-    "group.leave")
+    "group.get_at_all_remaining" "group.leave")
   "Native contact capabilities exercised by directory tests.")
 
 (defun qq-gateway-directory-test-account
@@ -372,6 +372,68 @@
          (lambda (_body reason) (setq failure reason))))
       (should-not success)
       (should (string-match-p "invalid fields" failure)))))
+
+(ert-deftest qq-gateway-directory-at-all-query-validates-owned-receipt ()
+  (qq-gateway-directory-test-with-state
+    (let (sent-method sent-params callback-value)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-directory-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall
+                    callback
+                    '((account_id . "slot-a") (generation . "7")
+                      (group_uin . "8209413637") (can_at_all . t)
+                      (remain_at_all_count_for_uin . 3)
+                      (remain_at_all_count_for_group . 9)))
+                   "at-all-request")))
+        (should
+         (equal
+          (qq-gateway-directory-get-group-at-all-remaining
+           "8209413637" (lambda (receipt) (setq callback-value receipt)))
+          "at-all-request")))
+      (should (equal sent-method "group.get_at_all_remaining"))
+      (should
+       (equal sent-params
+              '((account_id . "slot-a") (group_uin . "8209413637"))))
+      (should (eq (alist-get 'can_at_all callback-value) t))
+      (should (= (alist-get 'remain_at_all_count_for_uin callback-value) 3))
+      (should (= (alist-get 'remain_at_all_count_for_group callback-value) 9)))))
+
+(ert-deftest qq-gateway-directory-at-all-query-rejects-open-and-invalid-values ()
+  (qq-gateway-directory-test-with-state
+    (dolist
+        (result
+         '(((account_id . "slot-a") (generation . "7")
+            (group_uin . "8209413637") (can_at_all . :false)
+            (remain_at_all_count_for_uin . 3)
+            (remain_at_all_count_for_group . 9) (unexpected . t))
+           ((account_id . "slot-a") (generation . "7")
+            (group_uin . "8209413637") (can_at_all)
+            (remain_at_all_count_for_uin . 3)
+            (remain_at_all_count_for_group . 9))
+           ((account_id . "slot-a") (generation . "7")
+            (group_uin . "8209413637") (can_at_all . t)
+            (remain_at_all_count_for_uin . 4294967296)
+            (remain_at_all_count_for_group . 9))))
+      (let (success failure)
+        (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                   (lambda () t))
+                  ((symbol-function 'qq-gateway-transport-capabilities)
+                   (lambda () qq-gateway-directory-test-capabilities))
+                  ((symbol-function 'qq-gateway-transport-send)
+                   (lambda (_method _params callback _errback
+                            &optional _early)
+                     (funcall callback result)
+                     "request")))
+          (qq-gateway-directory-get-group-at-all-remaining
+           "8209413637" (lambda (_receipt) (setq success t))
+           (lambda (_body reason) (setq failure reason))))
+        (should-not success)
+        (should failure)))))
 
 (ert-deftest qq-gateway-directory-leave-revokes-owned-group-caches ()
   (qq-gateway-directory-test-with-state
