@@ -2001,7 +2001,8 @@ fallback describes the already accepted exact message."
        . ,(qq-state--normalize-time (alist-get 'time message)))
       (last-message-id . ,(or (alist-get 'server-id message)
                               (alist-get 'id message)))
-      (last-message-seq . ,(alist-get 'message-seq message))
+      (last-message-seq . ,(or (alist-get 'root-message-seq message)
+                               (alist-get 'message-seq message)))
       (last-message-local-id . ,(alist-get 'local-id message))
       (last-message-order . ,(alist-get 'order message))
       (last-message-preview . ,(qq-state-message-preview message))
@@ -3208,8 +3209,14 @@ its session metadata can be committed."
       (when message-copy
         (when-let* ((embedded-seq
                      (alist-get 'message_seq message-copy nil nil #'eq)))
-          (unless (and (stringp embedded-seq)
-                       (equal embedded-seq msg-seq))
+          (unless (or (and (stringp embedded-seq)
+                           (equal embedded-seq msg-seq))
+                      ;; A DataLine RawMessage has no exact message cursor and
+                      ;; reports sequence zero, while RecentContact exposes a
+                      ;; separate nonzero session-summary sequence.  Preserve
+                      ;; both domains instead of rejecting the whole snapshot.
+                      (and (eq session-type 'dataline)
+                           (equal embedded-seq "0")))
             (error "qq: recent contact msgSeq disagrees with latest message")))
         (if (qq-state--poke-notice-p message-copy)
             ;; Authoritative pokes deliberately carry their snowflake only in
@@ -3225,6 +3232,10 @@ its session metadata can be committed."
                      (not (alist-get 'id message-copy nil nil #'eq)))
             (push (cons 'message_id msg-id) message-copy)))
         (when (and msg-seq
+                   ;; Never disguise a recent-contact summary sequence as a
+                   ;; DataLine RawMessage cursor.  DataLine timeline messages
+                   ;; deliberately retain their native zero/missing sequence.
+                   (not (eq session-type 'dataline))
                    (not (alist-get 'message_seq message-copy nil nil #'eq)))
           (push (cons 'message_seq msg-seq) message-copy))
         (when (and (> msg-time 0)
@@ -3261,9 +3272,14 @@ its session metadata can be committed."
          (last-message-self-p . nil))
        :normalized-message
        (and message-copy
-            (qq-state--normalize-raw-message
-             message-copy session-key
-             (and (eq session-type 'private) peer-uid)))
+            (let ((message
+                   (qq-state--normalize-raw-message
+                    message-copy session-key
+                    (and (eq session-type 'private) peer-uid))))
+              (when (eq session-type 'dataline)
+                (setf (alist-get 'root-message-seq message nil nil #'eq)
+                      msg-seq))
+              message))
        :unread-entry-p (and unread-entry t)
        :unread-count (and unread-entry (cdr unread-entry))
        :at-me-seq
