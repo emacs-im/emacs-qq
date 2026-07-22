@@ -434,7 +434,7 @@ independent lifecycle and release operations."
 
 (defun qq-gateway-resource-open-local
     (resource-id &optional callback errback)
-  "Lease a short-lived read-only local path for ready RESOURCE-ID.
+  "Lease a short-lived isolated local copy of ready RESOURCE-ID.
 
 CALLBACK receives an access grant containing `access_id', `resource_id',
 `path', and `expires_at'.  The path is deliberately absent from ordinary

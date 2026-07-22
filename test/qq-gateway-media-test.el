@@ -10,7 +10,8 @@
   "media-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
 
 (defconst qq-gateway-media-test-capabilities
-  '("media.list" "media.status" "media.materialize" "media.release"
+  '("media.list" "media.status" "media.materialize" "media.cancel"
+    "media.release"
     "resource.derive_playable_record" "resource.open_local"
     "resource.close_local"))
 
@@ -118,7 +119,7 @@
     (qq-gateway-media-test-snapshot
      :phase "available" :resource-id "res-impossible"))))
 
-(ert-deftest qq-gateway-media-materialize-projects-linked-resource-atomically ()
+(ert-deftest qq-gateway-media-materialize-starts-background-state-machine ()
   (qq-gateway-media-test-with-state
     (let (delivered)
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
@@ -132,18 +133,10 @@
                                   `((media_id . ,qq-gateway-media-test-id))))
                    (funcall
                     callback
-                    `((media
-                       . ,(qq-gateway-media-test-snapshot
-                           :phase "materialized"
-                           :resource-id "res-native-silk"
-                           :bytes-done "128"
-                           :updated-at 1784700001))
-                      (resource
-                       . ,(qq-gateway-media-test-resource
-                           :resource-id "res-native-silk"
-                           :phase "staging"
-                           :suggested-name "voice.silk"
-                           :size "128"))))
+                    `((media . ,(qq-gateway-media-test-snapshot
+                                  :phase "materializing"
+                                  :bytes-done "0"
+                                  :updated-at 1784700001))))
                    "materialize-request")))
         (should
          (equal
@@ -151,10 +144,49 @@
            qq-gateway-media-test-id
            (lambda (result) (setq delivered result)))
           "materialize-request"))
-        (should (equal (alist-get 'phase (alist-get 'media delivered))
-                       "materialized"))
+        (should (equal (alist-get 'phase delivered) "materializing"))
         (should (qq-gateway-media qq-gateway-media-test-id))
-        (should (qq-gateway-resource "res-native-silk"))))))
+        (should-not (qq-gateway-resource "res-native-silk"))))))
+
+(ert-deftest qq-gateway-media-await-materialized-follows-events-and-is-locally-cancellable ()
+  (qq-gateway-media-test-with-state
+    (let (delivered failed)
+      (qq-gateway-media--upsert
+       (qq-gateway-media-test-snapshot :phase "materializing") 'test)
+      (let ((cancel
+             (qq-gateway-media-await-materialized
+              qq-gateway-media-test-id
+              (lambda (media) (setq delivered media))
+              (lambda (_body reason) (setq failed reason)))))
+        (should-not delivered)
+        (qq-gateway-media--handle-event
+         "media.changed"
+         `((media
+            . ,(qq-gateway-media-test-snapshot
+                :phase "materialized"
+                :resource-id "res-native-silk"
+                :bytes-done "128"
+                :updated-at 1784700001))))
+        (should (equal (alist-get 'resource_id delivered)
+                       "res-native-silk"))
+        (should-not failed)
+        (funcall cancel)))))
+
+(ert-deftest qq-gateway-media-cancel-operation-mutates-service-lifecycle ()
+  (qq-gateway-media-test-with-state
+    (let ((operation
+           (qq-gateway-media-operation-create
+            :active-p t :media-id qq-gateway-media-test-id :owner '("slot-a" . "7")))
+          canceled)
+      (cl-letf (((symbol-function 'qq-gateway--method-available-p)
+                 (lambda (method) (equal method "media.cancel")))
+                ((symbol-function 'qq-gateway-media-cancel)
+                 (lambda (media-id &optional _callback _errback)
+                   (setq canceled media-id)
+                   "cancel-request")))
+        (should (qq-gateway-media-cancel-operation operation))
+        (should-not (qq-gateway-media-operation-active-p operation))
+        (should (equal canceled qq-gateway-media-test-id))))))
 
 (ert-deftest qq-gateway-media-playback-pipeline-reuses-derived-wav ()
   (qq-gateway-media-test-with-state
@@ -181,12 +213,24 @@
                      (lambda (_media-id callback _errback)
                        (funcall
                         callback
-                        `((media
-                           . ,(qq-gateway-media-test-snapshot
-                               :phase "materialized"
-                               :resource-id "res-native-silk"))
-                          (resource . ,raw)))
+                        (qq-gateway-media-test-snapshot
+                         :phase "materializing"
+                         :updated-at 1784700001))
                        "materialize"))
+                    ((symbol-function 'qq-gateway-media-await-materialized)
+                     (lambda (_media-id callback _errback)
+                       (funcall
+                        callback
+                        (qq-gateway-media-test-snapshot
+                         :phase "materialized"
+                         :resource-id "res-native-silk"
+                         :bytes-done "128"
+                         :updated-at 1784700002))
+                       #'ignore))
+                    ((symbol-function 'qq-gateway-resource-status)
+                     (lambda (_resource-id callback _errback)
+                       (funcall callback raw)
+                       "resource-status"))
                     ((symbol-function 'qq-gateway-resource-await-ready)
                      (lambda (resource-id callback _errback)
                        (let ((resource

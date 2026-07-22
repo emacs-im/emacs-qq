@@ -1037,6 +1037,7 @@ states never probe a second interface such as get_file."
 
 (defconst qq-media--native-record-required-methods
   '("media.materialize"
+    "media.cancel"
     "resource.derive_playable_record"
     "resource.open_local"
     "resource.close_local")

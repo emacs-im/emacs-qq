@@ -216,13 +216,13 @@
       (let* ((hello (qq-gateway-transport--json-decode wire))
              (id (alist-get 'id hello)))
         (should (equal (alist-get 'method hello) "gateway.hello"))
-        (should (= (alist-get 'protocol_version (alist-get 'params hello)) 1))
+        (should (= (alist-get 'protocol_version (alist-get 'params hello)) 2))
         (should
          (equal (alist-get 'auth_token (alist-get 'params hello))
                 "0123456789abcdef0123456789abcdef"))
         (qq-gateway-transport--handle-payload
          `((kind . "response") (id . ,id)
-           (result . ((protocol_version . 1)
+           (result . ((protocol_version . 2)
                       (gateway_instance_id . "gateway-42")
                       (capabilities . ("account.list" "account.start"))))))
         ;; A successful hello response alone is not a synchronized session.
