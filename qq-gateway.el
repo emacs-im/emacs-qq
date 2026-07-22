@@ -13,6 +13,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'qq-gateway-transport)
+(require 'qq-protocol)
 
 (defconst qq-gateway--account-phases
   '("stopped" "starting" "login_required" "logging_in" "online"
@@ -449,6 +450,70 @@ CALLBACK receives the snapshot; ERRBACK receives a failure body and reason."
          #'qq-gateway--interactive-error))
   (qq-gateway--account-command
    "account.status" account-id callback errback))
+
+(defun qq-gateway--validate-presence-receipt
+    (result account-id generation presence)
+  "Validate account presence RESULT against its request ownership.
+
+ACCOUNT-ID and GENERATION identify the Account Runtime that accepted
+PRESENCE.  The receipt acknowledges the command; it is not an authoritative
+account snapshot."
+  (unless (qq-gateway--exact-object-keys-p
+           result '(account_id generation presence))
+    (error "qq: Gateway account.set_presence result has invalid fields"))
+  (let ((returned-account-id (alist-get 'account_id result))
+        (returned-generation (alist-get 'generation result))
+        (returned-presence
+         (qq-protocol-validate-account-presence
+          (alist-get 'presence result) "Gateway presence receipt")))
+    (unless (equal returned-account-id account-id)
+      (error "qq: Gateway presence receipt account_id contradicts request"))
+    (unless (equal returned-generation generation)
+      (error "qq: Gateway presence receipt generation contradicts request"))
+    (unless (equal returned-presence presence)
+      (error "qq: Gateway presence receipt contradicts requested presence"))
+    `((account_id . ,returned-account-id)
+      (generation . ,returned-generation)
+      (presence . ,returned-presence))))
+
+;;;###autoload
+(defun qq-gateway-account-set-presence
+    (account-id presence &optional callback errback)
+  "Set PRESENCE for managed ACCOUNT-ID's current runtime generation.
+
+CALLBACK receives a closed acknowledgement carrying account ownership and the
+requested presence.  This command does not change the account lifecycle phase
+or store presence in the local account snapshot."
+  (unless (qq-gateway--non-empty-string-p account-id)
+    (user-error "qq: Account ID must be a non-empty opaque string"))
+  (setq presence
+        (qq-protocol-validate-account-presence
+         presence "account presence" 'user-error))
+  (let* ((account
+          (or (qq-gateway-account account-id)
+              (user-error "qq: Gateway account does not exist: %s" account-id)))
+         (generation (alist-get 'generation account))
+         (owner (cons account-id generation)))
+    (qq-gateway--send
+     "account.set_presence"
+     `((account_id . ,account-id) (presence . ,presence))
+     (lambda (result)
+       (condition-case error-data
+           (let ((receipt
+                  (qq-gateway--validate-presence-receipt
+                   result account-id generation presence)))
+             (unless (equal owner
+                            (let ((current (qq-gateway-account account-id)))
+                              (and current
+                                   (cons account-id
+                                         (alist-get 'generation current)))))
+               (error "qq: Gateway account generation changed before presence acknowledgement"))
+             (qq-gateway--invoke callback receipt))
+         (error
+          (qq-gateway--client-error
+           errback "invalid_gateway_result" "%s"
+           (error-message-string error-data)))))
+     errback)))
 
 ;;;###autoload
 (defun qq-gateway-account-start (account-id &optional callback errback)

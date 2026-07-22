@@ -18,9 +18,11 @@
 (require 'transient)
 (require 'appkit-media)
 (require 'qq-api)
+(require 'qq-backend)
 (require 'qq-chat)
 (require 'qq-media)
 (require 'qq-protocol)
+(require 'qq-presence)
 (require 'qq-root)
 (require 'qq-state)
 (require 'qq-user)
@@ -161,6 +163,10 @@
 (defun qq-transient--friend-pin-inapt-p ()
   "Return non-nil when the current chat is not an authoritative friend chat."
   (not (qq-chat--friend-pin-capable-p)))
+
+(defun qq-transient--presence-inapt-p ()
+  "Return non-nil when account presence control is unavailable."
+  (not (qq-backend-presence-capable-p)))
 
 (defun qq-transient--chat-info-inapt-p ()
   "Return non-nil when the current chat has no profile page."
@@ -409,6 +415,26 @@ Prefer this over inline button rows."
 
 ;;; Root transient
 
+;;;###autoload(autoload 'qq-presence-transient "qq-transient" nil t)
+(transient-define-prefix qq-presence-transient ()
+  "Set presence for the selected QQ account."
+  [["Standard"
+    ("o" "Online" qq-presence-online
+     :inapt-if qq-transient--presence-inapt-p)
+    ("q" "Q me" qq-presence-q-me
+     :inapt-if qq-transient--presence-inapt-p)
+    ("a" "Away" qq-presence-away
+     :inapt-if qq-transient--presence-inapt-p)
+    ("b" "Busy" qq-presence-busy
+     :inapt-if qq-transient--presence-inapt-p)]
+   ["Privacy / custom"
+    ("d" "Do not disturb" qq-presence-do-not-disturb
+     :inapt-if qq-transient--presence-inapt-p)
+    ("i" "Invisible" qq-presence-invisible
+     :inapt-if qq-transient--presence-inapt-p)
+    ("c" "Custom…" qq-presence-custom
+     :inapt-if qq-transient--presence-inapt-p)]])
+
 ;;;###autoload(autoload 'qq-root-transient "qq-transient" nil t)
 (transient-define-prefix qq-root-transient ()
   "Root command menu for emacs-qq."
@@ -429,6 +455,8 @@ Prefer this over inline button rows."
    ["Connection"
     ("c" "Connect" qq-connect)
     ("C" "Disconnect" qq-disconnect)
+    ("p" "Presence…" qq-presence-transient
+     :inapt-if qq-transient--presence-inapt-p)
     ("x" "Reset state" qq-reset-session-state)]
    ["Window"
     ("q" "Quit window" quit-window)

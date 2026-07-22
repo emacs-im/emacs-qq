@@ -7,7 +7,8 @@
 (require 'qq-gateway)
 
 (defconst qq-gateway-test-capabilities
-  '("account.list" "account.create" "account.status" "account.start"
+  '("account.list" "account.create" "account.status" "account.set_presence"
+    "account.start"
     "account.login.password" "account.login.captcha"
     "account.login.new_device" "account.login.unusual_device"
     "account.stop" "account.logout" "account.remove"))
@@ -140,6 +141,81 @@
         (should (equal (alist-get 'generation
                                   (qq-gateway-account "slot-a"))
                        "1"))))))
+
+(ert-deftest qq-gateway-account-presence-is-owned-by-explicit-generation ()
+  (qq-gateway-test-with-state
+    (qq-gateway--upsert-account
+     (qq-gateway-test-account "slot-a" "7" "online" "10001") 'changed)
+    (let (sent-method sent-params delivered)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall
+                    callback
+                    '((account_id . "slot-a")
+                      (generation . "7")
+                      (presence
+                       (kind . "custom")
+                       (face_id . 4294967295)
+                       (wording . "writing Emacs Lisp"))))
+                   "presence-request")))
+        (should
+         (equal
+          (qq-gateway-account-set-presence
+           "slot-a"
+           '((kind . "custom") (face_id . 4294967295)
+             (wording . "writing Emacs Lisp"))
+           (lambda (receipt) (setq delivered receipt)))
+          "presence-request"))
+        (should (equal sent-method "account.set_presence"))
+        (should
+         (equal
+          sent-params
+          '((account_id . "slot-a")
+            (presence
+             (kind . "custom")
+             (face_id . 4294967295)
+             (wording . "writing Emacs Lisp")))))
+        (should
+         (equal delivered
+                '((account_id . "slot-a")
+                  (generation . "7")
+                  (presence
+                   (kind . "custom")
+                   (face_id . 4294967295)
+                   (wording . "writing Emacs Lisp")))))
+        (should (equal (alist-get 'phase (qq-gateway-account "slot-a"))
+                       "online"))))))
+
+(ert-deftest qq-gateway-account-presence-rejects-stale-acknowledgement ()
+  (qq-gateway-test-with-state
+    (qq-gateway--upsert-account
+     (qq-gateway-test-account "slot-a" "7" "online" "10001") 'changed)
+    (let (failure)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (qq-gateway--upsert-account
+                    (qq-gateway-test-account
+                     "slot-a" "8" "online" "10001")
+                    'changed)
+                   (funcall callback
+                            '((account_id . "slot-a")
+                              (generation . "7")
+                              (presence (kind . "away"))))
+                   "presence-request")))
+        (qq-gateway-account-set-presence
+         "slot-a" '((kind . "away")) nil
+         (lambda (_body reason) (setq failure reason)))
+        (should
+         (string-match-p "generation changed" failure))))))
 
 (ert-deftest qq-gateway-password-login-copies-secret-and-keeps-uin-string ()
   (qq-gateway-test-with-state

@@ -3107,6 +3107,37 @@ CALLBACK receives the successful OneBot response."
     (error "qq: emacs_set_friend_pinned contradicted its request"))
   (copy-tree data))
 
+(defun qq-api--validate-presence-receipt (data presence)
+  "Validate closed account presence DATA against requested PRESENCE."
+  (unless (qq-api--exact-object-keys-p data '(presence))
+    (error "qq: emacs_set_presence returned invalid fields"))
+  (let ((returned
+         (qq-protocol-validate-account-presence
+          (alist-get 'presence data) "emacs_set_presence receipt")))
+    (unless (equal returned presence)
+      (error "qq: emacs_set_presence contradicted its request"))
+    `((presence . ,returned))))
+
+(defun qq-api-set-presence (presence &optional callback errback)
+  "Set the current NapCat account PRESENCE through the closed fork action."
+  (setq presence
+        (qq-protocol-validate-account-presence
+         presence "account presence" 'user-error))
+  (qq-api-call
+   "emacs_set_presence"
+   `((presence . ,presence))
+   (lambda (response)
+     (condition-case error-data
+         (let ((receipt
+                (qq-api--validate-presence-receipt
+                 (qq-api--response-data response) presence)))
+           (when callback
+             (funcall callback receipt)))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   (or errback #'qq-api--default-error)))
+
 (defun qq-api-set-friend-pinned
     (user-id pinned &optional callback errback)
   "Set USER-ID's friend conversation PINNED state through the NapCat fork."

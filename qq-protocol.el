@@ -94,6 +94,35 @@ CONTEXT is included in protocol errors."
        (>= value 0)
        (<= value qq-protocol--max-safe-integer)))
 
+(defconst qq-protocol-account-presence-kinds
+  '("online" "q_me" "away" "busy" "do_not_disturb" "invisible")
+  "Closed standard account presence kinds.")
+
+(defun qq-protocol-account-presence-p (value)
+  "Return non-nil when VALUE is one closed account presence object."
+  (let ((kind (and (listp value) (alist-get 'kind value))))
+    (cond
+     ((member kind qq-protocol-account-presence-kinds)
+      (qq-protocol--closed-object-p value '(kind)))
+     ((equal kind "custom")
+      (and (qq-protocol--closed-object-p value '(kind face_id wording))
+           (let ((face-id (alist-get 'face_id value)))
+             (and (integerp face-id) (<= 0 face-id #xffffffff)))
+           (stringp (alist-get 'wording value))))
+     (t nil))))
+
+(defun qq-protocol-validate-account-presence
+    (value &optional context error-symbol)
+  "Return a copy of closed account presence VALUE after validation.
+
+CONTEXT is included in the diagnostic.  ERROR-SYMBOL defaults to `error'."
+  (unless (qq-protocol-account-presence-p value)
+    (signal (or error-symbol 'error)
+            (list
+             (format "qq: %s requires a closed account presence, got %S"
+                     (or context "protocol payload") value))))
+  (copy-tree value))
+
 (defun qq-protocol-emacs-session-locator-p (value)
   "Return non-nil when VALUE is a closed Emacs session locator."
   (pcase (and (consp value) (alist-get 'kind value))

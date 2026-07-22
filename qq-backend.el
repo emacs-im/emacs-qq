@@ -17,9 +17,11 @@
 (require 'subr-x)
 (require 'qq-customize)
 (require 'qq-api)
+(require 'qq-gateway)
 (require 'qq-gateway-directory)
 (require 'qq-gateway-message)
 (require 'qq-gateway-transport)
+(require 'qq-protocol)
 (require 'qq-state)
 (require 'qq-transport)
 
@@ -325,6 +327,29 @@ and reason."
       (qq-gateway-directory-set-friend-pinned
        user-id pinned callback
        (or errback #'qq-backend--default-gateway-error))))))
+
+(defun qq-backend-set-presence (presence &optional callback errback)
+  "Set the selected account's closed PRESENCE through the active backend.
+
+CALLBACK receives the backend's exact acknowledgement.  The native Gateway
+routes the request to the locally selected managed account without changing
+that account's lifecycle phase."
+  (setq presence
+        (qq-protocol-validate-account-presence
+         presence "account presence" 'user-error))
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot
+     (qq-backend--wrap-request
+      'onebot (qq-api-set-presence presence callback errback)))
+    ('gateway
+     (let ((owner
+            (or (qq-gateway-current-account-owner)
+                (user-error "qq: Select a managed Gateway account first"))))
+       (qq-backend--wrap-request
+        'gateway
+        (qq-gateway-account-set-presence
+         (car owner) presence callback
+         (or errback #'qq-backend--default-gateway-error)))))))
 
 (defun qq-backend-set-group-remark
     (group-id remark &optional callback errback)
@@ -884,9 +909,22 @@ request.  ERRBACK handles failure and COUNT limits the requested page size."
       (memq capability
             '(contacts group-members group-settings group-member-settings
               group-moderation group-clock-in group-at-all-quota
-              group-lifecycle
+              group-lifecycle presence
               send-text send-message face reply mention poke recall
               explicit-history)))))
+
+(defun qq-backend-presence-capable-p ()
+  "Return non-nil when the selected account can accept presence changes."
+  (and (qq-backend-ready-p)
+       (qq-backend-supports-p 'presence)
+       (pcase (qq-backend--validate qq-backend)
+         ('onebot t)
+         ('gateway
+          (let ((account (qq-gateway-current-account)))
+            (and account
+                 (equal (alist-get 'phase account) "online")
+                 (member "account.set_presence"
+                         (qq-gateway-transport-capabilities))))))))
 
 (defun qq-backend--gateway-bootstrap-complete (owner failed-p)
   "Complete one Gateway bootstrap part for OWNER, recording FAILED-P."

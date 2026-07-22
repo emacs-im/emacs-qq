@@ -286,6 +286,28 @@
     (should
      (qq-protocol-poke-recall-reference-expired-p reference 201))))
 
+(ert-deftest qq-protocol-account-presence-is-a-closed-tagged-union ()
+  (dolist (kind qq-protocol-account-presence-kinds)
+    (let* ((presence `((kind . ,kind)))
+           (validated
+            (qq-protocol-validate-account-presence presence "presence")))
+      (should (equal validated presence))
+      (should-not (eq validated presence))))
+  (should
+   (qq-protocol-account-presence-p
+    '((kind . "custom") (face_id . 4294967295)
+      (wording . "writing Emacs Lisp"))))
+  (dolist
+      (invalid
+       '(((kind . "away") (raw_status . 30))
+         ((kind . "custom") (face_id . "123") (wording . "x"))
+         ((kind . "custom") (face_id . 4294967296) (wording . "x"))
+         ((kind . "custom") (face_id . 1) (wording . "x") (face_type . 1))
+         ((kind . "unknown"))))
+    (should-not (qq-protocol-account-presence-p invalid))
+    (should-error
+     (qq-protocol-validate-account-presence invalid "presence"))))
+
 (provide 'qq-protocol-test)
 
 ;;; qq-protocol-test.el ends here
