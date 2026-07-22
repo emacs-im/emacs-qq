@@ -362,6 +362,23 @@ and reason."
        group-id callback
        (or errback #'qq-backend--default-gateway-error))))))
 
+(defun qq-backend-get-group-at-all-remaining
+    (group-id callback &optional errback)
+  "Fetch GROUP-ID's live @all availability through the selected backend."
+  (unless (qq-backend-group-id-p group-id)
+    (user-error "qq: Group @all quota requires an exact backend group id"))
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot
+     (qq-backend--wrap-request
+      'onebot
+      (qq-api-get-group-at-all-remaining group-id callback errback)))
+    ('gateway
+     (qq-backend--wrap-request
+      'gateway
+      (qq-gateway-directory-get-group-at-all-remaining
+       group-id callback
+       (or errback #'qq-backend--default-gateway-error))))))
+
 (defun qq-backend--group-leave-success (group-id callback receipt)
   "Remove confirmed GROUP-ID from loaded shared state, then forward RECEIPT."
   (when (qq-state-groups-loaded-p)
@@ -796,7 +813,8 @@ request.  ERRBACK handles failure and COUNT limits the requested page size."
      ('gateway
       (memq capability
             '(contacts group-members group-settings group-member-settings
-              group-moderation group-clock-in group-lifecycle
+              group-moderation group-clock-in group-at-all-quota
+              group-lifecycle
               send-text send-message face reply mention poke recall
               explicit-history)))))
 

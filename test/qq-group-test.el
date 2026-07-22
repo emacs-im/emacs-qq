@@ -98,6 +98,8 @@ BODY may refer to the lexical variables `buffer' and `view'."
       (should (button-at (1- (point))))
       (search-forward "群公告")
       (should (button-at (1- (point))))
+      (search-forward "@全体额度")
+      (should (button-at (1- (point))))
       (search-forward "退出群聊")
       (should (button-at (1- (point)))))))
 
@@ -225,6 +227,52 @@ BODY may refer to the lexical variables `buffer' and `view'."
       (should (string-match-p "连续 7 天" reported))
       (should (string-match-p "群排名 2" reported)))))
 
+(ert-deftest qq-group-at-all-query-reports-live-structured-result ()
+  (with-temp-buffer
+    (qq-group-mode)
+    (setq qq-group--group-id "8209413637"
+          qq-group--profile (copy-tree qq-group-test--profile))
+    (let (called reported)
+      (cl-letf (((symbol-function 'qq-backend-get-group-at-all-remaining)
+                 (lambda (group-id callback &optional _errback)
+                   (setq called group-id)
+                   (funcall
+                    callback
+                    '((account_id . "slot-a") (generation . "7")
+                      (group_uin . "8209413637") (can_at_all . :false)
+                      (remain_at_all_count_for_uin . 3)
+                      (remain_at_all_count_for_group . 9)))
+                   "at-all-request"))
+                ((symbol-function 'message)
+                 (lambda (format-string &rest arguments)
+                   (setq reported (apply #'format format-string arguments)))))
+        (should (equal (qq-group-show-at-all-remaining) "at-all-request")))
+      (should (equal called "8209413637"))
+      (should (string-match-p "当前不可使用 @全体" reported))
+      (should (string-match-p "个人剩余 3 次" reported))
+      (should (string-match-p "群剩余 9 次" reported)))))
+
+(ert-deftest qq-group-late-at-all-result-is-inert-after-profile-reuse ()
+  (with-temp-buffer
+    (qq-group-mode)
+    (setq qq-group--group-id "20001"
+          qq-group--profile (copy-tree qq-group-test--profile))
+    (let (success reported)
+      (cl-letf (((symbol-function 'qq-backend-get-group-at-all-remaining)
+                 (lambda (_group-id callback &optional _errback)
+                   (setq success callback)
+                   "at-all-request"))
+                ((symbol-function 'message)
+                 (lambda (&rest _arguments) (setq reported t))))
+        (qq-group-show-at-all-remaining)
+        (setq qq-group--group-id "20002")
+        (funcall
+         success
+         '((can_at_all . t)
+           (remain_at_all_count_for_uin . 3)
+           (remain_at_all_count_for_group . 9))))
+      (should-not reported))))
+
 (ert-deftest qq-group-leave-confirms-name-and-id-and-closes-owned-profile ()
   (let ((buffer (generate-new-buffer " *qq-group-leave-test*"))
         prompt called reported)
@@ -329,6 +377,8 @@ BODY may refer to the lexical variables `buffer' and `view'."
               #'qq-group-set-whole-mute))
   (should (eq (lookup-key qq-group-mode-map (kbd "S"))
               #'qq-group-clock-in))
+  (should (eq (lookup-key qq-group-mode-map (kbd "@"))
+              #'qq-group-show-at-all-remaining))
   (should (eq (lookup-key qq-group-mode-map (kbd "L"))
               #'qq-group-leave)))
 
