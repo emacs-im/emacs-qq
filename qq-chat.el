@@ -3797,6 +3797,25 @@ a replacement runtime generation."
        (qq-api-message-id-p (alist-get 'server-id message))
        (not (qq-state-message-recalled-p message))))
 
+(defun qq-chat--message-essence-capable-p (message)
+  "Return non-nil when MESSAGE supports an essence mutation."
+  (and (listp message)
+       (eq (alist-get 'type (qq-chat--session)) 'group)
+       (qq-api-message-id-p (alist-get 'server-id message))
+       (not (qq-state-message-recalled-p message))
+       (pcase qq-backend
+         ('onebot t)
+         ('gateway
+          (and (qq-protocol--nonzero-decimal-string-p
+                (alist-get 'message-seq message))
+               (let ((random (alist-get 'native-random message)))
+                 (and (integerp random) (<= 0 random #xffffffff)))
+               (equal
+                (cons (alist-get 'gateway-account-id message)
+                      (alist-get 'gateway-generation message))
+                (qq-gateway-current-account-owner))))
+         (_ nil))))
+
 (defun qq-chat--message-reference (message)
   "Return MESSAGE's closed locator-qualified mutation reference.
 
@@ -3833,6 +3852,30 @@ buffer session with a detached message id after the fact."
      (lambda (_response)
        (message "qq: reaction %s (%s)"
                 (if set "added" "removed") emoji-id)))))
+
+(defun qq-chat-toggle-message-essence (&optional message)
+  "Toggle essence state for MESSAGE or the message at point."
+  (interactive)
+  (let* ((message (or message
+                      (qq-chat--message-at-point)
+                      (user-error "qq: no message at point")))
+         (_capable
+          (or (qq-chat--message-essence-capable-p message)
+              (user-error "qq: essence requires a live group message")))
+         (set (not (eq (alist-get 'essence-p message) t))))
+    (qq-backend-set-message-essence
+     message set
+     (lambda (_response)
+       (message "qq: essence message %s"
+                (if set "set" "removed"))))))
+
+(defun qq-chat--insert-essence-line (message prefix-state properties)
+  "Insert an essence badge for MESSAGE using PREFIX-STATE and PROPERTIES."
+  (when (eq (alist-get 'essence-p message) t)
+    (appkit-ui-insert-prefixed-lines
+     prefix-state "★ 精华消息"
+     :face 'font-lock-keyword-face
+     :properties properties)))
 
 (defun qq-chat--insert-reaction-line (message prefix-state properties)
   "Insert shared appkit reaction chips adapted for QQ MESSAGE."
@@ -4174,6 +4217,7 @@ Visual model (telega-inspired; later appkit):
     (unless (or (qq-state-message-recalled-p message)
                 (qq-state-poke-message-p message)
                 (qq-state-gray-tip-message-p message))
+      (qq-chat--insert-essence-line message body-prefix-state properties)
       (qq-chat--insert-reaction-line message body-prefix-state properties))
     (insert "\n")
     (add-text-properties start (point) properties)))

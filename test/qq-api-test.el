@@ -2867,6 +2867,139 @@ The authoritative post-state reports UNREAD-COUNT."
       (should (eq (alist-get 'is_add applied) :false))
       (should callback-called))))
 
+(ert-deftest qq-api-essence-notice-projects-exact-message-and-metadata ()
+  (let ((qq-api--pending-essences (make-hash-table :test #'equal))
+        (qq-api--essence-revisions (make-hash-table :test #'equal)))
+    (qq-api-test-with-reset
+     (puthash
+      "group:20001"
+      '(((server-id . "9007199254741004001")
+         (session-key . "group:20001")
+         (time . 1710000000)
+         (status . received)
+         (segments . (((type . "text")
+                       (data . ((text . "hello"))))))))
+      qq-state--messages-by-session)
+     (qq-api--handle-notice
+      '((time . 1710000300)
+        (notice_type . "essence")
+        (sub_type . "add")
+        (group_id . 20001)
+        (message_id . "9007199254741004001")
+        (sender_id . 10001)
+        (operator_id . 10002)))
+     (let ((message (car (qq-state-session-messages "group:20001"))))
+       (should (eq (alist-get 'essence-p message) t))
+       (should (equal (alist-get 'essence-sender-id message) "10001"))
+       (should (equal (alist-get 'essence-operator-id message) "10002"))
+       (should (= (alist-get 'essence-changed-at message) 1710000300))))))
+
+(ert-deftest qq-api-essence-notice-never-coerces-numeric-message-id ()
+  (let ((qq-api--pending-essences (make-hash-table :test #'equal))
+        (qq-api--essence-revisions (make-hash-table :test #'equal)))
+    (should-error
+     (qq-api--handle-notice
+      '((time . 1710000300)
+        (notice_type . "essence")
+        (sub_type . "add")
+        (group_id . 20001)
+        (message_id . 9007199254741004001)
+        (sender_id . 10001)
+        (operator_id . 10002))))))
+
+(ert-deftest qq-api-essence-notice-replays-after-message-materializes ()
+  (let ((qq-api--pending-essences (make-hash-table :test #'equal))
+        (qq-api--essence-revisions (make-hash-table :test #'equal)))
+    (qq-api-test-with-reset
+     (qq-api--handle-notice
+      '((time . 1710000300)
+        (notice_type . "essence")
+        (sub_type . "add")
+        (group_id . "20001")
+        (message_id . "9007199254741004001")
+        (sender_id . "10001")
+        (operator_id . "10002")))
+     (should (= (hash-table-count qq-api--pending-essences) 1))
+     (puthash
+      "group:20001"
+      '(((server-id . "9007199254741004001")
+         (session-key . "group:20001")
+         (time . 1710000000)
+         (status . received)))
+      qq-state--messages-by-session)
+     (qq-api--apply-pending-essences "group:20001")
+     (should
+      (eq (alist-get
+           'essence-p
+           (car (qq-state-session-messages "group:20001")))
+          t))
+     (should (= (hash-table-count qq-api--pending-essences) 0)))))
+
+(ert-deftest qq-api-set-message-essence-preserves-snowflake-and-action ()
+  (let ((qq-api--pending-essences (make-hash-table :test #'equal))
+        (qq-api--essence-revisions (make-hash-table :test #'equal))
+        captured-action captured-params callback-called)
+    (qq-api-test-with-reset
+     (puthash
+      "group:20001"
+      '(((server-id . "9007199254741004001")
+         (session-key . "group:20001")
+         (time . 1710000000)
+         (status . received)))
+      qq-state--messages-by-session)
+     (cl-letf (((symbol-function 'qq-api-call)
+                (lambda (action params callback &optional _errback)
+                  (setq captured-action action captured-params params)
+                  (funcall callback '((status . "ok")))
+                  'sent)))
+       (qq-api-set-message-essence
+        (qq-api-test--message-reference
+         'group "20001" "9007199254741004001")
+        t (lambda (_response) (setq callback-called t))))
+     (should (equal captured-action "set_essence_msg"))
+     (should
+      (equal captured-params
+             '((message_id . "9007199254741004001"))))
+     (should callback-called)
+     (should
+      (eq (alist-get
+           'essence-p
+           (car (qq-state-session-messages "group:20001")))
+          t)))))
+
+(ert-deftest qq-api-authoritative-essence-beats-racing-action-receipt ()
+  (let ((qq-api--pending-essences (make-hash-table :test #'equal))
+        (qq-api--essence-revisions (make-hash-table :test #'equal))
+        response-callback)
+    (qq-api-test-with-reset
+     (puthash
+      "group:20001"
+      '(((server-id . "9007199254741004001")
+         (session-key . "group:20001")
+         (time . 1710000000)
+         (status . received)))
+      qq-state--messages-by-session)
+     (cl-letf (((symbol-function 'qq-api-call)
+                (lambda (_action _params callback &optional _errback)
+                  (setq response-callback callback)
+                  'sent)))
+       (qq-api-set-message-essence
+        (qq-api-test--message-reference
+         'group "20001" "9007199254741004001")
+        t)
+       (qq-api--handle-notice
+        '((time . 1710000300)
+          (notice_type . "essence")
+          (sub_type . "delete")
+          (group_id . "20001")
+          (message_id . "9007199254741004001")
+          (sender_id . "10001")
+          (operator_id . "10002")))
+       (funcall response-callback '((status . "ok"))))
+     (let ((message (car (qq-state-session-messages "group:20001"))))
+       (should-not (alist-get 'essence-p message))
+       (should (= (alist-get 'essence-changed-at message) 1710000300))))))
+
 (ert-deftest qq-api-send-poke-builds-group-request-and-local-notice ()
   (let (captured-action captured-params applied)
     (qq-state-reset)

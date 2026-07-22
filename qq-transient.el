@@ -111,6 +111,11 @@
   (not (qq-chat--message-reactable-p
         (qq-transient--message-at-point))))
 
+(defun qq-transient--essence-inapt-p ()
+  "Return non-nil when toggling essence at point is unavailable."
+  (not (qq-chat--message-essence-capable-p
+        (qq-transient--message-at-point))))
+
 (defun qq-transient--no-message-selection-p ()
   "Return non-nil when there are no selected message memberships to clear."
   (null qq-chat--message-selection))
@@ -236,6 +241,8 @@ Prefer this over inline button rows."
      :inapt-if qq-transient--recall-inapt-p)
     ("!" "React…" qq-chat-react-to-message
      :inapt-if qq-transient--reaction-inapt-p)
+    ("e" "Toggle essence" qq-chat-toggle-message-essence
+     :inapt-if qq-transient--essence-inapt-p)
     ("P" "Poke sender" qq-chat-poke-sender
      :inapt-if qq-transient--poke-sender-inapt-p)
     ("a" "Open avatar" qq-chat-open-avatar-at-point

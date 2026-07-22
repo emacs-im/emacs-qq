@@ -2909,6 +2909,32 @@
        (should button)
        (should (eq (button-get button 'face) 'qq-msg-reaction-chosen))))))
 
+(ert-deftest qq-chat-renders-group-essence-badge ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001"))
+    nil)
+   (puthash
+    "group:20001"
+    '(((server-id . "9007199254741004001")
+       (session-key . "group:20001")
+       (sender-id . "10001")
+       (sender-name . "Alice")
+       (time . 100)
+       (segments . (((type . "text") (data . ((text . "hello"))))))
+       (essence-p . t)))
+    qq-state--messages-by-session)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat--set-history-window "9007199254741004001" nil)
+     (qq-chat-render)
+     (goto-char (point-min))
+     (should (search-forward "★ 精华消息" nil t))
+     (should (eq (get-text-property (1- (point)) 'face)
+                 'font-lock-keyword-face)))))
+
 (ert-deftest qq-chat-reaction-chip-toggles-current-selection ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
@@ -2959,6 +2985,49 @@
          (should (eq (nth 0 called) message))
          (should (equal (nth 1 called) "178"))
          (should (eq (nth 2 called) t)))))))
+
+(ert-deftest qq-chat-essence-command-toggles-current-state ()
+  (qq-chat-test-with-reset
+   (let ((qq-backend 'onebot))
+     (qq-state-upsert-session
+      "group:20001"
+      '((type . group) (title . "Group") (target-id . "20001"))
+      nil)
+     (let ((message '((server-id . "9007199254741004001")
+                      (session-key . "group:20001")
+                      (essence-p . t))))
+       (with-temp-buffer
+         (qq-chat-mode)
+         (setq qq-chat--session-key "group:20001")
+         (let (called)
+           (cl-letf (((symbol-function 'qq-backend-set-message-essence)
+                      (lambda (selected set &rest _)
+                        (setq called (list selected set)))))
+             (qq-chat-toggle-message-essence message))
+           (should (eq (nth 0 called) message))
+           (should-not (nth 1 called))))))))
+
+(ert-deftest qq-chat-gateway-essence-capability-requires-native-random ()
+  (qq-chat-test-with-reset
+   (let ((qq-backend 'gateway))
+     (qq-state-upsert-session
+      "group:20001"
+      '((type . group) (title . "Group") (target-id . "20001"))
+      nil)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "group:20001")
+       (cl-letf (((symbol-function 'qq-gateway-current-account-owner)
+                  (lambda () '("slot-a" . "7"))))
+         (let ((message
+                '((server-id . "9007199254741004001")
+                  (session-key . "group:20001")
+                  (message-seq . "9007199254740999")
+                  (gateway-account-id . "slot-a")
+                  (gateway-generation . "7"))))
+           (should-not (qq-chat--message-essence-capable-p message))
+           (setf (alist-get 'native-random message) 4294967295)
+           (should (qq-chat--message-essence-capable-p message))))))))
 
 (ert-deftest qq-chat-filter-snapshot-builds-reference-without-caching-message ()
   (qq-chat-test-with-reset

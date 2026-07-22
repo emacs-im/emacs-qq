@@ -286,6 +286,43 @@
         (should (equal (nth 1 call) "178"))
         (should-not (nth 2 call))))))
 
+(ert-deftest qq-backend-gateway-essence-routes-whole-message ()
+  (let ((qq-backend 'gateway) call)
+    (cl-letf (((symbol-function 'qq-gateway-message-set-essence)
+               (lambda (message set &optional callback errback)
+                 (setq call (list message set callback errback))
+                 "essence-request")))
+      (let ((message
+             '((session-key . "group:8209413637")
+               (server-id . "7348923749823749823")
+               (message-seq . "9007199254740999")
+               (native-random . 7))))
+        (should
+         (equal (qq-backend-set-message-essence message t)
+                "essence-request"))
+        (should (eq (nth 0 call) message))
+        (should (eq (nth 1 call) t))
+        (should (functionp (nth 3 call)))))))
+
+(ert-deftest qq-backend-onebot-essence-retains-closed-reference ()
+  (let ((qq-backend 'onebot) call)
+    (cl-letf (((symbol-function 'qq-api-set-message-essence)
+               (lambda (reference set &optional callback errback)
+                 (setq call (list reference set callback errback))
+                 "onebot-essence")))
+      (let ((message
+             '((session-key . "group:8209413637")
+               (server-id . "7348923749823749823"))))
+        (should
+         (equal (qq-backend-set-message-essence message nil)
+                "onebot-essence"))
+        (should
+         (equal (nth 0 call)
+                '((message_id . "7348923749823749823")
+                  (chat . ((kind . "group")
+                           (group_id . "8209413637"))))))
+        (should-not (nth 1 call))))))
+
 (ert-deftest qq-backend-gateway-poke-recall-routes-whole-message ()
   (let ((qq-backend 'gateway) call)
     (cl-letf (((symbol-function 'qq-state-poke-message-p) (lambda (_message) t))
