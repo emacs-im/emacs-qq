@@ -557,6 +557,63 @@
       (delete-file path-a)
       (delete-file path-b))))
 
+(ert-deftest qq-native-local-record-is-prepared-before-message-send ()
+  (let ((path (make-temp-file "qq-native-record-" nil ".wav" "pcm"))
+        (owner '("slot-a" . "7"))
+        operation prepared sent released-resources)
+    (unwind-protect
+        (let ((segments
+               `(((type . "text") (data . ((text . "voice:"))))
+                 ((type . "record")
+                  (data . ((file . ,path) (name . "voice.wav")))))))
+          (cl-letf
+              (((symbol-function 'qq-gateway-current-account-owner)
+                (lambda () owner))
+               ((symbol-function
+                 'qq-gateway-attachment-stage-and-prepare-record)
+                (lambda (session record-path callback errback)
+                  (setq prepared
+                        (list session record-path callback errback)
+                        operation
+                        (qq-gateway-attachment-operation-create :active-p t))
+                  operation))
+               ((symbol-function 'qq-native--release-send-resource)
+                (lambda (resource-id) (push resource-id released-resources)))
+               ((symbol-function 'qq-gateway-message-send)
+                (lambda (session ready-segments
+                                 &optional raw callback errback optimistic)
+                  (setq sent (list session ready-segments raw callback
+                                   errback optimistic))
+                  "send-record-request")))
+            (let ((request
+                   (qq-native-send-message
+                    "private:10001" segments "optimistic")))
+              (should (qq-native-request-p request))
+              (should (equal (car prepared) "private:10001"))
+              (should (equal (cadr prepared) path))
+              (setf (qq-gateway-attachment-operation-active-p operation) nil)
+              (funcall
+               (nth 2 prepared)
+               (qq-native-test-prepared-image
+                "att-dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+                "res-record-ready"))
+              (should (equal (qq-native-request-token request)
+                             "send-record-request"))
+              (should
+               (equal
+                (nth 1 sent)
+                '(((type . "text") (data . ((text . "voice:"))))
+                  ((type . "record")
+                   (data
+                    . ((attachment_id
+                        . "att-dddddddd-dddd-4ddd-8ddd-dddddddddddd")))))))
+              (should (equal (nth 5 sent) segments))
+              (should-not
+               (string-match-p "qq-native-record-"
+                               (prin1-to-string (nth 1 sent))))
+              (should (equal released-resources '("res-record-ready"))))))
+      (delete-file path))))
+
 (ert-deftest qq-native-local-image-cancel-stops-before-message-dispatch ()
   (let ((path (make-temp-file "qq-native-image-cancel-" nil ".png" "abc"))
         (owner '("slot-a" . "7"))
@@ -620,7 +677,7 @@
             "res-image-owner"))
           (should-not sent)
           (should (equal (cadr failure)
-                         "QQ account generation changed while preparing images"))
+                         "QQ account generation changed while preparing media"))
           (should (equal released-resources '("res-image-owner")))
           (should
            (equal released-attachments

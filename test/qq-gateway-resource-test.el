@@ -7,7 +7,8 @@
 (require 'qq-gateway-resource)
 
 (defconst qq-gateway-resource-test-capabilities
-  '("resource.list" "resource.stage_local" "resource.status"
+  '("resource.list" "resource.stage_local" "resource.derive_record"
+    "resource.status"
     "resource.release" "resource.import.list_sources"
     "resource.import.list_images" "resource.import.stage_image"))
 
@@ -137,6 +138,66 @@
             (should (equal (alist-get 'phase delivered) "staging"))
             (should-not (assq 'path (qq-gateway-resource "res-opaque-a"))))
         (delete-file path)))))
+
+(ert-deftest qq-gateway-resource-derive-record-keeps-source-and-result-distinct ()
+  (qq-gateway-resource-test-with-state
+    (puthash "res-source-wav"
+             (qq-gateway-resource-test-ready "res-source-wav")
+             qq-gateway-resource--resources)
+    (let (sent-method sent-params delivered)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-resource-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall
+                    callback
+                    `((resource
+                       . ,(qq-gateway-resource-test-snapshot
+                           :resource-id "res-derived-silk"
+                           :suggested-name "voice.silk"
+                           :size "27"))))
+                   "derive-request")))
+        (should
+         (equal
+          (qq-gateway-resource-derive-record
+           "res-source-wav" "voice.silk"
+           (lambda (snapshot) (setq delivered snapshot)))
+          "derive-request"))
+        (should (equal sent-method "resource.derive_record"))
+        (should
+         (equal sent-params
+                '((source_resource_id . "res-source-wav")
+                  (suggested_name . "voice.silk"))))
+        (should (equal (alist-get 'resource_id delivered)
+                       "res-derived-silk"))
+        (should (qq-gateway-resource "res-source-wav"))
+        (should (qq-gateway-resource "res-derived-silk"))))))
+
+(ert-deftest qq-gateway-resource-derive-record-rejects-reused-source-id ()
+  (qq-gateway-resource-test-with-state
+    (let (failure)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-resource-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (funcall
+                    callback
+                    `((resource
+                       . ,(qq-gateway-resource-test-snapshot
+                           :resource-id "res-source-wav"))))
+                   "derive-request")))
+        (qq-gateway-resource-derive-record
+         "res-source-wav" nil nil
+         (lambda (body reason) (setq failure (list body reason))))
+        (should (equal (alist-get 'code (car failure))
+                       "invalid_gateway_result"))
+        (should (string-match-p "reused its source identity" (cadr failure)))
+        (should-not (qq-gateway-resource "res-source-wav"))))))
 
 (ert-deftest qq-gateway-resource-events-do-not-regress-terminal-state ()
   (qq-gateway-resource-test-with-state

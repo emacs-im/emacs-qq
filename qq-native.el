@@ -390,39 +390,45 @@ locally selected managed account without changing its lifecycle phase."
     group-id user-id reject-add-request callback
     (or errback #'qq-native--default-error))))
 
-(defun qq-native--local-image-plan (segment index)
-  "Return an upload plan for local image SEGMENT at INDEX, or nil.
+(defun qq-native--local-media-plan (segment index)
+  "Return a preparation plan for local media SEGMENT at INDEX, or nil.
 
-An image carrying an opaque `attachment_id' is already protocol-ready.  URL-
-only images deliberately fail: the native service accepts immutable staged
-bytes, not a URL that could change between validation and upload."
-  (when (equal (alist-get 'type segment) "image")
-    (let* ((data (alist-get 'data segment))
-           (attachment-id (and (listp data)
-                               (alist-get 'attachment_id data)))
-           (file (and (listp data)
-                      (or (alist-get 'file data)
-                          (alist-get 'path data))))
-           (summary (and (listp data) (alist-get 'summary data)))
-           (sub-type (and (listp data) (alist-get 'sub_type data))))
-      (cond
-       (attachment-id nil)
-       ((and (stringp file) (not (string-empty-p file)))
-        (let ((path (expand-file-name file))
-              (summary (or summary "[图片]"))
-              (sub-type (or sub-type 0)))
-          (unless (and (file-regular-p path) (file-readable-p path))
-            (user-error "qq: Image source is not a readable regular file: %s"
-                        path))
-          (qq-gateway-attachment--validate-use
-           `((kind . "image")
-             (summary . ,summary)
-             (sub_type . ,sub-type)))
-          (list :index index :path path
-                :summary summary :sub-type sub-type)))
-       (t
-        (user-error
-         "qq: Native image sending requires a local file or prepared attachment"))))))
+Image and record segments carrying an opaque `attachment_id' are already
+protocol-ready.  URL-only media deliberately fails: the native service accepts
+immutable staged bytes, not a URL that could change before upload."
+  (let ((kind (alist-get 'type segment)))
+    (when (member kind '("image" "record"))
+      (let* ((data (alist-get 'data segment))
+             (attachment-id (and (listp data)
+                                 (alist-get 'attachment_id data)))
+             (file (and (listp data)
+                        (or (alist-get 'file data)
+                            (alist-get 'path data))))
+             (summary (and (listp data) (alist-get 'summary data)))
+             (sub-type (and (listp data) (alist-get 'sub_type data))))
+        (cond
+         (attachment-id nil)
+         ((and (stringp file) (not (string-empty-p file)))
+          (let ((path (expand-file-name file)))
+            (unless (and (file-regular-p path) (file-readable-p path))
+              (user-error
+               "qq: %s source is not a readable regular file: %s"
+               (capitalize kind) path))
+            (if (equal kind "image")
+                (let ((summary (or summary "[图片]"))
+                      (sub-type (or sub-type 0)))
+                  (qq-gateway-attachment--validate-use
+                   `((kind . "image")
+                     (summary . ,summary)
+                     (sub_type . ,sub-type)))
+                  (list :index index :kind kind :path path
+                        :summary summary :sub-type sub-type))
+              (qq-gateway-attachment--validate-use '((kind . "record")))
+              (list :index index :kind kind :path path))))
+         (t
+          (user-error
+           "qq: Native %s sending requires a local file or prepared attachment"
+           kind)))))))
 
 (defun qq-native--release-send-resource (resource-id)
   "Best-effort release one send-pipeline RESOURCE-ID."
@@ -431,9 +437,9 @@ bytes, not a URL that could change between validation and upload."
         (qq-gateway-resource-release
          resource-id nil
          (lambda (_body reason)
-           (message "qq: staged image cleanup failed: %s" reason)))
+           (message "qq: staged media cleanup failed: %s" reason)))
       (error
-       (message "qq: staged image cleanup failed: %s"
+       (message "qq: staged media cleanup failed: %s"
                 (error-message-string error-data))))))
 
 (defun qq-native--release-send-attachment (attachment-id)
@@ -443,14 +449,14 @@ bytes, not a URL that could change between validation and upload."
         (qq-gateway-attachment-release
          attachment-id nil
          (lambda (_body reason)
-           (message "qq: prepared image cleanup failed: %s" reason)))
+           (message "qq: prepared media cleanup failed: %s" reason)))
       (error
-       (message "qq: prepared image cleanup failed: %s"
+       (message "qq: prepared media cleanup failed: %s"
                 (error-message-string error-data))))))
 
-(defun qq-native--send-message-with-local-images
+(defun qq-native--send-message-with-local-media
     (session-key segments plans raw-message callback errback)
-  "Resolve local image PLANS, then send SEGMENTS to SESSION-KEY.
+  "Resolve local media PLANS, then send SEGMENTS to SESSION-KEY.
 
 Staging and preparation may run concurrently, but the immutable segment order
 is retained.  Before `message.send' starts, cancellation releases every
@@ -499,7 +505,7 @@ attachments and cancellation only revokes the local response callback."
           ()
           (if (not (equal owner (qq-gateway-current-account-owner)))
               (finish nil nil
-                      "QQ account generation changed while preparing images")
+                      "QQ account generation changed while preparing media")
             (setq dispatched t)
             (condition-case error-data
                 (setq send-token
@@ -510,7 +516,7 @@ attachments and cancellation only revokes the local response callback."
                (send-failed nil (error-message-string error-data))))
             (when (and request active)
               (setf (qq-native-request-token request) send-token))))
-         (image-ready
+         (media-ready
           (plan attachment)
           (when active
             (let ((attachment-id (alist-get 'attachment_id attachment))
@@ -521,14 +527,14 @@ attachments and cancellation only revokes the local response callback."
               (push resource-id resource-ids)
               (unless (equal owner (qq-gateway-current-account-owner))
                 (finish nil nil
-                        "QQ account generation changed while preparing images"))
+                        "QQ account generation changed while preparing media"))
               (when active
                 ;; The Prepared Attachment already owns a Resource Lease.
                 ;; Releasing now prevents unrelated future leases while the
                 ;; service safely keeps bytes alive through send completion.
                 (qq-native--release-send-resource resource-id)
                 (aset resolved (plist-get plan :index)
-                      `((type . "image")
+                      `((type . ,(plist-get plan :kind))
                         (data . ((attachment_id . ,attachment-id)))))
                 (setq remaining (1- remaining))
                 (when (= remaining 0)
@@ -545,12 +551,19 @@ attachments and cancellation only revokes the local response callback."
             (qq-native-request-create :cancel-function #'cancel))
       (dolist (plan plans)
         (when active
-          (let ((operation
-                 (qq-gateway-attachment-stage-and-prepare-image
-                  session-key (plist-get plan :path)
-                  (plist-get plan :summary) (plist-get plan :sub-type)
-                  (apply-partially #'image-ready plan)
-                  #'send-failed)))
+          (let* ((ready (apply-partially #'media-ready plan))
+                 (operation
+                  (pcase (plist-get plan :kind)
+                    ("image"
+                     (qq-gateway-attachment-stage-and-prepare-image
+                      session-key (plist-get plan :path)
+                      (plist-get plan :summary) (plist-get plan :sub-type)
+                      ready #'send-failed))
+                    ("record"
+                     (qq-gateway-attachment-stage-and-prepare-record
+                      session-key (plist-get plan :path)
+                      ready #'send-failed))
+                    (_ (error "qq: Unknown local media plan")))))
             (when (and active
                        (qq-gateway-attachment-operation-active-p operation))
               (push operation operations)))))
@@ -560,19 +573,20 @@ attachments and cancellation only revokes the local response callback."
     (session-key segments &optional raw-message callback errback)
   "Send SEGMENTS to SESSION-KEY through the native service.
 
-Local image paths are copied into the service Resource Store, prepared for the
-exact account generation and conversation, and replaced by opaque attachment
-IDs before the closed wire request is sent.  RAW-MESSAGE is an optional
-optimistic rendering override.  The pending row is promoted only by the later
-authoritative self event."
+Local image paths are copied into the service Resource Store and local PCM WAV
+records are first derived into message-ready Tencent Silk.  Both are prepared
+for the exact account generation and conversation, then replaced by opaque
+attachment IDs before the closed wire request is sent.  RAW-MESSAGE is an
+optional optimistic rendering override.  The pending row is promoted only by
+the later authoritative self event."
   (let ((plans
          (cl-loop for segment in segments
                   for index from 0
-                  for plan = (qq-native--local-image-plan segment index)
+                  for plan = (qq-native--local-media-plan segment index)
                   when plan collect plan))
         (error-fn (or errback #'qq-native--default-error)))
     (if plans
-        (qq-native--send-message-with-local-images
+        (qq-native--send-message-with-local-media
          session-key segments plans raw-message callback error-fn)
       (qq-gateway-message-send
        session-key segments raw-message callback error-fn))))
