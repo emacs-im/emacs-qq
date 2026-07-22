@@ -26,8 +26,8 @@
          (qq-gateway-transport-event-hook nil)
          (qq-gateway-transport-protocol-error-hook nil)
          (qq-gateway-transport-state-hook nil)
-         (qq-gateway-request-timeout nil)
-         (qq-gateway-ready-timeout nil))
+         (qq-native-request-timeout nil)
+         (qq-native-ready-timeout nil))
      ,@body))
 
 (ert-deftest qq-gateway-transport-token-file-matches-server-policy ()
@@ -37,7 +37,7 @@
           (with-temp-file path
             (insert "0123456789abcdef0123456789abcdef\n"))
           (set-file-modes path #o600)
-          (let ((qq-gateway-auth-token-file path))
+          (let ((qq-native-auth-token-file path))
             (should
              (equal (qq-gateway-transport--read-auth-token)
                     "0123456789abcdef0123456789abcdef"))))
@@ -49,7 +49,7 @@
         (progn
           (with-temp-file path (insert "too-short\n"))
           (set-file-modes path #o600)
-          (let ((qq-gateway-auth-token-file path))
+          (let ((qq-native-auth-token-file path))
             (should-error (qq-gateway-transport--read-auth-token)
                           :type 'user-error)))
       (delete-file path))))
@@ -63,7 +63,7 @@
           (with-temp-file path
             (insert "0123456789abcdef0123456789abcdef\n"))
           (set-file-modes path #o640)
-          (let ((qq-gateway-auth-token-file path))
+          (let ((qq-native-auth-token-file path))
             (should-error (qq-gateway-transport--read-auth-token)
                           :type 'user-error)))
       (delete-file path))))
@@ -189,8 +189,8 @@
         (qq-gateway-transport-event-hook nil)
         (qq-gateway-transport-protocol-error-hook nil)
         (qq-gateway-transport-state-hook nil)
-        (qq-gateway-request-timeout nil)
-        (qq-gateway-ready-timeout nil)
+        (qq-native-request-timeout nil)
+        (qq-native-ready-timeout nil)
         callbacks
         wire
         events)

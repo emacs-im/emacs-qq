@@ -24,7 +24,7 @@
 (require 'appkit-ui)
 (require 'appkit-view)
 (require 'qq-api)
-(require 'qq-backend)
+(require 'qq-native)
 (require 'qq-media)
 (require 'qq-runtime)
 (require 'qq-state)
@@ -1438,7 +1438,7 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
   (interactive
    (list (read-string "群号: ")
          (read-string "搜索群成员: " nil 'qq-contacts-search-history)))
-  (unless (qq-backend-group-id-p group-id)
+  (unless (qq-native-group-id-p group-id)
     (user-error "qq: group member search requires an exact backend group id"))
   (setq query (string-trim (or query "")))
   (when (string-empty-p query)
@@ -1618,7 +1618,7 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
   (let* ((member (qq-contacts--group-member-at-point))
          (group-id (alist-get 'group_id member))
          (user-id (alist-get 'user_id member)))
-    (qq-backend-set-group-member-card
+    (qq-native-set-group-member-card
      group-id user-id card
      (apply-partially
       #'qq-contacts--apply-group-member-setting
@@ -1634,7 +1634,7 @@ SCOPE is one of `all', `contacts', `friends', `groups', or `strangers'."
   (let* ((member (qq-contacts--group-member-at-point))
          (group-id (alist-get 'group_id member))
          (user-id (alist-get 'user_id member)))
-    (qq-backend-set-group-member-special-title
+    (qq-native-set-group-member-special-title
      group-id user-id special-title
      (apply-partially
       #'qq-contacts--apply-group-member-setting
@@ -1676,7 +1676,7 @@ user as part of the same backend operation."
          (group-id (alist-get 'group_id member))
          (user-id (alist-get 'user_id member))
          (display-name (qq-contacts--member-name member)))
-    (qq-backend-kick-group-member
+    (qq-native-kick-group-member
      group-id user-id reject-add-request
      (apply-partially
       #'qq-contacts--apply-group-member-kick
@@ -1734,9 +1734,9 @@ user as part of the same backend operation."
         qq-contacts--refresh-parts nil
         qq-contacts--loading nil)
   (when qq-contacts--friend-request
-    (qq-backend-cancel-request qq-contacts--friend-request))
+    (qq-native-cancel-request qq-contacts--friend-request))
   (when qq-contacts--group-request
-    (qq-backend-cancel-request qq-contacts--group-request))
+    (qq-native-cancel-request qq-contacts--group-request))
   (setq qq-contacts--friend-request nil
         qq-contacts--group-request nil))
 
@@ -1789,7 +1789,7 @@ user as part of the same backend operation."
       (qq-contacts--queue-view-sync view)
       (condition-case error-data
           (let ((request
-                 (qq-backend-refresh-friend-categories
+                 (qq-native-refresh-friend-categories
                   (lambda (_categories)
                     (qq-contacts--finish-refresh-part
                      view buffer owner 'friends))
@@ -1804,7 +1804,7 @@ user as part of the same backend operation."
           view buffer owner 'friends (error-message-string error-data))))
       (condition-case error-data
           (let ((request
-                 (qq-backend-refresh-joined-groups
+                 (qq-native-refresh-joined-groups
                   (lambda (_groups)
                     (qq-contacts--finish-refresh-part
                      view buffer owner 'groups))

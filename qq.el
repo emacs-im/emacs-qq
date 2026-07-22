@@ -1,20 +1,21 @@
-;;; qq.el --- NapCat-backed QQ chat client -*- lexical-binding: t; -*-
+;;; qq.el --- Native QQ chat client -*- lexical-binding: t; -*-
 
 ;; Author: 0WD0 <wd.1105848296@gmail.com>
 ;; Keywords: comm
-;; Version: 0.1.0
+;; Version: 2.0.0
 ;; URL: https://github.com/0WD0/emacs-qq
 ;; Package-Requires: ((emacs "27.1") (websocket "1.16") (transient "0.7") (appkit "0.2.0"))
 
 ;;; Commentary:
 
-;; emacs-qq provides a small but usable QQ client inside Emacs.
+;; emacs-qq provides a native QQ client inside Emacs.
 ;;
-;; Current MVP scope:
-;; - connect to NapCat over OneBot websocket
+;; Version 2 deliberately speaks one native protocol:
+;; - connect to the long-lived native service over WebSocket
+;; - select and control complete lifecycles for multiple QQ accounts
 ;; - browse recent sessions in an appkit-backed root buffer
-;; - open one chat buffer, fetch history, send text messages
-;; - keep state updated from websocket events
+;; - open chat buffers, fetch history, and exchange structured messages
+;; - keep exact account-generation state updated from protocol events
 ;; - transient menus for root / chat / message / attachments
 
 ;;; Code:
@@ -24,13 +25,11 @@
 (require 'qq-customize)
 (require 'qq-runtime)
 (require 'qq-state)
-(require 'qq-transport)
 (require 'qq-gateway)
 (require 'qq-gateway-resource)
 (require 'qq-gateway-message)
 (require 'qq-gateway-directory)
-(require 'qq-api)
-(require 'qq-backend)
+(require 'qq-native)
 (require 'qq-chat)
 (require 'qq-search)
 (require 'qq-media)
@@ -210,48 +209,28 @@ current, detached, or legacy QQ buffers created by shutdown/kill hooks."
 
 ;;;###autoload
 (defun qq-connect ()
-  "Start the selected emacs-qq backend transport."
+  "Connect Emacs to the native QQ service."
   (interactive)
-  (qq-backend-connect))
+  (qq-native-connect))
 
 ;;;###autoload
 (defun qq-disconnect ()
-  "Stop the selected Emacs transport without changing remote account state."
+  "Disconnect Emacs without changing any managed QQ account state."
   (interactive)
-  (qq-backend-disconnect))
+  (qq-native-disconnect))
 
 ;;;###autoload
 (defun qq-refresh ()
-  "Refresh runtime data from the selected backend.
+  "Refresh runtime data from the native QQ service.
 
 When transport is not connected yet, start it and wait for bootstrap.
 When transport is already open, request a fresh snapshot immediately."
   (interactive)
-  (if (qq-backend-running-p)
-      (qq-backend-refresh)
+  (if (qq-native-running-p)
+      (qq-native-refresh)
     (progn
       (qq-connect)
-      (message "qq: connecting; initial refresh will run when the backend is ready"))))
-
-;;;###autoload
-(defun qq-switch-backend (backend)
-  "Reset the client projection, select BACKEND, and open emacs-qq.
-
-BACKEND is `onebot' or `gateway'.  Switching disconnects only the previous
-Emacs transport.  In particular, it never stops or logs out an account owned
-by the long-lived native Gateway."
-  (interactive
-   (list
-    (intern
-     (completing-read
-      "QQ backend: " '("onebot" "gateway") nil t nil nil
-      (symbol-name qq-backend)))))
-  (unless (memq backend '(onebot gateway))
-    (user-error "qq: Unknown backend %S" backend))
-  (unless (eq backend qq-backend)
-    (qq-reset-session-state)
-    (setq qq-backend backend))
-  (qq))
+      (message "qq: connecting; initial refresh will run when the service is ready"))))
 
 ;;;###autoload
 (defun qq-reset-session-state ()
@@ -276,7 +255,7 @@ Appkit detaches renamed views; legacy QQ major modes are included too."
             (qq-media-clear-cache))
         (unwind-protect
             (progn
-              (qq-backend-reset-session-state)
+              (qq-native-reset-session-state)
               (qq-state-reset))
           (unwind-protect
               (qq--drain-reset-resources buffers)

@@ -117,8 +117,7 @@
 (defmacro qq-gateway-directory-test-with-state (&rest body)
   "Run BODY with isolated selected Gateway and directory state."
   (declare (indent 0) (debug t))
-  `(let ((qq-backend 'gateway)
-         (qq-gateway--accounts (make-hash-table :test #'equal))
+  `(let ((qq-gateway--accounts (make-hash-table :test #'equal))
          (qq-gateway--account-order nil)
          (qq-gateway--current-account-id nil)
          (qq-gateway--gateway-instance-id nil)

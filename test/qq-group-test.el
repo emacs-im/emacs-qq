@@ -129,7 +129,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
 (ert-deftest qq-group-refresh-handles-synchronous-response-ownership ()
   (qq-group-test-with-profile-view
     (cl-letf (((symbol-function 'qq-group-render) #'ignore)
-              ((symbol-function 'qq-backend-get-group)
+              ((symbol-function 'qq-native-get-group)
                (lambda (_group-id callback &optional _errback)
                  (funcall callback (copy-tree qq-group-test--profile))
                  'request)))
@@ -164,19 +164,19 @@ BODY may refer to the lexical variables `buffer' and `view'."
           qq-group--profile (copy-tree qq-group-test--profile))
     (let (calls)
       (cl-letf
-          (((symbol-function 'qq-backend-set-group-name)
+          (((symbol-function 'qq-native-set-group-name)
             (lambda (group-id value callback &optional _errback)
               (push (list 'name group-id value) calls)
               (funcall callback '((status . "ok")))))
-           ((symbol-function 'qq-backend-set-group-remark)
+           ((symbol-function 'qq-native-set-group-remark)
             (lambda (group-id value callback &optional _errback)
               (push (list 'remark group-id value) calls)
               (funcall callback '((status . "ok")))))
-           ((symbol-function 'qq-backend-set-group-whole-mute)
+           ((symbol-function 'qq-native-set-group-whole-mute)
             (lambda (group-id value callback &optional _errback)
               (push (list 'mute group-id value) calls)
               (funcall callback '((status . "ok")))))
-           ((symbol-function 'qq-backend-set-group-pinned)
+           ((symbol-function 'qq-native-set-group-pinned)
             (lambda (group-id value callback &optional _errback)
               (push (list 'pinned group-id value) calls)
               (funcall callback '((pinned . :false)))))
@@ -201,7 +201,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
 (ert-deftest qq-group-refresh-settles-synchronous-dispatch-error ()
   (qq-group-test-with-profile-view
     (cl-letf (((symbol-function 'qq-group-render) #'ignore)
-              ((symbol-function 'qq-backend-get-group)
+              ((symbol-function 'qq-native-get-group)
                (lambda (&rest _args) (error "synthetic dispatch failure"))))
       (qq-group-refresh)
       (should-not qq-group--loading)
@@ -215,7 +215,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
     (setq qq-group--group-id "8209413637"
           qq-group--profile (copy-tree qq-group-test--profile))
     (let (called reported)
-      (cl-letf (((symbol-function 'qq-backend-clock-in-group)
+      (cl-letf (((symbol-function 'qq-native-clock-in-group)
                  (lambda (group-id callback &optional _errback)
                    (setq called group-id)
                    (funcall
@@ -242,7 +242,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
     (setq qq-group--group-id "8209413637"
           qq-group--profile (copy-tree qq-group-test--profile))
     (let (called reported)
-      (cl-letf (((symbol-function 'qq-backend-get-group-at-all-remaining)
+      (cl-letf (((symbol-function 'qq-native-get-group-at-all-remaining)
                  (lambda (group-id callback &optional _errback)
                    (setq called group-id)
                    (funcall
@@ -267,7 +267,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
     (setq qq-group--group-id "20001"
           qq-group--profile (copy-tree qq-group-test--profile))
     (let (success reported)
-      (cl-letf (((symbol-function 'qq-backend-get-group-at-all-remaining)
+      (cl-letf (((symbol-function 'qq-native-get-group-at-all-remaining)
                  (lambda (_group-id callback &optional _errback)
                    (setq success callback)
                    "at-all-request"))
@@ -293,7 +293,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
                   qq-group--profile (copy-tree qq-group-test--profile))
             (cl-letf (((symbol-function 'yes-or-no-p)
                        (lambda (value) (setq prompt value) t))
-                      ((symbol-function 'qq-backend-leave-group)
+                      ((symbol-function 'qq-native-leave-group)
                        (lambda (group-id callback &optional _errback)
                          (setq called group-id)
                          (funcall callback '((status . "ok")))
@@ -317,7 +317,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
     (setq qq-group--group-id "20001"
           qq-group--profile (copy-tree qq-group-test--profile))
     (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_prompt) nil))
-              ((symbol-function 'qq-backend-leave-group)
+              ((symbol-function 'qq-native-leave-group)
                (lambda (&rest _arguments)
                  (ert-fail "cancelled group leave was dispatched"))))
       (should-error (qq-group-leave) :type 'user-error))))
@@ -332,7 +332,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
             (setq qq-group--group-id "20001"
                   qq-group--profile (copy-tree qq-group-test--profile))
             (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_prompt) t))
-                      ((symbol-function 'qq-backend-leave-group)
+                      ((symbol-function 'qq-native-leave-group)
                        (lambda (_group-id callback &optional _errback)
                          (setq success callback)
                          "leave-request")))
@@ -440,7 +440,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
             qq-group--loading t
             qq-group--request 'old-group-request
             qq-group--request-owner 'old-owner)
-      (cl-letf (((symbol-function 'qq-backend-cancel-request)
+      (cl-letf (((symbol-function 'qq-native-cancel-request)
                  (lambda (request) (push request cancelled))))
         (appkit-kill-view view)
         (should (member 'old-group-request cancelled))
@@ -482,11 +482,11 @@ BODY may refer to the lexical variables `buffer' and `view'."
 (ert-deftest qq-group-dead-view-makes-late-profile-response-inert ()
   (qq-group-test-with-profile-view
     (let (success)
-      (cl-letf (((symbol-function 'qq-backend-get-group)
+      (cl-letf (((symbol-function 'qq-native-get-group)
                  (lambda (_group-id callback &optional _errback)
                    (setq success callback)
                    'group-token))
-                ((symbol-function 'qq-backend-cancel-request) #'ignore))
+                ((symbol-function 'qq-native-cancel-request) #'ignore))
         (qq-group-refresh)
         (appkit-kill-view view)
         (let ((replacement (qq-group--ensure-view))
@@ -507,7 +507,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
 (ert-deftest qq-group-profile-callback-uses-atomic-appkit-request-sync ()
   (qq-group-test-with-profile-view
     (let (success calls)
-      (cl-letf (((symbol-function 'qq-backend-get-group)
+      (cl-letf (((symbol-function 'qq-native-get-group)
                  (lambda (_group-id callback &optional _errback)
                    (setq success callback)
                    'group-token)))

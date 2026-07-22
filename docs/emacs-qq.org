@@ -4,20 +4,20 @@
 #+language: zh-CN
 #+texinfo_dir_category: Emacs
 #+texinfo_dir_title: emacs-qq: (emacs-qq).
-#+texinfo_dir_desc: 在 Emacs 中通过 NapCat 使用 QQ。
-#+subtitle: 适用于 0.1.0
+#+texinfo_dir_desc: 在 Emacs 中使用原生 QQ 协议。
+#+subtitle: 适用于 2.0.0
 #+options: broken-links:mark toc:2 num:nil
 
 * 简介
 
-~emacs-qq~ 是一个运行在 Emacs 中的 QQ 客户端。它通过 OneBot WebSocket 连接
-NapCat，在 Emacs 中提供最近会话、私聊、群聊、联系人、消息搜索、媒体、转发和
-通知等功能。
+~emacs-qq~ 是一个运行在 Emacs 中的 QQ 客户端。v2 通过 WebSocket 连接本工作区的
+长期运行原生 QQ 服务，在 Emacs 中提供最近会话、私聊、群聊、联系人、媒体和通知等
+功能。
 
 项目复用 [[https://github.com/0WD0/appkit.el][Appkit]] 的列表、时间线、补全和媒体基础设施，并参考了 telega.el 和
-disco.el 的交互设计。用户不需要了解这些内部实现；需要注意的是，本项目目前仍处于
-开发阶段，重点是私聊和普通群聊的核心体验，而不是覆盖 NapCat 的每一个 OneBot
-action。
+disco.el 的交互设计。与 telega 类似，界面代码调用稳定的 QQ 操作层，不选择某个
+“当前后端”；WebSocket 与 wire protocol 是包内连接实现。项目目前仍处于开发阶段，
+重点是私聊和普通群聊的原生体验。
 
 本手册面向日常用户。项目首页和最短启动示例见仓库中的 [[file:../README.org][README]]；协议实现笔记和
 跨仓库架构决策不属于本手册的范围。
@@ -26,13 +26,15 @@ action。
 
 一次完整会话包含三部分：
 
-1. QQ 桌面客户端负责登录账号。
-2. [[https://github.com/0WD0/NapCatQQ-emacs][NapCatQQ-emacs]] 在 QQ 进程中提供 emacs-qq 所需的严格接口，并开放 OneBot
-   WebSocket。
-3. ~emacs-qq~ 连接该 WebSocket，把远端状态投影为 Emacs 缓冲区。
+1. 原生 QQ 服务是独立的长期运行进程，负责保存账号槽位及其登录、重连、停止和移除
+   生命周期。
+2. ~emacs-qq~ 连接服务 WebSocket，显式选择一个在线账号及 generation，再把服务状态
+   投影为 Emacs 缓冲区。
+3. 关闭 Emacs 连接只会解除这个客户端的附着，不会隐式退出 QQ，也不会为每个账号另起
+   一个服务进程。
 
-NapCat 是必需的后端，不是可选的增强组件。关闭 QQ、NapCat 或 WebSocket 后，已经
-打开的缓冲区仍可暂时显示本地状态，但不能继续同步或发送消息。
+v2 不提供 NapCat/OneBot 兼容选择；v1 保留在版本历史中。Lagrange 与 NapCat 仍是协议
+和行为参考，但不是当前客户端接口。
 
 ** 支持范围
 
@@ -57,7 +59,7 @@ QQ 频道（Guild）已有浏览和阅读界面，但普通私聊、群聊是当
 ** 要求
 
 - Emacs 27.1 或更新版本；
-- [[https://github.com/0WD0/NapCatQQ-emacs][NapCatQQ-emacs]]，不能用上游原版 NapCat 替代；
+- 本工作区构建的原生 QQ 服务；
 - websocket.el 1.16 或更新版本；
 - transient.el 0.7 或更新版本；
 - [[https://github.com/0WD0/appkit.el][Appkit]]；
@@ -128,32 +130,17 @@ emacs-qq 依赖的 Appkit 尚未发布到包归档，因此这里也显式使用
 
 手动安装时不要只复制 ~qq.el~；~qq-*.el~ 和 ~qq-face-names.json~ 都是包的一部分。
 
-* 配置 NapCatQQ-emacs
+* 配置原生 QQ 服务
 
-** 为什么必须使用 fork
+服务独立于 Emacs 启动，并可以在没有任何登录账号时运行。账号的创建、登录挑战、
+上线、停止、退出和永久移除都是显式协议操作；不要把服务进程绑到某次账号登录命令。
 
-客户端与 NapCatQQ-emacs 对消息主键和若干 ~emacs_*~ action 采用严格协议。该协议
-不是对上游短消息 ID 的兼容层；使用 stock NapCat 即使能够建立 WebSocket，也会在
-历史定位、回复、撤回、转发或乐观消息晋升时产生错误。
+默认本机 WebSocket 地址是 ~ws://127.0.0.1:3002/~。服务认证 token 应写入一个只允许
+当前用户读取、内容仅为单个 token 的文件。不要通过启动 Emacs 的 shell 环境变量隐式
+选择账号或控制服务生命周期。
 
-请按照 [[https://github.com/0WD0/NapCatQQ-emacs][NapCatQQ-emacs 仓库]]的说明构建并加载 fork。升级 QQ 或 NapCat 后，也要确认
-实际运行的仍是 fork 构建。
-
-** OneBot 设置
-
-在 NapCat 中启用 WebSocket 服务，并让地址、端口和 token 与 Emacs 配置一致。典型
-的本机设置为：
-
-- WebSocket 地址：~ws://127.0.0.1:3001/~；
-- ~messagePostFormat = array~；
-- ~reportSelfMessage = true~；
-- 设置一个不为空、不可公开的 access token。
-
-数组消息格式让客户端直接接收结构化消息段。上报自己的消息则用于把其他 QQ 客户端
-发出的内容、发送回执和当前 Emacs 状态正确合并。
-
-不要在不可信网络上暴露无加密、无访问控制的 OneBot 端点。远程运行 NapCat 时，优先
-使用受保护的 ~wss://~ 端点、VPN 或 SSH 隧道。
+不要在不可信网络上暴露无加密的 WebSocket。远程运行时，应使用受保护的 ~wss://~、
+VPN 或 SSH 隧道，并保留同样的认证边界。
 
 * 配置 emacs-qq
 
@@ -162,26 +149,12 @@ emacs-qq 依赖的 Appkit 尚未发布到包归档，因此这里也显式使用
 #+begin_src emacs-lisp
 (require 'qq)
 
-(setq qq-onebot-websocket-url "ws://127.0.0.1:3001/")
-(setq qq-onebot-token "YOUR_ONEBOT_TOKEN")
+(setq qq-native-websocket-url "ws://127.0.0.1:3002/")
+(setq qq-native-auth-token-file "~/.emacs.d/qq/service-token")
 #+end_src
 
-执行 ~M-x qq~ 后，客户端会打开主界面并连接 NapCat。
-
-** 使用环境变量保存 token
-
-不希望把 token 写入可同步的 Emacs 配置时，可以在启动 Emacs 前设置：
-
-#+begin_src sh
-export NAPCAT_ONEBOT_TOKEN='YOUR_ONEBOT_TOKEN'
-#+end_src
-
-~qq-onebot-token~ 为 ~nil~ 时，客户端读取 ~qq-onebot-token-env-var~ 指定的环境变量；
-后者默认是 ~NAPCAT_ONEBOT_TOKEN~。图形化启动的 Emacs 不一定继承交互 shell 的
-环境，此时应从桌面会话、systemd user service 或 Emacs 配置中安全地注入变量。
-
-也可以执行 ~M-x qq-set-token~，只为当前 Emacs 进程设置 token。显式的
-~qq-onebot-token~ 优先于环境变量。
+执行 ~M-x qq~ 后，客户端会打开主界面并附着到原生服务。认证文件的权限过宽、token
+为空或握手协议不匹配时，连接会失败，不会退回其他实现。
 
 ** 可选全局模式
 
@@ -200,7 +173,7 @@ export NAPCAT_ONEBOT_TOKEN='YOUR_ONEBOT_TOKEN'
 
 ** 启动与连接命令
 
-- ~M-x qq~ (~qq~) :: 初始化运行时、打开主界面并连接 NapCat。日常启动通常只需要
+- ~M-x qq~ (~qq~) :: 初始化运行时、打开主界面并连接原生服务。日常启动通常只需要
   这个命令。
 - ~M-x qq-connect~ (~qq-connect~) :: 启动 WebSocket 传输，不重新创建已有缓冲区。
 - ~M-x qq-disconnect~ (~qq-disconnect~) :: 主动断开传输。客户端不会因此清除内存中的
@@ -216,8 +189,8 @@ export NAPCAT_ONEBOT_TOKEN='YOUR_ONEBOT_TOKEN'
 正常连接后，主界面应显示账号名称和最近会话。可以按 ~g~ 刷新，再打开一个会话验证
 历史消息；发送测试消息时，应先看到本地待发送状态，随后自动变为服务器确认的消息。
 
-如果主界面为空或持续断线，依次确认：QQ 已登录、NapCat fork 已加载、WebSocket
-端口可访问、token 完全一致，以及消息格式为 array。进一步排查见
+如果主界面为空或持续断线，依次确认：原生服务已启动、至少一个账号已经上线、
+WebSocket 端口可访问、认证文件权限正确且 token 完全一致。进一步排查见
 [[*故障排查][故障排查]]。
 
 * 界面概念
@@ -360,7 +333,7 @@ Linux QQ 返回的结果为准，不在客户端中重新按名称排序。
 
 剪贴板处理优先识别 ~text/uri-list~ 中的本地文件，其次读取图像字节；macOS 上还可以
 使用 ~pngpaste~。给剪贴板命令前缀参数会强制按文件处理。所有附件在输入区中保持为
-结构化对象，直到发送时才转换为 OneBot 消息段。
+结构化对象，直到发送时才投影为原生协议消息段。
 
 ** 历史、回复跳转和已读
 
@@ -385,7 +358,7 @@ fork 请求目标附近的一页历史，而不是从当前最旧消息盲目逐
 - ~s~ 另存为；
 - ~y~ 复制媒体 URL。
 
-某些媒体只有在 NapCat 返回可用 URL 或下载能力后才能执行相应动作。菜单会根据当前
+某些媒体只有在原生服务返回可用 URL 或下载能力后才能执行相应动作。菜单会根据当前
 卡片能力禁用不适用的动作。
 
 * 消息选择与转发
@@ -421,7 +394,7 @@ fork 请求目标附近的一页历史，而不是从当前最旧消息盲目逐
 
 * 搜索与过滤
 
-emacs-qq 的消息搜索以 Linux QQ/NapCat 返回的服务端结果为准，不是只在已经渲染的
+emacs-qq 的消息搜索以原生服务返回的服务端结果为准，不是只在已经渲染的
 buffer 文本中执行正则搜索。
 
 ** 时间线内搜索
@@ -474,7 +447,7 @@ buffer 文本中执行正则搜索。
 
 ** 用户资料
 
-用户资料页显示 NapCat 可提供的昵称、账号资料、头像和照片墙入口。常用按键：
+用户资料页显示原生服务可提供的昵称、账号资料、头像和照片墙入口。常用按键：
 
 - ~g~ 刷新；
 - ~m~ 打开私聊；
@@ -486,7 +459,7 @@ buffer 文本中执行正则搜索。
 - ~w~ 复制 QQ 号；
 - ~q~ 退出。
 
-资料字段是否存在取决于 QQ 隐私设置和 NapCat 返回值，空字段不会由客户端猜测。
+资料字段是否存在取决于 QQ 隐私设置和原生服务返回值，空字段不会由客户端猜测。
 
 ** 群资料
 
@@ -505,13 +478,8 @@ buffer 文本中执行正则搜索。
 
 * QQ 频道
 
-从主界面按 ~G~ 打开频道目录。Emacs state 中用 ~RET~ 打开频道或条目，~/~ 过滤，
-~C-c C-k~ 清除过滤，~g~ 刷新，~TAB~ / ~<backtab>~ 在目录项目间移动；Evil
-normal/motion state 中相应使用 ~s~、~gr~、~gj~ / ~gk~。频道、子频道、论坛和帖子
-使用不同的只读缓冲区，支持的动作以各页菜单和 ~describe-mode~ 为准。
-
-频道接口与普通 OneBot 私聊/群聊接口并不完全相同。遇到频道特有缺失功能时，不要
-把普通群聊的命令当作等价替代。
+QQ 频道尚未迁移到 v2 原生协议，当前不可用。旧界面代码暂时仍在源码中作为迁移素材，
+但不会通过 OneBot 回退执行；待服务提供闭合的频道身份与分页协议后再重新接入。
 
 * 通知与 mode line
 
@@ -613,14 +581,15 @@ state 和输入区边界共同决定。
 
 ** 连接与历史
 
-- ~qq-onebot-websocket-url~：OneBot WebSocket 地址；
-- ~qq-onebot-token~：显式 token，~nil~ 时读取环境变量；
-- ~qq-onebot-token-env-var~：token 环境变量名；
+- ~qq-native-websocket-url~：原生服务 WebSocket 地址；
+- ~qq-native-auth-token-file~：仅当前用户可读的认证 token 文件；
+- ~qq-native-client-name~：握手时发送的客户端名称；
 - ~qq-recent-contact-count~：刷新时请求的最近会话数量；
 - ~qq-history-fetch-count~：每次普通历史请求数量；
-- ~qq-transport-request-timeout~：action 本地超时秒数，~nil~ 表示不超时；
-- ~qq-transport-reconnect-delay~：重连间隔；
-- ~qq-transport-reconnect-max-attempts~：最大重试次数，~nil~ 表示不限次数；
+- ~qq-native-request-timeout~：原生请求的本地超时秒数，~nil~ 表示不超时；
+- ~qq-native-ready-timeout~：握手后等待权威 ready 快照的秒数；
+- ~qq-native-reconnect-delay~：重连间隔；
+- ~qq-native-reconnect-max-attempts~：最大重试次数，~nil~ 表示不限次数；
 - ~qq-chat-jump-history-count~：定位回复/搜索目标时请求的页面大小。
 
 无限重连适合长期运行的 Emacs daemon；网络长期离线时，可以设置最大次数或主动执行
@@ -661,7 +630,7 @@ state 和输入区边界共同决定。
 
 ** 消息主键硬切
 
-NapCatQQ-emacs 与客户端遵守以下不可混用的规则：
+原生服务与客户端遵守以下不可混用的规则：
 
 - 字段名仍叫 ~message_id~；
 - 值始终是 NT 消息雪花 ID 的原始十进制字符串；
@@ -675,9 +644,9 @@ NapCatQQ-emacs 与客户端遵守以下不可混用的规则：
 
 ** 严格转发与快照
 
-~emacs_get_forward~ 返回的 live 快照必须带非空 ~segments~，recalled 快照必须带空
-~segments~。~emacs_send_forward~ 只接受 ~individual~ 和 ~merged~ 两种封闭请求，
-不接受旧的 ~single~ / ~bundle~ 形状。
+转发快照中的 live 消息必须带非空 ~segments~，recalled 快照必须带空 ~segments~。
+原生操作只接受 ~individual~ 和 ~merged~ 两种封闭请求，不接受旧的
+~single~ / ~bundle~ 形状。
 
 一次请求中的消息必须来自同一个显式源会话。严格校验失败是一项安全边界；客户端不会
 猜测另一个会话或回退成表面相似的发送方式。
@@ -713,37 +682,35 @@ qq-evil-enable-integration
 
 ** 能连接但历史、回复或转发异常
 
-最常见原因是实际运行了上游 stock NapCat，或者某个中间层把 ~message_id~ 转成了
-数字。检查 NapCat 构建来源和原始 WebSocket payload：消息 ID 必须是十进制字符串，
-不能是 int32 short hash，也不能带科学计数法或已经舍入的尾数。
+首先检查原始 WebSocket payload 是否有中间层把 ~message_id~ 转成数字：消息 ID 必须
+是十进制字符串，不能带科学计数法或已经舍入的尾数。
 
-切回 fork 后执行 ~M-x qq-reset-session-state~，再执行 ~M-x qq~，避免旧协议状态继续
-留在当前 Emacs 进程。
+修正服务或中间层后执行 ~M-x qq-reset-session-state~，再执行 ~M-x qq~，避免旧协议
+状态继续留在当前 Emacs 进程。
 
 ** 主界面空白或反复重连
 
-1. 确认 QQ 已登录且 NapCat 控制台没有加载错误。
-2. 确认 WebSocket URL（包括路径和结尾斜杠）与 NapCat 配置一致。
-3. 确认 ~qq-onebot-token~ 或环境变量与服务端 token 一致。
+1. 确认原生服务已启动，并且所选账号处于 online phase。
+2. 确认 ~qq-native-websocket-url~（包括路径和结尾斜杠）与服务配置一致。
+3. 确认 ~qq-native-auth-token-file~ 权限安全，文件内容与服务端 token 一致。
 4. 确认端口没有被防火墙、容器网络或代理阻断。
-5. 确认使用 ~messagePostFormat = array~ 和 ~reportSelfMessage = true~。
-6. 先执行 ~M-x qq-disconnect~，修正配置后再 ~M-x qq-connect~。
+5. 先执行 ~M-x qq-disconnect~，修正配置后再 ~M-x qq-connect~。
 
-~qq-transport-request-timeout~ 控制没有响应的 action 何时在本地失败；它不是 WebSocket
-连接超时。反复重连间隔和上限分别由 ~qq-transport-reconnect-delay~、
-~qq-transport-reconnect-max-attempts~ 控制。
+~qq-native-request-timeout~ 控制没有响应的操作何时在本地失败；它不是 WebSocket
+连接超时。反复重连间隔和上限分别由 ~qq-native-reconnect-delay~、
+~qq-native-reconnect-max-attempts~ 控制。
 
 ** 自己发送的消息重复
 
-确保 NapCat 开启 ~reportSelfMessage = true~。客户端会在一个短窗口内把乐观发送、
-action 回执和自己的实时上报合并；~qq-self-message-dedupe-window~ 控制该窗口。不要为
-隐藏重复而把窗口设得很大，应先检查 fork 上报和 ID 是否完整。
+客户端会用本地发送 identity、原生回执和自己的实时上报完成乐观消息晋升。若仍出现
+重复，应检查三者是否携带相同的账号 generation、会话 locator、sequence/random 和
+最终雪花 ID；不要用扩大模糊时间窗口隐藏身份缺失。
 
 ** 头像或转发消息内头像不显示
 
-普通头像和合并转发节点头像不是同一种会话查找。先确认媒体缓存目录可写、NapCat 可
-返回头像资源，再检查问题是否只出现在转发卡片内部。后者需要 fork 按转发节点身份
-提供正确的头像接口，不能仅用当前聊天的发送者接口替代。
+普通头像和合并转发节点头像不是同一种会话查找。先确认媒体缓存目录可写、原生消息或
+资料快照携带权威头像 URL，再检查问题是否只出现在转发卡片内部。客户端不会猜测 QQ
+头像 URL，也不会回退调用 OneBot 头像接口。
 
 修改资源目录后可以重开聊天或刷新相应页面。彻底清理当前进程媒体状态可用
 ~qq-reset-session-state~，但它同时会关闭所有 QQ 缓冲区。
@@ -763,7 +730,8 @@ notifications 支持。
 
 * 隐私与数据位置
 
-OneBot token 能够控制当前 NapCat 会话，不应提交到公开仓库或共享配置。日志、bug
+原生服务 token 能够控制账号生命周期和业务操作，不应提交到公开仓库或共享配置。
+token 文件应只允许当前用户读取。日志、bug
 报告和截图可能包含 QQ 号、群号、消息 ID、消息正文及媒体 URL，发布前应主动脱敏。
 
 主动下载的文件默认进入 ~qq-media-download-directory~，临时资源进入
@@ -775,7 +743,7 @@ OneBot token 能够控制当前 NapCat 会话，不应提交到公开仓库或�
 - 在任意 QQ buffer 执行 ~M-x describe-mode~ 查看当前 major mode 和本地按键；
 - 使用 ~C-h k~ 检查某个按键的最终来源；
 - 使用 ~M-x customize-group RET qq RET~ 查看选项文档；
-- 报告问题时注明 Emacs、Evil、QQ、NapCatQQ-emacs 和 emacs-qq 版本；
+- 报告问题时注明 Emacs、Evil、原生服务和 emacs-qq 版本；
 - 协议问题附上脱敏后的原始 JSON 形状，并保留 ~message_id~ 的字符串类型信息。
 
 项目问题跟踪器：[[https://github.com/0WD0/emacs-qq/issues][GitHub Issues]]。
@@ -787,11 +755,10 @@ OneBot token 能够控制当前 NapCat 会话，不应提交到公开仓库或�
 :END:
 
 - ~qq~：打开主界面并连接。
-- ~qq-connect~：连接 NapCat。
-- ~qq-disconnect~：断开 NapCat。
+- ~qq-connect~：连接原生服务。
+- ~qq-disconnect~：断开原生服务，但不停止账号。
 - ~qq-refresh~：刷新运行时快照。
 - ~qq-reset-session-state~：重置当前账号的进程内状态。
-- ~qq-set-token~：设置当前 Emacs 会话的 token。
 - ~qq-contacts-open~：打开联系人目录。
 - ~qq-chat-transient~：打开聊天命令菜单。
 - ~qq-notifications-mode~：切换桌面通知。

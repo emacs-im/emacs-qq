@@ -467,10 +467,8 @@
 
 (defun qq-gateway-directory--handle-account-context (&rest _arguments)
   "Revoke directory caches after a selected account context change."
-  (if (eq qq-backend 'gateway)
-      (qq-gateway-directory--set-cache-owner
-       (qq-gateway-current-account-owner))
-    (qq-gateway-directory-reset)))
+  (qq-gateway-directory--set-cache-owner
+   (qq-gateway-current-account-owner)))
 
 (defun qq-gateway-directory--begin-request (resource owner)
   "Return and register the newest request token for RESOURCE and OWNER."
@@ -499,7 +497,7 @@ PARAMS are sent as-is.  VALIDATOR and PROJECTOR receive the result and exact
 owner.  CALLBACK receives the projected value; ERRBACK follows Gateway error
 conventions."
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_projection (qq-gateway-message--ensure-projection-owner owner))
          (_cache (qq-gateway-directory--set-cache-owner owner))
          (token (qq-gateway-directory--begin-request resource owner)))
@@ -594,12 +592,12 @@ single setting returned by the closed Gateway method."
 
 (defun qq-gateway-directory-set-friend-pinned
     (friend-uin pinned &optional callback errback)
-  "Set FRIEND-UIN's conversation PINNED state through the native Gateway."
+  "Set FRIEND-UIN's conversation PINNED state through the native service."
   (unless (qq-gateway--canonical-decimal-p friend-uin)
     (user-error "qq: Friend pinned state requires an exact decimal UIN"))
   (setq pinned (if pinned t :false))
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_projection (qq-gateway-message--ensure-projection-owner owner)))
     (qq-gateway--send
      "friend.set_pinned"
@@ -612,7 +610,7 @@ single setting returned by the closed Gateway method."
                   (qq-gateway-directory--validate-friend-pinned-receipt
                    raw-result owner friend-uin pinned)))
              (unless (equal owner (qq-gateway-current-account-owner))
-               (error "qq: Gateway account generation changed during friend setting"))
+               (error "qq: QQ account generation changed during friend setting"))
              (qq-gateway--invoke callback receipt))
          (error
           (qq-gateway--client-error
@@ -629,7 +627,7 @@ CALLBACK receives the validated generation-owned receipt."
   (unless (qq-gateway--canonical-decimal-p group-uin)
     (user-error "qq: Group setting requires an exact decimal group UIN"))
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_projection (qq-gateway-message--ensure-projection-owner owner)))
     (qq-gateway--send
      method
@@ -642,7 +640,7 @@ CALLBACK receives the validated generation-owned receipt."
                   (qq-gateway-directory--validate-group-setting-receipt
                    raw-result owner group-uin field value)))
              (unless (equal owner (qq-gateway-current-account-owner))
-               (error "qq: Gateway account generation changed during group setting"))
+               (error "qq: QQ account generation changed during group setting"))
              (qq-gateway--invoke callback receipt))
          (error
           (qq-gateway--client-error
@@ -652,7 +650,7 @@ CALLBACK receives the validated generation-owned receipt."
 
 (defun qq-gateway-directory-set-group-name
     (group-uin name &optional callback errback)
-  "Set GROUP-UIN's public NAME through the native Gateway."
+  "Set GROUP-UIN's public NAME through the native service."
   (unless (and (stringp name) (not (string-empty-p name)))
     (user-error "qq: Group name must be a non-empty string"))
   (qq-gateway-directory--set-group-setting
@@ -668,7 +666,7 @@ CALLBACK receives the validated generation-owned receipt."
 
 (defun qq-gateway-directory-set-group-whole-mute
     (group-uin enabled &optional callback errback)
-  "Set GROUP-UIN's whole-group mute state through the native Gateway."
+  "Set GROUP-UIN's whole-group mute state through the native service."
   (setq enabled (and enabled t))
   (qq-gateway-directory--set-group-setting
    "group.set_whole_mute" group-uin 'enabled
@@ -702,11 +700,11 @@ CALLBACK receives the validated generation-owned receipt."
 
 (defun qq-gateway-directory-clock-in-group
     (group-uin &optional callback errback)
-  "Clock the selected Gateway account into exact GROUP-UIN."
+  "Clock the selected QQ account into exact GROUP-UIN."
   (unless (qq-gateway--canonical-decimal-p group-uin)
     (user-error "qq: Group clock-in requires an exact group UIN"))
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_projection (qq-gateway-message--ensure-projection-owner owner)))
     (qq-gateway--send
      "group.clock_in"
@@ -719,7 +717,7 @@ CALLBACK receives the validated generation-owned receipt."
                    raw-result owner group-uin)))
              (unless (equal owner (qq-gateway-current-account-owner))
                (error
-                "qq: Gateway account generation changed during group clock-in"))
+                "qq: QQ account generation changed during group clock-in"))
              (qq-gateway--invoke callback receipt))
          (error
           (qq-gateway--client-error
@@ -751,7 +749,7 @@ CALLBACK receives the validated generation-owned receipt."
   (unless (qq-gateway--canonical-decimal-p group-uin)
     (user-error "qq: Group @all quota requires an exact group UIN"))
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_projection (qq-gateway-message--ensure-projection-owner owner)))
     (qq-gateway--send
      "group.get_at_all_remaining"
@@ -764,7 +762,7 @@ CALLBACK receives the validated generation-owned receipt."
                    raw-result owner group-uin)))
              (unless (equal owner (qq-gateway-current-account-owner))
                (error
-                "qq: Gateway account generation changed during group @all query"))
+                "qq: QQ account generation changed during group @all query"))
              (qq-gateway--invoke callback receipt))
          (error
           (qq-gateway--client-error
@@ -783,7 +781,7 @@ CALLBACK receives the validated generation-owned receipt."
 
 (defun qq-gateway-directory-leave-group
     (group-uin &optional callback errback)
-  "Leave exact GROUP-UIN through the selected native Gateway account.
+  "Leave exact GROUP-UIN through the selected native QQ account.
 
 This method cannot dismiss a group.  A successful receipt revokes cached
 member data and any older group or member request that could reintroduce the
@@ -791,7 +789,7 @@ departed group."
   (unless (qq-gateway--canonical-decimal-p group-uin)
     (user-error "qq: Group leave requires an exact group UIN"))
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_projection (qq-gateway-message--ensure-projection-owner owner))
          (_cache (qq-gateway-directory--set-cache-owner owner)))
     (qq-gateway--send
@@ -806,7 +804,7 @@ departed group."
              (unless (and (equal owner (qq-gateway-current-account-owner))
                           (equal owner qq-gateway-directory--cache-owner))
                (error
-                "qq: Gateway account generation changed during group leave"))
+                "qq: QQ account generation changed during group leave"))
              (remhash 'groups qq-gateway-directory--active-requests)
              (remhash (cons 'group-members group-uin)
                       qq-gateway-directory--active-requests)
@@ -859,7 +857,7 @@ receipt."
   (unless (stringp value)
     (user-error "qq: Group-member setting value must be a string"))
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_projection (qq-gateway-message--ensure-projection-owner owner)))
     (qq-gateway--send
      method
@@ -874,7 +872,7 @@ receipt."
                    raw-result owner group-uin target-uin field value)))
              (unless (equal owner (qq-gateway-current-account-owner))
                (error
-                "qq: Gateway account generation changed during group-member setting"))
+                "qq: QQ account generation changed during group-member setting"))
              (qq-gateway-directory--apply-group-member-setting
               group-uin target-uin cache-field value)
              (qq-gateway--invoke callback receipt))
@@ -934,13 +932,13 @@ member is left untouched, and no incomplete directory state is invented."
 
 (defun qq-gateway-directory-kick-group-member
     (group-uin target-uin reject-add-request &optional callback errback)
-  "Remove TARGET-UIN from GROUP-UIN through the native Gateway."
+  "Remove TARGET-UIN from GROUP-UIN through the native service."
   (unless (qq-gateway--canonical-decimal-p group-uin)
     (user-error "qq: Group kick requires an exact group UIN"))
   (unless (qq-gateway--canonical-decimal-p target-uin)
     (user-error "qq: Group kick requires an exact target UIN"))
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_projection (qq-gateway-message--ensure-projection-owner owner))
          (wire-reject (if reject-add-request t :false)))
     (qq-gateway--send
@@ -956,7 +954,7 @@ member is left untouched, and no incomplete directory state is invented."
                    raw-result owner group-uin target-uin wire-reject)))
              (unless (equal owner (qq-gateway-current-account-owner))
                (error
-                "qq: Gateway account generation changed during group-member kick"))
+                "qq: QQ account generation changed during group-member kick"))
              (qq-gateway-directory--remove-group-member group-uin target-uin)
              (qq-gateway--invoke callback receipt))
          (error

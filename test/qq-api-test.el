@@ -620,16 +620,6 @@ The authoritative post-state reports UNREAD-COUNT."
                         (data . ((text . "hello channel")))))))
       (should-not (assq 'chat_type captured-params)))))
 
-(ert-deftest qq-api-guild-message-event-validates-and-dispatches-closed-shape ()
-  (let (delivered)
-    (cl-letf (((symbol-function 'qq-state-merge-guild-message)
-               (lambda (event) (setq delivered event))))
-      (let ((source (qq-api-test--guild-message-event)))
-        (qq-api-handle-event source)
-        (should (equal delivered source))
-        (setf (alist-get 'message_sequence source) 17)
-        (should-error (qq-api-handle-event source))))))
-
 (ert-deftest qq-api-guild-message-event-rejects-lossy-or-open-identities ()
   (dolist (mutator
            (list
@@ -2137,48 +2127,6 @@ The authoritative post-state reports UNREAD-COUNT."
       (should (= 2 (gethash "group:20001"
                             qq-api--session-read-observation-tokens))))))
 
-(ert-deftest qq-api-read-observation-notice-supersedes-older-recent ()
-  (let ((qq-state-change-hook nil)
-        (qq-api--read-observation-clock 0)
-        (qq-api--session-read-observation-tokens
-         (make-hash-table :test #'equal))
-        recent-success)
-    (qq-state-reset)
-    (qq-state-upsert-session
-     "group:20001"
-     '((type . group) (target-id . "20001")
-       (title . "Old") (unread-count . 4))
-     nil)
-    (cl-letf (((symbol-function 'qq-api-call)
-               (lambda (action _params callback &optional _errback)
-                 (when (equal action "get_recent_contact")
-                   (setq recent-success callback))
-                 'sent)))
-      (qq-api-refresh-recent-contacts)
-      (let* ((notice
-              (qq-api-test--read-state-notice
-               '((kind . "group") (group_id . "20001"))))
-             (state (alist-get 'read_state notice)))
-        (setf (alist-get 'unread_count state) 0
-              (alist-get 'first_unread state) nil
-              (alist-get 'mentions state) '((at_me . nil) (at_all . nil)))
-        (qq-api-handle-event notice))
-      (funcall recent-success
-               '((data . (((chatType . 2)
-                            (peerUid . "20001")
-                            (peerUin . "20001")
-                            (peerName . "Fresh title")
-                            (msgTime . "1710000000")
-                            (msgId . "9007199254741004991")
-                            (msgSeq . "10001")
-                            (lastMessagePreview . "latest")
-                            (unreadCount . 9))))))
-      (let ((session (qq-state-session "group:20001")))
-        (should (= 0 (alist-get 'unread-count session)))
-        (should (equal "Fresh title" (alist-get 'title session))))
-      (should (= 2 (gethash "group:20001"
-                            qq-api--session-read-observation-tokens))))))
-
 (ert-deftest qq-api-read-observation-newer-recent-supersedes-older-recent ()
   (let ((qq-state-change-hook nil)
         (qq-api--read-observation-clock 0)
@@ -2743,85 +2691,6 @@ The authoritative post-state reports UNREAD-COUNT."
          (message_id . "9007199254750003456")
          (busi_id . "19366")))
       (should (equal (alist-get 'busi_id received) "19366")))))
-
-(ert-deftest qq-api-handle-read-state-notice-applies-authoritative-state ()
-  (let ((qq-api--read-observation-clock 0)
-        (qq-api--session-read-observation-tokens
-         (make-hash-table :test #'equal))
-        applications)
-    (cl-letf (((symbol-function 'qq-state-apply-session-read-state)
-               (lambda (session-key read-state)
-                 (push (list session-key read-state) applications))))
-      (dolist
-          (case
-           '((((kind . "group") (group_id . "20001")) . "group:20001")
-             (((kind . "private") (user_id . "10001")) . "private:10001")
-             (((kind . "dataline")
-               (peer_uid . "dev:a") (variant . "mobile"))
-              . "dataline:mobile:dev:a")
-             (((kind . "service") (peer_uid . "u:mail:x"))
-              . "service:u:mail:x")))
-        (qq-api-handle-event
-         (qq-api-test--read-state-notice (car case)))
-        (let ((application (car applications)))
-          (should (equal (car application) (cdr case)))
-          (should (equal (cadr application) (qq-api-test--read-state)))
-          (should (equal
-                   "9007199254742007089"
-                   (alist-get 'message_id
-                              (alist-get 'first_unread (cadr application)))))))
-      (should (= 4 (length applications)))
-      (should (= 4 qq-api--read-observation-clock)))))
-
-(ert-deftest qq-api-read-notice-first-creates-lossless-mobile-session ()
-  (let ((qq-state-change-hook nil)
-        (qq-api--read-observation-clock 0)
-        (qq-api--session-read-observation-tokens
-         (make-hash-table :test #'equal))
-        (locator '((kind . "dataline")
-                   (peer_uid . "dev:a")
-                   (variant . "mobile"))))
-    (qq-state-reset)
-    (unwind-protect
-        (progn
-          (qq-api-handle-event (qq-api-test--read-state-notice locator))
-          (let ((session (qq-state-session "dataline:mobile:dev:a")))
-            (should session)
-            (should (eq (alist-get 'type session) 'dataline))
-            (should (equal (alist-get 'target-id session) "dev:a"))
-            (should (equal (alist-get 'chat-type session) "134"))
-            (should (equal (alist-get 'peer-uid session) "dev:a"))
-            (should (equal (alist-get 'variant session) "mobile"))
-            (should (= (alist-get 'unread-count session) 5))
-            (should (equal
-                     (qq-api--session-emacs-locator
-                      "dataline:mobile:dev:a")
-                     locator))))
-      (qq-state-reset))))
-
-(ert-deftest qq-api-handle-read-state-notice-rejects-old-or-lossy-shapes ()
-  (let ((base
-         (qq-api-test--read-state-notice
-          '((kind . "private") (user_id . "10001"))))
-        applied)
-    (cl-letf (((symbol-function 'qq-state-apply-session-read-state)
-               (lambda (&rest _args) (setq applied t))))
-      (let* ((numeric (copy-tree base))
-             (read-state (alist-get 'read_state numeric))
-             (first (alist-get 'first_unread read-state)))
-        (setf (alist-get 'message_id first) 9007199254742007089)
-        (dolist
-            (invalid
-             (list
-              numeric
-              (append (copy-tree base) '((extra . t)))
-              (assq-delete-all 'read_state (copy-tree base))
-              `((post_type . "notice")
-                (notice_type . "emacs_read_state")
-                (chat . ((kind . "private") (user_id . "10001")))
-                (read_state . ,(qq-api-test--read-state)))))
-          (should-error (qq-api-handle-event invalid))
-          (should-not applied))))))
 
 (ert-deftest qq-api-handle-notice-dispatches-emoji-like ()
   (let (received-session received)

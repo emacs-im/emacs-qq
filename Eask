@@ -1,8 +1,8 @@
 ;; -*- mode: eask; lexical-binding: t -*-
 
 (package "qq"
-         "0.1.0"
-         "NapCat-backed QQ chat client")
+         "2.0.0"
+         "Native QQ chat client")
 
 (website-url "https://github.com/0WD0/emacs-qq")
 
@@ -22,7 +22,7 @@
  (depends-on "evil"))
 
 (script "refresh-appkit" "eask -f install-file ../appkit.el")
-(script "test" "eask test ert test/*.el")
+(script "test" "eask test ert --quiet test/*.el")
 (script "test-concise" "./scripts/test-concise.sh")
 (script "test-local"
-        "eask -f install-file ../appkit.el && eask recompile && eask test ert test/*.el")
+        "eask -f install-file ../appkit.el && eask recompile && eask test ert --quiet test/*.el")

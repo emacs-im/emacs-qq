@@ -36,9 +36,9 @@
       (and qq-transport--ws (websocket-openp qq-transport--ws))))
 
 (defun qq-transport--publish-connection-status (status)
-  "Publish OneBot transport STATUS only while OneBot owns shared state."
-  (when (eq qq-backend 'onebot)
-    (qq-state-set-connection-status status)))
+  "Ignore dormant v1 OneBot transport STATUS in emacs-qq v2."
+  (ignore status)
+  nil)
 
 (defun qq-transport--next-echo ()
   "Return a new OneBot echo token."

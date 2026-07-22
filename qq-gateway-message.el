@@ -4,7 +4,7 @@
 
 ;;; Commentary:
 
-;; Closed protocol decoder and selected-account projection for native Gateway
+;; Closed protocol decoder and selected-account projection for native service
 ;; message and recall events.  Events for every managed account remain
 ;; observable on `qq-gateway-message-event-hook'; only the exact selected
 ;; `(account_id . generation)' owner may mutate the legacy single-account QQ
@@ -59,7 +59,7 @@
 
 (defconst qq-gateway-message--max-uint64-decimal
   "18446744073709551615"
-  "Largest sequence accepted by the native Gateway protocol.")
+  "Largest sequence accepted by the native service protocol.")
 
 (defun qq-gateway-message--uint32-p (value)
   "Return non-nil when VALUE is an unsigned 32-bit integer."
@@ -420,14 +420,13 @@
 
 (defun qq-gateway-message--selected-owner-p (data)
   "Return non-nil when event DATA belongs to the exact selected generation."
-  (and (eq qq-backend 'gateway)
-       (equal (qq-gateway-message--event-owner data)
-              (qq-gateway-current-account-owner))))
+  (equal (qq-gateway-message--event-owner data)
+         (qq-gateway-current-account-owner)))
 
 (defun qq-gateway-message-revoke-projection ()
   "Revoke native projection ownership and all private correlation caches.
 
-Shared `qq-state' is left to the caller's backend-switch or reset transaction."
+Shared `qq-state' is left to the caller's account-switch or reset transaction."
   (setq qq-gateway-message--projection-owner nil)
   (clrhash qq-gateway-message--peer-uin-by-uid)
   (clrhash qq-gateway-message--pending-recalls)
@@ -479,8 +478,6 @@ correlation caches are always revoked."
 
 (defun qq-gateway-message--ensure-projection-owner (owner)
   "Ensure shared QQ state is exclusively owned by native OWNER."
-  (unless (eq qq-backend 'gateway)
-    (error "qq: Native Gateway does not own the active client backend"))
   (unless (equal owner (qq-gateway-current-account-owner))
     (error "qq: Gateway event owner is not the selected account generation"))
   (unless (equal owner qq-gateway-message--projection-owner)
@@ -492,9 +489,7 @@ correlation caches are always revoked."
   owner)
 
 (defun qq-gateway-message-activate-projection ()
-  "Claim the selected Gateway account for shared state when available."
-  (unless (eq qq-backend 'gateway)
-    (user-error "qq: Select the native Gateway backend first"))
+  "Claim the selected QQ account for shared state when available."
   (when-let* ((owner (qq-gateway-current-account-owner)))
     (qq-gateway-message--ensure-projection-owner owner)))
 
@@ -869,8 +864,7 @@ completed, so a failed projection cannot advance this side index."
 
 The result contains exact string `message_id' and `sequence' fields.  History
 responses never advance this observation; only `message.received' events do."
-  (when (and (eq qq-backend 'gateway)
-             qq-gateway-message--projection-owner
+  (when (and qq-gateway-message--projection-owner
              (equal qq-gateway-message--projection-owner
                     (qq-gateway-current-account-owner)))
     (copy-tree (gethash session-key qq-gateway-message--live-frontiers))))
@@ -1081,26 +1075,22 @@ responses never advance this observation; only `message.received' events do."
 (defun qq-gateway-message--handle-account-change (reason account-id)
   "Keep projection ownership aligned after account change REASON/ACCOUNT-ID."
   (ignore reason)
-  (if (not (eq qq-backend 'gateway))
-      (qq-gateway-message-revoke-projection)
-    (let ((selected (qq-gateway-current-account-owner)))
-      (cond
-       ((null selected)
-        (when qq-gateway-message--projection-owner
-          (qq-gateway-message--clear-projection-state)))
-       ((not (equal selected qq-gateway-message--projection-owner))
-        (qq-gateway-message--ensure-projection-owner selected))
-       ((or (null account-id)
-            (equal account-id (car selected)))
-        (let ((account (qq-gateway-current-account)))
-          (qq-gateway-message--sync-self-info account)
-          (qq-gateway-message--sync-connection-status account)))))))
+  (let ((selected (qq-gateway-current-account-owner)))
+    (cond
+     ((null selected)
+      (when qq-gateway-message--projection-owner
+        (qq-gateway-message--clear-projection-state)))
+     ((not (equal selected qq-gateway-message--projection-owner))
+      (qq-gateway-message--ensure-projection-owner selected))
+     ((or (null account-id)
+          (equal account-id (car selected)))
+      (let ((account (qq-gateway-current-account)))
+        (qq-gateway-message--sync-self-info account)
+        (qq-gateway-message--sync-connection-status account))))))
 
 (defun qq-gateway-message--handle-selection-change (_old-account-id new-account-id)
   "Move projected state ownership to selected NEW-ACCOUNT-ID."
   (cond
-   ((not (eq qq-backend 'gateway))
-   (qq-gateway-message-revoke-projection))
    (new-account-id
     (let ((owner (qq-gateway-current-account-owner)))
       (unless (and owner (equal (car owner) new-account-id))
@@ -1111,15 +1101,14 @@ responses never advance this observation; only `message.received' events do."
 
 (defun qq-gateway-message--handle-transport-state (_state)
   "Refresh shared status after a native transport state transition."
-  (when (and (eq qq-backend 'gateway)
-             qq-gateway-message--projection-owner
+  (when (and qq-gateway-message--projection-owner
              (equal qq-gateway-message--projection-owner
                     (qq-gateway-current-account-owner)))
     (qq-gateway-message--sync-connection-status
      (qq-gateway-current-account))))
 
 (defun qq-gateway-message--conversation-params (session-key)
-  "Return native Gateway conversation params for SESSION-KEY."
+  "Return native service conversation params for SESSION-KEY."
   (let* ((identity (qq-state-session-key-identity session-key))
          (kind (alist-get 'type identity))
          (target (alist-get 'target-id identity)))
@@ -1370,7 +1359,7 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
   (qq-gateway-message--validate-history-range start-sequence end-sequence)
   (let* ((conversation (qq-gateway-message--conversation-params session-key))
          (owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first"))))
+                    (user-error "qq: Select a QQ account first"))))
     (qq-gateway-message--ensure-projection-owner owner)
     (qq-gateway--send
      "message.get_history"
@@ -1382,7 +1371,7 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
        (condition-case error-data
            (progn
              (unless (equal owner (qq-gateway-current-account-owner))
-               (error "qq: Gateway account generation changed during history request"))
+               (error "qq: QQ account generation changed during history request"))
              (let* ((result
                      (qq-gateway-message--validate-history-result
                       raw-result owner start-sequence end-sequence))
@@ -1517,7 +1506,7 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
     (session-key segments raw-message method params callback errback)
   "Send validated SEGMENTS through METHOD with PARAMS for SESSION-KEY."
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
          (pending (qq-state-insert-pending-message
                    session-key segments raw-message))
@@ -1537,7 +1526,7 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
                         (qq-gateway-message--validate-send-receipt
                          result owner)))
                    (if (not (equal owner (qq-gateway-current-account-owner)))
-                       (fail nil "Gateway account generation changed during send")
+                       (fail nil "QQ account generation changed during send")
                      (unless
                          (seq-find
                           (lambda (message)
@@ -1571,7 +1560,7 @@ reply.  Reply metadata is resolved only from an exact message owned by the
 selected Gateway generation.  RAW-MESSAGE is an optional optimistic rendering
 override."
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
          (native-segments
           (qq-gateway-message--outgoing-segments session-key segments owner))
@@ -1627,7 +1616,7 @@ replace it."
          (kind (alist-get 'type session))
          (peer-uin (alist-get 'target-id session))
          (owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner)))
     (unless (and (memq kind '(private group))
                  (qq-gateway--canonical-decimal-p peer-uin))
@@ -1647,7 +1636,7 @@ replace it."
                   (qq-gateway-message--validate-poke-receipt
                    raw-result owner target-uin)))
              (unless (equal owner (qq-gateway-current-account-owner))
-               (error "qq: Gateway account generation changed during poke"))
+               (error "qq: QQ account generation changed during poke"))
              (when-let* ((self-id (qq-state-self-user-id)))
                (qq-state-apply-poke-notice
                 `((time . ,(truncate (float-time)))
@@ -1693,7 +1682,7 @@ SET non-nil adds the reaction.  CALLBACK receives the validated synchronous
 receipt; the later `message.reaction_changed' event reconciles the optimistic
 local delta with QQ's authoritative aggregate count."
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
          (session-key (alist-get 'session-key message))
          (message-id (alist-get 'server-id message))
@@ -1725,7 +1714,7 @@ local delta with QQ's authoritative aggregate count."
                   (qq-gateway-message--validate-reaction-receipt
                    raw-result owner message-id sequence emoji-id set)))
              (unless (equal owner (qq-gateway-current-account-owner))
-               (error "qq: Gateway account generation changed during reaction"))
+               (error "qq: QQ account generation changed during reaction"))
              (when-let* ((self-id (qq-state-self-user-id)))
                (qq-state-apply-emoji-like-notice
                 session-key
@@ -1768,7 +1757,7 @@ SET non-nil sets the essence flag.  CALLBACK receives the validated
 synchronous receipt.  The later `message.essence_changed' event is
 authoritative and suppresses a racing optimistic receipt update."
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
          (session-key (alist-get 'session-key message))
          (message-id (alist-get 'server-id message))
@@ -1805,7 +1794,7 @@ authoritative and suppresses a racing optimistic receipt update."
                     (qq-gateway-message--validate-essence-receipt
                      raw-result owner message-id sequence random set)))
                (unless (equal owner (qq-gateway-current-account-owner))
-                 (error "qq: Gateway account generation changed during essence action"))
+                 (error "qq: QQ account generation changed during essence action"))
                (when (= start-revision
                         (gethash target-key
                                  qq-gateway-message--essence-revisions 0))
@@ -1844,7 +1833,7 @@ native query/event semantics are not yet part of the closed Gateway protocol."
   (unless (memq operation '(set complete cancel))
     (user-error "qq: Unknown native todo operation %S" operation))
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
          (session-key (alist-get 'session-key message))
          (message-id (alist-get 'server-id message))
@@ -1874,7 +1863,7 @@ native query/event semantics are not yet part of the closed Gateway protocol."
                    raw-result owner group-uin message-id sequence
                    operation-name)))
              (unless (equal owner (qq-gateway-current-account-owner))
-               (error "qq: Gateway account generation changed during todo action"))
+               (error "qq: QQ account generation changed during todo action"))
              (qq-gateway--invoke callback receipt))
          (error
           (qq-gateway--client-error
@@ -1897,13 +1886,13 @@ native query/event semantics are not yet part of the closed Gateway protocol."
 
 (defun qq-gateway-message-recall
     (session-key message &optional callback errback)
-  "Recall native MESSAGE in SESSION-KEY for the selected Gateway account.
+  "Recall native MESSAGE in SESSION-KEY for the selected QQ account.
 
 CALLBACK receives the validated SSO receipt; ERRBACK receives an error body
 and reason.  State changes only after `message.recalled', which is the
 authoritative recall fact."
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
          (message-id (alist-get 'server-id message))
          (sequence (alist-get 'message-seq message))
@@ -1969,7 +1958,7 @@ authoritative recall fact."
                  (> (alist-get 'sent_at metadata) 0)
                  (qq-gateway--canonical-decimal-p
                   (alist-get 'tips_sequence metadata)))
-      (user-error "qq: Poke lacks exact native Gateway recall metadata"))
+      (user-error "qq: Poke lacks exact native service recall metadata"))
     (let ((conversation (alist-get 'conversation metadata)))
       (unless (and (qq-gateway--exact-object-keys-p
                     conversation '(kind group_uin))
@@ -1986,7 +1975,7 @@ authoritative recall fact."
 
 CALLBACK receives the validated receipt; ERRBACK receives failure details."
   (let* ((owner (or (qq-gateway-current-account-owner)
-                    (user-error "qq: Select a Gateway account first")))
+                    (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
          (reference (qq-state-poke-recall-reference message))
          (metadata
@@ -2011,7 +2000,7 @@ CALLBACK receives the validated receipt; ERRBACK receives failure details."
                   (qq-gateway-message--validate-recall-receipt
                    result owner message-id sequence)))
              (unless (equal owner (qq-gateway-current-account-owner))
-               (error "qq: Gateway account generation changed during poke recall"))
+               (error "qq: QQ account generation changed during poke recall"))
              (qq-state-apply-recall
               (alist-get 'session-key message) message-id)
              (qq-gateway--invoke callback receipt))

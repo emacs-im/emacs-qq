@@ -13,94 +13,71 @@
 (require 'url-util)
 
 (defgroup qq nil
-  "QQ client for Emacs backed by NapCat."
+  "Native QQ client for Emacs."
   :group 'comm)
 
-(defcustom qq-backend 'onebot
-  "Protocol backend used by the interactive emacs-qq client.
+(defcustom qq-native-websocket-url "ws://127.0.0.1:3002/"
+  "Native service WebSocket endpoint used by emacs-qq.
 
-`onebot' connects directly to NapCat's OneBot websocket.  `gateway' connects
-to the long-lived native nt-gateway websocket and projects only the account
-selected by this Emacs client.  This is explicit Emacs state; process
-environment variables never select a backend.  Use `qq-switch-backend' while a
-client session is running so account-scoped buffers and projections are
-revoked before the new backend starts."
-  :type '(choice (const :tag "NapCat OneBot" onebot)
-                 (const :tag "Native nt-gateway" gateway))
-  :group 'qq)
-
-(defcustom qq-onebot-websocket-url "ws://127.0.0.1:3001/"
-  "NapCat OneBot websocket endpoint used by emacs-qq."
-  :type 'string
-  :group 'qq)
-
-(defcustom qq-gateway-websocket-url "ws://127.0.0.1:3002/"
-  "Native nt-gateway websocket endpoint used by emacs-qq.
-
-The Gateway is a long-lived process which owns zero or more QQ account
-runtimes.  Closing this websocket only disconnects this Emacs client; it does
+The service is a long-lived process which owns zero or more QQ account
+runtimes.  Closing this WebSocket only disconnects this Emacs client; it does
 not stop or log out any managed account."
   :type 'string
   :group 'qq)
 
-(defcustom qq-gateway-auth-token-file
-  (locate-user-emacs-file "qq/gateway-token")
-  "File containing the native Gateway authentication token.
+(defcustom qq-native-auth-token-file
+  (locate-user-emacs-file "qq/service-token")
+  "File containing the native service authentication token.
 
-The token is read only while opening a Gateway connection and is sent in the
-first `gateway.hello' request.  It must be a single non-whitespace value of at
-least 32 bytes.  On Unix the file must not be accessible by group or other
-users, matching nt-gateway's own validation."
+The token is read only while opening a connection and is sent in the native
+protocol handshake.  It must be a single non-whitespace value of at least 32
+bytes.  On Unix the file must not be accessible by group or other users."
   :type 'file
   :group 'qq)
 
-(defcustom qq-gateway-client-name "emacs-qq"
-  "Client name sent in the native Gateway handshake."
+(defcustom qq-native-client-name "emacs-qq"
+  "Client name sent in the native protocol handshake."
   :type 'string
   :group 'qq)
 
-(defcustom qq-gateway-request-timeout 30
-  "Seconds before an unanswered native Gateway request fails locally.
+(defcustom qq-native-request-timeout 30
+  "Seconds before an unanswered native request fails locally.
 
 Nil disables request timeouts."
   :type '(choice (const :tag "Disabled" nil)
                  (number :tag "Seconds"))
   :group 'qq)
 
-(defcustom qq-gateway-ready-timeout 10
-  "Seconds to wait for `gateway.ready' after a successful handshake.
+(defcustom qq-native-ready-timeout 10
+  "Seconds to wait for the ready snapshot after a successful handshake.
 
-The server sends this authoritative snapshot immediately after the
-`gateway.hello' response.  Nil disables this additional protocol timeout."
+The service sends this authoritative snapshot immediately after the handshake
+response.  Nil disables this additional protocol timeout."
   :type '(choice (const :tag "Disabled" nil)
                  (number :tag "Seconds"))
   :group 'qq)
 
-(defcustom qq-gateway-reconnect-delay 3
-  "Seconds before reconnecting the native Gateway websocket."
+(defcustom qq-native-reconnect-delay 3
+  "Seconds before reconnecting the native service WebSocket."
   :type 'number
   :group 'qq)
 
-(defcustom qq-gateway-reconnect-max-attempts nil
-  "Maximum native Gateway reconnect attempts before stopping.
+(defcustom qq-native-reconnect-max-attempts nil
+  "Maximum native service reconnect attempts before stopping.
 
 Set to nil to retry indefinitely.  The counter is reset only after an
-authenticated `gateway.ready' snapshot, not merely when the socket opens."
+authenticated ready snapshot, not merely when the socket opens."
   :type '(choice (const :tag "Unlimited" nil) integer)
   :group 'qq)
 
-(defcustom qq-onebot-token nil
-  "OneBot access token for NapCat.
+(defvar qq-onebot-websocket-url "ws://127.0.0.1:3001/"
+  "Dormant v1 OneBot endpoint retained until legacy modules are removed.")
 
-Use `qq-set-token' to set this for the current Emacs session.
-When nil, emacs-qq falls back to `qq-onebot-token-env-var'."
-  :type '(choice (const :tag "Unset" nil) string)
-  :group 'qq)
+(defvar qq-onebot-token nil
+  "Dormant v1 OneBot token retained until legacy modules are removed.")
 
-(defcustom qq-onebot-token-env-var "NAPCAT_ONEBOT_TOKEN"
-  "Environment variable used as OneBot token fallback."
-  :type 'string
-  :group 'qq)
+(defvar qq-onebot-token-env-var "NAPCAT_ONEBOT_TOKEN"
+  "Dormant v1 OneBot token variable retained for legacy module loading.")
 
 (defcustom qq-recent-contact-count 50
   "Default amount of recent sessions requested during refresh."
@@ -112,14 +89,8 @@ When nil, emacs-qq falls back to `qq-onebot-token-env-var'."
   :type 'integer
   :group 'qq)
 
-(defcustom qq-transport-request-timeout 30
-  "Seconds before an unanswered NapCat action fails locally.
-
-Nil disables request timeouts.  A timeout removes the request from the
-transport pending table and invokes its error callback exactly once."
-  :type '(choice (const :tag "Disabled" nil)
-                 (number :tag "Seconds"))
-  :group 'qq)
+(defvar qq-transport-request-timeout 30
+  "Dormant v1 OneBot request timeout retained for legacy module loading.")
 
 (defcustom qq-chat-history-auto-load-threshold 2000
   "Character distance from a timeline edge that triggers history paging.
@@ -499,26 +470,20 @@ fallbacks and previews when the face image is not yet available."
   :type 'integer
   :group 'qq)
 
-(defcustom qq-transport-reconnect-delay 3
-  "Base delay in seconds before reconnect attempts."
-  :type 'number
-  :group 'qq)
+(defvar qq-transport-reconnect-delay 3
+  "Dormant v1 OneBot reconnect delay retained for legacy module loading.")
 
-(defcustom qq-transport-reconnect-max-attempts nil
-  "Maximum reconnect attempts before emacs-qq stops reconnecting.
-
-Set to nil to allow unlimited reconnect attempts."
-  :type '(choice (const :tag "Unlimited" nil) integer)
-  :group 'qq)
+(defvar qq-transport-reconnect-max-attempts nil
+  "Dormant v1 OneBot retry limit retained for legacy module loading.")
 
 (defun qq-set-token (token)
-  "Set OneBot TOKEN for the current Emacs session."
+  "Set dormant v1 OneBot TOKEN for the current Emacs session."
   (interactive (list (read-passwd "NapCat OneBot token: ")))
   (setq qq-onebot-token token)
   (message "qq: token set for current session"))
 
 (defun qq-current-token ()
-  "Return the active OneBot token from customize or environment."
+  "Return the dormant v1 OneBot token from variable or environment."
   (let ((custom-token (and (stringp qq-onebot-token)
                            (not (string-empty-p qq-onebot-token))
                            qq-onebot-token))

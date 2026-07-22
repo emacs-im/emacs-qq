@@ -1,4 +1,4 @@
-;;; qq-gateway-test.el --- Tests for native Gateway account client -*- lexical-binding: t; -*-
+;;; qq-gateway-test.el --- Tests for native QQ account client -*- lexical-binding: t; -*-
 
 ;;; Code:
 

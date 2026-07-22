@@ -329,16 +329,14 @@
        'image)))
    (should-not (qq-media--resource-fetching-p "avatar:10001"))))
 
-(ert-deftest qq-media-avatar-image-passes-error-callback-to-api ()
+(ert-deftest qq-media-avatar-image-never-falls-back-to-onebot ()
   (qq-media-test-with-reset
-   (let (errback-called)
+   (let (legacy-called)
      (cl-letf (((symbol-function 'qq-api-get-avatar)
-                (lambda (_user-id _done errback &optional _no-cache)
-                  (setq errback-called (functionp errback))
-                  (when errback
-                    (funcall errback nil "boom")))))
+                (lambda (&rest _)
+                  (setq legacy-called t))))
        (should-not (qq-media-avatar-image "10001"))
-       (should errback-called)
+       (should-not legacy-called)
        (should-not (qq-media--resource-fetching-p "avatar:10001"))))))
 
 (ert-deftest qq-media-message-avatar-keeps-guild-and-qq-identities-disjoint ()
