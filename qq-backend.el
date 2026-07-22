@@ -268,10 +268,14 @@ and reason."
   "Apply confirmed group FIELD VALUE for GROUP-ID to shared state."
   (let ((groups (qq-state-groups))
         changed)
-    (dolist (group groups)
-      (when (equal (alist-get 'group_id group) group-id)
-        (setf (alist-get field group nil nil #'eq) value)
-        (setq changed t)))
+    (setq groups
+          (mapcar
+           (lambda (group)
+             (when (equal (alist-get 'group_id group) group-id)
+               (setf (alist-get field group nil nil #'eq) value)
+               (setq changed t))
+             group)
+           groups))
     (when changed
       (qq-state-apply-groups groups))
     changed))
@@ -344,6 +348,27 @@ and reason."
       (qq-gateway-directory-set-group-whole-mute
        group-id enabled callback
        (or errback #'qq-backend--default-gateway-error))))))
+
+(defun qq-backend-set-group-pinned
+    (group-id pinned &optional callback errback)
+  "Set GROUP-ID's conversation PINNED state through the selected backend."
+  (unless (qq-backend-group-id-p group-id)
+    (user-error "qq: Group pinned state requires an exact backend group id"))
+  (setq pinned (and pinned t))
+  (let ((success (apply-partially #'qq-backend--group-setting-success
+                                  group-id 'pinned
+                                  (if pinned t :false) callback)))
+    (pcase (qq-backend--validate qq-backend)
+      ('onebot
+       (qq-backend--wrap-request
+        'onebot
+        (qq-api-set-group-pinned group-id pinned success errback)))
+      ('gateway
+       (qq-backend--wrap-request
+        'gateway
+        (qq-gateway-directory-set-group-pinned
+         group-id pinned success
+         (or errback #'qq-backend--default-gateway-error)))))))
 
 (defun qq-backend-clock-in-group
     (group-id &optional callback errback)

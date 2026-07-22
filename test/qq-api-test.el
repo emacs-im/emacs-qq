@@ -3103,6 +3103,37 @@ The authoritative post-state reports UNREAD-COUNT."
           (remain_at_all_count_for_uin . 4294967296))))
     (should-error (qq-api--validate-group-at-all-remaining invalid))))
 
+(ert-deftest qq-api-group-pinned-uses-closed-napcat-fork-contract ()
+  (let (calls delivered)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (action params callback &optional _errback)
+                 (push (list action params) calls)
+                 (funcall callback `((data . ,params)))
+                 'pin-request)))
+      (should
+       (eq (qq-api-set-group-pinned
+            "20001" t (lambda (receipt) (setq delivered receipt)))
+           'pin-request))
+      (qq-api-set-group-pinned "20001" nil #'ignore))
+    (should
+     (equal
+      (nreverse calls)
+      '(("emacs_set_group_pinned"
+         ((group_id . "20001") (pinned . t)))
+        ("emacs_set_group_pinned"
+         ((group_id . "20001") (pinned . :false))))))
+    (should (equal delivered '((group_id . "20001") (pinned . t))))
+    (should-error
+     (qq-api-set-group-pinned 20001 t)
+     :type 'user-error)
+    (should-error
+     (qq-api--validate-group-pinned-receipt
+      '((group_id . "20001") (pinned . t) (pinned_at . 1))
+      "20001" t))
+    (should-error
+     (qq-api--validate-group-pinned-receipt
+      '((group_id . "20002") (pinned . t)) "20001" t))))
+
 (ert-deftest qq-api-send-poke-builds-group-request-and-local-notice ()
   (let (captured-action captured-params applied)
     (qq-state-reset)

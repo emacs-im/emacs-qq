@@ -256,6 +256,19 @@ GROUP-ID defaults to the identity selected in the current buffer."
    (apply-partially #'qq-group--apply-whole-mute
                     (current-buffer) qq-group--group-id enabled)))
 
+(defun qq-group-toggle-pinned ()
+  "Toggle the current group's conversation pinned state."
+  (interactive)
+  (unless qq-group--group-id
+    (user-error "qq: this buffer has no group identity"))
+  (let ((pinned (not (eq (alist-get 'pinned qq-group--profile) t))))
+    (qq-backend-set-group-pinned
+     qq-group--group-id pinned
+     (apply-partially #'qq-group--apply-setting
+                      (current-buffer) qq-group--group-id 'pinned
+                      (if pinned t :false)
+                      (if pinned "群会话已置顶" "群会话已取消置顶")))))
+
 (defun qq-group--finish-clock-in (buffer group-id receipt)
   "Report a successful clock-in RECEIPT when BUFFER still owns GROUP-ID."
   (when (qq-group--setting-current-p buffer group-id)
@@ -364,6 +377,13 @@ GROUP-ID defaults to the identity selected in the current buffer."
    :face 'qq-group-action-button :help-echo "修改群备注 (R)")
   (insert "  ")
   (appkit-ui-insert-action-button
+   (if (eq (alist-get 'pinned qq-group--profile) t)
+       " 取消置顶 "
+     " 置顶群聊 ")
+   #'qq-group-toggle-pinned
+   :face 'qq-group-action-button :help-echo "切换群会话置顶状态 (P)")
+  (insert "  ")
+  (appkit-ui-insert-action-button
    " 全员禁言 " #'qq-group-set-whole-mute
    :face 'qq-group-action-button :help-echo "开启或关闭全员禁言 (M)")
   (insert "  ")
@@ -417,7 +437,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
          (insert "\n")
          (qq-group--insert-action-buttons)
          (appkit-view-insert-note-line
-          "g 刷新 · N 群名 · R 备注 · M 全员禁言 · S 群打卡 · @ 全体额度 · L 退出群聊 · s 成员（结果页 C 名片 / T 头衔 / K 移出） · q 关闭")
+          "g 刷新 · N 群名 · R 备注 · P 置顶 · M 全员禁言 · S 群打卡 · @ 全体额度 · L 退出群聊 · s 成员（结果页 C 名片 / T 头衔 / K 移出） · q 关闭")
          (insert "\n")
          (appkit-view-insert-heading-line "资料" :face 'bold)
          (let ((name (qq-group--present-string
@@ -699,6 +719,7 @@ RESOURCE identifies a presentation-only media dependency update."
     (define-key map (kbd "w") #'qq-group-copy-id)
     (define-key map (kbd "N") #'qq-group-set-name)
     (define-key map (kbd "R") #'qq-group-set-remark)
+    (define-key map (kbd "P") #'qq-group-toggle-pinned)
     (define-key map (kbd "M") #'qq-group-set-whole-mute)
     (define-key map (kbd "S") #'qq-group-clock-in)
     (define-key map (kbd "@") #'qq-group-show-at-all-remaining)

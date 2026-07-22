@@ -635,6 +635,14 @@ CALLBACK receives the validated generation-owned receipt."
    "group.set_whole_mute" group-uin 'enabled
    (if enabled t :false) callback errback))
 
+(defun qq-gateway-directory-set-group-pinned
+    (group-uin pinned &optional callback errback)
+  "Set GROUP-UIN's conversation PINNED state through the Gateway."
+  (setq pinned (and pinned t))
+  (qq-gateway-directory--set-group-setting
+   "group.set_pinned" group-uin 'pinned
+   (if pinned t :false) callback errback))
+
 (defun qq-gateway-directory--validate-group-clock-in-receipt
     (receipt owner group-uin)
   "Validate a closed group clock-in RECEIPT for OWNER and GROUP-UIN."

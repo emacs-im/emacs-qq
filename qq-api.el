@@ -3080,6 +3080,36 @@ CALLBACK receives the successful OneBot response."
        (funcall callback response)))
    (or errback #'qq-api--default-error)))
 
+(defun qq-api--validate-group-pinned-receipt (data group-id pinned)
+  "Validate closed group pinned DATA against GROUP-ID and PINNED."
+  (unless (qq-api--exact-object-keys-p data '(group_id pinned))
+    (error "qq: emacs_set_group_pinned returned invalid fields"))
+  (unless (and (equal (alist-get 'group_id data) group-id)
+               (equal (alist-get 'pinned data) pinned))
+    (error "qq: emacs_set_group_pinned contradicted its request"))
+  (copy-tree data))
+
+(defun qq-api-set-group-pinned
+    (group-id pinned &optional callback errback)
+  "Set GROUP-ID's conversation PINNED state through the NapCat fork."
+  (unless (qq-api-group-id-p group-id)
+    (user-error "qq: group pinned state requires a canonical uint32 group UIN"))
+  (setq pinned (if pinned t :false))
+  (qq-api-call
+   "emacs_set_group_pinned"
+   `((group_id . ,group-id) (pinned . ,pinned))
+   (lambda (response)
+     (condition-case error-data
+         (let ((receipt
+                (qq-api--validate-group-pinned-receipt
+                 (qq-api--response-data response) group-id pinned)))
+           (when callback
+             (funcall callback receipt)))
+       (error
+        (funcall (or errback #'qq-api--default-error)
+                 response (error-message-string error-data)))))
+   (or errback #'qq-api--default-error)))
+
 (defun qq-api-clock-in-group
     (group-id &optional callback errback)
   "Clock into GROUP-ID through NapCat OneBot.

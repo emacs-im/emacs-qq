@@ -9,7 +9,7 @@
 (defconst qq-gateway-directory-test-capabilities
   '("contact.list_friends" "contact.list_groups"
     "contact.list_group_members" "group.set_name" "group.set_remark"
-    "group.set_whole_mute" "group.set_member_card"
+    "group.set_whole_mute" "group.set_pinned" "group.set_member_card"
     "group.set_member_special_title" "group.kick_member" "group.clock_in"
     "group.get_at_all_remaining" "group.leave")
   "Native contact capabilities exercised by directory tests.")
@@ -276,15 +276,20 @@
                          (group_uin . "8209413637") (remark . "")))
                       ("group.set_whole_mute"
                        '((account_id . "slot-a") (generation . "7")
-                         (group_uin . "8209413637") (enabled . :false)))))
+                         (group_uin . "8209413637") (enabled . :false)))
+                      ("group.set_pinned"
+                       '((account_id . "slot-a") (generation . "7")
+                         (group_uin . "8209413637") (pinned . t)))))
                    method)))
         (qq-gateway-directory-set-group-name
          "8209413637" "New Name" (lambda (receipt) (push receipt receipts)))
         (qq-gateway-directory-set-group-remark
          "8209413637" "" (lambda (receipt) (push receipt receipts)))
         (qq-gateway-directory-set-group-whole-mute
-         "8209413637" nil (lambda (receipt) (push receipt receipts))))
-      (should (= (length receipts) 3))
+         "8209413637" nil (lambda (receipt) (push receipt receipts)))
+        (qq-gateway-directory-set-group-pinned
+         "8209413637" t (lambda (receipt) (push receipt receipts))))
+      (should (= (length receipts) 4))
       (should
        (equal
         (nreverse calls)
@@ -296,7 +301,10 @@
             (remark . "")))
           ("group.set_whole_mute"
            ((account_id . "slot-a") (group_uin . "8209413637")
-            (enabled . :false)))))))))
+            (enabled . :false)))
+          ("group.set_pinned"
+           ((account_id . "slot-a") (group_uin . "8209413637")
+            (pinned . t)))))))))
 
 (ert-deftest qq-gateway-directory-group-setting-rejects-stale-generation ()
   (qq-gateway-directory-test-with-state

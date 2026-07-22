@@ -233,6 +233,11 @@
                   (push (list 'mute group-id value) calls)
                   (funcall callback '((enabled . t)))
                   "mute-request"))
+               ((symbol-function 'qq-gateway-directory-set-group-pinned)
+                (lambda (group-id value callback &optional _errback)
+                  (push (list 'pinned group-id value) calls)
+                  (funcall callback '((pinned . :false)))
+                  "pinned-request"))
                ((symbol-function 'qq-gateway-directory-clock-in-group)
                 (lambda (group-id callback &optional _errback)
                   (push (list 'clock-in group-id) calls)
@@ -250,6 +255,10 @@
                    (qq-backend-set-group-whole-mute
                     "8209413637" t
                     (lambda (_receipt) (push 'mute callbacks))))
+                  (pinned-request
+                   (qq-backend-set-group-pinned
+                    "8209413637" nil
+                    (lambda (_receipt) (push 'pinned callbacks))))
                   (clock-in-request
                    (qq-backend-clock-in-group
                     "8209413637"
@@ -260,23 +269,44 @@
                              "remark-request"))
               (should (equal (qq-backend-request-token mute-request)
                              "mute-request"))
+              (should (equal (qq-backend-request-token pinned-request)
+                             "pinned-request"))
               (should (equal (qq-backend-request-token clock-in-request)
                              "clock-in-request"))))
           (let ((group (qq-state-group "8209413637")))
             (should (equal (alist-get 'group_name group) "New"))
-            (should-not (alist-get 'group_remark group)))
+            (should-not (alist-get 'group_remark group))
+            (should (eq (alist-get 'pinned group) :false)))
           (should (equal (sort callbacks
                                (lambda (left right)
                                  (string< (symbol-name left)
                                           (symbol-name right))))
-                         '(clock-in mute name remark)))
+                         '(clock-in mute name pinned remark)))
           (should
            (equal (nreverse calls)
                   '((name "8209413637" "New")
                     (remark "8209413637" "")
                     (mute "8209413637" t)
+                    (pinned "8209413637" nil)
                     (clock-in "8209413637")))))
       (qq-state-reset))))
+
+(ert-deftest qq-backend-onebot-group-pinned-retains-request-origin ()
+  (let ((qq-backend 'onebot) called callback-value)
+    (cl-letf (((symbol-function 'qq-api-set-group-pinned)
+               (lambda (group-id pinned callback &optional _errback)
+                 (setq called (list group-id pinned))
+                 (funcall callback
+                          `((group_id . ,group-id) (pinned . t)))
+                 "onebot-pinned")))
+      (let ((request
+             (qq-backend-set-group-pinned
+              "20001" t
+              (lambda (receipt) (setq callback-value receipt)))))
+        (should (eq (qq-backend-request-backend request) 'onebot))
+        (should (equal (qq-backend-request-token request) "onebot-pinned"))))
+    (should (equal called '("20001" t)))
+    (should (eq (alist-get 'pinned callback-value) t))))
 
 (ert-deftest qq-backend-group-leave-routes-both-backends-and-converges-state ()
   (dolist (backend '(onebot gateway))
