@@ -10,7 +10,8 @@
 (defconst qq-gateway-message-test-capabilities
   '("message.send" "message.send_text" "message.poke"
     "message.recall_poke" "message.recall" "message.set_reaction"
-    "message.set_essence" "message.set_todo" "message.get_history")
+    "message.set_essence" "message.set_todo" "message.get_history"
+    "message.mark_read")
   "Native Gateway capabilities exercised by message tests.")
 
 (defun qq-gateway-message-test-account
@@ -245,6 +246,85 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
             7348923749823749823)
       (should-error
        (qq-gateway-message--validate-message-data numeric)))))
+
+(ert-deftest qq-gateway-message-mark-read-preserves-closed-native-cursors ()
+  (qq-gateway-message-test-with-state
+    (let* ((private
+            '((session-key . "private:10001")
+              (server-id . "7348923749823749823")
+              (message-seq . "9007199254740999")
+              (native-sent-at . 1784700000)
+              (peer-uid . "u_peer")
+              (gateway-account-id . "slot-a")
+              (gateway-generation . "7")))
+           (group
+            '((session-key . "group:8209413637")
+              (server-id . "7348923749823749824")
+              (message-seq . "9007199254741000")
+              (native-sent-at . 1784700001)
+              (group-id . "8209413637")
+              (gateway-account-id . "slot-a")
+              (gateway-generation . "7")))
+           calls receipts)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (push (list method (copy-tree params)) calls)
+                   (let* ((message (alist-get 'message params))
+                          (sequence (alist-get 'sequence message)))
+                     (funcall
+                      callback
+                      `((account_id . "slot-a")
+                        (generation . "7")
+                        (read_through_message_id
+                         . ,(alist-get 'message_id message))
+                        (read_through_sequence . ,sequence)
+                        (server_read_sequence . ,sequence))))
+                   (format "read-%d" (length calls)))))
+        (qq-gateway-message-mark-read
+         private (lambda (receipt) (push receipt receipts)))
+        (qq-gateway-message-mark-read
+         group (lambda (receipt) (push receipt receipts))))
+      (setq calls (nreverse calls)
+            receipts (nreverse receipts))
+      (should
+       (equal
+        calls
+        '(("message.mark_read"
+           ((account_id . "slot-a")
+            (conversation . ((kind . "private") (peer_uid . "u_peer")))
+            (message . ((message_id . "7348923749823749823")
+                        (sequence . "9007199254740999")
+                        (sent_at . 1784700000)))))
+          ("message.mark_read"
+           ((account_id . "slot-a")
+            (conversation . ((kind . "group")
+                             (group_uin . "8209413637")))
+            (message . ((message_id . "7348923749823749824")
+                        (sequence . "9007199254741000"))))))))
+      (should (equal (alist-get 'read_through_sequence (car receipts))
+                     "9007199254740999"))
+      (should (equal (alist-get 'read_through_sequence (cadr receipts))
+                     "9007199254741000"))
+      (let ((missing-time (copy-tree private)))
+        (setf (alist-get 'native-sent-at missing-time) nil)
+        (should-error (qq-gateway-message-mark-read missing-time)
+                      :type 'user-error)))))
+
+(ert-deftest qq-gateway-message-mark-read-rejects-regressed-server-cursor ()
+  (should-error
+   (qq-gateway-message--validate-read-receipt
+    '((account_id . "slot-a")
+      (generation . "7")
+      (read_through_message_id . "7348923749823749823")
+      (read_through_sequence . "9007199254740999")
+      (server_read_sequence . "9007199254740998"))
+    '("slot-a" . "7")
+    "7348923749823749823"
+    "9007199254740999")))
 
 (ert-deftest qq-gateway-message-projects-group-segments-and-metadata ()
   (qq-gateway-message-test-with-state

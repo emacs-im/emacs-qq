@@ -37,6 +37,18 @@
 (defvar qq-native--bootstrap-pending 0
   "Number of directory parts pending for the current account bootstrap.")
 
+(defvar qq-native--read-operations (make-hash-table :test #'equal)
+  "Newest in-flight and coalesced native read intent per session.")
+
+(defvar qq-native--read-operation-counter 0
+  "Monotonic token used to reject stale native read callbacks.")
+
+(defun qq-native--revoke-read-operations (&rest _ignored)
+  "Revoke every in-flight or coalesced read intent.
+
+Late callbacks become inert because their operation token is no longer owned."
+  (setq qq-native--read-operations (make-hash-table :test #'equal)))
+
 (defun qq-native--wrap-request (token)
   "Wrap opaque native TOKEN for safe cancellation."
   (and token
@@ -677,6 +689,85 @@ response and reason."
     (qq-gateway-message-recall
      session-key message callback (or errback #'qq-native--default-error))))
 
+(defun qq-native--read-operation-current-p (session-key token)
+  "Return non-nil when TOKEN still owns SESSION-KEY's read operation."
+  (equal token
+         (plist-get (gethash session-key qq-native--read-operations) :token)))
+
+(defun qq-native--read-message-after-p (candidate reference)
+  "Return non-nil when CANDIDATE has a sequence after REFERENCE."
+  (let ((candidate-sequence (alist-get 'message-seq candidate))
+        (reference-sequence (alist-get 'message-seq reference)))
+    (and (qq-gateway--canonical-decimal-p candidate-sequence)
+         (qq-gateway--canonical-decimal-p reference-sequence)
+         (qq-gateway--decimal-less-p reference-sequence candidate-sequence))))
+
+(defun qq-native--finish-read-operation (session-key token)
+  "Settle TOKEN and start SESSION-KEY's newest coalesced read intent."
+  (when (qq-native--read-operation-current-p session-key token)
+    (let ((next (plist-get (gethash session-key qq-native--read-operations)
+                           :next)))
+      (remhash session-key qq-native--read-operations)
+      (when next
+        (qq-native--start-mark-message-read
+         (plist-get next :message)
+         (plist-get next :callback)
+         (plist-get next :errback))))))
+
+(defun qq-native--start-mark-message-read (message callback errback)
+  "Start one native read report for normalized MESSAGE."
+  (let* ((session-key (alist-get 'session-key message))
+         (token (cl-incf qq-native--read-operation-counter))
+         (operation (list :token token :message message :next nil)))
+    (puthash session-key operation qq-native--read-operations)
+    (condition-case error-data
+        (qq-gateway-message-mark-read
+         message
+         (lambda (receipt)
+           (when (qq-native--read-operation-current-p session-key token)
+             (unwind-protect
+                 (qq-gateway--invoke callback receipt)
+               (qq-native--finish-read-operation session-key token))))
+         (lambda (body reason)
+           (when (qq-native--read-operation-current-p session-key token)
+             (unwind-protect
+                 (qq-gateway--invoke
+                  (or errback #'qq-native--default-error) body reason)
+               (qq-native--finish-read-operation session-key token)))))
+      (error
+       (when (qq-native--read-operation-current-p session-key token)
+         (remhash session-key qq-native--read-operations))
+       (signal (car error-data) (cdr error-data))))
+    token))
+
+(defun qq-native-mark-message-read (message &optional callback errback)
+  "Advance native read state through normalized MESSAGE.
+
+Only one report per session is in flight.  Later calls retain the newest exact
+message sequence, so scrolling cannot create an unbounded request queue.
+CALLBACK receives the validated receipt and ERRBACK receives failure details."
+  (unless (and (listp message) (alist-get 'session-key message))
+    (user-error "qq: Native read report requires a normalized message"))
+  (let* ((session-key (alist-get 'session-key message))
+         (operation (gethash session-key qq-native--read-operations)))
+    (cond
+     ((null operation)
+      (qq-native--start-mark-message-read message callback errback))
+     ((not (qq-native--read-message-after-p
+            message (plist-get operation :message)))
+      (plist-get operation :token))
+     (t
+      (let ((next (plist-get operation :next)))
+        (when (or (null next)
+                  (qq-native--read-message-after-p
+                   message (plist-get next :message)))
+          (setq operation
+                (plist-put
+                 operation :next
+                 (list :message message :callback callback :errback errback)))
+          (puthash session-key operation qq-native--read-operations))
+        (plist-get operation :token))))))
+
 (defun qq-native--message-at-sequence (session-key sequence)
   "Return SESSION-KEY message carrying exact SEQUENCE, or nil."
   (seq-find
@@ -871,7 +962,36 @@ request.  ERRBACK handles failure and COUNT limits the requested page size."
           group-moderation group-clock-in group-at-all-quota
           group-lifecycle presence
           send-text send-message face reply mention poke recall
-          explicit-history)))
+          explicit-history read-receipt)))
+
+(defun qq-native-message-read-capable-p (message)
+  "Return non-nil when MESSAGE is a closed, currently reportable read cursor."
+  (let* ((session-key (and (listp message)
+                           (alist-get 'session-key message)))
+         (kind (and session-key
+                    (qq-state-session-key-type session-key)))
+         (owner (qq-gateway-current-account-owner))
+         (account (qq-gateway-current-account)))
+    (and (qq-native-ready-p)
+         (qq-native-supports-p 'read-receipt)
+         (member "message.mark_read" (qq-gateway-transport-capabilities))
+         owner
+         (equal (alist-get 'phase account) "online")
+         (equal (alist-get 'gateway-account-id message) (car owner))
+         (equal (alist-get 'gateway-generation message) (cdr owner))
+         (qq-gateway--canonical-decimal-p (alist-get 'server-id message))
+         (qq-gateway--canonical-decimal-p (alist-get 'message-seq message))
+         (pcase kind
+           ('private
+            (let ((sent-at (alist-get 'native-sent-at message)))
+              (and (qq-gateway--non-empty-string-p
+                    (alist-get 'peer-uid message))
+                   (qq-gateway-message--uint32-p sent-at)
+                   (> sent-at 0))))
+           ('group
+            (qq-gateway--canonical-decimal-p
+             (alist-get 'group-id message)))
+           (_ nil)))))
 
 (defun qq-native-presence-capable-p ()
   "Return non-nil when the selected account can accept presence changes."
@@ -935,12 +1055,15 @@ request.  ERRBACK handles failure and COUNT limits the requested page size."
   "Revoke account projection and request caches."
   (setq qq-native--bootstrap-owner nil
         qq-native--bootstrap-pending 0)
+  (qq-native--revoke-read-operations)
   (qq-gateway-attachment-reset)
   (qq-gateway-media-reset)
   (qq-gateway-resource-reset)
   (qq-gateway-directory-reset)
   (qq-gateway-message-revoke-projection))
 
+(add-hook 'qq-gateway-current-account-changed-hook
+          #'qq-native--revoke-read-operations)
 (add-hook 'qq-gateway-current-account-changed-hook
           #'qq-native--maybe-bootstrap t)
 (add-hook 'qq-gateway-accounts-changed-hook

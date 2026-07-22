@@ -1916,6 +1916,88 @@ native query/event semantics are not yet part of the closed Gateway protocol."
     (error "qq: Gateway recall receipt contradicts request"))
   (copy-tree receipt))
 
+(defun qq-gateway-message--validate-read-receipt
+    (receipt owner message-id sequence)
+  "Validate read RECEIPT for OWNER, MESSAGE-ID, and SEQUENCE."
+  (unless (qq-gateway-message--closed-object-p
+           receipt
+           '(account_id generation read_through_message_id
+             read_through_sequence)
+           '(server_read_sequence))
+    (error "qq: Gateway read receipt has invalid fields"))
+  (unless (and (equal (alist-get 'account_id receipt) (car owner))
+               (equal (alist-get 'generation receipt) (cdr owner))
+               (equal (alist-get 'read_through_message_id receipt) message-id)
+               (equal (alist-get 'read_through_sequence receipt) sequence))
+    (error "qq: Gateway read receipt contradicts request"))
+  (when-let* ((acknowledged (alist-get 'server_read_sequence receipt)))
+    (unless (and (qq-gateway--canonical-decimal-p acknowledged)
+                 (not (qq-gateway--decimal-less-p acknowledged sequence)))
+      (error "qq: Gateway acknowledged an older or malformed read cursor")))
+  (copy-tree receipt))
+
+(defun qq-gateway-message-mark-read
+    (message &optional callback errback)
+  "Advance the selected account's read cursor through normalized MESSAGE.
+
+MESSAGE must retain its exact native sequence and, for private chat, timestamp
+and peer UID.  CALLBACK receives the validated synchronous receipt; ERRBACK
+receives an error body and reason."
+  (let* ((owner (or (qq-gateway-current-account-owner)
+                    (user-error "qq: Select a QQ account first")))
+         (_owner (qq-gateway-message--ensure-projection-owner owner))
+         (session-key (alist-get 'session-key message))
+         (kind (and session-key (qq-state-session-key-type session-key)))
+         (message-id (alist-get 'server-id message))
+         (sequence (alist-get 'message-seq message))
+         conversation message-params)
+    (unless (and (memq kind '(private group))
+                 (qq-gateway--canonical-decimal-p message-id)
+                 (qq-gateway--canonical-decimal-p sequence))
+      (user-error "qq: Native read report requires exact message identity"))
+    (unless (and (equal (alist-get 'gateway-account-id message) (car owner))
+                 (equal (alist-get 'gateway-generation message) (cdr owner)))
+      (user-error "qq: Read target belongs to another Gateway generation"))
+    (setq message-params
+          `((message_id . ,message-id)
+            (sequence . ,sequence)))
+    (pcase kind
+      ('private
+       (let ((peer-uid (alist-get 'peer-uid message))
+             (sent-at (alist-get 'native-sent-at message)))
+         (unless (and (qq-gateway--non-empty-string-p peer-uid)
+                      (qq-gateway-message--uint32-p sent-at)
+                      (> sent-at 0))
+           (user-error
+            "qq: Private read report requires native peer UID and timestamp"))
+         (setq conversation `((kind . "private") (peer_uid . ,peer-uid))
+               message-params
+               (append message-params `((sent_at . ,sent-at))))))
+      ('group
+       (let ((group-uin (alist-get 'group-id message)))
+         (unless (qq-gateway--canonical-decimal-p group-uin)
+           (user-error "qq: Group read report requires exact group UIN"))
+         (setq conversation `((kind . "group") (group_uin . ,group-uin))))))
+    (qq-gateway--send
+     "message.mark_read"
+     `((account_id . ,(car owner))
+       (conversation . ,conversation)
+       (message . ,message-params))
+     (lambda (result)
+       (condition-case result-error
+           (progn
+             (unless (equal owner (qq-gateway-current-account-owner))
+               (error "qq: QQ account generation changed during read report"))
+             (qq-gateway--invoke
+              callback
+              (qq-gateway-message--validate-read-receipt
+               result owner message-id sequence)))
+         (error
+          (qq-gateway--client-error
+           errback "invalid_gateway_result" "%s"
+           (error-message-string result-error)))))
+     errback)))
+
 (defun qq-gateway-message-recall
     (session-key message &optional callback errback)
   "Recall native MESSAGE in SESSION-KEY for the selected QQ account.
