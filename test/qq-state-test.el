@@ -1408,9 +1408,11 @@
        (peerName . "")
        (msgTime . "1710000000")
        (msgId . "42")
-       (msgSeq . "0")
+       (msgSeq . "65493")
        (lastestMsg
         (time . 1710000000)
+        (message_id . "42")
+        (message_seq . "0")
         (message_type . "private")
         (chat_type . 8)
         (peer_uid . "dev:a")
@@ -1451,8 +1453,20 @@
      (should (equal (alist-get 'variant session-2) "mobile"))
      (should (equal (alist-get 'chat-type session-1) "8"))
      (should (equal (alist-get 'chat-type session-2) "134"))
+     (should (equal (alist-get 'last-message-seq session-1) "65493"))
      (should (equal (alist-get 'last-message-preview session-1) "hello from phone"))
-     (should (equal (alist-get 'last-message-preview session-2) "second device")))))
+     (should (equal (alist-get 'last-message-preview session-2) "second device"))
+     (let ((message (car (qq-state-session-messages
+                          "dataline:desktop:dev:a"))))
+       (should-not (alist-get 'message-seq message))
+       (should (equal (alist-get 'message_seq
+                                 (alist-get 'raw-event message))
+                      "0"))
+       (qq-state-merge-live-message (copy-tree (alist-get 'raw-event message)))
+       (should (equal (alist-get 'last-message-seq
+                                 (qq-state-session
+                                  "dataline:desktop:dev:a"))
+                      "65493"))))))
 
 (ert-deftest qq-state-recent-contacts-require-exact-native-identity ()
   (qq-test-with-reset
