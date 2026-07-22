@@ -3015,6 +3015,8 @@ The authoritative post-state reports UNREAD-COUNT."
        "20001" nil (lambda (_response) (push 'mute callbacks)))
       (qq-api-clock-in-group
        "20001" (lambda (_response) (push 'clock-in callbacks)))
+      (qq-api-leave-group
+       "20001" (lambda (_response) (push 'leave callbacks)))
       (qq-api-set-group-member-card
        "20001" "10002" "" (lambda (_response) (push 'card callbacks)))
       (qq-api-set-group-member-special-title
@@ -3034,6 +3036,8 @@ The authoritative post-state reports UNREAD-COUNT."
          ((group_id . "20001") (enable . :false)))
         ("set_group_sign"
          ((group_id . "20001")))
+        ("set_group_leave"
+         ((group_id . "20001") (is_dismiss . :false)))
         ("set_group_card"
          ((group_id . "20001") (user_id . "10002") (card . "")))
         ("set_group_special_title"
@@ -3045,7 +3049,7 @@ The authoritative post-state reports UNREAD-COUNT."
     (should (equal (sort callbacks
                          (lambda (left right)
                            (string< (symbol-name left) (symbol-name right))))
-                   '(card clock-in kick mute name remark title)))
+                   '(card clock-in kick leave mute name remark title)))
     (should-error (qq-api-set-group-name "20001" "") :type 'user-error)
     (should-error (qq-api-set-group-remark 20001 "Work") :type 'user-error)
     (should-error
@@ -3054,7 +3058,8 @@ The authoritative post-state reports UNREAD-COUNT."
     (should-error
      (qq-api-kick-group-member "4294967296" "10002" nil)
      :type 'user-error)
-    (should-error (qq-api-clock-in-group 20001) :type 'user-error)))
+    (should-error (qq-api-clock-in-group 20001) :type 'user-error)
+    (should-error (qq-api-leave-group 20001) :type 'user-error)))
 
 (ert-deftest qq-api-send-poke-builds-group-request-and-local-notice ()
   (let (captured-action captured-params applied)

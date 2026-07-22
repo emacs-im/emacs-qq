@@ -45,6 +45,11 @@
   "Face used for the primary title on QQ group cards."
   :group 'qq)
 
+(defface qq-group-destructive-action-button
+  '((t :inherit (error qq-group-action-button)))
+  "Face used for destructive QQ group actions."
+  :group 'qq)
+
 (defvar-local qq-group--group-id nil
   "Group code displayed by the current group buffer.")
 
@@ -277,6 +282,31 @@ GROUP-ID defaults to the identity selected in the current buffer."
    (apply-partially #'qq-group--finish-clock-in
                     (current-buffer) qq-group--group-id)))
 
+(defun qq-group--finish-leave (buffer group-id _receipt)
+  "Close BUFFER after confirmed leave when it still owns exact GROUP-ID."
+  (when (qq-group--setting-current-p buffer group-id)
+    (message "qq: 已退出群聊 %s" group-id)
+    (let ((kill-buffer-query-functions nil))
+      (kill-buffer buffer))))
+
+(defun qq-group-leave ()
+  "Confirm and leave the current group through the selected backend."
+  (interactive)
+  (unless qq-group--group-id
+    (user-error "qq: this buffer has no group identity"))
+  (let* ((group-id qq-group--group-id)
+         (group-name
+          (or (qq-group--present-string (alist-get 'name qq-group--profile))
+              (qq-group--present-string (alist-get 'remark qq-group--profile))
+              "未命名群聊")))
+    (unless (yes-or-no-p
+             (format "确认退出群聊 %s（%s）？" group-name group-id))
+      (user-error "qq: 已取消退出群聊"))
+    (qq-backend-leave-group
+     group-id
+     (apply-partially #'qq-group--finish-leave
+                      (current-buffer) group-id))))
+
 (defun qq-group--insert-action-buttons ()
   "Insert primary group action buttons."
   (insert "  ")
@@ -320,6 +350,10 @@ GROUP-ID defaults to the identity selected in the current buffer."
   (appkit-ui-insert-action-button
    " 群打卡 " #'qq-group-clock-in
    :face 'qq-group-action-button :help-echo "群打卡 (S)")
+  (insert "  ")
+  (appkit-ui-insert-action-button
+   " 退出群聊 " #'qq-group-leave
+   :face 'qq-group-destructive-action-button :help-echo "退出群聊 (L)")
   (insert "\n"))
 
 (defun qq-group-render ()
@@ -359,7 +393,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
          (insert "\n")
          (qq-group--insert-action-buttons)
          (appkit-view-insert-note-line
-          "g 刷新 · N 群名 · R 备注 · M 全员禁言 · S 群打卡 · s 成员（结果页 C 名片 / T 头衔 / K 移出） · q 退出")
+          "g 刷新 · N 群名 · R 备注 · M 全员禁言 · S 群打卡 · L 退出群聊 · s 成员（结果页 C 名片 / T 头衔 / K 移出） · q 关闭")
          (insert "\n")
          (appkit-view-insert-heading-line "资料" :face 'bold)
          (let ((name (qq-group--present-string
@@ -643,6 +677,7 @@ RESOURCE identifies a presentation-only media dependency update."
     (define-key map (kbd "R") #'qq-group-set-remark)
     (define-key map (kbd "M") #'qq-group-set-whole-mute)
     (define-key map (kbd "S") #'qq-group-clock-in)
+    (define-key map (kbd "L") #'qq-group-leave)
     (define-key map (kbd "TAB") #'forward-button)
     (define-key map (kbd "<backtab>") #'qq-group-button-backward)
     (define-key map (kbd "q") #'quit-window)

@@ -362,6 +362,36 @@ and reason."
        group-id callback
        (or errback #'qq-backend--default-gateway-error))))))
 
+(defun qq-backend--group-leave-success (group-id callback receipt)
+  "Remove confirmed GROUP-ID from loaded shared state, then forward RECEIPT."
+  (when (qq-state-groups-loaded-p)
+    (qq-state-apply-groups
+     (seq-remove
+      (lambda (group)
+        (equal (alist-get 'group_id group) group-id))
+      (qq-state-groups))))
+  (when callback
+    (funcall callback receipt)))
+
+(defun qq-backend-leave-group
+    (group-id &optional callback errback)
+  "Leave GROUP-ID through the selected backend without dismissing it."
+  (unless (qq-backend-group-id-p group-id)
+    (user-error "qq: Group leave requires an exact backend group id"))
+  (let ((success (apply-partially #'qq-backend--group-leave-success
+                                  group-id callback)))
+    (pcase (qq-backend--validate qq-backend)
+      ('onebot
+       (qq-backend--wrap-request
+        'onebot
+        (qq-api-leave-group group-id success errback)))
+      ('gateway
+       (qq-backend--wrap-request
+        'gateway
+        (qq-gateway-directory-leave-group
+         group-id success
+         (or errback #'qq-backend--default-gateway-error)))))))
+
 (defun qq-backend-set-group-member-card
     (group-id user-id card &optional callback errback)
   "Set or clear USER-ID's CARD in GROUP-ID through the selected backend."
@@ -766,7 +796,7 @@ request.  ERRBACK handles failure and COUNT limits the requested page size."
      ('gateway
       (memq capability
             '(contacts group-members group-settings group-member-settings
-              group-moderation group-clock-in
+              group-moderation group-clock-in group-lifecycle
               send-text send-message face reply mention poke recall
               explicit-history)))))
 

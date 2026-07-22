@@ -97,6 +97,8 @@ BODY may refer to the lexical variables `buffer' and `view'."
       (search-forward "搜索成员")
       (should (button-at (1- (point))))
       (search-forward "群公告")
+      (should (button-at (1- (point))))
+      (search-forward "退出群聊")
       (should (button-at (1- (point)))))))
 
 (ert-deftest qq-group-render-omits-unresolved-raw-enums ()
@@ -223,6 +225,67 @@ BODY may refer to the lexical variables `buffer' and `view'."
       (should (string-match-p "连续 7 天" reported))
       (should (string-match-p "群排名 2" reported)))))
 
+(ert-deftest qq-group-leave-confirms-name-and-id-and-closes-owned-profile ()
+  (let ((buffer (generate-new-buffer " *qq-group-leave-test*"))
+        prompt called reported)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (qq-group-mode)
+            (setq qq-group--group-id "20001"
+                  qq-group--profile (copy-tree qq-group-test--profile))
+            (cl-letf (((symbol-function 'yes-or-no-p)
+                       (lambda (value) (setq prompt value) t))
+                      ((symbol-function 'qq-backend-leave-group)
+                       (lambda (group-id callback &optional _errback)
+                         (setq called group-id)
+                         (funcall callback '((status . "ok")))
+                         "leave-request"))
+                      ((symbol-function 'message)
+                       (lambda (format-string &rest arguments)
+                         (setq reported
+                               (apply #'format format-string arguments)))))
+              (should (equal (qq-group-leave) "leave-request"))))
+          (should (equal called "20001"))
+          (should (string-match-p "Emacs Users" prompt))
+          (should (string-match-p "20001" prompt))
+          (should (string-match-p "已退出群聊 20001" reported))
+          (should-not (buffer-live-p buffer)))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest qq-group-leave-cancellation-sends-nothing ()
+  (with-temp-buffer
+    (qq-group-mode)
+    (setq qq-group--group-id "20001"
+          qq-group--profile (copy-tree qq-group-test--profile))
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_prompt) nil))
+              ((symbol-function 'qq-backend-leave-group)
+               (lambda (&rest _arguments)
+                 (ert-fail "cancelled group leave was dispatched"))))
+      (should-error (qq-group-leave) :type 'user-error))))
+
+(ert-deftest qq-group-late-leave-receipt-does-not-close-reused-profile ()
+  (let ((buffer (generate-new-buffer " *qq-group-stale-leave-test*"))
+        success)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (qq-group-mode)
+            (setq qq-group--group-id "20001"
+                  qq-group--profile (copy-tree qq-group-test--profile))
+            (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_prompt) t))
+                      ((symbol-function 'qq-backend-leave-group)
+                       (lambda (_group-id callback &optional _errback)
+                         (setq success callback)
+                         "leave-request")))
+              (qq-group-leave))
+            (setq qq-group--group-id "20002"))
+          (funcall success '((status . "ok")))
+          (should (buffer-live-p buffer)))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest qq-group-mode-cancels-request-before-major-mode-change ()
   (with-temp-buffer
     (qq-group-mode)
@@ -265,7 +328,9 @@ BODY may refer to the lexical variables `buffer' and `view'."
   (should (eq (lookup-key qq-group-mode-map (kbd "M"))
               #'qq-group-set-whole-mute))
   (should (eq (lookup-key qq-group-mode-map (kbd "S"))
-              #'qq-group-clock-in)))
+              #'qq-group-clock-in))
+  (should (eq (lookup-key qq-group-mode-map (kbd "L"))
+              #'qq-group-leave)))
 
 (ert-deftest qq-group-reuses-one-profile-buffer-like-telega ()
   (should (equal (qq-group--buffer-name "20001") "*qq-group*"))
