@@ -308,6 +308,24 @@ and reason."
          group-id name success
          (or errback #'qq-backend--default-gateway-error)))))))
 
+(defun qq-backend-set-friend-pinned
+    (user-id pinned &optional callback errback)
+  "Set USER-ID's friend conversation PINNED state through the backend."
+  (unless (qq-backend-user-id-p user-id)
+    (user-error "qq: Friend pinned state requires an exact backend user id"))
+  (setq pinned (and pinned t))
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot
+     (qq-backend--wrap-request
+      'onebot
+      (qq-api-set-friend-pinned user-id pinned callback errback)))
+    ('gateway
+     (qq-backend--wrap-request
+      'gateway
+      (qq-gateway-directory-set-friend-pinned
+       user-id pinned callback
+       (or errback #'qq-backend--default-gateway-error))))))
+
 (defun qq-backend-set-group-remark
     (group-id remark &optional callback errback)
   "Set or clear GROUP-ID's account-local REMARK through the backend."

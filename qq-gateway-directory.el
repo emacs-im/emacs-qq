@@ -581,6 +581,45 @@ single setting returned by the closed Gateway method."
     (error "qq: Gateway group setting receipt contradicts request"))
   (copy-tree receipt))
 
+(defun qq-gateway-directory--validate-friend-pinned-receipt
+    (receipt owner friend-uin pinned)
+  "Validate friend pinned RECEIPT for OWNER, FRIEND-UIN, and PINNED."
+  (qq-gateway-directory--validate-owner
+   receipt owner '(account_id generation friend_uin pinned)
+   "friend pinned receipt")
+  (unless (and (equal (alist-get 'friend_uin receipt) friend-uin)
+               (equal (alist-get 'pinned receipt) pinned))
+    (error "qq: Gateway friend pinned receipt contradicts request"))
+  (copy-tree receipt))
+
+(defun qq-gateway-directory-set-friend-pinned
+    (friend-uin pinned &optional callback errback)
+  "Set FRIEND-UIN's conversation PINNED state through the native Gateway."
+  (unless (qq-gateway--canonical-decimal-p friend-uin)
+    (user-error "qq: Friend pinned state requires an exact decimal UIN"))
+  (setq pinned (if pinned t :false))
+  (let* ((owner (or (qq-gateway-current-account-owner)
+                    (user-error "qq: Select a Gateway account first")))
+         (_projection (qq-gateway-message--ensure-projection-owner owner)))
+    (qq-gateway--send
+     "friend.set_pinned"
+     `((account_id . ,(car owner))
+       (friend_uin . ,friend-uin)
+       (pinned . ,pinned))
+     (lambda (raw-result)
+       (condition-case error-data
+           (let ((receipt
+                  (qq-gateway-directory--validate-friend-pinned-receipt
+                   raw-result owner friend-uin pinned)))
+             (unless (equal owner (qq-gateway-current-account-owner))
+               (error "qq: Gateway account generation changed during friend setting"))
+             (qq-gateway--invoke callback receipt))
+         (error
+          (qq-gateway--client-error
+           errback "invalid_gateway_result" "%s"
+           (error-message-string error-data)))))
+     errback)))
+
 (defun qq-gateway-directory--set-group-setting
     (method group-uin field value callback errback)
   "Send one closed group setting METHOD for GROUP-UIN.

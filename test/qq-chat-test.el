@@ -7604,6 +7604,55 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
        (should-not qq-chat--search-results)
        (should-not qq-chat--search-owner)))))
 
+(ert-deftest qq-chat-friend-pin-actions-use-authoritative-private-peer ()
+  (qq-chat-test-with-reset
+   (let ((qq-backend 'onebot) calls)
+     (qq-state-apply-friend-categories
+      '(((category_id . 0) (name . "Default")
+         (friends . (((user_id . "9007199254740999")
+                      (nickname . "Alice")))))))
+     (qq-state-upsert-session
+      "private:9007199254740999"
+      '((title . "Alice") (target-id . "9007199254740999")
+        (type . private)) nil)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "private:9007199254740999")
+       (cl-letf (((symbol-function 'qq-backend-set-friend-pinned)
+                  (lambda (user-id pinned callback &optional _errback)
+                    (push (list user-id pinned) calls)
+                    (funcall callback
+                             `((user_id . ,user-id)
+                               (pinned . ,(if pinned t :false))))
+                    'friend-pin-request)))
+         (should (qq-chat--friend-pin-capable-p))
+         (should (eq (qq-chat-pin-friend) 'friend-pin-request))
+         (should (eq (qq-chat-unpin-friend) 'friend-pin-request)))
+       (should
+        (equal (nreverse calls)
+               '(("9007199254740999" t)
+                 ("9007199254740999" nil))))))))
+
+(ert-deftest qq-chat-friend-pin-rejects-groups-and-nonfriends ()
+  (qq-chat-test-with-reset
+   (let ((qq-backend 'onebot))
+     (qq-state-upsert-session
+      "private:10001"
+      '((target-id . "10001") (type . private)) nil)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "private:10001")
+       (should-not (qq-chat--friend-pin-capable-p))
+       (should-error (qq-chat-pin-friend) :type 'user-error))
+     (qq-state-upsert-session
+      "group:20001"
+      '((target-id . "20001") (type . group)) nil)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "group:20001")
+       (should-not (qq-chat--friend-pin-capable-p))
+       (should-error (qq-chat-unpin-friend) :type 'user-error)))))
+
 (provide (quote qq-chat-test))
 
 ;;; qq-chat-test.el ends here

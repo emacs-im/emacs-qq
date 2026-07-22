@@ -37,6 +37,9 @@
   (should (commandp #'qq-chat-complete-message-todo))
   (should (commandp #'qq-chat-cancel-message-todo))
   (should (commandp #'qq-chat-message-todo-transient))
+  (should (commandp #'qq-chat-pin-friend))
+  (should (commandp #'qq-chat-unpin-friend))
+  (should (commandp #'qq-chat-friend-pin-transient))
   (should (commandp #'qq-chat-clear-message-selection))
   (should (commandp #'qq-chat-attach-transient))
   (should (commandp #'qq-root-transient)))
@@ -73,6 +76,24 @@
     (should
      (eq (cdr (assoc "c" commands)) 'qq-chat-complete-message-todo))
     (should (eq (cdr (assoc "x" commands)) 'qq-chat-cancel-message-todo))))
+
+(ert-deftest qq-transient-chat-prefix-exposes-explicit-friend-pin-actions ()
+  (let* ((chat-objects (transient-suffixes 'qq-chat-transient))
+         (pin-entry
+          (seq-find
+           (lambda (suffix) (equal (oref suffix key) "t"))
+           chat-objects))
+         (pin-objects (transient-suffixes 'qq-chat-friend-pin-transient))
+         (commands
+          (mapcar (lambda (suffix)
+                    (cons (oref suffix key) (oref suffix command)))
+                  pin-objects)))
+    (should pin-entry)
+    (should (eq (oref pin-entry command) 'qq-chat-friend-pin-transient))
+    (should (eq (oref pin-entry inapt-if)
+                'qq-transient--friend-pin-inapt-p))
+    (should (eq (cdr (assoc "p" commands)) 'qq-chat-pin-friend))
+    (should (eq (cdr (assoc "u" commands)) 'qq-chat-unpin-friend))))
 
 (ert-deftest qq-transient-forward-interface-has-no-legacy-mark-commands ()
   (should-not (fboundp 'qq-chat-forward-message))

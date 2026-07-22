@@ -9,7 +9,7 @@
 (defconst qq-gateway-directory-test-capabilities
   '("contact.list_friends" "contact.list_groups"
     "contact.list_group_members" "group.set_name" "group.set_remark"
-    "group.set_whole_mute" "group.set_pinned" "group.set_member_card"
+    "friend.set_pinned" "group.set_whole_mute" "group.set_pinned" "group.set_member_card"
     "group.set_member_special_title" "group.kick_member" "group.clock_in"
     "group.get_at_all_remaining" "group.leave")
   "Native contact capabilities exercised by directory tests.")
@@ -305,6 +305,37 @@
           ("group.set_pinned"
            ((account_id . "slot-a") (group_uin . "8209413637")
             (pinned . t)))))))))
+
+(ert-deftest qq-gateway-directory-friend-pinned-validates-generation-and-uins ()
+  (qq-gateway-directory-test-with-state
+    (let (sent callback-value)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-directory-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent (list method params))
+                   (funcall
+                    callback
+                    '((account_id . "slot-a") (generation . "7")
+                      (friend_uin . "9007199254740999") (pinned . :false)))
+                   "friend-pin-request")))
+        (should
+         (equal
+          (qq-gateway-directory-set-friend-pinned
+           "9007199254740999" nil
+           (lambda (receipt) (setq callback-value receipt)))
+          "friend-pin-request")))
+      (should
+       (equal sent
+              '("friend.set_pinned"
+                ((account_id . "slot-a")
+                 (friend_uin . "9007199254740999")
+                 (pinned . :false)))))
+      (should (equal (alist-get 'friend_uin callback-value)
+                     "9007199254740999"))
+      (should (eq (alist-get 'pinned callback-value) :false)))))
 
 (ert-deftest qq-gateway-directory-group-setting-rejects-stale-generation ()
   (qq-gateway-directory-test-with-state

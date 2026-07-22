@@ -308,6 +308,33 @@
     (should (equal called '("20001" t)))
     (should (eq (alist-get 'pinned callback-value) t))))
 
+(ert-deftest qq-backend-friend-pinned-routes-both-backends-with-exact-uin ()
+  (dolist (backend '(onebot gateway))
+    (let ((qq-backend backend) called callback-value)
+      (cl-letf (((symbol-function 'qq-api-set-friend-pinned)
+                 (lambda (user-id pinned callback &optional _errback)
+                   (setq called (list 'onebot user-id pinned))
+                   (funcall callback
+                            `((user_id . ,user-id) (pinned . t)))
+                   "onebot-friend-pin"))
+                ((symbol-function 'qq-gateway-directory-set-friend-pinned)
+                 (lambda (user-id pinned callback &optional _errback)
+                   (setq called (list 'gateway user-id pinned))
+                   (funcall callback
+                            `((friend_uin . ,user-id) (pinned . t)))
+                   "gateway-friend-pin")))
+        (let ((request
+               (qq-backend-set-friend-pinned
+                "9007199254740999" t
+                (lambda (receipt) (setq callback-value receipt)))))
+          (should (eq (qq-backend-request-backend request) backend))
+          (should
+           (equal (qq-backend-request-token request)
+                  (format "%s-friend-pin" backend)))))
+      (should (equal called
+                     (list backend "9007199254740999" t)))
+      (should (eq (alist-get 'pinned callback-value) t)))))
+
 (ert-deftest qq-backend-group-leave-routes-both-backends-and-converges-state ()
   (dolist (backend '(onebot gateway))
     (let ((qq-backend backend)

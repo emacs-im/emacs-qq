@@ -158,6 +158,10 @@
     (not (and (eq (alist-get 'type session) 'private)
               (qq-api-user-id-p user-id)))))
 
+(defun qq-transient--friend-pin-inapt-p ()
+  "Return non-nil when the current chat is not an authoritative friend chat."
+  (not (qq-chat--friend-pin-capable-p)))
+
 (defun qq-transient--chat-info-inapt-p ()
   "Return non-nil when the current chat has no profile page."
   (let* ((session (and (boundp 'qq-chat--session-key)
@@ -240,6 +244,15 @@
      :inapt-if qq-transient--todo-inapt-p)
     ("x" "Cancel" qq-chat-cancel-message-todo
      :inapt-if qq-transient--todo-inapt-p)]])
+
+;;;###autoload(autoload 'qq-chat-friend-pin-transient "qq-transient" nil t)
+(transient-define-prefix qq-chat-friend-pin-transient ()
+  "Explicit pin actions for the current QQ friend conversation."
+  [["Friend conversation"
+    ("p" "Pin" qq-chat-pin-friend
+     :inapt-if qq-transient--friend-pin-inapt-p)
+    ("u" "Unpin" qq-chat-unpin-friend
+     :inapt-if qq-transient--friend-pin-inapt-p)]])
 
 ;;;###autoload(autoload 'qq-chat-message-transient "qq-transient" nil t)
 (transient-define-prefix qq-chat-message-transient ()
@@ -384,6 +397,8 @@ Prefer this over inline button rows."
     ("d" "Recall at point" qq-chat-delete-message
      :inapt-if qq-transient--recall-inapt-p)]
    ["Session"
+    ("t" "Friend pin…" qq-chat-friend-pin-transient
+     :inapt-if qq-transient--friend-pin-inapt-p)
     ("h" "Chat info" qq-chat-open-peer-info
      :inapt-if qq-transient--chat-info-inapt-p)
     ("i" "User page" qq-chat-open-peer-user
