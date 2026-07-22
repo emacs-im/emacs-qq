@@ -3080,6 +3080,21 @@ CALLBACK receives the successful OneBot response."
        (funcall callback response)))
    (or errback #'qq-api--default-error)))
 
+(defun qq-api-clock-in-group
+    (group-id &optional callback errback)
+  "Clock into GROUP-ID through NapCat OneBot.
+
+CALLBACK receives NapCat's successful response."
+  (unless (qq-api-group-id-p group-id)
+    (user-error "qq: group clock-in requires a canonical uint32 group UIN"))
+  (qq-api-call
+   "set_group_sign"
+   `((group_id . ,group-id))
+   (lambda (response)
+     (when callback
+       (funcall callback response)))
+   (or errback #'qq-api--default-error)))
+
 (defun qq-api-set-group-member-card
     (group-id user-id card &optional callback errback)
   "Set or clear USER-ID's CARD in GROUP-ID through NapCat OneBot.

@@ -251,6 +251,32 @@ GROUP-ID defaults to the identity selected in the current buffer."
    (apply-partially #'qq-group--apply-whole-mute
                     (current-buffer) qq-group--group-id enabled)))
 
+(defun qq-group--finish-clock-in (buffer group-id receipt)
+  "Report a successful clock-in RECEIPT when BUFFER still owns GROUP-ID."
+  (when (qq-group--setting-current-p buffer group-id)
+    (with-current-buffer buffer
+      (let ((details
+             (delq nil
+                   (mapcar
+                    #'qq-group--present-string
+                    (list (alist-get 'title receipt)
+                          (alist-get 'keep_day_text receipt)
+                          (alist-get 'group_rank_text receipt))))))
+        (message "qq: 群打卡成功%s"
+                 (if details
+                     (concat "：" (string-join details " · "))
+                   ""))))))
+
+(defun qq-group-clock-in ()
+  "Clock the selected account into the current group."
+  (interactive)
+  (unless qq-group--group-id
+    (user-error "qq: this buffer has no group identity"))
+  (qq-backend-clock-in-group
+   qq-group--group-id
+   (apply-partially #'qq-group--finish-clock-in
+                    (current-buffer) qq-group--group-id)))
+
 (defun qq-group--insert-action-buttons ()
   "Insert primary group action buttons."
   (insert "  ")
@@ -290,6 +316,10 @@ GROUP-ID defaults to the identity selected in the current buffer."
   (appkit-ui-insert-action-button
    " 全员禁言 " #'qq-group-set-whole-mute
    :face 'qq-group-action-button :help-echo "开启或关闭全员禁言 (M)")
+  (insert "  ")
+  (appkit-ui-insert-action-button
+   " 群打卡 " #'qq-group-clock-in
+   :face 'qq-group-action-button :help-echo "群打卡 (S)")
   (insert "\n"))
 
 (defun qq-group-render ()
@@ -329,7 +359,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
          (insert "\n")
          (qq-group--insert-action-buttons)
          (appkit-view-insert-note-line
-          "g 刷新 · N 群名 · R 备注 · M 全员禁言 · s 成员（结果页 C 名片 / T 头衔） · q 退出")
+          "g 刷新 · N 群名 · R 备注 · M 全员禁言 · S 群打卡 · s 成员（结果页 C 名片 / T 头衔 / K 移出） · q 退出")
          (insert "\n")
          (appkit-view-insert-heading-line "资料" :face 'bold)
          (let ((name (qq-group--present-string
@@ -612,6 +642,7 @@ RESOURCE identifies a presentation-only media dependency update."
     (define-key map (kbd "N") #'qq-group-set-name)
     (define-key map (kbd "R") #'qq-group-set-remark)
     (define-key map (kbd "M") #'qq-group-set-whole-mute)
+    (define-key map (kbd "S") #'qq-group-clock-in)
     (define-key map (kbd "TAB") #'forward-button)
     (define-key map (kbd "<backtab>") #'qq-group-button-backward)
     (define-key map (kbd "q") #'quit-window)

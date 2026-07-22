@@ -345,6 +345,23 @@ and reason."
        group-id enabled callback
        (or errback #'qq-backend--default-gateway-error))))))
 
+(defun qq-backend-clock-in-group
+    (group-id &optional callback errback)
+  "Clock the selected account into GROUP-ID through its backend."
+  (unless (qq-backend-group-id-p group-id)
+    (user-error "qq: Group clock-in requires an exact backend group id"))
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot
+     (qq-backend--wrap-request
+      'onebot
+      (qq-api-clock-in-group group-id callback errback)))
+    ('gateway
+     (qq-backend--wrap-request
+      'gateway
+      (qq-gateway-directory-clock-in-group
+       group-id callback
+       (or errback #'qq-backend--default-gateway-error))))))
+
 (defun qq-backend-set-group-member-card
     (group-id user-id card &optional callback errback)
   "Set or clear USER-ID's CARD in GROUP-ID through the selected backend."
@@ -749,7 +766,7 @@ request.  ERRBACK handles failure and COUNT limits the requested page size."
      ('gateway
       (memq capability
             '(contacts group-members group-settings group-member-settings
-              group-moderation
+              group-moderation group-clock-in
               send-text send-message face reply mention poke recall
               explicit-history)))))
 
