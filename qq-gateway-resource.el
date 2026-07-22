@@ -37,6 +37,13 @@
        (> (length value) 4)
        (not (string-match-p "[[:space:][:cntrl:]]" value))))
 
+(defun qq-gateway-resource--local-access-id-p (value)
+  "Return non-nil when VALUE is an opaque local-access identity."
+  (and (stringp value)
+       (string-match-p
+        "\\`access-[0-9a-f]\\{8\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{12\\}\\'"
+        value)))
+
 (defun qq-gateway-resource--prefixed-digest-id-p (value prefix)
   "Return non-nil when VALUE is PREFIX followed by one SHA-256-shaped token."
   (and (stringp value)
@@ -367,6 +374,153 @@ lifecycle and release operations."
          errback "invalid_gateway_result" "%s"
          (error-message-string error-data)))))
    errback))
+
+(defun qq-gateway-resource-derive-playable-record
+    (source-resource-id &optional suggested-name callback errback)
+  "Derive portable PCM WAV playback from native SOURCE-RESOURCE-ID.
+
+The source must be a ready QQ/Tencent Silk resource accepted by the native
+service.  SUGGESTED-NAME, when non-nil, names the distinct derived resource.
+CALLBACK receives its validated staging snapshot; source and result retain
+independent lifecycle and release operations."
+  (unless (qq-gateway-resource--opaque-id-p source-resource-id)
+    (user-error "qq: Native record source ID must be an opaque res- identity"))
+  (when (and suggested-name
+             (not (qq-gateway-resource--safe-name-p suggested-name)))
+    (user-error "qq: Playable record name must be a safe basename"))
+  (qq-gateway--send
+   "resource.derive_playable_record"
+   `((source_resource_id . ,source-resource-id)
+     (suggested_name . ,suggested-name))
+   (lambda (result)
+     (condition-case error-data
+         (let ((snapshot
+                (qq-gateway-resource--validate-single-result
+                 result "resource.derive_playable_record")))
+           (unless (equal (alist-get 'phase snapshot) "staging")
+             (error "qq: Gateway playable record response is not staging"))
+           (when (equal (alist-get 'resource_id snapshot) source-resource-id)
+             (error "qq: Gateway playable record derivation reused its source identity"))
+           (setq snapshot
+                 (qq-gateway-resource--upsert
+                  snapshot 'derive-playable-record-response))
+           (qq-gateway--invoke callback snapshot))
+       (error
+        (qq-gateway--client-error
+         errback "invalid_gateway_result" "%s"
+         (error-message-string error-data)))))
+   errback))
+
+(defun qq-gateway-resource--validate-local-access
+    (access expected-resource-id)
+  "Validate and copy local ACCESS for EXPECTED-RESOURCE-ID."
+  (unless (qq-gateway--exact-object-keys-p
+           access '(access_id resource_id path expires_at))
+    (error "qq: Gateway local resource access has invalid fields"))
+  (unless (qq-gateway-resource--local-access-id-p
+           (alist-get 'access_id access))
+    (error "qq: Gateway local resource access identity is malformed"))
+  (unless (and (equal (alist-get 'resource_id access) expected-resource-id)
+               (qq-gateway-resource--opaque-id-p expected-resource-id))
+    (error "qq: Gateway local resource access contradicts its resource"))
+  (let ((path (alist-get 'path access)))
+    (unless (and (stringp path)
+                 (file-name-absolute-p path)
+                 (file-regular-p path))
+      (error "qq: Gateway local resource access path is not a regular absolute file")))
+  (unless (qq-gateway-resource--timestamp-p (alist-get 'expires_at access))
+    (error "qq: Gateway local resource access expiry is malformed"))
+  (copy-tree access))
+
+(defun qq-gateway-resource-open-local
+    (resource-id &optional callback errback)
+  "Lease a short-lived read-only local path for ready RESOURCE-ID.
+
+CALLBACK receives an access grant containing `access_id', `resource_id',
+`path', and `expires_at'.  The path is deliberately absent from ordinary
+resource snapshots and must later be revoked with
+`qq-gateway-resource-close-local'."
+  (unless (qq-gateway-resource--opaque-id-p resource-id)
+    (user-error "qq: Resource ID must be an opaque res- identity"))
+  (qq-gateway--send
+   "resource.open_local" `((resource_id . ,resource-id))
+   (lambda (result)
+     (condition-case error-data
+         (progn
+           (unless (qq-gateway--exact-object-keys-p result '(access))
+             (error "qq: Gateway resource.open_local result has invalid fields"))
+           (qq-gateway--invoke
+            callback
+            (qq-gateway-resource--validate-local-access
+             (alist-get 'access result) resource-id)))
+       (error
+        (qq-gateway--client-error
+         errback "invalid_gateway_result" "%s"
+         (error-message-string error-data)))))
+   errback))
+
+(defun qq-gateway-resource-close-local
+    (access-id &optional callback errback)
+  "Idempotently revoke local resource ACCESS-ID."
+  (unless (qq-gateway-resource--local-access-id-p access-id)
+    (user-error "qq: Local resource access ID must be an access- UUID"))
+  (qq-gateway--send
+   "resource.close_local" `((access_id . ,access-id))
+   (lambda (result)
+     (condition-case error-data
+         (progn
+           (unless (and (qq-gateway--exact-object-keys-p
+                         result '(access_id closed))
+                        (equal (alist-get 'access_id result) access-id)
+                        (eq (alist-get 'closed result) t))
+             (error "qq: Gateway resource.close_local receipt is malformed"))
+           (qq-gateway--invoke callback (copy-tree result)))
+       (error
+        (qq-gateway--client-error
+         errback "invalid_gateway_result" "%s"
+         (error-message-string error-data)))))
+   errback))
+
+(defun qq-gateway-resource-await-ready (resource-id callback errback)
+  "Wait until projected RESOURCE-ID becomes ready or terminal.
+
+Return a function that removes this local observer without changing service
+state.  CALLBACK receives the ready snapshot."
+  (unless (qq-gateway-resource--opaque-id-p resource-id)
+    (user-error "qq: Resource ID must be an opaque res- identity"))
+  (let (observer finished)
+    (setq observer
+          (lambda (_reason changed-id)
+            (when (and (not finished)
+                       (or (null changed-id) (equal changed-id resource-id)))
+              (let ((resource (qq-gateway-resource resource-id)))
+                (cond
+                 ((null resource)
+                  (setq finished t)
+                  (remove-hook 'qq-gateway-resource-changed-hook observer)
+                  (qq-gateway--client-error
+                   errback "resource_disappeared"
+                   "Staged resource disappeared"))
+                 ((equal (alist-get 'phase resource) "ready")
+                  (setq finished t)
+                  (remove-hook 'qq-gateway-resource-changed-hook observer)
+                  (qq-gateway--invoke callback resource))
+                 ((member (alist-get 'phase resource) '("failed" "released"))
+                  (setq finished t)
+                  (remove-hook 'qq-gateway-resource-changed-hook observer)
+                  (let ((problem (alist-get 'error resource)))
+                    (qq-gateway--client-error
+                     errback
+                     (or (alist-get 'code problem) "resource_released")
+                     "%s"
+                     (or (alist-get 'message problem)
+                         "Staged resource was released")))))))))
+    (add-hook 'qq-gateway-resource-changed-hook observer)
+    (funcall observer 'initial resource-id)
+    (lambda ()
+      (unless finished
+        (setq finished t)
+        (remove-hook 'qq-gateway-resource-changed-hook observer)))))
 
 (defun qq-gateway-resource--validate-import-source (source)
   "Validate and copy one closed native-cache SOURCE snapshot."
