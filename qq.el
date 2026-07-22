@@ -27,6 +27,7 @@
 (require 'qq-transport)
 (require 'qq-gateway)
 (require 'qq-gateway-message)
+(require 'qq-gateway-directory)
 (require 'qq-api)
 (require 'qq-chat)
 (require 'qq-search)

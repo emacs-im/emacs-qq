@@ -372,6 +372,24 @@
   "Return exact correlation key for OWNER and CLIENT-SEQUENCE."
   (list (car owner) (cdr owner) client-sequence))
 
+(defun qq-gateway-message--validate-peer-identity (owner uid uin)
+  "Validate exact UID/UIN mapping for projected account OWNER."
+  (unless (equal owner qq-gateway-message--projection-owner)
+    (error "qq: Peer identity does not belong to the projected Gateway owner"))
+  (unless (and (qq-gateway--non-empty-string-p uid)
+               (qq-gateway--canonical-decimal-p uin))
+    (error "qq: Peer identity requires opaque UID and exact UIN"))
+  (when-let* ((known (gethash uid qq-gateway-message--peer-uin-by-uid)))
+    (unless (equal known uin)
+      (error "qq: Gateway peer UID contradicts its known UIN")))
+  (cons uid uin))
+
+(defun qq-gateway-message--remember-peer-identity (owner uid uin)
+  "Remember validated UID/UIN identity for projected account OWNER."
+  (qq-gateway-message--validate-peer-identity owner uid uin)
+  (puthash uid uin qq-gateway-message--peer-uin-by-uid)
+  (cons uid uin))
+
 (defun qq-gateway-message--attach-pending-local-id
     (normalized owner message session-key)
   "Attach OWNER's pending local ID to NORMALIZED when MESSAGE metadata matches.
@@ -465,6 +483,9 @@ SESSION-KEY must equal the conversation recorded with the send receipt."
               (target-id . ,(if group-id group-id (alist-get 'uin peer)))
               (order . ,(qq-state--next-message-order))
               (raw-event . ,(copy-tree data)))))
+      (when (and peer (alist-get 'uid peer) (alist-get 'uin peer))
+        (qq-gateway-message--validate-peer-identity
+         owner (alist-get 'uid peer) (alist-get 'uin peer)))
       (qq-gateway-message--attach-pending-local-id
        normalized owner message session-key))))
 
@@ -472,7 +493,7 @@ SESSION-KEY must equal the conversation recorded with the send receipt."
   "Commit correlation context for OWNER's merged MESSAGE and NORMALIZED row."
   (when-let* ((peer-uid (alist-get 'peer-uid normalized))
               (peer-uin (alist-get 'peer-uin normalized)))
-    (puthash peer-uid peer-uin qq-gateway-message--peer-uin-by-uid))
+    (qq-gateway-message--remember-peer-identity owner peer-uid peer-uin))
   (let* ((key (qq-gateway-message--pending-send-key
                owner (alist-get 'client_sequence message)))
          (pending (gethash key qq-gateway-message--pending-sends)))
