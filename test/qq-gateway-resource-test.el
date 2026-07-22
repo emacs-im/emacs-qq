@@ -4,6 +4,7 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'qq-gateway-wire)
 (require 'qq-gateway-resource)
 
 (defconst qq-gateway-resource-test-capabilities
@@ -19,11 +20,13 @@
 (defconst qq-gateway-resource-test-candidate-id
   (concat "imp-linuxqq-" (make-string 64 ?b)))
 
-(defun qq-gateway-resource-test-import-source ()
-  "Return one pathless native-cache source fixture."
+(defun qq-gateway-resource-test-import-source (&optional domain-p)
+  "Return one pathless native-cache source fixture.
+
+Use a raw vector for `kinds' unless DOMAIN-P requests projected form."
   `((source_id . ,qq-gateway-resource-test-source-id)
     (layout . "linuxqq.nt_data.images.v1")
-    (kinds . ("image"))))
+    (kinds . ,(if domain-p '("image") ["image"]))))
 
 (defun qq-gateway-resource-test-import-candidate ()
   "Return one pathless native image candidate fixture."
@@ -76,6 +79,7 @@
   `(let ((qq-gateway-resource--resources (make-hash-table :test #'equal))
          (qq-gateway-resource--order nil)
          (qq-gateway-resource--gateway-instance-id nil)
+         (qq-gateway-resource--refresh-owner nil)
          (qq-gateway-resource--resync-request-id nil)
          (qq-gateway-resource-changed-hook nil)
          (qq-gateway-resource-desync-hook nil))
@@ -105,6 +109,48 @@
     (setf (alist-get 'error ready)
           '((code . "impossible") (message . "contradiction")))
     (should-error (qq-gateway-resource--validate-snapshot ready))))
+
+(ert-deftest qq-gateway-resource-wire-null-normalizes-and-owns-values ()
+  (let* ((name (copy-sequence "payload.bin"))
+         (snapshot
+          (qq-gateway-resource-test-snapshot
+           :suggested-name name
+           :media-type qq-gateway-wire-null
+           :digests qq-gateway-wire-null
+           :expires-at qq-gateway-wire-null
+           :error qq-gateway-wire-null))
+         (validated (qq-gateway-resource--validate-snapshot snapshot)))
+    (should-not (alist-get 'media_type validated))
+    (should-not (alist-get 'digests validated))
+    (should-not (alist-get 'expires_at validated))
+    (should-not (alist-get 'error validated))
+    (aset name 0 ?X)
+    (should (equal (alist-get 'suggested_name validated) "payload.bin"))))
+
+(ert-deftest qq-gateway-resource-wire-array-and-registry-own-values ()
+  (qq-gateway-resource-test-with-state
+    (let* ((name (copy-sequence "payload.bin"))
+           (snapshot
+            (qq-gateway-resource-test-snapshot
+             :suggested-name name
+             :media-type qq-gateway-wire-null
+             :digests qq-gateway-wire-null
+             :expires-at qq-gateway-wire-null
+             :error qq-gateway-wire-null)))
+      (qq-gateway-resource--replace (vector snapshot) 'wire-test)
+      (aset name 0 ?X)
+      (let ((first (qq-gateway-resource "res-opaque-a")))
+        (should (equal (alist-get 'suggested_name first) "payload.bin"))
+        (aset (alist-get 'suggested_name first) 0 ?Y)
+        (should (equal
+                 (alist-get 'suggested_name
+                            (qq-gateway-resource "res-opaque-a"))
+                 "payload.bin")))
+      (should-error
+       (qq-gateway-resource--replace qq-gateway-wire-null 'wire-test))
+      (should-error
+       (qq-gateway-resource--validate-list-result
+        `((resources . ,qq-gateway-wire-null)))))))
 
 (ert-deftest qq-gateway-resource-stage-local-sends-only-explicit-source-input ()
   (qq-gateway-resource-test-with-state
@@ -318,6 +364,10 @@
       (qq-gateway-resource--handle-event
        "resource.changed"
        `((resource . ,(qq-gateway-resource-test-ready))))
+      ;; Replayed content is not a projection change.
+      (qq-gateway-resource--handle-event
+       "resource.changed"
+       `((resource . ,(qq-gateway-resource-test-ready))))
       ;; A delayed staging response cannot overwrite the ready snapshot.
       (qq-gateway-resource--upsert
        (qq-gateway-resource-test-snapshot) 'stage-response)
@@ -354,13 +404,15 @@
                      ("resource.import.list_sources"
                       (funcall callback
                                `((sources
-                                  . (,(qq-gateway-resource-test-import-source))))))
+                                  . ,(vector
+                                      (qq-gateway-resource-test-import-source))))))
                      ("resource.import.list_images"
                       (funcall callback
                                `((source_id . ,qq-gateway-resource-test-source-id)
                                  (candidates
-                                  . (,(qq-gateway-resource-test-import-candidate)))
-                                 (next))))
+                                  . ,(vector
+                                      (qq-gateway-resource-test-import-candidate)))
+                                 (next . ,qq-gateway-wire-null))))
                      ("resource.import.stage_image"
                       (funcall callback
                                `((source_id . ,qq-gateway-resource-test-source-id)
@@ -378,7 +430,8 @@
          qq-gateway-resource-test-source-id
          qq-gateway-resource-test-candidate-id
          (lambda (value) (setq staged value)))
-        (should (equal sources (list (qq-gateway-resource-test-import-source))))
+        (should (equal sources
+                       (list (qq-gateway-resource-test-import-source t))))
         (should
          (equal (alist-get 'candidates page)
                 (list (qq-gateway-resource-test-import-candidate))))
@@ -406,21 +459,78 @@
       (cl-letf (((symbol-function 'qq-gateway-transport-capabilities)
                  (lambda () qq-gateway-resource-test-capabilities))
                 ((symbol-function 'qq-gateway-resource-refresh)
-                 (lambda (_callback _errback reason)
+                 (lambda (_callback _errback reason &optional _owner)
                    (push reason calls)
                    "resource-list-request")))
-        (qq-gateway-resource--handle-event
-         "gateway.ready"
-         '((gateway_instance_id . "gateway-a") (accounts)))
+        (qq-gateway-resource--handle-ready "gateway-a")
         (should (equal qq-gateway-resource--gateway-instance-id "gateway-a"))
-        (should (equal qq-gateway-resource--resync-request-id
-                       "resource-list-request"))
+        (should (equal (car qq-gateway-resource--resync-request-id)
+                       'resource-resync))
         (qq-gateway-resource--handle-protocol-error
          '((code . "resource_event_stream_lagged")
            (message . "missed 2")))
         (should (equal calls '(ready)))
         (should (equal (alist-get 'code desync)
                        "resource_event_stream_lagged"))))))
+
+(ert-deftest qq-gateway-resource-newest-refresh-owns-full-replacement ()
+  (qq-gateway-resource-test-with-state
+    (let (requests old-callback old-error new-callback)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () '("resource.list")))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback errback &optional _early)
+                   (setq requests
+                         (append requests (list (cons callback errback))))
+                   (intern (format "resource-request-%d"
+                                   (length requests))))))
+        (qq-gateway-resource-refresh
+         (lambda (_) (setq old-callback t))
+         (lambda (body _failure) (setq old-error body)))
+        (qq-gateway-resource-refresh
+         (lambda (_) (setq new-callback t)) #'ignore)
+        (funcall
+         (car (nth 1 requests))
+         `((resources .
+            [,(qq-gateway-resource-test-snapshot
+               :resource-id "res-new")])))
+        (funcall
+         (car (nth 0 requests))
+         `((resources .
+            [,(qq-gateway-resource-test-snapshot
+               :resource-id "res-old")])))
+        (should new-callback)
+        (should-not old-callback)
+        (should (equal (alist-get 'code old-error) "superseded_request"))
+        (should (qq-gateway-resource "res-new"))
+        (should-not (qq-gateway-resource "res-old"))
+        (should-not qq-gateway-resource--refresh-owner)))))
+
+(ert-deftest qq-gateway-resource-reset-cancels-pending-refresh ()
+  (qq-gateway-resource-test-with-state
+    (let (late-success canceled failures)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () '("resource.list")))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params success _failure &optional _early)
+                   (setq late-success success)
+                   'resource-refresh-token))
+                ((symbol-function 'qq-gateway-transport-cancel)
+                 (lambda (token) (push token canceled) t)))
+        (qq-gateway-resource-refresh
+         nil (lambda (body _reason) (push body failures)))
+        (qq-gateway-resource-reset)
+        (should (equal canceled '(resource-refresh-token)))
+        (should (= (length failures) 1))
+        (should-not qq-gateway-resource--refresh-owner)
+        (funcall late-success
+                 `((resources . [,(qq-gateway-resource-test-snapshot)])))
+        (should (= (length failures) 1))
+        (should-not (qq-gateway-resources))))))
 
 (ert-deftest qq-gateway-resource-list-replacement-is-atomic-on-duplicates ()
   (qq-gateway-resource-test-with-state

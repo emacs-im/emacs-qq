@@ -151,6 +151,53 @@
       (should (equal (alist-get 'code observed) "event_stream_lagged"))
       (should (= 0 (hash-table-count qq-gateway-transport--pending))))))
 
+(ert-deftest qq-gateway-transport-unsolicited-wire-null-id-is-accepted ()
+  (qq-gateway-transport-test-with-state
+    (let (observed)
+      (add-hook 'qq-gateway-transport-protocol-error-hook
+                (lambda (body) (setq observed body)))
+      (qq-gateway-transport--handle-payload
+       (qq-gateway-transport--json-decode
+        "{\"kind\":\"error\",\"id\":null,\"error\":{\"code\":\"event_stream_lagged\",\"message\":\"missed\"}}"))
+      (should (equal (alist-get 'code observed) "event_stream_lagged"))
+      (should-not (qq-gateway-wire-null-p observed)))))
+
+(ert-deftest qq-gateway-transport-hooks-own-deep-copies ()
+  (qq-gateway-transport-test-with-state
+    (let* ((source (copy-sequence "account-1"))
+           (qq-gateway-transport-event-hook
+            (list (lambda (_event data)
+                    (aset (alist-get 'account_id data) 0 ?X))
+                  (lambda (_event data)
+                    (should (equal (alist-get 'account_id data)
+                                   "account-1"))))))
+      (qq-gateway-transport--run-hook
+       'qq-gateway-transport-event-hook
+       "account.changed" `((account_id . ,source)))
+      (should (equal source "account-1")))))
+
+(ert-deftest qq-gateway-transport-metadata-accessors-own-strings ()
+  (qq-gateway-transport-test-with-state
+    (let* ((instance (copy-sequence "gateway-1"))
+           (capability (copy-sequence "account.list"))
+           (account-id (copy-sequence "account-1"))
+           (qq-gateway-transport--gateway-instance-id instance)
+           (qq-gateway-transport--capabilities (list capability))
+           (qq-gateway-transport--ready-accounts
+            `(((account_id . ,account-id)))))
+      (let ((returned-instance
+             (qq-gateway-transport-gateway-instance-id))
+            (returned-capabilities
+             (qq-gateway-transport-capabilities))
+            (returned-accounts
+             (qq-gateway-transport-ready-accounts)))
+        (aset returned-instance 0 ?G)
+        (aset (car returned-capabilities) 0 ?A)
+        (aset (alist-get 'account_id (car returned-accounts)) 0 ?Q))
+      (should (equal instance "gateway-1"))
+      (should (equal capability "account.list"))
+      (should (equal account-id "account-1")))))
+
 (ert-deftest qq-gateway-transport-consumer-hook-error-is-isolated ()
   (qq-gateway-transport-test-with-state
     (let (later-called)
@@ -224,14 +271,14 @@
          `((kind . "response") (id . ,id)
            (result . ((protocol_version . 2)
                       (gateway_instance_id . "gateway-42")
-                      (capabilities . ("account.list" "account.start"))))))
+                      (capabilities . ["account.list" "account.start"])))))
         ;; A successful hello response alone is not a synchronized session.
         (should (eq qq-gateway-transport--state 'authenticating))
         (should (= qq-gateway-transport--reconnect-attempt 4))
         (qq-gateway-transport--handle-payload
          '((kind . "event") (event . "gateway.ready")
            (data . ((gateway_instance_id . "gateway-42")
-                    (accounts . (((account_id . "a-1"))))))))
+                    (accounts . [((account_id . "a-1"))])))))
         (should (eq qq-gateway-transport--state 'ready))
         (should (= qq-gateway-transport--reconnect-attempt 0))
         (should (equal (qq-gateway-transport-gateway-instance-id)
@@ -240,7 +287,74 @@
          (equal (alist-get 'account_id
                            (car (qq-gateway-transport-ready-accounts)))
                 "a-1"))
-        (should (equal (caar events) "gateway.ready"))))))
+        (should (equal (caar events) "gateway.ready"))
+        ;; Raw event data retains its array vector until the account-domain
+        ;; validator deliberately normalizes it.
+        (should (vectorp (alist-get 'accounts (cdar events))))))))
+
+(ert-deftest qq-gateway-transport-hello-result-has-closed-schema ()
+  (qq-gateway-transport-test-with-state
+    (let (success-callback violations timer-started)
+      (cl-letf (((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback _allow-before-ready)
+                   (setq success-callback callback)
+                   "hello-request"))
+                ((symbol-function 'qq-gateway-transport--protocol-violation)
+                 (lambda (&rest arguments)
+                   (push (apply #'format arguments) violations)))
+                ((symbol-function 'qq-gateway-transport--start-ready-timer)
+                 (lambda () (setq timer-started t))))
+        (qq-gateway-transport--send-hello
+         (copy-sequence "0123456789abcdef0123456789abcdef"))
+        (funcall
+         success-callback
+         '((protocol_version . 2)
+           (gateway_instance_id . "gateway-42")
+           (capabilities . ["account.list" "account.start"])))
+        (should timer-started)
+        (should (equal qq-gateway-transport--hello-instance-id "gateway-42"))
+        (should (equal qq-gateway-transport--capabilities
+                       '("account.list" "account.start")))
+        (dolist (extra '((generation . 7) (future_field . "unknown")))
+          (setq timer-started nil
+                qq-gateway-transport--hello-instance-id nil
+                qq-gateway-transport--capabilities nil)
+          (funcall
+           success-callback
+           `((protocol_version . 2)
+             (gateway_instance_id . "gateway-42")
+             (capabilities . ["account.list"])
+             ,extra))
+          (should-not timer-started)
+          (should-not qq-gateway-transport--hello-instance-id)
+          (should-not qq-gateway-transport--capabilities))
+        (should (= (length violations) 2))
+        (should (cl-every (lambda (violation)
+                            (equal violation "Malformed gateway.hello result"))
+                          violations))))))
+
+(ert-deftest qq-gateway-transport-ready-null-is-not-an-empty-account-array ()
+  (qq-gateway-transport-test-with-state
+    (let ((qq-gateway-transport--state 'authenticating))
+      (should-error
+       (qq-gateway-transport--handle-payload
+        `((kind . "event") (event . "gateway.ready")
+          (data . ((gateway_instance_id . "gateway-1")
+                   (accounts . ,qq-gateway-wire-null)))))
+       :type 'error)
+      (should (eq qq-gateway-transport--state 'authenticating)))))
+
+(ert-deftest qq-gateway-transport-ready-object-is-not-an-account-array ()
+  (qq-gateway-transport-test-with-state
+    (let ((qq-gateway-transport--state 'authenticating))
+      (dolist (object '(nil ((field . "object"))))
+        (should-error
+         (qq-gateway-transport--handle-payload
+          `((kind . "event") (event . "gateway.ready")
+            (data . ((gateway_instance_id . "gateway-1")
+                     (accounts . ,object)))))
+         :type 'error))
+      (should (eq qq-gateway-transport--state 'authenticating)))))
 
 (ert-deftest qq-gateway-transport-ready-instance-mismatch-reconnects ()
   (qq-gateway-transport-test-with-state
@@ -255,7 +369,7 @@
                (qq-gateway-transport--handle-payload
                '((kind . "event") (event . "gateway.ready")
                   (data . ((gateway_instance_id . "different")
-                           (accounts)))))
+                           (accounts . [])))))
                "not rejected")
            (error (error-message-string error-data))))
         (should reconnect)))))

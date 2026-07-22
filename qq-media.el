@@ -58,7 +58,10 @@
   "Callbacks waiting for the shared favorite-face refresh.")
 
 (defvar qq-media--custom-face-refresh-owner nil
-  "Owner plist for the current favorite-face refresh, or nil.")
+  "Owner plist for the current favorite-face refresh, or nil.
+
+The plist records the account `:generation', current page `:request', and
+the adopted transport `:token'.")
 
 (defvar qq-media--custom-face-completion-pairs nil
   "Active `(LABEL . FACE)' pairs for favorite-face `completing-read'.")
@@ -73,6 +76,22 @@
   (and (eq owner qq-media--custom-face-refresh-owner)
        (qq-media--custom-face-owner-generation-current-p owner)))
 
+(defun qq-media--custom-face-request-current-p (owner request)
+  "Return non-nil when REQUEST is OWNER's current favorite-face page."
+  (and (qq-media--custom-face-owner-current-p owner)
+       (eq request (plist-get owner :request))))
+
+(defun qq-media--cancel-custom-face-request (token)
+  "Cancel favorite-face request TOKEN, isolating cancellation failures."
+  (when token
+    (condition-case err
+        (qq-api-cancel-request token)
+      (error
+       (message "qq: favorite-face request cancellation failed: %s"
+                (error-message-string err)))
+      (quit
+       (message "qq: favorite-face request cancellation was interrupted")))))
+
 (defun qq-media--revoke-custom-face-work ()
   "Revoke favorite-face callbacks and cancel their transport request."
   ;; Invalidate callback ownership before cancellation.  Some transports run
@@ -85,14 +104,7 @@
           qq-media--custom-faces nil
           qq-media--custom-faces-fetched-at nil
           qq-media--custom-face-completion-pairs nil)
-    (when token
-      (condition-case err
-          (qq-api-cancel-request token)
-        (error
-         (message "qq: favorite-face request cancellation failed: %s"
-                  (error-message-string err)))
-        (quit
-         (message "qq: favorite-face request cancellation was interrupted"))))))
+    (qq-media--cancel-custom-face-request token)))
 
 (defun qq-media-clear-cache ()
   "Clear all account-owned media caches and asynchronous work."
@@ -408,8 +420,8 @@ and ephemeral filesystem path retained by the private player state."
     (if (not (and entry
                   (equal qq-media--native-record-current-id media-id)
                   (eq (plist-get entry :status) 'preparing)
-                  (equal (plist-get entry :account-owner)
-                         (qq-gateway-current-account-owner))))
+                  (equal (plist-get entry :account-id)
+                         (qq-gateway-current-account-id))))
         (qq-media--close-native-record-access
          (alist-get 'access_id (alist-get 'access result)))
       (qq-media--start-native-record-player media-id result))))
@@ -471,22 +483,22 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
                   (not (equal qq-media--native-record-current-id media-id)))
          (qq-media--dispose-native-record-entry
           qq-media--native-record-current-id 'stopped))
-       (let* ((account-owner (qq-gateway-current-account-owner))
+       (let* ((account-id (qq-gateway-current-account-id))
               (owner-handle
-               (and account-owner owner
+               (and account-id owner
                     (appkit-register-handle
                      owner 'function
                      (apply-partially
                       #'qq-media--dispose-native-record-entry
                       media-id 'stopped))))
               (next (list :status 'preparing
-                          :account-owner account-owner
+                          :account-id account-id
                           :owner-handle owner-handle
                           :operation nil
                           :process nil
                           :access-id nil
                           :error nil)))
-         (unless account-owner
+         (unless account-id
            (user-error "qq: Select an online account before playing a record"))
          (puthash media-id next qq-media--native-record-playbacks)
          (setq qq-media--native-record-current-id media-id)
@@ -1045,7 +1057,7 @@ states never probe a second interface such as get_file."
 
 (defun qq-media--native-record-methods-ready-p ()
   "Return non-nil when native record playback can start for this account."
-  (and (qq-gateway-current-account-owner)
+  (and (qq-gateway-current-account-id)
        (qq-gateway-transport-ready-p)
        (cl-every #'qq-gateway--method-available-p
                  qq-media--native-record-required-methods)))
@@ -1099,7 +1111,7 @@ states never probe a second interface such as get_file."
                         (or problem-message "materialization failed")
                         68 nil nil t)))
               ((not player-ready) "Player unavailable")
-              ((not (qq-gateway-current-account-owner)) "Select an account")
+              ((not (qq-gateway-current-account-id)) "Select an account")
               ((not methods-ready) "Playback unavailable")
               (t "Remote voice"))))))
     (list :open (and open t)
@@ -2073,48 +2085,62 @@ CALLBACK, ERRBACK, and REQUESTED-COUNT have the same meaning as in
 `qq-media-refresh-custom-faces'.  Full responses continue recursively under
 the exact same owner, so a reset invalidates every page in the chain."
   (when (qq-media--custom-face-owner-current-p owner)
-    (let ((request
-           (qq-api-fetch-custom-face-info
-            (lambda (data)
-              (when (qq-media--custom-face-owner-current-p owner)
-                (let* ((faces (qq-media--normalize-custom-face-list data))
-                       (n (length faces))
-                       (max-count
-                        (max requested-count
-                             qq-media-custom-face-count-max)))
-                  (if (and (>= n requested-count)
-                           (< requested-count max-count))
-                      (qq-media--refresh-custom-faces-page
-                       owner callback errback
-                       (min max-count
-                            (max (* requested-count 2)
-                                 (1+ requested-count))))
-                    (setq qq-media--custom-faces faces
-                          qq-media--custom-faces-fetched-at (float-time))
-                    (when (and (>= n requested-count)
-                               (>= requested-count max-count))
-                      (message
-                       "qq: favorite faces may be truncated (%d returned, count max %d)"
-                       n max-count))
-                    (unwind-protect
-                        (when callback
-                          (funcall callback faces))
-                      ;; Shared waiter callbacks clear OWNER themselves.  A
-                      ;; direct refresh still needs a terminal owner boundary.
-                      (when (qq-media--custom-face-owner-current-p owner)
-                        (setq qq-media--custom-face-refresh-owner nil)))))))
-            (lambda (response reason)
-              (when (qq-media--custom-face-owner-current-p owner)
-                (unwind-protect
-                    (when errback
-                      (funcall errback response reason))
-                  (when (qq-media--custom-face-owner-current-p owner)
-                    (setq qq-media--custom-face-refresh-owner nil)))))
-            requested-count)))
-      ;; Synchronous transports may already have completed and retired OWNER.
-      (when (qq-media--custom-face-owner-current-p owner)
-        (setf (plist-get owner :token) request))
-      request)))
+    (let ((request-identity (list 'favorite-face-page requested-count))
+          request-token)
+      ;; Publish page ownership before dispatch.  A synchronous full-page
+      ;; response may recursively publish the next page before this dispatch
+      ;; returns its token.
+      (setf (plist-get owner :request) request-identity
+            (plist-get owner :token) nil)
+      (setq request-token
+            (qq-api-fetch-custom-face-info
+             (lambda (data)
+               (when (qq-media--custom-face-request-current-p
+                      owner request-identity)
+                 (let* ((faces (qq-media--normalize-custom-face-list data))
+                        (n (length faces))
+                        (max-count
+                         (max requested-count
+                              qq-media-custom-face-count-max)))
+                   (if (and (>= n requested-count)
+                            (< requested-count max-count))
+                       (qq-media--refresh-custom-faces-page
+                        owner callback errback
+                        (min max-count
+                             (max (* requested-count 2)
+                                  (1+ requested-count))))
+                     (setq qq-media--custom-faces faces
+                           qq-media--custom-faces-fetched-at (float-time))
+                     (when (and (>= n requested-count)
+                                (>= requested-count max-count))
+                       (message
+                        "qq: favorite faces may be truncated (%d returned, count max %d)"
+                        n max-count))
+                     (unwind-protect
+                         (when callback
+                           (funcall callback faces))
+                       ;; Shared waiter callbacks clear OWNER themselves.  A
+                       ;; direct refresh still needs a terminal page boundary.
+                       (when (qq-media--custom-face-request-current-p
+                              owner request-identity)
+                         (setq qq-media--custom-face-refresh-owner nil)))))))
+             (lambda (response reason)
+               (when (qq-media--custom-face-request-current-p
+                      owner request-identity)
+                 (unwind-protect
+                     (when errback
+                       (funcall errback response reason))
+                   (when (qq-media--custom-face-request-current-p
+                          owner request-identity)
+                     (setq qq-media--custom-face-refresh-owner nil)))))
+             requested-count))
+      (if (qq-media--custom-face-request-current-p owner request-identity)
+          (setf (plist-get owner :token) request-token)
+        ;; The dispatch synchronously settled, advanced, or was reset.  Its
+        ;; returned token must not replace the page that now owns the chain.
+        (qq-media--cancel-custom-face-request request-token))
+      (and (qq-media--custom-face-owner-current-p owner)
+           (plist-get owner :token)))))
 
 (defun qq-media-refresh-custom-faces (&optional callback errback count)
   "Fetch favorite custom faces from NapCat and cache them.
@@ -2131,6 +2157,7 @@ by `qq-media-custom-face-count-max') so large favorites libraries are not
 silently truncated at 96/page-size."
   (let ((owner (or qq-media--custom-face-refresh-owner
                    (list :generation qq-media--account-generation
+                         :request nil
                          :token nil))))
     (unless qq-media--custom-face-refresh-owner
       (setq qq-media--custom-face-refresh-owner owner))
@@ -2188,18 +2215,15 @@ cache was already loaded."
     (push (cons callback errback) qq-media--custom-face-waiters)
     (unless qq-media--custom-face-refresh-owner
       (let ((owner (list :generation qq-media--account-generation
+                         :request nil
                          :token nil)))
         (setq qq-media--custom-face-refresh-owner owner)
         (condition-case err
-            (let ((token
-                   (qq-media-refresh-custom-faces
-                    (apply-partially
-                     #'qq-media--finish-custom-face-waiters owner)
-                    (apply-partially
-                     #'qq-media--fail-custom-face-waiters owner))))
-              ;; Test transports may complete synchronously and clear OWNER.
-              (when (eq qq-media--custom-face-refresh-owner owner)
-                (setf (plist-get owner :token) token)))
+            (qq-media-refresh-custom-faces
+             (apply-partially
+              #'qq-media--finish-custom-face-waiters owner)
+             (apply-partially
+              #'qq-media--fail-custom-face-waiters owner))
           (error
            (when (qq-media--custom-face-owner-current-p owner)
              (qq-media--fail-custom-face-waiters

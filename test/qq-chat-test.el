@@ -37,6 +37,12 @@
                 (appkit-view-invalidations view)))
       (ert-fail "chat invalidations did not settle"))))
 
+(defun qq-chat-test-native-request (token)
+  "Return an active native request fixture carrying opaque TOKEN."
+  (let ((request (qq-native-request-create)))
+    (setf (qq-native-request-token request) token)
+    request))
+
 (defun qq-chat-test--search-result (id sequence time &optional preview)
   "Return one strict group search result."
   `((chat . ((kind . "group") (group_id . "20001")))
@@ -2967,14 +2973,13 @@
                       (message-seq . "9007199254740999")
                       (native-random . 7)
                       (gateway-account-id . "slot-a")
-                      (gateway-generation . "7")
                       (essence-p . t))))
        (with-temp-buffer
          (qq-chat-mode)
          (setq qq-chat--session-key "group:20001")
          (let (called)
-           (cl-letf (((symbol-function 'qq-gateway-current-account-owner)
-                      (lambda () '("slot-a" . "7")))
+           (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+                      (lambda () "slot-a"))
                      ((symbol-function 'qq-native-set-message-essence)
                       (lambda (selected set &rest _)
                         (setq called (list selected set)))))
@@ -2992,14 +2997,13 @@
      (with-temp-buffer
        (qq-chat-mode)
        (setq qq-chat--session-key "group:20001")
-       (cl-letf (((symbol-function 'qq-gateway-current-account-owner)
-                  (lambda () '("slot-a" . "7"))))
+       (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+                  (lambda () "slot-a")))
          (let ((message
                 '((server-id . "9007199254741004001")
                   (session-key . "group:20001")
                   (message-seq . "9007199254740999")
-                  (gateway-account-id . "slot-a")
-                  (gateway-generation . "7"))))
+                  (gateway-account-id . "slot-a"))))
            (should-not (qq-chat--message-essence-capable-p message))
            (setf (alist-get 'native-random message) 4294967295)
            (should (qq-chat--message-essence-capable-p message))))))))
@@ -3014,14 +3018,13 @@
      (let ((message '((server-id . "9007199254741004001")
                       (session-key . "group:20001")
                       (message-seq . "9007199254740999")
-                      (gateway-account-id . "slot-a")
-                      (gateway-generation . "7")))
+                      (gateway-account-id . "slot-a")))
            calls)
        (with-temp-buffer
          (qq-chat-mode)
          (setq qq-chat--session-key "group:20001")
-         (cl-letf (((symbol-function 'qq-gateway-current-account-owner)
-                    (lambda () '("slot-a" . "7")))
+         (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+                    (lambda () "slot-a"))
                    ((symbol-function 'qq-native-set-message-todo)
                     (lambda (selected operation &rest _)
                       (push (list selected operation) calls))))
@@ -3032,7 +3035,7 @@
           (equal (mapcar #'cadr (nreverse calls))
                  '(set complete cancel))))))))
 
-(ert-deftest qq-chat-native-todo-capability-requires-sequence-and-owner ()
+(ert-deftest qq-chat-native-todo-capability-requires-sequence-and-account ()
   (qq-chat-test-with-reset
    (progn
      (qq-state-upsert-session
@@ -3042,18 +3045,84 @@
      (with-temp-buffer
        (qq-chat-mode)
        (setq qq-chat--session-key "group:20001")
-       (cl-letf (((symbol-function 'qq-gateway-current-account-owner)
-                  (lambda () '("slot-a" . "7"))))
+       (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+                  (lambda () "slot-a")))
          (let ((message
                 '((server-id . "9007199254741004001")
                   (session-key . "group:20001")
-                  (gateway-account-id . "slot-a")
-                  (gateway-generation . "7"))))
+                  (gateway-account-id . "slot-a"))))
            (should-not (qq-chat--message-todo-capable-p message))
            (setf (alist-get 'message-seq message) "9007199254740999")
            (should (qq-chat--message-todo-capable-p message))
-           (setf (alist-get 'gateway-generation message) "8")
+           (setf (alist-get 'gateway-account-id message) "slot-b")
            (should-not (qq-chat--message-todo-capable-p message))))))))
+
+(ert-deftest qq-chat-cached-message-remains-actionable-after-same-slot-restart ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001"))
+    nil)
+   ;; MESSAGE was cached before the native runtime restarted.  Its stable
+   ;; account, conversation, and message identities remain authoritative.
+   (let ((message '((server-id . "9007199254741004001")
+                    (session-key . "group:20001")
+                    (message-seq . "9007199254740999")
+                    (native-random . 7)
+                    (gateway-account-id . "slot-a")))
+         calls)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "group:20001")
+       (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+                  (lambda () "slot-a"))
+                 ((symbol-function 'qq-chat--message-at-point)
+                  (lambda () message))
+                 ((symbol-function 'qq-chat--set-pending-reply)
+                  (lambda (selected)
+                    (should (eq selected message))
+                    (push 'reply calls)))
+                 ((symbol-function 'qq-native-message-read-capable-p)
+                  (lambda (selected) (eq selected message)))
+                 ((symbol-function 'qq-native-mark-message-read)
+                  (lambda (selected &optional callback _errback)
+                    (should (eq selected message))
+                    (push 'read calls)
+                    (when callback
+                      (funcall
+                       callback
+                       '((read_through_message_id
+                          . "9007199254741004001"))))))
+                 ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+                 ((symbol-function 'qq-native-recall-message)
+                  (lambda (selected &rest _)
+                    (should (eq selected message))
+                    (push 'recall calls)))
+                 ((symbol-function 'qq-native-set-message-reaction)
+                  (lambda (selected emoji-id set &rest _)
+                    (should (eq selected message))
+                    (should (equal emoji-id "178"))
+                    (should (eq set t))
+                    (push 'reaction calls)))
+                 ((symbol-function 'qq-native-set-message-essence)
+                  (lambda (selected set &rest _)
+                    (should (eq selected message))
+                    (should (eq set t))
+                    (push 'essence calls)))
+                 ((symbol-function 'qq-native-set-message-todo)
+                  (lambda (selected operation &rest _)
+                    (should (eq selected message))
+                    (should (eq operation 'set))
+                    (push 'todo calls))))
+         (qq-chat-reply-to-message)
+         (qq-chat--mark-message-viewed message t)
+         (qq-chat--delete-message-internal message)
+         (qq-chat-react-to-message "178" message)
+         (qq-chat-toggle-message-essence message)
+         (qq-chat-set-message-todo message))
+       (should (= (length calls) 6))
+       (dolist (operation '(reply read recall reaction essence todo))
+         (should (memq operation calls)))))))
 
 (ert-deftest qq-chat-filter-snapshot-builds-reference-without-caching-message ()
   (qq-chat-test-with-reset
@@ -4200,7 +4269,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
             (should-not (eq (cadar calls) view))
 
             ;; Replacing the runtime with an equal kind/id app must not alter an
-            ;; action rendered by the preceding account generation.
+            ;; action rendered by the preceding account app instance.
             (appkit-stop-app old-app)
             (setq replacement
                   (appkit-start-app 'qq :id 'default :shutdown #'ignore)
@@ -5027,15 +5096,15 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
       "group:20001"
       `(((server-id . ,first) (session-key . "group:20001")
          (message-seq . "1") (group-id . "20001")
-         (gateway-account-id . "slot-a") (gateway-generation . "7")
+         (gateway-account-id . "slot-a")
          (time . 1) (raw-message . "first"))
         ((server-id . ,second) (session-key . "group:20001")
          (message-seq . "2") (group-id . "20001")
-         (gateway-account-id . "slot-a") (gateway-generation . "7")
+         (gateway-account-id . "slot-a")
          (time . 2) (raw-message . "second"))
         ((server-id . ,third) (session-key . "group:20001")
          (message-seq . "3") (group-id . "20001")
-         (gateway-account-id . "slot-a") (gateway-generation . "7")
+         (gateway-account-id . "slot-a")
          (time . 3) (raw-message . "third")))
       qq-state--messages-by-session)
      (with-temp-buffer
@@ -5053,7 +5122,12 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                            (list (list (alist-get 'session-key message)
                                        (alist-get 'server-id message)))))
                     (when callback
-                      (funcall callback '((read_through_sequence . "1"))))
+                      (funcall
+                       callback
+                       `((read_through_message_id
+                          . ,(alist-get 'server-id message))
+                         (read_through_sequence
+                          . ,(alist-get 'message-seq message)))))
                     "read-request")))
          ;; An already-read row does not move the native boundary backward.
          (goto-char (point-min))
@@ -5160,7 +5234,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                        :requested-end-sequence "100"
                        :batch-message-ids (,oldest ,latest)
                        :message-count 2 :added-count 2))
-                    (qq-native-request-create :token "latest-native")))
+                    (qq-chat-test-native-request "latest-native")))
                  ((symbol-function 'qq-chat--ensure-view) #'ignore)
                  ((symbol-function 'qq-chat--sync-timeline) #'ignore)
                  ((symbol-function 'qq-chat--update-frame) #'ignore))
@@ -6193,8 +6267,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                   (lambda (_session start end success
                            &optional _failure _properties)
                     (setq callback success)
-                    (qq-native-request-create
-                     :token (format "older:%s:%s" start end)))))
+                    (qq-chat-test-native-request
+                     (format "older:%s:%s" start end)))))
          (qq-chat-load-older-messages t))
        (should (appkit-chat-history-loading-p))
        (setq old-view (appkit-current-view))
@@ -6305,7 +6379,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                  ((symbol-function 'qq-native-fetch-latest-history)
                   (lambda (_session success &optional _failure _count)
                     (setq latest-callback success)
-                    (qq-native-request-create :token "latest-token"))))
+                    (qq-chat-test-native-request "latest-token"))))
          (qq-chat--load-initial-history (current-buffer) "group:20001")
          (should (equal
                   (qq-native-request-token qq-chat--initial-history-request)

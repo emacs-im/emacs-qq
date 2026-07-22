@@ -15,6 +15,7 @@
 (require 'subr-x)
 (require 'websocket)
 (require 'qq-customize)
+(require 'qq-gateway-wire)
 
 (defconst qq-gateway-transport-protocol-version 2
   "Native Gateway protocol version implemented by this client.")
@@ -50,15 +51,16 @@
 
 (defun qq-gateway-transport-gateway-instance-id ()
   "Return the current authenticated Gateway instance ID, or nil."
-  qq-gateway-transport--gateway-instance-id)
+  (and qq-gateway-transport--gateway-instance-id
+       (copy-sequence qq-gateway-transport--gateway-instance-id)))
 
 (defun qq-gateway-transport-capabilities ()
   "Return a copy of capabilities advertised by the current Gateway."
-  (copy-sequence qq-gateway-transport--capabilities))
+  (qq-gateway-value-copy qq-gateway-transport--capabilities))
 
 (defun qq-gateway-transport-ready-accounts ()
   "Return a copy of the accounts in the latest `gateway.ready' snapshot."
-  (copy-tree qq-gateway-transport--ready-accounts))
+  (qq-gateway-value-copy qq-gateway-transport--ready-accounts))
 
 (defun qq-gateway-transport-running-p ()
   "Return non-nil while the native service connection is active."
@@ -79,7 +81,7 @@
    #'run-hook-wrapped hook
    (lambda (function &rest hook-arguments)
      (condition-case error-data
-         (apply function hook-arguments)
+         (apply function (mapcar #'qq-gateway-value-copy hook-arguments))
        (error
         (message "qq: Gateway hook %s failed in %S: %s"
                  hook function (error-message-string error-data))))
@@ -106,12 +108,8 @@
     (json-encode object)))
 
 (defun qq-gateway-transport--json-decode (text)
-  "Decode native service JSON TEXT into alists and lists."
-  (json-parse-string text
-                     :object-type 'alist
-                     :array-type 'list
-                     :false-object :false
-                     :null-object nil))
+  "Decode native service JSON TEXT without collapsing wire value kinds."
+  (qq-gateway-wire-decode text))
 
 (defun qq-gateway-transport--frame-text (frame)
   "Return UTF-8 text carried by websocket FRAME, or nil."
@@ -122,16 +120,7 @@
 
 (defun qq-gateway-transport--exact-object-keys-p (object keys)
   "Return non-nil when alist OBJECT has exactly symbol KEYS."
-  (and (listp object)
-       (cl-every (lambda (entry)
-                   (and (consp entry) (symbolp (car entry))))
-                 object)
-       (equal (sort (mapcar #'car object)
-                    (lambda (left right)
-                      (string-lessp (symbol-name left) (symbol-name right))))
-              (sort (copy-sequence keys)
-                    (lambda (left right)
-                      (string-lessp (symbol-name left) (symbol-name right)))))))
+  (qq-gateway-wire-exact-object-keys-p object keys))
 
 (defun qq-gateway-transport--read-auth-token ()
   "Read and validate `qq-native-auth-token-file'."
@@ -352,23 +341,27 @@ FORMAT-STRING and ARGUMENTS describe the violation."
 
 (defun qq-gateway-transport--dispatch-error (payload)
   "Dispatch a validated error PAYLOAD."
-  (let* ((id (alist-get 'id payload nil nil #'eq))
-         (body (alist-get 'error payload nil nil #'eq))
-         (code (and (listp body) (alist-get 'code body)))
-         (reason (and (listp body) (alist-get 'message body))))
+  (let* ((wire-id (alist-get 'id payload nil nil #'eq))
+         (id (if (qq-gateway-wire-null-p wire-id) nil wire-id))
+         (wire-body (alist-get 'error payload nil nil #'eq))
+         (code (and (qq-gateway-wire-object-p wire-body)
+                    (alist-get 'code wire-body)))
+         (reason (and (qq-gateway-wire-object-p wire-body)
+                      (alist-get 'message wire-body))))
     (unless (and (or (null id)
                      (and (stringp id) (not (string-empty-p id))))
                  (qq-gateway-transport--exact-object-keys-p
-                  body '(code message))
+                  wire-body '(code message))
                  (stringp code) (not (string-empty-p code))
                  (stringp reason) (not (string-empty-p reason)))
       (error "Gateway error envelope is malformed"))
-    (if id
-        (qq-gateway-transport--complete id 'error body reason)
-      (progn
-        (qq-gateway-transport--run-hook
-         'qq-gateway-transport-protocol-error-hook body)
-        (message "qq: Gateway protocol error %s: %s" code reason)))))
+    (let ((body (qq-gateway-wire-domain-copy wire-body)))
+      (if id
+          (qq-gateway-transport--complete id 'error body reason)
+        (progn
+          (qq-gateway-transport--run-hook
+           'qq-gateway-transport-protocol-error-hook body)
+          (message "qq: Gateway protocol error %s: %s" code reason))))))
 
 (defun qq-gateway-transport--dispatch-event (payload)
   "Dispatch a validated event PAYLOAD."
@@ -377,28 +370,33 @@ FORMAT-STRING and ARGUMENTS describe the violation."
     (unless (and (stringp event) (not (string-empty-p event)))
       (error "Gateway event name must be a non-empty string"))
     (when (equal event "gateway.ready")
-      (unless (and (listp data)
-                   (stringp (alist-get 'gateway_instance_id data))
-                   (listp (alist-get 'accounts data)))
+      (unless (and (qq-gateway-transport--exact-object-keys-p
+                    data '(gateway_instance_id accounts))
+                   (stringp (alist-get 'gateway_instance_id data)))
         (error "Gateway ready data is malformed"))
-      (unless (and qq-gateway-transport--hello-instance-id
-                   (equal qq-gateway-transport--hello-instance-id
-                          (alist-get 'gateway_instance_id data)))
-        (error "Gateway ready instance does not match hello response"))
-      (setq qq-gateway-transport--gateway-instance-id
-            (alist-get 'gateway_instance_id data)
-            qq-gateway-transport--ready-accounts
-            (copy-tree (alist-get 'accounts data))
-            qq-gateway-transport--reconnect-attempt 0)
-      (qq-gateway-transport--clear-ready-timer)
-      (qq-gateway-transport--set-state 'ready)
-      (message "qq: native service ready"))
+      (let ((domain-accounts
+             (qq-gateway-wire-array
+              (alist-get 'accounts data nil nil #'eq)
+              "Gateway ready accounts")))
+        (unless (and qq-gateway-transport--hello-instance-id
+                     (equal qq-gateway-transport--hello-instance-id
+                            (alist-get 'gateway_instance_id data)))
+          (error "Gateway ready instance does not match hello response"))
+        (setq data (qq-gateway-value-copy data))
+        (setq qq-gateway-transport--gateway-instance-id
+              (copy-sequence (alist-get 'gateway_instance_id data))
+              qq-gateway-transport--ready-accounts
+              (mapcar #'qq-gateway-wire-domain-copy domain-accounts)
+              qq-gateway-transport--reconnect-attempt 0)
+        (qq-gateway-transport--clear-ready-timer)
+        (qq-gateway-transport--set-state 'ready)
+        (message "qq: native service ready")))
     (qq-gateway-transport--run-hook
      'qq-gateway-transport-event-hook event data)))
 
 (defun qq-gateway-transport--handle-payload (payload)
   "Validate and dispatch one decoded native service PAYLOAD."
-  (unless (listp payload)
+  (unless (qq-gateway-wire-object-p payload)
     (error "Gateway envelope must be an object"))
   (pcase (alist-get 'kind payload)
     ("response"
@@ -498,19 +496,35 @@ machinery used only for the initial `gateway.hello' request."
              (client_name . ,qq-native-client-name)
              (auth_token . ,token))
            (lambda (result)
-             (if (and (listp result)
-                      (equal (alist-get 'protocol_version result)
-                             qq-gateway-transport-protocol-version)
-                      (stringp (alist-get 'gateway_instance_id result))
-                      (listp (alist-get 'capabilities result)))
-                 (progn
-                   (setq qq-gateway-transport--hello-instance-id
-                         (alist-get 'gateway_instance_id result)
-                         qq-gateway-transport--capabilities
-                         (copy-sequence (alist-get 'capabilities result)))
-                   (qq-gateway-transport--start-ready-timer))
-               (qq-gateway-transport--protocol-violation
-                "Malformed gateway.hello result")))
+             (condition-case nil
+                 (let ((capabilities
+                        (qq-gateway-wire-array
+                         (and (qq-gateway-wire-object-p result)
+                              (alist-get 'capabilities result nil nil #'eq))
+                         "Gateway capabilities")))
+                   (if (and (equal (alist-get 'protocol_version result)
+                                   qq-gateway-transport-protocol-version)
+                            (qq-gateway-transport--exact-object-keys-p
+                             result
+                             '(protocol_version gateway_instance_id
+                               capabilities))
+                            (stringp (alist-get 'gateway_instance_id result))
+                            (cl-every (lambda (capability)
+                                        (and (stringp capability)
+                                             (not (string-empty-p capability))))
+                                      capabilities))
+                       (progn
+                         (setq qq-gateway-transport--hello-instance-id
+                               (copy-sequence
+                                (alist-get 'gateway_instance_id result))
+                               qq-gateway-transport--capabilities
+                               (qq-gateway-value-copy capabilities))
+                         (qq-gateway-transport--start-ready-timer))
+                     (qq-gateway-transport--protocol-violation
+                      "Malformed gateway.hello result")))
+               (error
+                (qq-gateway-transport--protocol-violation
+                 "Malformed gateway.hello result"))))
            #'qq-gateway-transport--hello-failed
            t)
         (error "Could not send gateway.hello"))
@@ -588,7 +602,7 @@ machinery used only for the initial `gateway.hello' request."
                 (error-message-string error-data))))))
 
 (defun qq-gateway-transport-start ()
-  "Start the native service websocket without starting an account runtime."
+  "Start the native service websocket without starting a Native Session."
   (interactive)
   (setq qq-gateway-transport--stopping nil)
   (unless (timerp qq-gateway-transport--reconnect-timer)

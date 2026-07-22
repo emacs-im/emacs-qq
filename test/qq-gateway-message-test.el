@@ -14,15 +14,13 @@
     "message.mark_read")
   "Native Gateway capabilities exercised by message tests.")
 
-(defun qq-gateway-message-test-account
-    (&optional account-id generation uin uid)
-  "Return an online account for ACCOUNT-ID, GENERATION, UIN, and UID."
+(defun qq-gateway-message-test-account (&optional account-id uin uid)
+  "Return an online account for ACCOUNT-ID, UIN, and UID."
   `((account_id . ,(or account-id "slot-a"))
     (label . "Primary")
     (phase . "online")
     (uin . ,(or uin "10002"))
     (uid . ,(or uid "u_self"))
-    (generation . ,(or generation "7"))
     (challenge)
     (problem)))
 
@@ -30,13 +28,21 @@
   "Return a native text segment containing TEXT."
   `((kind . "text") (payload . ((text . ,text)))))
 
+(defun qq-gateway-message-test-wire-segment (segment)
+  "Return readable SEGMENT in strict decoded-wire array form."
+  (let ((copy (copy-tree segment)))
+    (when-let* ((payload (alist-get 'payload copy))
+                (entry (assq 'native_keys payload))
+                ((listp (cdr entry))))
+      (setcdr entry (vconcat (cdr entry))))
+    copy))
+
 (defun qq-gateway-message-test-ready-image (&optional attachment-id)
   "Return one ready group-image attachment fixture."
   `((attachment_id
      . ,(or attachment-id "att-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"))
     (resource_id . "res-image-wire")
     (account_id . "slot-a")
-    (generation . "7")
     (conversation . ((kind . "group") (group_uin . "8209413637")))
     (use . ((kind . "image") (summary . "[图片]") (sub_type . 0)))
     (phase . "ready")
@@ -53,7 +59,6 @@
      . ,(or attachment-id "att-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeef"))
     (resource_id . "res-record-wire")
     (account_id . "slot-a")
-    (generation . "7")
     (conversation . ((kind . "group") (group_uin . "8209413637")))
     (use . ((kind . "record")))
     (phase . "ready")
@@ -66,7 +71,7 @@
 
 (cl-defun qq-gateway-message-test-event
     (&key
-     (account-id "slot-a") (generation "7")
+     (account-id "slot-a")
      (message-id "7348923749823749823")
      (sent-at 1784700000)
      (sender '((uin . "10001") (uid . "u_peer")))
@@ -78,7 +83,6 @@
      (segments '(((kind . "text") (payload . ((text . "hello")))))))
   "Return one closed native Gateway message event payload."
   `((account_id . ,account-id)
-    (generation . ,generation)
     (message
      . ((message_id . ,message-id)
         (sent_at . ,sent-at)
@@ -90,18 +94,19 @@
         (random . ,random)
         (message_type . ,message-type)
         (sub_type . ,sub-type)
-        (segments . ,(copy-tree segments))))))
+        (segments
+         . ,(vconcat (mapcar #'qq-gateway-message-test-wire-segment
+                             (append segments nil))))))))
 
 (cl-defun qq-gateway-message-test-recall
     (&key
-     (account-id "slot-a") (generation "7")
+     (account-id "slot-a")
      (conversation '((kind . "group") (group_uin . "8209413637")))
      (target '((kind . "sequence") (sequence . "9007199254740999")))
      (author-uid "u_peer") (operator-uid "u_admin")
      (tip "message recalled"))
   "Return one closed native Gateway recall event payload."
   `((account_id . ,account-id)
-    (generation . ,generation)
     (recall
      . ((conversation . ,(copy-tree conversation))
         (target . ,(copy-tree target))
@@ -111,14 +116,13 @@
 
 (cl-defun qq-gateway-message-test-poke
     (&key
-     (account-id "slot-a") (generation "7")
+     (account-id "slot-a")
      (message-id "7348923749823749823") (sent-at 1784700000)
      (sequence "9007199254740999") (group-uin "8209413637")
      (actor-uin "10002") (target-uin "9007199254741001")
      (tips-sequence "9007199254741007") (valid-before 1784700120))
   "Return one authoritative native Gateway group poke event payload."
   `((account_id . ,account-id)
-    (generation . ,generation)
     (poke
      . ((message_id . ,message-id)
         (sent_at . ,sent-at)
@@ -134,13 +138,12 @@
 
 (cl-defun qq-gateway-message-test-reaction
     (&key
-     (account-id "slot-a") (generation "7")
+     (account-id "slot-a")
      (group-uin "8209413637") (sequence "9007199254740999")
      (operator-uid "u_member") (operator-uin "10001")
      (emoji-id "178") (emoji-type "1") (is-add t) (count 3))
   "Return one authoritative native Gateway group reaction event payload."
   `((account_id . ,account-id)
-    (generation . ,generation)
     (reaction
      . ((conversation . ((kind . "group") (group_uin . ,group-uin)))
         (sequence . ,sequence)
@@ -153,14 +156,13 @@
 
 (cl-defun qq-gateway-message-test-essence
     (&key
-     (account-id "slot-a") (generation "7")
+     (account-id "slot-a")
      (group-uin "8209413637") (sequence "9007199254740999")
      (random 7) (is-set t) (sender-uin "10001")
      (operator-uin "10002") (changed-at 1784700000)
      (operator-nickname "Moderator") (sender-nickname "Alice"))
   "Return one authoritative native Gateway group essence event payload."
   `((account_id . ,account-id)
-    (generation . ,generation)
     (essence
      . ((conversation . ((kind . "group") (group_uin . ,group-uin)))
         (sequence . ,sequence)
@@ -182,13 +184,12 @@
 
 START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
   `((account_id . "slot-a")
-    (generation . "7")
     (requested_start_sequence . ,start-sequence)
     (requested_end_sequence . ,end-sequence)
     (response_start_sequence . ,response-start)
     (response_end_sequence . ,response-end)
     (unsupported_message_count . ,unsupported-count)
-    (messages . ,(copy-tree messages))))
+    (messages . ,(vconcat (mapcar #'copy-tree (append messages nil))))))
 
 (defmacro qq-gateway-message-test-with-state (&rest body)
   "Run BODY with one selected account and isolated message projection state."
@@ -247,6 +248,68 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
       (should-error
        (qq-gateway-message--validate-message-data numeric)))))
 
+(ert-deftest qq-gateway-message-wire-arrays-normalize-at-their-schema-level ()
+  (let* ((event
+         (qq-gateway-message-test-event
+           :segments nil))
+         (message (alist-get 'message event)))
+    ;; Build the vector separately to keep the fixture readable.
+    (setf (alist-get 'segments message)
+          [((kind . "unsupported")
+            (payload . ((native_keys . ["ark" "xml"])
+                        (summary . "unsupported"))))])
+    (let* ((validated
+            (qq-gateway-message--validate-message-data event))
+           (validated-message (alist-get 'message validated))
+           (validated-payload
+            (alist-get 'payload
+                       (car (alist-get 'segments validated-message)))))
+      (should (listp (alist-get 'segments validated-message)))
+      (should (equal (alist-get 'native_keys validated-payload)
+                     '("ark" "xml"))))
+    (setf (alist-get 'native_keys
+                     (alist-get 'payload
+                                (aref (alist-get 'segments message) 0)))
+          qq-gateway-wire-null)
+    (should-error (qq-gateway-message--validate-message-data event)
+                  :type 'error)
+    (setf (alist-get 'segments message) qq-gateway-wire-null)
+    (should-error (qq-gateway-message--validate-message-data event)
+                  :type 'error)))
+
+(ert-deftest qq-gateway-message-validator-owns-nested-strings ()
+  (let* ((text (copy-sequence "mutable"))
+         (event
+          (qq-gateway-message-test-event
+           :segments (list (qq-gateway-message-test-text-segment text))))
+         (validated (qq-gateway-message--validate-message-data event))
+         (validated-text
+          (alist-get
+           'text
+           (alist-get
+            'payload
+            (car (alist-get 'segments (alist-get 'message validated)))))))
+    (aset validated-text 0 ?X)
+    (should (equal text "mutable"))))
+
+(ert-deftest qq-gateway-message-history-requires-wire-array-not-null ()
+  (let* ((message
+          (alist-get 'message (qq-gateway-message-test-event
+                               :sequence "100")))
+         (result (qq-gateway-message-test-history-result nil "100" "100")))
+    (setf (alist-get 'messages result) (vector message))
+    (should
+     (listp
+      (alist-get
+       'messages
+       (qq-gateway-message--validate-history-result
+        result "slot-a" "100" "100"))))
+    (setf (alist-get 'messages result) qq-gateway-wire-null)
+    (should-error
+     (qq-gateway-message--validate-history-result
+      result "slot-a" "100" "100")
+     :type 'error)))
+
 (ert-deftest qq-gateway-message-mark-read-preserves-closed-native-cursors ()
   (qq-gateway-message-test-with-state
     (let* ((private
@@ -255,16 +318,14 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
               (message-seq . "9007199254740999")
               (native-sent-at . 1784700000)
               (peer-uid . "u_peer")
-              (gateway-account-id . "slot-a")
-              (gateway-generation . "7")))
+              (gateway-account-id . "slot-a")))
            (group
             '((session-key . "group:8209413637")
               (server-id . "7348923749823749824")
               (message-seq . "9007199254741000")
               (native-sent-at . 1784700001)
               (group-id . "8209413637")
-              (gateway-account-id . "slot-a")
-              (gateway-generation . "7")))
+              (gateway-account-id . "slot-a")))
            calls receipts)
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                  (lambda () t))
@@ -278,12 +339,13 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                      (funcall
                       callback
                       `((account_id . "slot-a")
-                        (generation . "7")
                         (read_through_message_id
                          . ,(alist-get 'message_id message))
                         (read_through_sequence . ,sequence)
                         (server_read_sequence . ,sequence))))
                    (format "read-%d" (length calls)))))
+        (should (qq-gateway-message-read-capable-p private))
+        (should (qq-gateway-message-read-capable-p group))
         (qq-gateway-message-mark-read
          private (lambda (receipt) (push receipt receipts)))
         (qq-gateway-message-mark-read
@@ -311,6 +373,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                      "9007199254741000"))
       (let ((missing-time (copy-tree private)))
         (setf (alist-get 'native-sent-at missing-time) nil)
+        (should-not (qq-gateway-message-read-capable-p missing-time))
         (should-error (qq-gateway-message-mark-read missing-time)
                       :type 'user-error)))))
 
@@ -318,11 +381,10 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
   (should-error
    (qq-gateway-message--validate-read-receipt
     '((account_id . "slot-a")
-      (generation . "7")
       (read_through_message_id . "7348923749823749823")
       (read_through_sequence . "9007199254740999")
       (server_read_sequence . "9007199254740998"))
-    '("slot-a" . "7")
+    "slot-a"
     "7348923749823749823"
     "9007199254740999")))
 
@@ -367,7 +429,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                        "9007199254741001"))
         (should (= (alist-get 'native-random message) 7))
         (should (equal (alist-get 'gateway-account-id message) "slot-a"))
-        (should (equal (alist-get 'gateway-generation message) "7"))
         (should (equal (alist-get 'sender-name message) "Alice"))
         (should (equal (alist-get 'mention-kinds message) '(at-me)))
         (should (eq (alist-get 'status message) 'received))
@@ -436,21 +497,10 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
       (qq-gateway-message--handle-event
        "message.received"
        (qq-gateway-message-test-event
-        :account-id "slot-b" :generation "11"))
+        :account-id "slot-b"))
       (should (equal (car observed) "message.received"))
       (should (equal (alist-get 'account_id (cadr observed)) "slot-b"))
       (should-not qq-gateway-message--projection-owner)
-      (should-not (qq-state-sessions)))))
-
-(ert-deftest qq-gateway-message-stale-generation-cannot-project ()
-  (qq-gateway-message-test-with-state
-    (let ((events 0))
-      (add-hook 'qq-gateway-message-event-hook
-                (lambda (&rest _) (cl-incf events)))
-      (qq-gateway-message--handle-event
-       "message.received"
-       (qq-gateway-message-test-event :generation "6"))
-      (should (= events 1))
       (should-not (qq-state-sessions)))))
 
 (ert-deftest qq-gateway-message-temp-is-valid-but-not-projected ()
@@ -613,7 +663,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                    (setq sent-method method sent-params params)
                    (funcall callback
                             `((account_id . "slot-a")
-                              (generation . "7")
                               (sent_at . ,now)
                               (server_sequence . "8765432109")
                               (client_sequence . "42001")
@@ -683,7 +732,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                      (setq sent-method method sent-params params)
                      (funcall callback
                               `((account_id . "slot-a")
-                                (generation . "7")
                                 (sent_at . ,now)
                                 (server_sequence . "8765432110")
                                 (client_sequence . "42002")
@@ -749,7 +797,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                    (setq sent-params params)
                    (funcall callback
                             `((account_id . "slot-a")
-                              (generation . "7")
                               (sent_at . ,now)
                               (server_sequence . "8765432111")
                               (client_sequence . "42003")
@@ -788,7 +835,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
          "group:8209413637"
          `(((type . "record")
             (data . ((attachment_id . ,attachment-id)))))
-         '("slot-a" . "7"))
+         "slot-a")
         `(((kind . "record")
            (payload . ((attachment_id . ,attachment-id)))))))
       (should-error
@@ -796,7 +843,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         "group:8209413637"
         `(((type . "image")
            (data . ((attachment_id . ,attachment-id)))))
-        '("slot-a" . "7"))
+        "slot-a")
        :type 'user-error))))
 
 (ert-deftest qq-gateway-message-send-rejects-non-base-face-before-pending ()
@@ -848,7 +895,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                    (setq sent-method method sent-params params)
                    (funcall callback
                             '((account_id . "slot-a")
-                              (generation . "7")
                               (target_uin . "9007199254741001")))
                    "request-poke"))
                 ((symbol-function 'qq-state-apply-poke-notice)
@@ -888,7 +934,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                (lambda (_method _params callback _errback &optional _early)
                  (funcall callback
                           '((account_id . "slot-a")
-                            (generation . "7")
                             (target_uin . "9007199254741001")))
                  "request-poke")))
       (qq-gateway-message-send-poke
@@ -938,7 +983,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                    (setq sent-method method sent-params params)
                    (funcall callback
                             '((account_id . "slot-a")
-                              (generation . "7")
                               (message_id . "7348923749823749823")
                               (sequence . "9007199254740999")
                               (emoji_id . "128077")
@@ -991,7 +1035,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                    (setq sent-method method sent-params params)
                    (funcall callback
                             '((account_id . "slot-a")
-                              (generation . "7")
                               (message_id . "7348923749823749823")
                               (sequence . "9007199254740999")
                               (random . 4277998232)
@@ -1046,7 +1089,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
          (qq-gateway-message-test-essence :is-set :false))
         (funcall response-callback
                  '((account_id . "slot-a")
-                   (generation . "7")
                    (message_id . "7348923749823749823")
                    (sequence . "9007199254740999")
                    (random . 7)
@@ -1075,9 +1117,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                  (lambda (method params callback _errback &optional _early)
                    (push (list method (copy-tree params)) calls)
                    (funcall
-                    callback
+                   callback
                     `((account_id . "slot-a")
-                      (generation . "7")
                       (group_uin . "8209413637")
                       (message_id . "7348923749823749823")
                       (sequence . "9007199254740999")
@@ -1119,10 +1160,9 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                       (nreverse receipts))
               '("set" "complete" "cancel"))))))
 
-(ert-deftest qq-gateway-message-todo-receipt-is-closed-and-generation-owned ()
+(ert-deftest qq-gateway-message-todo-receipt-is-closed-and-account-owned ()
   (let ((receipt
          '((account_id . "slot-a")
-           (generation . "7")
            (group_uin . "8209413637")
            (message_id . "7348923749823749823")
            (sequence . "9007199254740999")
@@ -1130,19 +1170,19 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (should
      (equal
       (qq-gateway-message--validate-todo-receipt
-       receipt '("slot-a" . "7") "8209413637"
+       receipt "slot-a" "8209413637"
        "7348923749823749823" "9007199254740999" "set")
       receipt))
     (let ((stale (copy-tree receipt)))
-      (setf (alist-get 'generation stale) "8")
+      (setf (alist-get 'account_id stale) "slot-b")
       (should-error
        (qq-gateway-message--validate-todo-receipt
-        stale '("slot-a" . "7") "8209413637"
+        stale "slot-a" "8209413637"
         "7348923749823749823" "9007199254740999" "set")))
     (let ((open (append (copy-tree receipt) '((done . t)))))
       (should-error
        (qq-gateway-message--validate-todo-receipt
-        open '("slot-a" . "7") "8209413637"
+        open "slot-a" "8209413637"
         "7348923749823749823" "9007199254740999" "set")))))
 
 (ert-deftest qq-gateway-message-recall-poke-sends-original-gray-tip-metadata ()
@@ -1163,7 +1203,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                    (setq sent-method method sent-params params)
                    (funcall callback
                             '((account_id . "slot-a")
-                              (generation . "7")
                               (message_id . "7348923749823749823")
                               (sequence . "9007199254740999")))
                    "request-poke-recall")))
@@ -1210,7 +1249,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           :random 123))
         (funcall response-callback
                  `((account_id . "slot-a")
-                   (generation . "7")
                    (sent_at . ,now)
                    (server_sequence . "8765432109")
                    (client_sequence . "42001")
@@ -1266,7 +1304,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                    (setq sent-params params)
                    (funcall callback
                             '((account_id . "slot-a")
-                              (generation . "7")
                               (message_id . "7348923749823749823")
                               (sequence . "9007199254740999")))
                    "request-recall")))
@@ -1305,7 +1342,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                    (setq sent-params params)
                    (funcall callback
                             '((account_id . "slot-a")
-                              (generation . "7")
                               (message_id . "7348923749823749823")
                               (sequence . "9007199254740999")))
                    "request-recall")))
@@ -1668,13 +1704,14 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
          (lambda (_body reason) (setq failure reason)))
         (qq-gateway--upsert-account
          (qq-gateway-message-test-account
-          "slot-b" "11" "10003" "u_other_self")
+          "slot-b" "10003" "u_other_self")
          'changed)
         (qq-gateway-account-select "slot-b")
         (funcall
          response-callback
          (qq-gateway-message-test-history-result nil "100" "100"))
-        (should (string-match-p "generation changed" failure))
+        (should (string-match-p "account or Gateway connection changed"
+                                failure))
         (should-not (qq-state-sessions))))))
 
 (ert-deftest qq-gateway-message-history-recovers-lost-self-event ()
@@ -1690,7 +1727,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                      ("message.send_text"
                       (funcall callback
                                `((account_id . "slot-a")
-                                 (generation . "7")
                                  (sent_at . ,now)
                                  (server_sequence . "8765432109")
                                  (client_sequence . "42001")
@@ -1734,7 +1770,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                  (lambda (format-string &rest arguments)
                    (setq violation
                          (apply #'format format-string arguments)))))
-        (qq-gateway-message--handle-event "message.received" bad)
+        (qq-gateway-dispatch--handle-transport-event "message.received" bad)
         (should (string-match-p "Malformed message.received event" violation))
         (should-not (qq-state-sessions))))))
 
@@ -1743,26 +1779,93 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (qq-gateway-message--handle-event
      "message.received" (qq-gateway-message-test-event))
     (should (qq-state-sessions))
-    (should (equal qq-gateway-message--projection-owner
-                   '("slot-a" . "7")))
+    (should (equal qq-gateway-message--projection-owner "slot-a"))
     (qq-gateway--upsert-account
      (qq-gateway-message-test-account
-      "slot-b" "11" "10003" "u_other_self")
+      "slot-b" "10003" "u_other_self")
      'changed)
     (let ((qq-gateway-current-account-changed-hook
            '(qq-gateway-message--handle-selection-change)))
       (qq-gateway-account-select "slot-b"))
     (should-not (qq-state-sessions))
     (should (equal (alist-get 'user_id (qq-state-self-info)) "10003"))
-    (should (equal qq-gateway-message--projection-owner
-                   '("slot-b" . "11")))))
+    (should (equal qq-gateway-message--projection-owner "slot-b"))))
+
+(ert-deftest qq-gateway-message-same-slot-restart-preserves-state-and-pending ()
+  (qq-gateway-message-test-with-state
+    (let* ((session-key "group:8209413637")
+           (conversation
+            '((kind . "group")
+              (group_uin . "8209413637")
+              (group_name . "Protocol Lab")
+              (sender_card . "Alice"))))
+      (qq-gateway-message--handle-event
+       "message.received"
+       (qq-gateway-message-test-event :conversation conversation))
+      (let* ((old-message (car (qq-state-session-messages session-key)))
+             (pending
+              (qq-state-insert-pending-message
+               session-key
+               '(((type . "text") (data . ((text . "in flight")))))))
+             (local-id (alist-get 'local-id pending))
+             sent-params delivered)
+        (puthash '(old-runtime) t qq-gateway-message--pending-recalls)
+        (puthash session-key
+                 '((message_id . "7348923749823749823")
+                   (sequence . "9007199254740999"))
+                 qq-gateway-message--live-frontiers)
+        (let ((stopped (qq-gateway-message-test-account)))
+          (setf (alist-get 'phase stopped) "stopped")
+          (qq-gateway--upsert-account stopped 'changed))
+        (qq-gateway-message--handle-account-change 'changed "slot-a")
+        (qq-gateway--upsert-account
+         (qq-gateway-message-test-account) 'changed)
+        (qq-gateway-message--handle-account-change 'changed "slot-a")
+        (should (equal qq-gateway-message--projection-owner "slot-a"))
+        (should (= (hash-table-count qq-gateway-message--pending-recalls) 1))
+        (should (= (hash-table-count qq-gateway-message--live-frontiers) 1))
+        (let ((retained
+               (seq-find
+                (lambda (message)
+                  (equal (alist-get 'server-id message)
+                         "7348923749823749823"))
+                (qq-state-session-messages session-key)))
+              (in-flight
+               (seq-find
+                (lambda (message)
+                  (equal (alist-get 'local-id message) local-id))
+                (qq-state-session-messages session-key))))
+          (should retained)
+          (should (eq (alist-get 'status in-flight) 'pending))
+          (should-not (alist-get 'error in-flight)))
+        (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                   (lambda () t))
+                  ((symbol-function 'qq-gateway-transport-capabilities)
+                   (lambda () qq-gateway-message-test-capabilities))
+                  ((symbol-function 'qq-gateway-transport-send)
+                   (lambda (_method params callback _errback &optional _early)
+                     (setq sent-params params)
+                     (funcall
+                      callback
+                      '((account_id . "slot-a")
+                        (message_id . "7348923749823749823")
+                        (sequence . "9007199254740999")))
+                     "restart-recall")))
+          (should
+           (equal
+            (qq-gateway-message-recall
+             session-key old-message
+             (lambda (receipt) (setq delivered receipt)))
+            "restart-recall")))
+        (should delivered)
+        (should (equal (alist-get 'account_id sent-params) "slot-a"))
+        (should-not (assq 'generation sent-params))))))
 
 (ert-deftest qq-gateway-message-account-ready-claims-selected-owner ()
   (qq-gateway-message-test-with-state
     (should-not qq-gateway-message--projection-owner)
     (qq-gateway-message--handle-account-change 'ready nil)
-    (should (equal qq-gateway-message--projection-owner
-                   '("slot-a" . "7")))
+    (should (equal qq-gateway-message--projection-owner "slot-a"))
     (should (equal (alist-get 'user_id (qq-state-self-info)) "10002"))
     (should (eq (qq-state-connection-status) 'ready))))
 

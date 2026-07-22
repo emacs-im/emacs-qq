@@ -28,8 +28,8 @@ disco.el 的交互设计。与 telega 类似，界面代码调用稳定的 QQ �
 
 1. 原生 QQ 服务是独立的长期运行进程，负责保存账号槽位及其登录、重连、停止和移除
    生命周期。
-2. ~emacs-qq~ 连接服务 WebSocket，显式选择一个在线账号及 generation，再把服务状态
-   投影为 Emacs 缓冲区。
+2. ~emacs-qq~ 连接服务 WebSocket，显式选择一个由稳定 ~account_id~ 标识的在线账号，
+   再把服务状态投影为 Emacs 缓冲区。
 3. 关闭 Emacs 连接只会解除这个客户端的附着，不会隐式退出 QQ，也不会为每个账号另起
    一个服务进程。
 
@@ -703,7 +703,7 @@ qq-evil-enable-integration
 ** 自己发送的消息重复
 
 客户端会用本地发送 identity、原生回执和自己的实时上报完成乐观消息晋升。若仍出现
-重复，应检查三者是否携带相同的账号 generation、会话 locator、sequence/random 和
+重复，应检查三者是否携带相同的 ~account_id~、会话 locator、sequence/random 和
 最终雪花 ID；不要用扩大模糊时间窗口隐藏身份缺失。
 
 ** 头像或转发消息内头像不显示
