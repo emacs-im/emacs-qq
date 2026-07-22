@@ -278,6 +278,59 @@
                     (clock-in "8209413637")))))
       (qq-state-reset))))
 
+(ert-deftest qq-backend-group-leave-routes-both-backends-and-converges-state ()
+  (dolist (backend '(onebot gateway))
+    (let ((qq-backend backend)
+          (group-id (if (eq backend 'onebot) "20001" "8209413637"))
+          called callback-value)
+      (unwind-protect
+          (progn
+            (qq-state-reset)
+            (qq-state-apply-groups
+             `(((group_id . ,group-id) (group_name . "Leave"))
+               ((group_id . "20002") (group_name . "Keep"))))
+            (cl-letf
+                (((symbol-function 'qq-api-leave-group)
+                  (lambda (group-id callback &optional _errback)
+                    (setq called (list 'onebot group-id))
+                    (funcall callback '((status . "ok")))
+                    "onebot-leave"))
+                 ((symbol-function 'qq-gateway-directory-leave-group)
+                  (lambda (group-id callback &optional _errback)
+                    (setq called (list 'gateway group-id))
+                    (funcall callback
+                             `((account_id . "slot-a") (generation . "7")
+                               (group_uin . ,group-id)))
+                    "gateway-leave")))
+              (let ((request
+                     (qq-backend-leave-group
+                      group-id
+                      (lambda (receipt) (setq callback-value receipt)))))
+                (should (eq (qq-backend-request-backend request) backend))
+                (should
+                 (equal (qq-backend-request-token request)
+                        (if (eq backend 'onebot)
+                            "onebot-leave"
+                          "gateway-leave")))))
+            (should (equal called (list backend group-id)))
+            (should callback-value)
+            (should-not (qq-state-group group-id))
+            (should (qq-state-group "20002")))
+        (qq-state-reset)))))
+
+(ert-deftest qq-backend-group-leave-does-not-invent-unloaded-directory ()
+  (let ((qq-backend 'onebot))
+    (unwind-protect
+        (progn
+          (qq-state-reset)
+          (cl-letf (((symbol-function 'qq-api-leave-group)
+                     (lambda (_group-id callback &optional _errback)
+                       (funcall callback '((status . "ok")))
+                       "leave")))
+            (qq-backend-leave-group "20001"))
+          (should-not (qq-state-groups-loaded-p)))
+      (qq-state-reset))))
+
 (ert-deftest qq-backend-group-member-settings-route-wide-native-identities ()
   (let ((qq-backend 'gateway) calls callbacks)
     (cl-letf

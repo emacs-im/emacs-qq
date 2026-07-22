@@ -680,6 +680,52 @@ CALLBACK receives the validated generation-owned receipt."
            (error-message-string error-data)))))
      errback)))
 
+(defun qq-gateway-directory--validate-group-leave-receipt
+    (receipt owner group-uin)
+  "Validate a closed group-leave RECEIPT for OWNER and GROUP-UIN."
+  (qq-gateway-directory--validate-owner
+   receipt owner '(account_id generation group_uin) "group leave receipt")
+  (unless (equal (alist-get 'group_uin receipt) group-uin)
+    (error "qq: Gateway group leave receipt contradicts request"))
+  (copy-tree receipt))
+
+(defun qq-gateway-directory-leave-group
+    (group-uin &optional callback errback)
+  "Leave exact GROUP-UIN through the selected native Gateway account.
+
+This method cannot dismiss a group.  A successful receipt revokes cached
+member data and any older group or member request that could reintroduce the
+departed group."
+  (unless (qq-gateway--canonical-decimal-p group-uin)
+    (user-error "qq: Group leave requires an exact group UIN"))
+  (let* ((owner (or (qq-gateway-current-account-owner)
+                    (user-error "qq: Select a Gateway account first")))
+         (_projection (qq-gateway-message--ensure-projection-owner owner))
+         (_cache (qq-gateway-directory--set-cache-owner owner)))
+    (qq-gateway--send
+     "group.leave"
+     `((account_id . ,(car owner))
+       (group_uin . ,group-uin))
+     (lambda (raw-result)
+       (condition-case error-data
+           (let ((receipt
+                  (qq-gateway-directory--validate-group-leave-receipt
+                   raw-result owner group-uin)))
+             (unless (and (equal owner (qq-gateway-current-account-owner))
+                          (equal owner qq-gateway-directory--cache-owner))
+               (error
+                "qq: Gateway account generation changed during group leave"))
+             (remhash 'groups qq-gateway-directory--active-requests)
+             (remhash (cons 'group-members group-uin)
+                      qq-gateway-directory--active-requests)
+             (remhash group-uin qq-gateway-directory--member-pages)
+             (qq-gateway--invoke callback receipt))
+         (error
+          (qq-gateway--client-error
+           errback "invalid_gateway_result" "%s"
+           (error-message-string error-data)))))
+     errback)))
+
 (defun qq-gateway-directory--validate-group-member-setting-receipt
     (receipt owner group-uin target-uin field expected)
   "Validate one group-member setting RECEIPT against its closed request."

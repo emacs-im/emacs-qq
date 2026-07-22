@@ -10,7 +10,8 @@
   '("contact.list_friends" "contact.list_groups"
     "contact.list_group_members" "group.set_name" "group.set_remark"
     "group.set_whole_mute" "group.set_member_card"
-    "group.set_member_special_title" "group.kick_member" "group.clock_in")
+    "group.set_member_special_title" "group.kick_member" "group.clock_in"
+    "group.leave")
   "Native contact capabilities exercised by directory tests.")
 
 (defun qq-gateway-directory-test-account
@@ -371,6 +372,71 @@
          (lambda (_body reason) (setq failure reason))))
       (should-not success)
       (should (string-match-p "invalid fields" failure)))))
+
+(ert-deftest qq-gateway-directory-leave-revokes-owned-group-caches ()
+  (qq-gateway-directory-test-with-state
+    (let (sent-method sent-params callback-value)
+      (qq-gateway-directory--set-cache-owner
+       (qq-gateway-current-account-owner))
+      (puthash "8209413637" '((member_count . 3))
+               qq-gateway-directory--member-pages)
+      (puthash 'groups 'old-group-list
+               qq-gateway-directory--active-requests)
+      (puthash '(group-members . "8209413637") 'old-member-list
+               qq-gateway-directory--active-requests)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-directory-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall callback
+                            '((account_id . "slot-a") (generation . "7")
+                              (group_uin . "8209413637")))
+                   "leave-request")))
+        (should
+         (equal
+          (qq-gateway-directory-leave-group
+           "8209413637" (lambda (receipt) (setq callback-value receipt)))
+          "leave-request")))
+      (should (equal sent-method "group.leave"))
+      (should
+       (equal sent-params
+              '((account_id . "slot-a") (group_uin . "8209413637"))))
+      (should (equal (alist-get 'group_uin callback-value) "8209413637"))
+      (should-not (gethash "8209413637"
+                           qq-gateway-directory--member-pages))
+      (should-not (gethash 'groups
+                           qq-gateway-directory--active-requests))
+      (should-not (gethash '(group-members . "8209413637")
+                           qq-gateway-directory--active-requests)))))
+
+(ert-deftest qq-gateway-directory-leave-rejects-open-receipt-without-revoking-cache ()
+  (qq-gateway-directory-test-with-state
+    (let (success failure)
+      (qq-gateway-directory--set-cache-owner
+       (qq-gateway-current-account-owner))
+      (puthash "8209413637" '((member_count . 3))
+               qq-gateway-directory--member-pages)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-directory-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (funcall callback
+                            '((account_id . "slot-a") (generation . "7")
+                              (group_uin . "8209413637")
+                              (is_dismiss . :false)))
+                   "request")))
+        (qq-gateway-directory-leave-group
+         "8209413637" (lambda (_receipt) (setq success t))
+         (lambda (_body reason) (setq failure reason))))
+      (should-not success)
+      (should (string-match-p "invalid fields" failure))
+      (should (gethash "8209413637"
+                       qq-gateway-directory--member-pages)))))
 
 (ert-deftest qq-gateway-directory-group-member-settings-update-owned-page ()
   (qq-gateway-directory-test-with-state

@@ -3095,6 +3095,21 @@ CALLBACK receives NapCat's successful response."
        (funcall callback response)))
    (or errback #'qq-api--default-error)))
 
+(defun qq-api-leave-group
+    (group-id &optional callback errback)
+  "Leave GROUP-ID through NapCat OneBot without requesting group dismissal.
+
+CALLBACK receives NapCat's successful response."
+  (unless (qq-api-group-id-p group-id)
+    (user-error "qq: group leave requires a canonical uint32 group UIN"))
+  (qq-api-call
+   "set_group_leave"
+   `((group_id . ,group-id) (is_dismiss . :false))
+   (lambda (response)
+     (when callback
+       (funcall callback response)))
+   (or errback #'qq-api--default-error)))
+
 (defun qq-api-set-group-member-card
     (group-id user-id card &optional callback errback)
   "Set or clear USER-ID's CARD in GROUP-ID through NapCat OneBot.
