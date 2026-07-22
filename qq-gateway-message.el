@@ -857,7 +857,7 @@ The result saturates at zero.  VALUE is never coerced to an Emacs number."
   count)
 
 (defun qq-gateway-message-history-range-ending-at (end-sequence count)
-  "Return inclusive COUNT-wide range ending at exact END-SEQUENCE.
+  "Return COUNT messages in an inclusive range ending at exact END-SEQUENCE.
 
 The start saturates at zero, so a sequence near the beginning may yield a
 shorter range."
@@ -870,7 +870,7 @@ shorter range."
      start-sequence end-sequence)))
 
 (defun qq-gateway-message-history-range-around (sequence count)
-  "Return an inclusive COUNT-wide range containing exact SEQUENCE.
+  "Return COUNT messages in an inclusive range containing exact SEQUENCE.
 
 The target is centered when possible.  Close to zero, the whole range shifts
 right instead of becoming shorter."
@@ -1051,39 +1051,123 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
      errback)))
 
 (defun qq-gateway-message--validate-send-receipt (receipt owner)
-  "Validate and copy text-send RECEIPT for exact OWNER."
+  "Validate and copy message-send RECEIPT for exact OWNER."
   (unless (qq-gateway--exact-object-keys-p
            receipt
            '(account_id generation sent_at server_sequence client_sequence random))
-    (error "qq: Gateway text-send receipt has invalid fields"))
+    (error "qq: Gateway message-send receipt has invalid fields"))
   (unless (and (equal (alist-get 'account_id receipt) (car owner))
                (equal (alist-get 'generation receipt) (cdr owner)))
-    (error "qq: Gateway text-send receipt owner contradicts request"))
+    (error "qq: Gateway message-send receipt owner contradicts request"))
   (unless (and (integerp (alist-get 'sent_at receipt))
                (>= (alist-get 'sent_at receipt) 0))
-    (error "qq: Gateway text-send receipt timestamp is invalid"))
+    (error "qq: Gateway message-send receipt timestamp is invalid"))
   (dolist (key '(server_sequence client_sequence))
     (unless (qq-gateway--canonical-decimal-p (alist-get key receipt) t)
-      (error "qq: Gateway text-send receipt %s is invalid" key)))
+      (error "qq: Gateway message-send receipt %s is invalid" key)))
   (unless (qq-gateway-message--uint32-p (alist-get 'random receipt))
-    (error "qq: Gateway text-send receipt random is invalid"))
+    (error "qq: Gateway message-send receipt random is invalid"))
   (copy-tree receipt))
 
-(defun qq-gateway-message-send-text
-    (session-key text &optional callback errback)
-  "Send TEXT to native private/group SESSION-KEY on the selected account.
+(defun qq-gateway-message--outgoing-reply-target
+    (session-key message-id owner)
+  "Return native reply target for MESSAGE-ID in SESSION-KEY owned by OWNER."
+  (unless (qq-gateway--canonical-decimal-p message-id)
+    (user-error "qq: Native reply requires an exact snowflake message ID"))
+  (let ((message
+         (seq-find
+          (lambda (candidate)
+            (equal (alist-get 'server-id candidate) message-id))
+          (qq-state-session-messages session-key))))
+    (unless message
+      (user-error "qq: Native reply target %s is not loaded" message-id))
+    (unless (and (equal (alist-get 'gateway-account-id message) (car owner))
+                 (equal (alist-get 'gateway-generation message) (cdr owner)))
+      (user-error "qq: Native reply target belongs to another Gateway generation"))
+    (let ((sequence (alist-get 'message-seq message))
+          (sender-uin (alist-get 'user-id message))
+          (sender-uid (alist-get 'sender-native-id message))
+          (sent-at (alist-get 'native-sent-at message)))
+      (unless (qq-gateway--canonical-decimal-p sequence)
+        (user-error "qq: Native reply target lacks an exact message sequence"))
+      (unless (qq-gateway--canonical-decimal-p sender-uin)
+        (user-error "qq: Native reply target lacks an exact sender UIN"))
+      (unless (qq-gateway--non-empty-string-p sender-uid)
+        (user-error "qq: Native reply target lacks an exact sender UID"))
+      (unless (qq-gateway-message--uint32-p sent-at)
+        (user-error "qq: Native reply target has an invalid timestamp"))
+      `((message_id . ,message-id)
+        (sequence . ,sequence)
+        (sender_uin . ,sender-uin)
+        (sender_uid . ,sender-uid)
+        (sent_at . ,sent-at)))))
 
-The local pending row remains pending after the synchronous Gateway receipt,
-because that receipt intentionally has no message ID.  CALLBACK receives the
-validated receipt.  ERRBACK receives an error body and reason after the row is
-marked failed.  The later exact self `message.received' event promotes it."
-  (unless (and (stringp text) (not (string-empty-p text)))
-    (user-error "qq: Text message must not be empty"))
+(defun qq-gateway-message--outgoing-segments (session-key segments owner)
+  "Validate SEGMENTS for SESSION-KEY and return native elements for OWNER."
+  (unless (and (proper-list-p segments)
+               segments
+               (<= (length segments) 128))
+    (user-error "qq: Native Gateway requires between 1 and 128 segments"))
+  (let ((group-p (eq (qq-state-session-key-type session-key) 'group))
+        (reply-count 0))
+    (mapcar
+     (lambda (segment)
+       (unless (qq-gateway--exact-object-keys-p segment '(type data))
+         (user-error "qq: Native Gateway segment has invalid fields"))
+       (let ((type (alist-get 'type segment))
+             (data (alist-get 'data segment)))
+         (pcase type
+           ("text"
+            (unless (and (qq-gateway--exact-object-keys-p data '(text))
+                         (qq-gateway--non-empty-string-p
+                          (alist-get 'text data)))
+              (user-error "qq: Native Gateway text segment is malformed"))
+            `((kind . "text")
+              (payload . ((text . ,(alist-get 'text data))))))
+           ("at"
+            (unless group-p
+              (user-error "qq: Native Gateway mentions require a group chat"))
+            (unless (qq-gateway-message--closed-object-p data '(qq) '(name))
+              (user-error "qq: Native Gateway mention has invalid fields"))
+            (let ((qq (alist-get 'qq data))
+                  (name (alist-get 'name data)))
+              (unless (or (equal qq "all")
+                          (qq-gateway--canonical-decimal-p qq))
+                (user-error "qq: Native Gateway mention target is invalid"))
+              (when (and (assq 'name data)
+                         (not (qq-gateway--non-empty-string-p name)))
+                (user-error "qq: Native Gateway mention name is invalid"))
+              `((kind . "mention")
+                (payload
+                 . ((target
+                     . ((kind . ,(if (equal qq "all") "all" "user"))
+                        ,@(unless (equal qq "all") `((uin . ,qq)))))
+                    ,@(when name `((display . ,name))))))))
+           ("reply"
+            (cl-incf reply-count)
+            (when (> reply-count 1)
+              (user-error "qq: Native Gateway accepts at most one reply"))
+            (unless (and (qq-gateway--exact-object-keys-p data '(id))
+                         (stringp (alist-get 'id data)))
+              (user-error "qq: Native Gateway reply segment is malformed"))
+            `((kind . "reply")
+              (payload
+               . ((target
+                   . ,(qq-gateway-message--outgoing-reply-target
+                       session-key (alist-get 'id data) owner))))))
+           (_
+            (user-error
+             "qq: Native Gateway cannot send segment type %S yet" type)))))
+     segments)))
+
+(defun qq-gateway-message--send-request
+    (session-key segments raw-message method params callback errback)
+  "Send validated SEGMENTS through METHOD with PARAMS for SESSION-KEY."
   (let* ((owner (or (qq-gateway-current-account-owner)
                     (user-error "qq: Select a Gateway account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
-         (conversation (qq-gateway-message--conversation-params session-key))
-         (pending (qq-state-insert-pending-text-message session-key text))
+         (pending (qq-state-insert-pending-message
+                   session-key segments raw-message))
          (local-id (alist-get 'local-id pending)))
     (cl-labels
         ((fail
@@ -1092,10 +1176,8 @@ marked failed.  The later exact self `message.received' event promotes it."
           (qq-gateway--invoke errback body reason)))
       (condition-case error-data
           (qq-gateway--send
-           "message.send_text"
-           `((account_id . ,(car owner))
-             (conversation . ,conversation)
-             (text . ,text))
+           method
+           (append `((account_id . ,(car owner))) params)
            (lambda (result)
              (condition-case result-error
                  (let ((receipt
@@ -1126,6 +1208,44 @@ marked failed.  The later exact self `message.received' event promotes it."
          (qq-state-mark-pending-message-failed
           session-key local-id (error-message-string error-data))
          (signal (car error-data) (cdr error-data)))))))
+
+(defun qq-gateway-message-send
+    (session-key segments &optional raw-message callback errback)
+  "Send closed SEGMENTS to native private/group SESSION-KEY.
+
+Supported elements are text, group mention, and reply.  Reply metadata is
+resolved only from an exact message owned by the selected Gateway generation.
+RAW-MESSAGE is an optional optimistic rendering override."
+  (let* ((owner (or (qq-gateway-current-account-owner)
+                    (user-error "qq: Select a Gateway account first")))
+         (_owner (qq-gateway-message--ensure-projection-owner owner))
+         (native-segments
+          (qq-gateway-message--outgoing-segments session-key segments owner))
+         (conversation (qq-gateway-message--conversation-params session-key)))
+    (qq-gateway-message--send-request
+     session-key segments raw-message "message.send"
+     `((conversation . ,conversation)
+       (segments . ,native-segments))
+     callback errback)))
+
+(defun qq-gateway-message-send-text
+    (session-key text &optional callback errback)
+  "Send TEXT to native private/group SESSION-KEY on the selected account.
+
+The local pending row remains pending after the synchronous Gateway receipt,
+because that receipt intentionally has no message ID.  CALLBACK receives the
+validated receipt.  ERRBACK receives an error body and reason after the row is
+marked failed.  The later exact self `message.received' event promotes it."
+  (unless (and (stringp text) (not (string-empty-p text)))
+    (user-error "qq: Text message must not be empty"))
+  (qq-gateway-message--send-request
+   session-key
+   `(((type . "text") (data . ((text . ,text)))))
+   text
+   "message.send_text"
+   `((conversation . ,(qq-gateway-message--conversation-params session-key))
+     (text . ,text))
+   callback errback))
 
 (defun qq-gateway-message--validate-recall-receipt
     (receipt owner message-id sequence)

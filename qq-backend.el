@@ -194,42 +194,20 @@ and reason."
             (qq-backend--filter-gateway-members members query limit)))
          (or errback #'qq-backend--default-gateway-error)))))))
 
-(defun qq-backend--gateway-text (segments)
-  "Return text represented by native-sendable SEGMENTS.
-
-The current Gateway method deliberately supports text only.  Unsupported rich
-segments fail before optimistic timeline state is inserted."
-  (unless (and (proper-list-p segments) segments)
-    (user-error "qq: Native Gateway requires at least one text segment"))
-  (let (parts)
-    (dolist (segment segments)
-      (unless (and (qq-gateway--exact-object-keys-p segment '(type data))
-                   (equal (alist-get 'type segment) "text")
-                   (qq-gateway--exact-object-keys-p
-                    (alist-get 'data segment) '(text))
-                   (stringp (alist-get 'text (alist-get 'data segment))))
-        (user-error
-         "qq: Native Gateway currently sends plain text without reply or rich segments"))
-      (push (alist-get 'text (alist-get 'data segment)) parts))
-    (let ((text (mapconcat #'identity (nreverse parts) "")))
-      (when (string-empty-p text)
-        (user-error "qq: Native Gateway text message must not be empty"))
-      text)))
-
 (defun qq-backend-send-message
     (session-key segments &optional raw-message callback errback)
   "Send SEGMENTS to SESSION-KEY through the selected backend.
 
 RAW-MESSAGE retains the OneBot optimistic rendering override.  The native
-Gateway currently accepts text-only segments and promotes its pending row from
-the later authoritative self event."
+Gateway accepts closed text, group mention, and reply segments, then promotes
+its pending row from the later authoritative self event."
   (pcase (qq-backend--validate qq-backend)
     ('onebot
      (qq-api-send-message
       session-key segments raw-message callback errback))
     ('gateway
-     (qq-gateway-message-send-text
-      session-key (qq-backend--gateway-text segments) callback
+     (qq-gateway-message-send
+      session-key segments raw-message callback
       (or errback #'qq-backend--default-gateway-error)))))
 
 (defun qq-backend-recall-message (message &optional callback errback)
@@ -266,7 +244,8 @@ backend failure response and reason."
 (defun qq-backend-history-frontier (session-key)
   "Return the selected backend's exact known history frontier.
 
-For the native Gateway the result is a plist containing `:sequence' and,
+SESSION-KEY identifies the private or group conversation.  For the native
+Gateway the result is a plist containing `:sequence' and,
 when known, `:message-id'.  Group `latest_sequence' is authoritative and is
 advanced by a newer live event.  Private history deliberately exposes only a
 live sequence observed by this Gateway projection because neither Lagrange nor
@@ -327,7 +306,7 @@ the QQ C2C history method provides a latest cursor.  `:empty-p' or
                     :unavailable-reason 'group-directory))))))))))
 
 (defun qq-backend-history-range-before (start-sequence count)
-  "Return native history range before exact START-SEQUENCE, or nil at zero."
+  "Return a native range of COUNT messages before START-SEQUENCE, or nil at zero."
   (qq-gateway-message--validate-sequence
    start-sequence "Current history start sequence")
   (qq-gateway-message--validate-history-count count)
@@ -338,7 +317,7 @@ the QQ C2C history method provides a latest cursor.  `:empty-p' or
 
 (defun qq-backend-history-range-after
     (end-sequence count &optional maximum-sequence)
-  "Return native history range after END-SEQUENCE, optionally capped at MAXIMUM.
+  "Return COUNT native messages after END-SEQUENCE, capped at MAXIMUM-SEQUENCE.
 
 All sequence values stay canonical decimal strings.  Return nil when MAXIMUM
 is already covered."
@@ -375,7 +354,8 @@ is already covered."
 
 START-SEQUENCE and END-SEQUENCE are inclusive exact strings.  CALLBACK receives
 merge metadata prefixed by optional plist PROPERTIES.  The returned request is
-tagged for cancellation across later backend changes."
+tagged for cancellation across later backend changes.  ERRBACK handles a
+transport or protocol failure."
   (unless (eq (qq-backend--validate qq-backend) 'gateway)
     (user-error "qq: Explicit sequence ranges belong to the native Gateway"))
   (qq-backend--wrap-request
@@ -395,7 +375,7 @@ tagged for cancellation across later backend changes."
 Native group history uses the directory's exact latest sequence.  Native
 private history uses only a live observed sequence; when none exists CALLBACK
 receives metadata with `:history-frontier-unavailable' instead of a guessed
-request."
+request.  ERRBACK handles failure and COUNT limits the requested page size."
   (pcase (qq-backend--validate qq-backend)
     ('onebot
      (qq-backend--wrap-request
@@ -472,9 +452,10 @@ request."
   "Return non-nil when selected backend supports product CAPABILITY."
   (pcase (qq-backend--validate qq-backend)
     ('onebot t)
-    ('gateway
-     (memq capability
-           '(contacts group-members send-text recall explicit-history)))))
+     ('gateway
+      (memq capability
+            '(contacts group-members send-text send-message reply mention
+              recall explicit-history)))))
 
 (defun qq-backend--gateway-bootstrap-complete (owner failed-p)
   "Complete one Gateway bootstrap part for OWNER, recording FAILED-P."
