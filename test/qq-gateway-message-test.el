@@ -7,7 +7,7 @@
 (require 'qq-gateway-message)
 
 (defconst qq-gateway-message-test-capabilities
-  '("message.send_text" "message.recall" "message.get_history")
+  '("message.send" "message.send_text" "message.recall" "message.get_history")
   "Native Gateway capabilities exercised by message tests.")
 
 (defun qq-gateway-message-test-account
@@ -331,6 +331,89 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                          "7348923749823749823"))
           (should (eq (alist-get 'status message) 'sent))
           (should (= (hash-table-count qq-gateway-message--pending-sends) 0)))))))
+
+(ert-deftest qq-gateway-message-send-projects-reply-mention-and-text ()
+  (qq-gateway-message-test-with-state
+    (let ((now (floor (float-time))) sent-method sent-params)
+      (qq-gateway-message--handle-event
+       "message.received"
+       (qq-gateway-message-test-event
+        :sent-at now
+        :conversation
+        '((kind . "group")
+          (group_uin . "8209413637")
+          (group_name . "Protocol Lab")
+          (sender_card . "Alice"))))
+      (let ((segments
+             '(((type . "reply")
+                (data . ((id . "7348923749823749823"))))
+               ((type . "at")
+                (data . ((qq . "10001") (name . "Alice"))))
+               ((type . "text") (data . ((text . " hello")))))))
+        (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                   (lambda () t))
+                  ((symbol-function 'qq-gateway-transport-capabilities)
+                   (lambda () qq-gateway-message-test-capabilities))
+                  ((symbol-function 'qq-gateway-transport-send)
+                   (lambda (method params callback _errback &optional _early)
+                     (setq sent-method method sent-params params)
+                     (funcall callback
+                              `((account_id . "slot-a")
+                                (generation . "7")
+                                (sent_at . ,now)
+                                (server_sequence . "8765432110")
+                                (client_sequence . "42002")
+                                (random . 124)))
+                     "request-rich-send")))
+          (should
+           (equal
+            (qq-gateway-message-send "group:8209413637" segments)
+            "request-rich-send"))
+          (should (equal sent-method "message.send"))
+          (should
+           (equal
+            sent-params
+            `((account_id . "slot-a")
+              (conversation
+               . ((kind . "group") (group_uin . "8209413637")))
+              (segments
+               . (((kind . "reply")
+                   (payload
+                    . ((target
+                        . ((message_id . "7348923749823749823")
+                           (sequence . "9007199254740999")
+                           (sender_uin . "10001")
+                           (sender_uid . "u_peer")
+                           (sent_at . ,now))))))
+                  ((kind . "mention")
+                   (payload
+                    . ((target . ((kind . "user") (uin . "10001")))
+                       (display . "Alice"))))
+                  ((kind . "text")
+                   (payload . ((text . " hello")))))))))
+          (let ((pending
+                 (seq-find
+                  (lambda (message)
+                    (eq (alist-get 'status message) 'pending))
+                  (qq-state-session-messages "group:8209413637"))))
+            (should pending)
+            (should (equal (alist-get 'segments pending) segments)))
+          (should (= (hash-table-count qq-gateway-message--pending-sends) 1)))))))
+
+(ert-deftest qq-gateway-message-send-rejects-unresolved-reply-before-pending ()
+  (qq-gateway-message-test-with-state
+    (let ((sent nil))
+      (cl-letf (((symbol-function 'qq-gateway-transport-send)
+                 (lambda (&rest _arguments) (setq sent t))))
+        (should-error
+         (qq-gateway-message-send
+          "private:10001"
+          '(((type . "reply")
+             (data . ((id . "7348923749823749823"))))
+            ((type . "text") (data . ((text . "hello"))))))
+         :type 'user-error)
+        (should-not sent)
+        (should-not (qq-state-session-messages "private:10001"))))))
 
 (ert-deftest qq-gateway-message-self-event-before-receipt-still-rekeys ()
   (qq-gateway-message-test-with-state

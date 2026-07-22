@@ -209,28 +209,26 @@
         (should (= (length result) 1))
         (should (equal (alist-get 'user_id (car result)) "10003"))))))
 
-(ert-deftest qq-backend-gateway-send-accepts-only-plain-text ()
+(ert-deftest qq-backend-gateway-send-routes-closed-segments ()
   (let ((qq-backend 'gateway) sent)
-    (cl-letf (((symbol-function 'qq-gateway-message-send-text)
-               (lambda (session-key text &optional callback errback)
-                 (setq sent (list session-key text callback errback))
+    (cl-letf (((symbol-function 'qq-gateway-message-send)
+               (lambda (session-key segments &optional raw callback errback)
+                 (setq sent (list session-key segments raw callback errback))
                  "send-request")))
-      (should
-       (equal
-        (qq-backend-send-message
-         "private:10001"
-         '(((type . "text") (data . ((text . "hello "))))
-           ((type . "text") (data . ((text . "world"))))))
-        "send-request"))
-      (should (equal (seq-take sent 2) '("private:10001" "hello world")))
-      (setq sent nil)
-      (should-error
-       (qq-backend-send-message
-        "private:10001"
-        '(((type . "reply") (data . ((id . "7348923749823749823"))))
-          ((type . "text") (data . ((text . "hello"))))))
-       :type 'user-error)
-      (should-not sent))))
+      (let ((segments
+             '(((type . "reply")
+                (data . ((id . "7348923749823749823"))))
+               ((type . "at")
+                (data . ((qq . "10002") (name . "Alice"))))
+               ((type . "text") (data . ((text . "hello")))))))
+        (should
+         (equal
+          (qq-backend-send-message
+           "group:8209413637" segments "optimistic")
+          "send-request"))
+        (should (equal (nth 0 sent) "group:8209413637"))
+        (should (eq (nth 1 sent) segments))
+        (should (equal (nth 2 sent) "optimistic"))))))
 
 (ert-deftest qq-backend-recall-dispatches-the-owned-native-message ()
   (let ((qq-backend 'gateway) call)
