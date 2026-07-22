@@ -465,6 +465,23 @@ fallbacks and previews when the face image is not yet available."
   :type 'directory
   :group 'qq)
 
+(defcustom qq-media-record-player-command
+  (cond
+   ((executable-find "ffplay") '("ffplay" "-nodisp" "-autoexit"))
+   ((executable-find "mpv") '("mpv" "--no-video"))
+   ((executable-find "vlc") '("vlc" "--intf" "dummy" "--play-and-exit"))
+   (t nil))
+  "Command used to play native QQ voice records.
+
+The decoded PCM WAV path is supplied as the final argument.  Playback never
+uses this command to select or perform a protocol transformation; Rust has
+already materialized and decoded the immutable resource before launch."
+  :type '(choice
+          (const :tag "No record player" nil)
+          (string :tag "Command line")
+          (repeat :tag "Argument vector" string))
+  :group 'qq)
+
 (defcustom qq-self-message-dedupe-window 10
   "Seconds used to weakly dedupe self-message event echoes."
   :type 'integer
