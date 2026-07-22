@@ -8,7 +8,8 @@
 
 (defconst qq-gateway-directory-test-capabilities
   '("contact.list_friends" "contact.list_groups"
-    "contact.list_group_members")
+    "contact.list_group_members" "group.set_name" "group.set_remark"
+    "group.set_whole_mute")
   "Native contact capabilities exercised by directory tests.")
 
 (defun qq-gateway-directory-test-account
@@ -251,6 +252,68 @@
           (should (equal (alist-get 'self_permission group) "owner"))
           (should (equal (alist-get 'latest_sequence group) "123"))
           (should (= (alist-get 'max_member_count group) 500)))))))
+
+(ert-deftest qq-gateway-directory-group-settings-validate-generation-receipts ()
+  (qq-gateway-directory-test-with-state
+    (let (calls receipts)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-directory-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (push (list method params) calls)
+                   (funcall
+                    callback
+                    (pcase method
+                      ("group.set_name"
+                       '((account_id . "slot-a") (generation . "7")
+                         (group_uin . "8209413637") (name . "New Name")))
+                      ("group.set_remark"
+                       '((account_id . "slot-a") (generation . "7")
+                         (group_uin . "8209413637") (remark . "")))
+                      ("group.set_whole_mute"
+                       '((account_id . "slot-a") (generation . "7")
+                         (group_uin . "8209413637") (enabled . :false)))))
+                   method)))
+        (qq-gateway-directory-set-group-name
+         "8209413637" "New Name" (lambda (receipt) (push receipt receipts)))
+        (qq-gateway-directory-set-group-remark
+         "8209413637" "" (lambda (receipt) (push receipt receipts)))
+        (qq-gateway-directory-set-group-whole-mute
+         "8209413637" nil (lambda (receipt) (push receipt receipts))))
+      (should (= (length receipts) 3))
+      (should
+       (equal
+        (nreverse calls)
+        '(("group.set_name"
+           ((account_id . "slot-a") (group_uin . "8209413637")
+            (name . "New Name")))
+          ("group.set_remark"
+           ((account_id . "slot-a") (group_uin . "8209413637")
+            (remark . "")))
+          ("group.set_whole_mute"
+           ((account_id . "slot-a") (group_uin . "8209413637")
+            (enabled . :false)))))))))
+
+(ert-deftest qq-gateway-directory-group-setting-rejects-stale-generation ()
+  (qq-gateway-directory-test-with-state
+    (let (success failure)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-directory-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (funcall callback
+                            '((account_id . "slot-a") (generation . "6")
+                              (group_uin . "8209413637") (name . "Stale")))
+                   "request")))
+        (qq-gateway-directory-set-group-name
+         "8209413637" "Stale" (lambda (_receipt) (setq success t))
+         (lambda (_body reason) (setq failure reason))))
+      (should-not success)
+      (should (string-match-p "contradicts request" failure)))))
 
 (ert-deftest qq-gateway-directory-members-map-and-enrich-group-ownership ()
   (qq-gateway-directory-test-with-state

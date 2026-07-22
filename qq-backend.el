@@ -71,6 +71,15 @@
                   (memq (qq-state-connection-status) '(open ready))))
     ('gateway (qq-gateway-transport-ready-p))))
 
+(defun qq-backend-group-id-p (value)
+  "Return non-nil when VALUE is a valid group id for the selected backend.
+
+NapCat's hard-cut actions retain their canonical uint32 group-code contract;
+the native Gateway carries Lagrange's wider decimal group UIN as a string."
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot (qq-api-group-id-p value))
+    ('gateway (qq-gateway--canonical-decimal-p value))))
+
 (defun qq-backend-connect ()
   "Connect the selected backend without changing remote account lifecycle."
   (qq-backend-activate)
@@ -123,6 +132,58 @@ authoritative refreshes."
       'gateway
       (qq-gateway-directory-refresh-groups
        callback (or errback #'qq-backend--default-gateway-error) refresh)))))
+
+(defun qq-backend--group-profile-from-state (group-id)
+  "Return a group-profile projection for exact GROUP-ID, or nil."
+  (when-let* ((group (qq-state-group group-id)))
+    `((group_id . ,group-id)
+      (name . ,(alist-get 'group_name group))
+      (remark . ,(alist-get 'group_remark group))
+      (description . ,(alist-get 'description group))
+      (announcement . ,(alist-get 'announcement group))
+      (owner_id . ,(alist-get 'owner_id group))
+      (member_count . ,(alist-get 'member_count group))
+      (max_member_count . ,(alist-get 'max_member_count group))
+      (active_member_count . ,(alist-get 'active_member_count group))
+      (created_at . ,(alist-get 'created_at group))
+      (joined_at . ,(alist-get 'joined_at group))
+      (pinned . ,(alist-get 'pinned group))
+      (mute . ,(copy-tree (alist-get 'mute group)))
+      (join . ,(copy-tree (alist-get 'join group)))
+      (self_permission . ,(alist-get 'self_permission group))
+      (category . ,(copy-tree (alist-get 'category group)))
+      (grade . ,(alist-get 'grade group))
+      (certification . ,(copy-tree (alist-get 'certification group)))
+      (school . ,(copy-tree (alist-get 'school group)))
+      (location . ,(copy-tree (alist-get 'location group)))
+      (has_custom_avatar . ,(alist-get 'has_custom_avatar group)))))
+
+(defun qq-backend-get-group (group-id callback &optional errback)
+  "Fetch selected-backend GROUP-ID profile and call CALLBACK.
+
+The Gateway projection is derived from its generation-owned joined-group
+cache; when absent, one authoritative group refresh is performed first."
+  (unless (qq-backend-group-id-p group-id)
+    (user-error "qq: group profile requires an exact backend group id"))
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot
+     (qq-backend--wrap-request
+      'onebot (qq-api-get-group group-id callback errback)))
+    ('gateway
+     (if-let* ((profile (qq-backend--group-profile-from-state group-id)))
+         (progn
+           (when callback
+             (funcall callback profile))
+           nil)
+       (qq-backend-refresh-joined-groups
+        (lambda (_groups)
+          (if-let* ((profile
+                     (qq-backend--group-profile-from-state group-id)))
+              (when callback
+                (funcall callback profile))
+            (funcall (or errback #'qq-backend--default-gateway-error)
+                     nil "group is not present in the selected account")))
+        errback t)))))
 
 (defun qq-backend-refresh ()
   "Refresh primary data supported by the selected backend."
@@ -193,6 +254,87 @@ and reason."
             callback
             (qq-backend--filter-gateway-members members query limit)))
          (or errback #'qq-backend--default-gateway-error)))))))
+
+(defun qq-backend--apply-group-setting (group-id field value)
+  "Apply confirmed group FIELD VALUE for GROUP-ID to shared state."
+  (let ((groups (qq-state-groups))
+        changed)
+    (dolist (group groups)
+      (when (equal (alist-get 'group_id group) group-id)
+        (setf (alist-get field group nil nil #'eq) value)
+        (setq changed t)))
+    (when changed
+      (qq-state-apply-groups groups))
+    changed))
+
+(defun qq-backend--group-setting-success
+    (group-id field value callback receipt)
+  "Apply one confirmed group setting and forward RECEIPT to CALLBACK."
+  (qq-backend--apply-group-setting group-id field value)
+  (when callback
+    (funcall callback receipt)))
+
+(defun qq-backend-set-group-name
+    (group-id name &optional callback errback)
+  "Set GROUP-ID's public NAME through the selected backend."
+  (unless (qq-backend-group-id-p group-id)
+    (user-error "qq: Group name requires an exact backend group id"))
+  (unless (and (stringp name) (not (string-empty-p name)))
+    (user-error "qq: Group name must be a non-empty string"))
+  (let ((success (apply-partially #'qq-backend--group-setting-success
+                                  group-id 'group_name name callback)))
+    (pcase (qq-backend--validate qq-backend)
+      ('onebot
+       (qq-backend--wrap-request
+        'onebot
+        (qq-api-set-group-name group-id name success errback)))
+      ('gateway
+       (qq-backend--wrap-request
+        'gateway
+        (qq-gateway-directory-set-group-name
+         group-id name success
+         (or errback #'qq-backend--default-gateway-error)))))))
+
+(defun qq-backend-set-group-remark
+    (group-id remark &optional callback errback)
+  "Set or clear GROUP-ID's account-local REMARK through the backend."
+  (unless (qq-backend-group-id-p group-id)
+    (user-error "qq: Group remark requires an exact backend group id"))
+  (unless (stringp remark)
+    (user-error "qq: Group remark must be a string"))
+  (let ((success (apply-partially #'qq-backend--group-setting-success
+                                  group-id 'group_remark
+                                  (and (not (string-empty-p remark)) remark)
+                                  callback)))
+    (pcase (qq-backend--validate qq-backend)
+      ('onebot
+       (qq-backend--wrap-request
+        'onebot
+        (qq-api-set-group-remark group-id remark success errback)))
+      ('gateway
+       (qq-backend--wrap-request
+        'gateway
+        (qq-gateway-directory-set-group-remark
+         group-id remark success
+         (or errback #'qq-backend--default-gateway-error)))))))
+
+(defun qq-backend-set-group-whole-mute
+    (group-id enabled &optional callback errback)
+  "Set GROUP-ID's whole-group mute state through the selected backend."
+  (unless (qq-backend-group-id-p group-id)
+    (user-error "qq: Group whole mute requires an exact backend group id"))
+  (setq enabled (and enabled t))
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot
+     (qq-backend--wrap-request
+      'onebot
+      (qq-api-set-group-whole-mute group-id enabled callback errback)))
+    ('gateway
+     (qq-backend--wrap-request
+      'gateway
+      (qq-gateway-directory-set-group-whole-mute
+       group-id enabled callback
+       (or errback #'qq-backend--default-gateway-error))))))
 
 (defun qq-backend-send-message
     (session-key segments &optional raw-message callback errback)

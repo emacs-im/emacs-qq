@@ -3000,6 +3000,35 @@ The authoritative post-state reports UNREAD-COUNT."
        (should-not (alist-get 'essence-p message))
        (should (= (alist-get 'essence-changed-at message) 1710000300))))))
 
+(ert-deftest qq-api-group-settings-use-napcat-string-contracts ()
+  (let (calls callbacks)
+    (cl-letf (((symbol-function 'qq-api-call)
+               (lambda (action params callback &optional _errback)
+                 (push (list action params) calls)
+                 (funcall callback '((status . "ok")))
+                 'sent)))
+      (qq-api-set-group-name
+       "20001" "Emacs QQ" (lambda (_response) (push 'name callbacks)))
+      (qq-api-set-group-remark
+       "20001" "Work" (lambda (_response) (push 'remark callbacks)))
+      (qq-api-set-group-whole-mute
+       "20001" nil (lambda (_response) (push 'mute callbacks))))
+    (should
+     (equal
+      (nreverse calls)
+      '(("set_group_name"
+         ((group_id . "20001") (group_name . "Emacs QQ")))
+        ("set_group_remark"
+         ((group_id . "20001") (remark . "Work")))
+        ("set_group_whole_ban"
+         ((group_id . "20001") (enable . :false))))))
+    (should (equal (sort callbacks
+                         (lambda (left right)
+                           (string< (symbol-name left) (symbol-name right))))
+                   '(mute name remark)))
+    (should-error (qq-api-set-group-name "20001" "") :type 'user-error)
+    (should-error (qq-api-set-group-remark 20001 "Work") :type 'user-error)))
+
 (ert-deftest qq-api-send-poke-builds-group-request-and-local-notice ()
   (let (captured-action captured-params applied)
     (qq-state-reset)

@@ -180,6 +180,92 @@
           (qq-backend-cancel-request request))
         (should (equal cancelled "gateway-request"))))))
 
+(ert-deftest qq-backend-gateway-group-profile-uses-owned-directory-state ()
+  (let ((qq-backend 'gateway) profile refreshed)
+    (unwind-protect
+        (progn
+          (qq-state-reset)
+          (qq-state-apply-groups
+           '(((group_id . "8209413637")
+              (group_name . "Protocol Lab")
+              (group_remark . "Lab")
+              (member_count . 3)
+              (max_member_count . 500)
+              (created_at . 1700000000)
+              (description . "Native Gateway")
+              (announcement . "Welcome")
+              (self_permission . "owner"))))
+          (cl-letf (((symbol-function 'qq-backend-refresh-joined-groups)
+                     (lambda (&rest _arguments) (setq refreshed t))))
+            (should-not
+             (qq-backend-get-group
+              "8209413637" (lambda (value) (setq profile value))))
+            (should-not refreshed)
+            (should (equal (alist-get 'group_id profile) "8209413637"))
+            (should (equal (alist-get 'name profile) "Protocol Lab"))
+            (should (= (alist-get 'member_count profile) 3))))
+      (qq-state-reset))))
+
+(ert-deftest qq-backend-group-settings-update-shared-directory-after-receipt ()
+  (let ((qq-backend 'gateway) calls callbacks)
+    (unwind-protect
+        (progn
+          (qq-state-reset)
+          (qq-state-apply-groups
+           '(((group_id . "8209413637")
+              (group_name . "Old")
+              (group_remark . "Old Remark")
+              (member_count . 3)
+              (max_member_count . 500))))
+          (cl-letf
+              (((symbol-function 'qq-gateway-directory-set-group-name)
+                (lambda (group-id value callback &optional _errback)
+                  (push (list 'name group-id value) calls)
+                  (funcall callback '((name . "New")))
+                  "name-request"))
+               ((symbol-function 'qq-gateway-directory-set-group-remark)
+                (lambda (group-id value callback &optional _errback)
+                  (push (list 'remark group-id value) calls)
+                  (funcall callback '((remark . "")))
+                  "remark-request"))
+               ((symbol-function 'qq-gateway-directory-set-group-whole-mute)
+                (lambda (group-id value callback &optional _errback)
+                  (push (list 'mute group-id value) calls)
+                  (funcall callback '((enabled . t)))
+                  "mute-request")))
+            (let ((name-request
+                   (qq-backend-set-group-name
+                    "8209413637" "New"
+                    (lambda (_receipt) (push 'name callbacks))))
+                  (remark-request
+                   (qq-backend-set-group-remark
+                    "8209413637" ""
+                    (lambda (_receipt) (push 'remark callbacks))))
+                  (mute-request
+                   (qq-backend-set-group-whole-mute
+                    "8209413637" t
+                    (lambda (_receipt) (push 'mute callbacks)))))
+              (should (equal (qq-backend-request-token name-request)
+                             "name-request"))
+              (should (equal (qq-backend-request-token remark-request)
+                             "remark-request"))
+              (should (equal (qq-backend-request-token mute-request)
+                             "mute-request"))))
+          (let ((group (qq-state-group "8209413637")))
+            (should (equal (alist-get 'group_name group) "New"))
+            (should-not (alist-get 'group_remark group)))
+          (should (equal (sort callbacks
+                               (lambda (left right)
+                                 (string< (symbol-name left)
+                                          (symbol-name right))))
+                         '(mute name remark)))
+          (should
+           (equal (nreverse calls)
+                  '((name "8209413637" "New")
+                    (remark "8209413637" "")
+                    (mute "8209413637" t)))))
+      (qq-state-reset))))
+
 (ert-deftest qq-backend-gateway-member-search-filters-cached-exact-ids ()
   (let ((qq-backend 'gateway) result fetched)
     (cl-letf (((symbol-function 'qq-gateway-directory-group-member-page)

@@ -564,6 +564,77 @@ force the Account Runtime to replace its generation-local contact cache."
    #'qq-gateway-directory--project-groups
    callback errback))
 
+(defun qq-gateway-directory--validate-group-setting-receipt
+    (receipt owner group-uin field expected)
+  "Validate group-setting RECEIPT for OWNER and exact request values.
+
+GROUP-UIN is the original decimal string.  FIELD and EXPECTED identify the
+single setting returned by the closed Gateway method."
+  (unless (qq-gateway--exact-object-keys-p
+           receipt `(account_id generation group_uin ,field))
+    (error "qq: Gateway group setting receipt has invalid fields"))
+  (unless (and (equal (alist-get 'account_id receipt) (car owner))
+               (equal (alist-get 'generation receipt) (cdr owner))
+               (equal (alist-get 'group_uin receipt) group-uin)
+               (equal (alist-get field receipt 'qq--missing nil #'eq)
+                      expected))
+    (error "qq: Gateway group setting receipt contradicts request"))
+  (copy-tree receipt))
+
+(defun qq-gateway-directory--set-group-setting
+    (method group-uin field value callback errback)
+  "Send one closed group setting METHOD for GROUP-UIN.
+
+FIELD and VALUE are used both as the request pair and receipt discriminator.
+CALLBACK receives the validated generation-owned receipt."
+  (unless (qq-gateway--canonical-decimal-p group-uin)
+    (user-error "qq: Group setting requires an exact decimal group UIN"))
+  (let* ((owner (or (qq-gateway-current-account-owner)
+                    (user-error "qq: Select a Gateway account first")))
+         (_projection (qq-gateway-message--ensure-projection-owner owner)))
+    (qq-gateway--send
+     method
+     `((account_id . ,(car owner))
+       (group_uin . ,group-uin)
+       (,field . ,value))
+     (lambda (raw-result)
+       (condition-case error-data
+           (let ((receipt
+                  (qq-gateway-directory--validate-group-setting-receipt
+                   raw-result owner group-uin field value)))
+             (unless (equal owner (qq-gateway-current-account-owner))
+               (error "qq: Gateway account generation changed during group setting"))
+             (qq-gateway--invoke callback receipt))
+         (error
+          (qq-gateway--client-error
+           errback "invalid_gateway_result" "%s"
+           (error-message-string error-data)))))
+     errback)))
+
+(defun qq-gateway-directory-set-group-name
+    (group-uin name &optional callback errback)
+  "Set GROUP-UIN's public NAME through the native Gateway."
+  (unless (and (stringp name) (not (string-empty-p name)))
+    (user-error "qq: Group name must be a non-empty string"))
+  (qq-gateway-directory--set-group-setting
+   "group.set_name" group-uin 'name name callback errback))
+
+(defun qq-gateway-directory-set-group-remark
+    (group-uin remark &optional callback errback)
+  "Set or clear GROUP-UIN's account-local REMARK through the Gateway."
+  (unless (stringp remark)
+    (user-error "qq: Group remark must be a string"))
+  (qq-gateway-directory--set-group-setting
+   "group.set_remark" group-uin 'remark remark callback errback))
+
+(defun qq-gateway-directory-set-group-whole-mute
+    (group-uin enabled &optional callback errback)
+  "Set GROUP-UIN's whole-group mute state through the native Gateway."
+  (setq enabled (and enabled t))
+  (qq-gateway-directory--set-group-setting
+   "group.set_whole_mute" group-uin 'enabled
+   (if enabled t :false) callback errback))
+
 (defun qq-gateway-directory-list-group-members
     (group-uin callback &optional errback refresh)
   "List exact GROUP-UIN members and call CALLBACK with mapped members.
