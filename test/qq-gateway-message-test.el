@@ -4,6 +4,7 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'qq-gateway-attachment)
 (require 'qq-gateway-message)
 
 (defconst qq-gateway-message-test-capabilities
@@ -27,6 +28,23 @@
 (defun qq-gateway-message-test-text-segment (text)
   "Return a native text segment containing TEXT."
   `((kind . "text") (payload . ((text . ,text)))))
+
+(defun qq-gateway-message-test-ready-image (&optional attachment-id)
+  "Return one ready group-image attachment fixture."
+  `((attachment_id
+     . ,(or attachment-id "att-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"))
+    (resource_id . "res-image-wire")
+    (account_id . "slot-a")
+    (generation . "7")
+    (conversation . ((kind . "group") (group_uin . "8209413637")))
+    (use . ((kind . "image") (summary . "[图片]") (sub_type . 0)))
+    (phase . "ready")
+    (bytes_done . "0")
+    (bytes_total . "3")
+    (fast_path . t)
+    (created_at . 1784700000)
+    (updated_at . 1784700001)
+    (error)))
 
 (cl-defun qq-gateway-message-test-event
     (&key
@@ -165,6 +183,10 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
          (qq-gateway-accounts-changed-hook nil)
          (qq-gateway-current-account-changed-hook nil)
          (qq-gateway-desync-hook nil)
+         (qq-gateway-attachment--attachments
+          (make-hash-table :test #'equal))
+         (qq-gateway-attachment--order nil)
+         (qq-gateway-attachment-changed-hook nil)
          (qq-gateway-message--projection-owner nil)
          (qq-gateway-message--peer-uin-by-uid
           (make-hash-table :test #'equal))
@@ -573,6 +595,58 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
             (should pending)
             (should (equal (alist-get 'segments pending) segments)))
           (should (= (hash-table-count qq-gateway-message--pending-sends) 1)))))))
+
+(ert-deftest qq-gateway-message-send-image-keeps-local-path-off-wire ()
+  (qq-gateway-message-test-with-state
+    (let* ((now (floor (float-time)))
+           (attachment-id "att-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+           (wire-segments
+            `(((type . "image")
+               (data . ((attachment_id . ,attachment-id))))))
+           (optimistic-segments
+            '(((type . "image")
+               (data . ((file . "/tmp/private-source.png")
+                        (summary . "[图片]")
+                        (sub_type . 0))))))
+           sent-params)
+      (qq-gateway-attachment--upsert
+       (qq-gateway-message-test-ready-image attachment-id) 'test)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method params callback _errback &optional _early)
+                   (setq sent-params params)
+                   (funcall callback
+                            `((account_id . "slot-a")
+                              (generation . "7")
+                              (sent_at . ,now)
+                              (server_sequence . "8765432111")
+                              (client_sequence . "42003")
+                              (random . 125)))
+                   "request-image-send")))
+        (should
+         (equal
+          (qq-gateway-message-send
+           "group:8209413637" wire-segments nil nil nil optimistic-segments)
+          "request-image-send"))
+        (should
+         (equal
+          (alist-get 'segments sent-params)
+          `(((kind . "image")
+             (payload . ((attachment_id . ,attachment-id)))))))
+        (should-not
+         (string-match-p "/tmp/private-source\\.png"
+                         (prin1-to-string sent-params)))
+        (let ((pending
+               (seq-find
+                (lambda (message)
+                  (eq (alist-get 'status message) 'pending))
+                (qq-state-session-messages "group:8209413637"))))
+          (should pending)
+          (should (equal (alist-get 'segments pending)
+                         optimistic-segments)))))))
 
 (ert-deftest qq-gateway-message-send-rejects-non-base-face-before-pending ()
   (qq-gateway-message-test-with-state

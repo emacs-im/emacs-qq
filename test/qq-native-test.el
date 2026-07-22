@@ -35,6 +35,11 @@
     (challenge)
     (problem)))
 
+(defun qq-native-test-prepared-image (attachment-id resource-id)
+  "Return the identities reported for one prepared image."
+  `((attachment_id . ,attachment-id)
+    (resource_id . ,resource-id)))
+
 (defconst qq-native-test-members
   '(((user_id . "9007199254740999")
      (uid . "u_alice")
@@ -458,6 +463,185 @@
         (should (equal (nth 0 sent) "group:8209413637"))
         (should (eq (nth 1 sent) segments))
         (should (equal (nth 2 sent) "optimistic"))))))
+
+(ert-deftest qq-native-local-images-finish-concurrently-but-send-in-draft-order ()
+  (let ((path-a (make-temp-file "qq-native-image-a-" nil ".png" "aaa"))
+        (path-b (make-temp-file "qq-native-image-b-" nil ".png" "bbb"))
+        (owner '("slot-a" . "7"))
+        staged sent released-resources)
+    (unwind-protect
+        (let ((segments
+               `(((type . "text") (data . ((text . "before"))))
+                 ((type . "image")
+                  (data . ((file . ,path-a)
+                           (summary . "first")
+                           (sub_type . 0))))
+                 ((type . "text") (data . ((text . "between"))))
+                 ((type . "image")
+                  (data . ((file . ,path-b)
+                           (summary . "second")
+                           (sub_type . 1)))))))
+          (cl-letf
+              (((symbol-function 'qq-gateway-current-account-owner)
+                (lambda () owner))
+               ((symbol-function
+                 'qq-gateway-attachment-stage-and-prepare-image)
+                (lambda (session path summary sub-type callback errback)
+                  (let ((operation
+                         (qq-gateway-attachment-operation-create
+                          :active-p t)))
+                    (push (list session path summary sub-type callback
+                                errback operation)
+                          staged)
+                    operation)))
+               ((symbol-function 'qq-native--release-send-resource)
+                (lambda (resource-id)
+                  (push resource-id released-resources)))
+               ((symbol-function 'qq-gateway-message-send)
+                (lambda (session ready-segments
+                                 &optional raw callback errback optimistic)
+                  (setq sent (list session ready-segments raw callback
+                                   errback optimistic))
+                  "send-request")))
+            (let ((request
+                   (qq-native-send-message
+                    "group:8209413637" segments "optimistic")))
+              (should (qq-native-request-p request))
+              (should (= (length staged) 2))
+              (let* ((entry-b (seq-find (lambda (entry)
+                                          (equal (nth 1 entry) path-b))
+                                        staged))
+                     (operation-b (nth 6 entry-b)))
+                (setf (qq-gateway-attachment-operation-active-p operation-b)
+                      nil)
+                (funcall
+                 (nth 4 entry-b)
+                 (qq-native-test-prepared-image
+                  "att-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                  "res-image-b")))
+              (should-not sent)
+              (let* ((entry-a (seq-find (lambda (entry)
+                                          (equal (nth 1 entry) path-a))
+                                        staged))
+                     (operation-a (nth 6 entry-a)))
+                (setf (qq-gateway-attachment-operation-active-p operation-a)
+                      nil)
+                (funcall
+                 (nth 4 entry-a)
+                 (qq-native-test-prepared-image
+                  "att-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+                  "res-image-a")))
+              (should (equal (qq-native-request-token request) "send-request"))
+              (should (equal (car sent) "group:8209413637"))
+              (should
+               (equal
+                (nth 1 sent)
+                '(((type . "text") (data . ((text . "before"))))
+                  ((type . "image")
+                   (data
+                    . ((attachment_id
+                        . "att-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"))))
+                  ((type . "text") (data . ((text . "between"))))
+                  ((type . "image")
+                   (data
+                    . ((attachment_id
+                        . "att-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")))))))
+              (should (equal (nth 2 sent) "optimistic"))
+              (should (equal (nth 5 sent) segments))
+              (should-not
+               (string-match-p "qq-native-image-"
+                               (prin1-to-string (nth 1 sent))))
+              (should
+               (equal (sort released-resources #'string<)
+                      '("res-image-a" "res-image-b"))))))
+      (delete-file path-a)
+      (delete-file path-b))))
+
+(ert-deftest qq-native-local-image-cancel-stops-before-message-dispatch ()
+  (let ((path (make-temp-file "qq-native-image-cancel-" nil ".png" "abc"))
+        (owner '("slot-a" . "7"))
+        operation sent)
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'qq-gateway-current-account-owner)
+              (lambda () owner))
+             ((symbol-function
+               'qq-gateway-attachment-stage-and-prepare-image)
+              (lambda (&rest _arguments)
+                (setq operation
+                      (qq-gateway-attachment-operation-create :active-p t))))
+             ((symbol-function 'qq-gateway-message-send)
+              (lambda (&rest _arguments) (setq sent t))))
+          (let ((request
+                 (qq-native-send-message
+                  "private:10001"
+                  `(((type . "image") (data . ((file . ,path))))))))
+            (should (qq-gateway-attachment-operation-active-p operation))
+            (qq-native-cancel-request request)
+            (should-not
+             (qq-gateway-attachment-operation-active-p operation))
+            (should-not sent)))
+      (delete-file path))))
+
+(ert-deftest qq-native-local-image-generation-drift-releases-completion ()
+  (let ((path (make-temp-file "qq-native-image-owner-" nil ".png" "abc"))
+        (owner '("slot-a" . "7"))
+        operation ready-callback sent failure
+        released-resources released-attachments)
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'qq-gateway-current-account-owner)
+              (lambda () owner))
+             ((symbol-function
+               'qq-gateway-attachment-stage-and-prepare-image)
+              (lambda (_session _path _summary _sub-type callback _errback)
+                (setq ready-callback callback
+                      operation
+                      (qq-gateway-attachment-operation-create :active-p t))
+                operation))
+             ((symbol-function 'qq-native--release-send-resource)
+              (lambda (resource-id) (push resource-id released-resources)))
+             ((symbol-function 'qq-native--release-send-attachment)
+              (lambda (attachment-id)
+                (push attachment-id released-attachments)))
+             ((symbol-function 'qq-gateway-message-send)
+              (lambda (&rest _arguments) (setq sent t))))
+          (qq-native-send-message
+           "private:10001"
+           `(((type . "image") (data . ((file . ,path)))))
+           nil nil
+           (lambda (body reason) (setq failure (list body reason))))
+          (setq owner '("slot-a" . "8"))
+          (setf (qq-gateway-attachment-operation-active-p operation) nil)
+          (funcall
+           ready-callback
+           (qq-native-test-prepared-image
+            "att-cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+            "res-image-owner"))
+          (should-not sent)
+          (should (equal (cadr failure)
+                         "QQ account generation changed while preparing images"))
+          (should (equal released-resources '("res-image-owner")))
+          (should
+           (equal released-attachments
+                  '("att-cccccccc-cccc-4ccc-8ccc-cccccccccccc"))))
+      (delete-file path))))
+
+(ert-deftest qq-native-url-only-image-fails-before-staging ()
+  (let (staged sent)
+    (cl-letf (((symbol-function
+                'qq-gateway-attachment-stage-and-prepare-image)
+               (lambda (&rest _arguments) (setq staged t)))
+              ((symbol-function 'qq-gateway-message-send)
+               (lambda (&rest _arguments) (setq sent t))))
+      (should-error
+       (qq-native-send-message
+        "private:10001"
+        '(((type . "image")
+           (data . ((url . "https://example.invalid/changeable.png"))))))
+       :type 'user-error)
+      (should-not staged)
+      (should-not sent))))
 
 (ert-deftest qq-native-poke-routes-exact-target ()
   (let (call)
