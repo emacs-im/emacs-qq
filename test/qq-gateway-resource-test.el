@@ -8,7 +8,30 @@
 
 (defconst qq-gateway-resource-test-capabilities
   '("resource.list" "resource.stage_local" "resource.status"
-    "resource.release"))
+    "resource.release" "resource.import.list_sources"
+    "resource.import.list_images" "resource.import.stage_image"))
+
+(defconst qq-gateway-resource-test-source-id
+  (concat "src-linuxqq-" (make-string 64 ?a)))
+
+(defconst qq-gateway-resource-test-candidate-id
+  (concat "imp-linuxqq-" (make-string 64 ?b)))
+
+(defun qq-gateway-resource-test-import-source ()
+  "Return one pathless native-cache source fixture."
+  `((source_id . ,qq-gateway-resource-test-source-id)
+    (layout . "linuxqq.nt_data.images.v1")
+    (kinds . ("image"))))
+
+(defun qq-gateway-resource-test-import-candidate ()
+  "Return one pathless native image candidate fixture."
+  `((candidate_id . ,qq-gateway-resource-test-candidate-id)
+    (layout . "linuxqq.nt_data.images.v1")
+    (family . "picture")
+    (month . "2026-04")
+    (suggested_name . "84306143ce7c58d1997a95b413e5c177.png")
+    (size . "14")
+    (expected_md5 . "84306143ce7c58d1997a95b413e5c177")))
 
 (cl-defun qq-gateway-resource-test-snapshot
     (&key
@@ -138,6 +161,74 @@
        "resource.removed" '((resource_id . "res-opaque-a")))
       (should-not (qq-gateway-resource "res-opaque-a"))
       (should (equal (car changes) '(removed "res-opaque-a"))))))
+
+(ert-deftest qq-gateway-resource-native-import-validators-are-closed-and-pathless ()
+  (let ((source (qq-gateway-resource-test-import-source))
+        (candidate (qq-gateway-resource-test-import-candidate)))
+    (should (qq-gateway-resource--validate-import-source source))
+    (should (qq-gateway-resource--validate-import-candidate candidate))
+    (push '(path . "/private/nt_data") source)
+    (should-error (qq-gateway-resource--validate-import-source source))
+    (setf (alist-get 'size candidate) 14)
+    (should-error (qq-gateway-resource--validate-import-candidate candidate))))
+
+(ert-deftest qq-gateway-resource-native-import-lists-and-stages-with-opaque-identities ()
+  (qq-gateway-resource-test-with-state
+    (let (calls sources page staged)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-resource-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (push (list method params) calls)
+                   (pcase method
+                     ("resource.import.list_sources"
+                      (funcall callback
+                               `((sources
+                                  . (,(qq-gateway-resource-test-import-source))))))
+                     ("resource.import.list_images"
+                      (funcall callback
+                               `((source_id . ,qq-gateway-resource-test-source-id)
+                                 (candidates
+                                  . (,(qq-gateway-resource-test-import-candidate)))
+                                 (next))))
+                     ("resource.import.stage_image"
+                      (funcall callback
+                               `((source_id . ,qq-gateway-resource-test-source-id)
+                                 (candidate_id
+                                  . ,qq-gateway-resource-test-candidate-id)
+                                 (resource
+                                  . ,(qq-gateway-resource-test-snapshot))))))
+                   method)))
+        (qq-gateway-resource-import-sources
+         (lambda (value) (setq sources value)))
+        (qq-gateway-resource-import-images
+         qq-gateway-resource-test-source-id nil 25
+         (lambda (value) (setq page value)))
+        (qq-gateway-resource-import-image
+         qq-gateway-resource-test-source-id
+         qq-gateway-resource-test-candidate-id
+         (lambda (value) (setq staged value)))
+        (should (equal sources (list (qq-gateway-resource-test-import-source))))
+        (should
+         (equal (alist-get 'candidates page)
+                (list (qq-gateway-resource-test-import-candidate))))
+        (should (equal (alist-get 'phase staged) "staging"))
+        (should (qq-gateway-resource "res-opaque-a"))
+        (should
+         (member
+          `("resource.import.list_images"
+            ((source_id . ,qq-gateway-resource-test-source-id)
+             (after)
+             (limit . 25)))
+          calls))
+        (should
+         (member
+          `("resource.import.stage_image"
+            ((source_id . ,qq-gateway-resource-test-source-id)
+             (candidate_id . ,qq-gateway-resource-test-candidate-id)))
+          calls))))))
 
 (ert-deftest qq-gateway-resource-ready-and-lag-errors-request-one-resync ()
   (qq-gateway-resource-test-with-state
