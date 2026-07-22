@@ -329,7 +329,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
          (insert "\n")
          (qq-group--insert-action-buttons)
          (appkit-view-insert-note-line
-          "g 刷新 · N 群名 · R 备注 · M 全员禁言 · m 群聊 · s 成员 · n 公告 · q 退出")
+          "g 刷新 · N 群名 · R 备注 · M 全员禁言 · s 成员（结果页 C 名片 / T 头衔） · q 退出")
          (insert "\n")
          (appkit-view-insert-heading-line "资料" :face 'bold)
          (let ((name (qq-group--present-string

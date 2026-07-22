@@ -3080,6 +3080,47 @@ CALLBACK receives the successful OneBot response."
        (funcall callback response)))
    (or errback #'qq-api--default-error)))
 
+(defun qq-api-set-group-member-card
+    (group-id user-id card &optional callback errback)
+  "Set or clear USER-ID's CARD in GROUP-ID through NapCat OneBot.
+
+An empty CARD clears the group card.  CALLBACK receives the successful
+OneBot response."
+  (unless (qq-api-group-id-p group-id)
+    (user-error "qq: group member card requires a canonical uint32 group UIN"))
+  (unless (qq-api-user-id-p user-id)
+    (user-error "qq: group member card requires a canonical decimal user UIN"))
+  (unless (stringp card)
+    (user-error "qq: group member card must be a string"))
+  (qq-api-call
+   "set_group_card"
+   `((group_id . ,group-id) (user_id . ,user-id) (card . ,card))
+   (lambda (response)
+     (when callback
+       (funcall callback response)))
+   (or errback #'qq-api--default-error)))
+
+(defun qq-api-set-group-member-special-title
+    (group-id user-id special-title &optional callback errback)
+  "Set or clear USER-ID's SPECIAL-TITLE in GROUP-ID through NapCat OneBot.
+
+An empty SPECIAL-TITLE clears it.  CALLBACK receives the successful response."
+  (unless (qq-api-group-id-p group-id)
+    (user-error "qq: special title requires a canonical uint32 group UIN"))
+  (unless (qq-api-user-id-p user-id)
+    (user-error "qq: special title requires a canonical decimal user UIN"))
+  (unless (stringp special-title)
+    (user-error "qq: special title must be a string"))
+  (qq-api-call
+   "set_group_special_title"
+   `((group_id . ,group-id)
+     (user_id . ,user-id)
+     (special_title . ,special-title))
+   (lambda (response)
+     (when callback
+       (funcall callback response)))
+   (or errback #'qq-api--default-error)))
+
 (defun qq-api-get-avatar (user-id callback &optional errback no-cache)
   "Fetch avatar resource for USER-ID and pass it to CALLBACK."
   (qq-api-call

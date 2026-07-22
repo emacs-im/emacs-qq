@@ -635,6 +635,86 @@ CALLBACK receives the validated generation-owned receipt."
    "group.set_whole_mute" group-uin 'enabled
    (if enabled t :false) callback errback))
 
+(defun qq-gateway-directory--validate-group-member-setting-receipt
+    (receipt owner group-uin target-uin field expected)
+  "Validate one group-member setting RECEIPT against its closed request."
+  (unless (qq-gateway--exact-object-keys-p
+           receipt `(account_id generation group_uin target_uin ,field))
+    (error "qq: Gateway group-member setting receipt has invalid fields"))
+  (unless (and (equal (alist-get 'account_id receipt) (car owner))
+               (equal (alist-get 'generation receipt) (cdr owner))
+               (equal (alist-get 'group_uin receipt) group-uin)
+               (equal (alist-get 'target_uin receipt) target-uin)
+               (equal (alist-get field receipt 'qq--missing nil #'eq)
+                      expected))
+    (error "qq: Gateway group-member setting receipt contradicts request"))
+  (copy-tree receipt))
+
+(defun qq-gateway-directory--apply-group-member-setting
+    (group-uin target-uin field value)
+  "Apply confirmed FIELD VALUE to cached TARGET-UIN in GROUP-UIN.
+
+The directory never creates an incomplete page or member from a mutation
+receipt."
+  (when-let* ((page (gethash group-uin
+                             qq-gateway-directory--member-pages))
+              (member
+               (seq-find
+                (lambda (candidate)
+                  (equal (alist-get 'user_id candidate) target-uin))
+                (alist-get 'members page))))
+    (setf (alist-get field member nil nil #'eq)
+          (and (not (string-empty-p value)) value))))
+
+(defun qq-gateway-directory--set-group-member-setting
+    (method group-uin target-uin field cache-field value callback errback)
+  "Send closed group-member setting METHOD and validate its receipt."
+  (unless (qq-gateway--canonical-decimal-p group-uin)
+    (user-error "qq: Group-member setting requires an exact group UIN"))
+  (unless (qq-gateway--canonical-decimal-p target-uin)
+    (user-error "qq: Group-member setting requires an exact target UIN"))
+  (unless (stringp value)
+    (user-error "qq: Group-member setting value must be a string"))
+  (let* ((owner (or (qq-gateway-current-account-owner)
+                    (user-error "qq: Select a Gateway account first")))
+         (_projection (qq-gateway-message--ensure-projection-owner owner)))
+    (qq-gateway--send
+     method
+     `((account_id . ,(car owner))
+       (group_uin . ,group-uin)
+       (target_uin . ,target-uin)
+       (,field . ,value))
+     (lambda (raw-result)
+       (condition-case error-data
+           (let ((receipt
+                  (qq-gateway-directory--validate-group-member-setting-receipt
+                   raw-result owner group-uin target-uin field value)))
+             (unless (equal owner (qq-gateway-current-account-owner))
+               (error
+                "qq: Gateway account generation changed during group-member setting"))
+             (qq-gateway-directory--apply-group-member-setting
+              group-uin target-uin cache-field value)
+             (qq-gateway--invoke callback receipt))
+         (error
+          (qq-gateway--client-error
+           errback "invalid_gateway_result" "%s"
+           (error-message-string error-data)))))
+     errback)))
+
+(defun qq-gateway-directory-set-group-member-card
+    (group-uin target-uin card &optional callback errback)
+  "Set or clear TARGET-UIN's CARD in GROUP-UIN through the Gateway."
+  (qq-gateway-directory--set-group-member-setting
+   "group.set_member_card" group-uin target-uin 'card 'card card
+   callback errback))
+
+(defun qq-gateway-directory-set-group-member-special-title
+    (group-uin target-uin special-title &optional callback errback)
+  "Set or clear TARGET-UIN's SPECIAL-TITLE in GROUP-UIN through Gateway."
+  (qq-gateway-directory--set-group-member-setting
+   "group.set_member_special_title" group-uin target-uin
+   'special_title 'title special-title callback errback))
+
 (defun qq-gateway-directory-list-group-members
     (group-uin callback &optional errback refresh)
   "List exact GROUP-UIN members and call CALLBACK with mapped members.
