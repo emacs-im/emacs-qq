@@ -180,6 +180,12 @@
                       (qq-gateway--canonical-decimal-p
                        (alist-get 'message_id target)))
            (error "qq: Gateway reply target is malformed"))))
+      ("record"
+       (unless (and (qq-gateway--exact-object-keys-p
+                     payload '(duration_seconds))
+                    (qq-gateway-message--uint32-p
+                     (alist-get 'duration_seconds payload)))
+         (error "qq: Gateway record segment is malformed")))
       ("unsupported"
        (unless (qq-gateway-message--closed-object-p
                 payload '(native_keys summary) '(raw))

@@ -259,6 +259,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                    . ((kind . "unresolved")
                       (message_id . "7348923749823749111"))))))
             '((kind . "face") (payload . ((id . "178"))))
+            '((kind . "record") (payload . ((duration_seconds . 17))))
             '((kind . "unsupported")
               (payload
                . ((native_keys . ("text.pb_reserve"))
@@ -291,15 +292,31 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (should (equal (alist-get 'mention-kinds message) '(at-me)))
         (should (eq (alist-get 'status message) 'received))
         (should (equal (mapcar (lambda (it) (alist-get 'type it)) internal)
-                       '("text" "at" "reply" "face" "__unsupported")))
+                       '("text" "at" "reply" "face" "record"
+                         "__unsupported")))
         (should
          (equal
           (alist-get 'message_id (alist-get 'data (nth 2 internal)))
           "7348923749823749111"))
         (should (equal (alist-get 'id (alist-get 'data (nth 3 internal)))
                        "178"))
+        (should (= (alist-get 'duration_seconds
+                              (alist-get 'data (nth 4 internal)))
+                   17))
         (should (equal (alist-get 'title (qq-state-session session-key))
                        "Protocol Lab"))))))
+
+(ert-deftest qq-gateway-message-record-duration-is-closed-uint32 ()
+  (let ((record '((kind . "record")
+                  (payload . ((duration_seconds . 17))))))
+    (should (qq-gateway-message--validate-segment record))
+    (dolist (duration '(-1 4294967296 "17"))
+      (let ((malformed (copy-tree record)))
+        (setf (alist-get 'duration_seconds (alist-get 'payload malformed))
+              duration)
+        (should-error (qq-gateway-message--validate-segment malformed))))
+    (push '(file_uuid . "must-stay-native") (alist-get 'payload record))
+    (should-error (qq-gateway-message--validate-segment record))))
 
 (ert-deftest qq-gateway-message-projects-private-peer-by-self-endpoint ()
   (qq-gateway-message-test-with-state
