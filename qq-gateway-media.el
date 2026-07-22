@@ -274,38 +274,101 @@ CALLBACK receives the projected snapshot; ERRBACK receives failure details."
    errback))
 
 (defun qq-gateway-media-materialize (media-id &optional callback errback)
-  "Materialize remote MEDIA-ID into one immutable native resource.
+  "Start materializing remote MEDIA-ID without waiting for its download.
 
-CALLBACK receives the linked media/resource pair; ERRBACK receives failure
-details."
+CALLBACK receives the current media snapshot, normally in `materializing'
+phase.  Progress and completion arrive through `media.changed'.  ERRBACK
+receives failure details."
   (unless (qq-gateway-media--id-p media-id)
     (user-error "qq: Media ID must be an opaque media- UUID"))
   (qq-gateway--send
    "media.materialize" `((media_id . ,media-id))
    (lambda (result)
      (condition-case error-data
-         (progn
-           (unless (qq-gateway--exact-object-keys-p result '(media resource))
-             (error "qq: Gateway media.materialize result has invalid fields"))
-           (let* ((media (qq-gateway-media--validate-snapshot
-                          (alist-get 'media result)))
-                  (resource (qq-gateway-resource--validate-snapshot
-                             (alist-get 'resource result)))
-                  (resource-id (alist-get 'resource_id resource)))
-             (unless (and (equal (alist-get 'media_id media) media-id)
-                          (equal (alist-get 'phase media) "materialized")
-                          (equal (alist-get 'resource_id media) resource-id))
-               (error "qq: Gateway media.materialize identities contradict"))
-             (setq media (qq-gateway-media--upsert media 'materialize-response)
-                   resource (qq-gateway-resource--upsert
-                             resource 'media-materialize-response))
-             (qq-gateway--invoke
-              callback `((media . ,media) (resource . ,resource)))))
+         (let ((media
+                (qq-gateway-media--validate-single-result
+                 result "media.materialize")))
+           (unless (and (equal (alist-get 'media_id media) media-id)
+                        (member (alist-get 'phase media)
+                                '("materializing" "materialized")))
+             (error "qq: Gateway media.materialize state contradicts request"))
+           (qq-gateway--invoke
+            callback (qq-gateway-media--upsert media 'materialize-response)))
        (error
         (qq-gateway--client-error
          errback "invalid_gateway_result" "%s"
          (error-message-string error-data)))))
    errback))
+
+(defun qq-gateway-media-cancel (media-id &optional callback errback)
+  "Idempotently cancel active materialization of remote MEDIA-ID.
+
+Completed media stays materialized.  An active operation returns to
+`available', preserving the reusable remote handle."
+  (unless (qq-gateway-media--id-p media-id)
+    (user-error "qq: Media ID must be an opaque media- UUID"))
+  (qq-gateway--send
+   "media.cancel" `((media_id . ,media-id))
+   (lambda (result)
+     (condition-case error-data
+         (let ((media
+                (qq-gateway-media--validate-single-result
+                 result "media.cancel")))
+           (unless (equal (alist-get 'media_id media) media-id)
+             (error "qq: Gateway media.cancel identity contradicts request"))
+           (qq-gateway--invoke
+            callback (qq-gateway-media--upsert media 'cancel-response)))
+       (error
+        (qq-gateway--client-error
+         errback "invalid_gateway_result" "%s"
+         (error-message-string error-data)))))
+   errback))
+
+(defun qq-gateway-media-await-materialized (media-id callback errback)
+  "Observe MEDIA-ID until it materializes or reaches another terminal state.
+
+Return a function that removes only this local observer.  CALLBACK receives
+the materialized media snapshot."
+  (unless (qq-gateway-media--id-p media-id)
+    (user-error "qq: Media ID must be an opaque media- UUID"))
+  (let (observer finished)
+    (setq observer
+          (lambda (_reason changed-id)
+            (when (and (not finished)
+                       (or (null changed-id) (equal changed-id media-id)))
+              (let ((media (qq-gateway-media media-id)))
+                (cond
+                 ((null media)
+                  (setq finished t)
+                  (remove-hook 'qq-gateway-media-changed-hook observer)
+                  (qq-gateway--client-error
+                   errback "media_disappeared" "Remote media disappeared"))
+                 ((equal (alist-get 'phase media) "materialized")
+                  (setq finished t)
+                  (remove-hook 'qq-gateway-media-changed-hook observer)
+                  (qq-gateway--invoke callback media))
+                 ((equal (alist-get 'phase media) "failed")
+                  (setq finished t)
+                  (remove-hook 'qq-gateway-media-changed-hook observer)
+                  (let ((problem (alist-get 'error media)))
+                    (qq-gateway--client-error
+                     errback
+                     (or (alist-get 'code problem) "media_materialize_failed")
+                     "%s"
+                     (or (alist-get 'message problem)
+                         "Remote media materialization failed"))))
+                 ((equal (alist-get 'phase media) "available")
+                  (setq finished t)
+                  (remove-hook 'qq-gateway-media-changed-hook observer)
+                  (qq-gateway--client-error
+                   errback "media_materialize_canceled"
+                   "Remote media materialization was canceled")))))))
+    (add-hook 'qq-gateway-media-changed-hook observer)
+    (funcall observer 'initial media-id)
+    (lambda ()
+      (unless finished
+        (setq finished t)
+        (remove-hook 'qq-gateway-media-changed-hook observer)))))
 
 (defun qq-gateway-media-release (media-id &optional callback errback)
   "Idempotently release remote MEDIA-ID without releasing its resources.
@@ -342,11 +405,21 @@ CALLBACK receives the release receipt; ERRBACK receives failure details."
     (setf (qq-gateway-media-operation-wait-cancel operation) nil)))
 
 (defun qq-gateway-media-cancel-operation (operation)
-  "Cancel client ownership of playback-preparation OPERATION."
+  "Cancel playback-preparation OPERATION locally and in the service."
   (when (and (qq-gateway-media-operation-p operation)
              (qq-gateway-media-operation-active-p operation))
     (setf (qq-gateway-media-operation-active-p operation) nil)
     (qq-gateway-media--cancel-operation-local operation)
+    (when (qq-gateway--method-available-p "media.cancel")
+      (condition-case error-data
+          (qq-gateway-media-cancel
+           (qq-gateway-media-operation-media-id operation)
+           nil
+           (lambda (_body failure)
+             (message "qq: Media cancellation failed: %s" failure)))
+        (error
+         (message "qq: Media cancellation failed: %s"
+                  (error-message-string error-data)))))
     t))
 
 (defun qq-gateway-media--owner-current-p (operation)
@@ -477,26 +550,50 @@ Return a cancellable `qq-gateway-media-operation'."
                 (_
                  (remhash media-id qq-gateway-media--playable-resources)
                  (derive-playable source))))))
-         (materialized
-          (result)
+         (source-status
+          (resource)
           (when (qq-gateway-media-operation-active-p operation)
-            (setf (qq-gateway-media-operation-request-id operation) nil)
-            (let* ((media (alist-get 'media result))
-                   (resource (alist-get 'resource result))
-                   (account-id (alist-get 'account_id media)))
+            (setf (qq-gateway-media-operation-request-id operation) nil
+                  (qq-gateway-media-operation-source-resource-id operation)
+                  (alist-get 'resource_id resource))
+            (await-resource (alist-get 'resource_id resource) #'source-ready)))
+         (materialized
+          (media)
+          (when (qq-gateway-media-operation-active-p operation)
+            (setf (qq-gateway-media-operation-wait-cancel operation) nil)
+            (let ((account-id (alist-get 'account_id media))
+                  (resource-id (alist-get 'resource_id media)))
               (if (not (and (ensure-owner)
                             (equal account-id
                                    (car (qq-gateway-media-operation-owner operation)))))
                   (when (qq-gateway-media-operation-active-p operation)
                     (fail nil "Remote record belongs to another managed account"))
-                (setf (qq-gateway-media-operation-source-resource-id operation)
-                      (alist-get 'resource_id resource))
-                (await-resource (alist-get 'resource_id resource)
-                                #'source-ready))))))
+                (start-request
+                 'source-resource-status
+                 (lambda ()
+                   (qq-gateway-resource-status
+                    resource-id #'source-status #'fail)))))))
+         (await-media
+          ()
+          (let ((marker (list 'media-wait)))
+            (setf (qq-gateway-media-operation-wait-cancel operation) marker)
+            (let ((cancel
+                   (qq-gateway-media-await-materialized
+                    media-id #'materialized #'fail)))
+              (when (eq marker
+                        (qq-gateway-media-operation-wait-cancel operation))
+                (setf (qq-gateway-media-operation-wait-cancel operation)
+                      cancel)))))
+         (materialize-started
+          (_media)
+          (when (qq-gateway-media-operation-active-p operation)
+            (setf (qq-gateway-media-operation-request-id operation) nil)
+            (await-media))))
       (start-request
        'media-materialize
        (lambda ()
-         (qq-gateway-media-materialize media-id #'materialized #'fail)))
+         (qq-gateway-media-materialize
+          media-id #'materialize-started #'fail)))
       operation)))
 
 (defun qq-gateway-media--drop-stale-playable-resources (_reason resource-id)

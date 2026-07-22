@@ -18,7 +18,7 @@
 (defconst qq-gateway--account-phases
   '("stopped" "starting" "login_required" "logging_in" "online"
     "reconnecting" "stopping" "logged_out" "failed")
-  "Closed account phase vocabulary for native service protocol v1.")
+  "Closed account phase vocabulary for native service protocol v2.")
 
 (defvar qq-gateway-accounts-changed-hook nil
   "Hook called with REASON and ACCOUNT-ID after the local registry changes.

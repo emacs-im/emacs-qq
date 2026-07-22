@@ -16,7 +16,7 @@
 (require 'websocket)
 (require 'qq-customize)
 
-(defconst qq-gateway-transport-protocol-version 1
+(defconst qq-gateway-transport-protocol-version 2
   "Native Gateway protocol version implemented by this client.")
 
 (defvar qq-gateway-transport-event-hook nil
