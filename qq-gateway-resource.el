@@ -332,6 +332,42 @@ validated staging snapshot; ERRBACK follows the Gateway convention."
            (error-message-string error-data)))))
      errback)))
 
+(defun qq-gateway-resource-derive-record
+    (source-resource-id &optional suggested-name callback errback)
+  "Derive message-ready Tencent Silk from SOURCE-RESOURCE-ID.
+
+The source must be a ready mono PCM WAV accepted by the native service.
+SUGGESTED-NAME, when non-nil, names the distinct derived resource.  CALLBACK
+receives its validated staging snapshot; source and result retain independent
+lifecycle and release operations."
+  (unless (qq-gateway-resource--opaque-id-p source-resource-id)
+    (user-error "qq: Record source ID must be an opaque res- identity"))
+  (when (and suggested-name
+             (not (qq-gateway-resource--safe-name-p suggested-name)))
+    (user-error "qq: Derived record name must be a safe basename"))
+  (qq-gateway--send
+   "resource.derive_record"
+   `((source_resource_id . ,source-resource-id)
+     (suggested_name . ,suggested-name))
+   (lambda (result)
+     (condition-case error-data
+         (let ((snapshot
+                (qq-gateway-resource--validate-single-result
+                 result "resource.derive_record")))
+           (unless (equal (alist-get 'phase snapshot) "staging")
+             (error "qq: Gateway derived record response is not staging"))
+           (when (equal (alist-get 'resource_id snapshot) source-resource-id)
+             (error "qq: Gateway record derivation reused its source identity"))
+           (setq snapshot
+                 (qq-gateway-resource--upsert
+                  snapshot 'derive-record-response))
+           (qq-gateway--invoke callback snapshot))
+       (error
+        (qq-gateway--client-error
+         errback "invalid_gateway_result" "%s"
+         (error-message-string error-data)))))
+   errback))
+
 (defun qq-gateway-resource--validate-import-source (source)
   "Validate and copy one closed native-cache SOURCE snapshot."
   (unless (qq-gateway--exact-object-keys-p source '(source_id layout kinds))

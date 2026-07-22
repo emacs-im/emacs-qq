@@ -44,6 +44,7 @@ request callbacks and temporary resource/attachment identities created on
 behalf of one caller."
   active-p
   request-id
+  source-resource-id
   resource-id
   attachment-id
   resource-wait-cancel
@@ -528,9 +529,9 @@ state."
                  ((null resource)
                   (setq finished t)
                   (remove-hook 'qq-gateway-resource-changed-hook observer)
-                  (qq-gateway--client-error
+                 (qq-gateway--client-error
                    errback "resource_disappeared"
-                   "Staged image resource disappeared"))
+                   "Staged resource disappeared"))
                  ((equal (alist-get 'phase resource) "ready")
                   (setq finished t)
                   (remove-hook 'qq-gateway-resource-changed-hook observer)
@@ -544,7 +545,7 @@ state."
                      (or (alist-get 'code problem) "resource_released")
                      "%s"
                      (or (alist-get 'message problem)
-                         "Staged image resource was released")))))))))
+                         "Staged resource was released")))))))))
     (add-hook 'qq-gateway-resource-changed-hook observer)
     (funcall observer 'initial resource-id)
     (lambda ()
@@ -582,12 +583,19 @@ state."
     (condition-case nil
         (qq-gateway-attachment-release attachment-id)
       (error nil)))
-  (when-let* ((resource-id
-               (qq-gateway-attachment-operation-resource-id operation)))
-    (setf (qq-gateway-attachment-operation-resource-id operation) nil)
-    (condition-case nil
-        (qq-gateway-resource-release resource-id)
-      (error nil))))
+  (let ((resource-ids
+         (delete-dups
+          (delq nil
+                (list
+                 (qq-gateway-attachment-operation-resource-id operation)
+                 (qq-gateway-attachment-operation-source-resource-id
+                  operation))))))
+    (setf (qq-gateway-attachment-operation-resource-id operation) nil
+          (qq-gateway-attachment-operation-source-resource-id operation) nil)
+    (dolist (resource-id resource-ids)
+      (condition-case nil
+          (qq-gateway-resource-release resource-id)
+        (error nil)))))
 
 (defun qq-gateway-attachment-cancel-operation (operation)
   "Cancel unfinished stage-and-prepare OPERATION idempotently.
@@ -610,14 +618,15 @@ never stops an account or the long-lived service."
     (qq-gateway-attachment--release-created operation)
     (qq-gateway--invoke errback body reason)))
 
-(defun qq-gateway-attachment-stage-and-prepare-image
-    (session-key path &optional summary sub-type callback errback)
-  "Stage local PATH and prepare one ready image for SESSION-KEY.
+(defun qq-gateway-attachment--stage-transform-and-prepare
+    (path media-name transform-phase transform prepare callback errback)
+  "Stage PATH, run TRANSFORM, then PREPARE it for one target.
 
-CALLBACK runs only after the Prepared Attachment reaches `ready'.  The local
-path is used solely by `resource.stage_local' and is not retained in either
-service projection.  Return a cancellable local operation; canceling it also
-best-effort releases any resource or attachment already created for it."
+MEDIA-NAME and TRANSFORM-PHASE describe lifecycle errors.  TRANSFORM receives
+the ready source resource plus success and failure callbacks.  PREPARE receives
+the final ready resource ID plus success and failure callbacks.  CALLBACK runs
+only after the Prepared Attachment reaches `ready'.  Return a cancellable
+local operation that owns every service object created before that handoff."
   (let* ((path (expand-file-name path))
          (owner (or (qq-gateway-current-account-owner)
                     (user-error "qq: Select a QQ account first")))
@@ -628,6 +637,48 @@ best-effort releases any resource or attachment already created for it."
           (body reason)
           (qq-gateway-attachment--fail-operation
            operation errback body reason))
+         (release-source
+          ()
+          (when-let* ((resource-id
+                       (qq-gateway-attachment-operation-source-resource-id
+                        operation)))
+            (setf
+             (qq-gateway-attachment-operation-source-resource-id operation)
+             nil)
+            (condition-case nil
+                (qq-gateway-resource-release resource-id)
+              (error nil))))
+         (start-request
+          (tag thunk)
+          (let ((marker (list tag)))
+            (setf (qq-gateway-attachment-operation-request-id operation)
+                  marker)
+            (condition-case error-data
+                (let ((request-id (funcall thunk)))
+                  (when (eq marker
+                            (qq-gateway-attachment-operation-request-id
+                             operation))
+                    (setf
+                     (qq-gateway-attachment-operation-request-id operation)
+                     request-id)))
+              (error
+               (fail nil (error-message-string error-data))))))
+         (await-resource
+          (resource-id ready-callback)
+          (let ((marker (list 'resource-wait)))
+            (setf
+             (qq-gateway-attachment-operation-resource-wait-cancel operation)
+             marker)
+            (let ((cancel
+                   (qq-gateway-attachment--await-resource
+                    resource-id ready-callback #'fail)))
+              (when (eq marker
+                        (qq-gateway-attachment-operation-resource-wait-cancel
+                         operation))
+                (setf
+                 (qq-gateway-attachment-operation-resource-wait-cancel
+                  operation)
+                 cancel)))))
          (await-attachment
           (attachment)
           (when (qq-gateway-attachment-operation-active-p operation)
@@ -647,8 +698,11 @@ best-effort releases any resource or attachment already created for it."
                             (qq-gateway-attachment-operation-active-p operation)
                           (if (not (equal owner
                                           (qq-gateway-current-account-owner)))
-                              (fail nil
-                                    "QQ account generation changed during image preparation")
+                              (fail
+                               nil
+                               (format
+                                "QQ account generation changed during %s preparation"
+                                media-name))
                             (setf
                              (qq-gateway-attachment-operation-active-p operation)
                              nil
@@ -662,55 +716,78 @@ best-effort releases any resource or attachment already created for it."
                            operation))
                   (setf
                    (qq-gateway-attachment-operation-attachment-wait-cancel
-                    operation)
+                   operation)
                    cancel))))))
-         (prepare
+         (prepare-final
           (_resource)
           (when (qq-gateway-attachment-operation-active-p operation)
             (setf (qq-gateway-attachment-operation-resource-wait-cancel
                    operation)
                   nil)
             (if (not (equal owner (qq-gateway-current-account-owner)))
-                (fail nil "QQ account generation changed during image staging")
-              (let ((marker (list 'attachment-prepare)))
-                (setf (qq-gateway-attachment-operation-request-id operation)
-                      marker)
-                (condition-case error-data
-                    (let ((request-id
-                           (qq-gateway-attachment-prepare-image
-                            session-key
-                            (qq-gateway-attachment-operation-resource-id
-                             operation)
-                            summary sub-type #'await-attachment #'fail)))
-                      (when (eq marker
-                                (qq-gateway-attachment-operation-request-id
-                                 operation))
-                        (setf
-                         (qq-gateway-attachment-operation-request-id operation)
-                         request-id)))
-                  (error
-                   (fail nil (error-message-string error-data))))))))
+                (fail
+                 nil
+                 (format "QQ account generation changed during %s"
+                         transform-phase))
+              (start-request
+               'attachment-prepare
+               (lambda ()
+                 (funcall
+                  prepare
+                  (qq-gateway-attachment-operation-resource-id operation)
+                  #'await-attachment #'fail))))))
+         (transform-complete
+          (resource)
+          (when (qq-gateway-attachment-operation-active-p operation)
+            (let* ((resource-id (alist-get 'resource_id resource))
+                   (source-id
+                    (qq-gateway-attachment-operation-source-resource-id
+                     operation)))
+              (setf (qq-gateway-attachment-operation-request-id operation) nil
+                    (qq-gateway-attachment-operation-resource-id operation)
+                    resource-id)
+              (when (equal source-id resource-id)
+                (setf
+                 (qq-gateway-attachment-operation-source-resource-id operation)
+                 nil))
+              (if (not (equal owner (qq-gateway-current-account-owner)))
+                  (fail
+                   nil
+                   (format "QQ account generation changed during %s"
+                           transform-phase))
+                ;; A distinct derived resource no longer depends on the staged
+                ;; source once the transform request has returned.
+                (release-source)
+                (await-resource resource-id #'prepare-final)))))
+         (source-ready
+          (resource)
+          (when (qq-gateway-attachment-operation-active-p operation)
+            (setf (qq-gateway-attachment-operation-resource-wait-cancel
+                   operation)
+                  nil)
+            (if (not (equal owner (qq-gateway-current-account-owner)))
+                (fail
+                 nil
+                 (format "QQ account generation changed during %s staging"
+                         media-name))
+              (start-request
+               'resource-transform
+               (lambda ()
+                 (funcall transform resource #'transform-complete #'fail))))))
          (stage-complete
           (resource)
           (when (qq-gateway-attachment-operation-active-p operation)
             (let* ((resource-id (alist-get 'resource_id resource))
-                   (marker (list 'resource-wait)))
+                   (source-id
+                    (qq-gateway-attachment-operation-source-resource-id
+                     operation)))
               (setf (qq-gateway-attachment-operation-request-id operation) nil
-                    (qq-gateway-attachment-operation-resource-id operation)
-                    resource-id
-                    (qq-gateway-attachment-operation-resource-wait-cancel
+                    (qq-gateway-attachment-operation-source-resource-id
                      operation)
-                    marker)
-              (let ((cancel
-                     (qq-gateway-attachment--await-resource
-                      resource-id #'prepare #'fail)))
-                (when (eq marker
-                          (qq-gateway-attachment-operation-resource-wait-cancel
-                           operation))
-                  (setf
-                   (qq-gateway-attachment-operation-resource-wait-cancel
-                    operation)
-                   cancel)))))))
+                    resource-id)
+              (when (and source-id (not (equal source-id resource-id)))
+                (error "qq: Resource stage changed identity within one operation"))
+              (await-resource resource-id #'source-ready)))))
       (let ((marker (list 'resource-stage)))
         (setf (qq-gateway-attachment-operation-request-id operation) marker)
         (condition-case error-data
@@ -727,6 +804,40 @@ best-effort releases any resource or attachment already created for it."
            (qq-gateway-attachment--release-created operation)
            (signal (car error-data) (cdr error-data)))))
       operation)))
+
+(defun qq-gateway-attachment-stage-and-prepare-image
+    (session-key path &optional summary sub-type callback errback)
+  "Stage local PATH and prepare one ready image for SESSION-KEY.
+
+CALLBACK runs only after the Prepared Attachment reaches `ready'.  Return a
+cancellable local operation; canceling it also best-effort releases every
+resource or attachment already created for it."
+  (qq-gateway-attachment--stage-transform-and-prepare
+   path "image" "image staging"
+   (lambda (resource success _failure)
+     (funcall success resource))
+   (lambda (resource-id success failure)
+     (qq-gateway-attachment-prepare-image
+      session-key resource-id summary sub-type success failure))
+   callback errback))
+
+(defun qq-gateway-attachment-stage-and-prepare-record
+    (session-key path &optional callback errback)
+  "Stage PCM WAV at PATH and prepare one native record for SESSION-KEY.
+
+The account-neutral source is derived into a distinct Tencent Silk resource.
+Once derivation succeeds, the temporary WAV resource is released while the
+Silk resource proceeds through target-scoped attachment preparation.  Return a
+cancellable operation with the same ownership semantics as the image helper."
+  (qq-gateway-attachment--stage-transform-and-prepare
+   path "record" "record derivation"
+   (lambda (resource success failure)
+     (qq-gateway-resource-derive-record
+      (alist-get 'resource_id resource) nil success failure))
+   (lambda (resource-id success failure)
+     (qq-gateway-attachment-prepare-record
+      session-key resource-id success failure))
+   callback errback))
 
 (defun qq-gateway-attachment-assert-sendable
     (attachment-id session-key owner &optional expected-use)

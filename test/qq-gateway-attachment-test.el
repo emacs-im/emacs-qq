@@ -301,6 +301,89 @@
               (should (equal (alist-get 'phase delivered) "ready"))))
         (delete-file path)))))
 
+(ert-deftest qq-gateway-attachment-record-releases-source-after-derivation ()
+  (qq-gateway-attachment-test-with-state
+    (let ((path (make-temp-file "qq-record-" nil ".wav" "pcm"))
+          derived-source prepared-resource delivered released)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'qq-gateway-resource-stage-local)
+                (lambda (_path _name _digest success _failure)
+                  (puthash "res-record-source"
+                           '((resource_id . "res-record-source")
+                             (phase . "ready"))
+                           qq-gateway-resource--resources)
+                  (funcall success
+                           '((resource_id . "res-record-source")
+                             (phase . "staging")))
+                  "stage-request"))
+               ((symbol-function 'qq-gateway-resource-derive-record)
+                (lambda (source-id _name success _failure)
+                  (setq derived-source source-id)
+                  (puthash "res-record-a"
+                           '((resource_id . "res-record-a") (phase . "ready"))
+                           qq-gateway-resource--resources)
+                  (funcall success
+                           '((resource_id . "res-record-a")
+                             (phase . "staging")))
+                  "derive-request"))
+               ((symbol-function 'qq-gateway-resource-release)
+                (lambda (resource-id &rest _)
+                  (push resource-id released)))
+               ((symbol-function 'qq-gateway-attachment-prepare-record)
+                (lambda (_session resource-id success _failure)
+                  (setq prepared-resource resource-id)
+                  (let ((ready (qq-gateway-attachment-test-ready-record)))
+                    (puthash qq-gateway-attachment-test-record-id ready
+                             qq-gateway-attachment--attachments)
+                    (funcall success
+                             (qq-gateway-attachment-test-snapshot
+                              :attachment-id
+                              qq-gateway-attachment-test-record-id
+                              :resource-id "res-record-a"
+                              :use '((kind . "record")))))
+                  "prepare-request")))
+            (let ((operation
+                   (qq-gateway-attachment-stage-and-prepare-record
+                    "group:8209413637" path
+                    (lambda (snapshot) (setq delivered snapshot)) #'ignore)))
+              (should-not
+               (qq-gateway-attachment-operation-active-p operation))
+              (should (equal derived-source "res-record-source"))
+              (should (equal prepared-resource "res-record-a"))
+              (should (equal released '("res-record-source")))
+              (should (equal (alist-get 'phase delivered) "ready"))))
+        (delete-file path)))))
+
+(ert-deftest qq-gateway-attachment-record-cancel-during-derivation-releases-source ()
+  (qq-gateway-attachment-test-with-state
+    (let ((path (make-temp-file "qq-record-cancel-" nil ".wav" "pcm"))
+          canceled released)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'qq-gateway-resource-stage-local)
+                (lambda (_path _name _digest success _failure)
+                  (puthash "res-record-source"
+                           '((resource_id . "res-record-source")
+                             (phase . "ready"))
+                           qq-gateway-resource--resources)
+                  (funcall success '((resource_id . "res-record-source")))
+                  "stage-request"))
+               ((symbol-function 'qq-gateway-resource-derive-record)
+                (lambda (_source _name _success _failure) "derive-request"))
+               ((symbol-function 'qq-gateway-transport-cancel)
+                (lambda (request-id) (setq canceled request-id)))
+               ((symbol-function 'qq-gateway-resource-release)
+                (lambda (resource-id &rest _) (push resource-id released))))
+            (let ((operation
+                   (qq-gateway-attachment-stage-and-prepare-record
+                    "private:10001" path nil #'ignore)))
+              (should (qq-gateway-attachment-operation-active-p operation))
+              (should (qq-gateway-attachment-cancel-operation operation))
+              (should (equal canceled "derive-request"))
+              (should (equal released '("res-record-source")))))
+        (delete-file path)))))
+
 (ert-deftest qq-gateway-attachment-ready-after-generation-drift-is-released ()
   (qq-gateway-attachment-test-with-state
     (let ((path (make-temp-file "qq-image-owner-" nil ".png" "abc"))
