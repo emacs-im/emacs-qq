@@ -389,6 +389,27 @@ and reason."
        group-id user-id special-title callback
        (or errback #'qq-backend--default-gateway-error))))))
 
+(defun qq-backend-kick-group-member
+    (group-id user-id reject-add-request &optional callback errback)
+  "Remove USER-ID from GROUP-ID through the selected backend."
+  (unless (qq-backend-group-id-p group-id)
+    (user-error "qq: Group kick requires an exact backend group id"))
+  (unless (qq-backend-user-id-p user-id)
+    (user-error "qq: Group kick requires an exact backend user id"))
+  (setq reject-add-request (and reject-add-request t))
+  (pcase (qq-backend--validate qq-backend)
+    ('onebot
+     (qq-backend--wrap-request
+      'onebot
+      (qq-api-kick-group-member
+       group-id user-id reject-add-request callback errback)))
+    ('gateway
+     (qq-backend--wrap-request
+      'gateway
+      (qq-gateway-directory-kick-group-member
+       group-id user-id reject-add-request callback
+       (or errback #'qq-backend--default-gateway-error))))))
+
 (defun qq-backend-send-message
     (session-key segments &optional raw-message callback errback)
   "Send SEGMENTS to SESSION-KEY through the selected backend.
@@ -728,6 +749,7 @@ request.  ERRBACK handles failure and COUNT limits the requested page size."
      ('gateway
       (memq capability
             '(contacts group-members group-settings group-member-settings
+              group-moderation
               send-text send-message face reply mention poke recall
               explicit-history)))))
 

@@ -1137,6 +1137,52 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
         '((card "8209413637" "9007199254741001" "")
           (title "8209413637" "9007199254741001" "Lead")))))))
 
+(ert-deftest qq-contacts-member-kick-confirms-before-dispatch-and-removes-row ()
+  (with-temp-buffer
+    (qq-contacts-mode)
+    (let* ((member
+            '((group_id . "8209413637") (group_name . "Protocol Lab")
+              (user_id . "9007199254741001") (uid . "u_member")
+              (nickname . "Crab") (card . "Ferris")))
+           (qq-contacts--search-members (list member))
+           calls prompts)
+      (let ((inhibit-read-only t))
+        (insert "member\n")
+        (add-text-properties
+         (point-min) (point-max)
+         (list 'qq-contacts-row-type 'member
+               'qq-contacts-object member)))
+      (goto-char (point-min))
+      (cl-letf
+          (((symbol-function 'qq-backend-kick-group-member)
+            (lambda (&rest arguments) (push arguments calls)))
+           ((symbol-function 'yes-or-no-p)
+            (lambda (prompt) (push prompt prompts) nil)))
+        (should-error (call-interactively
+                       #'qq-contacts-kick-member-at-point)
+                      :type 'user-error))
+      (should-not calls)
+      (should (equal qq-contacts--search-members (list member)))
+      (cl-letf
+          (((symbol-function 'qq-backend-kick-group-member)
+            (lambda (group-id user-id reject callback &optional _errback)
+              (push (list group-id user-id reject) calls)
+              (funcall callback '((reject_add_request . t)))))
+           ((symbol-function 'yes-or-no-p)
+            (lambda (prompt) (push prompt prompts) t))
+           ((symbol-function 'y-or-n-p)
+            (lambda (prompt) (push prompt prompts) t))
+           ((symbol-function 'qq-contacts--queue-view-sync) #'ignore)
+           ((symbol-function 'message) #'ignore))
+        (call-interactively #'qq-contacts-kick-member-at-point))
+      (should (equal calls
+                     '(("8209413637" "9007199254741001" t))))
+      (should-not qq-contacts--search-members)
+      (should (seq-some
+               (lambda (prompt)
+                 (string-match-p "QQ 9007199254741001" prompt))
+               prompts)))))
+
 (ert-deftest qq-contacts-bindings-follow-directory-and-root-conventions ()
   (should (eq (lookup-key qq-root-mode-map (kbd "c")) #'qq-contacts-open))
   (should (eq (lookup-key qq-contacts-mode-map (kbd "g"))
@@ -1150,7 +1196,9 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
   (should (eq (lookup-key qq-contacts-mode-map (kbd "C"))
               #'qq-contacts-set-member-card-at-point))
   (should (eq (lookup-key qq-contacts-mode-map (kbd "T"))
-              #'qq-contacts-set-member-special-title-at-point)))
+              #'qq-contacts-set-member-special-title-at-point))
+  (should (eq (lookup-key qq-contacts-mode-map (kbd "K"))
+              #'qq-contacts-kick-member-at-point)))
 
 (provide 'qq-contacts-test)
 

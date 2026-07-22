@@ -279,7 +279,12 @@
           (lambda (group-id user-id value callback &optional _errback)
             (push (list 'title group-id user-id value) calls)
             (funcall callback '((special_title . "Maintainer")))
-            "title-request")))
+            "title-request"))
+         ((symbol-function 'qq-gateway-directory-kick-group-member)
+          (lambda (group-id user-id reject callback &optional _errback)
+            (push (list 'kick group-id user-id reject) calls)
+            (funcall callback '((reject_add_request . t)))
+            "kick-request")))
       (let ((card-request
              (qq-backend-set-group-member-card
               "8209413637" "9007199254741001" "Ferris"
@@ -287,19 +292,26 @@
             (title-request
              (qq-backend-set-group-member-special-title
               "8209413637" "9007199254741001" "Maintainer"
-              (lambda (_receipt) (push 'title callbacks)))))
+              (lambda (_receipt) (push 'title callbacks))))
+            (kick-request
+             (qq-backend-kick-group-member
+              "8209413637" "9007199254741001" t
+              (lambda (_receipt) (push 'kick callbacks)))))
         (should (equal (qq-backend-request-token card-request)
                        "card-request"))
         (should (equal (qq-backend-request-token title-request)
-                       "title-request"))))
+                       "title-request"))
+        (should (equal (qq-backend-request-token kick-request)
+                       "kick-request"))))
     (should (equal (nreverse calls)
                    '((card "8209413637" "9007199254741001" "Ferris")
                      (title "8209413637" "9007199254741001"
-                            "Maintainer"))))
+                            "Maintainer")
+                     (kick "8209413637" "9007199254741001" t))))
     (should (equal (sort callbacks
                          (lambda (left right)
                            (string< (symbol-name left) (symbol-name right))))
-                   '(card title)))
+                   '(card kick title)))
     (should (qq-backend-group-id-p "8209413637"))
     (should (qq-backend-user-id-p "9007199254741001")))
   (let ((qq-backend 'onebot))
