@@ -22,6 +22,7 @@
 (require 'appkit-chat-completion)
 (require 'appkit-chat-timeline)
 (require 'appkit-chat-ins)
+(require 'appkit-name-color)
 (require 'appkit-media)
 (require 'appkit-ui)
 (require 'appkit-view)
@@ -4128,11 +4129,24 @@ on the first inline line when the body is pure inline content."
           (qq-native-recall-poke message)
         (qq-native-recall-message message)))))
 
+(defun qq-chat--message-sender-color-key (message)
+  "Return MESSAGE's stable sender key for shared name coloring."
+  (or (qq-chat--present-string (alist-get 'sender-native-id message))
+      (qq-chat--present-string (alist-get 'sender-id message))
+      (qq-chat--message-sender-name message)))
+
 (defun qq-chat--message-title-face (message)
-  "Return sender title face for MESSAGE."
+  "Return sender title face for MESSAGE.
+
+The current account retains its QQ-specific face.  Other senders combine the
+QQ base face with Appkit's deterministic identity-keyed color."
   (if (alist-get 'self-p message)
       'qq-msg-self-title
-    'qq-msg-user-title))
+    (if-let* ((color-face
+               (appkit-name-color-face
+                (qq-chat--message-sender-color-key message))))
+        (list color-face 'qq-msg-user-title)
+      'qq-msg-user-title)))
 
 (defun qq-chat--message-avatar-prefixes (message)
   "Return shared telega-style two-line avatar prefixes for MESSAGE."

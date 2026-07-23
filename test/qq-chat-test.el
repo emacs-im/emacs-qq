@@ -2031,6 +2031,27 @@
      (goto-char (point-min))
      (should (search-forward "10001" nil t)))))
 
+(ert-deftest qq-chat-message-title-face-colors-stable-sender-identity ()
+  (let* ((original
+          '((sender-native-id . "u_42")
+            (sender-id . "10001")
+            (sender-name . "Original Name")))
+         (renamed
+          '((sender-native-id . "u_42")
+            (sender-id . "10001")
+            (sender-name . "Renamed User")))
+         (expected
+          (list (appkit-name-color-face "u_42")
+                'qq-msg-user-title)))
+    (should (equal expected (qq-chat--message-title-face original)))
+    (should
+     (equal (qq-chat--message-title-face original)
+            (qq-chat--message-title-face renamed)))
+    (should
+     (eq 'qq-msg-self-title
+         (qq-chat--message-title-face
+          '((sender-id . "10001") (self-p . t)))))))
+
 (ert-deftest qq-chat-render-shows-group-card-and-nickname-like-telega ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
