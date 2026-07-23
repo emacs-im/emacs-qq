@@ -706,230 +706,230 @@ while an unclaimed Ready attachment cannot be left without a client owner."
          request)
     (cl-labels
         ((cancel-operation
-          (operation)
-          (condition-case error-data
-              (qq-gateway-attachment-cancel-operation operation)
-            ((error quit)
-             (message "qq: local media operation cleanup failed: %s"
-                      (error-message-string error-data)))))
+           (operation)
+           (condition-case error-data
+               (qq-gateway-attachment-cancel-operation operation)
+             ((error quit)
+              (message "qq: local media operation cleanup failed: %s"
+                       (error-message-string error-data)))))
          (release-attachments
-          ()
-          ;; Detach before calling the asynchronous release helper so a
-          ;; synchronous callback or repeated terminal signal cannot release
-          ;; the same attachment twice.
-          (let ((inhibit-quit t)
-                (owned-attachment-ids (delete-dups attachment-ids)))
-            (setq attachment-ids nil)
-            (dolist (attachment-id owned-attachment-ids)
-              (condition-case error-data
-                  (qq-native--release-send-attachment attachment-id)
-                ((error quit)
-                 (message "qq: prepared media cleanup failed: %s"
-                          (error-message-string error-data)))))))
+           ()
+           ;; Detach before calling the asynchronous release helper so a
+           ;; synchronous callback or repeated terminal signal cannot release
+           ;; the same attachment twice.
+           (let ((inhibit-quit t)
+                 (owned-attachment-ids (delete-dups attachment-ids)))
+             (setq attachment-ids nil)
+             (dolist (attachment-id owned-attachment-ids)
+               (condition-case error-data
+                   (qq-native--release-send-attachment attachment-id)
+                 ((error quit)
+                  (message "qq: prepared media cleanup failed: %s"
+                           (error-message-string error-data)))))))
          (release-pre-dispatch
-          ()
-          ;; Detach ownership before calling cancellation/release helpers.
-          ;; Besides making cleanup idempotent, this prevents a synchronous
-          ;; callback from observing the same objects as still owned here.
-          (let ((inhibit-quit t)
-                (owned-operations operations)
-                (owned-resource-ids (delete-dups resource-ids)))
-            (setq operations nil
-                  resource-ids nil)
-            (dolist (operation owned-operations)
-              (cancel-operation operation))
-            (release-attachments)
-            (dolist (resource-id owned-resource-ids)
-              (condition-case error-data
-                  (qq-native--release-send-resource resource-id)
-                ((error quit)
-                 (message "qq: staged media cleanup failed: %s"
-                          (error-message-string error-data)))))))
+           ()
+           ;; Detach ownership before calling cancellation/release helpers.
+           ;; Besides making cleanup idempotent, this prevents a synchronous
+           ;; callback from observing the same objects as still owned here.
+           (let ((inhibit-quit t)
+                 (owned-operations operations)
+                 (owned-resource-ids (delete-dups resource-ids)))
+             (setq operations nil
+                   resource-ids nil)
+             (dolist (operation owned-operations)
+               (cancel-operation operation))
+             (release-attachments)
+             (dolist (resource-id owned-resource-ids)
+               (condition-case error-data
+                   (qq-native--release-send-resource resource-id)
+                 ((error quit)
+                  (message "qq: staged media cleanup failed: %s"
+                           (error-message-string error-data)))))))
          (cancel-send
-          ()
-          (when-let* ((token send-token))
-            (setq send-token nil)
-            (let ((inhibit-quit t))
-              (condition-case error-data
-                  (qq-gateway-transport-cancel token)
-                ((error quit)
-                 (message "qq: local media send cancellation failed: %s"
-                          (error-message-string error-data)))))))
+           ()
+           (when-let* ((token send-token))
+             (setq send-token nil)
+             (let ((inhibit-quit t))
+               (condition-case error-data
+                   (qq-gateway-transport-cancel token)
+                 ((error quit)
+                  (message "qq: local media send cancellation failed: %s"
+                           (error-message-string error-data)))))))
          (cancel-dispatched
-          ()
-          (let ((inhibit-quit t))
-            (cancel-send)
-            (release-attachments)))
+           ()
+           (let ((inhibit-quit t))
+             (cancel-send)
+             (release-attachments)))
          (finish
-          (success-p body value)
-          (when active
-            ;; Make terminal ownership changes indivisible with cleanup.  A
-            ;; pending C-g may skip the user callback, but cannot leave an
-            ;; active request after ACTIVE has been cleared.
-            (let ((inhibit-quit t))
-              (setq active nil)
-              (cond
-               (success-p
-                ;; A successful service call owns every claimed attachment,
-                ;; including synchronous completion before token handoff.
-                (setq attachment-ids nil))
-               ((not dispatched)
-                (release-pre-dispatch))
-               (t
-                ;; A resolver rejection can leave attachments Ready.  Release
-                ;; every submitted ID; claimed/Sending attachments make this
-                ;; idempotent service call a no-op.
-                (release-attachments)))
-              (if success-p
-                  (qq-native-request-finish request)
-                (qq-native-request-fail request)))
-            (if success-p
-                (qq-native-request--invoke callback value)
-              (qq-native-request--invoke errback body value))))
+           (success-p body value)
+           (when active
+             ;; Make terminal ownership changes indivisible with cleanup.  A
+             ;; pending C-g may skip the user callback, but cannot leave an
+             ;; active request after ACTIVE has been cleared.
+             (let ((inhibit-quit t))
+               (setq active nil)
+               (cond
+                (success-p
+                 ;; A successful service call owns every claimed attachment,
+                 ;; including synchronous completion before token handoff.
+                 (setq attachment-ids nil))
+                ((not dispatched)
+                 (release-pre-dispatch))
+                (t
+                 ;; A resolver rejection can leave attachments Ready.  Release
+                 ;; every submitted ID; claimed/Sending attachments make this
+                 ;; idempotent service call a no-op.
+                 (release-attachments)))
+               (if success-p
+                   (qq-native-request-finish request)
+                 (qq-native-request-fail request)))
+             (if success-p
+                 (qq-native-request--invoke callback value)
+               (qq-native-request--invoke errback body value))))
          (send-failed
-          (body reason)
-          (finish nil body reason))
+           (body reason)
+           (finish nil body reason))
          (send-succeeded
-          (receipt)
-          (finish t nil receipt))
+           (receipt)
+           (finish t nil receipt))
          (dispatch
-          ()
-          (let (returned-p)
-            (unwind-protect
-                (progn
-                  (if (not (equal owner (qq-gateway-current-account-id)))
-                      (qq-native-cancel-request request)
-                    (condition-case error-data
-                        (let ((inhibit-quit t))
-                          (let ((token
-                                 (qq-gateway-message-send
-                                  session-key (append resolved nil) raw-message
-                                  #'send-succeeded #'send-failed
-                                  optimistic-segments)))
-                            (cond
-                             ;; Only a live returned token transfers prepared
-                             ;; attachments to message.send.  A synchronous
-                             ;; preflight failure leaves DISPATCHED nil.
-                             ((and active token)
-                              (setq send-token token
-                                    dispatched t)
-                              (setf (qq-native-request-token request) token))
-                             ;; A synchronous callback or cancellation may
-                             ;; revoke REQUEST before the token handoff.
-                             (token
-                              (condition-case cancellation-error
-                                  (qq-gateway-transport-cancel token)
-                                ((error quit)
-                                 (message
-                                  "qq: orphan media send cancellation failed: %s"
-                                  (error-message-string
-                                   cancellation-error)))))
-                             (active
-                              (send-failed
-                               nil "Gateway message send did not start")))))
-                      (error
-                       (send-failed
-                        nil (error-message-string error-data)))))
-                  (setq returned-p t))
-              ;; DISPATCH can run from a later media completion, after the
-              ;; outer starter loop has returned.  Give its token handoff an
-              ;; independent quit boundary so no composite becomes ownerless.
-              (unless returned-p
-                (abort-startup)))))
+           ()
+           (let (returned-p)
+             (unwind-protect
+                 (progn
+                   (if (not (equal owner (qq-gateway-current-account-id)))
+                       (qq-native-cancel-request request)
+                     (condition-case error-data
+                         (let ((inhibit-quit t))
+                           (let ((token
+                                  (qq-gateway-message-send
+                                   session-key (append resolved nil) raw-message
+                                   #'send-succeeded #'send-failed
+                                   optimistic-segments)))
+                             (cond
+                              ;; Only a live returned token transfers prepared
+                              ;; attachments to message.send.  A synchronous
+                              ;; preflight failure leaves DISPATCHED nil.
+                              ((and active token)
+                               (setq send-token token
+                                     dispatched t)
+                               (setf (qq-native-request-token request) token))
+                              ;; A synchronous callback or cancellation may
+                              ;; revoke REQUEST before the token handoff.
+                              (token
+                               (condition-case cancellation-error
+                                   (qq-gateway-transport-cancel token)
+                                 ((error quit)
+                                  (message
+                                   "qq: orphan media send cancellation failed: %s"
+                                   (error-message-string
+                                    cancellation-error)))))
+                              (active
+                               (send-failed
+                                nil "Gateway message send did not start")))))
+                       (error
+                        (send-failed
+                         nil (error-message-string error-data)))))
+                   (setq returned-p t))
+               ;; DISPATCH can run from a later media completion, after the
+               ;; outer starter loop has returned.  Give its token handoff an
+               ;; independent quit boundary so no composite becomes ownerless.
+               (unless returned-p
+                 (abort-startup)))))
          (media-ready
-          (plan attachment)
-          (let ((inhibit-quit t)
-                (attachment-id (alist-get 'attachment_id attachment))
-                (resource-id (alist-get 'resource_id attachment)))
-            (if (not active)
-                ;; Cancellation can race service completion.  Release both
-                ;; halves as one best-effort sweep before delivering C-g.
-                (progn
-                  (qq-native--release-send-attachment attachment-id)
-                  (qq-native--release-send-resource resource-id))
-              ;; Record ownership before the account check so a completion
-              ;; from a deselected slot cannot strand service objects.
-              (push attachment-id attachment-ids)
-              (push resource-id resource-ids)
-              (unless (equal owner (qq-gateway-current-account-id))
-                (qq-native-cancel-request request))
-              (when active
-                ;; The Prepared Attachment already owns a Resource Lease.
-                ;; Releasing now prevents unrelated future leases while the
-                ;; service safely keeps bytes alive through send completion.
-                (qq-native--release-send-resource resource-id)
-                (setq resource-ids (delete resource-id resource-ids))
-                (aset resolved (plist-get plan :index)
-                      `((type . ,(plist-get plan :kind))
-                        (data . ((attachment_id . ,attachment-id)))))
-                (setq remaining (1- remaining))
-                (when (= remaining 0)
-                  (dispatch))))))
+           (plan attachment)
+           (let ((inhibit-quit t)
+                 (attachment-id (alist-get 'attachment_id attachment))
+                 (resource-id (alist-get 'resource_id attachment)))
+             (if (not active)
+                 ;; Cancellation can race service completion.  Release both
+                 ;; halves as one best-effort sweep before delivering C-g.
+                 (progn
+                   (qq-native--release-send-attachment attachment-id)
+                   (qq-native--release-send-resource resource-id))
+               ;; Record ownership before the account check so a completion
+               ;; from a deselected slot cannot strand service objects.
+               (push attachment-id attachment-ids)
+               (push resource-id resource-ids)
+               (unless (equal owner (qq-gateway-current-account-id))
+                 (qq-native-cancel-request request))
+               (when active
+                 ;; The Prepared Attachment already owns a Resource Lease.
+                 ;; Releasing now prevents unrelated future leases while the
+                 ;; service safely keeps bytes alive through send completion.
+                 (qq-native--release-send-resource resource-id)
+                 (setq resource-ids (delete resource-id resource-ids))
+                 (aset resolved (plist-get plan :index)
+                       `((type . ,(plist-get plan :kind))
+                         (data . ((attachment_id . ,attachment-id)))))
+                 (setq remaining (1- remaining))
+                 (when (= remaining 0)
+                   (dispatch))))))
          (cancel
-          ()
-          (when active
-            (setq active nil)
-            (if dispatched
-                (cancel-dispatched)
-              (release-pre-dispatch))))
+           ()
+           (when active
+             (setq active nil)
+             (if dispatched
+                 (cancel-dispatched)
+               (release-pre-dispatch))))
          (abort-startup
-          ()
-          ;; A starter may signal after an earlier starter synchronously
-          ;; produced a Prepared Attachment.  Defer quit while sweeping each
-          ;; owned object, then preserve the starter's original nonlocal exit.
-          (let ((inhibit-quit t))
-            (when active
-              (setq active nil)
-              (if dispatched
-                  (cancel-dispatched)
-                (release-pre-dispatch)))
-            (when request
-              (qq-native-request-fail request)))))
+           ()
+           ;; A starter may signal after an earlier starter synchronously
+           ;; produced a Prepared Attachment.  Defer quit while sweeping each
+           ;; owned object, then preserve the starter's original nonlocal exit.
+           (let ((inhibit-quit t))
+             (when active
+               (setq active nil)
+               (if dispatched
+                   (cancel-dispatched)
+                 (release-pre-dispatch)))
+             (when request
+               (qq-native-request-fail request)))))
       (let (returned-p)
         (unwind-protect
-          (progn
-            ;; Make REQUEST visible to the cleanup clause before a pending
-            ;; quit can be delivered after registration.
-            (let ((inhibit-quit t))
-              (setq request
-                    (qq-native-request-create owner #'cancel)))
-            (dolist (plan plans)
-              (when active
-                (let ((ready (apply-partially #'media-ready plan))
-                      operation
-                      handed-off-p)
-                  ;; Once a starter returns an operation, either transfer it
-                  ;; to OPERATIONS or revoke it locally.  This inner boundary
-                  ;; closes the quit window between return and `push'.
-                  (unwind-protect
-                      (let ((inhibit-quit t))
-                        (setq operation
-                              (pcase (plist-get plan :kind)
-                                ("image"
-                                 (qq-gateway-attachment-stage-and-prepare-image
-                                  session-key (plist-get plan :path)
-                                  (plist-get plan :summary)
-                                  (plist-get plan :sub-type)
-                                  ready #'send-failed))
-                                ("record"
-                                 (qq-gateway-attachment-stage-and-prepare-record
-                                  session-key (plist-get plan :path)
-                                  ready #'send-failed))
-                                (_ (error "qq: Unknown local media plan"))))
-                        (when (qq-gateway-attachment-operation-active-p
-                               operation)
-                          (if active
-                              (push operation operations)
-                            (cancel-operation operation)))
-                        (setq handed-off-p t))
-                    (unless handed-off-p
-                      (let ((inhibit-quit t))
-                        (when (and operation
-                                   (qq-gateway-attachment-operation-active-p
-                                    operation))
-                          (cancel-operation operation))))))))
-            (setq returned-p t)
-            request)
+            (progn
+              ;; Make REQUEST visible to the cleanup clause before a pending
+              ;; quit can be delivered after registration.
+              (let ((inhibit-quit t))
+                (setq request
+                      (qq-native-request-create owner #'cancel)))
+              (dolist (plan plans)
+                (when active
+                  (let ((ready (apply-partially #'media-ready plan))
+                        operation
+                        handed-off-p)
+                    ;; Once a starter returns an operation, either transfer it
+                    ;; to OPERATIONS or revoke it locally.  This inner boundary
+                    ;; closes the quit window between return and `push'.
+                    (unwind-protect
+                        (let ((inhibit-quit t))
+                          (setq operation
+                                (pcase (plist-get plan :kind)
+                                  ("image"
+                                   (qq-gateway-attachment-stage-and-prepare-image
+                                    session-key (plist-get plan :path)
+                                    (plist-get plan :summary)
+                                    (plist-get plan :sub-type)
+                                    ready #'send-failed))
+                                  ("record"
+                                   (qq-gateway-attachment-stage-and-prepare-record
+                                    session-key (plist-get plan :path)
+                                    ready #'send-failed))
+                                  (_ (error "qq: Unknown local media plan"))))
+                          (when (qq-gateway-attachment-operation-active-p
+                                 operation)
+                            (if active
+                                (push operation operations)
+                              (cancel-operation operation)))
+                          (setq handed-off-p t))
+                      (unless handed-off-p
+                        (let ((inhibit-quit t))
+                          (when (and operation
+                                     (qq-gateway-attachment-operation-active-p
+                                      operation))
+                            (cancel-operation operation))))))))
+              (setq returned-p t)
+              request)
           (unless returned-p
             (abort-startup)))))))
 

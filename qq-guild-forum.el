@@ -453,8 +453,8 @@ An empty CURSOR replaces the authoritative first page."
     (qq-state-upsert-session
      session-key
      `((title . ,(format "%s · ▤ %s"
-                        (alist-get 'guild_name channel)
-                        (alist-get 'name channel)))
+                         (alist-get 'guild_name channel)
+                         (alist-get 'name channel)))
        (guild-name . ,(alist-get 'guild_name channel))
        (channel-name . ,(alist-get 'name channel))
        (channel-kind . "forum"))

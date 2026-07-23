@@ -331,7 +331,7 @@ message title rather than like dimmed preview content."
   (pcase (qq-root--entry-type entry)
     ('note
      (appkit-view-insert-note-line (qq-root--entry-text entry)
-                                  :face (qq-root--entry-face entry)))
+                                   :face (qq-root--entry-face entry)))
     ('blank (insert "\n"))
     ('session (qq-root--insert-session-line (qq-root--entry-session entry)))
     (type (error "qq: unknown root entry type %S" type))))

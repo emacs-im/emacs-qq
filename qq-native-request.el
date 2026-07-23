@@ -54,9 +54,9 @@ authorize a request or add fields to its wire parameters.
 CANCEL-FUNCTION revokes adapter work and is called at most once.  Callers that
 only own a Gateway transport token should use `qq-native-request-start'."
   (let ((request
-         (qq-native-request--create
-          :owner (qq-native-request--copy-owner owner)
-          :cancel-function cancel-function)))
+          (qq-native-request--create
+           :owner (qq-native-request--copy-owner owner)
+           :cancel-function cancel-function)))
     (puthash request t qq-native-request--active)
     request))
 
@@ -213,45 +213,45 @@ must publish identity before STARTER can complete synchronously."
                 (qq-native-request-errback request) errback)
           (cl-labels
               ((success
-               (value)
-                (when (qq-native-request-active-p request)
-                  (if (not (qq-native-request--owner-current-p request))
-                      (qq-native-cancel-request request)
-                    (when (qq-native-request--claim-completion request)
-                      (condition-case error-data
-                          (let ((projected
-                                 (if projector
-                                     (funcall projector value)
-                                   value)))
-                            (when (eq (qq-native-request-state request)
-                                      'completing)
-                              (if (qq-native-request--owner-current-p request)
-                                  (progn
-                                    (qq-native-request--retire request 'settled)
-                                    (qq-native-request--invoke callback projected))
-                                (qq-native-request--retire request 'cancelled))))
-                        (error
-                         (when (eq (qq-native-request-state request) 'completing)
-                           (let ((reason (error-message-string error-data))
-                                 (owner-current-p
-                                  (qq-native-request--owner-current-p request)))
-                             (qq-native-request--retire request 'failed)
-                             (when owner-current-p
-                               (qq-native-request--invoke
-                                errback
-                                `((code . "invalid_gateway_result")
-                                  (message . ,reason))
-                                reason)))))
-                        (quit
-                         (qq-native-request--retire request 'cancelled)
-                         (signal (car error-data) (cdr error-data))))))))
+                 (value)
+                 (when (qq-native-request-active-p request)
+                   (if (not (qq-native-request--owner-current-p request))
+                       (qq-native-cancel-request request)
+                     (when (qq-native-request--claim-completion request)
+                       (condition-case error-data
+                           (let ((projected
+                                  (if projector
+                                      (funcall projector value)
+                                    value)))
+                             (when (eq (qq-native-request-state request)
+                                       'completing)
+                               (if (qq-native-request--owner-current-p request)
+                                   (progn
+                                     (qq-native-request--retire request 'settled)
+                                     (qq-native-request--invoke callback projected))
+                                 (qq-native-request--retire request 'cancelled))))
+                         (error
+                          (when (eq (qq-native-request-state request) 'completing)
+                            (let ((reason (error-message-string error-data))
+                                  (owner-current-p
+                                   (qq-native-request--owner-current-p request)))
+                              (qq-native-request--retire request 'failed)
+                              (when owner-current-p
+                                (qq-native-request--invoke
+                                 errback
+                                 `((code . "invalid_gateway_result")
+                                   (message . ,reason))
+                                 reason)))))
+                         (quit
+                          (qq-native-request--retire request 'cancelled)
+                          (signal (car error-data) (cdr error-data))))))))
                (failure
-                (body reason)
-                (when (qq-native-request-active-p request)
-                  (if (not (qq-native-request--owner-current-p request))
-                      (qq-native-cancel-request request)
-                    (qq-native-request--retire request 'failed)
-                    (qq-native-request--invoke errback body reason)))))
+                 (body reason)
+                 (when (qq-native-request-active-p request)
+                   (if (not (qq-native-request--owner-current-p request))
+                       (qq-native-cancel-request request)
+                     (qq-native-request--retire request 'failed)
+                     (qq-native-request--invoke errback body reason)))))
             ;; Defer a real C-g across replacement, adapter handoff, and token
             ;; adoption.  If quit is delivered on leaving this scope, the outer
             ;; cleanup can already see and revoke all published ownership.

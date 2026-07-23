@@ -359,23 +359,23 @@ empty continuation pages while next-result navigation is pending."
               :anchor-property 'qq-search-entry-key
               :preserve-window-start t))))
       (appkit-with-content-update view
-				  (unless qq-search--ewoc
-				    (erase-buffer)
-				    (setq qq-search--ewoc
-					  (ewoc-create #'qq-search--ewoc-printer nil nil t)))
-				  (setq qq-search--node-table
-					(appkit-ewoc-reconcile
-					 qq-search--ewoc
-					 (qq-search--project-entries)
-					 #'qq-search--entry-key
-					 :force-keys (appkit-invalidations-entry-keys invalidations)))
-				  (when snapshot
-				    (appkit-position-restore snapshot))
-				  (when (and qq-search--focus-first-result-p qq-search--results)
-				    (setq qq-search--focus-first-result-p nil)
-				    (goto-char (point-min))
-				    (qq-search--next-local-result))
-				  (qq-search--resume-pending-next)))))
+        (unless qq-search--ewoc
+          (erase-buffer)
+          (setq qq-search--ewoc
+                (ewoc-create #'qq-search--ewoc-printer nil nil t)))
+        (setq qq-search--node-table
+              (appkit-ewoc-reconcile
+               qq-search--ewoc
+               (qq-search--project-entries)
+               #'qq-search--entry-key
+               :force-keys (appkit-invalidations-entry-keys invalidations)))
+        (when snapshot
+          (appkit-position-restore snapshot))
+        (when (and qq-search--focus-first-result-p qq-search--results)
+          (setq qq-search--focus-first-result-p nil)
+          (goto-char (point-min))
+          (qq-search--next-local-result))
+        (qq-search--resume-pending-next)))))
 
 (defun qq-search--goto-result-key (key)
   "Move point to the result identified by KEY and return non-nil."
@@ -468,9 +468,9 @@ empty continuation pages while next-result navigation is pending."
           (progn
             (when next-p
               (unless cursor
-		(error "qq: message search has no continuation cursor"))
+                (error "qq: message search has no continuation cursor"))
               (when (gethash cursor qq-search--consumed-cursors)
-		(error "qq: message search repeated an already consumed cursor"))
+                (error "qq: message search repeated an already consumed cursor"))
               (puthash cursor t qq-search--consumed-cursors)
               ;; NapCat cursors own one native searchMore operation.  Consume
               ;; before dispatch and never restore after failure or signal.
@@ -480,40 +480,40 @@ empty continuation pages while next-result navigation is pending."
                       (qq-api-search-messages-next
                        session-key cursor 'summary
                        (lambda (page)
-			 (qq-search--page-succeeded
+                         (qq-search--page-succeeded
                           view buffer session-key owner page))
                        (lambda (response reason)
-			 (qq-search--page-failed
+                         (qq-search--page-failed
                           view buffer session-key owner response reason)))
                     (qq-api-search-messages-start
                      session-key qq-search--query
                      (lambda (page)
                        (qq-search--page-succeeded
-			view buffer session-key owner page))
+                        view buffer session-key owner page))
                      (lambda (response reason)
                        (qq-search--page-failed
-			view buffer session-key owner response reason))
+                        view buffer session-key owner response reason))
                      qq-search-page-size)))
             ;; A mocked or local transport may complete synchronously.  Store
             ;; the token only while this exact owner remains pending.
             (when (and (qq-search--request-current-p
-			view buffer session-key owner)
+                        view buffer session-key owner)
                        (plist-get owner :pending))
               (setq qq-search--request request))
             request)
-	(error
-	 (when (qq-search--request-current-p view buffer session-key owner)
+        (error
+         (when (qq-search--request-current-p view buffer session-key owner)
            (setf (plist-get owner :pending) nil)
            (setq qq-search--request nil
-		 qq-search--request-owner nil
-		 qq-search--next-cursor nil
-		 qq-search--status 'error
-		 qq-search--pending-next-key nil
-		 qq-search--error
-		 (format "dispatch failed: %s; press g to restart"
-			 (error-message-string error-data)))
+                 qq-search--request-owner nil
+                 qq-search--next-cursor nil
+                 qq-search--status 'error
+                 qq-search--pending-next-key nil
+                 qq-search--error
+                 (format "dispatch failed: %s; press g to restart"
+                         (error-message-string error-data)))
            (qq-search--request-sync view))
-	 nil)))))
+         nil)))))
 
 (defun qq-search-search (query)
   "Replace this buffer with a server-backed search for QUERY."
