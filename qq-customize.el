@@ -313,9 +313,10 @@ Same defaults as `telega-msg-self-title'."
 
 (defface qq-msg-user-title
   '((t nil))
-  "Face for other users' sender titles.
+  "Base face for other users' sender titles.
 
-Same defaults as `telega-msg-user-title'."
+Message headings combine this face with Appkit's identity-keyed name color.
+The default otherwise matches `telega-msg-user-title'."
   :group 'qq)
 
 (defface qq-msg-inline-reply

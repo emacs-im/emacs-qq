@@ -152,7 +152,8 @@ When SHOW-COMMENT-COUNT-P is non-nil, include the directory metadata footer."
      :avatar-help-echo "Open channel member avatar"
      :heading-inserter
      (lambda ()
-       (qq-chat--insert-message-sender message 'qq-msg-user-title))
+       (qq-chat--insert-message-sender
+        message (qq-chat--message-title-face message)))
      :heading-line-face 'qq-msg-heading
      :time (qq-guild-forum--time-string message)
      :time-face 'qq-msg-status

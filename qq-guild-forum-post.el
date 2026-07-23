@@ -149,7 +149,8 @@
      :avatar-help-echo "Open channel member avatar"
      :heading-inserter
      (lambda ()
-       (qq-chat--insert-message-sender message 'qq-msg-user-title)
+       (qq-chat--insert-message-sender
+        message (qq-chat--message-title-face message))
        (when target
          (qq-guild-forum-post--insert-reply-target target)))
      :heading-line-face 'qq-msg-heading
