@@ -3813,7 +3813,8 @@ a replacement app instance."
   (and (listp message)
        (eq (alist-get 'type (qq-chat--session)) 'group)
        (qq-protocol-message-id-p (alist-get 'server-id message))
-       (not (qq-state-message-recalled-p message))))
+       (not (qq-state-message-recalled-p message))
+       (qq-chat--message-current-account-p message)))
 
 (defun qq-chat--message-current-account-p (message)
   "Return non-nil when MESSAGE belongs to the selected Gateway account slot."
@@ -3829,10 +3830,6 @@ a replacement app instance."
        (eq (alist-get 'type (qq-chat--session)) 'group)
        (qq-protocol-message-id-p (alist-get 'server-id message))
        (not (qq-state-message-recalled-p message))
-       (qq-protocol--nonzero-decimal-string-p
-        (alist-get 'message-seq message))
-       (let ((random (alist-get 'native-random message)))
-         (and (integerp random) (<= 0 random #xffffffff)))
        (qq-chat--message-current-account-p message)))
 
 (defun qq-chat--friend-pin-target ()
@@ -3880,8 +3877,6 @@ a replacement app instance."
        (eq (alist-get 'type (qq-chat--session)) 'group)
        (qq-protocol-message-id-p (alist-get 'server-id message))
        (not (qq-state-message-recalled-p message))
-       (qq-protocol--nonzero-decimal-string-p
-        (alist-get 'message-seq message))
        (qq-chat--message-current-account-p message)))
 
 (defun qq-chat--message-reference (message)

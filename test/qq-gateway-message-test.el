@@ -215,8 +215,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (make-hash-table :test #'equal))
          (qq-gateway-message--pending-essences
           (make-hash-table :test #'equal))
-         (qq-gateway-message--essence-revisions
-          (make-hash-table :test #'equal))
          (qq-gateway-message--pending-sends
           (make-hash-table :test #'equal))
          (qq-gateway-message--live-frontiers
@@ -621,7 +619,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
      "message.essence_changed"
      (qq-gateway-message-test-essence :is-set :false))
     (should (= (hash-table-count qq-gateway-message--pending-essences) 1))
-    (should (= (hash-table-count qq-gateway-message--essence-revisions) 1))
     (qq-gateway-message--handle-event
      "message.received"
      (qq-gateway-message-test-event
@@ -963,7 +960,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           9007199254740999)
     (should-error (qq-gateway-message--validate-poke-data event))))
 
-(ert-deftest qq-gateway-message-reaction-send-keeps-snowflake-and-sequence ()
+(ert-deftest qq-gateway-message-reaction-sends-only-the-message-reference ()
   (qq-gateway-message-test-with-state
     (qq-gateway-message--handle-event
      "message.received"
@@ -974,6 +971,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (let* ((session-key "group:8209413637")
            (message (car (qq-state-session-messages session-key)))
            sent-method sent-params callback-result)
+      (dolist (key '(message-seq native-random))
+        (setq message (assq-delete-all key message)))
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-gateway-transport-capabilities)
@@ -1001,11 +1000,20 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           '((account_id . "slot-a")
             (conversation . ((kind . "group")
                              (group_uin . "8209413637")))
-            (message . ((message_id . "7348923749823749823")
-                        (sequence . "9007199254740999")))
+            (message . ((message_id . "7348923749823749823")))
             (emoji_id . "128077")
             (set . t))))
         (should (equal (alist-get 'emoji_id callback-result) "128077"))
+        (should-not
+         (qq-state-message-reactions
+          (car (qq-state-session-messages session-key))))
+        (qq-gateway-message--handle-event
+         "message.reaction_changed"
+         (qq-gateway-message-test-reaction
+          :operator-uin "10002"
+          :emoji-id "128077"
+          :emoji-type "2"
+          :count 1))
         (let ((reaction
                (car (qq-state-message-reactions
                      (car (qq-state-session-messages session-key))))))
@@ -1014,7 +1022,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (should (= (alist-get 'count reaction) 1))
           (should (alist-get 'chosen-p reaction)))))))
 
-(ert-deftest qq-gateway-message-essence-send-keeps-exact-native-target ()
+(ert-deftest qq-gateway-message-essence-sends-only-the-message-reference ()
   (qq-gateway-message-test-with-state
     (qq-gateway-message--handle-event
      "message.received"
@@ -1026,6 +1034,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (let* ((session-key "group:8209413637")
            (message (car (qq-state-session-messages session-key)))
            sent-method sent-params callback-result)
+      (dolist (key '(message-seq native-random))
+        (setq message (assq-delete-all key message)))
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-gateway-transport-capabilities)
@@ -1052,12 +1062,17 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           '((account_id . "slot-a")
             (conversation . ((kind . "group")
                              (group_uin . "8209413637")))
-            (message . ((message_id . "7348923749823749823")
-                        (sequence . "9007199254740999")
-                        (random . 4277998232)))
+            (message . ((message_id . "7348923749823749823")))
             (set . t))))
         (should (equal (alist-get 'message_id callback-result)
                        "7348923749823749823"))
+        (should-not
+         (alist-get
+          'essence-p
+          (car (qq-state-session-messages session-key))))
+        (qq-gateway-message--handle-event
+         "message.essence_changed"
+         (qq-gateway-message-test-essence :random 4277998232))
         (should
          (eq (alist-get
               'essence-p
@@ -1109,6 +1124,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (let* ((message
             (car (qq-state-session-messages "group:8209413637")))
            calls receipts)
+      (dolist (key '(message-seq native-random))
+        (setq message (assq-delete-all key message)))
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-gateway-transport-capabilities)
@@ -1138,22 +1155,19 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
            ((account_id . "slot-a")
             (conversation . ((kind . "group")
                              (group_uin . "8209413637")))
-            (message . ((message_id . "7348923749823749823")
-                        (sequence . "9007199254740999")))
+            (message . ((message_id . "7348923749823749823")))
             (operation . "set")))
           ("message.set_todo"
            ((account_id . "slot-a")
             (conversation . ((kind . "group")
                              (group_uin . "8209413637")))
-            (message . ((message_id . "7348923749823749823")
-                        (sequence . "9007199254740999")))
+            (message . ((message_id . "7348923749823749823")))
             (operation . "complete")))
           ("message.set_todo"
            ((account_id . "slot-a")
             (conversation . ((kind . "group")
                              (group_uin . "8209413637")))
-            (message . ((message_id . "7348923749823749823")
-                        (sequence . "9007199254740999")))
+            (message . ((message_id . "7348923749823749823")))
             (operation . "cancel"))))))
       (should
        (equal (mapcar (lambda (receipt) (alist-get 'operation receipt))
@@ -1171,19 +1185,19 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
      (equal
       (qq-gateway-message--validate-todo-receipt
        receipt "slot-a" "8209413637"
-       "7348923749823749823" "9007199254740999" "set")
+       "7348923749823749823" "set")
       receipt))
     (let ((stale (copy-tree receipt)))
       (setf (alist-get 'account_id stale) "slot-b")
       (should-error
        (qq-gateway-message--validate-todo-receipt
         stale "slot-a" "8209413637"
-        "7348923749823749823" "9007199254740999" "set")))
+        "7348923749823749823" "set")))
     (let ((open (append (copy-tree receipt) '((done . t)))))
       (should-error
        (qq-gateway-message--validate-todo-receipt
         open "slot-a" "8209413637"
-        "7348923749823749823" "9007199254740999" "set")))))
+        "7348923749823749823" "set")))))
 
 (ert-deftest qq-gateway-message-recall-poke-sends-original-gray-tip-metadata ()
   (qq-gateway-message-test-with-state
@@ -1282,7 +1296,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (should (eq (alist-get 'status message) 'failed))
           (should (equal (alist-get 'error message) "boom")))))))
 
-(ert-deftest qq-gateway-message-group-recall-awaits-authoritative-event ()
+(ert-deftest qq-gateway-message-group-recall-projects-typed-acknowledgement ()
   (qq-gateway-message-test-with-state
     (qq-gateway-message--handle-event
      "message.received"
@@ -1295,6 +1309,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (let* ((session-key "group:8209413637")
            (message (car (qq-state-session-messages session-key)))
            sent-params)
+      (setq message (assq-delete-all 'message-seq message))
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-gateway-transport-capabilities)
@@ -1304,8 +1319,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                    (setq sent-params params)
                    (funcall callback
                             '((account_id . "slot-a")
-                              (message_id . "7348923749823749823")
-                              (sequence . "9007199254740999")))
+                              (message_id . "7348923749823749823")))
                    "request-recall")))
         (should (equal (qq-gateway-message-recall session-key message)
                        "request-recall"))
@@ -1315,9 +1329,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           '((account_id . "slot-a")
             (conversation . ((kind . "group")
                              (group_uin . "8209413637")))
-            (message . ((message_id . "7348923749823749823")
-                        (sequence . "9007199254740999"))))))
-        (should-not
+            (message . ((message_id . "7348923749823749823"))))))
+        (should
          (qq-state-message-recalled-p
           (car (qq-state-session-messages session-key))))
         (qq-gateway-message--handle-event
@@ -1326,13 +1339,16 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
          (qq-state-message-recalled-p
           (car (qq-state-session-messages session-key))))))))
 
-(ert-deftest qq-gateway-message-private-recall-includes-native-metadata ()
+(ert-deftest qq-gateway-message-private-recall-sends-only-the-message-reference ()
   (qq-gateway-message-test-with-state
     (qq-gateway-message--handle-event
      "message.received" (qq-gateway-message-test-event))
     (let* ((session-key "private:10001")
            (message (car (qq-state-session-messages session-key)))
            sent-params)
+      (dolist (key '(message-seq native-client-sequence
+                    native-random native-sent-at))
+        (setq message (assq-delete-all key message)))
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-gateway-transport-capabilities)
@@ -1342,21 +1358,19 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                    (setq sent-params params)
                    (funcall callback
                             '((account_id . "slot-a")
-                              (message_id . "7348923749823749823")
-                              (sequence . "9007199254740999")))
+                              (message_id . "7348923749823749823")))
                    "request-recall")))
         (qq-gateway-message-recall session-key message)
         (should
          (equal
           (alist-get 'message sent-params)
-          '((message_id . "7348923749823749823")
-            (sequence . "9007199254740999")
-            (client_sequence . "9007199254741001")
-            (random . 7)
-            (sent_at . 1784700000))))
+          '((message_id . "7348923749823749823"))))
         (should
          (equal (alist-get 'conversation sent-params)
-                '((kind . "private") (peer_uin . "10001"))))))))
+                '((kind . "private") (peer_uin . "10001"))))
+        (should
+         (qq-state-message-recalled-p
+          (car (qq-state-session-messages session-key))))))))
 
 (ert-deftest qq-gateway-message-history-range-stays-exact-decimal ()
   (should
@@ -1422,10 +1436,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
 (ert-deftest qq-gateway-message-revoke-clears-essence-correlation ()
   (qq-gateway-message-test-with-state
     (puthash '(owner target) t qq-gateway-message--pending-essences)
-    (puthash '(owner target) 3 qq-gateway-message--essence-revisions)
     (qq-gateway-message-revoke-projection)
-    (should (= (hash-table-count qq-gateway-message--pending-essences) 0))
-    (should (= (hash-table-count qq-gateway-message--essence-revisions) 0))))
+    (should (= (hash-table-count qq-gateway-message--pending-essences) 0))))
 
 (ert-deftest qq-gateway-message-history-request-preserves-large-sequences ()
   (qq-gateway-message-test-with-state
@@ -1848,8 +1860,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                      (funcall
                       callback
                       '((account_id . "slot-a")
-                        (message_id . "7348923749823749823")
-                        (sequence . "9007199254740999")))
+                        (message_id . "7348923749823749823")))
                      "restart-recall")))
           (should
            (equal
@@ -1859,6 +1870,9 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
             "restart-recall")))
         (should delivered)
         (should (equal (alist-get 'account_id sent-params) "slot-a"))
+        (should
+         (equal (alist-get 'message sent-params)
+                '((message_id . "7348923749823749823"))))
         (should-not (assq 'generation sent-params))))))
 
 (ert-deftest qq-gateway-message-account-ready-claims-selected-owner ()

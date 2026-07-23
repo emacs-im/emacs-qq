@@ -2920,6 +2920,7 @@
     "group:20001"
     '(((server-id . "9007199254741004001")
        (session-key . "group:20001")
+       (gateway-account-id . "slot-a")
        (reactions . (((emoji-id . "178")
                       (emoji-type . "1")
                       (count . 1)
@@ -2929,7 +2930,9 @@
      (qq-chat-mode)
      (setq qq-chat--session-key "group:20001")
      (let (called)
-       (cl-letf (((symbol-function 'qq-native-set-message-reaction)
+       (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+                  (lambda () "slot-a"))
+                 ((symbol-function 'qq-native-set-message-reaction)
                   (lambda (message emoji-id set &rest _)
                     (setq called (list message emoji-id set)))))
          (qq-chat-toggle-message-reaction
@@ -2946,16 +2949,19 @@
    (qq-state-upsert-session
     "group:20001"
     '((type . group) (title . "Group") (target-id . "20001"))
-    nil)
+   nil)
    (let ((message '((server-id . "9007199254741004001")
-                    (session-key . "group:20001"))))
+                    (session-key . "group:20001")
+                    (gateway-account-id . "slot-a"))))
      (with-temp-buffer
        (qq-chat-mode)
        (setq qq-chat--session-key "group:20001")
        (let (called)
          (cl-letf (((symbol-function 'qq-native-set-message-reaction)
                     (lambda (selected emoji-id set &rest _)
-                      (setq called (list selected emoji-id set)))))
+                      (setq called (list selected emoji-id set))))
+                   ((symbol-function 'qq-gateway-current-account-id)
+                    (lambda () "slot-a")))
            (qq-chat-react-to-message "178" message))
          (should (eq (nth 0 called) message))
          (should (equal (nth 1 called) "178"))
@@ -2987,7 +2993,7 @@
            (should (eq (nth 0 called) message))
            (should-not (nth 1 called))))))))
 
-(ert-deftest qq-chat-native-essence-capability-requires-native-random ()
+(ert-deftest qq-chat-native-essence-capability-uses-the-message-reference ()
   (qq-chat-test-with-reset
    (progn
      (qq-state-upsert-session
@@ -3002,11 +3008,10 @@
          (let ((message
                 '((server-id . "9007199254741004001")
                   (session-key . "group:20001")
-                  (message-seq . "9007199254740999")
                   (gateway-account-id . "slot-a"))))
-           (should-not (qq-chat--message-essence-capable-p message))
-           (setf (alist-get 'native-random message) 4294967295)
-           (should (qq-chat--message-essence-capable-p message))))))))
+           (should (qq-chat--message-essence-capable-p message))
+           (setf (alist-get 'gateway-account-id message) "slot-b")
+           (should-not (qq-chat--message-essence-capable-p message))))))))
 
 (ert-deftest qq-chat-todo-commands-route-all-closed-operations ()
   (qq-chat-test-with-reset
@@ -3035,7 +3040,7 @@
           (equal (mapcar #'cadr (nreverse calls))
                  '(set complete cancel))))))))
 
-(ert-deftest qq-chat-native-todo-capability-requires-sequence-and-account ()
+(ert-deftest qq-chat-native-todo-capability-uses-reference-and-account ()
   (qq-chat-test-with-reset
    (progn
      (qq-state-upsert-session
@@ -3051,8 +3056,6 @@
                 '((server-id . "9007199254741004001")
                   (session-key . "group:20001")
                   (gateway-account-id . "slot-a"))))
-           (should-not (qq-chat--message-todo-capable-p message))
-           (setf (alist-get 'message-seq message) "9007199254740999")
            (should (qq-chat--message-todo-capable-p message))
            (setf (alist-get 'gateway-account-id message) "slot-b")
            (should-not (qq-chat--message-todo-capable-p message))))))))
