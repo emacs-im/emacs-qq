@@ -92,6 +92,10 @@ When ALLOW-ZERO is non-nil, the exact string `0' is accepted."
            (string-match-p "\\`\\(?:0\\|[1-9][0-9]*\\)\\'" value)
          (string-match-p "\\`[1-9][0-9]*\\'" value))))
 
+(defconst qq-gateway--max-uint64-decimal
+  "18446744073709551615"
+  "Largest exact unsigned 64-bit integer accepted on the Gateway wire.")
+
 (defun qq-gateway--decimal-less-p (left right)
   "Return non-nil when canonical decimal LEFT is less than RIGHT.
 
@@ -99,6 +103,16 @@ The comparison never coerces either protocol value to an Emacs number."
   (or (< (length left) (length right))
       (and (= (length left) (length right))
            (string-lessp left right))))
+
+(defun qq-gateway--uint64-decimal-p (value &optional allow-zero)
+  "Return non-nil when VALUE is a canonical uint64 decimal string.
+
+VALUE is compared as decimal text and is never coerced to an Emacs number.
+By default zero is rejected; when ALLOW-ZERO is non-nil, only the exact
+canonical string `0' additionally qualifies."
+  (and (qq-gateway--canonical-decimal-p value allow-zero)
+       (not (qq-gateway--decimal-less-p
+             qq-gateway--max-uint64-decimal value))))
 
 (defun qq-gateway--validate-optional-string (value context)
   "Validate optional string VALUE for CONTEXT."
@@ -171,8 +185,8 @@ The comparison never coerces either protocol value to an Emacs number."
       (error "qq: QQ account label is invalid"))
     (unless (member phase qq-gateway--account-phases)
       (error "qq: QQ account phase is invalid"))
-    (unless (or (null uin) (qq-gateway--canonical-decimal-p uin))
-      (error "qq: QQ account UIN must be an exact decimal string or null"))
+    (unless (or (null uin) (qq-gateway--uint64-decimal-p uin))
+      (error "qq: QQ account UIN must be a canonical nonzero uint64 string or null"))
     (unless (or (null uid) (qq-gateway--non-empty-string-p uid))
       (error "qq: QQ account UID must be an opaque string or null"))
     (qq-gateway--validate-challenge
@@ -511,8 +525,8 @@ reason."
            (read-passwd "QQ password: ") nil
            #'qq-gateway--interactive-success
            #'qq-gateway--interactive-error)))
-  (unless (qq-gateway--canonical-decimal-p uin)
-    (user-error "qq: UIN must be a canonical positive decimal string"))
+  (unless (qq-gateway--uint64-decimal-p uin)
+    (user-error "qq: UIN must be a canonical nonzero uint64 string"))
   (unless (qq-gateway--non-empty-string-p password)
     (user-error "qq: Password must not be empty"))
   (unless (or (null qimei) (qq-gateway--non-empty-string-p qimei))

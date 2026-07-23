@@ -39,6 +39,17 @@
          (qq-gateway-desync-hook nil))
      ,@body))
 
+(ert-deftest qq-gateway-uint64-wire-predicate-is-exact-and-bounded ()
+  (should (qq-gateway--uint64-decimal-p "1"))
+  (should
+   (qq-gateway--uint64-decimal-p qq-gateway--max-uint64-decimal))
+  (should (qq-gateway--uint64-decimal-p "0" t))
+  (dolist (value
+           '(nil 0 "0" "00" "01" "-1" "18446744073709551616"))
+    (should-not (qq-gateway--uint64-decimal-p value)))
+  (dolist (value '("00" "01" "18446744073709551616"))
+    (should-not (qq-gateway--uint64-decimal-p value t))))
+
 (ert-deftest qq-gateway-account-validator-preserves-exact-identities ()
   (let* ((raw (qq-gateway-test-account
                "slot-a" "online" "9007199254740993" "Primary"))
@@ -47,6 +58,16 @@
     (should-not (assq 'generation snapshot))
     (setf (alist-get 'uin raw) 9007199254740993)
     (should-error (qq-gateway--validate-account raw))))
+
+(ert-deftest qq-gateway-account-uin-is-a-nonzero-uint64 ()
+  (should
+   (qq-gateway--validate-account
+    (qq-gateway-test-account
+     "slot-a" "online" "18446744073709551615")))
+  (dolist (uin '("0" "010001" "18446744073709551616"))
+    (should-error
+     (qq-gateway--validate-account
+      (qq-gateway-test-account "slot-a" "online" uin)))))
 
 (ert-deftest qq-gateway-account-validator-rejects-open-shapes ()
   (let ((raw (append (qq-gateway-test-account "slot-a")
