@@ -8,7 +8,7 @@
 (require 'qq-gateway-message)
 
 (defconst qq-gateway-message-test-capabilities
-  '("message.send" "message.send_text" "message.poke"
+  '("message.send" "message.poke"
     "message.recall_poke" "message.recall" "message.set_reaction"
     "message.set_essence" "message.set_todo" "message.get_history"
     "message.mark_read")
@@ -240,11 +240,55 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (should (equal (alist-get 'sequence message)
                    "9007199254740999"))
     (should (stringp (alist-get 'client_sequence message)))
-    (let ((numeric (copy-tree raw)))
-      (setf (alist-get 'message_id (alist-get 'message numeric))
-            7348923749823749823)
-      (should-error
-       (qq-gateway-message--validate-message-data numeric)))))
+    (let ((maximum (copy-tree raw)))
+      (setf (alist-get 'message_id (alist-get 'message maximum))
+            "18446744073709551615")
+      (should (qq-gateway-message--validate-message-data maximum)))
+    (dolist (invalid-id
+             '(7348923749823749823 "0" "07348923749823749823"
+               "18446744073709551616"))
+      (let ((invalid (copy-tree raw)))
+        (setf (alist-get 'message_id (alist-get 'message invalid)) invalid-id)
+        (should-error
+         (qq-gateway-message--validate-message-data invalid))))))
+
+(ert-deftest qq-gateway-message-nested-message-references-use-exact-uint64 ()
+  (let ((reply
+         '((kind . "reply")
+           (payload
+            . ((target
+                . ((kind . "unresolved")
+                   (message_id . "18446744073709551615")))))))
+        (recall
+         '((kind . "message")
+           (message_id . "18446744073709551615")
+           (sequence . "0"))))
+    (should (qq-gateway-message--validate-segment reply))
+    (should (qq-gateway-message--validate-recall-target recall))
+    (dolist (message-id '("0" "01" "18446744073709551616"))
+      (let ((invalid-reply (copy-tree reply))
+            (invalid-recall (copy-tree recall)))
+        (setf (alist-get
+               'message_id
+               (alist-get 'target (alist-get 'payload invalid-reply)))
+              message-id)
+        (setf (alist-get 'message_id invalid-recall) message-id)
+        (should-error
+         (qq-gateway-message--validate-segment invalid-reply))
+        (should-error
+         (qq-gateway-message--validate-recall-target invalid-recall))))))
+
+(ert-deftest qq-gateway-message-conversation-params-require-uint64-uin ()
+  (should
+   (equal
+    (qq-gateway-message--conversation-params
+     "private:18446744073709551615")
+    '((kind . "private") (peer_uin . "18446744073709551615"))))
+  (dolist (session-key
+           '("private:0" "private:010001" "group:18446744073709551616"))
+    (should-error
+     (qq-gateway-message--conversation-params session-key)
+     :type 'user-error)))
 
 (ert-deftest qq-gateway-message-wire-arrays-normalize-at-their-schema-level ()
   (let* ((event
@@ -664,20 +708,24 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                    "request-send")))
         (should
          (equal
-          (qq-gateway-message-send-text
-           "private:10001" "hello"
+          (qq-gateway-message-send
+           "private:10001"
+           '(((type . "text") (data . ((text . "hello")))))
+           nil
            (lambda (receipt) (setq callback-result receipt)))
           "request-send"))
         (setq local-id
               (alist-get 'local-id
                          (car (qq-state-session-messages "private:10001"))))
-        (should (equal sent-method "message.send_text"))
+        (should (equal sent-method "message.send"))
         (should
          (equal sent-params
                 '((account_id . "slot-a")
                   (conversation . ((kind . "private")
                                    (peer_uin . "10001")))
-                  (text . "hello"))))
+                  (segments
+                   . (((kind . "text")
+                       (payload . ((text . "hello")))))))))
         (should (equal (alist-get 'client_sequence callback-result) "42001"))
         (should (= (hash-table-count qq-gateway-message--pending-sends) 1))
         (qq-gateway-message--handle-event
@@ -698,7 +746,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (should (eq (alist-get 'status message) 'sent))
           (should (= (hash-table-count qq-gateway-message--pending-sends) 0)))))))
 
-(ert-deftest qq-gateway-message-send-projects-reference-only-rich-segments ()
+(ert-deftest qq-gateway-message-send-lifts-reference-out-of-rich-content ()
   (qq-gateway-message-test-with-state
     (let ((now (floor (float-time))) sent-method sent-params)
       (let ((segments
@@ -733,11 +781,10 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
             `((account_id . "slot-a")
               (conversation
                . ((kind . "group") (group_uin . "8209413637")))
+              (reply_to
+               . ((message_id . "7348923749823749823")))
               (segments
-               . (((kind . "reply")
-                   (payload
-                    . ((message_id . "7348923749823749823"))))
-                  ((kind . "mention")
+               . (((kind . "mention")
                    (payload
                     . ((target . ((kind . "user") (uin . "10001")))
                        (display . "Alice"))))
@@ -811,15 +858,17 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
        (qq-gateway-message-test-ready-record attachment-id) 'test)
       (should
        (equal
-        (qq-gateway-message--outgoing-segments
+        (qq-gateway-message--prepare-outbound
          "group:8209413637"
          `(((type . "record")
             (data . ((attachment_id . ,attachment-id)))))
          "slot-a")
-        `(((kind . "record")
-           (payload . ((attachment_id . ,attachment-id)))))))
+        `(:reply-to nil
+          :segments
+          (((kind . "record")
+            (payload . ((attachment_id . ,attachment-id))))))))
       (should-error
-       (qq-gateway-message--outgoing-segments
+       (qq-gateway-message--prepare-outbound
         "group:8209413637"
         `(((type . "image")
            (data . ((attachment_id . ,attachment-id)))))
@@ -871,22 +920,32 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           sent-params
           '((account_id . "slot-a")
             (conversation . ((kind . "private") (peer_uin . "10001")))
+            (reply_to
+             . ((message_id . "7348923749823749823")))
             (segments
-             . (((kind . "reply")
-                 (payload
-                  . ((message_id . "7348923749823749823"))))
-                ((kind . "text") (payload . ((text . "hello")))))))))
+             . (((kind . "text")
+                 (payload . ((text . "hello")))))))))
         (let ((pending
                (car (qq-state-session-messages "private:10001"))))
           (should pending)
+          (should
+           (equal
+            (alist-get 'segments pending)
+            '(((type . "reply")
+               (data . ((id . "7348923749823749823"))))
+              ((type . "text") (data . ((text . "hello")))))))
           (should (eq (alist-get 'status pending) 'pending)))))))
 
-(ert-deftest qq-gateway-message-send-rejects-malformed-reply-before-pending ()
+(ert-deftest
+    qq-gateway-message-send-rejects-malformed-or-duplicate-reply-before-pending
+    ()
   (qq-gateway-message-test-with-state
     (let ((sent nil))
       (cl-letf (((symbol-function 'qq-gateway-transport-send)
                  (lambda (&rest _arguments) (setq sent t))))
-        (dolist (message-id '(42 "07348923749823749823"))
+        (dolist (message-id
+                 '(42 "0" "07348923749823749823"
+                   "18446744073709551616"))
           (should-error
            (qq-gateway-message-send
             "private:10001"
@@ -894,8 +953,74 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                (data . ((id . ,message-id))))
               ((type . "text") (data . ((text . "hello"))))))
            :type 'user-error))
+        (should-error
+         (qq-gateway-message-send
+          "private:10001"
+          '(((type . "reply")
+             (data . ((id . "7348923749823749823"))))
+            ((type . "text") (data . ((text . "hello"))))
+            ((type . "reply")
+             (data . ((id . "7348923749823749824"))))))
+         :type 'user-error)
         (should-not sent)
         (should-not (qq-state-session-messages "private:10001"))))))
+
+(ert-deftest qq-gateway-message-send-rejects-out-of-range-session-before-pending ()
+  (qq-gateway-message-test-with-state
+    (let ((sent nil))
+      (cl-letf (((symbol-function 'qq-gateway-transport-send)
+                 (lambda (&rest _arguments) (setq sent t))))
+        (dolist (session-key
+                 '("private:0" "private:010001"
+                   "group:18446744073709551616"))
+          (should-error
+           (qq-gateway-message-send
+            session-key
+            '(((type . "text") (data . ((text . "hello"))))))
+           :type 'user-error)
+          (should-not (qq-state-session-messages session-key)))
+        (should-not sent)))))
+
+(ert-deftest qq-gateway-message-send-requires-non-reply-content ()
+  (qq-gateway-message-test-with-state
+    (let ((sent nil))
+      (cl-letf (((symbol-function 'qq-gateway-transport-send)
+                 (lambda (&rest _arguments) (setq sent t))))
+        (dolist
+            (segments
+             '(nil
+               (((type . "reply")
+                 (data . ((id . "7348923749823749823")))))))
+          (should-error
+           (qq-gateway-message-send "private:10001" segments)
+           :type 'user-error))
+        (should-not sent)
+        (should-not (qq-state-session-messages "private:10001"))))))
+
+(ert-deftest qq-gateway-message-reply-does-not-count-toward-content-limit ()
+  (qq-gateway-message-test-with-state
+    (let* ((reply
+             '((type . "reply")
+               (data . ((id . "18446744073709551615")))))
+           (contents
+            (cl-loop repeat 128
+                     collect
+                     '((type . "text") (data . ((text . "hello"))))))
+           (outbound
+            (qq-gateway-message--prepare-outbound
+             "private:10001" (cons reply contents) "slot-a")))
+      (should (= (length (plist-get outbound :segments)) 128))
+      (should
+       (equal
+         (plist-get outbound :reply-to)
+         '((message_id . "18446744073709551615"))))
+      (should-error
+       (qq-gateway-message--prepare-outbound
+        "private:10001"
+        (append contents
+                '(((type . "text") (data . ((text . "overflow"))))))
+        "slot-a")
+       :type 'user-error))))
 
 (ert-deftest qq-gateway-message-poke-uses-exact-uin-and-local-gray-tip ()
   (qq-gateway-message-test-with-state
@@ -1268,7 +1393,9 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                  (lambda (_method _params callback _errback &optional _early)
                    (setq response-callback callback)
                    "request-send")))
-        (qq-gateway-message-send-text "private:10001" "hello")
+        (qq-gateway-message-send
+         "private:10001"
+         '(((type . "text") (data . ((text . "hello"))))))
         (setq local-id
               (alist-get 'local-id
                          (car (qq-state-session-messages "private:10001"))))
@@ -1307,8 +1434,10 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                             '((code . "send_failed") (message . "boom"))
                             "boom")
                    nil)))
-        (qq-gateway-message-send-text
-         "private:10001" "hello" nil
+        (qq-gateway-message-send
+         "private:10001"
+         '(((type . "text") (data . ((text . "hello")))))
+         nil nil
          (lambda (_body reason) (setq failure reason)))
         (let ((message
                (car (qq-state-session-messages "private:10001"))))
@@ -1755,7 +1884,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                 ((symbol-function 'qq-gateway-transport-send)
                  (lambda (method _params callback _errback &optional _early)
                    (pcase method
-                     ("message.send_text"
+                     ("message.send"
                       (funcall callback
                                `((account_id . "slot-a")
                                  (sent_at . ,now)
@@ -1778,7 +1907,9 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                          (qq-gateway-message-test-history-result
                           (list message) "8765432109" "8765432109")))))
                    (concat "request-" method))))
-        (qq-gateway-message-send-text "private:10001" "hello")
+        (qq-gateway-message-send
+         "private:10001"
+         '(((type . "text") (data . ((text . "hello"))))))
         (setq local-id
               (alist-get 'local-id
                          (car (qq-state-session-messages "private:10001"))))

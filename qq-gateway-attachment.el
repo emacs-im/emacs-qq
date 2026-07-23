@@ -101,19 +101,15 @@ behalf of one caller."
   (setq conversation (qq-gateway-wire-domain-copy conversation))
   (pcase (alist-get 'kind conversation)
     ("private"
-     (let ((uin (alist-get 'peer_uin conversation))
-           (uid (alist-get 'peer_uid conversation)))
-       (unless (or (and (qq-gateway--exact-object-keys-p
-                         conversation '(kind peer_uin))
-                        (qq-gateway--canonical-decimal-p uin))
-                   (and (qq-gateway--exact-object-keys-p
-                         conversation '(kind peer_uid))
-                        (qq-gateway--non-empty-string-p uid)))
-         (error "qq: Gateway private attachment conversation is malformed"))))
+     (unless (and (qq-gateway--exact-object-keys-p
+                   conversation '(kind peer_uin))
+                  (qq-gateway--uint64-decimal-p
+                   (alist-get 'peer_uin conversation)))
+       (error "qq: Gateway private attachment conversation is malformed")))
     ("group"
      (unless (and (qq-gateway--exact-object-keys-p
                    conversation '(kind group_uin))
-                  (qq-gateway--canonical-decimal-p
+                  (qq-gateway--uint64-decimal-p
                    (alist-get 'group_uin conversation)))
        (error "qq: Gateway group attachment conversation is malformed")))
     (_ (error "qq: Gateway attachment conversation has unknown kind")))
@@ -173,8 +169,8 @@ behalf of one caller."
     (qq-gateway-attachment--validate-use (alist-get 'use snapshot))
     (unless (member phase qq-gateway-attachment--phases)
       (error "qq: Gateway attachment has unknown phase"))
-    (unless (and (qq-gateway--canonical-decimal-p bytes-done t)
-                 (qq-gateway--canonical-decimal-p bytes-total)
+    (unless (and (qq-gateway--uint64-decimal-p bytes-done t)
+                 (qq-gateway--uint64-decimal-p bytes-total t)
                  (qq-gateway-attachment--decimal-less-or-equal-p
                   bytes-done bytes-total))
       (error "qq: Gateway attachment byte progress is malformed"))
@@ -364,8 +360,16 @@ behalf of one caller."
          (kind (alist-get 'type identity))
          (target (alist-get 'target-id identity)))
     (pcase kind
-      ('private `((kind . "private") (peer_uin . ,target)))
-      ('group `((kind . "group") (group_uin . ,target)))
+      ('private
+       (unless (qq-gateway--uint64-decimal-p target)
+         (user-error
+          "qq: Prepared private attachment requires a canonical nonzero uint64 UIN"))
+       `((kind . "private") (peer_uin . ,target)))
+      ('group
+       (unless (qq-gateway--uint64-decimal-p target)
+         (user-error
+          "qq: Prepared group attachment requires a canonical nonzero uint64 UIN"))
+       `((kind . "group") (group_uin . ,target)))
       (_ (user-error
           "qq: Prepared attachments support only private or group chats")))))
 
@@ -534,9 +538,9 @@ state."
                  ((null resource)
                   (setq finished t)
                   (remove-hook 'qq-gateway-resource-changed-hook observer)
-                 (qq-gateway--client-error
-                   errback "resource_disappeared"
-                   "Staged resource disappeared"))
+                  (qq-gateway--client-error
+                    errback "resource_disappeared"
+                    "Staged resource disappeared"))
                  ((equal (alist-get 'phase resource) "ready")
                   (setq finished t)
                   (remove-hook 'qq-gateway-resource-changed-hook observer)

@@ -107,6 +107,64 @@
           '((kind . "record") (summary . "must-not-exist")))
     (should-error (qq-gateway-attachment--validate-snapshot record))))
 
+(ert-deftest qq-gateway-attachment-private-conversation-is-uin-only ()
+  (let* ((snapshot
+          (qq-gateway-attachment-test-snapshot
+           :conversation '((kind . "private") (peer_uin . "10001"))))
+         (validated (qq-gateway-attachment--validate-snapshot snapshot)))
+    (should
+     (equal (alist-get 'conversation validated)
+            '((kind . "private") (peer_uin . "10001")))))
+  (dolist
+      (conversation
+       '(((kind . "private") (peer_uid . "u_native"))
+         ((kind . "private") (peer_uin . "10001") (peer_uid . "u_native"))
+         ((kind . "private") (peer_uin . "10001") (native_hint . "u_native"))
+         ((kind . "private") (peer_uin . "010001"))))
+    (should-error
+     (qq-gateway-attachment--validate-snapshot
+      (qq-gateway-attachment-test-snapshot
+       :conversation conversation)))))
+
+(ert-deftest qq-gateway-attachment-conversation-uins-are-bounded-uint64 ()
+  (dolist
+      (conversation
+       '(((kind . "private") (peer_uin . "18446744073709551615"))
+         ((kind . "group") (group_uin . "18446744073709551615"))))
+    (should (qq-gateway-attachment--validate-conversation conversation)))
+  (dolist (uin '("0" "010001" "18446744073709551616"))
+    (dolist (kind '((private . peer_uin) (group . group_uin)))
+      (should-error
+       (qq-gateway-attachment--validate-conversation
+        `((kind . ,(symbol-name (car kind))) (,(cdr kind) . ,uin)))))))
+
+(ert-deftest qq-gateway-attachment-progress-is-an-exact-uint64 ()
+  (should
+   (qq-gateway-attachment--validate-snapshot
+    (qq-gateway-attachment-test-snapshot
+     :bytes-done "18446744073709551615"
+     :bytes-total "18446744073709551615")))
+  (should
+   (qq-gateway-attachment--validate-snapshot
+    (qq-gateway-attachment-test-snapshot
+     :bytes-done "0" :bytes-total "0")))
+  (dolist (value '("00" "18446744073709551616"))
+    (should-error
+     (qq-gateway-attachment--validate-snapshot
+      (qq-gateway-attachment-test-snapshot :bytes-total value)))))
+
+(ert-deftest qq-gateway-attachment-conversation-params-require-uint64-uin ()
+  (should
+   (equal
+    (qq-gateway-attachment--conversation-params
+     "group:18446744073709551615")
+    '((kind . "group") (group_uin . "18446744073709551615"))))
+  (dolist (session-key
+           '("private:0" "private:010001" "group:18446744073709551616"))
+    (should-error
+     (qq-gateway-attachment--conversation-params session-key)
+     :type 'user-error)))
+
 (ert-deftest qq-gateway-attachment-validator-rejects-phase-contradictions ()
   (let ((ready (qq-gateway-attachment-test-ready))
         (uploaded
