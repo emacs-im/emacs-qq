@@ -39,7 +39,7 @@
 
 (defface qq-red-packet-action-button
   '((t :inherit mode-line-inactive :weight semi-bold
-       :box (:line-width -1 :style released-button)))
+     :box (:line-width -1 :style released-button)))
   "Face used for red-packet page actions."
   :group 'qq)
 
@@ -359,28 +359,28 @@
     (qq-red-packet--request-sync view)
     (condition-case error-data
         (let ((request
-               (qq-api-get-red-packet-detail
-                session-key message-id
-                (lambda (detail)
-                  (when (qq-red-packet--request-current-p
-                         view buffer session-key message-id owner)
-                    (with-current-buffer buffer
-                      (setq qq-red-packet--detail detail
-                            qq-red-packet--loading nil
-                            qq-red-packet--error nil
-                            qq-red-packet--request nil
-                            qq-red-packet--request-owner nil)
-                      (qq-red-packet--request-sync view))))
-                (lambda (_response reason)
-                  (when (qq-red-packet--request-current-p
-                         view buffer session-key message-id owner)
-                    (with-current-buffer buffer
-                      (setq qq-red-packet--loading nil
-                            qq-red-packet--error
-                            (or reason "无法获取红包详情")
-                            qq-red-packet--request nil
-                            qq-red-packet--request-owner nil)
-                      (qq-red-packet--request-sync view)))))))
+                (qq-api-get-red-packet-detail
+                 session-key message-id
+                 (lambda (detail)
+                   (when (qq-red-packet--request-current-p
+                          view buffer session-key message-id owner)
+                     (with-current-buffer buffer
+                       (setq qq-red-packet--detail detail
+                             qq-red-packet--loading nil
+                             qq-red-packet--error nil
+                             qq-red-packet--request nil
+                             qq-red-packet--request-owner nil)
+                       (qq-red-packet--request-sync view))))
+                 (lambda (_response reason)
+                   (when (qq-red-packet--request-current-p
+                          view buffer session-key message-id owner)
+                     (with-current-buffer buffer
+                       (setq qq-red-packet--loading nil
+                             qq-red-packet--error
+                             (or reason "无法获取红包详情")
+                             qq-red-packet--request nil
+                             qq-red-packet--request-owner nil)
+                       (qq-red-packet--request-sync view)))))))
           (when (eq qq-red-packet--request-owner owner)
             (setq qq-red-packet--request request)))
       (error
@@ -437,39 +437,39 @@
     (qq-red-packet--request-sync view)
     (condition-case error-data
         (let ((request
-               (qq-api-grab-red-packet
-                session-key message-id
-                (lambda (result)
-                  (when (qq-red-packet--grab-current-p
-                         view buffer session-key message-id owner)
-                    (with-current-buffer buffer
-                      (setq qq-red-packet--grabbing nil
-                            qq-red-packet--grab-request nil
-                            qq-red-packet--grab-owner nil)
-                      (if (equal (alist-get 'interaction result) "password")
-                          (progn
-                            (setq qq-red-packet--notice
-                                  "口令红包领取请求已提交")
-                            (message "qq: 口令红包领取请求已提交"))
-                        (setq qq-red-packet--notice
-                              "红包领取请求已完成")
-                        (message "qq: 红包领取请求已完成")
-                        (appkit-view-enqueue-event
-                         view
-                         (list :type 'refresh-detail
-                               :session-key session-key
-                               :message-id message-id)))
-                      (qq-red-packet--request-sync view))))
-                (lambda (_response reason)
-                  (when (qq-red-packet--grab-current-p
-                         view buffer session-key message-id owner)
-                    (with-current-buffer buffer
-                      (setq qq-red-packet--grabbing nil
-                            qq-red-packet--error
-                            (or reason "领取红包失败")
-                            qq-red-packet--grab-request nil
-                            qq-red-packet--grab-owner nil)
-                      (qq-red-packet--request-sync view)))))))
+                (qq-api-grab-red-packet
+                 session-key message-id
+                 (lambda (result)
+                   (when (qq-red-packet--grab-current-p
+                          view buffer session-key message-id owner)
+                     (with-current-buffer buffer
+                       (setq qq-red-packet--grabbing nil
+                             qq-red-packet--grab-request nil
+                             qq-red-packet--grab-owner nil)
+                       (if (equal (alist-get 'interaction result) "password")
+                           (progn
+                             (setq qq-red-packet--notice
+                                   "口令红包领取请求已提交")
+                             (message "qq: 口令红包领取请求已提交"))
+                         (setq qq-red-packet--notice
+                               "红包领取请求已完成")
+                         (message "qq: 红包领取请求已完成")
+                         (appkit-view-enqueue-event
+                          view
+                          (list :type 'refresh-detail
+                                :session-key session-key
+                                :message-id message-id)))
+                       (qq-red-packet--request-sync view))))
+                 (lambda (_response reason)
+                   (when (qq-red-packet--grab-current-p
+                          view buffer session-key message-id owner)
+                     (with-current-buffer buffer
+                       (setq qq-red-packet--grabbing nil
+                             qq-red-packet--error
+                             (or reason "领取红包失败")
+                             qq-red-packet--grab-request nil
+                             qq-red-packet--grab-owner nil)
+                       (qq-red-packet--request-sync view)))))))
           (when (eq qq-red-packet--grab-owner owner)
             (setq qq-red-packet--grab-request request)))
       (error
@@ -554,7 +554,7 @@
             (appkit-view-sync-function current)
             #'qq-red-packet--sync-invalidations
             (appkit-view-parts current) '(packet))
-     current)
+      current)
      ((appkit-view-live-p current)
       (error "QQ: Red-packet buffer belongs to another Appkit view"))
      (t

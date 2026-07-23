@@ -230,7 +230,7 @@ the recursive media/forward decoder."
   "Return non-nil when VALUE is one flat closed rendering snapshot."
   (and (qq-protocol--closed-object-p
         value '(chat message_id message_seq sent_at sender outgoing state
-                     segments reactions))
+                segments reactions))
        (qq-protocol-emacs-chat-locator-p (alist-get 'chat value))
        (qq-protocol--nonzero-decimal-string-p
         (alist-get 'message_id value))

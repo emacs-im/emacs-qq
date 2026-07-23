@@ -234,9 +234,9 @@ USER-ID defaults to the opaque identity selected in the current buffer."
   (when (consp level)
     (let ((parts
            (cl-loop for (field label) in '((crowns "皇冠")
-                                            (suns "太阳")
-                                            (moons "月亮")
-                                            (stars "星星"))
+                                           (suns "太阳")
+                                           (moons "月亮")
+                                           (stars "星星"))
                     for count = (alist-get field level)
                     when (and (integerp count) (> count 0))
                     collect (format "%d %s" count label))))

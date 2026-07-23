@@ -41,7 +41,7 @@
 
 (defface qq-guild-user-action-button
   '((t :inherit mode-line-inactive :weight semi-bold
-       :box (:line-width -1 :style released-button)))
+     :box (:line-width -1 :style released-button)))
   "Face used for QQ channel member page actions."
   :group 'qq)
 
@@ -264,29 +264,29 @@ RESOURCE identifies a presentation-only avatar update."
       (qq-guild-user--request-sync view)
       (condition-case error-data
           (let ((request
-                 (qq-api-get-guild-member-profile
-                  guild-id native-id
-                  (lambda (profile)
-                    (when (qq-guild-user--request-current-p
-                           view buffer guild-id native-id owner)
-                      (with-current-buffer buffer
-                        (setq qq-guild-user--profile profile
-                              qq-guild-user--loading nil
-                              qq-guild-user--error nil
-                              qq-guild-user--request nil
-                              qq-guild-user--request-owner nil)
-                        (qq-guild-user--request-sync view))))
-                  (lambda (_response reason)
-                    (when (qq-guild-user--request-current-p
-                           view buffer guild-id native-id owner)
-                      (with-current-buffer buffer
-                        (setq qq-guild-user--loading nil
-                              qq-guild-user--error
-                              (format "Unable to load channel member: %s"
-                                      (or reason "unknown error"))
-                              qq-guild-user--request nil
-                              qq-guild-user--request-owner nil)
-                        (qq-guild-user--request-sync view)))))))
+                  (qq-api-get-guild-member-profile
+                   guild-id native-id
+                   (lambda (profile)
+                     (when (qq-guild-user--request-current-p
+                            view buffer guild-id native-id owner)
+                       (with-current-buffer buffer
+                         (setq qq-guild-user--profile profile
+                               qq-guild-user--loading nil
+                               qq-guild-user--error nil
+                               qq-guild-user--request nil
+                               qq-guild-user--request-owner nil)
+                         (qq-guild-user--request-sync view))))
+                   (lambda (_response reason)
+                     (when (qq-guild-user--request-current-p
+                            view buffer guild-id native-id owner)
+                       (with-current-buffer buffer
+                         (setq qq-guild-user--loading nil
+                               qq-guild-user--error
+                               (format "Unable to load channel member: %s"
+                                       (or reason "unknown error"))
+                               qq-guild-user--request nil
+                               qq-guild-user--request-owner nil)
+                         (qq-guild-user--request-sync view)))))))
             (when (eq qq-guild-user--request-owner owner)
               (setq qq-guild-user--request request)))
         (error
@@ -388,7 +388,7 @@ RESOURCE identifies a presentation-only avatar update."
             (appkit-view-sync-function current)
             #'qq-guild-user--sync-invalidations
             (appkit-view-parts current) '(profile))
-     current)
+      current)
      ((appkit-view-live-p current)
       (error "QQ: Member buffer belongs to another Appkit view"))
      (t

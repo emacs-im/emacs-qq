@@ -297,23 +297,23 @@ the stable-key projection is reconciled."
                :preserve-window-start t))))
       (when (or full-p force-keys)
         (appkit-with-content-update view
-				    (unless qq-user-photo--ewoc
-				      (erase-buffer)
-				      (setq qq-user-photo--ewoc
-					    (ewoc-create #'qq-user-photo--ewoc-printer nil nil t)))
-				    (if full-p
-					(setq qq-user-photo--node-table
-					      (appkit-ewoc-reconcile
-					       qq-user-photo--ewoc
-					       (qq-user-photo--project-entries)
-					       #'qq-user-photo--entry-key
-					       :force-keys force-keys))
-				      (dolist (key force-keys)
-					(appkit-ewoc-invalidate-key
-					 qq-user-photo--ewoc qq-user-photo--node-table key)))
-				    (force-mode-line-update)
-				    (when snapshot
-				      (appkit-position-restore snapshot)))))))
+          (unless qq-user-photo--ewoc
+            (erase-buffer)
+            (setq qq-user-photo--ewoc
+                  (ewoc-create #'qq-user-photo--ewoc-printer nil nil t)))
+          (if full-p
+              (setq qq-user-photo--node-table
+                    (appkit-ewoc-reconcile
+                     qq-user-photo--ewoc
+                     (qq-user-photo--project-entries)
+                     #'qq-user-photo--entry-key
+                     :force-keys force-keys))
+            (dolist (key force-keys)
+              (appkit-ewoc-invalidate-key
+               qq-user-photo--ewoc qq-user-photo--node-table key)))
+          (force-mode-line-update)
+          (when snapshot
+            (appkit-position-restore snapshot)))))))
 
 (defun qq-user-photo-open-at-point ()
   "Open the native photo-wall image at point."
@@ -383,20 +383,20 @@ the stable-key projection is reconciled."
       (qq-user-photo--request-sync view)
       (condition-case error-data
           (let ((request
-                 (qq-api-get-user-photo-wall
-                  user-id
-                  (lambda (photos)
-                    (qq-user-photo--accept-load-event
-                     view buffer user-id owner
-                     (list :type 'success :photos photos)))
-                  (lambda (_response reason)
-                    (qq-user-photo--accept-load-event
-                     view buffer user-id owner
-                     (list
-                      :type 'error
-                      :error
-                      (format "Unable to load photo wall: %s"
-                              (or reason "unknown error"))))))))
+                  (qq-api-get-user-photo-wall
+                   user-id
+                   (lambda (photos)
+                     (qq-user-photo--accept-load-event
+                      view buffer user-id owner
+                      (list :type 'success :photos photos)))
+                   (lambda (_response reason)
+                     (qq-user-photo--accept-load-event
+                      view buffer user-id owner
+                      (list
+                       :type 'error
+                       :error
+                       (format "Unable to load photo wall: %s"
+                               (or reason "unknown error"))))))))
             (when (eq qq-user-photo--request-owner owner)
               (setq qq-user-photo--request request)))
         ((error quit)

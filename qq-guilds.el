@@ -469,15 +469,15 @@ buffer has been renamed."
       (qq-guilds--queue-view-sync view)
       (condition-case error-data
           (let ((request
-                 (qq-api-refresh-guild-directory
-                  (lambda (_directory)
-                    (qq-guilds--finish-refresh view buffer owner))
-                  (lambda (response reason)
-                    (qq-guilds--finish-refresh
-                     view buffer owner
-                     (format "读取频道目录失败: %s"
-                             (or reason (alist-get 'message response)
-                                 "未知错误")))))))
+                  (qq-api-refresh-guild-directory
+                   (lambda (_directory)
+                     (qq-guilds--finish-refresh view buffer owner))
+                   (lambda (response reason)
+                     (qq-guilds--finish-refresh
+                      view buffer owner
+                      (format "读取频道目录失败: %s"
+                              (or reason (alist-get 'message response)
+                                  "未知错误")))))))
             (when (qq-guilds--refresh-current-p view buffer owner)
               (setq qq-guilds--refresh-request request)))
         (error
@@ -538,8 +538,8 @@ buffer has been renamed."
        (let ((key (qq-state-guild-channel-session-key guild-id channel-id)))
          (qq-state-upsert-session
           key `((title . ,(format "%s · #%s"
-                                 (alist-get 'guild_name channel)
-                                 (alist-get 'name channel)))
+                                  (alist-get 'guild_name channel)
+                                  (alist-get 'name channel)))
                 (guild-name . ,(alist-get 'guild_name channel))
                 (channel-name . ,(alist-get 'name channel))
                 (channel-kind . ,kind))

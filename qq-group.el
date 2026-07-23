@@ -36,7 +36,7 @@
 
 (defface qq-group-action-button
   '((t :inherit mode-line-inactive :weight semi-bold
-       :box (:line-width -1 :style released-button)))
+     :box (:line-width -1 :style released-button)))
   "Face used for action buttons on QQ group cards."
   :group 'qq)
 
@@ -584,30 +584,30 @@ RESOURCE identifies a presentation-only media dependency update."
       (qq-group--request-sync view)
       (condition-case error-data
           (let ((request
-                 (qq-native-get-group
-                  group-id
-                  (lambda (profile)
-                    (when (qq-group--request-current-p
-                           view buffer group-id owner)
-                      (with-current-buffer buffer
-                        (setq qq-group--profile profile
-                              qq-group--loading nil
-                              qq-group--error nil
-                              qq-group--request nil
-                              qq-group--request-owner nil)
-                        (qq-group--request-sync view))))
-                  (lambda (response reason)
-                    (when (qq-group--request-current-p
-                           view buffer group-id owner)
-                      (with-current-buffer buffer
-                        (setq qq-group--loading nil
-                              qq-group--error
-                              (format "Unable to load group: %s"
-                                      (or reason "unknown error"))
-                              qq-group--request nil
-                              qq-group--request-owner nil)
-                        (qq-group--request-sync view)
-                        (qq-api--default-error response reason)))))))
+                  (qq-native-get-group
+                   group-id
+                   (lambda (profile)
+                     (when (qq-group--request-current-p
+                            view buffer group-id owner)
+                       (with-current-buffer buffer
+                         (setq qq-group--profile profile
+                               qq-group--loading nil
+                               qq-group--error nil
+                               qq-group--request nil
+                               qq-group--request-owner nil)
+                         (qq-group--request-sync view))))
+                   (lambda (response reason)
+                     (when (qq-group--request-current-p
+                            view buffer group-id owner)
+                       (with-current-buffer buffer
+                         (setq qq-group--loading nil
+                               qq-group--error
+                               (format "Unable to load group: %s"
+                                       (or reason "unknown error"))
+                               qq-group--request nil
+                               qq-group--request-owner nil)
+                         (qq-group--request-sync view)
+                         (qq-api--default-error response reason)))))))
             (when (eq qq-group--request-owner owner)
               (setq qq-group--request request)))
         (error

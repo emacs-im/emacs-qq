@@ -299,19 +299,19 @@ the stopped account."
               :anchor-property 'qq-group-notice-key
               :preserve-window-start t))))
       (appkit-with-content-update view
-				  (unless qq-group-notices--ewoc
-				    (erase-buffer)
-				    (setq qq-group-notices--ewoc
-					  (ewoc-create #'qq-group-notices--ewoc-printer nil nil t)))
-				  (setq qq-group-notices--node-table
-					(appkit-ewoc-reconcile
-					 qq-group-notices--ewoc
-					 (qq-group-notices--project-entries)
-					 #'qq-group-notices--entry-key
-					 :force-keys (appkit-invalidations-entry-keys invalidations)))
-				  (force-mode-line-update)
-				  (when snapshot
-				    (appkit-position-restore snapshot))))))
+        (unless qq-group-notices--ewoc
+          (erase-buffer)
+          (setq qq-group-notices--ewoc
+                (ewoc-create #'qq-group-notices--ewoc-printer nil nil t)))
+        (setq qq-group-notices--node-table
+              (appkit-ewoc-reconcile
+               qq-group-notices--ewoc
+               (qq-group-notices--project-entries)
+               #'qq-group-notices--entry-key
+               :force-keys (appkit-invalidations-entry-keys invalidations)))
+        (force-mode-line-update)
+        (when snapshot
+          (appkit-position-restore snapshot))))))
 
 (defun qq-group-notices--request-current-p (view buffer group-id owner)
   "Return non-nil when VIEW and OWNER still load GROUP-ID in BUFFER."
@@ -341,35 +341,35 @@ the stopped account."
       (qq-group-notices--request-sync view)
       (condition-case error-data
           (let ((request
-		 (qq-api-get-group-notices
-                  group-id
-                  (lambda (notices)
-                    (when (qq-group-notices--request-current-p
-                           view buffer group-id owner)
-                      (with-current-buffer buffer
-			(setq qq-group-notices--items notices
-                              qq-group-notices--loading nil
-                              qq-group-notices--error nil
-                              qq-group-notices--request nil
-                              qq-group-notices--request-owner nil)
-			(qq-group-notices--request-sync view))))
-                  (lambda (response reason)
-                    (when (qq-group-notices--request-current-p
-                           view buffer group-id owner)
-                      (with-current-buffer buffer
-			(setq qq-group-notices--loading nil
-                              qq-group-notices--error
-                              (format "无法加载群公告：%s"
-                                      (or reason "未知错误"))
-                              qq-group-notices--request nil
-                              qq-group-notices--request-owner nil)
-			(qq-group-notices--request-sync view))
-                      (qq-api--default-error response reason))))))
+                  (qq-api-get-group-notices
+                   group-id
+                   (lambda (notices)
+                     (when (qq-group-notices--request-current-p
+                            view buffer group-id owner)
+                       (with-current-buffer buffer
+                         (setq qq-group-notices--items notices
+                               qq-group-notices--loading nil
+                               qq-group-notices--error nil
+                               qq-group-notices--request nil
+                               qq-group-notices--request-owner nil)
+                         (qq-group-notices--request-sync view))))
+                   (lambda (response reason)
+                     (when (qq-group-notices--request-current-p
+                            view buffer group-id owner)
+                       (with-current-buffer buffer
+                         (setq qq-group-notices--loading nil
+                               qq-group-notices--error
+                               (format "无法加载群公告：%s"
+                                       (or reason "未知错误"))
+                               qq-group-notices--request nil
+                               qq-group-notices--request-owner nil)
+                         (qq-group-notices--request-sync view))
+                       (qq-api--default-error response reason))))))
             (when (eq qq-group-notices--request-owner owner)
               (setq qq-group-notices--request request)))
-	(error
-	 (when (qq-group-notices--request-current-p
-		view buffer group-id owner)
+        (error
+         (when (qq-group-notices--request-current-p
+                view buffer group-id owner)
            (with-current-buffer buffer
              (setq qq-group-notices--loading nil
                    qq-group-notices--error
