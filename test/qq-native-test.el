@@ -1236,7 +1236,8 @@
   (let ((path (make-temp-file "qq-native-image-send-" nil ".png" "abc"))
         (qq-native-request--active (make-hash-table :test #'eq))
         (real-create (symbol-function 'qq-native-request-create))
-        request cancelled send-inhibited-p released-resources)
+        request cancelled send-errback send-inhibited-p
+        released-resources released-attachments)
     (unwind-protect
         (cl-letf
             (((symbol-function 'qq-gateway-current-account-id)
@@ -1256,9 +1257,14 @@
                 (qq-gateway-attachment-operation-create :active-p nil)))
              ((symbol-function 'qq-native--release-send-resource)
               (lambda (resource-id) (push resource-id released-resources)))
+             ((symbol-function 'qq-native--release-send-attachment)
+              (lambda (attachment-id)
+                (push attachment-id released-attachments)))
              ((symbol-function 'qq-gateway-message-send)
-              (lambda (&rest _arguments)
-                (setq send-inhibited-p inhibit-quit)
+              (lambda (_session _segments &optional _raw _callback errback
+                       _optimistic)
+                (setq send-errback errback
+                      send-inhibited-p inhibit-quit)
                 "send-handoff-token"))
              ((symbol-function 'qq-gateway-transport-cancel)
               (lambda (token) (push token cancelled))))
@@ -1273,13 +1279,20 @@
           (qq-native-cancel-request request)
           (should (equal cancelled '("send-handoff-token")))
           (should (equal released-resources '("res-pending-send")))
+          (should
+           (equal released-attachments
+                  '("att-dddddddd-1111-4111-8111-dddddddddddd")))
+          (funcall send-errback nil "late send failure")
+          (should
+           (equal released-attachments
+                  '("att-dddddddd-1111-4111-8111-dddddddddddd")))
           (should (= (hash-table-count qq-native-request--active) 0)))
       (delete-file path))))
 
 (ert-deftest qq-native-local-record-is-prepared-before-message-send ()
   (let ((path (make-temp-file "qq-native-record-" nil ".wav" "pcm"))
         (owner "slot-a")
-        operation prepared sent released-resources)
+        operation prepared sent released-resources released-attachments)
     (unwind-protect
         (let ((segments
                `(((type . "text") (data . ((text . "voice:"))))
@@ -1298,6 +1311,9 @@
                   operation))
                ((symbol-function 'qq-native--release-send-resource)
                 (lambda (resource-id) (push resource-id released-resources)))
+               ((symbol-function 'qq-native--release-send-attachment)
+                (lambda (attachment-id)
+                  (push attachment-id released-attachments)))
                ((symbol-function 'qq-gateway-message-send)
                 (lambda (session ready-segments
                                  &optional raw callback errback optimistic)
@@ -1330,7 +1346,10 @@
               (should-not
                (string-match-p "qq-native-record-"
                                (prin1-to-string (nth 1 sent))))
-              (should (equal released-resources '("res-record-ready"))))))
+              (should (equal released-resources '("res-record-ready")))
+              (funcall (nth 3 sent) '((sent . t)))
+              (should (eq (qq-native-request-state request) 'settled))
+              (should-not released-attachments))))
       (delete-file path))))
 
 (ert-deftest qq-native-local-image-cancel-stops-before-message-dispatch ()
@@ -1450,6 +1469,67 @@
      (equal released-attachments
             '("att-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")))
     (should (equal (cadr failure) "message.send unavailable"))))
+
+(ert-deftest qq-native-local-image-async-send-failure-releases-submitted-object ()
+  (let ((path (make-temp-file "qq-native-image-async-failure-" nil ".png" "abc"))
+        ready-callback operation send-errback failure
+        released-resources released-attachments)
+    (unwind-protect
+        (cl-letf
+            (((symbol-function 'qq-gateway-current-account-id)
+              (lambda () "slot-a"))
+             ((symbol-function
+               'qq-gateway-attachment-stage-and-prepare-image)
+              (lambda (_session _path _summary _sub-type callback _errback)
+                (setq ready-callback callback
+                      operation
+                      (qq-gateway-attachment-operation-create :active-p t))
+                operation))
+             ((symbol-function 'qq-native--release-send-resource)
+              (lambda (resource-id) (push resource-id released-resources)))
+             ((symbol-function 'qq-native--release-send-attachment)
+              (lambda (attachment-id)
+                (push attachment-id released-attachments)))
+             ((symbol-function 'qq-gateway-message-send)
+              (lambda (_session _segments &optional _raw _callback errback
+                       _optimistic)
+                (setq send-errback errback)
+                "send-async-failure")))
+          (let ((request
+                 (qq-native-send-message
+                  "private:10001"
+                  `(((type . "reply")
+                     (data . ((id . "7348923749823749823"))))
+                    ((type . "image") (data . ((file . ,path)))))
+                  nil nil
+                  (lambda (body reason) (setq failure (list body reason))))))
+            (setf (qq-gateway-attachment-operation-active-p operation) nil)
+            (funcall
+             ready-callback
+             (qq-native-test-prepared-image
+              "att-ffffffff-eeee-4eee-8eee-ffffffffffff"
+              "res-image-async-failure"))
+            (should (equal (qq-native-request-token request)
+                           "send-async-failure"))
+            (should (equal released-resources
+                           '("res-image-async-failure")))
+            (should-not released-attachments)
+            (funcall send-errback
+                     '((code . "message_reference_unknown"))
+                     "reply target is unknown")
+            (should (eq (qq-native-request-state request) 'failed))
+            (should
+             (equal released-attachments
+                    '("att-ffffffff-eeee-4eee-8eee-ffffffffffff")))
+            (should (equal (cadr failure) "reply target is unknown"))
+            ;; A duplicate terminal callback cannot release the ID twice.
+            (funcall send-errback
+                     '((code . "message_reference_unknown"))
+                     "reply target is unknown")
+            (should
+             (equal released-attachments
+                    '("att-ffffffff-eeee-4eee-8eee-ffffffffffff")))))
+      (delete-file path))))
 
 (ert-deftest qq-native-url-only-image-fails-before-staging ()
   (let (staged sent)
