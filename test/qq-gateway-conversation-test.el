@@ -82,13 +82,11 @@ TRUNCATED is its exact wire boolean."
          (qq-gateway--gateway-instance-id nil)
          (qq-gateway--resync-request-id nil)
          (qq-gateway-accounts-changed-hook nil)
-         (qq-gateway-current-account-changed-hook
-          '(qq-gateway-conversation-reset))
+         (qq-gateway-current-account-changed-hook nil)
          (qq-gateway-desync-hook nil)
          (qq-gateway-transport--gateway-instance-id "gateway-a")
          (qq-gateway-transport--capabilities '("conversation.list_recent"))
-         (qq-gateway-transport--state 'ready)
-         (qq-gateway-conversation--active-request nil))
+         (qq-gateway-transport--state 'ready))
      (qq-gateway--replace-accounts
       (list (qq-gateway-conversation-test-account)) 'ready "gateway-a")
      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
@@ -109,12 +107,13 @@ TRUNCATED is its exact wire boolean."
                    "recent-1")))
         (should (equal
                  (qq-gateway-conversation-list-recent
-                  (lambda (page) (setq delivered page)) nil 37)
+                  "slot-a"
+                  :callback (lambda (page) (setq delivered page))
+                  :limit 37)
                  "recent-1"))
         (should (equal method "conversation.list_recent"))
         (should (equal params '((account_id . "slot-a") (limit . 37))))
         (funcall success (qq-gateway-conversation-test-page)))
-      (should (null qq-gateway-conversation--active-request))
       (should (proper-list-p (alist-get 'conversations delivered)))
       (let* ((row (car (alist-get 'conversations delivered)))
              (message (alist-get 'latest_message row))
@@ -236,219 +235,41 @@ TRUNCATED is its exact wire boolean."
                  (lambda (&rest _arguments) (cl-incf sent))))
         (dolist (invalid '(0 501 1.5 "10"))
           (should-error
-           (qq-gateway-conversation-list-recent nil nil invalid)
+           (qq-gateway-conversation-list-recent
+            "slot-a" :limit invalid)
            :type 'user-error))
-        (qq-gateway-conversation-list-recent nil nil)
+        (qq-gateway-conversation-list-recent "slot-a")
         (should (= sent 1))))))
 
-(ert-deftest qq-gateway-conversation-stale-owner-or-instance-cannot-deliver ()
-  (dolist (stale-kind '(owner instance))
-    (qq-gateway-conversation-test-with-state
-      (let (success delivered error-body)
-        (cl-letf (((symbol-function 'qq-gateway-transport-send)
-                   (lambda (_method _params callback _errback &optional _early)
-                     (setq success callback)
-                     "recent-stale")))
+(ert-deftest qq-gateway-conversation-is-stateless-and-account-addressed ()
+  (qq-gateway-conversation-test-with-state
+    (let (params success delivered)
+      (cl-letf (((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method request-params callback _errback
+                          &optional _early)
+                   (setq params request-params
+                         success callback)
+                   "recent-explicit")))
+        ;; Selection is product state and is intentionally irrelevant here.
+        (setq qq-gateway--current-account-id nil)
+        (should
+         (equal
           (qq-gateway-conversation-list-recent
-           (lambda (page) (setq delivered page))
-           (lambda (body _reason) (setq error-body body))
-           10)
-          (pcase stale-kind
-            ('owner
-             (puthash
-              "slot-b"
-              (qq-gateway-conversation-test-account
-               "slot-b" "10003" "u_other")
-              qq-gateway--accounts)
-             (setq qq-gateway--current-account-id "slot-b"))
-            ('instance
-             (setq qq-gateway-transport--gateway-instance-id "gateway-b")))
-          (funcall success (qq-gateway-conversation-test-page)))
-        (should-not delivered)
-        (should (equal (alist-get 'code error-body) "superseded_request"))
-        (should-not qq-gateway-conversation--active-request)))))
+           "slot-b" :limit 11
+           :callback (lambda (page) (setq delivered page)))
+          "recent-explicit"))
+        (should (equal params '((account_id . "slot-b") (limit . 11))))
+        (funcall success
+                 (qq-gateway-conversation-test-page :account-id "slot-b")))
+      (should (equal (alist-get 'account_id delivered) "slot-b")))))
 
-(ert-deftest qq-gateway-conversation-same-slot-restart-can-deliver-current-page ()
-  (qq-gateway-conversation-test-with-state
-    (let (success delivered failure)
-      (cl-letf (((symbol-function 'qq-gateway-transport-send)
-                 (lambda (_method _params callback _errback &optional _early)
-                   (setq success callback)
-                   "recent-restart")))
-        (qq-gateway-conversation-list-recent
-         (lambda (page) (setq delivered page))
-         (lambda (body _reason) (setq failure body)) 10)
-        ;; The stable slot restarted while this slot-scoped request was queued.
-        (puthash "slot-a"
-                 (qq-gateway-conversation-test-account
-                  "slot-a" "10002" "u_self" "stopped")
-                 qq-gateway--accounts)
-        (puthash "slot-a"
-                 (qq-gateway-conversation-test-account
-                  "slot-a" "10002" "u_self" "online")
-                 qq-gateway--accounts)
-        (funcall
-         success
-         (qq-gateway-conversation-test-page
-          :rows
-          (list (qq-gateway-conversation-test-row
-                 :read-cursor
-                 '((read_through_message_id . "7348923749823749822")
-                   (read_through_sequence . "9007199254740998")))))))
-      (should delivered)
-      (should-not failure)
-      (should (equal (alist-get 'account_id delivered) "slot-a")))))
-
-(ert-deftest qq-gateway-conversation-new-request-supersedes-old-delivery ()
-  (qq-gateway-conversation-test-with-state
-    (let (requests cancelled first-error first-value second-value)
-      (cl-letf (((symbol-function 'qq-gateway-transport-send)
-                 (lambda (_method _params callback errback &optional _early)
-                   (let ((token (format "recent-%d" (1+ (length requests)))))
-                     (setq requests
-                           (append requests
-                                   (list (list token callback errback))))
-                     token)))
-                ((symbol-function 'qq-gateway-transport-cancel)
-                 (lambda (token) (push token cancelled) t)))
-        (qq-gateway-conversation-list-recent
-         (lambda (page) (setq first-value page))
-         (lambda (body _reason) (setq first-error body)) 10)
-        (qq-gateway-conversation-list-recent
-         (lambda (page) (setq second-value page)) #'ignore 20)
-        (should (equal cancelled '("recent-1")))
-        (should (equal (alist-get 'code first-error) "superseded_request"))
-        ;; A transport implementation may still race a callback after local
-        ;; cancellation; revoked ownership keeps it inert.
-        (funcall (nth 1 (car requests))
-                 (qq-gateway-conversation-test-page))
-        (should-not first-value)
-        (funcall (nth 1 (cadr requests))
-                 (qq-gateway-conversation-test-page)))
-      (should second-value)
-      (should-not qq-gateway-conversation--active-request))))
-
-(ert-deftest qq-gateway-conversation-synchronous-settlement-cancels-token ()
-  (dolist (settlement '(success failure cancel))
-    (qq-gateway-conversation-test-with-state
-      (let (cancelled delivered failure)
-        (cl-letf (((symbol-function 'qq-gateway-transport-send)
-                   (lambda (_method _params callback errback &optional _early)
-                     (pcase settlement
-                       ('success
-                        (funcall callback
-                                 (qq-gateway-conversation-test-page)))
-                       ('failure
-                        (funcall errback '((code . "server_failure")) "boom"))
-                       ('cancel
-                        (qq-gateway-conversation-reset)))
-                     "synchronous-orphan"))
-                  ((symbol-function 'qq-gateway-transport-cancel)
-                   (lambda (token) (push token cancelled) t)))
-          (should (equal
-                   (qq-gateway-conversation-list-recent
-                    (lambda (page) (setq delivered page))
-                    (lambda (body _reason) (setq failure body))
-                    10)
-                   "synchronous-orphan")))
-        (should (equal cancelled '("synchronous-orphan")))
-        (should-not qq-gateway-conversation--active-request)
-        (pcase settlement
-          ('success (should delivered))
-          ('failure
-           (should (equal (alist-get 'code failure) "server_failure")))
-          ('cancel
-           (should-not delivered)
-           (should-not failure)))))))
-
-(ert-deftest qq-gateway-conversation-reentrant-supersession-cancels-token ()
-  (qq-gateway-conversation-test-with-state
-    (let ((send-depth 0)
-          cancelled
-          first-error)
-      (cl-letf (((symbol-function 'qq-gateway-transport-send)
-                 (lambda (_method _params _callback _errback &optional _early)
-                   (cl-incf send-depth)
-                   (if (= send-depth 1)
-                       (progn
-                         (qq-gateway-conversation-list-recent nil #'ignore 20)
-                         "superseded-orphan")
-                     "replacement-live")))
-                ((symbol-function 'qq-gateway-transport-cancel)
-                 (lambda (token) (push token cancelled) t)))
-        (should (equal
-                 (qq-gateway-conversation-list-recent
-                  nil
-                  (lambda (body _reason) (setq first-error body))
-                  10)
-                 "superseded-orphan")))
-      (should (equal cancelled '("superseded-orphan")))
-      (should (equal (alist-get 'code first-error) "superseded_request"))
-      (should
-       (equal
-        (qq-gateway-conversation--request-transport-token
-         qq-gateway-conversation--active-request)
-        "replacement-live")))))
-
-(ert-deftest qq-gateway-conversation-reset-cancels-and-revokes-callback ()
-  (qq-gateway-conversation-test-with-state
-    (let (success cancelled delivered)
-      (cl-letf (((symbol-function 'qq-gateway-transport-send)
-                 (lambda (_method _params callback _errback &optional _early)
-                   (setq success callback)
-                   "recent-reset"))
-                ((symbol-function 'qq-gateway-transport-cancel)
-                 (lambda (token) (setq cancelled token) t)))
-        (qq-gateway-conversation-list-recent
-         (lambda (page) (setq delivered page)) #'ignore 10)
-        (qq-gateway-conversation-reset)
-        (funcall success (qq-gateway-conversation-test-page)))
-      (should (equal cancelled "recent-reset"))
-      (should-not delivered)
-      (should-not qq-gateway-conversation--active-request))))
-
-(ert-deftest qq-gateway-conversation-adapter-cancel-clears-active-marker ()
-  (qq-gateway-conversation-test-with-state
-    (let (success cancelled delivered)
-      (cl-letf (((symbol-function 'qq-gateway-transport-send)
-                 (lambda (_method _params callback _errback &optional _early)
-                   (setq success callback)
-                   "recent-cancel"))
-                ((symbol-function 'qq-gateway-transport-cancel)
-                 (lambda (token) (setq cancelled token) t)))
-        (let ((token
-               (qq-gateway-conversation-list-recent
-                (lambda (page) (setq delivered page)) #'ignore 10)))
-          (should (equal token "recent-cancel"))
-          (should qq-gateway-conversation--active-request)
-          (should (qq-gateway-conversation-cancel token))
-          (should-not qq-gateway-conversation--active-request)
-          (funcall success (qq-gateway-conversation-test-page))))
-      (should (equal cancelled "recent-cancel"))
-      (should-not delivered))))
-
-(ert-deftest qq-gateway-conversation-slot-switch-cancels-active-request ()
-  (qq-gateway-conversation-test-with-state
-    (let (cancelled)
-      (cl-letf (((symbol-function 'qq-gateway-transport-send)
-                 (lambda (&rest _arguments) "recent-switch"))
-                ((symbol-function 'qq-gateway-transport-cancel)
-                 (lambda (token) (setq cancelled token) t)))
-        (qq-gateway-conversation-list-recent nil #'ignore 10)
-        (qq-gateway--upsert-account
-         (qq-gateway-conversation-test-account
-          "slot-b" "10003" "u_other")
-         'changed)
-        (qq-gateway-account-select "slot-b"))
-      (should (equal cancelled "recent-switch"))
-      (should-not qq-gateway-conversation--active-request))))
-
-(ert-deftest qq-gateway-conversation-transport-signal-revokes-ownership ()
+(ert-deftest qq-gateway-conversation-transport-signal-propagates ()
   (qq-gateway-conversation-test-with-state
     (cl-letf (((symbol-function 'qq-gateway-transport-send)
                (lambda (&rest _arguments) (error "transport exploded"))))
-      (should-error (qq-gateway-conversation-list-recent nil #'ignore 10))
-      (should-not qq-gateway-conversation--active-request))))
+      (should-error
+       (qq-gateway-conversation-list-recent
+        "slot-a" :errback #'ignore :limit 10)))))
 
 (provide 'qq-gateway-conversation-test)
 ;;; qq-gateway-conversation-test.el ends here
