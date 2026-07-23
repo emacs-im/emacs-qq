@@ -22,6 +22,7 @@
 (require 'qq-api)
 (require 'qq-chat)
 (require 'qq-media)
+(require 'qq-login)
 (require 'qq-runtime)
 (require 'qq-state)
 
@@ -333,6 +334,7 @@ message title rather than like dimmed preview content."
      (appkit-view-insert-note-line (qq-root--entry-text entry)
                                    :face (qq-root--entry-face entry)))
     ('blank (insert "\n"))
+    ('login (qq-login-insert-view (qq-root--entry-text entry)))
     ('session (qq-root--insert-session-line (qq-root--entry-session entry)))
     (type (error "qq: unknown root entry type %S" type))))
 
@@ -352,6 +354,11 @@ message title rather than like dimmed preview content."
            (qq-root--entry-create :key 'metadata-gap :type 'blank))))
     (append
      metadata
+     (when-let* ((login (qq-login-view-model)))
+       (list
+        (qq-root--entry-create
+         :key 'login :type 'login :text login)
+        (qq-root--entry-create :key 'login-gap :type 'blank)))
      (mapcar
       (lambda (session)
         (qq-root--entry-create
@@ -764,8 +771,13 @@ pixel-valued alignment follows text scaling."
       ((or 'reset 'sessions-refreshed 'friends-refreshed 'groups-refreshed)
        (qq-root--queue-invalidation :structure t)))))
 
+(defun qq-root--handle-login-change ()
+  "Reconcile the root after the foreground login presentation changes."
+  (qq-root--queue-invalidation :structure t))
+
 (add-hook 'qq-media-cache-update-hook #'qq-root--handle-media-cache-update)
 (add-hook 'qq-state-change-hook #'qq-root--handle-state-change)
+(add-hook 'qq-login-change-hook #'qq-root--handle-login-change)
 
 (provide 'qq-root)
 

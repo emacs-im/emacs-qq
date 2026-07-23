@@ -33,6 +33,7 @@
 (require 'qq-gateway-conversation)
 (require 'qq-gateway-directory)
 (require 'qq-native)
+(require 'qq-login)
 (require 'qq-chat)
 (require 'qq-search)
 (require 'qq-media)
@@ -208,7 +209,8 @@ current, detached, or legacy QQ buffers created by shutdown/kill hooks."
   (interactive)
   (qq-runtime-app)
   (qq-root-open)
-  (qq-connect))
+  (unless (qq-login-active-p)
+    (qq-login)))
 
 ;;;###autoload
 (defun qq-connect ()
@@ -245,6 +247,7 @@ finally all account-scoped QQ buffers are closed.  Buffers are collected before
 Appkit detaches renamed views; legacy QQ major modes are included too."
   (interactive)
   (unless qq--resetting-p
+    (qq-login-cancel)
     (let ((qq--resetting-p t)
           ;; Keep notification callbacks inert for the entire QQ transaction,
           ;; not merely during each individual notification cleanup pass.

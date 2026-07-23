@@ -451,31 +451,6 @@ snapshot; ERRBACK receives a failure body and reason."
    ticket callback errback))
 
 ;;;###autoload
-(defun qq-gateway-account-login-new-device
-    (account-id challenge-id token &optional callback errback)
-  "Continue ACCOUNT-ID's new-device CHALLENGE-ID using TOKEN.
-
-CALLBACK receives the account snapshot; ERRBACK receives a failure body and
-reason."
-  (interactive
-   (let* ((account-id (qq-gateway--read-account-id "New-device account: "))
-          (challenge (alist-get 'challenge (qq-gateway-account account-id))))
-     (unless (equal (alist-get 'kind challenge) "new_device")
-       (user-error "qq: Selected account has no new-device challenge"))
-     (list account-id (alist-get 'challenge_id challenge)
-           (read-passwd "New-device token: ")
-           #'qq-gateway--interactive-success
-           #'qq-gateway--interactive-error)))
-  (unless (and (qq-gateway--non-empty-string-p challenge-id)
-               (qq-gateway--non-empty-string-p token))
-    (user-error "qq: Challenge ID and token must be non-empty strings"))
-  (qq-gateway--login-command
-   "account.login.new_device" account-id
-   (lambda (secret)
-     `((challenge_id . ,challenge-id) (token . ,secret)))
-   token callback errback))
-
-;;;###autoload
 (defun qq-gateway-account-login-unusual-device
     (account-id challenge-id device-sig-hex &optional callback errback)
   "Continue ACCOUNT-ID's unusual-device CHALLENGE-ID using DEVICE-SIG-HEX.

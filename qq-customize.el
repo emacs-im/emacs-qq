@@ -70,6 +70,26 @@ authenticated ready snapshot, not merely when the socket opens."
   :type '(choice (const :tag "Unlimited" nil) integer)
   :group 'qq)
 
+(defcustom qq-login-open-verification-url t
+  "Whether `qq-login' opens the projected captcha URL.
+
+When nil, the URL is still shown in the echo area and can be opened manually."
+  :type 'boolean
+  :group 'qq)
+
+(defcustom qq-login-qrencode-program "qrencode"
+  "Program used to render QQ login QR codes.
+
+The program must support the standard qrencode command-line interface.  A PNG
+is used in graphical Emacs; terminal frames use its UTF-8 rendering."
+  :type 'string
+  :group 'qq)
+
+(defcustom qq-login-qr-image-size 220
+  "Pixel width and height of a graphical QQ login QR code."
+  :type 'integer
+  :group 'qq)
+
 (defvar qq-onebot-websocket-url "ws://127.0.0.1:3001/"
   "Dormant v1 OneBot endpoint retained until legacy modules are removed.")
 
