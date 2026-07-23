@@ -666,7 +666,6 @@ correlation concerns after this closed codec boundary."
         (message-seq . ,(alist-get 'sequence message))
         (native-client-sequence . ,(alist-get 'client_sequence message))
         (native-random . ,(alist-get 'random message))
-        (native-sent-at . ,(alist-get 'sent_at message))
         (gateway-account-id . ,owner)
         (sender-id . ,sender-id)
         (sender-native-id . ,(alist-get 'uid sender))
@@ -1458,38 +1457,6 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
     (error "qq: Gateway message-send receipt random is invalid"))
   (qq-gateway-wire-domain-copy receipt))
 
-(defun qq-gateway-message--outgoing-reply-target
-    (session-key message-id owner)
-  "Return native reply target for MESSAGE-ID in OWNER's stable account slot."
-  (unless (qq-gateway--canonical-decimal-p message-id)
-    (user-error "qq: Native reply requires an exact snowflake message ID"))
-  (let ((message
-         (seq-find
-          (lambda (candidate)
-            (equal (alist-get 'server-id candidate) message-id))
-          (qq-state-session-messages session-key))))
-    (unless message
-      (user-error "qq: Native reply target %s is not loaded" message-id))
-    (unless (equal (alist-get 'gateway-account-id message) owner)
-      (user-error "qq: Native reply target belongs to another Gateway account"))
-    (let ((sequence (alist-get 'message-seq message))
-          (sender-uin (alist-get 'user-id message))
-          (sender-uid (alist-get 'sender-native-id message))
-          (sent-at (alist-get 'native-sent-at message)))
-      (unless (qq-gateway--canonical-decimal-p sequence)
-        (user-error "qq: Native reply target lacks an exact message sequence"))
-      (unless (qq-gateway--canonical-decimal-p sender-uin)
-        (user-error "qq: Native reply target lacks an exact sender UIN"))
-      (unless (qq-gateway--non-empty-string-p sender-uid)
-        (user-error "qq: Native reply target lacks an exact sender UID"))
-      (unless (qq-gateway-message--uint32-p sent-at)
-        (user-error "qq: Native reply target has an invalid timestamp"))
-      `((message_id . ,message-id)
-        (sequence . ,sequence)
-        (sender_uin . ,sender-uin)
-        (sender_uid . ,sender-uid)
-        (sent_at . ,sent-at)))))
-
 (defun qq-gateway-message--outgoing-segments (session-key segments owner)
   "Validate SEGMENTS for SESSION-KEY and return native elements for OWNER."
   (unless (and (proper-list-p segments)
@@ -1562,13 +1529,11 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
             (when (> reply-count 1)
               (user-error "qq: Native Gateway accepts at most one reply"))
             (unless (and (qq-gateway--exact-object-keys-p data '(id))
-                         (stringp (alist-get 'id data)))
+                         (qq-gateway--canonical-decimal-p
+                          (alist-get 'id data)))
               (user-error "qq: Native Gateway reply segment is malformed"))
             `((kind . "reply")
-              (payload
-               . ((target
-                   . ,(qq-gateway-message--outgoing-reply-target
-                       session-key (alist-get 'id data) owner))))))
+              (payload . ((message_id . ,(alist-get 'id data))))))
            (_
             (user-error
              "qq: Native Gateway cannot send segment type %S yet" type)))))
@@ -1625,9 +1590,10 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
   "Send closed SEGMENTS to native private/group SESSION-KEY.
 
 Supported elements are text, base face (ID 0 through 259), group mention,
-reply, and already prepared image/record attachments.  Reply metadata is
-resolved only from an exact message owned by the selected stable account slot.
-RAW-MESSAGE is an optional optimistic rendering override.
+reply, and already prepared image/record attachments.  A reply carries only
+the exact target message ID; the enclosing conversation completes its stable
+Message Reference and Gateway resolves native metadata.  RAW-MESSAGE is an
+optional optimistic rendering override.
 OPTIMISTIC-SEGMENTS, when non-nil, are stored in the pending row instead of
 protocol-ready SEGMENTS so local media previews never enter the wire request."
   (let* ((owner (or (qq-gateway-current-account-id)

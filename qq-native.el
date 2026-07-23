@@ -688,8 +688,10 @@ immutable staged bytes, not a URL that could change before upload."
 
 Staging and preparation may run concurrently, but the immutable segment order
 is retained.  Before `message.send' starts, cancellation releases every
-pipeline-owned object.  After dispatch, the service owns the single-use
-attachments and cancellation only revokes the local response callback."
+pipeline-owned object.  After dispatch, cancellation revokes the local
+response callback and best-effort releases every attachment ID; a later send
+rejection performs the same release.  Already claimed attachments ignore it,
+while an unclaimed Ready attachment cannot be left without a client owner."
   (let* ((owner (or (qq-gateway-current-account-id)
                     (user-error "qq: Select a QQ account first")))
          (optimistic-segments (copy-tree segments))
@@ -710,6 +712,20 @@ attachments and cancellation only revokes the local response callback."
             ((error quit)
              (message "qq: local media operation cleanup failed: %s"
                       (error-message-string error-data)))))
+         (release-attachments
+          ()
+          ;; Detach before calling the asynchronous release helper so a
+          ;; synchronous callback or repeated terminal signal cannot release
+          ;; the same attachment twice.
+          (let ((inhibit-quit t)
+                (owned-attachment-ids (delete-dups attachment-ids)))
+            (setq attachment-ids nil)
+            (dolist (attachment-id owned-attachment-ids)
+              (condition-case error-data
+                  (qq-native--release-send-attachment attachment-id)
+                ((error quit)
+                 (message "qq: prepared media cleanup failed: %s"
+                          (error-message-string error-data)))))))
          (release-pre-dispatch
           ()
           ;; Detach ownership before calling cancellation/release helpers.
@@ -717,19 +733,12 @@ attachments and cancellation only revokes the local response callback."
           ;; callback from observing the same objects as still owned here.
           (let ((inhibit-quit t)
                 (owned-operations operations)
-                (owned-attachment-ids (delete-dups attachment-ids))
                 (owned-resource-ids (delete-dups resource-ids)))
             (setq operations nil
-                  attachment-ids nil
                   resource-ids nil)
             (dolist (operation owned-operations)
               (cancel-operation operation))
-            (dolist (attachment-id owned-attachment-ids)
-              (condition-case error-data
-                  (qq-native--release-send-attachment attachment-id)
-                ((error quit)
-                 (message "qq: prepared media cleanup failed: %s"
-                          (error-message-string error-data)))))
+            (release-attachments)
             (dolist (resource-id owned-resource-ids)
               (condition-case error-data
                   (qq-native--release-send-resource resource-id)
@@ -746,6 +755,11 @@ attachments and cancellation only revokes the local response callback."
                 ((error quit)
                  (message "qq: local media send cancellation failed: %s"
                           (error-message-string error-data)))))))
+         (cancel-dispatched
+          ()
+          (let ((inhibit-quit t))
+            (cancel-send)
+            (release-attachments)))
          (finish
           (success-p body value)
           (when active
@@ -754,8 +768,18 @@ attachments and cancellation only revokes the local response callback."
             ;; active request after ACTIVE has been cleared.
             (let ((inhibit-quit t))
               (setq active nil)
-              (unless dispatched
+              (cond
+               (success-p
+                ;; A successful service call owns every claimed attachment,
+                ;; including synchronous completion before token handoff.
+                (setq attachment-ids nil))
+               ((not dispatched)
                 (release-pre-dispatch))
+               (t
+                ;; A resolver rejection can leave attachments Ready.  Release
+                ;; every submitted ID; claimed/Sending attachments make this
+                ;; idempotent service call a no-op.
+                (release-attachments)))
               (if success-p
                   (qq-native-request-finish request)
                 (qq-native-request-fail request)))
@@ -846,7 +870,7 @@ attachments and cancellation only revokes the local response callback."
           (when active
             (setq active nil)
             (if dispatched
-                (cancel-send)
+                (cancel-dispatched)
               (release-pre-dispatch))))
          (abort-startup
           ()
@@ -857,7 +881,7 @@ attachments and cancellation only revokes the local response callback."
             (when active
               (setq active nil)
               (if dispatched
-                  (cancel-send)
+                  (cancel-dispatched)
                 (release-pre-dispatch)))
             (when request
               (qq-native-request-fail request)))))
