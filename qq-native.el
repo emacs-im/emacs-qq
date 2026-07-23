@@ -135,14 +135,17 @@ This never stops or logs out a managed QQ account."
 
 (cl-defun qq-native--start-request
     (starter callback errback
-             &optional (owner nil owner-supplied-p) cancel-function)
+             &key (owner nil owner-supplied-p) cancel-function replace-key
+             projector)
   "Start asynchronous product work through STARTER.
 
 CALLBACK and ERRBACK are product-facing leaf callbacks.  When omitted, OWNER
 defaults to the stable selected account slot; an explicitly supplied nil marks
 global work.  Omitting OWNER without a selected slot is a user error.
-CANCEL-FUNCTION, when non-nil, cancels the adapter token and its local lifecycle
-marker.  Return one uniform `qq-native-request'."
+CANCEL-FUNCTION, when non-nil, cancels the adapter token.  REPLACE-KEY gives
+the request newest-wins semantics among matching operations for the same OWNER.
+PROJECTOR transforms a successful adapter value inside the request's ownership
+boundary.  Return one uniform `qq-native-request'."
   (qq-native-request-start
    starter
    :callback callback
@@ -151,7 +154,9 @@ marker.  Return one uniform `qq-native-request'."
               owner
             (or (qq-gateway-current-account-id)
                 (user-error "qq: Select a QQ account first")))
-   :cancel-function cancel-function))
+   :cancel-function cancel-function
+   :replace-key replace-key
+   :projector projector))
 
 (defun qq-native--directory-refresh-success
     (kind owner callback value)
@@ -290,18 +295,16 @@ adapter boundary."
     (qq-native--start-request
      (lambda (success failure)
        (qq-gateway-conversation-list-recent
-        (lambda (page)
-          (condition-case error-data
-              (funcall success
-                       (qq-native--apply-recent-page page observation-token))
-            (error
-             (let ((reason (error-message-string error-data)))
-               (funcall failure
-                        `((code . "invalid_gateway_result")
-                          (message . ,reason))
-                        reason)))))
-        failure limit))
-     callback errback account-id #'qq-gateway-conversation-cancel)))
+        account-id
+        :callback success
+        :errback failure
+        :limit limit))
+     callback errback
+     :owner account-id
+     :replace-key 'recent-conversations
+     :projector
+     (lambda (page)
+       (qq-native--apply-recent-page page observation-token)))))
 
 (defun qq-native--group-profile-from-state (group-id)
   "Return a group-profile projection for exact GROUP-ID, or nil."
@@ -1663,7 +1666,6 @@ no public Native Session identity or counter is required."
   (qq-gateway-attachment-reset)
   (qq-gateway-media-reset)
   (qq-gateway-resource-reset)
-  (qq-gateway-conversation-reset)
   (qq-gateway-directory-reset)
   (qq-gateway-message-revoke-projection))
 
