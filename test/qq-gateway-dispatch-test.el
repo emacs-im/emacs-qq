@@ -43,10 +43,11 @@
      "example.unknown" '((ignored . t)))
     (should-not qq-gateway-dispatch-test--calls)
     (qq-gateway-dispatch--handle-transport-event
-     "example.changed" '((value . "opaque")))
+     "example.changed"
+     `((value . ["opaque" ,qq-gateway-wire-null])))
     (should
      (equal qq-gateway-dispatch-test--calls
-            '((event "example.changed" ((value . "opaque"))))))))
+            '((event "example.changed" ((value . ("opaque" nil)))))))))
 
 (ert-deftest qq-gateway-dispatch-registration-is-owned-and-reload-safe ()
   (qq-gateway-dispatch-test-with-state
@@ -64,7 +65,7 @@
     (should-error
      (qq-gateway-dispatch-register-event "example.lambda" (lambda (&rest _))))))
 
-(ert-deftest qq-gateway-dispatch-domain-error-is-one-protocol-violation ()
+(ert-deftest qq-gateway-dispatch-domain-error-is-not-a-protocol-violation ()
   (qq-gateway-dispatch-test-with-state
     (let (violations)
       (qq-gateway-dispatch-register-event
@@ -72,13 +73,10 @@
       (cl-letf (((symbol-function 'qq-gateway-transport--protocol-violation)
                  (lambda (format-string &rest arguments)
                    (push (apply #'format format-string arguments) violations))))
-        (qq-gateway-dispatch--handle-transport-event
-         "example.changed" '((invalid . t))))
-      (should (= (length violations) 1))
-      (should
-       (string-match-p
-        "Malformed example.changed event: invalid domain payload"
-        (car violations))))))
+        (should-error
+         (qq-gateway-dispatch--handle-transport-event
+          "example.changed" '((invalid . t)))))
+      (should-not violations))))
 
 (ert-deftest qq-gateway-dispatch-routes-unsolicited-errors-by-code ()
   (qq-gateway-dispatch-test-with-state

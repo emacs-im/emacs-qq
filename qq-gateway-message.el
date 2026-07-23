@@ -4,7 +4,7 @@
 
 ;;; Commentary:
 
-;; Closed protocol decoder and selected-account projection for native service
+;; Domain adapter and selected-account projection for native service
 ;; message and recall events.  Events for every managed account remain
 ;; observable on `qq-gateway-message-event-hook'.  Only events for the selected
 ;; stable account slot may mutate its timeline.  The Gateway filters obsolete
@@ -27,7 +27,7 @@
 (require 'qq-state)
 
 (defvar qq-gateway-message-event-hook nil
-  "Hook called with EVENT and validated DATA for every native message event.")
+  "Hook called with EVENT and domain DATA for every native message event.")
 
 (defvar qq-gateway-message-projection-error-hook nil
   "Hook called with EVENT, DATA, and REASON when a valid event cannot project.")
@@ -62,379 +62,6 @@
 (defun qq-gateway-message--message-id-p (value)
   "Return non-nil when VALUE is one canonical, nonzero uint64 Message ID."
   (qq-gateway--uint64-decimal-p value))
-
-(defun qq-gateway-message--uint32-p (value)
-  "Return non-nil when VALUE is an unsigned 32-bit integer."
-  (and (integerp value) (<= 0 value) (<= value #xffffffff)))
-
-(defun qq-gateway-message--int32-p (value)
-  "Return non-nil when VALUE is a signed 32-bit integer."
-  (and (integerp value) (<= (- #x80000000) value) (< value #x80000000)))
-
-(defun qq-gateway-message--closed-object-p (object required optional)
-  "Return non-nil when OBJECT has exactly REQUIRED plus optional OPTIONAL keys."
-  (qq-gateway-wire-closed-object-p object required optional))
-
-(defun qq-gateway-message--validate-owner-data (data payload-key)
-  "Validate event DATA containing stable account identity and PAYLOAD-KEY."
-  (unless (qq-gateway--exact-object-keys-p
-           data (list 'account_id payload-key))
-    (error "qq: Gateway message event has invalid outer fields"))
-  (unless (qq-gateway--non-empty-string-p (alist-get 'account_id data))
-    (error "qq: Gateway message event account_id must be opaque string"))
-  data)
-
-(defun qq-gateway-message--validate-endpoint (endpoint context)
-  "Validate and copy message ENDPOINT for CONTEXT."
-  (unless (qq-gateway-message--closed-object-p endpoint nil '(uin uid))
-    (error "qq: Gateway %s endpoint has invalid fields" context))
-  (when (assq 'uin endpoint)
-    (unless (qq-gateway--uint64-decimal-p (alist-get 'uin endpoint))
-      (error "qq: Gateway %s endpoint UIN must be canonical uint64" context)))
-  (when (assq 'uid endpoint)
-    (unless (qq-gateway--non-empty-string-p (alist-get 'uid endpoint))
-      (error "qq: Gateway %s endpoint UID must be opaque string" context)))
-  (qq-gateway-wire-domain-copy endpoint))
-
-(defun qq-gateway-message--validate-conversation (conversation)
-  "Validate and copy native message CONVERSATION."
-  (unless (qq-gateway-wire-object-p conversation)
-    (error "qq: Gateway message conversation must be an object"))
-  (pcase (alist-get 'kind conversation)
-    ("private"
-     (unless (qq-gateway-message--closed-object-p
-              conversation '(kind) '(name))
-       (error "qq: Gateway private conversation has invalid fields"))
-     (when (assq 'name conversation)
-       (unless (stringp (alist-get 'name conversation))
-         (error "qq: Gateway private conversation name must be string"))))
-    ("group"
-     (unless (qq-gateway-message--closed-object-p
-              conversation '(kind group_uin) '(group_name sender_card))
-       (error "qq: Gateway group conversation has invalid fields"))
-     (unless (qq-gateway--uint64-decimal-p
-              (alist-get 'group_uin conversation))
-       (error "qq: Gateway group UIN must be canonical uint64"))
-     (dolist (key '(group_name sender_card))
-       (when (assq key conversation)
-         (unless (stringp (alist-get key conversation))
-           (error "qq: Gateway group %s must be string" key)))))
-    ("temp"
-     (unless (qq-gateway-message--closed-object-p
-              conversation '(kind) '(name from_tiny_id to_tiny_id))
-       (error "qq: Gateway temp conversation has invalid fields"))
-     (dolist (key '(name from_tiny_id to_tiny_id))
-       (when (assq key conversation)
-         (unless (stringp (alist-get key conversation))
-           (error "qq: Gateway temp %s must be string" key)))))
-    (_ (error "qq: Gateway message conversation has unknown kind")))
-  (qq-gateway-wire-domain-copy conversation))
-
-(defun qq-gateway-message--array-values (value context domain-p)
-  "Return array VALUE elements for CONTEXT.
-
-When DOMAIN-P is non-nil, VALUE must already be a proper domain list.
-Otherwise it must be one strict decoded wire array."
-  (if domain-p
-      (progn
-        (unless (proper-list-p value)
-          (error "qq: %s must be a validated domain list" context))
-        value)
-    (qq-gateway-wire-array value context)))
-
-(defun qq-gateway-message--validate-segment (segment &optional domain-p)
-  "Validate and copy one native message SEGMENT.
-
-DOMAIN-P accepts only the list representation produced by an earlier strict
-wire validation; it never widens the raw wire decoder."
-  (unless (qq-gateway--exact-object-keys-p segment '(kind payload))
-    (error "qq: Gateway message segment has invalid fields"))
-  (let ((kind (alist-get 'kind segment))
-        (payload (alist-get 'payload segment)))
-    (pcase kind
-      ("text"
-       (unless (and (qq-gateway--exact-object-keys-p payload '(text))
-                    (stringp (alist-get 'text payload)))
-         (error "qq: Gateway text segment is malformed")))
-      ("face"
-       (let ((id (alist-get 'id payload)))
-         (unless (and (qq-gateway--exact-object-keys-p payload '(id))
-                      (qq-gateway--canonical-decimal-p id t)
-                      (qq-gateway--decimal-less-p id "260"))
-           (error "qq: Gateway base face segment is malformed"))))
-      ("at"
-       (unless (qq-gateway-message--closed-object-p payload '(qq) '(name))
-         (error "qq: Gateway at segment has invalid fields"))
-       (let ((qq (alist-get 'qq payload)))
-         (unless (or (equal qq "all")
-                     (qq-gateway--uint64-decimal-p qq))
-           (error "qq: Gateway at target must be exact UIN or all")))
-       (when (assq 'name payload)
-         (unless (stringp (alist-get 'name payload))
-           (error "qq: Gateway at display name must be string"))))
-      ("reply"
-       (unless (qq-gateway--exact-object-keys-p payload '(target))
-         (error "qq: Gateway reply segment has invalid fields"))
-       (let ((target (alist-get 'target payload)))
-         (unless (and (qq-gateway--exact-object-keys-p
-                       target '(kind message_id))
-                      (equal (alist-get 'kind target) "unresolved")
-                      (qq-gateway-message--message-id-p
-                       (alist-get 'message_id target)))
-           (error "qq: Gateway reply target is malformed"))))
-      ("record"
-       (unless (and (qq-gateway-message--closed-object-p
-                     payload '(duration_seconds) '(media_id))
-                    (qq-gateway-message--uint32-p
-                     (alist-get 'duration_seconds payload)))
-         (error "qq: Gateway record segment is malformed"))
-       (when (assq 'media_id payload)
-         (unless (qq-gateway-media--id-p (alist-get 'media_id payload))
-           (error "qq: Gateway record media_id is malformed"))))
-      ("unsupported"
-       (unless (qq-gateway-message--closed-object-p
-                payload '(native_keys summary) '(raw))
-         (error "qq: Gateway unsupported segment has invalid fields"))
-       (let ((native-keys
-              (qq-gateway-message--array-values
-               (alist-get 'native_keys payload)
-               "Gateway unsupported segment native_keys" domain-p)))
-         (unless (and (cl-every #'stringp native-keys)
-                      (stringp (alist-get 'summary payload)))
-           (error "qq: Gateway unsupported segment metadata is malformed")))
-       (when (assq 'raw payload)
-         (let ((raw (alist-get 'raw payload)))
-           (unless (and (qq-gateway--exact-object-keys-p raw '(fallback_text))
-                        (stringp (alist-get 'fallback_text raw)))
-             (error "qq: Gateway unsupported segment raw data is malformed")))))
-      (_ (error "qq: Gateway message segment has unknown kind %S" kind))))
-  (qq-gateway-wire-domain-copy segment))
-
-(defun qq-gateway-message--validate-message (message &optional domain-p)
-  "Validate and copy a closed native MESSAGE snapshot.
-
-DOMAIN-P denotes the list-array form returned by an earlier invocation; raw
-Gateway input always leaves it nil and therefore remains vector-only."
-  (unless (qq-gateway--exact-object-keys-p
-           message
-           '(message_id sent_at sender recipient conversation sequence
-             client_sequence random message_type sub_type segments))
-    (error "qq: Gateway message snapshot has invalid fields"))
-  (unless (qq-gateway-message--message-id-p (alist-get 'message_id message))
-    (error "qq: Gateway message_id must be a canonical nonzero uint64 string"))
-  (unless (and (integerp (alist-get 'sent_at message))
-               (>= (alist-get 'sent_at message) 0))
-    (error "qq: Gateway message sent_at must be non-negative integer"))
-  (qq-gateway-message--validate-endpoint
-   (alist-get 'sender message) "sender")
-  (qq-gateway-message--validate-endpoint
-   (alist-get 'recipient message) "recipient")
-  (qq-gateway-message--validate-conversation
-   (alist-get 'conversation message))
-  (dolist (key '(sequence client_sequence))
-    (unless (qq-gateway--uint64-decimal-p (alist-get key message) t)
-      (error "qq: Gateway message %s must be canonical uint64" key)))
-  (unless (qq-gateway-message--uint32-p (alist-get 'random message))
-    (error "qq: Gateway message random must be uint32"))
-  (dolist (key '(message_type sub_type))
-    (unless (qq-gateway-message--int32-p (alist-get key message))
-      (error "qq: Gateway message %s must be int32" key)))
-  (dolist (segment
-           (qq-gateway-message--array-values
-            (alist-get 'segments message) "Gateway message segments" domain-p))
-    (qq-gateway-message--validate-segment segment domain-p))
-  (qq-gateway-wire-domain-copy message))
-
-(defun qq-gateway-message--validate-recall-conversation (conversation)
-  "Validate and copy recall CONVERSATION."
-  (pcase (alist-get 'kind conversation)
-    ("private"
-     (unless (and (qq-gateway--exact-object-keys-p
-                   conversation '(kind peer_uid))
-                  (qq-gateway--non-empty-string-p
-                   (alist-get 'peer_uid conversation)))
-       (error "qq: Gateway private recall conversation is malformed")))
-    ("group"
-     (unless (and (qq-gateway--exact-object-keys-p
-                   conversation '(kind group_uin))
-                  (qq-gateway--uint64-decimal-p
-                   (alist-get 'group_uin conversation)))
-       (error "qq: Gateway group recall conversation is malformed")))
-    (_ (error "qq: Gateway recall conversation has unknown kind")))
-  (qq-gateway-wire-domain-copy conversation))
-
-(defun qq-gateway-message--validate-recall-target (target)
-  "Validate and copy recall TARGET."
-  (pcase (alist-get 'kind target)
-    ("message"
-     (unless (and (qq-gateway--exact-object-keys-p
-                   target '(kind message_id sequence))
-                  (qq-gateway-message--message-id-p
-                   (alist-get 'message_id target))
-                  (qq-gateway--uint64-decimal-p
-                   (alist-get 'sequence target) t))
-       (error "qq: Gateway message recall target is malformed")))
-    ("sequence"
-     (unless (and (qq-gateway--exact-object-keys-p target '(kind sequence))
-                  (qq-gateway--uint64-decimal-p
-                   (alist-get 'sequence target) t))
-       (error "qq: Gateway sequence recall target is malformed")))
-    (_ (error "qq: Gateway recall target has unknown kind")))
-  (qq-gateway-wire-domain-copy target))
-
-(defun qq-gateway-message--validate-recall (recall)
-  "Validate and copy one closed native RECALL snapshot."
-  (unless (qq-gateway-message--closed-object-p
-           recall '(conversation target) '(author_uid operator_uid tip))
-    (error "qq: Gateway recall snapshot has invalid fields"))
-  (qq-gateway-message--validate-recall-conversation
-   (alist-get 'conversation recall))
-  (qq-gateway-message--validate-recall-target (alist-get 'target recall))
-  (dolist (key '(author_uid operator_uid tip))
-    (when (assq key recall)
-      (unless (qq-gateway--non-empty-string-p (alist-get key recall))
-        (error "qq: Gateway recall %s must be non-empty string" key))))
-  (qq-gateway-wire-domain-copy recall))
-
-(defun qq-gateway-message--validate-message-data (data)
-  "Validate and copy outer message event DATA."
-  (qq-gateway-message--validate-owner-data data 'message)
-  (qq-gateway-message--validate-message (alist-get 'message data))
-  (qq-gateway-wire-domain-copy data))
-
-(defun qq-gateway-message--validate-recall-data (data)
-  "Validate and copy outer recall event DATA."
-  (qq-gateway-message--validate-owner-data data 'recall)
-  (qq-gateway-message--validate-recall (alist-get 'recall data))
-  (qq-gateway-wire-domain-copy data))
-
-(defun qq-gateway-message--validate-poke (poke)
-  "Validate and copy one authoritative group POKE snapshot."
-  (unless (qq-gateway-message--closed-object-p
-           poke
-           '(message_id sent_at sequence conversation actor_uin target_uin
-             recall)
-           '(action action_image_url suffix))
-    (error "qq: Gateway poke snapshot has invalid fields"))
-  (unless (qq-gateway-message--message-id-p (alist-get 'message_id poke))
-    (error "qq: Gateway poke message_id must be canonical nonzero uint64"))
-  (unless (qq-gateway--uint64-decimal-p (alist-get 'sequence poke) t)
-    (error "qq: Gateway poke sequence must be canonical uint64"))
-  (dolist (key '(actor_uin target_uin))
-    (unless (qq-gateway--uint64-decimal-p (alist-get key poke))
-      (error "qq: Gateway poke %s must be canonical nonzero uint64" key)))
-  (unless (and (integerp (alist-get 'sent_at poke))
-               (> (alist-get 'sent_at poke) 0))
-    (error "qq: Gateway poke sent_at must be positive integer"))
-  (let ((conversation (alist-get 'conversation poke)))
-    (unless (and (qq-gateway--exact-object-keys-p
-                  conversation '(kind group_uin))
-                 (equal (alist-get 'kind conversation) "group")
-                 (qq-gateway--uint64-decimal-p
-                  (alist-get 'group_uin conversation)))
-      (error "qq: Gateway poke conversation must identify an exact group")))
-  (dolist (key '(action action_image_url suffix))
-    (when (assq key poke)
-      (unless (qq-gateway--non-empty-string-p (alist-get key poke))
-        (error "qq: Gateway poke %s must be non-empty string" key))))
-  (let ((recall (alist-get 'recall poke)))
-    (unless (and (qq-gateway--exact-object-keys-p
-                  recall '(tips_sequence valid_before))
-                 (qq-gateway--uint64-decimal-p
-                  (alist-get 'tips_sequence recall) t)
-                 (integerp (alist-get 'valid_before recall))
-                 (> (alist-get 'valid_before recall)
-                    (alist-get 'sent_at poke)))
-      (error "qq: Gateway poke recall capability is malformed")))
-  (qq-gateway-wire-domain-copy poke))
-
-(defun qq-gateway-message--validate-poke-data (data)
-  "Validate and copy outer authoritative poke event DATA."
-  (qq-gateway-message--validate-owner-data data 'poke)
-  (qq-gateway-message--validate-poke (alist-get 'poke data))
-  (qq-gateway-wire-domain-copy data))
-
-(defun qq-gateway-message--validate-reaction (reaction)
-  "Validate and copy one authoritative group REACTION event."
-  (unless (qq-gateway-message--closed-object-p
-           reaction
-           '(conversation sequence operator_uid emoji_id emoji_type is_add count)
-           '(operator_uin))
-    (error "qq: Gateway reaction snapshot has invalid fields"))
-  (let ((conversation (alist-get 'conversation reaction)))
-    (unless (and (qq-gateway--exact-object-keys-p
-                  conversation '(kind group_uin))
-                 (equal (alist-get 'kind conversation) "group")
-                 (qq-gateway--uint64-decimal-p
-                  (alist-get 'group_uin conversation)))
-      (error "qq: Gateway reaction conversation must identify an exact group")))
-  (unless (qq-gateway--uint64-decimal-p (alist-get 'sequence reaction) t)
-    (error "qq: Gateway reaction sequence must be canonical uint64"))
-  (unless (qq-gateway--non-empty-string-p (alist-get 'operator_uid reaction))
-    (error "qq: Gateway reaction operator UID must be opaque string"))
-  (when (assq 'operator_uin reaction)
-    (unless (qq-gateway--uint64-decimal-p
-             (alist-get 'operator_uin reaction))
-      (error "qq: Gateway reaction operator UIN must be canonical uint64")))
-  (let* ((emoji-id (alist-get 'emoji_id reaction))
-         (emoji-type (alist-get 'emoji_type reaction))
-         (expected-type (and (stringp emoji-id)
-                             (if (<= (length emoji-id) 3) "1" "2"))))
-    (unless (and (qq-gateway--canonical-decimal-p emoji-id t)
-                 (member emoji-type '("1" "2"))
-                 (equal emoji-type expected-type))
-      (error "qq: Gateway reaction emoji identity is malformed")))
-  (unless (memq (alist-get 'is_add reaction) '(t :false))
-    (error "qq: Gateway reaction direction must be JSON boolean"))
-  (unless (qq-gateway-message--uint32-p (alist-get 'count reaction))
-    (error "qq: Gateway reaction count must be uint32"))
-  (qq-gateway-wire-domain-copy reaction))
-
-(defun qq-gateway-message--validate-reaction-data (data)
-  "Validate and copy outer authoritative reaction event DATA."
-  (qq-gateway-message--validate-owner-data data 'reaction)
-  (qq-gateway-message--validate-reaction (alist-get 'reaction data))
-  (qq-gateway-wire-domain-copy data))
-
-(defun qq-gateway-message--validate-essence (essence)
-  "Validate and copy one authoritative group ESSENCE event."
-  (unless (qq-gateway-message--closed-object-p
-           essence
-           '(conversation sequence random is_set sender_uin operator_uin
-             changed_at)
-           '(operator_nickname sender_nickname))
-    (error "qq: Gateway essence snapshot has invalid fields"))
-  (let ((conversation (alist-get 'conversation essence)))
-    (unless (and (qq-gateway--exact-object-keys-p
-                  conversation '(kind group_uin))
-                 (equal (alist-get 'kind conversation) "group")
-                 (qq-gateway--uint64-decimal-p
-                  (alist-get 'group_uin conversation)))
-      (error "qq: Gateway essence conversation must identify an exact group")))
-  (unless (qq-gateway--uint64-decimal-p (alist-get 'sequence essence) t)
-    (error "qq: Gateway essence sequence must be canonical uint64"))
-  (unless (qq-gateway-message--uint32-p (alist-get 'random essence))
-    (error "qq: Gateway essence random must be uint32"))
-  (unless (memq (alist-get 'is_set essence) '(t :false))
-    (error "qq: Gateway essence direction must be JSON boolean"))
-  (dolist (key '(sender_uin operator_uin))
-    (unless (qq-gateway--uint64-decimal-p (alist-get key essence))
-      (error "qq: Gateway essence %s must be canonical nonzero uint64" key)))
-  (unless (and (qq-gateway-message--uint32-p
-                (alist-get 'changed_at essence))
-               (> (alist-get 'changed_at essence) 0))
-    (error "qq: Gateway essence changed_at must be positive uint32"))
-  (dolist (key '(operator_nickname sender_nickname))
-    (when (assq key essence)
-      (unless (qq-gateway--non-empty-string-p (alist-get key essence))
-        (error "qq: Gateway essence %s must be non-empty string" key))))
-  (qq-gateway-wire-domain-copy essence))
-
-(defun qq-gateway-message--validate-essence-data (data)
-  "Validate and copy outer authoritative essence event DATA."
-  (qq-gateway-message--validate-owner-data data 'essence)
-  (qq-gateway-message--validate-essence (alist-get 'essence data))
-  (qq-gateway-wire-domain-copy data))
 
 (defun qq-gateway-message--event-owner (data)
   "Return the stable ACCOUNT-ID carried by event DATA."
@@ -550,7 +177,7 @@ because the product state is a single-account projection."
     (list :outgoing outgoing :peer peer)))
 
 (defun qq-gateway-message--segment-to-internal (segment)
-  "Convert validated native SEGMENT to shared timeline shape."
+  "Convert native SEGMENT to shared timeline shape."
   (let ((kind (alist-get 'kind segment))
         (payload (alist-get 'payload segment)))
     (pcase kind
@@ -583,7 +210,7 @@ because the product state is a single-account projection."
   (cons uid uin))
 
 (defun qq-gateway-message--remember-peer-identity (owner uid uin)
-  "Remember validated UID/UIN identity for projected account OWNER."
+  "Remember UID/UIN identity for projected account OWNER."
   (qq-gateway-message--validate-peer-identity owner uid uin)
   (puthash uid uin qq-gateway-message--peer-uin-by-uid)
   (cons uid uin))
@@ -612,24 +239,20 @@ SESSION-KEY must equal the conversation recorded with the send receipt."
 
 (defun qq-gateway-message-normalize-snapshot
     (message owner account &optional recalled-p)
-  "Purely normalize one validated domain MESSAGE for OWNER and ACCOUNT.
+  "Purely normalize one Gateway MESSAGE for OWNER and ACCOUNT.
 
 OWNER is the stable opaque account-id.  ACCOUNT supplies the QQ identity needed
 to resolve private endpoints.  When RECALLED-P is non-nil, return a recalled
 root-summary row.
 
-MESSAGE must be the domain snapshot returned by the strict wire validator.
-This function rechecks that closed domain shape but does not inspect or mutate
-pending send, recall, reaction, essence, peer-correlation, live-frontier, or
-timeline state.
-It also does not allocate a local message order.  Projection paths add local
-correlation concerns after this closed codec boundary."
-  (unless (qq-gateway--non-empty-string-p owner)
-    (error "qq: Native message snapshot requires a stable account id"))
+MESSAGE is already in the domain representation owned by the RPC or event
+boundary.  This function checks only client-owned relationships and does not
+inspect or mutate pending send, recall, reaction, essence, peer-correlation,
+live-frontier, or timeline state.  It also does not allocate a local message
+order."
   (unless (and (listp account)
                (equal (alist-get 'account_id account) owner))
     (error "qq: Native message snapshot account contradicts observation owner"))
-  (setq message (qq-gateway-message--validate-message message t))
   (let* ((conversation (alist-get 'conversation message))
          (kind (alist-get 'kind conversation))
          (sender (alist-get 'sender message))
@@ -698,7 +321,7 @@ correlation concerns after this closed codec boundary."
         (target-id . ,(if group-id group-id (alist-get 'uin peer)))))))
 
 (defun qq-gateway-message--normalize-message (data)
-  "Normalize validated native message event DATA for projection.
+  "Normalize native message event DATA for projection.
 
 Unlike `qq-gateway-message-normalize-snapshot', this wrapper attaches local
 ordering and pending-send correlation owned by the selected live projection."
@@ -992,7 +615,7 @@ responses never advance this observation; only `message.received' events do."
        qq-gateway-message--pending-recalls))))
 
 (defun qq-gateway-message--poke-raw-info (poke)
-  "Return shared renderer decoration items for validated POKE."
+  "Return shared renderer decoration items for POKE."
   (delq
    nil
    (list
@@ -1078,45 +701,32 @@ responses never advance this observation; only `message.received' events do."
        qq-gateway-message--pending-essences))))
 
 (defun qq-gateway-message--projection-error (event data error-data)
-  "Publish projection ERROR-DATA for validated EVENT and DATA."
+  "Publish projection ERROR-DATA for Gateway EVENT and domain DATA."
   (let ((reason (error-message-string error-data)))
     (qq-gateway--run-hook
      'qq-gateway-message-projection-error-hook event (copy-tree data) reason)
     (message "qq: Gateway %s projection skipped: %s" event reason)))
 
 (defun qq-gateway-message--handle-event (event data)
-  "Validate native message EVENT with DATA and project the selected owner."
-  (let ((validated
-         (pcase event
-           ("message.received"
-            (qq-gateway-message--validate-message-data data))
-           ("message.recalled"
-            (qq-gateway-message--validate-recall-data data))
-           ("message.poked"
-            (qq-gateway-message--validate-poke-data data))
-           ("message.reaction_changed"
-            (qq-gateway-message--validate-reaction-data data))
-           ("message.essence_changed"
-            (qq-gateway-message--validate-essence-data data))
-           (_ (error "qq: Unowned Gateway message event %s" event)))))
-    (qq-gateway--run-hook
-     'qq-gateway-message-event-hook event (copy-tree validated))
-    (when (qq-gateway-message--selected-owner-p validated)
-      (condition-case projection-error
-          (pcase event
-            ("message.received"
-             (qq-gateway-message--project-message validated))
-            ("message.recalled"
-             (qq-gateway-message--project-recall validated))
-            ("message.poked"
-             (qq-gateway-message--project-poke validated))
-            ("message.reaction_changed"
-             (qq-gateway-message--project-reaction validated))
-            ("message.essence_changed"
-             (qq-gateway-message--project-essence validated)))
-        (error
-         (qq-gateway-message--projection-error
-          event validated projection-error))))))
+  "Observe domainized message EVENT DATA and project the selected owner."
+  (qq-gateway--run-hook
+   'qq-gateway-message-event-hook event (copy-tree data))
+  (when (qq-gateway-message--selected-owner-p data)
+    (condition-case projection-error
+        (pcase event
+          ("message.received"
+           (qq-gateway-message--project-message data))
+          ("message.recalled"
+           (qq-gateway-message--project-recall data))
+          ("message.poked"
+           (qq-gateway-message--project-poke data))
+          ("message.reaction_changed"
+           (qq-gateway-message--project-reaction data))
+          ("message.essence_changed"
+           (qq-gateway-message--project-essence data)))
+      (error
+       (qq-gateway-message--projection-error
+        event data projection-error)))))
 
 (defun qq-gateway-message--handle-account-change (reason account-id)
   "Keep projection ownership aligned after account change REASON/ACCOUNT-ID."
@@ -1159,16 +769,8 @@ responses never advance this observation; only `message.received' events do."
          (kind (alist-get 'type identity))
          (target (alist-get 'target-id identity)))
     (pcase kind
-      ('private
-       (unless (qq-gateway--uint64-decimal-p target)
-         (user-error
-          "qq: Native Gateway private conversation requires a canonical nonzero uint64 UIN"))
-       `((kind . "private") (peer_uin . ,target)))
-      ('group
-       (unless (qq-gateway--uint64-decimal-p target)
-         (user-error
-          "qq: Native Gateway group conversation requires a canonical nonzero uint64 UIN"))
-       `((kind . "group") (group_uin . ,target)))
+      ('private `((kind . "private") (peer_uin . ,target)))
+      ('group `((kind . "group") (group_uin . ,target)))
       (_ (user-error "qq: Native Gateway only sends private or group messages")))))
 
 (defun qq-gateway-message--decimal-add-small (value addend)
@@ -1268,47 +870,6 @@ right instead of becoming shorter."
     (qq-gateway-message--validate-history-range
      start-sequence end-sequence)))
 
-(defun qq-gateway-message--validate-history-result
-    (result owner start-sequence end-sequence)
-  "Validate history RESULT for OWNER and START-SEQUENCE through END-SEQUENCE."
-  (unless (qq-gateway--exact-object-keys-p
-           result
-           '(account_id requested_start_sequence
-             requested_end_sequence response_start_sequence
-             response_end_sequence unsupported_message_count messages))
-    (error "qq: Gateway history result has invalid fields"))
-  (unless (equal (alist-get 'account_id result) owner)
-    (error "qq: Gateway history result owner contradicts request"))
-  (unless (and (equal (alist-get 'requested_start_sequence result)
-                      start-sequence)
-               (equal (alist-get 'requested_end_sequence result)
-                      end-sequence))
-    (error "qq: Gateway history result range contradicts request"))
-  (dolist (key '(requested_start_sequence requested_end_sequence
-                 response_start_sequence response_end_sequence))
-    (condition-case error-data
-        (qq-gateway-message--validate-sequence
-         (alist-get key result) (format "History result %s" key))
-      (user-error
-       (error "%s" (error-message-string error-data)))))
-  (when (qq-gateway--decimal-less-p
-         (alist-get 'response_end_sequence result)
-         (alist-get 'response_start_sequence result))
-    (error "qq: Gateway history response range is reversed"))
-  (unless (and (integerp (alist-get 'unsupported_message_count result))
-               (>= (alist-get 'unsupported_message_count result) 0))
-    (error "qq: Gateway history unsupported count must be non-negative integer"))
-  (let ((messages
-         (qq-gateway-wire-array
-          (alist-get 'messages result) "Gateway history messages")))
-    (dolist (message messages)
-      (qq-gateway-message--validate-message message)
-      (let ((sequence (alist-get 'sequence message)))
-        (when (or (qq-gateway--decimal-less-p sequence start-sequence)
-                  (qq-gateway--decimal-less-p end-sequence sequence))
-          (error "qq: Gateway history message falls outside requested range")))))
-  (qq-gateway-wire-domain-copy result))
-
 (defun qq-gateway-message--history-message-data (owner message)
   "Wrap one history MESSAGE with stable account OWNER context."
   `((account_id . ,owner)
@@ -1345,7 +906,7 @@ Return a list of `(NATIVE-MESSAGE . NORMALIZED-MESSAGE)' pairs."
        (signal (car error-data) (cdr error-data))))))
 
 (defun qq-gateway-message--merge-history (session-key result owner)
-  "Merge validated native history RESULT into SESSION-KEY for OWNER."
+  "Merge native history RESULT into SESSION-KEY for OWNER."
   (let ((rows (qq-gateway-message--normalize-history
                result owner session-key))
         (known-ids (make-hash-table :test #'equal))
@@ -1399,8 +960,7 @@ Return a list of `(NATIVE-MESSAGE . NORMALIZED-MESSAGE)' pairs."
       meta)))
 
 (cl-defun qq-gateway-message--call
-    (method owner params decoder
-            &key projector callback errback stale-message)
+    (method owner params &key projector callback errback stale-message)
   "Call message METHOD for stable account OWNER through the typed RPC boundary.
 
 PARAMS deliberately exclude account ownership: this helper adds only the
@@ -1418,7 +978,6 @@ the stable selected slot and Gateway instance, never Native Session identity."
                    (qq-gateway-transport-gateway-instance-id))))
      :stale-message
      (or stale-message "QQ account or Gateway connection changed during request")
-     :decoder decoder
      :projector projector
      :callback callback
      :errback errback)))
@@ -1440,91 +999,42 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
      `((conversation . ,conversation)
        (start_sequence . ,start-sequence)
        (end_sequence . ,end-sequence))
-     (lambda (raw-result)
-       (qq-gateway-message--validate-history-result
-        raw-result owner start-sequence end-sequence))
      :projector
      (lambda (result)
        (qq-gateway-message--merge-history session-key result owner))
      :callback callback
      :errback errback)))
 
-(defun qq-gateway-message--validate-send-receipt (receipt owner)
-  "Validate and copy message-send RECEIPT for stable account OWNER."
-  (unless (qq-gateway--exact-object-keys-p
-           receipt
-           '(account_id sent_at server_sequence client_sequence random))
-    (error "qq: Gateway message-send receipt has invalid fields"))
-  (unless (equal (alist-get 'account_id receipt) owner)
-    (error "qq: Gateway message-send receipt owner contradicts request"))
-  (unless (and (integerp (alist-get 'sent_at receipt))
-               (>= (alist-get 'sent_at receipt) 0))
-    (error "qq: Gateway message-send receipt timestamp is invalid"))
-  (dolist (key '(server_sequence client_sequence))
-    (unless (qq-gateway--uint64-decimal-p (alist-get key receipt) t)
-      (error "qq: Gateway message-send receipt %s is invalid" key)))
-  (unless (qq-gateway-message--uint32-p (alist-get 'random receipt))
-    (error "qq: Gateway message-send receipt random is invalid"))
-  (qq-gateway-wire-domain-copy receipt))
-
 (defun qq-gateway-message--prepare-outbound (session-key segments owner)
-  "Validate closed UI SEGMENTS and prepare one native outbound message.
+  "Translate UI SEGMENTS into one native outbound message.
 
-Return a plist with `:reply-to', either nil or a closed message-reference
+Return a plist with `:reply-to', either nil or an exact message-reference
 object, and `:segments', the ordered native content elements.  Reply is a
-request modifier rather than content: exactly zero or one is accepted and it
-does not count toward the required 1 through 128 content elements.  Prepared
-attachments remain scoped to SESSION-KEY and OWNER."
-  (unless (proper-list-p segments)
-    (user-error "qq: Native Gateway segments must be a proper list"))
+request modifier rather than content.  This adapter checks only facts needed
+to translate the local shape or protect its attachment projection; Gateway
+owns the outbound domain schema and segment limits."
   (let ((group-p (eq (qq-state-session-key-type session-key) 'group))
         reply-to
         native-segments)
     (dolist (segment segments)
-      (unless (qq-gateway--exact-object-keys-p segment '(type data))
-        (user-error "qq: Native Gateway segment has invalid fields"))
       (let* ((type (alist-get 'type segment))
              (data (alist-get 'data segment))
              (native
               (pcase type
                 ("text"
-                 (unless
-                     (and (qq-gateway--exact-object-keys-p data '(text))
-                          (qq-gateway--non-empty-string-p
-                           (alist-get 'text data)))
-                   (user-error
-                    "qq: Native Gateway text segment is malformed"))
+                 (unless (qq-gateway--non-empty-string-p
+                          (alist-get 'text data))
+                   (user-error "qq: Message text must not be empty"))
                  `((kind . "text")
                    (payload . ((text . ,(alist-get 'text data))))))
                 ("face"
-                 (let ((id (alist-get 'id data)))
-                   (unless
-                       (and (qq-gateway--exact-object-keys-p data '(id))
-                            (qq-gateway--canonical-decimal-p id t)
-                            (qq-gateway--decimal-less-p id "260"))
-                     (user-error
-                      "qq: Native Gateway base face ID must be between 0 and 259"))
-                   `((kind . "face") (payload . ((id . ,id))))))
+                 `((kind . "face")
+                   (payload . ((id . ,(alist-get 'id data))))))
                 ("at"
                  (unless group-p
-                   (user-error
-                    "qq: Native Gateway mentions require a group chat"))
-                 (unless
-                     (qq-gateway-message--closed-object-p data '(qq) '(name))
-                   (user-error
-                    "qq: Native Gateway mention has invalid fields"))
+                   (user-error "qq: Mentions require a group chat"))
                  (let ((qq (alist-get 'qq data))
                        (name (alist-get 'name data)))
-                   (unless
-                       (or (equal qq "all")
-                           (qq-gateway--uint64-decimal-p qq))
-                     (user-error
-                      "qq: Native Gateway mention target is invalid"))
-                   (when
-                       (and (assq 'name data)
-                            (not (qq-gateway--non-empty-string-p name)))
-                     (user-error
-                      "qq: Native Gateway mention name is invalid"))
                    `((kind . "mention")
                      (payload
                       . ((target
@@ -1534,35 +1044,23 @@ attachments remain scoped to SESSION-KEY and OWNER."
                                  `((uin . ,qq)))))
                          ,@(when name `((display . ,name))))))))
                 ("image"
-                 (unless
-                     (qq-gateway--exact-object-keys-p data '(attachment_id))
-                   (user-error
-                    "qq: Native image requires one prepared attachment ID"))
                  (let ((attachment-id (alist-get 'attachment_id data)))
                    (qq-gateway-attachment-assert-sendable
                     attachment-id session-key owner)
                    `((kind . "image")
                      (payload . ((attachment_id . ,attachment-id))))))
                 ("record"
-                 (unless
-                     (qq-gateway--exact-object-keys-p data '(attachment_id))
-                   (user-error
-                    "qq: Native record requires one prepared attachment ID"))
                  (let ((attachment-id (alist-get 'attachment_id data)))
                    (qq-gateway-attachment-assert-sendable
                     attachment-id session-key owner "record")
                    `((kind . "record")
                      (payload . ((attachment_id . ,attachment-id))))))
                 ("reply"
-                 (unless
-                     (and (qq-gateway--exact-object-keys-p data '(id))
-                          (qq-gateway-message--message-id-p
-                           (alist-get 'id data)))
-                   (user-error
-                    "qq: Native Gateway reply segment is malformed"))
+                 (unless (qq-gateway-message--message-id-p
+                          (alist-get 'id data))
+                   (user-error "qq: Reply target has no exact Message ID"))
                  (when reply-to
-                   (user-error
-                    "qq: Native Gateway accepts at most one reply"))
+                   (user-error "qq: A message has only one reply target"))
                  (setq reply-to
                        `((message_id . ,(alist-get 'id data))))
                  nil)
@@ -1574,16 +1072,12 @@ attachments remain scoped to SESSION-KEY and OWNER."
           (push native native-segments))))
     (setq native-segments (nreverse native-segments))
     (unless native-segments
-      (user-error
-       "qq: Native Gateway requires at least one content segment"))
-    (when (> (length native-segments) 128)
-      (user-error
-       "qq: Native Gateway accepts at most 128 content segments"))
+      (user-error "qq: Enter message content before sending"))
     (list :reply-to reply-to :segments native-segments)))
 
 (defun qq-gateway-message--send-request
     (session-key segments raw-message method params callback errback)
-  "Send validated SEGMENTS through METHOD with PARAMS for SESSION-KEY."
+  "Send prepared SEGMENTS through METHOD with PARAMS for SESSION-KEY."
   (let* ((owner (or (qq-gateway-current-account-id)
                     (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
@@ -1598,8 +1092,6 @@ attachments remain scoped to SESSION-KEY and OWNER."
       (condition-case error-data
           (qq-gateway-message--call
            method owner params
-           (lambda (result)
-             (qq-gateway-message--validate-send-receipt result owner))
            :projector
            (lambda (receipt)
              (unless
@@ -1629,7 +1121,7 @@ attachments remain scoped to SESSION-KEY and OWNER."
 (defun qq-gateway-message-send
     (session-key segments &optional raw-message callback errback
                  optimistic-segments)
-  "Send closed SEGMENTS to native private/group SESSION-KEY.
+  "Send SEGMENTS to native private/group SESSION-KEY.
 
 Supported elements are text, base face (ID 0 through 259), group mention,
 reply, and already prepared image/record attachments.  One optional reply is
@@ -1656,18 +1148,6 @@ The original reply element remains part of this local rendering shape."
        (segments . ,native-segments))
      callback errback)))
 
-(defun qq-gateway-message--validate-poke-receipt (receipt owner target-uin)
-  "Validate poke RECEIPT for stable OWNER account and TARGET-UIN."
-  (unless (qq-gateway--exact-object-keys-p
-           receipt '(account_id target_uin))
-    (error "qq: Gateway poke receipt has invalid fields"))
-  (unless (and (equal (alist-get 'account_id receipt) owner)
-               (equal (alist-get 'target_uin receipt) target-uin)
-               (qq-gateway--uint64-decimal-p
-                (alist-get 'target_uin receipt)))
-    (error "qq: Gateway poke receipt contradicts request"))
-  (qq-gateway-wire-domain-copy receipt))
-
 (defun qq-gateway-message-send-poke
     (session-key target-uin &optional callback errback)
   "Poke exact TARGET-UIN in native private/group SESSION-KEY.
@@ -1691,12 +1171,9 @@ replace it."
     (qq-gateway-message--call
      "message.poke" owner
      `((conversation
-        . ((kind . ,(symbol-name kind))
+       . ((kind . ,(symbol-name kind))
            (,(if (eq kind 'group) 'group_uin 'peer_uin) . ,peer-uin)))
        (target_uin . ,target-uin))
-     (lambda (raw-result)
-       (qq-gateway-message--validate-poke-receipt
-        raw-result owner target-uin))
      :projector
      (lambda (receipt)
        (when-let* ((self-id (qq-state-self-user-id)))
@@ -1718,31 +1195,12 @@ replace it."
      :errback errback
      :stale-message "QQ account or Gateway connection changed during poke")))
 
-(defun qq-gateway-message--validate-reaction-receipt
-    (receipt owner message-id emoji-id set)
-  "Validate RECEIPT for OWNER, MESSAGE-ID, EMOJI-ID, and SET."
-  (unless (qq-gateway--exact-object-keys-p
-           receipt
-           '(account_id message_id sequence emoji_id set))
-    (error "qq: Gateway reaction receipt has invalid fields"))
-  (unless (and (equal (alist-get 'account_id receipt) owner)
-               (equal (alist-get 'message_id receipt) message-id)
-               (qq-gateway-message--message-id-p
-                (alist-get 'message_id receipt))
-               (qq-gateway--uint64-decimal-p
-                (alist-get 'sequence receipt) t)
-               (equal (alist-get 'emoji_id receipt) emoji-id)
-               (eq (alist-get 'set receipt) (if set t :false)))
-    (error "qq: Gateway reaction receipt contradicts request"))
-  (qq-gateway-wire-domain-copy receipt))
-
 (defun qq-gateway-message-set-reaction
     (message emoji-id set &optional callback errback)
   "Add or remove EMOJI-ID on native group MESSAGE.
 
-SET non-nil adds the reaction.  CALLBACK receives the validated synchronous
-receipt.  Only the authoritative `message.reaction_changed' update changes
-local reaction state."
+SET non-nil adds the reaction.  CALLBACK receives the receipt.  Only the
+authoritative `message.reaction_changed' update changes local reaction state."
   (let* ((owner (or (qq-gateway-current-account-id)
                     (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
@@ -1766,40 +1224,17 @@ local reaction state."
        (message . ((message_id . ,message-id)))
        (emoji_id . ,emoji-id)
        (set . ,(if set t :false)))
-     (lambda (raw-result)
-       (qq-gateway-message--validate-reaction-receipt
-        raw-result owner message-id emoji-id set))
      :callback callback
      :errback errback
      :stale-message
      "QQ account or Gateway connection changed during reaction")))
 
-(defun qq-gateway-message--validate-essence-receipt
-    (receipt owner message-id set)
-  "Validate essence RECEIPT for OWNER and MESSAGE-ID."
-  (unless (qq-gateway--exact-object-keys-p
-           receipt
-           '(account_id message_id sequence random set))
-    (error "qq: Gateway essence receipt has invalid fields"))
-  (unless (and (equal (alist-get 'account_id receipt) owner)
-               (equal (alist-get 'message_id receipt) message-id)
-               (qq-gateway-message--message-id-p
-                (alist-get 'message_id receipt))
-               (qq-gateway--uint64-decimal-p
-                (alist-get 'sequence receipt) t)
-               (qq-gateway-message--uint32-p
-                (alist-get 'random receipt))
-               (eq (alist-get 'set receipt) (if set t :false)))
-    (error "qq: Gateway essence receipt contradicts request"))
-  (qq-gateway-wire-domain-copy receipt))
-
 (defun qq-gateway-message-set-essence
     (message set &optional callback errback)
   "Set or remove native group MESSAGE as an essence message.
 
-SET non-nil sets the essence flag.  CALLBACK receives the validated
-synchronous receipt.  Only the authoritative `message.essence_changed' update
-changes local essence state."
+SET non-nil sets the essence flag.  CALLBACK receives the receipt.  Only the
+authoritative `message.essence_changed' update changes local essence state."
   (let* ((owner (or (qq-gateway-current-account-id)
                     (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
@@ -1820,41 +1255,18 @@ changes local essence state."
      `((conversation . ((kind . "group") (group_uin . ,group-uin)))
        (message . ((message_id . ,message-id)))
        (set . ,(if set t :false)))
-     (lambda (raw-result)
-       (qq-gateway-message--validate-essence-receipt
-        raw-result owner message-id set))
      :callback callback
      :errback errback
      :stale-message
      "QQ account or Gateway connection changed during essence action")))
-
-(defun qq-gateway-message--validate-todo-receipt
-    (receipt owner group-uin message-id operation)
-  "Validate todo RECEIPT against OWNER and its group Message Reference."
-  (unless (qq-gateway--exact-object-keys-p
-           receipt
-           '(account_id group_uin message_id sequence operation))
-    (error "qq: Gateway todo receipt has invalid fields"))
-  (unless (and (equal (alist-get 'account_id receipt) owner)
-               (equal (alist-get 'group_uin receipt) group-uin)
-               (qq-gateway--uint64-decimal-p
-                (alist-get 'group_uin receipt))
-               (equal (alist-get 'message_id receipt) message-id)
-               (qq-gateway-message--message-id-p
-                (alist-get 'message_id receipt))
-               (qq-gateway--uint64-decimal-p
-                (alist-get 'sequence receipt) t)
-               (equal (alist-get 'operation receipt) operation))
-    (error "qq: Gateway todo receipt contradicts request"))
-  (qq-gateway-wire-domain-copy receipt))
 
 (defun qq-gateway-message-set-todo
     (message operation &optional callback errback)
   "Apply todo OPERATION to native group MESSAGE.
 
 OPERATION is one of `set', `complete', or `cancel'.  CALLBACK receives the
-validated synchronous receipt.  No local todo state is invented because the
-native query/event semantics are not yet part of the closed Gateway protocol."
+receipt.  No local todo state is invented because native query/event semantics
+are not yet part of the Gateway protocol."
   (unless (memq operation '(set complete cancel))
     (user-error "qq: Unknown native todo operation %S" operation))
   (let* ((owner (or (qq-gateway-current-account-id)
@@ -1877,62 +1289,17 @@ native query/event semantics are not yet part of the closed Gateway protocol."
      `((conversation . ((kind . "group") (group_uin . ,group-uin)))
        (message . ((message_id . ,message-id)))
        (operation . ,operation-name))
-     (lambda (raw-result)
-       (qq-gateway-message--validate-todo-receipt
-        raw-result owner group-uin message-id operation-name))
      :callback callback
      :errback errback
      :stale-message
      "QQ account or Gateway connection changed during todo action")))
 
-(defun qq-gateway-message--validate-recall-receipt
-    (receipt owner message-id)
-  "Validate recall RECEIPT for OWNER and MESSAGE-ID."
-  (unless (qq-gateway--exact-object-keys-p
-           receipt '(account_id message_id))
-    (error "qq: Gateway recall receipt has invalid fields"))
-  (unless (and (equal (alist-get 'account_id receipt) owner)
-               (equal (alist-get 'message_id receipt) message-id)
-               (qq-gateway-message--message-id-p
-                (alist-get 'message_id receipt)))
-    (error "qq: Gateway recall receipt contradicts request"))
-  (qq-gateway-wire-domain-copy receipt))
-
-(defun qq-gateway-message--validate-poke-recall-receipt
-    (receipt owner message-id sequence)
-  "Validate poke recall RECEIPT for OWNER and its expiring native target."
-  (unless (qq-gateway--exact-object-keys-p
-           receipt '(account_id message_id sequence))
-    (error "qq: Gateway poke recall receipt has invalid fields"))
-  (unless (and (equal (alist-get 'account_id receipt) owner)
-               (equal (alist-get 'message_id receipt) message-id)
-               (qq-gateway-message--message-id-p
-                (alist-get 'message_id receipt))
-               (equal (alist-get 'sequence receipt) sequence)
-               (qq-gateway--uint64-decimal-p
-                (alist-get 'sequence receipt) t))
-    (error "qq: Gateway poke recall receipt contradicts request"))
-  (qq-gateway-wire-domain-copy receipt))
-
-(defun qq-gateway-message--validate-read-receipt
-    (receipt owner message-id)
-  "Validate read RECEIPT for OWNER and MESSAGE-ID."
-  (unless (qq-gateway--exact-object-keys-p
-           receipt '(account_id message_id))
-    (error "qq: Gateway read receipt has invalid fields"))
-  (unless (and (equal (alist-get 'account_id receipt) owner)
-               (equal (alist-get 'message_id receipt) message-id)
-               (qq-gateway-message--message-id-p
-                (alist-get 'message_id receipt)))
-    (error "qq: Gateway read receipt contradicts request"))
-  (qq-gateway-wire-domain-copy receipt))
-
 (defun qq-gateway-message--read-request (message owner)
-  "Return a closed reference-only read request for MESSAGE and OWNER.
+  "Return an exact reference-only read request for MESSAGE and OWNER.
 
 The result is a plist containing `:message-id' and `:params'.  This is the
-single structural validator for both capability checks and the wire
-operation; it has no projection or transport side effects."
+single capability check and request builder; it has no projection or transport
+side effects."
   (let* ((session-key (and (listp message)
                            (alist-get 'session-key message)))
          (kind (and session-key (qq-state-session-key-type session-key)))
@@ -1966,19 +1333,15 @@ operation; it has no projection or transport side effects."
 
 MESSAGE supplies only its stable public conversation locator and exact
 message ID.  Gateway resolves the corresponding Native read boundary.
-CALLBACK receives the validated acknowledgement; ERRBACK receives an error
+CALLBACK receives the acknowledgement; ERRBACK receives an error
 body and reason."
   (let* ((owner (or (qq-gateway-current-account-id)
                     (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
-         (request (qq-gateway-message--read-request message owner))
-         (message-id (plist-get request :message-id)))
+         (request (qq-gateway-message--read-request message owner)))
     (qq-gateway-message--call
      "message.mark_read" owner
      (plist-get request :params)
-     (lambda (result)
-       (qq-gateway-message--validate-read-receipt
-        result owner message-id))
      :callback callback
      :errback errback
      :stale-message
@@ -1988,7 +1351,7 @@ body and reason."
     (session-key message &optional callback errback)
   "Recall native MESSAGE in SESSION-KEY for the selected QQ account.
 
-CALLBACK receives the validated SSO receipt; ERRBACK receives an error body
+CALLBACK receives the SSO receipt; ERRBACK receives an error body
 and reason.  A successful typed acknowledgement marks the local message
 recalled; a later `message.recalled' event is an idempotent reconciliation."
   (let* ((owner (or (qq-gateway-current-account-id)
@@ -2005,9 +1368,6 @@ recalled; a later `message.recalled' event is an idempotent reconciliation."
      "message.recall" owner
      `((conversation . ,conversation)
        (message . ((message_id . ,message-id))))
-     (lambda (result)
-       (qq-gateway-message--validate-recall-receipt
-        result owner message-id))
      :projector
      (lambda (receipt)
        (qq-state-apply-recall session-key message-id)
@@ -2054,7 +1414,7 @@ recalled; a later `message.recalled' event is an idempotent reconciliation."
     (message &optional callback errback)
   "Recall authoritative group poke MESSAGE through the selected Gateway.
 
-CALLBACK receives the validated receipt; ERRBACK receives failure details."
+CALLBACK receives the receipt; ERRBACK receives failure details."
   (let* ((owner (or (qq-gateway-current-account-id)
                     (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
@@ -2074,9 +1434,6 @@ CALLBACK receives the validated receipt; ERRBACK receives failure details."
                 (sequence . ,sequence)
                 (sent_at . ,(alist-get 'sent_at metadata))
                 (tips_sequence . ,(alist-get 'tips_sequence metadata)))))
-     (lambda (result)
-       (qq-gateway-message--validate-poke-recall-receipt
-        result owner message-id sequence))
      :projector
      (lambda (receipt)
        (qq-state-apply-recall

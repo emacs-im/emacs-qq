@@ -50,63 +50,20 @@
   (dolist (value '("00" "01" "18446744073709551616"))
     (should-not (qq-gateway--uint64-decimal-p value t))))
 
-(ert-deftest qq-gateway-account-validator-preserves-exact-identities ()
-  (let* ((raw (qq-gateway-test-account
-               "slot-a" "online" "9007199254740993" "Primary"))
-         (snapshot (qq-gateway--validate-account raw)))
-    (should (equal (alist-get 'uin snapshot) "9007199254740993"))
-    (should-not (assq 'generation snapshot))
-    (setf (alist-get 'uin raw) 9007199254740993)
-    (should-error (qq-gateway--validate-account raw))))
-
-(ert-deftest qq-gateway-account-uin-is-a-nonzero-uint64 ()
-  (should
-   (qq-gateway--validate-account
-    (qq-gateway-test-account
-     "slot-a" "online" "18446744073709551615")))
-  (dolist (uin '("0" "010001" "18446744073709551616"))
-    (should-error
-     (qq-gateway--validate-account
-      (qq-gateway-test-account "slot-a" "online" uin)))))
-
-(ert-deftest qq-gateway-account-validator-rejects-open-shapes ()
-  (let ((raw (append (qq-gateway-test-account "slot-a")
-                     '((future_field . t)))))
-    (should-error (qq-gateway--validate-account raw))))
-
-(ert-deftest qq-gateway-account-validator-rejects-wire-generation ()
-  (let ((raw (append (qq-gateway-test-account "slot-a")
-                     '((generation . "1")))))
-    (should-error (qq-gateway--validate-account raw))))
-
-(ert-deftest qq-gateway-account-validator-normalizes-only-wire-null ()
-  (let ((raw
-         `((account_id . "slot-a")
-           (label . ,qq-gateway-wire-null)
-           (phase . "stopped")
-           (uin . ,qq-gateway-wire-null)
-           (uid . ,qq-gateway-wire-null)
-           (challenge . ,qq-gateway-wire-null)
-           (problem . ,qq-gateway-wire-null))))
-    (let ((snapshot (qq-gateway--validate-account raw)))
-      (dolist (key '(label uin uid challenge problem))
-        (should (null (alist-get key snapshot)))))
-    (dolist (key '(label uin uid challenge problem))
-      (let ((invalid (qq-gateway-value-copy raw)))
-        (setf (alist-get key invalid nil nil #'eq) [])
-        (should-error (qq-gateway--validate-account invalid) :type 'error)))))
-
-(ert-deftest qq-gateway-account-validator-and-accessors-own-strings ()
+(ert-deftest qq-gateway-account-registry-preserves-domain-and-owns-accessors ()
   (qq-gateway-test-with-state
     (let* ((account-id (copy-sequence "slot-a"))
            (label (copy-sequence "Primary"))
-           (raw (qq-gateway-test-account account-id "online" "10001" label))
-           (validated (qq-gateway--validate-account raw)))
-      (aset (alist-get 'label validated) 0 ?X)
-      (should (equal label "Primary"))
-      (qq-gateway--replace-accounts (vector raw) 'ready "gateway-1")
+           (raw
+            (append
+             (qq-gateway-test-account
+              account-id "online" "9007199254740993" label)
+             '((future_field . t)))))
+      (qq-gateway--replace-accounts (list raw) 'ready "gateway-1")
       (let ((snapshot (qq-gateway-account "slot-a"))
             (selected (qq-gateway-current-account-id)))
+        (should (equal (alist-get 'uin snapshot) "9007199254740993"))
+        (should (eq (alist-get 'future_field snapshot) t))
         (aset (alist-get 'account_id snapshot) 0 ?X)
         (aset (alist-get 'label snapshot) 0 ?X)
         (aset selected 0 ?X))
@@ -118,16 +75,6 @@
       (should (equal (qq-gateway-current-account-id) "slot-a"))
       (should (equal account-id "slot-a"))
       (should (equal label "Primary")))))
-
-(ert-deftest qq-gateway-account-list-requires-an-array ()
-  (should (equal
-           (qq-gateway--validate-account-list-result
-            `((accounts . [,(qq-gateway-test-account "slot-a")])))
-           (list (qq-gateway-test-account "slot-a"))))
-  (should-error
-   (qq-gateway--validate-account-list-result
-    `((accounts . ,qq-gateway-wire-null)))
-   :type 'error))
 
 (ert-deftest qq-gateway-ready-replaces-registry-and-selects-singleton ()
   (qq-gateway-test-with-state
@@ -146,7 +93,7 @@
       (qq-gateway--handle-event
        "gateway.ready"
        `((gateway_instance_id . "gateway-1")
-         (accounts . [,(qq-gateway-test-account "slot-a")])))
+         (accounts . (,(qq-gateway-test-account "slot-a")))))
       (should (equal (qq-gateway-current-account-id) "slot-a"))
       (should (equal selection '((nil "slot-a"))))
       (should (equal changes '((ready nil))))
@@ -186,7 +133,7 @@
          nil (lambda (body _reason) (push body failures)))
         (qq-gateway--handle-event
          "gateway.ready"
-         `((gateway_instance_id . "gateway-ready") (accounts . [])))
+         '((gateway_instance_id . "gateway-ready") (accounts)))
         (should (equal canceled '(account-refresh-token)))
         (should (= (length failures) 1))
         (should (equal (alist-get 'code (car failures))
@@ -307,14 +254,6 @@
         (should (equal (alist-get 'phase (qq-gateway-account "slot-a"))
                        "online"))))))
 
-(ert-deftest qq-gateway-account-presence-rejects-wire-generation ()
-  (should-error
-   (qq-gateway--validate-presence-receipt
-    '((account_id . "slot-a")
-      (generation . "1")
-      (presence (kind . "away")))
-    "slot-a" '((kind . "away")))))
-
 (ert-deftest qq-gateway-account-presence-accepts-receipt-after-slot-update ()
   (qq-gateway-test-with-state
     (qq-gateway--upsert-account
@@ -372,26 +311,6 @@
           (should (stringp (alist-get 'uin params)))
           (should (equal (alist-get 'password params)
                          "correct horse battery staple")))))))
-
-(ert-deftest qq-gateway-login-response-cannot-switch-account ()
-  (qq-gateway-test-with-state
-    (let (failure)
-      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
-                 (lambda () t))
-                ((symbol-function 'qq-gateway-transport-capabilities)
-                 (lambda () qq-gateway-test-capabilities))
-                ((symbol-function 'qq-gateway-transport-send)
-                 (lambda (_method _params callback _errback &optional _early)
-                   (funcall callback
-                            (qq-gateway-test-account
-                             "slot-b" "logging_in" "10002"))
-                   "request-3")))
-        (qq-gateway-account-login-password
-         "slot-a" "10001" "secret" nil nil
-         (lambda (_body reason) (setq failure reason)))
-        (should (string-match-p "contradicts request" failure))
-        (should-not (qq-gateway-account "slot-a"))
-        (should-not (qq-gateway-account "slot-b"))))))
 
 (ert-deftest qq-gateway-account-remove-consumes-returned-snapshot ()
   (qq-gateway-test-with-state
@@ -690,31 +609,20 @@
         (funcall (car (nth 2 requests)) '((accounts . [])))
         (should-not qq-gateway--resync-request-id)))))
 
-(ert-deftest qq-gateway-malformed-domain-event-reconnects-transport ()
+(ert-deftest qq-gateway-account-event-accepts-forward-compatible-domain-fields ()
   (qq-gateway-test-with-state
     (let (violation)
       (cl-letf (((symbol-function 'qq-gateway-transport--protocol-violation)
                  (lambda (format-string &rest arguments)
                    (setq violation (apply #'format format-string arguments)))))
         (qq-gateway-dispatch--handle-transport-event
-         "account.changed" '((account_id . "open-shape")))
-        (should (string-match-p "Malformed account.changed event" violation))))))
-
-(ert-deftest qq-gateway-malformed-ready-is-one-violation-before-typed-ready ()
-  (qq-gateway-test-with-state
-    (let ((violations 0) ready)
-      (add-hook 'qq-gateway-ready-hook
-                (lambda (_instance-id) (setq ready t)))
-      (cl-letf (((symbol-function 'qq-gateway-transport--protocol-violation)
-                 (lambda (&rest _) (cl-incf violations))))
-        (qq-gateway-dispatch--handle-transport-event
-         "gateway.ready"
-         '((gateway_instance_id . "gateway-1")
-           (accounts . [])
-           (future_field . t))))
-      (should (= violations 1))
-      (should-not ready)
-      (should-not (qq-gateway-accounts)))))
+         "account.changed"
+         (append (qq-gateway-test-account "slot-a")
+                 '((future_field . t)))))
+      (should-not violation)
+      (should (eq (alist-get 'future_field
+                             (qq-gateway-account "slot-a"))
+                  t)))))
 
 (provide 'qq-gateway-test)
 

@@ -118,10 +118,9 @@ TRUNCATED is its exact wire boolean."
         (should (equal (alist-get 'message_id message)
                        "7348923749823749823"))))))
 
-(ert-deftest qq-gateway-conversation-decoder-preserves-optional-pinned-state ()
+(ert-deftest qq-gateway-conversation-domain-page-preserves-optional-pinned-state ()
   (qq-gateway-conversation-test-with-state
-    (let* ((owner "slot-a")
-           (pinned-page
+    (let* ((pinned-page
             (qq-gateway-conversation-test-page
              :rows (list (qq-gateway-conversation-test-row :pinned t))))
            (unknown-page
@@ -129,70 +128,48 @@ TRUNCATED is its exact wire boolean."
              :rows (list (qq-gateway-conversation-test-row))))
            (pinned-row
             (car (alist-get 'conversations
-                            (qq-gateway-conversation--validate-page
-                             pinned-page owner))))
+                            (qq-gateway-conversation--check-page
+                             (qq-gateway-wire-domain-copy pinned-page)))))
            (unknown-row
             (car (alist-get 'conversations
-                            (qq-gateway-conversation--validate-page
-                             unknown-page owner)))))
+                            (qq-gateway-conversation--check-page
+                             (qq-gateway-wire-domain-copy unknown-page))))))
       (should (eq (alist-get 'pinned pinned-row) t))
-      (should-not (assq 'pinned unknown-row))
-      (let* ((bad-row (qq-gateway-conversation-test-row :pinned nil))
-             (bad-page
-              (qq-gateway-conversation-test-page :rows (list bad-row))))
-        (should-error
-         (qq-gateway-conversation--validate-page bad-page owner))))))
+      (should-not (assq 'pinned unknown-row)))))
 
-(ert-deftest qq-gateway-conversation-decoder-preserves-stable-account-page ()
+(ert-deftest qq-gateway-conversation-projection-preserves-stable-account-page ()
   (qq-gateway-conversation-test-with-state
     (let* ((page (qq-gateway-conversation-test-page))
            (validated
-            (qq-gateway-conversation--validate-page page "slot-a"))
+            (qq-gateway-conversation--check-page
+             (qq-gateway-wire-domain-copy page)))
            (row (car (alist-get 'conversations validated))))
       (should (equal (alist-get 'account_id validated) "slot-a"))
       (should-not (assq 'generation validated))
       (should-not (assq 'latest_message_generation row)))))
 
-(ert-deftest qq-gateway-conversation-decoder-is-closed-and-rejects-generation ()
+(ert-deftest qq-gateway-conversation-projection-allows-forward-compatible-fields ()
   (qq-gateway-conversation-test-with-state
-    (let ((owner "slot-a"))
-      (let ((page (qq-gateway-conversation-test-page)))
-        (push '(extra . t) page)
-        (should-error
-         (qq-gateway-conversation--validate-page page owner)))
-      (let ((page (append (qq-gateway-conversation-test-page)
-                          '((generation . "8")))))
-        (should-error
-         (qq-gateway-conversation--validate-page page owner)))
-      (let* ((row (append (qq-gateway-conversation-test-row)
-                          '((latest_message_generation . "8"))))
-             (page (qq-gateway-conversation-test-page :rows (list row))))
-        (should-error
-         (qq-gateway-conversation--validate-page page owner)))
-      (let* ((row
-              (append
-               (qq-gateway-conversation-test-row)
-               '((read_cursor
-                  . ((read_through_message_id
-                      . "7348923749823749823"))))))
-             (page (qq-gateway-conversation-test-page :rows (list row))))
-        (should-error
-         (qq-gateway-conversation--validate-page page owner)))
-      (let* ((message (qq-gateway-conversation-test-message
-                       :message-id 7348923749823749823))
-             (row (qq-gateway-conversation-test-row :message message))
-             (page (qq-gateway-conversation-test-page :rows (list row))))
-        (should-error
-         (qq-gateway-conversation--validate-page page owner))))))
+    (let* ((row
+            (append
+             (qq-gateway-conversation-test-row)
+             '((read_cursor
+                . ((read_through_message_id
+                    . "7348923749823749823"))))))
+           (page
+            (append
+             (qq-gateway-conversation-test-page :rows (list row))
+             '((server_extension . t))))
+           (domain
+            (qq-gateway-conversation--check-page
+             (qq-gateway-wire-domain-copy page)))
+           (projected-row (car (alist-get 'conversations domain))))
+      (should (eq (alist-get 'server_extension domain) t))
+      (should (assq 'read_cursor projected-row)))))
 
-(ert-deftest qq-gateway-conversation-decoder-validates-identity-contract ()
+(ert-deftest qq-gateway-conversation-projection-checks-identity-contract ()
   (qq-gateway-conversation-test-with-state
-    (let ((owner "slot-a"))
-      (let* ((row (qq-gateway-conversation-test-row
-                   :identity '((kind . "private"))))
-             (page (qq-gateway-conversation-test-page :rows (list row))))
-        (should-error
-         (qq-gateway-conversation--validate-page page owner)))
+    (let ()
       (let* ((message
               (qq-gateway-conversation-test-message
                :conversation
@@ -200,7 +177,8 @@ TRUNCATED is its exact wire boolean."
              (row (qq-gateway-conversation-test-row :message message))
              (page (qq-gateway-conversation-test-page :rows (list row))))
         (should-error
-         (qq-gateway-conversation--validate-page page owner)))
+         (qq-gateway-conversation--check-page
+          (qq-gateway-wire-domain-copy page))))
       (let* ((identity '((kind . "group") (group_uin . "8209413637")))
              (message
               (qq-gateway-conversation-test-message
@@ -210,7 +188,8 @@ TRUNCATED is its exact wire boolean."
                    :identity identity :message message))
              (page (qq-gateway-conversation-test-page :rows (list row))))
         (should-error
-         (qq-gateway-conversation--validate-page page owner))))))
+         (qq-gateway-conversation--check-page
+          (qq-gateway-wire-domain-copy page)))))))
 
 (ert-deftest qq-gateway-conversation-limit-is-closed-before-send ()
   (qq-gateway-conversation-test-with-state

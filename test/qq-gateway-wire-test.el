@@ -74,13 +74,5 @@
       (aset (aref (cdr copy-value) 0) 0 ?H)
       (should (equal text "value")))))
 
-(ert-deftest qq-gateway-wire-closed-object-rejects-duplicate-keys ()
-  (should (qq-gateway-wire-closed-object-p
-           '((required . "one") (optional . "two"))
-           '(required) '(optional)))
-  (should-not (qq-gateway-wire-closed-object-p
-               '((required . "one") (required . "two"))
-               '(required) nil)))
-
 (provide 'qq-gateway-wire-test)
 ;;; qq-gateway-wire-test.el ends here

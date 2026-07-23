@@ -93,137 +93,18 @@
      (qq-gateway-account-select "slot-a")
      ,@body))
 
-(ert-deftest qq-gateway-attachment-validator-is-closed-and-pathless ()
-  (let ((snapshot (qq-gateway-attachment-test-ready)))
-    (should (qq-gateway-attachment--validate-snapshot snapshot))
-    (push '(path . "/tmp/private.png") snapshot)
-    (should-error (qq-gateway-attachment--validate-snapshot snapshot))
-    (setq snapshot (qq-gateway-attachment-test-ready))
-    (push '(generation . "7") snapshot)
-    (should-error (qq-gateway-attachment--validate-snapshot snapshot)))
-  (let ((record (qq-gateway-attachment-test-ready-record)))
-    (should (qq-gateway-attachment--validate-snapshot record))
-    (setf (alist-get 'use record)
-          '((kind . "record") (summary . "must-not-exist")))
-    (should-error (qq-gateway-attachment--validate-snapshot record))))
-
-(ert-deftest qq-gateway-attachment-private-conversation-is-uin-only ()
-  (let* ((snapshot
-          (qq-gateway-attachment-test-snapshot
-           :conversation '((kind . "private") (peer_uin . "10001"))))
-         (validated (qq-gateway-attachment--validate-snapshot snapshot)))
-    (should
-     (equal (alist-get 'conversation validated)
-            '((kind . "private") (peer_uin . "10001")))))
-  (dolist
-      (conversation
-       '(((kind . "private") (peer_uid . "u_native"))
-         ((kind . "private") (peer_uin . "10001") (peer_uid . "u_native"))
-         ((kind . "private") (peer_uin . "10001") (native_hint . "u_native"))
-         ((kind . "private") (peer_uin . "010001"))))
-    (should-error
-     (qq-gateway-attachment--validate-snapshot
-      (qq-gateway-attachment-test-snapshot
-       :conversation conversation)))))
-
-(ert-deftest qq-gateway-attachment-conversation-uins-are-bounded-uint64 ()
-  (dolist
-      (conversation
-       '(((kind . "private") (peer_uin . "18446744073709551615"))
-         ((kind . "group") (group_uin . "18446744073709551615"))))
-    (should (qq-gateway-attachment--validate-conversation conversation)))
-  (dolist (uin '("0" "010001" "18446744073709551616"))
-    (dolist (kind '((private . peer_uin) (group . group_uin)))
-      (should-error
-       (qq-gateway-attachment--validate-conversation
-        `((kind . ,(symbol-name (car kind))) (,(cdr kind) . ,uin)))))))
-
-(ert-deftest qq-gateway-attachment-progress-is-an-exact-uint64 ()
-  (should
-   (qq-gateway-attachment--validate-snapshot
-    (qq-gateway-attachment-test-snapshot
-     :bytes-done "18446744073709551615"
-     :bytes-total "18446744073709551615")))
-  (should
-   (qq-gateway-attachment--validate-snapshot
-    (qq-gateway-attachment-test-snapshot
-     :bytes-done "0" :bytes-total "0")))
-  (dolist (value '("00" "18446744073709551616"))
-    (should-error
-     (qq-gateway-attachment--validate-snapshot
-      (qq-gateway-attachment-test-snapshot :bytes-total value)))))
-
-(ert-deftest qq-gateway-attachment-conversation-params-require-uint64-uin ()
+(ert-deftest qq-gateway-attachment-conversation-params-use-session-identity ()
   (should
    (equal
     (qq-gateway-attachment--conversation-params
      "group:18446744073709551615")
     '((kind . "group") (group_uin . "18446744073709551615"))))
-  (dolist (session-key
-           '("private:0" "private:010001" "group:18446744073709551616"))
-    (should-error
-     (qq-gateway-attachment--conversation-params session-key)
-     :type 'user-error)))
+  (should
+   (equal
+    (qq-gateway-attachment--conversation-params "private:10001")
+    '((kind . "private") (peer_uin . "10001")))))
 
-(ert-deftest qq-gateway-attachment-validator-rejects-phase-contradictions ()
-  (let ((ready (qq-gateway-attachment-test-ready))
-        (uploaded
-         (qq-gateway-attachment-test-snapshot
-          :phase "ready" :bytes-done "3" :fast-path :false
-          :updated-at 1784700001))
-        (failed
-         (qq-gateway-attachment-test-snapshot
-          :phase "failed" :updated-at 1784700001
-          :error '((code . "upload_failed") (message . "no route")))))
-    (should (qq-gateway-attachment--validate-snapshot ready))
-    (should (qq-gateway-attachment--validate-snapshot uploaded))
-    (should (qq-gateway-attachment--validate-snapshot failed))
-    (setf (alist-get 'bytes_done uploaded) "2")
-    (should-error (qq-gateway-attachment--validate-snapshot uploaded))))
-
-(ert-deftest qq-gateway-attachment-validator-normalizes-wire-null ()
-  (let ((snapshot (qq-gateway-attachment-test-snapshot)))
-    (setf (alist-get 'fast_path snapshot) qq-gateway-wire-null
-          (alist-get 'error snapshot) qq-gateway-wire-null)
-    (let ((validated (qq-gateway-attachment--validate-snapshot snapshot)))
-      (should (null (alist-get 'fast_path validated nil nil #'eq)))
-      (should (null (alist-get 'error validated nil nil #'eq)))
-      (should-not
-       (qq-gateway-wire-null-p
-        (alist-get 'fast_path validated nil nil #'eq)))
-      (should-not
-       (qq-gateway-wire-null-p
-        (alist-get 'error validated nil nil #'eq)))))
-  (let ((snapshot (qq-gateway-attachment-test-snapshot)))
-    (setf (alist-get 'fast_path snapshot) [])
-    (should-error (qq-gateway-attachment--validate-snapshot snapshot)))
-  (let ((snapshot (qq-gateway-attachment-test-snapshot)))
-    (setf (alist-get 'error snapshot) [])
-    (should-error (qq-gateway-attachment--validate-snapshot snapshot))))
-
-(ert-deftest qq-gateway-attachment-list-result-accepts-wire-array-only ()
-  (let ((snapshot (qq-gateway-attachment-test-snapshot)))
-    (setf (alist-get 'fast_path snapshot) qq-gateway-wire-null
-          (alist-get 'error snapshot) qq-gateway-wire-null)
-    (let ((attachments
-           (qq-gateway-attachment--validate-list-result
-            `((attachments . ,(vector snapshot))))))
-      (should (proper-list-p attachments))
-      (should (= (length attachments) 1))
-      ;; The outer array is normalized here; nested wire values stay distinct
-      ;; until the snapshot validator accepts their nullable fields.
-      (should
-       (qq-gateway-wire-null-p
-        (alist-get 'fast_path (car attachments) nil nil #'eq)))
-      (let ((validated
-             (qq-gateway-attachment--validate-snapshot (car attachments))))
-        (should (null (alist-get 'fast_path validated nil nil #'eq)))
-        (should (null (alist-get 'error validated nil nil #'eq))))))
-  (should-error
-   (qq-gateway-attachment--validate-list-result
-    `((attachments . ,qq-gateway-wire-null)))))
-
-(ert-deftest qq-gateway-attachment-registry-owns-nested-strings ()
+(ert-deftest qq-gateway-attachment-registry-returns-owned-copies ()
   (qq-gateway-attachment-test-with-state
     (let* ((summary (copy-sequence "photo"))
            (snapshot
@@ -232,14 +113,6 @@
                     (summary . ,summary)
                     (sub_type . 0)))))
       (qq-gateway-attachment--upsert snapshot 'test)
-      (aset summary 0 ?X)
-      (should
-       (equal
-        (alist-get 'summary
-                   (alist-get
-                    'use
-                    (qq-gateway-attachment qq-gateway-attachment-test-id)))
-        "photo"))
       (let* ((public
               (qq-gateway-attachment qq-gateway-attachment-test-id))
              (public-summary
@@ -488,73 +361,19 @@
       :phase "negotiating" :updated-at 1784700001)
      'negotiating)
     (let ((called nil)
-          (cancel
+          (watch
            (qq-gateway-attachment--await
             qq-gateway-attachment-test-id
             (lambda (_) (setq called t))
             (lambda (&rest _) (setq called t)))))
       (should (= (length qq-gateway-attachment-changed-hook) 1))
-      (funcall cancel)
+      (qq-gateway-watch-cancel watch)
       (should-not qq-gateway-attachment-changed-hook)
       (qq-gateway-attachment--upsert
        (qq-gateway-attachment-test-snapshot
         :phase "ready" :fast-path t :updated-at 1784700002)
        'ready)
       (should-not called))))
-
-(ert-deftest qq-gateway-attachment-stage-and-prepare-settles-synchronously ()
-  (qq-gateway-attachment-test-with-state
-    (let ((path (make-temp-file "qq-image-" nil ".png" "abc"))
-          delivered canceled
-          (resource-observer-revocations 0)
-          (attachment-observer-revocations 0))
-      (unwind-protect
-          (cl-letf
-              (((symbol-function 'qq-gateway-resource-stage-local)
-                (lambda (_path _name _digest success _failure)
-                  (puthash "res-image-a"
-                           '((resource_id . "res-image-a") (phase . "ready"))
-                           qq-gateway-resource--resources)
-                  (funcall success
-                           '((resource_id . "res-image-a") (phase . "staging")))
-                  "stage-request"))
-               ((symbol-function 'qq-gateway-attachment--await-resource)
-                (lambda (resource-id callback _errback)
-                  (funcall callback
-                           `((resource_id . ,resource-id) (phase . "ready")))
-                  (lambda ()
-                    (cl-incf resource-observer-revocations)
-                    nil)))
-               ((symbol-function 'qq-gateway-attachment--await)
-                (lambda (_attachment-id callback _errback)
-                  (funcall callback (qq-gateway-attachment-test-ready))
-                  (lambda ()
-                    (cl-incf attachment-observer-revocations)
-                    nil)))
-               ((symbol-function 'qq-gateway-attachment-prepare-image)
-                (lambda (_session _resource _summary _sub success _failure)
-                  (let ((ready (qq-gateway-attachment-test-ready)))
-                    (puthash qq-gateway-attachment-test-id ready
-                             qq-gateway-attachment--attachments)
-                    (setq qq-gateway-attachment--order
-                          (list qq-gateway-attachment-test-id))
-                    (funcall success
-                             (qq-gateway-attachment-test-snapshot)))
-                  "prepare-request"))
-               ((symbol-function 'qq-gateway-transport-cancel)
-                (lambda (request-id) (push request-id canceled) t)))
-            (let ((operation
-                   (qq-gateway-attachment-stage-and-prepare-image
-                    "group:8209413637" path nil nil
-                    (lambda (snapshot) (setq delivered snapshot)) #'ignore)))
-              (should (qq-gateway-attachment-operation-p operation))
-              (should-not
-               (qq-gateway-attachment-operation-active-p operation))
-              (should (equal (alist-get 'phase delivered) "ready"))
-              (should (equal canceled '("stage-request" "prepare-request")))
-              (should (= resource-observer-revocations 2))
-              (should (= attachment-observer-revocations 1))))
-        (delete-file path)))))
 
 (ert-deftest qq-gateway-attachment-record-releases-source-after-derivation ()
   (qq-gateway-attachment-test-with-state
@@ -613,16 +432,12 @@
 (ert-deftest qq-gateway-attachment-record-cancel-during-derivation-releases-source ()
   (qq-gateway-attachment-test-with-state
     (let ((path (make-temp-file "qq-record-cancel-" nil ".wav" "pcm"))
-          canceled released)
+          stage-success canceled released)
       (unwind-protect
           (cl-letf
               (((symbol-function 'qq-gateway-resource-stage-local)
                 (lambda (_path _name _digest success _failure)
-                  (puthash "res-record-source"
-                           '((resource_id . "res-record-source")
-                             (phase . "ready"))
-                           qq-gateway-resource--resources)
-                  (funcall success '((resource_id . "res-record-source")))
+                  (setq stage-success success)
                   "stage-request"))
                ((symbol-function 'qq-gateway-resource-derive-record)
                 (lambda (_source _name _success _failure) "derive-request"))
@@ -633,6 +448,11 @@
             (let ((operation
                    (qq-gateway-attachment-stage-and-prepare-record
                     "private:10001" path nil #'ignore)))
+              (puthash "res-record-source"
+                       '((resource_id . "res-record-source")
+                         (phase . "ready"))
+                       qq-gateway-resource--resources)
+              (funcall stage-success '((resource_id . "res-record-source")))
               (should (qq-gateway-attachment-operation-active-p operation))
               (should (qq-gateway-attachment-cancel-operation operation))
               (should (equal canceled "derive-request"))
@@ -649,11 +469,11 @@
                 (lambda (_path _name _digest success _failure)
                   (funcall success '((resource_id . "res-image-a")))
                   "stage-request"))
-               ((symbol-function 'qq-gateway-attachment--await-resource)
+               ((symbol-function 'qq-gateway-resource-await-ready)
                 (lambda (_resource-id callback _errback)
                   (funcall callback
                            '((resource_id . "res-image-a") (phase . "ready")))
-                  #'ignore))
+                  (qq-gateway-watch-create :active-p nil)))
                ((symbol-function 'qq-gateway-attachment-prepare-image)
                 (lambda (_session _resource _summary _sub success _failure)
                   (let ((queued (qq-gateway-attachment-test-snapshot)))
@@ -702,8 +522,10 @@
           :active-p t :request-id "request-a"
           :resource-id "res-image-a"
           :attachment-id qq-gateway-attachment-test-id
-          :resource-wait-cancel #'ignore
-          :attachment-wait-cancel #'ignore))
+          :resource-watch
+          (qq-gateway-watch-create :active-p t :cancel-function #'ignore)
+          :attachment-watch
+          (qq-gateway-watch-create :active-p t :cancel-function #'ignore)))
         canceled released-resource released-attachment)
     (cl-letf (((symbol-function 'qq-gateway-transport-cancel)
                (lambda (request-id) (setq canceled request-id)))

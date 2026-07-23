@@ -6,7 +6,7 @@
 
 ;; JSON decoding and ownership helpers for the native Gateway boundary.
 ;; Wire arrays stay distinguishable from objects, and JSON null stays
-;; distinguishable from both until a domain validator accepts it.
+;; distinguishable from both until the RPC or event boundary domainizes it.
 
 ;;; Code:
 
@@ -19,10 +19,6 @@
 (defun qq-gateway-wire-null-p (value)
   "Return non-nil when VALUE is the Gateway JSON null sentinel."
   (eq value qq-gateway-wire-null))
-
-(defun qq-gateway-wire-nullable (value)
-  "Return nil for wire null VALUE, preserving every other value kind."
-  (if (qq-gateway-wire-null-p value) nil value))
 
 (defun qq-gateway-wire-object-p (value)
   "Return non-nil when VALUE has the shape of a decoded JSON object."
@@ -41,19 +37,6 @@
         (sort (copy-sequence keys)
               (lambda (left right)
                 (string-lessp (symbol-name left) (symbol-name right)))))))
-
-(defun qq-gateway-wire-closed-object-p (object required optional)
-  "Return non-nil when OBJECT has REQUIRED keys and only OPTIONAL extras."
-  (and (qq-gateway-wire-object-p object)
-       (let (seen)
-         (and (cl-every
-               (lambda (entry)
-                 (let ((key (car entry)))
-                   (and (memq key (append required optional))
-                        (not (memq key seen))
-                        (progn (push key seen) t))))
-               object)
-              (cl-every (lambda (key) (memq key seen)) required)))))
 
 (defun qq-gateway-wire--copy (value domain-p)
   "Recursively copy VALUE.
@@ -104,8 +87,7 @@ Vectors are the only raw representation produced by the Gateway decoder.
 When ALLOW-DOMAIN-LIST is non-nil, proper lists are also accepted for an
 explicitly internal, already-normalized registry boundary.  This opt-in is
 necessary because an empty decoded JSON object is also represented by nil and
-must never pass a raw array validator.  Nested wire values remain distinct for
-their owning schema validators."
+must never pass a raw array boundary."
   (cond
    ((vectorp value)
     (mapcar #'qq-gateway-value-copy (append value nil)))
