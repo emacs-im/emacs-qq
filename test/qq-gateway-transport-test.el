@@ -263,13 +263,13 @@
       (let* ((hello (qq-gateway-transport--json-decode wire))
              (id (alist-get 'id hello)))
         (should (equal (alist-get 'method hello) "gateway.hello"))
-        (should (= (alist-get 'protocol_version (alist-get 'params hello)) 2))
+        (should (= (alist-get 'protocol_version (alist-get 'params hello)) 3))
         (should
          (equal (alist-get 'auth_token (alist-get 'params hello))
                 "0123456789abcdef0123456789abcdef"))
         (qq-gateway-transport--handle-payload
          `((kind . "response") (id . ,id)
-           (result . ((protocol_version . 2)
+           (result . ((protocol_version . 3)
                       (gateway_instance_id . "gateway-42")
                       (capabilities . ["account.list" "account.start"])))))
         ;; A successful hello response alone is not a synchronized session.
@@ -308,7 +308,7 @@
          (copy-sequence "0123456789abcdef0123456789abcdef"))
         (funcall
          success-callback
-         '((protocol_version . 2)
+         '((protocol_version . 3)
            (gateway_instance_id . "gateway-42")
            (capabilities . ["account.list" "account.start"])))
         (should timer-started)
@@ -321,7 +321,7 @@
                 qq-gateway-transport--capabilities nil)
           (funcall
            success-callback
-           `((protocol_version . 2)
+           `((protocol_version . 3)
              (gateway_instance_id . "gateway-42")
              (capabilities . ["account.list"])
              ,extra))

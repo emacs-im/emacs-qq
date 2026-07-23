@@ -17,7 +17,7 @@
 (require 'qq-customize)
 (require 'qq-gateway-wire)
 
-(defconst qq-gateway-transport-protocol-version 2
+(defconst qq-gateway-transport-protocol-version 3
   "Native Gateway protocol version implemented by this client.")
 
 (defvar qq-gateway-transport-event-hook nil

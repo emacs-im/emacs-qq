@@ -10,7 +10,7 @@
   '("account.list" "account.create" "account.status" "account.set_presence"
     "account.start"
     "account.login.password" "account.login.captcha"
-    "account.login.new_device" "account.login.unusual_device"
+    "account.login.unusual_device"
     "account.stop" "account.logout" "account.remove"))
 
 (defun qq-gateway-test-account

@@ -59,6 +59,30 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
      (should (= 1 (plist-get metrics :important)))
      (should (= 1 (plist-get metrics :muted))))))
 
+(ert-deftest qq-root-projects-the-scannable-login-view ()
+  (let ((model '(:account-id "slot-a"
+                 :status "Waiting for mobile QQ confirmation…"
+                 :display "[QR]\n")))
+    (cl-letf (((symbol-function 'qq-login-view-model)
+               (lambda () model)))
+      (let* ((entries (qq-root--project-entries))
+             (login
+              (seq-find
+               (lambda (entry)
+                 (eq (qq-root--entry-type entry) 'login))
+               entries)))
+        (should login)
+        (should (equal (qq-root--entry-text login) model))
+        (with-temp-buffer
+          (qq-root--entry-printer login)
+          (should
+           (string-prefix-p
+            "Waiting for mobile QQ confirmation…\n[QR]\n"
+            (buffer-string)))
+          (should (string-match-p
+                   "Scan with mobile QQ"
+                   (buffer-string))))))))
+
 (ert-deftest qq-root-renders-muted-unread-in-title-trail ()
   (let* ((session '((key . "group:muted")
                     (type . group)

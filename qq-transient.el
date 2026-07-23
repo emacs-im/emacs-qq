@@ -453,6 +453,8 @@ Prefer this over inline button rows."
     ("s" "Search messages…" qq-root-search)
     ("u" "Next unread" qq-root-next-unread)]
    ["Connection"
+    ("l" "Login / continue" qq-login)
+    ("n" "Login new account" qq-login-new-account)
     ("c" "Connect" qq-connect)
     ("C" "Disconnect" qq-disconnect)
     ("p" "Presence…" qq-presence-transient
