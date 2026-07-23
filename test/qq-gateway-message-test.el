@@ -29,13 +29,8 @@
   `((kind . "text") (payload . ((text . ,text)))))
 
 (defun qq-gateway-message-test-wire-segment (segment)
-  "Return readable SEGMENT in strict decoded-wire array form."
-  (let ((copy (copy-tree segment)))
-    (when-let* ((payload (alist-get 'payload copy))
-                (entry (assq 'native_keys payload))
-                ((listp (cdr entry))))
-      (setcdr entry (vconcat (cdr entry))))
-    copy))
+  "Return an owned domain copy of readable SEGMENT."
+  (copy-tree segment))
 
 (defun qq-gateway-message-test-ready-image (&optional attachment-id)
   "Return one ready group-image attachment fixture."
@@ -95,8 +90,8 @@
         (message_type . ,message-type)
         (sub_type . ,sub-type)
         (segments
-         . ,(vconcat (mapcar #'qq-gateway-message-test-wire-segment
-                             (append segments nil))))))))
+         . ,(mapcar #'qq-gateway-message-test-wire-segment
+                    (append segments nil)))))))
 
 (cl-defun qq-gateway-message-test-recall
     (&key
@@ -231,126 +226,54 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
            ,@body)
        (qq-state-reset))))
 
-(ert-deftest qq-gateway-message-validator-keeps-exact-string-identities ()
-  (let* ((raw (qq-gateway-message-test-event))
-         (validated (qq-gateway-message--validate-message-data raw))
-         (message (alist-get 'message validated)))
-    (should (equal (alist-get 'message_id message)
-                   "7348923749823749823"))
-    (should (equal (alist-get 'sequence message)
-                   "9007199254740999"))
-    (should (stringp (alist-get 'client_sequence message)))
-    (let ((maximum (copy-tree raw)))
-      (setf (alist-get 'message_id (alist-get 'message maximum))
-            "18446744073709551615")
-      (should (qq-gateway-message--validate-message-data maximum)))
-    (dolist (invalid-id
-             '(7348923749823749823 "0" "07348923749823749823"
-               "18446744073709551616"))
-      (let ((invalid (copy-tree raw)))
-        (setf (alist-get 'message_id (alist-get 'message invalid)) invalid-id)
-        (should-error
-         (qq-gateway-message--validate-message-data invalid))))))
-
-(ert-deftest qq-gateway-message-nested-message-references-use-exact-uint64 ()
-  (let ((reply
-         '((kind . "reply")
-           (payload
-            . ((target
-                . ((kind . "unresolved")
-                   (message_id . "18446744073709551615")))))))
-        (recall
-         '((kind . "message")
-           (message_id . "18446744073709551615")
-           (sequence . "0"))))
-    (should (qq-gateway-message--validate-segment reply))
-    (should (qq-gateway-message--validate-recall-target recall))
-    (dolist (message-id '("0" "01" "18446744073709551616"))
-      (let ((invalid-reply (copy-tree reply))
-            (invalid-recall (copy-tree recall)))
-        (setf (alist-get
-               'message_id
-               (alist-get 'target (alist-get 'payload invalid-reply)))
-              message-id)
-        (setf (alist-get 'message_id invalid-recall) message-id)
-        (should-error
-         (qq-gateway-message--validate-segment invalid-reply))
-        (should-error
-         (qq-gateway-message--validate-recall-target invalid-recall))))))
-
-(ert-deftest qq-gateway-message-conversation-params-require-uint64-uin ()
+(ert-deftest qq-gateway-message-conversation-params-use-session-identity ()
   (should
    (equal
     (qq-gateway-message--conversation-params
      "private:18446744073709551615")
     '((kind . "private") (peer_uin . "18446744073709551615"))))
-  (dolist (session-key
-           '("private:0" "private:010001" "group:18446744073709551616"))
-    (should-error
-     (qq-gateway-message--conversation-params session-key)
-     :type 'user-error)))
+  (should
+   (equal
+    (qq-gateway-message--conversation-params "group:8209413637")
+    '((kind . "group") (group_uin . "8209413637")))))
 
-(ert-deftest qq-gateway-message-wire-arrays-normalize-at-their-schema-level ()
-  (let* ((event
-         (qq-gateway-message-test-event
-           :segments nil))
-         (message (alist-get 'message event)))
-    ;; Build the vector separately to keep the fixture readable.
-    (setf (alist-get 'segments message)
-          [((kind . "unsupported")
-            (payload . ((native_keys . ["ark" "xml"])
-                        (summary . "unsupported"))))])
-    (let* ((validated
-            (qq-gateway-message--validate-message-data event))
-           (validated-message (alist-get 'message validated))
-           (validated-payload
-            (alist-get 'payload
-                       (car (alist-get 'segments validated-message)))))
-      (should (listp (alist-get 'segments validated-message)))
-      (should (equal (alist-get 'native_keys validated-payload)
-                     '("ark" "xml"))))
-    (setf (alist-get 'native_keys
-                     (alist-get 'payload
-                                (aref (alist-get 'segments message) 0)))
-          qq-gateway-wire-null)
-    (should-error (qq-gateway-message--validate-message-data event)
-                  :type 'error)
-    (setf (alist-get 'segments message) qq-gateway-wire-null)
-    (should-error (qq-gateway-message--validate-message-data event)
-                  :type 'error)))
-
-(ert-deftest qq-gateway-message-validator-owns-nested-strings ()
-  (let* ((text (copy-sequence "mutable"))
-         (event
-          (qq-gateway-message-test-event
-           :segments (list (qq-gateway-message-test-text-segment text))))
-         (validated (qq-gateway-message--validate-message-data event))
-         (validated-text
-          (alist-get
-           'text
-           (alist-get
-            'payload
-            (car (alist-get 'segments (alist-get 'message validated)))))))
-    (aset validated-text 0 ?X)
-    (should (equal text "mutable"))))
-
-(ert-deftest qq-gateway-message-history-requires-wire-array-not-null ()
-  (let* ((message
-          (alist-get 'message (qq-gateway-message-test-event
-                               :sequence "100")))
-         (result (qq-gateway-message-test-history-result nil "100" "100")))
-    (setf (alist-get 'messages result) (vector message))
-    (should
-     (listp
-      (alist-get
-       'messages
-       (qq-gateway-message--validate-history-result
-        result "slot-a" "100" "100"))))
-    (setf (alist-get 'messages result) qq-gateway-wire-null)
-    (should-error
-     (qq-gateway-message--validate-history-result
-      result "slot-a" "100" "100")
-     :type 'error)))
+(ert-deftest qq-gateway-message-event-boundary-domainizes-and-owns-wire-data ()
+  (qq-gateway-message-test-with-state
+    (let* ((source-text (copy-sequence "mutable"))
+           (event
+            (qq-gateway-message-test-event
+             :segments
+             (list
+              (qq-gateway-message-test-text-segment source-text)
+              '((kind . "unsupported")
+                (payload . ((native_keys . ("ark" "xml"))
+                            (summary . "unsupported")))))))
+           observed)
+      (let* ((message (alist-get 'message event))
+             (segments (alist-get 'segments message)))
+        (setf (alist-get 'native_keys
+                         (alist-get 'payload (cadr segments)))
+              ["ark" "xml"]
+              (alist-get 'segments message)
+              (vconcat segments)))
+      (let ((qq-gateway-message-event-hook
+             (list (lambda (_event data) (setq observed data)))))
+        (qq-gateway-dispatch--handle-transport-event
+         "message.received" event))
+      (let* ((message (alist-get 'message observed))
+             (segments (alist-get 'segments message))
+             (text (alist-get 'text (alist-get 'payload (car segments))))
+             (native-keys
+              (alist-get 'native_keys
+                         (alist-get 'payload (cadr segments)))))
+        (should (listp segments))
+        (should (listp native-keys))
+        (should (equal (alist-get 'message_id message)
+                       "7348923749823749823"))
+        (should (equal text source-text))
+        (should-not (eq text source-text))
+        (aset text 0 ?X)
+        (should (equal source-text "mutable"))))))
 
 (ert-deftest qq-gateway-message-mark-read-sends-exact-message-references ()
   (qq-gateway-message-test-with-state
@@ -402,29 +325,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                  (message_id . "7348923749823749823"))
                 ((account_id . "slot-a")
                  (message_id . "7348923749823749824"))))))))
-
-(ert-deftest qq-gateway-message-mark-read-ack-is-reference-only ()
-  (let ((receipt
-         '((account_id . "slot-a")
-           (message_id . "7348923749823749823"))))
-    (should
-     (equal
-      (qq-gateway-message--validate-read-receipt
-       receipt "slot-a" "7348923749823749823")
-      receipt))
-    (dolist
-        (invalid
-         '(((account_id . "slot-a")
-            (message_id . "7348923749823749823")
-            (server_read_sequence . "9007199254740999"))
-           ((account_id . "slot-a")
-            (read_through_message_id . "7348923749823749823"))
-           ((account_id . "slot-a")
-            (message_id . "7348923749823749824"))))
-      (should-error
-       (qq-gateway-message--validate-read-receipt
-        invalid "slot-a" "7348923749823749823")
-       :type 'error))))
 
 (ert-deftest qq-gateway-message-projects-group-segments-and-metadata ()
   (qq-gateway-message-test-with-state
@@ -486,32 +386,13 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (should (equal (alist-get 'title (qq-state-session session-key))
                        "Protocol Lab"))))))
 
-(ert-deftest qq-gateway-message-record-duration-is-closed-uint32 ()
-  (let ((record '((kind . "record")
-                  (payload . ((duration_seconds . 17))))))
-    (should (qq-gateway-message--validate-segment record))
-    (dolist (duration '(-1 4294967296 "17"))
-      (let ((malformed (copy-tree record)))
-        (setf (alist-get 'duration_seconds (alist-get 'payload malformed))
-              duration)
-        (should-error (qq-gateway-message--validate-segment malformed))))
-    (push '(file_uuid . "must-stay-native") (alist-get 'payload record))
-    (should-error (qq-gateway-message--validate-segment record))))
-
-(ert-deftest qq-gateway-message-record-retains-only-opaque-media-handle ()
+(ert-deftest qq-gateway-message-record-projects-opaque-media-handle ()
   (let* ((media-id "media-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
          (record `((kind . "record")
                    (payload . ((duration_seconds . 17)
                                (media_id . ,media-id)))))
-         (validated (qq-gateway-message--validate-segment record))
-         (internal (qq-gateway-message--segment-to-internal validated)))
-    (should (equal (alist-get 'media_id (alist-get 'data internal)) media-id))
-    (dolist (malformed '("media-short" 7 nil))
-      (let ((copy (copy-tree record)))
-        (setf (alist-get 'media_id (alist-get 'payload copy)) malformed)
-        (should-error (qq-gateway-message--validate-segment copy))))
-    (push '(file_uuid . "must-stay-native") (alist-get 'payload record))
-    (should-error (qq-gateway-message--validate-segment record))))
+         (internal (qq-gateway-message--segment-to-internal record)))
+    (should (equal (alist-get 'media_id (alist-get 'data internal)) media-id))))
 
 (ert-deftest qq-gateway-message-projects-private-peer-by-self-endpoint ()
   (qq-gateway-message-test-with-state
@@ -576,11 +457,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
       (should (qq-state-message-recalled-p message))
       (should (= (hash-table-count qq-gateway-message--pending-recalls) 0)))))
 
-(ert-deftest qq-gateway-message-reaction-validator-rejects-numeric-identity ()
-  (let ((event (qq-gateway-message-test-reaction)))
-    (setf (alist-get 'emoji_id (alist-get 'reaction event)) 178)
-    (should-error (qq-gateway-message--validate-reaction-data event))))
-
 (ert-deftest qq-gateway-message-reaction-applies-authoritative-count ()
   (qq-gateway-message-test-with-state
     (qq-gateway-message--handle-event
@@ -621,18 +497,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
       (should (= (hash-table-count
                   qq-gateway-message--pending-reactions)
                  0)))))
-
-(ert-deftest qq-gateway-message-essence-validator-rejects-lossy-or-invented-id ()
-  (let* ((numeric (qq-gateway-message-test-essence))
-         (essence (alist-get 'essence numeric)))
-    (setf (alist-get 'sequence essence) 9007199254740999)
-    (should-error (qq-gateway-message--validate-essence-data numeric)))
-  (let* ((invented (qq-gateway-message-test-essence))
-         (essence (alist-get 'essence invented)))
-    (setf (alist-get 'essence invented)
-          (append essence
-                  '((message_id . "7348923749823749823"))))
-    (should-error (qq-gateway-message--validate-essence-data invented))))
 
 (ert-deftest qq-gateway-message-essence-applies-authoritative-metadata ()
   (qq-gateway-message-test-with-state
@@ -875,25 +739,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         "slot-a")
        :type 'user-error))))
 
-(ert-deftest qq-gateway-message-send-rejects-non-base-face-before-pending ()
-  (qq-gateway-message-test-with-state
-    (let ((sent nil))
-      (cl-letf (((symbol-function 'qq-gateway-transport-send)
-                 (lambda (&rest _arguments) (setq sent t))))
-        (should-error
-         (qq-gateway-message-send
-          "private:10001"
-          '(((type . "face") (data . ((id . "260"))))))
-         :type 'user-error)
-        (should-not sent)
-        (should-not (qq-state-session-messages "private:10001"))))))
-
-(ert-deftest qq-gateway-message-validator-rejects-non-base-face ()
-  (let ((event
-         (qq-gateway-message-test-event
-          :segments '(((kind . "face") (payload . ((id . "260"))))))))
-    (should-error (qq-gateway-message--validate-message-data event))))
-
 (ert-deftest qq-gateway-message-send-allows-unloaded-reply-reference ()
   (qq-gateway-message-test-with-state
     (let (sent-method sent-params)
@@ -965,22 +810,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (should-not sent)
         (should-not (qq-state-session-messages "private:10001"))))))
 
-(ert-deftest qq-gateway-message-send-rejects-out-of-range-session-before-pending ()
-  (qq-gateway-message-test-with-state
-    (let ((sent nil))
-      (cl-letf (((symbol-function 'qq-gateway-transport-send)
-                 (lambda (&rest _arguments) (setq sent t))))
-        (dolist (session-key
-                 '("private:0" "private:010001"
-                   "group:18446744073709551616"))
-          (should-error
-           (qq-gateway-message-send
-            session-key
-            '(((type . "text") (data . ((text . "hello"))))))
-           :type 'user-error)
-          (should-not (qq-state-session-messages session-key)))
-        (should-not sent)))))
-
 (ert-deftest qq-gateway-message-send-requires-non-reply-content ()
   (qq-gateway-message-test-with-state
     (let ((sent nil))
@@ -1012,15 +841,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
       (should (= (length (plist-get outbound :segments)) 128))
       (should
        (equal
-         (plist-get outbound :reply-to)
-         '((message_id . "18446744073709551615"))))
-      (should-error
-       (qq-gateway-message--prepare-outbound
-        "private:10001"
-        (append contents
-                '(((type . "text") (data . ((text . "overflow"))))))
-        "slot-a")
-       :type 'user-error))))
+        (plist-get outbound :reply-to)
+        '((message_id . "18446744073709551615")))))))
 
 (ert-deftest qq-gateway-message-poke-uses-exact-uin-and-local-gray-tip ()
   (qq-gateway-message-test-with-state
@@ -1098,12 +920,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (should (equal (alist-get 'image-url
                                   (qq-state-poke-message-data message))
                        "https://example.invalid/poke.png"))))))
-
-(ert-deftest qq-gateway-message-poke-event-rejects-numeric-identity ()
-  (let ((event (qq-gateway-message-test-poke)))
-    (setf (alist-get 'actor_uin (alist-get 'poke event))
-          9007199254740999)
-    (should-error (qq-gateway-message--validate-poke-data event))))
 
 (ert-deftest qq-gateway-message-reaction-sends-only-the-message-reference ()
   (qq-gateway-message-test-with-state
@@ -1318,31 +1134,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
        (equal (mapcar (lambda (receipt) (alist-get 'operation receipt))
                       (nreverse receipts))
               '("set" "complete" "cancel"))))))
-
-(ert-deftest qq-gateway-message-todo-receipt-is-closed-and-account-owned ()
-  (let ((receipt
-         '((account_id . "slot-a")
-           (group_uin . "8209413637")
-           (message_id . "7348923749823749823")
-           (sequence . "9007199254740999")
-           (operation . "set"))))
-    (should
-     (equal
-      (qq-gateway-message--validate-todo-receipt
-       receipt "slot-a" "8209413637"
-       "7348923749823749823" "set")
-      receipt))
-    (let ((stale (copy-tree receipt)))
-      (setf (alist-get 'account_id stale) "slot-b")
-      (should-error
-       (qq-gateway-message--validate-todo-receipt
-        stale "slot-a" "8209413637"
-        "7348923749823749823" "set")))
-    (let ((open (append (copy-tree receipt) '((done . t)))))
-      (should-error
-       (qq-gateway-message--validate-todo-receipt
-        open "slot-a" "8209413637"
-        "7348923749823749823" "set")))))
 
 (ert-deftest qq-gateway-message-recall-poke-sends-original-gray-tip-metadata ()
   (qq-gateway-message-test-with-state
@@ -1922,19 +1713,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (should (equal (alist-get 'server-id message)
                          "7348923749823749823"))
           (should (= (hash-table-count qq-gateway-message--pending-sends) 0)))))))
-
-(ert-deftest qq-gateway-message-malformed-event-is-protocol-violation ()
-  (qq-gateway-message-test-with-state
-    (let ((bad (qq-gateway-message-test-event)) violation)
-      (setf (alist-get 'message_id (alist-get 'message bad)) 42)
-      (cl-letf (((symbol-function
-                  'qq-gateway-transport--protocol-violation)
-                 (lambda (format-string &rest arguments)
-                   (setq violation
-                         (apply #'format format-string arguments)))))
-        (qq-gateway-dispatch--handle-transport-event "message.received" bad)
-        (should (string-match-p "Malformed message.received event" violation))
-        (should-not (qq-state-sessions))))))
 
 (ert-deftest qq-gateway-message-selection-change-revokes-old-state ()
   (qq-gateway-message-test-with-state

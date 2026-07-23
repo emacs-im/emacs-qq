@@ -10,18 +10,19 @@
   "Return one valid private native service message event."
   '((account_id . "slot-a")
     (message
-     . ((message_id . "7348923749823749823")
-        (sent_at . 1784700000)
-        (sender . ((uin . "10001") (uid . "u_peer")))
-        (recipient . ((uin . "10002") (uid . "u_self")))
-        (conversation . ((kind . "private") (name . "Peer")))
-        (sequence . "9007199254740999")
-        (client_sequence . "9007199254741001")
-        (random . 7)
-        (message_type . 166)
-        (sub_type . 0)
-        (segments . [((kind . "text")
-                      (payload . ((text . "hello"))))])))))
+     (message_id . "7348923749823749823")
+     (sent_at . 1784700000)
+     (sender . ((uin . "10001") (uid . "u_peer")))
+     (recipient . ((uin . "10002") (uid . "u_self")))
+     (conversation . ((kind . "private") (name . "Peer")))
+     (sequence . "9007199254740999")
+     (client_sequence . "9007199254741001")
+     (random . 7)
+     (message_type . 166)
+     (sub_type . 0)
+     (segments
+      ((kind . "text")
+       (payload . ((text . "hello"))))))))
 
 (defun qq-native-test-account ()
   "Return one selected online QQ account."
@@ -139,7 +140,7 @@
 
 (ert-deftest qq-native-recent-projects-uid-only-private-and-skips-temporary ()
   (let* ((raw-message (alist-get 'message (qq-native-test-message-event)))
-         (message (qq-gateway-message--validate-message raw-message))
+         (message (qq-gateway-wire-domain-copy raw-message))
          (temporary-message (copy-tree message))
          (page
          `((account_id . "slot-a")
@@ -186,7 +187,7 @@
 
 (ert-deftest qq-gateway-message-pure-normalizer-does-not-consume-projection-state ()
   (let* ((raw-message (alist-get 'message (qq-native-test-message-event)))
-         (message (qq-gateway-message--validate-message raw-message))
+         (message (qq-gateway-wire-domain-copy raw-message))
          (qq-state--message-order-counter 41)
          (qq-gateway-message--pending-sends (make-hash-table :test #'equal))
          (qq-gateway-message--pending-recalls (make-hash-table :test #'equal))
@@ -226,7 +227,8 @@
         (should-not delivered)))))
 
 (ert-deftest qq-native-recent-request-owns-the-only-lifecycle ()
-  (let (cancelled)
+  (let ((qq-native--recent-request nil)
+        cancelled)
     (cl-letf (((symbol-function 'qq-gateway-current-account-id)
                (lambda () "slot-a"))
               ((symbol-function 'qq-state-session-summary-observation-start)
@@ -238,14 +240,14 @@
       (let ((request (qq-native-refresh-recent-conversations)))
         (should (qq-native-request-active-p request))
         (should (equal (qq-native-request-token request) "recent-request"))
-        (should (eq (qq-native-request-replace-key request)
-                    'recent-conversations))
+        (should (eq request qq-native--recent-request))
         (should (qq-native-cancel-request request))
         (should (equal cancelled "recent-request"))
         (should (eq (qq-native-request-state request) 'cancelled))))))
 
 (ert-deftest qq-native-recent-replacement-revokes-old-projector ()
   (let ((qq-native-request--active (make-hash-table :test #'eq))
+        (qq-native--recent-request nil)
         callbacks cancelled projected delivered (request-count 0))
     (cl-letf (((symbol-function 'qq-gateway-current-account-id)
                (lambda () "slot-a"))
@@ -275,307 +277,39 @@
       (funcall (cadr (car callbacks)) 'new-page)
       (should (equal projected
                      '((new-page (observation 2)))))
-      (should (equal delivered '(new-page))))
+      (should (equal delivered '(new-page)))
+      (should-not qq-native--recent-request))
     (should (= (hash-table-count qq-native-request--active) 0))))
 
-(ert-deftest qq-native-request-handles-synchronous-completion-once ()
+(ert-deftest qq-native-request-starter-nonlocal-exit-revokes-ownership ()
   (let ((qq-native-request--active (make-hash-table :test #'eq))
-        values)
-    (let ((request
-           (qq-native-request-start
-            (lambda (success _failure)
-              (funcall success 'done)
-              "already-completed")
-            :callback (lambda (value) (push value values)))))
-      (should (equal values '(done)))
-      (should (eq (qq-native-request-state request) 'settled))
-      (should-not (qq-native-request-token request))
-      (should-not (qq-native-cancel-request request))
-      (should (= (hash-table-count qq-native-request--active) 0)))))
-
-(ert-deftest qq-native-request-replace-key-supersedes-predecessor-once ()
-  (let ((qq-native-request--active (make-hash-table :test #'eq))
-        cancelled errors first-success second-success projected delivered)
-    (cl-letf (((symbol-function 'qq-gateway-transport-cancel)
-               (lambda (token) (push token cancelled) t)))
-      (let ((first
-             (qq-native-request-start
-              (lambda (success _failure)
-                (setq first-success success)
-                "first-token")
-              :owner nil
-              :replace-key 'recent-conversations
-              :projector (lambda (value) (push value projected) value)
-              :callback (lambda (value) (push value delivered))
-              :errback (lambda (body _reason) (push body errors)))))
-        (let ((second
-               (qq-native-request-start
-                (lambda (success _failure)
-                  (setq second-success success)
-                  "second-token")
-                :owner nil
-                :replace-key 'recent-conversations
-                :projector (lambda (value) (push value projected) value)
-                :callback (lambda (value) (push value delivered))
-                :errback (lambda (body _reason) (push body errors)))))
-          (should (eq (qq-native-request-state first) 'cancelled))
-          (should (qq-native-request-active-p second))
-          (should (equal cancelled '("first-token")))
-          (should (= (length errors) 1))
-          (should (equal (alist-get 'code (car errors))
-                         "superseded_request"))
-          ;; A racy adapter callback may still arrive after local cancellation;
-          ;; revoked ownership keeps both projection and leaf delivery inert.
-          (funcall first-success 'stale)
-          (should-not projected)
-          (should-not delivered)
-          (funcall second-success 'fresh)
-          (should (equal projected '(fresh)))
-          (should (equal delivered '(fresh)))
-          (should (eq (qq-native-request-state second) 'settled)))))
-    (should (= (hash-table-count qq-native-request--active) 0))))
-
-(ert-deftest qq-native-request-projector-failure-is-owned-and-cancels-orphan ()
-  (let ((qq-native-request--active (make-hash-table :test #'eq))
-        cancelled delivered failure)
-    (let ((request
-           (qq-native-request-start
-            (lambda (success _failure)
-              (funcall success 'raw)
-              "projector-orphan")
-            :owner nil
-            :projector (lambda (_value) (error "projection exploded"))
-            :callback (lambda (value) (setq delivered value))
-            :errback (lambda (body _reason) (setq failure body))
-            :cancel-function (lambda (token) (setq cancelled token)))))
-      (should (eq (qq-native-request-state request) 'failed))
-      (should-not delivered)
-      (should (equal (alist-get 'code failure) "invalid_gateway_result"))
-      (should (equal cancelled "projector-orphan"))
-      (should (= (hash-table-count qq-native-request--active) 0)))))
-
-(ert-deftest qq-native-request-projector-is-an-irrevocable-completion-commit ()
-  (let ((qq-native-request--active (make-hash-table :test #'eq))
-        success replacement delivered errors cancelled)
-    (cl-letf (((symbol-function 'qq-gateway-current-account-id)
-               (lambda () "slot-a"))
-              ((symbol-function 'qq-gateway-transport-cancel)
-               (lambda (token) (push token cancelled) t)))
-      (let ((request
-             (qq-native-request-start
-              (lambda (callback _failure)
-                (setq success callback)
-                "completed-token")
-              :owner "slot-a"
-              :replace-key 'recent-conversations
-              :projector
-              (lambda (value)
-                (setq replacement
-                      (qq-native-request-start
-                       (lambda (_next-success _next-failure)
-                         "replacement-token")
-                       :owner "slot-a"
-                       :replace-key 'recent-conversations
-                       :errback #'ignore))
-                value)
-              :callback (lambda (value) (setq delivered value))
-              :errback (lambda (body _reason) (push body errors)))))
-        (funcall success 'committed)
-        (should (eq (qq-native-request-state request) 'settled))
-        (should (eq delivered 'committed))
-        (should-not errors)
-        (should-not cancelled)
-        (should (qq-native-request-active-p replacement))
-        (qq-native-cancel-request replacement)
-        (should (equal cancelled '("replacement-token")))))
-    (should (= (hash-table-count qq-native-request--active) 0))))
-
-(ert-deftest qq-native-request-projector-rechecks-owner-before-leaf-delivery ()
-  (let ((qq-native-request--active (make-hash-table :test #'eq))
-        (account-id "slot-a") success delivered)
-    (cl-letf (((symbol-function 'qq-gateway-current-account-id)
-               (lambda () account-id)))
-      (let ((request
-             (qq-native-request-start
-              (lambda (callback _failure)
-                (setq success callback)
-                "switch-token")
-              :owner "slot-a"
-              :projector
-              (lambda (value)
-                (setq account-id "slot-b")
-                value)
-              :callback (lambda (value) (setq delivered value)))))
-        (funcall success 'projected)
-        (should-not delivered)
-        (should (eq (qq-native-request-state request) 'cancelled))))
-    (should (= (hash-table-count qq-native-request--active) 0))))
-
-(ert-deftest qq-native-request-replace-key-publishes-before-reentrant-errback ()
-  (let ((qq-native-request--active (make-hash-table :test #'eq))
-        cancelled third second-errors (second-started 0))
-    (cl-letf (((symbol-function 'qq-gateway-transport-cancel)
-               (lambda (token) (push token cancelled) t)))
-      (qq-native-request-start
-       (lambda (_success _failure) "first-token")
-       :owner nil
-       :replace-key 'recent-conversations
-       :errback
-       (lambda (_body _reason)
-         (setq third
-               (qq-native-request-start
-                (lambda (_success _failure) "third-token")
-                :owner nil
-                :replace-key 'recent-conversations
-                :errback #'ignore))))
-      (let ((second
-             (qq-native-request-start
-              (lambda (_success _failure)
-                (cl-incf second-started)
-                "second-token")
-              :owner nil
-              :replace-key 'recent-conversations
-              :errback
-              (lambda (body _reason) (push body second-errors)))))
-        (should (eq (qq-native-request-state second) 'cancelled))
-        (should (= second-started 0))
-        (should (= (length second-errors) 1))
-        (should (equal (alist-get 'code (car second-errors))
-                       "superseded_request")))
-      (should (qq-native-request-active-p third))
-      (should (equal (qq-native-request-token third) "third-token"))
-      (should (equal cancelled '("first-token")))
-      (qq-native-cancel-request third)
-      (should (equal cancelled '("third-token" "first-token"))))
-    (should (= (hash-table-count qq-native-request--active) 0))))
-
-(ert-deftest qq-native-request-replace-key-cancels-token-returned-after-reentry ()
-  (let ((qq-native-request--active (make-hash-table :test #'eq))
-        cancelled replacement errors)
-    (cl-letf (((symbol-function 'qq-gateway-transport-cancel)
-               (lambda (token) (push token cancelled) t)))
-      (let ((first
-             (qq-native-request-start
-              (lambda (_success _failure)
-                (setq replacement
-                      (qq-native-request-start
-                       (lambda (_next-success _next-failure)
-                         "replacement-token")
-                       :owner nil
-                       :replace-key 'recent-conversations
-                       :errback #'ignore))
-                "orphan-token")
-              :owner nil
-              :replace-key 'recent-conversations
-              :errback (lambda (body _reason) (push body errors)))))
-        (should (eq (qq-native-request-state first) 'cancelled))
-        (should (qq-native-request-active-p replacement))
-        (should (equal cancelled '("orphan-token")))
-        (should (= (length errors) 1))
-        (should (equal (alist-get 'code (car errors))
-                       "superseded_request"))
-        (qq-native-cancel-request replacement)
-        (should (equal cancelled
-                       '("replacement-token" "orphan-token")))))
-    (should (= (hash-table-count qq-native-request--active) 0))))
-
-(ert-deftest qq-native-request-replace-key-is-scoped-by-account ()
-  (let ((qq-native-request--active (make-hash-table :test #'eq))
-        cancelled)
-    (cl-letf (((symbol-function 'qq-gateway-transport-cancel)
-               (lambda (token) (push token cancelled) t)))
-      (let ((first
-             (qq-native-request-start
-              (lambda (_success _failure) "slot-a-token")
-              :owner "slot-a" :replace-key 'recent-conversations))
-            (second
-             (qq-native-request-start
-              (lambda (_success _failure) "slot-b-token")
-              :owner "slot-b" :replace-key 'recent-conversations)))
-        (should (qq-native-request-active-p first))
-        (should (qq-native-request-active-p second))
-        (should-not cancelled)
-        (qq-native-cancel-request first)
-        (qq-native-cancel-request second)))
-    (should (equal (sort cancelled #'string<)
-                   '("slot-a-token" "slot-b-token")))
-    (should (= (hash-table-count qq-native-request--active) 0))))
-
-(ert-deftest qq-native-request-cancels-token-returned-after-reentrant-revocation ()
-  (let ((qq-native-request--active (make-hash-table :test #'eq))
-        cancelled)
-    (let ((request (qq-native-request-create "slot-a")))
-      (should
-       (eq
+        caught)
+    (condition-case error-data
         (qq-native-request-start
-         (lambda (_success _failure)
-           (qq-native-cancel-request request)
-           "late-token")
-         :owner "slot-a" :request request
-         :cancel-function (lambda (token) (setq cancelled token)))
-        request))
-      (should (equal cancelled "late-token"))
-      (should (eq (qq-native-request-state request) 'cancelled))
-      (should (= (hash-table-count qq-native-request--active) 0)))))
-
-(ert-deftest qq-native-request-starter-quit-revokes-registered-ownership ()
-  (let ((qq-native-request--active (make-hash-table :test #'eq))
-        cleaned cleanup-inhibited-p caught)
-    (let ((request
-           (qq-native-request-create
-            "slot-a"
-            (lambda ()
-              (setq cleanup-inhibited-p inhibit-quit
-                    cleaned t)))))
-      (condition-case error-data
-          (qq-native-request-start
-           (lambda (_success _failure)
-             (signal 'quit nil))
-           :request request)
-        (quit (setq caught error-data)))
-      (should (equal caught '(quit)))
-      (should cleaned)
-      (should cleanup-inhibited-p)
-      (should (eq (qq-native-request-state request) 'cancelled))
-      (should (= (hash-table-count qq-native-request--active) 0)))))
-
-(ert-deftest qq-native-request-starter-handoff-inhibits-quit ()
-  (let ((qq-native-request--active (make-hash-table :test #'eq))
-        (request (qq-native-request-create "slot-a"))
-        cancelled starter-inhibited-p)
-    (should
-     (eq
-      (qq-native-request-start
-       (lambda (_success _failure)
-         (setq starter-inhibited-p inhibit-quit)
-         "handoff-token")
-       :request request
-       :cancel-function (lambda (token) (setq cancelled token)))
-      request))
-    (should starter-inhibited-p)
-    (should (qq-native-request-active-p request))
-    (qq-native-cancel-request request)
-    (should (equal cancelled "handoff-token"))
-    (should (eq (qq-native-request-state request) 'cancelled))
+         (lambda (_success _failure) (signal 'quit nil))
+         :owner nil)
+      (quit (setq caught error-data)))
+    (should (equal caught '(quit)))
     (should (= (hash-table-count qq-native-request--active) 0))))
 
-(ert-deftest qq-native-request-revoke-all-isolates-quit-through-sweep ()
+(ert-deftest qq-native-request-revoke-all-cancels-active-requests ()
   (let ((qq-native-request--active (make-hash-table :test #'eq))
-        cleaned cleanup-inhibited)
+        cleaned requests)
     (dolist (name '(first second))
       (let ((identity name))
-        (qq-native-request-create
-         nil
-         (lambda ()
-           (push identity cleaned)
-           (push inhibit-quit cleanup-inhibited)
-           (signal 'quit nil)))))
+        (push
+         (qq-native-request-create
+          nil (lambda () (push identity cleaned)))
+         requests)))
     (qq-native-request-revoke-all)
     (should (equal (sort cleaned
                          (lambda (left right)
                            (string< (symbol-name left) (symbol-name right))))
                    '(first second)))
-    (should (equal cleanup-inhibited '(t t)))
+    (should (cl-every
+             (lambda (request)
+               (eq (qq-native-request-state request) 'cancelled))
+             requests))
     (should (= (hash-table-count qq-native-request--active) 0))))
 
 (ert-deftest qq-native-request-slot-scope-survives-restart-but-not-selection ()
@@ -1111,7 +845,7 @@
         (path-c (make-temp-file "qq-native-image-quit-" nil ".png" "ccc"))
         (qq-native-request--active (make-hash-table :test #'eq))
         (real-create (symbol-function 'qq-native-request-create))
-        request operations late-ready caught sent failure cleanup-quit-p
+        request operations late-ready caught sent failure
         released-resources released-attachments)
     (unwind-protect
         (cl-letf
@@ -1147,12 +881,7 @@
               (lambda (resource-id) (push resource-id released-resources)))
              ((symbol-function 'qq-native--release-send-attachment)
               (lambda (attachment-id)
-                (push attachment-id released-attachments)
-                ;; The first cleanup item must not prevent the remaining
-                ;; attachment sweep or later resource/late-result cleanup.
-                (unless cleanup-quit-p
-                  (setq cleanup-quit-p t)
-                  (signal 'quit nil))))
+                (push attachment-id released-attachments)))
              ((symbol-function 'qq-gateway-message-send)
               (lambda (&rest _arguments) (setq sent t))))
           (condition-case error-data
@@ -1175,8 +904,7 @@
              (qq-gateway-attachment-operation-active-p operation)))
           (should-not sent)
           (should-not failure)
-          ;; A completion from the starter that was interrupted is inert and
-          ;; releases its orphan instead of dispatching message.send.
+          ;; A late completion is inert and releases the objects it produced.
           (funcall
            late-ready
            (qq-native-test-prepared-image
@@ -1195,99 +923,6 @@
       (delete-file path-a)
       (delete-file path-b)
       (delete-file path-c))))
-
-(ert-deftest qq-native-local-media-operation-handoff-inhibits-quit ()
-  (let ((path (make-temp-file "qq-native-image-pending-" nil ".png" "abc"))
-        (qq-native-request--active (make-hash-table :test #'eq))
-        (real-create (symbol-function 'qq-native-request-create))
-        request operation starter-inhibited-p sent)
-    (unwind-protect
-        (cl-letf
-            (((symbol-function 'qq-gateway-current-account-id)
-              (lambda () "slot-a"))
-             ((symbol-function 'qq-native-request-create)
-              (lambda (&optional owner cancel-function)
-                (setq request
-                      (funcall real-create owner cancel-function))))
-             ((symbol-function
-               'qq-gateway-attachment-stage-and-prepare-image)
-              (lambda (&rest _arguments)
-                (setq operation
-                      (qq-gateway-attachment-operation-create :active-p t)
-                      starter-inhibited-p inhibit-quit)
-                operation))
-             ((symbol-function 'qq-gateway-message-send)
-              (lambda (&rest _arguments) (setq sent t))))
-          (should
-           (eq
-            (qq-native-send-message
-             "private:10001"
-             `(((type . "image") (data . ((file . ,path))))))
-            request))
-          (should starter-inhibited-p)
-          (should (qq-native-request-active-p request))
-          (qq-native-cancel-request request)
-          (should-not (qq-gateway-attachment-operation-active-p operation))
-          (should-not sent)
-          (should (= (hash-table-count qq-native-request--active) 0)))
-      (delete-file path))))
-
-(ert-deftest qq-native-local-media-send-handoff-inhibits-quit ()
-  (let ((path (make-temp-file "qq-native-image-send-" nil ".png" "abc"))
-        (qq-native-request--active (make-hash-table :test #'eq))
-        (real-create (symbol-function 'qq-native-request-create))
-        request cancelled send-errback send-inhibited-p
-        released-resources released-attachments)
-    (unwind-protect
-        (cl-letf
-            (((symbol-function 'qq-gateway-current-account-id)
-              (lambda () "slot-a"))
-             ((symbol-function 'qq-native-request-create)
-              (lambda (&optional owner cancel-function)
-                (setq request
-                      (funcall real-create owner cancel-function))))
-             ((symbol-function
-               'qq-gateway-attachment-stage-and-prepare-image)
-              (lambda (_session _path _summary _sub-type callback _errback)
-                (funcall
-                 callback
-                 (qq-native-test-prepared-image
-                  "att-dddddddd-1111-4111-8111-dddddddddddd"
-                  "res-pending-send"))
-                (qq-gateway-attachment-operation-create :active-p nil)))
-             ((symbol-function 'qq-native--release-send-resource)
-              (lambda (resource-id) (push resource-id released-resources)))
-             ((symbol-function 'qq-native--release-send-attachment)
-              (lambda (attachment-id)
-                (push attachment-id released-attachments)))
-             ((symbol-function 'qq-gateway-message-send)
-              (lambda (_session _segments &optional _raw _callback errback
-                       _optimistic)
-                (setq send-errback errback
-                      send-inhibited-p inhibit-quit)
-                "send-handoff-token"))
-             ((symbol-function 'qq-gateway-transport-cancel)
-              (lambda (token) (push token cancelled))))
-          (should
-           (eq
-            (qq-native-send-message
-             "private:10001"
-             `(((type . "image") (data . ((file . ,path))))))
-            request))
-          (should send-inhibited-p)
-          (should (qq-native-request-active-p request))
-          (qq-native-cancel-request request)
-          (should (equal cancelled '("send-handoff-token")))
-          (should (equal released-resources '("res-pending-send")))
-          (should
-           (equal released-attachments
-                  '("att-dddddddd-1111-4111-8111-dddddddddddd")))
-          (funcall send-errback nil "late send failure")
-          (should
-           (equal released-attachments
-                  '("att-dddddddd-1111-4111-8111-dddddddddddd")))
-          (should (= (hash-table-count qq-native-request--active) 0)))
-      (delete-file path))))
 
 (ert-deftest qq-native-local-record-is-prepared-before-message-send ()
   (let ((path (make-temp-file "qq-native-record-" nil ".wav" "pcm"))
@@ -1711,72 +1346,6 @@
                  '((account_id . "slot-a")
                    (message_id . "7348923749823749824")))
         (should (= (length calls) 2))))))
-
-(ert-deftest qq-native-read-synchronous-completion-cancels-orphan-token ()
-  (let ((qq-native--read-operations (make-hash-table :test #'equal))
-        (qq-native-request--active (make-hash-table :test #'eq))
-        cancelled receipts)
-    (cl-letf (((symbol-function 'qq-gateway-current-account-id)
-               (lambda () "slot-a"))
-              ((symbol-function 'qq-native-message-read-capable-p)
-               (lambda (_message) t))
-              ((symbol-function 'qq-gateway-transport-cancel)
-               (lambda (token) (push token cancelled)))
-              ((symbol-function 'qq-gateway-message-mark-read)
-               (lambda (_message &optional callback _errback)
-                 (funcall callback
-                          '((account_id . "slot-a")
-                            (message_id . "7348923749823749823")))
-                 "late-read-token")))
-      (let ((request
-             (qq-native-mark-message-read
-              '((session-key . "group:8209413637")
-                (server-id . "7348923749823749823")
-                (group-id . "8209413637")
-                (gateway-account-id . "slot-a"))
-              (lambda (receipt) (push receipt receipts)))))
-        (should (eq (qq-native-request-state request) 'settled))
-        (should (equal cancelled '("late-read-token")))
-        (should (equal receipts
-                       '(((account_id . "slot-a")
-                          (message_id . "7348923749823749823")))))
-        (should (= (hash-table-count qq-native--read-operations) 0))
-        (should (= (hash-table-count qq-native-request--active) 0))))))
-
-(ert-deftest qq-native-read-leaf-handoff-inhibits-quit ()
-  (let ((qq-native--read-operations (make-hash-table :test #'equal))
-        (qq-native-request--active (make-hash-table :test #'eq))
-        (real-create (symbol-function 'qq-native-request-create))
-        request cancelled starter-inhibited-p)
-    (cl-letf (((symbol-function 'qq-gateway-current-account-id)
-               (lambda () "slot-a"))
-              ((symbol-function 'qq-native-message-read-capable-p)
-               (lambda (_message) t))
-              ((symbol-function 'qq-native-request-create)
-               (lambda (&optional owner cancel-function)
-                 (setq request
-                       (funcall real-create owner cancel-function))))
-              ((symbol-function 'qq-gateway-transport-cancel)
-               (lambda (token) (push token cancelled)))
-              ((symbol-function 'qq-gateway-message-mark-read)
-               (lambda (&rest _arguments)
-                 (setq starter-inhibited-p inhibit-quit)
-                 "read-handoff-token")))
-      (should
-       (eq
-        (qq-native-mark-message-read
-         '((session-key . "group:8209413637")
-           (server-id . "7348923749823749823")
-           (group-id . "8209413637")
-           (gateway-account-id . "slot-a")))
-        request))
-      (should starter-inhibited-p)
-      (should (qq-native-request-active-p request))
-      (qq-native-cancel-request request)
-      (should (eq (qq-native-request-state request) 'cancelled))
-      (should (equal cancelled '("read-handoff-token")))
-      (should (= (hash-table-count qq-native--read-operations) 0))
-      (should (= (hash-table-count qq-native-request--active) 0)))))
 
 (ert-deftest qq-native-account-switch-revokes-stale-read-callback ()
   (let ((qq-native--read-operations (make-hash-table :test #'equal))

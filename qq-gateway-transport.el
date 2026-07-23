@@ -422,8 +422,11 @@ FORMAT-STRING and ARGUMENTS describe the violation."
 
 CALLBACK receives the successful result object.  ERRBACK receives the
 protocol error body (or nil) and a human-readable reason.  Return the opaque
-request ID, or nil when unavailable.  ALLOW-BEFORE-READY is private transport
-machinery used only for the initial `gateway.hello' request."
+request ID, or nil when unavailable.  Unavailable requests invoke ERRBACK
+before returning nil.  A non-nil ID denotes accepted work whose callback runs
+later from the WebSocket or timeout event loop, never before this function
+returns.  ALLOW-BEFORE-READY is private transport machinery used only for the
+initial `gateway.hello' request."
   (if (not (and qq-gateway-transport--ws
                 (websocket-openp qq-gateway-transport--ws)
                 (or allow-before-ready

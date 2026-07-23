@@ -4,8 +4,8 @@
 
 ;;; Commentary:
 
-;; Strict projection and upload-ahead helpers for Gateway Prepared
-;; Attachments.  Staged resources remain account-neutral; attachments bind
+;; Projection and upload-ahead helpers for Gateway Prepared Attachments.
+;; Staged resources remain account-neutral; attachments bind
 ;; those immutable bytes to one stable account slot, one conversation, and one
 ;; media use.  Native MsgInfo, upload keys, Highway tickets, and local paths
 ;; never enter this projection.
@@ -21,11 +21,6 @@
 (require 'qq-gateway-transport)
 (require 'qq-gateway-wire)
 (require 'qq-state)
-
-(defconst qq-gateway-attachment--phases
-  '("queued" "negotiating" "uploading" "ready"
-    "failed" "sending" "consumed" "canceled")
-  "Closed Prepared Attachment phases implemented by this client.")
 
 (defvar qq-gateway-attachment-changed-hook nil
   "Hook called with REASON and ATTACHMENT-ID after projection changes.")
@@ -53,8 +48,8 @@ behalf of one caller."
   source-resource-id
   resource-id
   attachment-id
-  resource-wait-cancel
-  attachment-wait-cancel)
+  resource-watch
+  attachment-watch)
 
 (defun qq-gateway-attachment--id-p (value)
   "Return non-nil when VALUE is a canonical opaque attachment identity."
@@ -64,144 +59,6 @@ behalf of one caller."
          "\\`att-[0-9a-f]\\{8\\}-[0-9a-f]\\{4\\}-"
          "[0-9a-f]\\{4\\}-[0-9a-f]\\{4\\}-[0-9a-f]\\{12\\}\\'")
         value)))
-
-(defun qq-gateway-attachment--uint32-p (value)
-  "Return non-nil when VALUE is an unsigned 32-bit integer."
-  (and (integerp value) (<= 0 value) (<= value #xffffffff)))
-
-(defun qq-gateway-attachment--timestamp-p (value)
-  "Return non-nil when VALUE is a non-negative integer timestamp."
-  (and (integerp value) (<= 0 value)))
-
-(defun qq-gateway-attachment--boolean-p (value)
-  "Return non-nil when VALUE is a decoded JSON boolean."
-  (memq value '(t :false)))
-
-(defun qq-gateway-attachment--decimal-less-or-equal-p (left right)
-  "Return non-nil when canonical decimal LEFT is at most RIGHT."
-  (or (equal left right) (qq-gateway--decimal-less-p left right)))
-
-(defun qq-gateway-attachment--validate-problem (problem)
-  "Validate and return attachment PROBLEM or nil."
-  (when (vectorp problem)
-    (error "qq: Gateway attachment problem must be an object or null"))
-  (when (qq-gateway-wire-null-p problem)
-    (setq problem nil))
-  (when problem
-    (unless (and (qq-gateway--exact-object-keys-p problem '(code message))
-                 (qq-gateway--non-empty-string-p (alist-get 'code problem))
-                 (qq-gateway--non-empty-string-p (alist-get 'message problem)))
-      (error "qq: Gateway attachment problem is malformed")))
-  (qq-gateway-value-copy problem))
-
-(defun qq-gateway-attachment--validate-conversation (conversation)
-  "Validate and copy attachment CONVERSATION."
-  (unless (qq-gateway-wire-object-p conversation)
-    (error "qq: Gateway attachment conversation must be an object"))
-  (setq conversation (qq-gateway-wire-domain-copy conversation))
-  (pcase (alist-get 'kind conversation)
-    ("private"
-     (unless (and (qq-gateway--exact-object-keys-p
-                   conversation '(kind peer_uin))
-                  (qq-gateway--uint64-decimal-p
-                   (alist-get 'peer_uin conversation)))
-       (error "qq: Gateway private attachment conversation is malformed")))
-    ("group"
-     (unless (and (qq-gateway--exact-object-keys-p
-                   conversation '(kind group_uin))
-                  (qq-gateway--uint64-decimal-p
-                   (alist-get 'group_uin conversation)))
-       (error "qq: Gateway group attachment conversation is malformed")))
-    (_ (error "qq: Gateway attachment conversation has unknown kind")))
-  (qq-gateway-value-copy conversation))
-
-(defun qq-gateway-attachment--validate-use (use)
-  "Validate and copy attachment USE."
-  (unless (qq-gateway-wire-object-p use)
-    (error "qq: Gateway attachment use must be an object"))
-  (setq use (qq-gateway-wire-domain-copy use))
-  (pcase (alist-get 'kind use)
-    ("image"
-     (unless (and (qq-gateway--exact-object-keys-p
-                   use '(kind summary sub_type))
-                  (qq-gateway--non-empty-string-p (alist-get 'summary use))
-                  (<= (length (string-to-list (alist-get 'summary use))) 128)
-                  (not (string-match-p
-                        "[[:cntrl:]]" (alist-get 'summary use)))
-                  (qq-gateway-attachment--uint32-p
-                   (alist-get 'sub_type use)))
-       (error "qq: Gateway image attachment use is malformed")))
-    ("record"
-     (unless (qq-gateway--exact-object-keys-p use '(kind))
-       (error "qq: Gateway record attachment use is malformed")))
-    (_ (error "qq: Gateway attachment use has unknown kind")))
-  (qq-gateway-value-copy use))
-
-(defun qq-gateway-attachment--validate-snapshot (snapshot)
-  "Validate and copy one closed Prepared Attachment SNAPSHOT."
-  (unless (qq-gateway--exact-object-keys-p
-           snapshot
-           '(attachment_id resource_id account_id conversation use
-             phase bytes_done bytes_total fast_path created_at updated_at error))
-    (error "qq: Gateway attachment snapshot has invalid fields"))
-  (let ((attachment-id (alist-get 'attachment_id snapshot))
-        (resource-id (alist-get 'resource_id snapshot))
-        (account-id (alist-get 'account_id snapshot))
-        (phase (alist-get 'phase snapshot))
-        (bytes-done (alist-get 'bytes_done snapshot))
-        (bytes-total (alist-get 'bytes_total snapshot))
-        (fast-path
-         (let ((value (alist-get 'fast_path snapshot nil nil #'eq)))
-           (if (qq-gateway-wire-null-p value) nil value)))
-        (created-at (alist-get 'created_at snapshot))
-        (updated-at (alist-get 'updated_at snapshot))
-        (problem
-         (qq-gateway-attachment--validate-problem
-          (alist-get 'error snapshot nil nil #'eq))))
-    (unless (qq-gateway-attachment--id-p attachment-id)
-      (error "qq: Gateway attachment_id must be an opaque att- UUID"))
-    (unless (qq-gateway-resource--opaque-id-p resource-id)
-      (error "qq: Gateway attachment resource_id is malformed"))
-    (unless (qq-gateway--non-empty-string-p account-id)
-      (error "qq: Gateway attachment account_id is malformed"))
-    (qq-gateway-attachment--validate-conversation
-     (alist-get 'conversation snapshot))
-    (qq-gateway-attachment--validate-use (alist-get 'use snapshot))
-    (unless (member phase qq-gateway-attachment--phases)
-      (error "qq: Gateway attachment has unknown phase"))
-    (unless (and (qq-gateway--uint64-decimal-p bytes-done t)
-                 (qq-gateway--uint64-decimal-p bytes-total t)
-                 (qq-gateway-attachment--decimal-less-or-equal-p
-                  bytes-done bytes-total))
-      (error "qq: Gateway attachment byte progress is malformed"))
-    (unless (and (qq-gateway-attachment--timestamp-p created-at)
-                 (qq-gateway-attachment--timestamp-p updated-at)
-                 (<= created-at updated-at))
-      (error "qq: Gateway attachment timestamps are malformed"))
-    (pcase phase
-      ((or "queued" "negotiating" "uploading")
-       (when (or fast-path problem)
-         (error "qq: Gateway active attachment carries terminal metadata")))
-      ("ready"
-       (unless (and (qq-gateway-attachment--boolean-p fast-path)
-                    (null problem)
-                    (if (eq fast-path t)
-                        (equal bytes-done "0")
-                      (equal bytes-done bytes-total)))
-         (error "qq: Gateway ready attachment has contradictory metadata")))
-      ("failed"
-       (unless (and problem (null fast-path))
-         (error "qq: Gateway failed attachment lacks an exclusive error")))
-      ((or "sending" "consumed")
-       (unless (and (qq-gateway-attachment--boolean-p fast-path)
-                    (null problem))
-         (error "qq: Gateway sent attachment has contradictory metadata")))
-      ("canceled"
-       (unless (and (or (null fast-path)
-                        (qq-gateway-attachment--boolean-p fast-path))
-                    (null problem))
-         (error "qq: Gateway canceled attachment is malformed"))))
-    (qq-gateway-wire-domain-copy snapshot)))
 
 (defun qq-gateway-attachment (attachment-id)
   "Return a copy of Prepared ATTACHMENT-ID, or nil."
@@ -238,14 +95,10 @@ behalf of one caller."
 
 (defun qq-gateway-attachment--replace (snapshots reason)
   "Atomically replace attachments with SNAPSHOTS for REASON."
-  (setq snapshots
-        (qq-gateway-wire-array
-         snapshots "Gateway attachment snapshots" t))
   (let ((next (make-hash-table :test #'equal))
         order)
-    (dolist (raw snapshots)
-      (let* ((snapshot (qq-gateway-attachment--validate-snapshot raw))
-             (attachment-id (alist-get 'attachment_id snapshot)))
+    (dolist (snapshot snapshots)
+      (let ((attachment-id (alist-get 'attachment_id snapshot)))
         (when (gethash attachment-id next)
           (error "qq: Gateway attachment list duplicates %s" attachment-id))
         (puthash attachment-id snapshot next)
@@ -294,7 +147,7 @@ behalf of one caller."
 
 (defun qq-gateway-attachment--upsert (raw-snapshot reason)
   "Merge RAW-SNAPSHOT for REASON without regressing its lifecycle."
-  (let* ((snapshot (qq-gateway-attachment--validate-snapshot raw-snapshot))
+  (let* ((snapshot raw-snapshot)
          (attachment-id (alist-get 'attachment_id snapshot))
          (existing (gethash attachment-id
                             qq-gateway-attachment--attachments)))
@@ -328,29 +181,14 @@ behalf of one caller."
        'qq-gateway-attachment-changed-hook reason attachment-id))
     (qq-gateway-value-copy snapshot)))
 
-(defun qq-gateway-attachment--validate-single-result (result context)
-  "Validate and return attachment in RESULT for CONTEXT."
-  (unless (qq-gateway--exact-object-keys-p result '(attachment))
-    (error "qq: Gateway %s result has invalid fields" context))
-  (qq-gateway-attachment--validate-snapshot
-   (alist-get 'attachment result)))
-
-(defun qq-gateway-attachment--validate-list-result (result)
-  "Validate and return attachments carried by attachment.list RESULT."
-  (unless (qq-gateway--exact-object-keys-p result '(attachments))
-    (error "qq: Gateway attachment.list result has invalid fields"))
-  (qq-gateway-wire-array
-   (alist-get 'attachments result nil nil #'eq)
-   "Gateway attachment.list attachments"))
-
 (defun qq-gateway-attachment-refresh (&optional callback errback reason)
   "Fetch the authoritative Prepared Attachment registry."
   (qq-gateway-rpc-latest-call
    'qq-gateway-attachment--refresh-owner "attachment.list" nil
-   :decoder #'qq-gateway-attachment--validate-list-result
    :projector
-   (lambda (attachments)
-     (qq-gateway-attachment--replace attachments (or reason 'resync)))
+   (lambda (result)
+     (qq-gateway-attachment--replace
+      (alist-get 'attachments result) (or reason 'resync)))
    :callback callback
    :errback errback))
 
@@ -360,25 +198,17 @@ behalf of one caller."
          (kind (alist-get 'type identity))
          (target (alist-get 'target-id identity)))
     (pcase kind
-      ('private
-       (unless (qq-gateway--uint64-decimal-p target)
-         (user-error
-          "qq: Prepared private attachment requires a canonical nonzero uint64 UIN"))
-       `((kind . "private") (peer_uin . ,target)))
-      ('group
-       (unless (qq-gateway--uint64-decimal-p target)
-         (user-error
-          "qq: Prepared group attachment requires a canonical nonzero uint64 UIN"))
-       `((kind . "group") (group_uin . ,target)))
+      ('private `((kind . "private") (peer_uin . ,target)))
+      ('group `((kind . "group") (group_uin . ,target)))
       (_ (user-error
           "qq: Prepared attachments support only private or group chats")))))
 
 (defun qq-gateway-attachment--prepare
     (session-key resource-id use media-name callback errback)
-  "Prepare RESOURCE-ID for SESSION-KEY with closed USE.
+  "Prepare RESOURCE-ID for SESSION-KEY with USE.
 
-MEDIA-NAME is used only in local errors.  CALLBACK receives the validated
-queued snapshot; later progress is projected through
+MEDIA-NAME is used only in local errors.  CALLBACK receives the queued
+snapshot; later progress is projected through
 `qq-gateway-attachment-changed-hook'."
   (let* ((account-id (or (qq-gateway-current-account-id)
                          (user-error "qq: Select a QQ account first")))
@@ -388,32 +218,20 @@ queued snapshot; later progress is projected through
     (unless (and resource (equal (alist-get 'phase resource) "ready"))
       (user-error "qq: %s preparation requires a ready staged resource"
                   media-name))
-    (qq-gateway-attachment--validate-use use)
     (qq-gateway-rpc-call
      "attachment.prepare"
      `((account_id . ,account-id)
        (resource_id . ,resource-id)
        (conversation . ,conversation)
        (use . ,use))
-     :decoder
-     (lambda (result)
-       (let ((snapshot
-              (qq-gateway-attachment--validate-single-result
-               result "attachment.prepare")))
-         (unless (and (equal (alist-get 'phase snapshot) "queued")
-                      (equal (alist-get 'resource_id snapshot) resource-id)
-                      (equal (alist-get 'account_id snapshot) account-id)
-                      (equal (alist-get 'conversation snapshot) conversation)
-                      (equal (alist-get 'use snapshot) use))
-           (error "qq: Gateway attachment.prepare response contradicts request"))
-         snapshot))
      :current-p
      (lambda () (equal account-id (qq-gateway-current-account-id)))
      :stale-code "invalid_gateway_result"
      :stale-message "Selected QQ account changed during attachment preparation"
      :projector
-     (lambda (snapshot)
-       (qq-gateway-attachment--upsert snapshot 'prepare-response))
+     (lambda (result)
+       (qq-gateway-attachment--upsert
+        (alist-get 'attachment result) 'prepare-response))
      :callback callback
      :errback errback)))
 
@@ -421,7 +239,7 @@ queued snapshot; later progress is projected through
     (session-key resource-id &optional summary sub-type callback errback)
   "Prepare staged RESOURCE-ID as an image for SESSION-KEY.
 
-CALLBACK receives the validated queued snapshot.  Progress and completion are
+CALLBACK receives the queued snapshot.  Progress and completion are
 projected through `qq-gateway-attachment-changed-hook'."
   (qq-gateway-attachment--prepare
    session-key resource-id
@@ -436,7 +254,7 @@ projected through `qq-gateway-attachment-changed-hook'."
 
 The staged resource must already contain message-ready Tencent Silk.  Audio
 conversion creates a separate derived resource and is not implicit here.
-CALLBACK receives the validated queued snapshot."
+CALLBACK receives the queued snapshot."
   (qq-gateway-attachment--prepare
    session-key resource-id '((kind . "record")) "Record" callback errback))
 
@@ -447,16 +265,10 @@ CALLBACK receives the validated queued snapshot."
     (user-error "qq: Attachment ID must be an opaque att- UUID"))
   (qq-gateway-rpc-call
    "attachment.status" `((attachment_id . ,attachment-id))
-   :decoder
-   (lambda (result)
-     (let ((snapshot
-            (qq-gateway-attachment--validate-single-result
-             result "attachment.status")))
-       (unless (equal attachment-id (alist-get 'attachment_id snapshot))
-         (error "qq: Gateway attachment.status identity contradicts request"))
-       snapshot))
    :projector
-   (lambda (snapshot) (qq-gateway-attachment--upsert snapshot 'status))
+   (lambda (result)
+     (qq-gateway-attachment--upsert
+      (alist-get 'attachment result) 'status))
    :callback callback
    :errback errback))
 
@@ -467,15 +279,6 @@ CALLBACK receives the validated queued snapshot."
     (user-error "qq: Attachment ID must be an opaque att- UUID"))
   (qq-gateway-rpc-call
    "attachment.release" `((attachment_id . ,attachment-id))
-   :decoder
-   (lambda (result)
-     (setq result (qq-gateway-wire-domain-copy result))
-     (unless (and (qq-gateway--exact-object-keys-p
-                   result '(attachment_id released))
-                  (equal (alist-get 'attachment_id result) attachment-id)
-                  (memq (alist-get 'released result) '(t :false)))
-       (error "qq: Gateway attachment.release receipt is malformed"))
-     result)
    :callback callback
    :errback errback))
 
@@ -483,30 +286,33 @@ CALLBACK receives the validated queued snapshot."
     (attachment-id callback errback)
   "Wait until projected ATTACHMENT-ID becomes ready or terminal.
 
-Return a function that removes this local observer without changing service
-state."
-  (let (observer finished)
+Return a `qq-gateway-watch' that removes this local observer without changing
+service state."
+  (let (observer watch)
+    (setq watch
+          (qq-gateway-watch-create
+           :active-p t
+           :cancel-function
+           (lambda ()
+             (remove-hook 'qq-gateway-attachment-changed-hook observer))))
     (setq observer
           (lambda (_reason changed-id)
-            (when (and (not finished)
+            (when (and (qq-gateway-watch-active-p watch)
                        (or (null changed-id)
                            (equal changed-id attachment-id)))
               (let ((snapshot (qq-gateway-attachment attachment-id)))
                 (cond
                  ((null snapshot)
-                  (setq finished t)
-                  (remove-hook 'qq-gateway-attachment-changed-hook observer)
+                  (qq-gateway-watch-cancel watch)
                   (qq-gateway--client-error
                    errback "attachment_disappeared"
                    "Prepared attachment disappeared during upload"))
                  ((equal (alist-get 'phase snapshot) "ready")
-                  (setq finished t)
-                  (remove-hook 'qq-gateway-attachment-changed-hook observer)
+                  (qq-gateway-watch-cancel watch)
                   (qq-gateway--invoke callback snapshot))
                  ((member (alist-get 'phase snapshot)
                           '("failed" "consumed" "canceled"))
-                  (setq finished t)
-                  (remove-hook 'qq-gateway-attachment-changed-hook observer)
+                  (qq-gateway-watch-cancel watch)
                   (let ((problem (alist-get 'error snapshot)))
                     (qq-gateway--client-error
                      errback
@@ -517,72 +323,22 @@ state."
                                  (alist-get 'phase snapshot)))))))))))
     (add-hook 'qq-gateway-attachment-changed-hook observer)
     (funcall observer 'initial attachment-id)
-    (lambda ()
-      (unless finished
-        (setq finished t)
-        (remove-hook 'qq-gateway-attachment-changed-hook observer)))))
-
-(defun qq-gateway-attachment--await-resource
-    (resource-id callback errback)
-  "Wait until staged RESOURCE-ID becomes ready or terminal.
-
-Return a function that removes this local observer without changing service
-state."
-  (let (observer finished)
-    (setq observer
-          (lambda (_reason changed-id)
-            (when (and (not finished)
-                       (or (null changed-id) (equal changed-id resource-id)))
-              (let ((resource (qq-gateway-resource resource-id)))
-                (cond
-                 ((null resource)
-                  (setq finished t)
-                  (remove-hook 'qq-gateway-resource-changed-hook observer)
-                  (qq-gateway--client-error
-                    errback "resource_disappeared"
-                    "Staged resource disappeared"))
-                 ((equal (alist-get 'phase resource) "ready")
-                  (setq finished t)
-                  (remove-hook 'qq-gateway-resource-changed-hook observer)
-                  (qq-gateway--invoke callback resource))
-                 ((member (alist-get 'phase resource) '("failed" "released"))
-                  (setq finished t)
-                  (remove-hook 'qq-gateway-resource-changed-hook observer)
-                  (let ((problem (alist-get 'error resource)))
-                    (qq-gateway--client-error
-                     errback
-                     (or (alist-get 'code problem) "resource_released")
-                     "%s"
-                     (or (alist-get 'message problem)
-                         "Staged resource was released")))))))))
-    (add-hook 'qq-gateway-resource-changed-hook observer)
-    (funcall observer 'initial resource-id)
-    (lambda ()
-      (unless finished
-        (setq finished t)
-        (remove-hook 'qq-gateway-resource-changed-hook observer)))))
+    watch))
 
 (defun qq-gateway-attachment--cancel-local-work (operation)
   "Cancel callback ownership and observers held by OPERATION."
   (when-let* ((request-id
                (qq-gateway-attachment-operation-request-id operation)))
-    (when (stringp request-id)
-      (qq-gateway-transport-cancel request-id))
+    (qq-gateway-transport-cancel request-id)
     (setf (qq-gateway-attachment-operation-request-id operation) nil))
-  (when-let* ((cancel
-               (qq-gateway-attachment-operation-resource-wait-cancel
-                operation)))
-    (when (functionp cancel)
-      (funcall cancel))
-    (setf (qq-gateway-attachment-operation-resource-wait-cancel operation)
-          nil))
-  (when-let* ((cancel
-               (qq-gateway-attachment-operation-attachment-wait-cancel
-                operation)))
-    (when (functionp cancel)
-      (funcall cancel))
-    (setf (qq-gateway-attachment-operation-attachment-wait-cancel operation)
-          nil)))
+  (when-let* ((watch
+               (qq-gateway-attachment-operation-resource-watch operation)))
+    (qq-gateway-watch-cancel watch)
+    (setf (qq-gateway-attachment-operation-resource-watch operation) nil))
+  (when-let* ((watch
+               (qq-gateway-attachment-operation-attachment-watch operation)))
+    (qq-gateway-watch-cancel watch)
+    (setf (qq-gateway-attachment-operation-attachment-watch operation) nil)))
 
 (defun qq-gateway-attachment--release-created (operation)
   "Best-effort release service objects created for OPERATION."
@@ -658,55 +414,34 @@ local operation that owns every service object created before that handoff."
                 (qq-gateway-resource-release resource-id)
               (error nil))))
          (start-request
-          (tag thunk)
-          (let ((marker (list tag)))
-            (setf (qq-gateway-attachment-operation-request-id operation)
-                  marker)
-            (condition-case error-data
-                (let ((request-id (funcall thunk)))
-                  (if (eq marker
-                          (qq-gateway-attachment-operation-request-id
-                           operation))
-                      (setf
-                       (qq-gateway-attachment-operation-request-id operation)
-                       request-id)
-                    ;; THUNK may synchronously settle or advance OPERATION
-                    ;; before returning its transport token.
-                    (when request-id
-                      (qq-gateway-transport-cancel request-id))))
-              (error
-               (fail nil (error-message-string error-data))))))
+          (thunk)
+          (condition-case error-data
+              (let ((request-id (funcall thunk)))
+                (when (and request-id
+                           (qq-gateway-attachment-operation-active-p
+                            operation))
+                  (setf
+                   (qq-gateway-attachment-operation-request-id operation)
+                   request-id)))
+            (error
+             (fail nil (error-message-string error-data)))))
          (await-resource
           (resource-id ready-callback)
-          (let ((marker (list 'resource-wait)))
-            (setf
-             (qq-gateway-attachment-operation-resource-wait-cancel operation)
-             marker)
-            (let ((cancel
-                   (qq-gateway-attachment--await-resource
-                    resource-id ready-callback #'fail)))
-              (if (eq marker
-                      (qq-gateway-attachment-operation-resource-wait-cancel
-                       operation))
-                  (setf
-                   (qq-gateway-attachment-operation-resource-wait-cancel
-                    operation)
-                   cancel)
-                ;; READY-CALLBACK can advance the pipeline synchronously.
-                (when (functionp cancel)
-                  (funcall cancel))))))
+          (let ((watch
+                 (qq-gateway-resource-await-ready
+                  resource-id ready-callback #'fail)))
+            (when (qq-gateway-watch-active-p watch)
+              (setf
+               (qq-gateway-attachment-operation-resource-watch operation)
+               watch))))
          (await-attachment
           (attachment)
           (when (qq-gateway-attachment-operation-active-p operation)
-            (let* ((attachment-id (alist-get 'attachment_id attachment))
-                   (marker (list 'attachment-wait)))
+            (let ((attachment-id (alist-get 'attachment_id attachment)))
               (setf (qq-gateway-attachment-operation-request-id operation) nil
                     (qq-gateway-attachment-operation-attachment-id operation)
-                    attachment-id
-                    (qq-gateway-attachment-operation-attachment-wait-cancel
-                     operation)
-                    marker)
-              (let ((cancel
+                    attachment-id)
+              (let ((watch
                      (qq-gateway-attachment--await
                       attachment-id
                       (lambda (ready)
@@ -722,25 +457,19 @@ local operation that owns every service object created before that handoff."
                             (setf
                              (qq-gateway-attachment-operation-active-p operation)
                              nil
-                             (qq-gateway-attachment-operation-attachment-wait-cancel
+                             (qq-gateway-attachment-operation-attachment-watch
                               operation)
                              nil)
                             (qq-gateway--invoke callback ready))))
                       #'fail)))
-                (if (eq marker
-                        (qq-gateway-attachment-operation-attachment-wait-cancel
-                         operation))
-                    (setf
-                     (qq-gateway-attachment-operation-attachment-wait-cancel
-                      operation)
-                     cancel)
-                  ;; The initial observation can deliver a terminal snapshot.
-                  (when (functionp cancel)
-                    (funcall cancel)))))))
+                (when (qq-gateway-watch-active-p watch)
+                  (setf
+                   (qq-gateway-attachment-operation-attachment-watch operation)
+                   watch))))))
          (prepare-final
           (_resource)
           (when (qq-gateway-attachment-operation-active-p operation)
-            (setf (qq-gateway-attachment-operation-resource-wait-cancel
+            (setf (qq-gateway-attachment-operation-resource-watch
                    operation)
                   nil)
             (if (not (equal account-id (qq-gateway-current-account-id)))
@@ -749,7 +478,6 @@ local operation that owns every service object created before that handoff."
                  (format "Selected QQ account changed during %s"
                          transform-phase))
               (start-request
-               'attachment-prepare
                (lambda ()
                  (funcall
                   prepare
@@ -781,7 +509,7 @@ local operation that owns every service object created before that handoff."
          (source-ready
           (resource)
           (when (qq-gateway-attachment-operation-active-p operation)
-            (setf (qq-gateway-attachment-operation-resource-wait-cancel
+            (setf (qq-gateway-attachment-operation-resource-watch
                    operation)
                   nil)
             (if (not (equal account-id (qq-gateway-current-account-id)))
@@ -790,7 +518,6 @@ local operation that owns every service object created before that handoff."
                  (format "Selected QQ account changed during %s staging"
                          media-name))
               (start-request
-               'resource-transform
                (lambda ()
                  (funcall transform resource #'transform-complete #'fail))))))
          (stage-complete
@@ -807,25 +534,19 @@ local operation that owns every service object created before that handoff."
               (when (and source-id (not (equal source-id resource-id)))
                 (error "qq: Resource stage changed identity within one operation"))
               (await-resource resource-id #'source-ready)))))
-      (let ((marker (list 'resource-stage)))
-        (setf (qq-gateway-attachment-operation-request-id operation) marker)
-        (condition-case error-data
-            (let ((request-id
-                   (qq-gateway-resource-stage-local
-                    path (file-name-nondirectory path) nil
-                    #'stage-complete #'fail)))
-              (if (eq marker
-                      (qq-gateway-attachment-operation-request-id operation))
-                  (setf (qq-gateway-attachment-operation-request-id operation)
-                        request-id)
-                ;; STAGE-COMPLETE may run synchronously and hand ownership to
-                ;; a later stage before this transport token is returned.
-                (when request-id
-                  (qq-gateway-transport-cancel request-id))))
-          (error
-           (setf (qq-gateway-attachment-operation-active-p operation) nil)
-           (qq-gateway-attachment--release-created operation)
-           (signal (car error-data) (cdr error-data)))))
+      (condition-case error-data
+          (let ((request-id
+                 (qq-gateway-resource-stage-local
+                  path (file-name-nondirectory path) nil
+                  #'stage-complete #'fail)))
+            (when (and request-id
+                       (qq-gateway-attachment-operation-active-p operation))
+              (setf (qq-gateway-attachment-operation-request-id operation)
+                    request-id)))
+        ((error quit)
+         (setf (qq-gateway-attachment-operation-active-p operation) nil)
+         (qq-gateway-attachment--release-created operation)
+         (signal (car error-data) (cdr error-data))))
       operation)))
 
 (defun qq-gateway-attachment-stage-and-prepare-image
@@ -899,7 +620,7 @@ and may be \"record\"."
    "attachment"))
 
 (defun qq-gateway-attachment--handle-ready (instance-id)
-  "Synchronize attachments after validated Gateway ready INSTANCE-ID."
+  "Synchronize attachments after Gateway ready INSTANCE-ID."
   (unless (qq-gateway--non-empty-string-p instance-id)
     (error "qq: Gateway ready instance identity is malformed"))
   (unless (equal instance-id qq-gateway-attachment--gateway-instance-id)
@@ -914,8 +635,6 @@ and may be \"record\"."
   "Project native service attachment EVENT with DATA."
   (pcase event
     ("attachment.changed"
-     (unless (qq-gateway--exact-object-keys-p data '(attachment))
-       (error "qq: Gateway attachment.changed data has invalid fields"))
      (qq-gateway-attachment--upsert
       (alist-get 'attachment data) 'changed))
     (_ (error "qq: Unowned Gateway attachment event %s" event))))
@@ -925,7 +644,7 @@ and may be \"record\"."
   (when (equal (alist-get 'code body) "attachment_event_stream_lagged")
     (qq-gateway--run-hook
      'qq-gateway-attachment-desync-hook
-     (qq-gateway-wire-domain-copy body))
+     body)
     (qq-gateway-attachment--request-resync 'resync)))
 
 (add-hook 'qq-gateway-ready-hook #'qq-gateway-attachment--handle-ready)

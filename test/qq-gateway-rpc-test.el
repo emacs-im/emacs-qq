@@ -54,8 +54,9 @@
        (equal
         (qq-gateway-rpc-call
          "message.send" params
-         :decoder (lambda (wire) (alist-get 'value wire))
-         :projector (lambda (value) (concat value "-projected"))
+         :projector
+         (lambda (result)
+           (concat (alist-get 'value result) "-projected"))
          :callback (lambda (value) (setq result value)))
         "request-7"))
       (should (equal sent (list "message.send" params)))
@@ -64,8 +65,35 @@
       (should-not (assq 'generation (cadr sent)))
       (should (equal result "wire-projected")))))
 
+(ert-deftest qq-gateway-rpc-domainizes-and-owns-success-before-projection ()
+  (let* ((source (copy-sequence "mutable"))
+         (wire `((items . [,source ,qq-gateway-wire-null])))
+         projected delivered)
+    (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+               (lambda () t))
+              ((symbol-function 'qq-gateway-transport-capabilities)
+               (lambda () '("test.method")))
+              ((symbol-function 'qq-gateway-transport-send)
+               (lambda (_method _params success _error)
+                 (funcall success wire)
+                 "request")))
+      (qq-gateway-rpc-call
+       "test.method" nil
+       :projector
+       (lambda (domain)
+         (setq projected domain)
+         domain)
+       :callback (lambda (domain) (setq delivered domain))))
+    (let ((items (alist-get 'items projected)))
+      (should (listp items))
+      (should (equal items (list "mutable" nil)))
+      (should-not (eq (car items) source))
+      (aset (car items) 0 ?X)
+      (should (equal source "mutable")))
+    (should (equal delivered '((items . ("mutable" nil)))))))
+
 (ert-deftest qq-gateway-rpc-transformer-errors-become-invalid-result ()
-  (dolist (stage '(decoder projector current))
+  (dolist (stage '(projector current))
     (let (failure callback-called)
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                  (lambda () t))
@@ -77,9 +105,6 @@
                    "request")))
         (qq-gateway-rpc-call
          "test.method" nil
-         :decoder (if (eq stage 'decoder)
-                      (lambda (_result) (error "bad decoder"))
-                    #'identity)
          :projector (if (eq stage 'projector)
                         (lambda (_result) (error "bad projector"))
                       #'identity)
@@ -95,7 +120,7 @@
         (should (string-match-p "bad" (cadr failure)))))))
 
 (ert-deftest qq-gateway-rpc-stale-context-has-distinct-error ()
-  (let (failure decoded)
+  (let (failure projected)
     (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                (lambda () t))
               ((symbol-function 'qq-gateway-transport-capabilities)
@@ -107,12 +132,12 @@
       (qq-gateway-rpc-call
        "test.method" nil
        :current-p (lambda () nil)
-       :decoder (lambda (_result) (setq decoded t))
+       :projector (lambda (_result) (setq projected t))
        :stale-code "superseded_request"
        :stale-message "Directory request was superseded"
        :errback (lambda (body reason)
                   (setq failure (list body reason))))
-      (should-not decoded)
+      (should-not projected)
       (should (equal (alist-get 'code (car failure)) "superseded_request"))
       (should (equal (cadr failure) "Directory request was superseded")))))
 
@@ -192,34 +217,37 @@
     (should (equal wire-value "value"))))
 
 (ert-deftest qq-gateway-rpc-latest-call-settles-leaf-exactly-once ()
-  (let (qq-gateway-rpc-test--latest callbacks failures)
+  (let (qq-gateway-rpc-test--latest success failure callbacks failures)
     (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                (lambda () t))
               ((symbol-function 'qq-gateway-transport-capabilities)
                (lambda () '("registry.list")))
               ((symbol-function 'qq-gateway-transport-send)
-               (lambda (_method _params success failure)
-                 (funcall success '((value . "first")))
-                 (funcall failure
-                          '((code . "late_error") (message . "late"))
-                          "late")
-                 (funcall success '((value . "duplicate")))
+               (lambda (_method _params success-callback failure-callback)
+                 (setq success success-callback
+                       failure failure-callback)
                  'opaque-request-token)))
       (should
        (eq
         (qq-gateway-rpc-latest-call
          'qq-gateway-rpc-test--latest "registry.list" nil
-         :decoder (lambda (result) (alist-get 'value result))
+         :projector (lambda (result) (alist-get 'value result))
          :callback (lambda (value) (push value callbacks))
          :errback (lambda (body reason)
                     (push (list body reason) failures)))
         'opaque-request-token))
+      (funcall success '((value . "first")))
+      (funcall failure
+               '((code . "late_error") (message . "late"))
+               "late")
+      (funcall success '((value . "duplicate")))
       (should (equal callbacks '("first")))
       (should-not failures)
       (should-not qq-gateway-rpc-test--latest))))
 
-(ert-deftest qq-gateway-rpc-latest-call-revokes-token-returned-after-reentry ()
-  (let (qq-gateway-rpc-test--latest canceled delivered (send-count 0))
+(ert-deftest qq-gateway-rpc-latest-callback-can-start-successor ()
+  (let (qq-gateway-rpc-test--latest first-success canceled delivered
+        (send-count 0))
     (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                (lambda () t))
               ((symbol-function 'qq-gateway-transport-capabilities)
@@ -228,11 +256,7 @@
                (lambda (_method _params success _failure)
                  (cl-incf send-count)
                  (if (= send-count 1)
-                     (progn
-                       ;; The leaf callback starts the replacement before this
-                       ;; first transport invocation returns its token.
-                       (funcall success '((value . "first")))
-                       'orphaned-first-token)
+                     (progn (setq first-success success) 'first-token)
                    'replacement-token)))
               ((symbol-function 'qq-gateway-transport-cancel)
                (lambda (token) (push token canceled) t)))
@@ -240,22 +264,22 @@
        (eq
         (qq-gateway-rpc-latest-call
          'qq-gateway-rpc-test--latest "registry.list" nil
-         :decoder (lambda (result) (alist-get 'value result))
+         :projector (lambda (result) (alist-get 'value result))
          :callback
          (lambda (value)
            (push value delivered)
            (qq-gateway-rpc-latest-call
             'qq-gateway-rpc-test--latest "registry.list" nil)))
-        'orphaned-first-token))
+        'first-token))
+      (funcall first-success '((value . "first")))
       (should (equal delivered '("first")))
-      (should (equal canceled '(orphaned-first-token)))
+      (should-not canceled)
       (should
        (eq (qq-gateway-rpc-latest-request-transport-token
             qq-gateway-rpc-test--latest)
            'replacement-token))
       (qq-gateway-rpc-cancel-latest 'qq-gateway-rpc-test--latest)
-      (should (equal canceled
-                     '(replacement-token orphaned-first-token))))))
+      (should (equal canceled '(replacement-token))))))
 
 (ert-deftest qq-gateway-rpc-latest-call-cleans-owner-on-nonlocal-exit ()
   (dolist (condition '(error quit))

@@ -85,72 +85,17 @@ Use a raw vector for `kinds' unless DOMAIN-P requests projected form."
          (qq-gateway-resource-desync-hook nil))
      ,@body))
 
-(ert-deftest qq-gateway-resource-validator-keeps-exact-size-and-hides-path ()
-  (let* ((snapshot (qq-gateway-resource-test-ready))
-         (validated (qq-gateway-resource--validate-snapshot snapshot)))
-    (should (equal (alist-get 'size validated) "3"))
-    (should-not (assq 'path validated))
-    (setf (alist-get 'size snapshot) 3)
-    (should-error (qq-gateway-resource--validate-snapshot snapshot))
-    (setf (alist-get 'size snapshot) "3")
-    (push '(path . "/tmp/payload.bin") snapshot)
-    (should-error (qq-gateway-resource--validate-snapshot snapshot))))
-
-(ert-deftest qq-gateway-resource-validator-rejects-contradictory-phases ()
-  (let ((staging (qq-gateway-resource-test-snapshot))
-        (ready (qq-gateway-resource-test-ready))
-        (failed
-         (qq-gateway-resource-test-snapshot
-          :phase "failed"
-          :error '((code . "copy_failed") (message . "disk full")))))
-    (should (qq-gateway-resource--validate-snapshot staging))
-    (should (qq-gateway-resource--validate-snapshot ready))
-    (should (qq-gateway-resource--validate-snapshot failed))
-    (setf (alist-get 'error ready)
-          '((code . "impossible") (message . "contradiction")))
-    (should-error (qq-gateway-resource--validate-snapshot ready))))
-
-(ert-deftest qq-gateway-resource-wire-null-normalizes-and-owns-values ()
-  (let* ((name (copy-sequence "payload.bin"))
-         (snapshot
-          (qq-gateway-resource-test-snapshot
-           :suggested-name name
-           :media-type qq-gateway-wire-null
-           :digests qq-gateway-wire-null
-           :expires-at qq-gateway-wire-null
-           :error qq-gateway-wire-null))
-         (validated (qq-gateway-resource--validate-snapshot snapshot)))
-    (should-not (alist-get 'media_type validated))
-    (should-not (alist-get 'digests validated))
-    (should-not (alist-get 'expires_at validated))
-    (should-not (alist-get 'error validated))
-    (aset name 0 ?X)
-    (should (equal (alist-get 'suggested_name validated) "payload.bin"))))
-
-(ert-deftest qq-gateway-resource-wire-array-and-registry-own-values ()
+(ert-deftest qq-gateway-resource-accessors-copy-projected-values ()
   (qq-gateway-resource-test-with-state
-    (let* ((name (copy-sequence "payload.bin"))
-           (snapshot
-            (qq-gateway-resource-test-snapshot
-             :suggested-name name
-             :media-type qq-gateway-wire-null
-             :digests qq-gateway-wire-null
-             :expires-at qq-gateway-wire-null
-             :error qq-gateway-wire-null)))
-      (qq-gateway-resource--replace (vector snapshot) 'wire-test)
-      (aset name 0 ?X)
+    (let ((snapshot (qq-gateway-resource-test-snapshot)))
+      (qq-gateway-resource--replace (list snapshot) 'projection-test)
       (let ((first (qq-gateway-resource "res-opaque-a")))
         (should (equal (alist-get 'suggested_name first) "payload.bin"))
         (aset (alist-get 'suggested_name first) 0 ?Y)
         (should (equal
                  (alist-get 'suggested_name
                             (qq-gateway-resource "res-opaque-a"))
-                 "payload.bin")))
-      (should-error
-       (qq-gateway-resource--replace qq-gateway-wire-null 'wire-test))
-      (should-error
-       (qq-gateway-resource--validate-list-result
-        `((resources . ,qq-gateway-wire-null)))))))
+                 "payload.bin"))))))
 
 (ert-deftest qq-gateway-resource-stage-local-sends-only-explicit-source-input ()
   (qq-gateway-resource-test-with-state
@@ -379,16 +324,6 @@ Use a raw vector for `kinds' unless DOMAIN-P requests projected form."
        "resource.removed" '((resource_id . "res-opaque-a")))
       (should-not (qq-gateway-resource "res-opaque-a"))
       (should (equal (car changes) '(removed "res-opaque-a"))))))
-
-(ert-deftest qq-gateway-resource-native-import-validators-are-closed-and-pathless ()
-  (let ((source (qq-gateway-resource-test-import-source))
-        (candidate (qq-gateway-resource-test-import-candidate)))
-    (should (qq-gateway-resource--validate-import-source source))
-    (should (qq-gateway-resource--validate-import-candidate candidate))
-    (push '(path . "/private/nt_data") source)
-    (should-error (qq-gateway-resource--validate-import-source source))
-    (setf (alist-get 'size candidate) 14)
-    (should-error (qq-gateway-resource--validate-import-candidate candidate))))
 
 (ert-deftest qq-gateway-resource-native-import-lists-and-stages-with-opaque-identities ()
   (qq-gateway-resource-test-with-state

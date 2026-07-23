@@ -38,8 +38,7 @@
   next-message
   next-callback
   next-errback
-  leaf-id
-  leaf-token)
+  token)
 
 (defvar qq-native--bootstrap-owner nil
   "Account owner whose initial directory refresh is running or complete.")
@@ -68,6 +67,9 @@
 (defvar qq-native--recent-resync-context nil
   "Selected slot/Gateway context with one lag resync currently in flight.")
 
+(defvar qq-native--recent-request nil
+  "Newest product request allowed to replace the recent-session projection.")
+
 (defvar qq-native--read-operations (make-hash-table :test #'equal)
   "Newest in-flight and coalesced native read intent per session.")
 
@@ -77,8 +79,7 @@
 Late callbacks become inert because their operation token is no longer owned.
 Pending transport requests are forgotten after ownership has been revoked, so
 cancellation cannot reenter the old operation."
-  (let ((inhibit-quit t)
-        requests)
+  (let (requests)
     (maphash
      (lambda (_session-key operation)
        (when-let* ((request (qq-native--read-operation-request operation)))
@@ -135,17 +136,13 @@ This never stops or logs out a managed QQ account."
 
 (cl-defun qq-native--start-request
     (starter callback errback
-             &key (owner nil owner-supplied-p) cancel-function replace-key
-             projector)
+             &key (owner nil owner-supplied-p))
   "Start asynchronous product work through STARTER.
 
 CALLBACK and ERRBACK are product-facing leaf callbacks.  When omitted, OWNER
 defaults to the stable selected account slot; an explicitly supplied nil marks
 global work.  Omitting OWNER without a selected slot is a user error.
-CANCEL-FUNCTION, when non-nil, cancels the adapter token.  REPLACE-KEY gives
-the request newest-wins semantics among matching operations for the same OWNER.
-PROJECTOR transforms a successful adapter value inside the request's ownership
-boundary.  Return one uniform `qq-native-request'."
+Return one uniform `qq-native-request'."
   (qq-native-request-start
    starter
    :callback callback
@@ -153,10 +150,7 @@ boundary.  Return one uniform `qq-native-request'."
    :owner (if owner-supplied-p
               owner
             (or (qq-gateway-current-account-id)
-                (user-error "qq: Select a QQ account first")))
-   :cancel-function cancel-function
-   :replace-key replace-key
-   :projector projector))
+                (user-error "qq: Select a QQ account first")))))
 
 (defun qq-native--directory-refresh-success
     (kind owner callback value)
@@ -222,7 +216,7 @@ contact cache."
   (let ((identity (alist-get 'conversation row)))
     (pcase (alist-get 'kind identity)
       ("group" t)
-      ;; The identity may legitimately be UID-only.  The closed latest message
+      ;; The identity may legitimately be UID-only.  The latest message
       ;; can still provide the peer UIN needed by the product session key.
       ("private" (qq-native--recent-private-row-projectable-p row account))
       ;; Temporary conversations are valid protocol rows but have no product
@@ -230,7 +224,7 @@ contact cache."
       ("temporary" nil))))
 
 (defun qq-native--recent-row-state-entry (page row account)
-  "Return one state-domain entry for validated PAGE ROW and ACCOUNT."
+  "Return one state-domain entry for PAGE ROW and ACCOUNT."
   (let* ((account-id (alist-get 'account_id page))
          (identity (alist-get 'conversation row))
          (normalized
@@ -264,7 +258,7 @@ contact cache."
      :pinned (alist-get 'pinned row))))
 
 (defun qq-native--apply-recent-page (page observation-token)
-  "Normalize and apply validated recent PAGE for OBSERVATION-TOKEN."
+  "Normalize and apply recent PAGE for OBSERVATION-TOKEN."
   (let ((account (qq-gateway-current-account)))
     (unless (and account
                  (equal (alist-get 'account_id account)
@@ -284,24 +278,46 @@ contact cache."
 
 This operation is slot-scoped: a restart of the same managed account does not
 invalidate its result.  CALLBACK receives the resulting state session list;
-ERRBACK receives a closed service/client error.  LIMIT defaults at the Gateway
+ERRBACK receives a service/client error.  LIMIT defaults at the Gateway
 adapter boundary."
   (let ((account-id (or (qq-gateway-current-account-id)
                         (user-error "qq: Select a QQ account first")))
-        (observation-token (qq-state-session-summary-observation-start)))
-    (qq-native--start-request
-     (lambda (success failure)
-       (qq-gateway-conversation-list-recent
-        account-id
-        :callback success
-        :errback failure
-        :limit limit))
-     callback errback
-     :owner account-id
-     :replace-key 'recent-conversations
-     :projector
-     (lambda (page)
-       (qq-native--apply-recent-page page observation-token)))))
+        (observation-token (qq-state-session-summary-observation-start))
+        (error-fn (or errback #'qq-native--default-error))
+        request)
+    (when qq-native--recent-request
+      (qq-native-cancel-request qq-native--recent-request))
+    (setq qq-native--recent-request nil)
+    (setq request
+          (qq-native--start-request
+           (lambda (success failure)
+             (qq-gateway-conversation-list-recent
+              account-id
+              :callback success
+              :errback failure
+              :limit limit))
+           (lambda (page)
+             (when (eq request qq-native--recent-request)
+               (setq qq-native--recent-request nil))
+             (condition-case error-data
+                 (qq-gateway--invoke
+                  callback
+                  (qq-native--apply-recent-page page observation-token))
+               (error
+                (let ((reason (error-message-string error-data)))
+                  (qq-gateway--invoke
+                   error-fn
+                   `((code . "client_projection_failed")
+                     (message . ,reason))
+                   reason)))))
+           (lambda (body reason)
+             (when (eq request qq-native--recent-request)
+               (setq qq-native--recent-request nil))
+             (qq-gateway--invoke error-fn body reason))
+           :owner account-id))
+    (when (qq-native-request-active-p request)
+      (setq qq-native--recent-request request))
+    request))
 
 (defun qq-native--group-profile-from-state (group-id)
   "Return a group-profile projection for exact GROUP-ID, or nil."
@@ -468,7 +484,7 @@ after its first fetch.  ERRBACK receives the service response and reason."
    callback errback))
 
 (defun qq-native-set-presence (presence &optional callback errback)
-  "Set the selected account's closed PRESENCE through the native service.
+  "Set the selected account's PRESENCE through the native service.
 
 CALLBACK receives the exact acknowledgement.  The request is routed to the
 locally selected managed account without changing its lifecycle phase."
@@ -645,13 +661,16 @@ immutable staged bytes, not a URL that could change before upload."
             (if (equal kind "image")
                 (let ((summary (or summary "[图片]"))
                       (sub-type (or sub-type 0)))
-                  (qq-gateway-attachment--validate-use
-                   `((kind . "image")
-                     (summary . ,summary)
-                     (sub_type . ,sub-type)))
+                  (unless (and (qq-gateway--non-empty-string-p summary)
+                               (<= (length (string-to-list summary)) 128)
+                               (not (string-match-p "[[:cntrl:]]" summary)))
+                    (user-error
+                     "qq: Image summary must be 1–128 printable characters"))
+                  (unless (and (integerp sub-type)
+                               (<= 0 sub-type #xffffffff))
+                    (user-error "qq: Image sub-type must be an unsigned integer"))
                   (list :index index :kind kind :path path
                         :summary summary :sub-type sub-type))
-              (qq-gateway-attachment--validate-use '((kind . "record")))
               (list :index index :kind kind :path path))))
          (t
           (user-error
@@ -687,11 +706,9 @@ immutable staged bytes, not a URL that could change before upload."
   "Resolve local media PLANS, then send SEGMENTS to SESSION-KEY.
 
 Staging and preparation may run concurrently, but the immutable segment order
-is retained.  Before `message.send' starts, cancellation releases every
-pipeline-owned object.  After dispatch, cancellation revokes the local
-response callback and best-effort releases every attachment ID; a later send
-rejection performs the same release.  Already claimed attachments ignore it,
-while an unclaimed Ready attachment cannot be left without a client owner."
+is retained.  This composite request owns preparation operations until they
+produce ready attachments, then owns those attachments until `message.send'
+accepts them.  Cancellation or failure releases everything still owned here."
   (let* ((owner (or (qq-gateway-current-account-id)
                     (user-error "qq: Select a QQ account first")))
          (optimistic-segments (copy-tree segments))
@@ -699,9 +716,7 @@ while an unclaimed Ready attachment cannot be left without a client owner."
          (remaining (length plans))
          (operations nil)
          (attachment-ids nil)
-         (resource-ids nil)
          (active t)
-         (dispatched nil)
          send-token
          request)
     (cl-labels
@@ -714,75 +729,43 @@ while an unclaimed Ready attachment cannot be left without a client owner."
                        (error-message-string error-data)))))
          (release-attachments
            ()
-           ;; Detach before calling the asynchronous release helper so a
-           ;; synchronous callback or repeated terminal signal cannot release
-           ;; the same attachment twice.
-           (let ((inhibit-quit t)
-                 (owned-attachment-ids (delete-dups attachment-ids)))
+           (let ((owned-attachment-ids (delete-dups attachment-ids)))
              (setq attachment-ids nil)
              (dolist (attachment-id owned-attachment-ids)
-               (condition-case error-data
-                   (qq-native--release-send-attachment attachment-id)
-                 ((error quit)
-                  (message "qq: prepared media cleanup failed: %s"
-                           (error-message-string error-data)))))))
-         (release-pre-dispatch
-           ()
-           ;; Detach ownership before calling cancellation/release helpers.
-           ;; Besides making cleanup idempotent, this prevents a synchronous
-           ;; callback from observing the same objects as still owned here.
-           (let ((inhibit-quit t)
-                 (owned-operations operations)
-                 (owned-resource-ids (delete-dups resource-ids)))
-             (setq operations nil
-                   resource-ids nil)
-             (dolist (operation owned-operations)
-               (cancel-operation operation))
-             (release-attachments)
-             (dolist (resource-id owned-resource-ids)
-               (condition-case error-data
-                   (qq-native--release-send-resource resource-id)
-                 ((error quit)
-                  (message "qq: staged media cleanup failed: %s"
-                           (error-message-string error-data)))))))
+               (qq-native--release-send-attachment attachment-id))))
          (cancel-send
            ()
-           (when-let* ((token send-token))
-             (setq send-token nil)
-             (let ((inhibit-quit t))
+           (when send-token
+             (let ((token send-token))
+               (setq send-token nil)
                (condition-case error-data
                    (qq-gateway-transport-cancel token)
                  ((error quit)
                   (message "qq: local media send cancellation failed: %s"
                            (error-message-string error-data)))))))
-         (cancel-dispatched
+         (cleanup
            ()
-           (let ((inhibit-quit t))
+           (let ((owned-operations operations))
+             (setq operations nil)
              (cancel-send)
+             (dolist (operation owned-operations)
+               (cancel-operation operation))
              (release-attachments)))
          (finish
            (success-p body value)
            (when active
-             ;; Make terminal ownership changes indivisible with cleanup.  A
-             ;; pending C-g may skip the user callback, but cannot leave an
-             ;; active request after ACTIVE has been cleared.
-             (let ((inhibit-quit t))
-               (setq active nil)
-               (cond
-                (success-p
-                 ;; A successful service call owns every claimed attachment,
-                 ;; including synchronous completion before token handoff.
-                 (setq attachment-ids nil))
-                ((not dispatched)
-                 (release-pre-dispatch))
-                (t
-                 ;; A resolver rejection can leave attachments Ready.  Release
-                 ;; every submitted ID; claimed/Sending attachments make this
-                 ;; idempotent service call a no-op.
-                 (release-attachments)))
-               (if success-p
-                   (qq-native-request-finish request)
-                 (qq-native-request-fail request)))
+             (setq active nil
+                   send-token nil)
+             (if success-p
+                 ;; Successful `message.send' has claimed every attachment.
+                 (setq attachment-ids nil
+                       operations nil)
+               ;; Release is idempotent when the service already moved an
+               ;; attachment into its Sending state.
+               (cleanup))
+             (if success-p
+                 (qq-native-request-finish request)
+               (qq-native-request-fail request))
              (if success-p
                  (qq-native-request--invoke callback value)
                (qq-native-request--invoke errback body value))))
@@ -794,71 +777,36 @@ while an unclaimed Ready attachment cannot be left without a client owner."
            (finish t nil receipt))
          (dispatch
            ()
-           (let (returned-p)
-             (unwind-protect
-                 (progn
-                   (if (not (equal owner (qq-gateway-current-account-id)))
-                       (qq-native-cancel-request request)
-                     (condition-case error-data
-                         (let ((inhibit-quit t))
-                           (let ((token
-                                  (qq-gateway-message-send
-                                   session-key (append resolved nil) raw-message
-                                   #'send-succeeded #'send-failed
-                                   optimistic-segments)))
-                             (cond
-                              ;; Only a live returned token transfers prepared
-                              ;; attachments to message.send.  A synchronous
-                              ;; preflight failure leaves DISPATCHED nil.
-                              ((and active token)
-                               (setq send-token token
-                                     dispatched t)
-                               (setf (qq-native-request-token request) token))
-                              ;; A synchronous callback or cancellation may
-                              ;; revoke REQUEST before the token handoff.
-                              (token
-                               (condition-case cancellation-error
-                                   (qq-gateway-transport-cancel token)
-                                 ((error quit)
-                                  (message
-                                   "qq: orphan media send cancellation failed: %s"
-                                   (error-message-string
-                                    cancellation-error)))))
-                              (active
-                               (send-failed
-                                nil "Gateway message send did not start")))))
-                       (error
-                        (send-failed
-                         nil (error-message-string error-data)))))
-                   (setq returned-p t))
-               ;; DISPATCH can run from a later media completion, after the
-               ;; outer starter loop has returned.  Give its token handoff an
-               ;; independent quit boundary so no composite becomes ownerless.
-               (unless returned-p
-                 (abort-startup)))))
+           (if (not (equal owner (qq-gateway-current-account-id)))
+               (qq-native-cancel-request request)
+             (condition-case error-data
+                 (let ((token
+                        (qq-gateway-message-send
+                         session-key (append resolved nil) raw-message
+                         #'send-succeeded #'send-failed
+                         optimistic-segments)))
+                   ;; Nil is paired with a synchronous preflight failure.
+                   ;; Accepted requests complete later on the event loop.
+                   (when (and active token)
+                     (setq send-token token)
+                     (setf (qq-native-request-token request) token)))
+               (error
+                (send-failed nil (error-message-string error-data))))))
          (media-ready
            (plan attachment)
-           (let ((inhibit-quit t)
-                 (attachment-id (alist-get 'attachment_id attachment))
+           (let ((attachment-id (alist-get 'attachment_id attachment))
                  (resource-id (alist-get 'resource_id attachment)))
              (if (not active)
-                 ;; Cancellation can race service completion.  Release both
-                 ;; halves as one best-effort sweep before delivering C-g.
                  (progn
                    (qq-native--release-send-attachment attachment-id)
                    (qq-native--release-send-resource resource-id))
-               ;; Record ownership before the account check so a completion
-               ;; from a deselected slot cannot strand service objects.
                (push attachment-id attachment-ids)
-               (push resource-id resource-ids)
+               ;; The prepared attachment keeps the bytes alive, so the
+               ;; composite never needs to retain the extra resource lease.
+               (qq-native--release-send-resource resource-id)
                (unless (equal owner (qq-gateway-current-account-id))
                  (qq-native-cancel-request request))
                (when active
-                 ;; The Prepared Attachment already owns a Resource Lease.
-                 ;; Releasing now prevents unrelated future leases while the
-                 ;; service safely keeps bytes alive through send completion.
-                 (qq-native--release-send-resource resource-id)
-                 (setq resource-ids (delete resource-id resource-ids))
                  (aset resolved (plist-get plan :index)
                        `((type . ,(plist-get plan :kind))
                          (data . ((attachment_id . ,attachment-id)))))
@@ -869,69 +817,41 @@ while an unclaimed Ready attachment cannot be left without a client owner."
            ()
            (when active
              (setq active nil)
-             (if dispatched
-                 (cancel-dispatched)
-               (release-pre-dispatch))))
+             (cleanup)))
          (abort-startup
            ()
-           ;; A starter may signal after an earlier starter synchronously
-           ;; produced a Prepared Attachment.  Defer quit while sweeping each
-           ;; owned object, then preserve the starter's original nonlocal exit.
-           (let ((inhibit-quit t))
-             (when active
-               (setq active nil)
-               (if dispatched
-                   (cancel-dispatched)
-                 (release-pre-dispatch)))
-             (when request
-               (qq-native-request-fail request)))))
-      (let (returned-p)
-        (unwind-protect
-            (progn
-              ;; Make REQUEST visible to the cleanup clause before a pending
-              ;; quit can be delivered after registration.
-              (let ((inhibit-quit t))
-                (setq request
-                      (qq-native-request-create owner #'cancel)))
-              (dolist (plan plans)
-                (when active
-                  (let ((ready (apply-partially #'media-ready plan))
-                        operation
-                        handed-off-p)
-                    ;; Once a starter returns an operation, either transfer it
-                    ;; to OPERATIONS or revoke it locally.  This inner boundary
-                    ;; closes the quit window between return and `push'.
-                    (unwind-protect
-                        (let ((inhibit-quit t))
-                          (setq operation
-                                (pcase (plist-get plan :kind)
-                                  ("image"
-                                   (qq-gateway-attachment-stage-and-prepare-image
-                                    session-key (plist-get plan :path)
-                                    (plist-get plan :summary)
-                                    (plist-get plan :sub-type)
-                                    ready #'send-failed))
-                                  ("record"
-                                   (qq-gateway-attachment-stage-and-prepare-record
-                                    session-key (plist-get plan :path)
-                                    ready #'send-failed))
-                                  (_ (error "qq: Unknown local media plan"))))
-                          (when (qq-gateway-attachment-operation-active-p
-                                 operation)
-                            (if active
-                                (push operation operations)
-                              (cancel-operation operation)))
-                          (setq handed-off-p t))
-                      (unless handed-off-p
-                        (let ((inhibit-quit t))
-                          (when (and operation
-                                     (qq-gateway-attachment-operation-active-p
-                                      operation))
-                            (cancel-operation operation))))))))
-              (setq returned-p t)
-              request)
-          (unless returned-p
-            (abort-startup)))))))
+           (when active
+             (setq active nil)
+             (cleanup))
+           (when request
+             (qq-native-request-fail request))))
+      (condition-case error-data
+          (progn
+            (setq request (qq-native-request-create owner #'cancel))
+            (dolist (plan plans)
+              (when active
+                (let* ((ready (apply-partially #'media-ready plan))
+                       (operation
+                        (pcase (plist-get plan :kind)
+                          ("image"
+                           (qq-gateway-attachment-stage-and-prepare-image
+                            session-key (plist-get plan :path)
+                            (plist-get plan :summary)
+                            (plist-get plan :sub-type)
+                            ready #'send-failed))
+                          ("record"
+                           (qq-gateway-attachment-stage-and-prepare-record
+                            session-key (plist-get plan :path)
+                            ready #'send-failed))
+                          (_ (error "qq: Unknown local media plan")))))
+                  (when (qq-gateway-attachment-operation-active-p operation)
+                    (if active
+                        (push operation operations)
+                      (cancel-operation operation))))))
+            request)
+        ((error quit)
+         (abort-startup)
+         (signal (car error-data) (cdr error-data)))))))
 
 (defun qq-native-send-message
     (session-key segments &optional raw-message callback errback)
@@ -940,7 +860,7 @@ while an unclaimed Ready attachment cannot be left without a client owner."
 Local image paths are copied into the service Resource Store and local PCM WAV
 records are first derived into message-ready Tencent Silk.  Both are prepared
 for the selected account and conversation, then replaced by opaque attachment
-IDs before the closed wire request is sent.  RAW-MESSAGE is an
+IDs before the wire request is sent.  RAW-MESSAGE is an
 optional optimistic rendering override.  The pending row is promoted only by
 the later authoritative self event."
   (let ((plans
@@ -1009,7 +929,7 @@ service receipt; ERRBACK receives failure details."
   "Apply todo OPERATION to normalized native group MESSAGE.
 
 OPERATION must be one of `set', `complete', or `cancel'.  CALLBACK receives
-the successful closed receipt; ERRBACK receives failure details."
+the successful receipt; ERRBACK receives failure details."
   (unless (listp message)
     (user-error "qq: Todo action requires a normalized message"))
   (unless (memq operation '(set complete cancel))
@@ -1091,29 +1011,17 @@ sequence metadata."
              reference-position
              (> candidate-position reference-position))))))
 
-(defun qq-native--cancel-read-token (token)
-  "Best-effort cancel one read-report transport TOKEN."
-  (when token
-    (let ((inhibit-quit t))
-      (condition-case error-data
-          (qq-gateway-transport-cancel token)
-        ((error quit)
-         (message "qq: read-report cancellation failed: %s"
-                  (error-message-string error-data)))))))
-
 (defun qq-native--cancel-read-operation (session-key operation)
-  "Revoke OPERATION, its queued intent, and its current leaf token."
+  "Revoke OPERATION, its queued intent, and its transport token."
   (when (qq-native--read-operation-current-p session-key operation)
     (remhash session-key qq-native--read-operations))
-  ;; Detach before touching the transport.  This is intentionally safe even
-  ;; after the session hash was replaced wholesale by account revocation.
-  (let ((token (qq-native--read-operation-leaf-token operation)))
-    (setf (qq-native--read-operation-leaf-id operation) nil
-          (qq-native--read-operation-leaf-token operation) nil
+  (let ((token (qq-native--read-operation-token operation)))
+    (setf (qq-native--read-operation-token operation) nil
           (qq-native--read-operation-next-message operation) nil
           (qq-native--read-operation-next-callback operation) nil
           (qq-native--read-operation-next-errback operation) nil)
-    (qq-native--cancel-read-token token)))
+    (when token
+      (qq-gateway-transport-cancel token))))
 
 (defun qq-native--advance-read-operation
     (session-key operation success-p)
@@ -1121,146 +1029,91 @@ sequence metadata."
 
 The stable composite request remains active while a queued read intent exists
 and becomes terminal only after the actual queue is empty."
-  (let ((request (qq-native--read-operation-request operation))
-        advanced-p)
-    (unwind-protect
-        (progn
-          (if-let* ((message
-                     (qq-native--read-operation-next-message operation)))
-              (progn
-                (setf (qq-native--read-operation-message operation) message
-                      (qq-native--read-operation-callback operation)
-                      (qq-native--read-operation-next-callback operation)
-                      (qq-native--read-operation-errback operation)
-                      (qq-native--read-operation-next-errback operation)
-                      (qq-native--read-operation-next-message operation) nil
-                      (qq-native--read-operation-next-callback operation) nil
-                      (qq-native--read-operation-next-errback operation) nil)
-                ;; OPERATION is already published in the session hash.
-                ;; Dispatching now makes callback reentry observe this live
-                ;; successor request.
-                (qq-native--dispatch-read-operation session-key operation))
-            (remhash session-key qq-native--read-operations)
-            (if success-p
-                (qq-native-request-finish request)
-              (qq-native-request-fail request)))
-          (setq advanced-p t))
-      (unless advanced-p
-        (qq-native-cancel-request request)))))
+  (if-let* ((message (qq-native--read-operation-next-message operation)))
+      (progn
+        (setf (qq-native--read-operation-message operation) message
+              (qq-native--read-operation-callback operation)
+              (qq-native--read-operation-next-callback operation)
+              (qq-native--read-operation-errback operation)
+              (qq-native--read-operation-next-errback operation)
+              (qq-native--read-operation-next-message operation) nil
+              (qq-native--read-operation-next-callback operation) nil
+              (qq-native--read-operation-next-errback operation) nil)
+        ;; Publish the successor before leaf delivery so callback reentry sees
+        ;; the stable composite request still in flight.
+        (qq-native--dispatch-read-operation session-key operation))
+    (remhash session-key qq-native--read-operations)
+    (if success-p
+        (qq-native-request-finish
+         (qq-native--read-operation-request operation))
+      (qq-native-request-fail
+       (qq-native--read-operation-request operation)))))
 
 (defun qq-native--settle-read-leaf
-    (session-key operation leaf-id success-p body value)
-  "Settle OPERATION's exact LEAF-ID with BODY and VALUE."
-  (when (and (qq-native--read-operation-current-p session-key operation)
-             (eq leaf-id (qq-native--read-operation-leaf-id operation)))
+    (session-key operation success-p body value)
+  "Settle OPERATION's current read report with BODY and VALUE."
+  (when (qq-native--read-operation-current-p session-key operation)
     (let* ((request (qq-native--read-operation-request operation))
            (callback
             (if success-p
                 (qq-native--read-operation-callback operation)
               (or (qq-native--read-operation-errback operation)
-                  #'qq-native--default-error)))
-           deliver-p
-           transitioned-p)
-      ;; The cleanup protects the tiny leaf-detach/queue-transition boundary;
-      ;; the user callback runs only after that boundary has either committed
-      ;; or revoked the composite request.
-      (unwind-protect
-          (progn
-            (setf (qq-native--read-operation-leaf-id operation) nil
-                  (qq-native--read-operation-leaf-token operation) nil)
-            (if (not (qq-native-request--owner-current-p request))
-                (qq-native-cancel-request request)
-              (setq deliver-p t)
-              (qq-native--advance-read-operation
-               session-key operation success-p))
-            (setq transitioned-p t))
-        (unless transitioned-p
-          (qq-native-cancel-request request))
-        (when deliver-p
-          (if success-p
-              (qq-native-request--invoke callback value)
-            (qq-native-request--invoke callback body value)))))))
+                  #'qq-native--default-error))))
+      (setf (qq-native--read-operation-token operation) nil)
+      (if (not (qq-native-request--owner-current-p request))
+          (qq-native-cancel-request request)
+        (qq-native--advance-read-operation session-key operation success-p)
+        (if success-p
+            (qq-native-request--invoke callback value)
+          (qq-native-request--invoke callback body value))))))
 
 (defun qq-native--dispatch-read-operation (session-key operation)
   "Dispatch OPERATION's current leaf for SESSION-KEY."
-  (let ((leaf-id (list 'qq-native-read-leaf))
-        (request (qq-native--read-operation-request operation))
-        returned-p)
-    (unwind-protect
-        (progn
-          ;; Cover the adapter call and token adoption with one synchronous
-          ;; handoff.  Pending C-g is delivered only after the leaf token is
-          ;; either owned by OPERATION or canceled as an orphan.
-          (let ((inhibit-quit t))
-            (setf (qq-native--read-operation-leaf-id operation) leaf-id
-                  (qq-native--read-operation-leaf-token operation) nil)
-            (let ((token
-                   (qq-gateway-message-mark-read
-                    (qq-native--read-operation-message operation)
-                    (lambda (receipt)
-                      (qq-native--settle-read-leaf
-                       session-key operation leaf-id t nil receipt))
-                    (lambda (body reason)
-                      (qq-native--settle-read-leaf
-                       session-key operation leaf-id nil body reason)))))
-              (cond
-               ((and (qq-native--read-operation-current-p
-                      session-key operation)
-                     (eq leaf-id
-                         (qq-native--read-operation-leaf-id operation))
-                     (qq-native-request-active-p request))
-                (if token
-                    (setf (qq-native--read-operation-leaf-token operation)
-                          token)
-                  (qq-native--settle-read-leaf
-                   session-key operation leaf-id nil nil
-                   "Gateway read report did not start")))
-               ;; A synchronous callback or reentrant revocation can retire or
-               ;; advance the leaf before its starter returns a token.
-               (token
-                (qq-native--cancel-read-token token)))))
-          (setq returned-p t)
-          request)
-      (unless returned-p
-        (when (and (qq-native--read-operation-current-p
-                    session-key operation)
-                   (eq leaf-id
-                       (qq-native--read-operation-leaf-id operation)))
-          (qq-native-cancel-request request))))))
+  (let* ((request (qq-native--read-operation-request operation))
+         (token
+          (qq-gateway-message-mark-read
+           (qq-native--read-operation-message operation)
+           (lambda (receipt)
+             (qq-native--settle-read-leaf
+              session-key operation t nil receipt))
+           (lambda (body reason)
+             (qq-native--settle-read-leaf
+              session-key operation nil body reason)))))
+    ;; A nil token is paired with a synchronous failure callback.  Every
+    ;; non-nil token completes later through the transport event loop.
+    (when (and token
+               (qq-native--read-operation-current-p session-key operation)
+               (qq-native-request-active-p request))
+      (setf (qq-native--read-operation-token operation) token))
+    request))
 
 (defun qq-native--start-mark-message-read (message callback errback)
   "Start one native read report for exact MESSAGE."
   (let* ((session-key (alist-get 'session-key message))
          (owner (qq-gateway-current-account-id))
          request
-         operation
-         returned-p)
-    (unwind-protect
+         operation)
+    (condition-case error-data
         (progn
-          ;; Publish the stable composite and its cancel closure atomically
-          ;; with respect to quit.  The raw transport token never becomes the
-          ;; product request's identity.
-          (let ((inhibit-quit t))
-            (setq request
-                  (qq-native-request-create
-                   owner
-                   (lambda ()
-                     (qq-native--cancel-read-operation
-                      session-key operation)))
-                  operation
-                  (qq-native--read-operation-create
-                   :owner (copy-tree owner)
-                   :request request
-                   :message message
-                   :callback callback
-                   :errback errback))
-            (puthash session-key operation qq-native--read-operations))
+          (setq operation
+                (qq-native--read-operation-create
+                 :owner (copy-sequence owner)
+                 :message message
+                 :callback callback
+                 :errback errback))
+          (setq request
+                (qq-native-request-create
+                 owner
+                 (lambda ()
+                   (qq-native--cancel-read-operation session-key operation))))
+          (setf (qq-native--read-operation-request operation) request)
+          (puthash session-key operation qq-native--read-operations)
           (qq-native--dispatch-read-operation session-key operation)
-          (setq returned-p t)
           request)
-      (unless returned-p
+      ((error quit)
         (when request
-          (qq-native-cancel-request request))))))
+          (qq-native-cancel-request request))
+        (signal (car error-data) (cdr error-data))))))
 
 (defun qq-native-mark-message-read (message &optional callback errback)
   "Advance native read state through normalized MESSAGE.
@@ -1678,8 +1531,8 @@ no public Native Session identity or counter is required."
                 (instance-id (qq-gateway-transport-gateway-instance-id)))
       (let ((context (list instance-id account-id)))
         (unless (equal context qq-native--recent-resync-context)
-          ;; Publish ownership before starting because adapters may complete
-          ;; synchronously in tests or on an immediate readiness error.
+          ;; Publish ownership before starting because a preflight failure
+          ;; reports through the error callback before the starter returns.
           (setq qq-native--recent-resync-context (copy-tree context))
           (qq-native-refresh-recent-conversations
            (apply-partially
@@ -1703,7 +1556,8 @@ no public Native Session identity or counter is required."
         qq-native--group-directory-owner nil
         qq-native--observed-account-id nil
         qq-native--observed-account-phase nil
-        qq-native--recent-resync-context nil)
+        qq-native--recent-resync-context nil
+        qq-native--recent-request nil)
   (qq-native--revoke-read-operations)
   (qq-native-request-revoke-all)
   (qq-gateway-attachment-reset)

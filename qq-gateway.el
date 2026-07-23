@@ -18,11 +18,6 @@
 (require 'qq-gateway-wire)
 (require 'qq-protocol)
 
-(defconst qq-gateway--account-phases
-  '("stopped" "starting" "login_required" "logging_in" "online"
-    "reconnecting" "stopping" "logged_out" "failed")
-  "Closed account phase vocabulary for native service protocol v2.")
-
 (defvar qq-gateway-accounts-changed-hook nil
   "Hook called with REASON and ACCOUNT-ID after the local registry changes.
 
@@ -51,6 +46,23 @@ Gateway-owned registries without inspecting raw transport events.")
 (defvar qq-gateway--resync-request-id nil
   "Identity of the in-flight automatic account registry resync.")
 
+(cl-defstruct (qq-gateway-watch
+               (:constructor qq-gateway-watch-create))
+  "Cancellable local observer of a Gateway projection."
+  active-p
+  cancel-function)
+
+(defun qq-gateway-watch-cancel (watch)
+  "Detach active projection WATCH exactly once."
+  (when (and (qq-gateway-watch-p watch)
+             (qq-gateway-watch-active-p watch))
+    (let ((cancel (qq-gateway-watch-cancel-function watch)))
+      (setf (qq-gateway-watch-active-p watch) nil
+            (qq-gateway-watch-cancel-function watch) nil)
+      (when cancel
+        (funcall cancel))
+      t)))
+
 (defun qq-gateway--run-hook (hook &rest arguments)
   "Run each function on HOOK with ARGUMENTS, isolating consumer errors."
   (apply
@@ -65,11 +77,11 @@ Gateway-owned registries without inspecting raw transport events.")
    arguments))
 
 (defun qq-gateway--invoke (callback &rest arguments)
-  "Compatibility wrapper invoking CALLBACK with owned ARGUMENTS."
+  "Invoke CALLBACK with owned copies of ARGUMENTS."
   (apply #'qq-gateway-rpc-invoke callback arguments))
 
 (defun qq-gateway--client-error (errback code format-string &rest arguments)
-  "Compatibility wrapper invoking ERRBACK with client CODE.
+  "Invoke ERRBACK with client CODE.
 
 FORMAT-STRING and ARGUMENTS produce the human-readable failure text."
   (apply #'qq-gateway-rpc-client-error
@@ -113,87 +125,6 @@ canonical string `0' additionally qualifies."
   (and (qq-gateway--canonical-decimal-p value allow-zero)
        (not (qq-gateway--decimal-less-p
              qq-gateway--max-uint64-decimal value))))
-
-(defun qq-gateway--validate-optional-string (value context)
-  "Validate optional string VALUE for CONTEXT."
-  (unless (or (null value) (stringp value))
-    (error "qq: %s must be a string or null" context)))
-
-(defun qq-gateway--validate-challenge (challenge)
-  "Validate and copy a login CHALLENGE, or return nil."
-  (setq challenge (qq-gateway-wire-nullable challenge))
-  (when challenge
-    (unless (qq-gateway-wire-object-p challenge)
-      (error "qq: QQ account challenge must be an object or null"))
-    (let ((kind (alist-get 'kind challenge)))
-      (pcase kind
-        ("captcha"
-         (unless (qq-gateway--exact-object-keys-p
-                  challenge '(kind challenge_id url sid))
-           (error "qq: Gateway captcha challenge has invalid fields"))
-         (qq-gateway--validate-optional-string
-          (qq-gateway-wire-nullable (alist-get 'url challenge)) "captcha URL")
-         (qq-gateway--validate-optional-string
-          (qq-gateway-wire-nullable (alist-get 'sid challenge)) "captcha sid"))
-        ("new_device"
-         (unless (qq-gateway--exact-object-keys-p
-                  challenge '(kind challenge_id jump_url))
-           (error "qq: Gateway new-device challenge has invalid fields"))
-         (qq-gateway--validate-optional-string
-          (qq-gateway-wire-nullable (alist-get 'jump_url challenge))
-          "new-device jump URL"))
-        ("unusual_device"
-         (unless (qq-gateway--exact-object-keys-p
-                  challenge '(kind challenge_id))
-           (error "qq: Gateway unusual-device challenge has invalid fields")))
-        (_ (error "qq: QQ account challenge has unknown kind %S" kind)))
-      (unless (qq-gateway--non-empty-string-p
-               (alist-get 'challenge_id challenge))
-        (error "qq: Gateway challenge_id must be a non-empty string"))
-      (qq-gateway-wire-domain-copy challenge))))
-
-(defun qq-gateway--validate-problem (problem)
-  "Validate and copy account PROBLEM, or return nil."
-  (setq problem (qq-gateway-wire-nullable problem))
-  (when problem
-    (unless (and (qq-gateway--exact-object-keys-p problem '(code message))
-                 (qq-gateway--non-empty-string-p (alist-get 'code problem))
-                 (qq-gateway--non-empty-string-p (alist-get 'message problem)))
-      (error "qq: QQ account problem is malformed"))
-    (qq-gateway-wire-domain-copy problem)))
-
-(defun qq-gateway--validate-account (snapshot)
-  "Validate and copy one closed managed-account SNAPSHOT."
-  (unless (qq-gateway--exact-object-keys-p
-           snapshot
-           '(account_id label phase uin uid challenge problem))
-    (error "qq: QQ account snapshot has invalid fields"))
-  (let ((account-id (alist-get 'account_id snapshot))
-        (label (qq-gateway-wire-nullable
-                (alist-get 'label snapshot nil nil #'eq)))
-        (phase (alist-get 'phase snapshot))
-        (uin (qq-gateway-wire-nullable
-              (alist-get 'uin snapshot nil nil #'eq)))
-        (uid (qq-gateway-wire-nullable
-              (alist-get 'uid snapshot nil nil #'eq))))
-    (unless (qq-gateway--non-empty-string-p account-id)
-      (error "qq: QQ account_id must be a non-empty opaque string"))
-    (unless (or (null label)
-                (and (qq-gateway--non-empty-string-p label)
-                     (equal label (string-trim label))
-                     (<= (length label) 128)))
-      (error "qq: QQ account label is invalid"))
-    (unless (member phase qq-gateway--account-phases)
-      (error "qq: QQ account phase is invalid"))
-    (unless (or (null uin) (qq-gateway--uint64-decimal-p uin))
-      (error "qq: QQ account UIN must be a canonical nonzero uint64 string or null"))
-    (unless (or (null uid) (qq-gateway--non-empty-string-p uid))
-      (error "qq: QQ account UID must be an opaque string or null"))
-    (qq-gateway--validate-challenge
-     (alist-get 'challenge snapshot nil nil #'eq))
-    (qq-gateway--validate-problem
-     (alist-get 'problem snapshot nil nil #'eq))
-    (qq-gateway-wire-domain-copy snapshot)))
 
 (defun qq-gateway-account (account-id)
   "Return a copy of managed ACCOUNT-ID's snapshot, or nil."
@@ -277,13 +208,10 @@ canonical string `0' additionally qualifies."
 
 (defun qq-gateway--replace-accounts (snapshots reason instance-id)
   "Replace the registry with SNAPSHOTS for REASON and INSTANCE-ID."
-  (setq snapshots
-        (qq-gateway-wire-array snapshots "QQ account snapshots" t))
   (let ((next (make-hash-table :test #'equal))
         order)
-    (dolist (raw snapshots)
-      (let* ((snapshot (qq-gateway--validate-account raw))
-             (account-id (alist-get 'account_id snapshot)))
+    (dolist (snapshot snapshots)
+      (let ((account-id (alist-get 'account_id snapshot)))
         (when (gethash account-id next)
           (error "qq: Duplicate QQ account ID %s" account-id))
         (puthash account-id snapshot next)
@@ -297,8 +225,8 @@ canonical string `0' additionally qualifies."
     (qq-gateway-accounts)))
 
 (defun qq-gateway--upsert-account (raw-snapshot reason)
-  "Validate and merge RAW-SNAPSHOT for REASON."
-  (let* ((snapshot (qq-gateway--validate-account raw-snapshot))
+  "Merge domain account RAW-SNAPSHOT for REASON."
+  (let* ((snapshot raw-snapshot)
          (account-id (alist-get 'account_id snapshot))
          (existing (gethash account-id qq-gateway--accounts)))
     (unless existing
@@ -323,14 +251,6 @@ canonical string `0' additionally qualifies."
        'qq-gateway-accounts-changed-hook reason account-id))
     old))
 
-(defun qq-gateway--validate-account-list-result (result)
-  "Validate and return accounts carried by account.list RESULT."
-  (unless (qq-gateway--exact-object-keys-p result '(accounts))
-    (error "qq: QQ account.list result has invalid fields"))
-  (qq-gateway-wire-array
-   (alist-get 'accounts result nil nil #'eq)
-   "QQ account.list accounts"))
-
 (defun qq-gateway--method-available-p (method)
   "Compatibility wrapper checking whether Gateway advertises METHOD."
   (qq-gateway-rpc-method-available-p method))
@@ -342,11 +262,10 @@ CALLBACK receives the copied account list.  ERRBACK follows the transport
 error convention.  REASON defaults to `resync'."
   (qq-gateway-rpc-latest-call
    'qq-gateway--refresh-owner "account.list" nil
-   :decoder #'qq-gateway--validate-account-list-result
    :projector
-   (lambda (accounts)
+   (lambda (result)
      (qq-gateway--replace-accounts
-      accounts (or reason 'resync)
+      (alist-get 'accounts result) (or reason 'resync)
       (qq-gateway-transport-gateway-instance-id)))
    :callback callback
    :errback errback))
@@ -355,20 +274,14 @@ error convention.  REASON defaults to `resync'."
     (method account-id callback errback &optional remove-p)
   "Send account METHOD for ACCOUNT-ID and update the local registry.
 
-CALLBACK receives the validated account snapshot and ERRBACK receives a
-protocol error body plus reason.
+CALLBACK receives the domain account snapshot and ERRBACK receives a protocol
+error body plus reason.
 
 When REMOVE-P is non-nil, remove the returned snapshot instead of merging it."
   (unless (qq-gateway--non-empty-string-p account-id)
     (user-error "qq: Account ID must be a non-empty opaque string"))
   (qq-gateway-rpc-call
    method `((account_id . ,account-id))
-   :decoder
-   (lambda (result)
-     (let ((snapshot (qq-gateway--validate-account result)))
-       (unless (equal account-id (alist-get 'account_id snapshot))
-         (error "qq: Gateway response account_id contradicts request"))
-       snapshot))
    :projector
    (lambda (snapshot)
      (if remove-p
@@ -405,7 +318,6 @@ CALLBACK receives its snapshot; ERRBACK receives a failure body and reason."
       (user-error "qq: Account label must be trimmed and at most 128 characters")))
   (qq-gateway-rpc-call
    "account.create" (if label `((label . ,label)) '((label)))
-   :decoder #'qq-gateway--validate-account
    :projector
    (lambda (snapshot)
      (setq snapshot (qq-gateway--upsert-account snapshot 'response))
@@ -428,31 +340,12 @@ CALLBACK receives the snapshot; ERRBACK receives a failure body and reason."
   (qq-gateway--account-command
    "account.status" account-id callback errback))
 
-(defun qq-gateway--validate-presence-receipt (result account-id presence)
-  "Validate account presence RESULT against ACCOUNT-ID and PRESENCE.
-
-The receipt acknowledges the command; it is not an authoritative account
-snapshot."
-  (unless (qq-gateway--exact-object-keys-p
-           result '(account_id presence))
-    (error "qq: QQ account.set_presence result has invalid fields"))
-  (let ((returned-account-id (alist-get 'account_id result))
-        (returned-presence
-         (qq-protocol-validate-account-presence
-          (alist-get 'presence result) "Gateway presence receipt")))
-    (unless (equal returned-account-id account-id)
-      (error "qq: Gateway presence receipt account_id contradicts request"))
-    (unless (equal returned-presence presence)
-      (error "qq: Gateway presence receipt contradicts requested presence"))
-    `((account_id . ,returned-account-id)
-      (presence . ,returned-presence))))
-
 ;;;###autoload
 (defun qq-gateway-account-set-presence
     (account-id presence &optional callback errback)
   "Set PRESENCE for managed ACCOUNT-ID.
 
-CALLBACK receives a closed acknowledgement carrying the account ID and
+CALLBACK receives an acknowledgement carrying the account ID and
 requested presence.  This command does not change the account lifecycle phase
 or store presence in the local account snapshot."
   (unless (qq-gateway--non-empty-string-p account-id)
@@ -465,9 +358,6 @@ or store presence in the local account snapshot."
   (qq-gateway-rpc-call
    "account.set_presence"
    `((account_id . ,account-id) (presence . ,presence))
-   :decoder
-   (lambda (result)
-     (qq-gateway--validate-presence-receipt result account-id presence))
    :callback callback
    :errback errback))
 
@@ -496,12 +386,6 @@ snapshot; ERRBACK receives a failure body and reason."
         (qq-gateway-rpc-call
          method (append `((account_id . ,account-id))
                         (funcall params secret-copy))
-         :decoder
-         (lambda (result)
-           (let ((snapshot (qq-gateway--validate-account result)))
-             (unless (equal account-id (alist-get 'account_id snapshot))
-               (error "qq: Gateway login response account_id contradicts request"))
-             snapshot))
          :projector
          (lambda (snapshot)
            (qq-gateway--upsert-account snapshot 'response))
@@ -680,16 +564,8 @@ reason."
   "Project native service EVENT with DATA into the account registry."
   (pcase event
     ("gateway.ready"
-     (unless (qq-gateway--exact-object-keys-p
-              data '(gateway_instance_id accounts))
-       (error "qq: Gateway.ready data has invalid fields"))
      (let ((instance-id (alist-get 'gateway_instance_id data))
-           (accounts
-            (qq-gateway-wire-array
-             (alist-get 'accounts data nil nil #'eq)
-             "Gateway.ready accounts")))
-       (unless (qq-gateway--non-empty-string-p instance-id)
-         (error "qq: Gateway.ready data is malformed"))
+           (accounts (alist-get 'accounts data)))
        (let ((resync-marker qq-gateway--resync-request-id))
          (qq-gateway-rpc-cancel-latest
           'qq-gateway--refresh-owner "superseded_request"
@@ -703,10 +579,6 @@ reason."
     ("account.changed"
      (qq-gateway--upsert-account data 'changed))
     ("account.removed"
-     (unless (and (qq-gateway--exact-object-keys-p data '(account_id))
-                  (qq-gateway--non-empty-string-p
-                   (alist-get 'account_id data)))
-       (error "qq: Account.removed data is malformed"))
      (qq-gateway--remove-account
       (alist-get 'account_id data) 'removed))
     (_ (error "qq: Unowned Gateway account event %s" event))))

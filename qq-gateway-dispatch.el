@@ -12,6 +12,7 @@
 
 (require 'subr-x)
 (require 'qq-gateway-transport)
+(require 'qq-gateway-wire)
 
 (defvar qq-gateway-dispatch--event-handlers
   (make-hash-table :test #'equal)
@@ -40,7 +41,7 @@ safe.  A different owner for an existing NAME is an architecture error."
 (defun qq-gateway-dispatch-register-event (event handler)
   "Make named HANDLER the sole domain owner of native EVENT.
 
-HANDLER receives EVENT and its raw DATA value."
+HANDLER receives EVENT and an owned, recursively domainized DATA value."
   (qq-gateway-dispatch--register
    qq-gateway-dispatch--event-handlers "event" event handler))
 
@@ -55,16 +56,12 @@ HANDLER receives the validated protocol error body."
   "Route native EVENT and DATA to its explicit domain owner.
 
 Unknown events remain observable through the transport hook but are ignored by
-the closed client projection.  A domain validation failure is one protocol
-violation, regardless of how many higher-level projections are loaded."
+the client projection.  Transport has already established the exact protocol
+version; feature-handler failures are client projection errors, not reasons to
+reconnect a healthy socket."
   (let ((handler (gethash event qq-gateway-dispatch--event-handlers)))
     (when handler
-      (condition-case error-data
-          (funcall handler event data)
-        (error
-         (qq-gateway-transport--protocol-violation
-          "Malformed %s event: %s"
-          event (error-message-string error-data)))))))
+      (funcall handler event (qq-gateway-wire-domain-copy data)))))
 
 (defun qq-gateway-dispatch--handle-transport-error (body)
   "Route unsolicited protocol error BODY by its exact code.
@@ -76,7 +73,7 @@ bug rather than malformed wire data, so it is isolated without reconnecting."
                        (gethash code qq-gateway-dispatch--error-handlers))))
     (when handler
       (condition-case error-data
-          (funcall handler body)
+          (funcall handler (qq-gateway-wire-domain-copy body))
         (error
          (message "qq: Gateway error handler %S failed for %s: %s"
                   handler code (error-message-string error-data)))))))

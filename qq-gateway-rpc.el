@@ -43,24 +43,22 @@ preflight failures preserve the request API's unavailable-token convention."
   (member method (qq-gateway-transport-capabilities)))
 
 (defun qq-gateway-rpc--success
-    (result decoder projector callback errback current-p
+    (result projector callback errback current-p
             stale-code stale-message)
-  "Transform one successful RESULT and invoke CALLBACK.
+  "Own and project one successful RESULT, then invoke CALLBACK.
 
-DECODER and PROJECTOR are optional unary functions.  CURRENT-P is an optional
-zero-argument context predicate.  ERRBACK receives STALE-CODE and
-STALE-MESSAGE when the predicate normally returns nil.  Signals from the
-predicate or either transformer are reported as `invalid_gateway_result'."
+This boundary performs the sole wire-to-domain ownership conversion before
+the optional unary PROJECTOR runs.  CURRENT-P is an optional zero-argument
+context predicate.  ERRBACK receives STALE-CODE and STALE-MESSAGE when the
+predicate normally returns nil.  Signals from the predicate or PROJECTOR are
+reported as `invalid_gateway_result'."
   (let ((outcome
          (condition-case error-data
              (if (and current-p (not (funcall current-p)))
                  '(stale)
-               (let* ((decoded (if decoder
-                                   (funcall decoder result)
-                                 result))
-                      (projected (if projector
-                                     (funcall projector decoded)
-                                   decoded)))
+               (let* ((domain (qq-gateway-wire-domain-copy result))
+                      (projected
+                       (if projector (funcall projector domain) domain)))
                  (list 'ok projected)))
            (error (list 'invalid error-data)))))
     (pcase (car outcome)
@@ -103,14 +101,14 @@ contract failure and is therefore reported as `invalid_gateway_result'."
 
 (cl-defun qq-gateway-rpc-call
     (method params
-            &key decoder projector callback errback current-p
+            &key projector callback errback current-p
             (stale-code "stale_request")
             (stale-message "Gateway request context is no longer current"))
   "Call advertised Gateway METHOD with PARAMS through the typed RPC boundary.
 
-DECODER validates and domainizes the successful wire result.  PROJECTOR may
-then update a client-side projection and returns the value for CALLBACK.
-Both are optional unary functions.  Any ordinary error they signal becomes
+This RPC boundary recursively owns and domainizes the successful wire result
+before PROJECTOR may update an adapter-side projection and return the value
+for CALLBACK.  PROJECTOR is optional.  Any ordinary error it signals becomes
 an `invalid_gateway_result' delivered to ERRBACK.
 
 When optional CURRENT-P normally returns nil, skip transformation and report
@@ -118,9 +116,10 @@ STALE-CODE with STALE-MESSAGE.  An error signaled by CURRENT-P is treated like
 a transformer error.  User CALLBACK and ERRBACK functions are isolated leaf
 consumers and receive owned copies.
 
-Preflight errors invoke ERRBACK synchronously and return nil.  Otherwise
-return exactly the opaque token from `qq-gateway-transport-send'.  Transport
-signals are deliberately not caught."
+Preflight errors invoke ERRBACK synchronously and return nil.  Otherwise return
+exactly the opaque token from `qq-gateway-transport-send'; accepted work
+completes later on the transport event loop.  Transport signals are
+deliberately not caught."
   (cond
    ((not (qq-gateway-transport-ready-p))
     (qq-gateway-rpc-client-error
@@ -134,7 +133,7 @@ signals are deliberately not caught."
      method params
      (lambda (result)
        (qq-gateway-rpc--success
-        result decoder projector callback errback current-p
+        result projector callback errback current-p
         stale-code stale-message))
      (lambda (body reason)
        (qq-gateway-rpc--failure
@@ -146,8 +145,7 @@ signals are deliberately not caught."
   state
   transport-token
   errback
-  owner-symbol
-  method)
+  owner-symbol)
 
 (defun qq-gateway-rpc--latest-request-current-p (request)
   "Return non-nil when REQUEST is active and still owns its registry."
@@ -187,103 +185,77 @@ signals are deliberately not caught."
   "Cancel and settle the request currently stored in OWNER-SYMBOL.
 
 CODE defaults to `superseded_request'.  MESSAGE is copied into the standard
-client error delivered exactly once to the request errback.  Legacy opaque
-owners left by a live reload are safely revoked but cannot be cancelled."
+client error delivered exactly once to the request errback."
   (let ((request (symbol-value owner-symbol)))
-    (cond
-     ((qq-gateway-rpc-latest-request-p request)
+    (when (qq-gateway-rpc-latest-request-p request)
       (qq-gateway-rpc--cancel-latest-request
        request (or code "superseded_request")
-       (or message "Gateway registry request was superseded")))
-     (request
-      (when (eq request (symbol-value owner-symbol))
-        (set owner-symbol nil)
-        t)))))
+       (or message "Gateway registry request was superseded")))))
 
 (cl-defun qq-gateway-rpc-latest-call
     (owner-symbol method params
-                  &key decoder projector callback errback)
+                  &key projector callback errback)
   "Run the newest-owned registry request for OWNER-SYMBOL.
 
 Publish a request record before cancelling its predecessor or calling METHOD.
 The record owns the transport token and settles exactly once.  A newer call
 cancels and reports the predecessor as superseded before it sends; reentrant
 errbacks may themselves replace the new request.  Only the surviving owner
-may decode, project, or deliver.  Return the transport token; if synchronous
-callbacks already revoked this request, cancel that returned token immediately."
+may project or deliver.  Return the transport token."
   (let* ((previous (symbol-value owner-symbol))
          (request
           (qq-gateway-rpc-latest-request--create
            :state 'active :errback errback
-           :owner-symbol owner-symbol :method method))
-         returned-p)
+           :owner-symbol owner-symbol)))
     ;; Publish first so a predecessor's possibly reentrant errback observes
     ;; the replacement rather than an empty ownership window.
     (set owner-symbol request)
-    (unwind-protect
-        (prog1
-            (progn
-              (when previous
-                (if (qq-gateway-rpc-latest-request-p previous)
-                    (qq-gateway-rpc--cancel-latest-request
-                     previous "superseded_request"
-                     (format "Gateway %s request was superseded" method))
-                  ;; A live reload may leave an older opaque identity.  The
-                  ;; published record already makes its callbacks inert.
-                  nil))
-              (when (qq-gateway-rpc--latest-request-current-p request)
-                (cl-labels
-                    ((current-p ()
-                       (qq-gateway-rpc--latest-request-current-p request))
-                     (finish-success (value)
-                       (if (current-p)
-                           (when (qq-gateway-rpc--finish-latest-request request)
-                             (qq-gateway-rpc-invoke callback value))
-                         (when (qq-gateway-rpc--finish-latest-request request)
+    (condition-case error-data
+        (progn
+          (when (qq-gateway-rpc-latest-request-p previous)
+            (qq-gateway-rpc--cancel-latest-request
+             previous "superseded_request"
+             (format "Gateway %s request was superseded" method)))
+          (when (qq-gateway-rpc--latest-request-current-p request)
+            (cl-labels
+                ((current-p ()
+                   (qq-gateway-rpc--latest-request-current-p request))
+                 (finish-success (value)
+                   (if (current-p)
+                       (when (qq-gateway-rpc--finish-latest-request request)
+                         (qq-gateway-rpc-invoke callback value))
+                     (when (qq-gateway-rpc--finish-latest-request request)
+                       (qq-gateway-rpc-client-error
+                        errback "superseded_request"
+                        "Gateway %s request was superseded" method))))
+                 (finish-error (body failure)
+                   (when (eq (qq-gateway-rpc-latest-request-state request)
+                             'active)
+                     (let ((current (current-p)))
+                       (when (qq-gateway-rpc--finish-latest-request request)
+                         (if current
+                             (qq-gateway-rpc-invoke errback body failure)
                            (qq-gateway-rpc-client-error
                             errback "superseded_request"
-                            "Gateway %s request was superseded" method))))
-                     (finish-error (body failure)
-                       (when (eq (qq-gateway-rpc-latest-request-state request)
-                                 'active)
-                         (let ((current (current-p)))
-                           (when (qq-gateway-rpc--finish-latest-request request)
-                             (if current
-                                 (qq-gateway-rpc-invoke errback body failure)
-                               (qq-gateway-rpc-client-error
-                                errback "superseded_request"
-                                "Gateway %s request was superseded" method)))))))
-                  (let ((token
-                         (qq-gateway-rpc-call
-                          method params
-                          :current-p #'current-p
-                          :stale-code "superseded_request"
-                          :stale-message
-                          (format "Gateway %s request was superseded" method)
-                          :decoder decoder
-                          :projector
-                          (and projector
-                               (lambda (value)
-                                 (if (current-p)
-                                     (funcall projector value)
-                                   value)))
-                          :callback #'finish-success
-                          :errback #'finish-error)))
-                    ;; Publish the returned token only while REQUEST still
-                    ;; owns the slot.  A synchronous callback may have settled
-                    ;; or replaced it before `qq-gateway-rpc-call' returns; in
-                    ;; that case the token must not remain live and unowned.
-                    (if (current-p)
-                        (setf (qq-gateway-rpc-latest-request-transport-token
-                               request)
-                              token)
-                      (when token
-                        (qq-gateway-transport-cancel token)))
-                    token))))
-          (setq returned-p t))
-      ;; Preserve transport signals and quits without leaking a false owner.
-      (unless returned-p
-        (qq-gateway-rpc--finish-latest-request request)))))
+                            "Gateway %s request was superseded" method)))))))
+              (let ((token
+                     (qq-gateway-rpc-call
+                      method params
+                      :current-p #'current-p
+                      :stale-code "superseded_request"
+                      :stale-message
+                      (format "Gateway %s request was superseded" method)
+                      :projector projector
+                      :callback #'finish-success
+                      :errback #'finish-error)))
+                (when (and token (current-p))
+                  (setf
+                   (qq-gateway-rpc-latest-request-transport-token request)
+                   token))
+                token))))
+      ((error quit)
+       (qq-gateway-rpc--finish-latest-request request)
+       (signal (car error-data) (cdr error-data))))))
 
 (defun qq-gateway-rpc-request-single-flight
     (marker-symbol marker-tag starter failure-label)
@@ -308,12 +280,11 @@ the marker's own callbacks clear it.  FAILURE-LABEL names diagnostics."
                  (unless (equal (alist-get 'code body) "superseded_request")
                    (message "qq: Gateway %s resync failed: %s"
                             failure-label failure)))))
-          (let (returned-p)
-            (unwind-protect
-                (prog1 (funcall starter #'succeed #'fail)
-                  (setq returned-p t))
-              (unless returned-p
-                (finish))))))))
+          (condition-case error-data
+              (funcall starter #'succeed #'fail)
+            ((error quit)
+             (finish)
+             (signal (car error-data) (cdr error-data))))))))
 
 (provide 'qq-gateway-rpc)
 
