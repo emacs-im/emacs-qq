@@ -944,20 +944,20 @@ With FORCE, submit even when this buffer already requested the same target."
       (if (not (qq-native-message-read-capable-p message))
           (when force
             (user-error
-             "qq: this message lacks a reportable native read cursor"))
+             "qq: this message lacks a current stable Message Reference"))
         (let ((buffer (current-buffer))
               (session-key qq-chat--session-key))
           (qq-native-mark-message-read
            message
-           (lambda (receipt)
+           (lambda (_receipt)
              (when (buffer-live-p buffer)
                (with-current-buffer buffer
                  (when (equal qq-chat--session-key session-key)
-                   ;; A newer queued cursor may subsume this caller.  The
-                   ;; accepted receipt, not the captured request, is therefore
-                   ;; the confirmed local boundary.
-                   (setq qq-chat--last-read-target-id
-                         (alist-get 'read_through_message_id receipt))))))))))))
+                   ;; The Gateway acknowledgement proves remote completion,
+                   ;; but is not authoritative read state.  This callback
+                   ;; belongs to this dispatched reference, so it may advance
+                   ;; the buffer-local submission fence.
+                   (setq qq-chat--last-read-target-id message-id)))))))))))
 
 (defun qq-chat--manage-read-position (&optional position)
   "Advance read state to the message represented by POSITION.

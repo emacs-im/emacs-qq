@@ -45,21 +45,16 @@ SEQUENCE, SENDER, RECIPIENT, and CONVERSATION provide its native context."
      (revision "12")
      (message (qq-gateway-conversation-test-message))
      (recalled :false)
-     (pinned 'absent)
-     (read-cursor
-      '((read_through_message_id . "7348923749823749822")
-        (read_through_sequence . "9007199254740998")
-        (server_read_sequence . "9007199254740999"))))
+     (pinned 'absent))
   "Return a closed recent-conversation row for IDENTITY and REVISION.
 
-MESSAGE, RECALLED, PINNED, and READ-CURSOR supply its latest projection
-metadata.  The symbol `absent' omits unknown pin state."
+MESSAGE, RECALLED, and PINNED supply its latest projection metadata.  The
+symbol `absent' omits unknown pin state."
   `((conversation . ,(copy-tree identity))
     ,@(unless (eq pinned 'absent) `((pinned . ,pinned)))
     (activity_revision . ,revision)
     (latest_message . ,(copy-tree message))
-    (latest_message_recalled . ,recalled)
-    ,@(when read-cursor `((read_cursor . ,(copy-tree read-cursor))))))
+    (latest_message_recalled . ,recalled)))
 
 (cl-defun qq-gateway-conversation-test-page
     (&key
@@ -116,10 +111,9 @@ TRUNCATED is its exact wire boolean."
         (funcall success (qq-gateway-conversation-test-page)))
       (should (proper-list-p (alist-get 'conversations delivered)))
       (let* ((row (car (alist-get 'conversations delivered)))
-             (message (alist-get 'latest_message row))
-             (cursor (alist-get 'read_cursor row)))
+             (message (alist-get 'latest_message row)))
         (should-not (assq 'latest_message_generation row))
-        (should-not (assq 'generation cursor))
+        (should-not (assq 'read_cursor row))
         (should (proper-list-p (alist-get 'segments message)))
         (should (equal (alist-get 'message_id message)
                        "7348923749823749823"))))))
@@ -154,12 +148,10 @@ TRUNCATED is its exact wire boolean."
     (let* ((page (qq-gateway-conversation-test-page))
            (validated
             (qq-gateway-conversation--validate-page page "slot-a"))
-           (row (car (alist-get 'conversations validated)))
-           (cursor (alist-get 'read_cursor row)))
+           (row (car (alist-get 'conversations validated))))
       (should (equal (alist-get 'account_id validated) "slot-a"))
       (should-not (assq 'generation validated))
-      (should-not (assq 'latest_message_generation row))
-      (should-not (assq 'generation cursor)))))
+      (should-not (assq 'latest_message_generation row)))))
 
 (ert-deftest qq-gateway-conversation-decoder-is-closed-and-rejects-generation ()
   (qq-gateway-conversation-test-with-state
@@ -177,19 +169,12 @@ TRUNCATED is its exact wire boolean."
              (page (qq-gateway-conversation-test-page :rows (list row))))
         (should-error
          (qq-gateway-conversation--validate-page page owner)))
-      (let* ((cursor
-              '((generation . "8")
-                (read_through_message_id . "7348923749823749823")
-                (read_through_sequence . "10")))
-             (row (qq-gateway-conversation-test-row :read-cursor cursor))
-             (page (qq-gateway-conversation-test-page :rows (list row))))
-        (should-error
-         (qq-gateway-conversation--validate-page page owner)))
-      (let* ((cursor
-              '((read_through_message_id . "7348923749823749823")
-                (read_through_sequence . "10")
-                (server_read_sequence . "9")))
-             (row (qq-gateway-conversation-test-row :read-cursor cursor))
+      (let* ((row
+              (append
+               (qq-gateway-conversation-test-row)
+               '((read_cursor
+                  . ((read_through_message_id
+                      . "7348923749823749823"))))))
              (page (qq-gateway-conversation-test-page :rows (list row))))
         (should-error
          (qq-gateway-conversation--validate-page page owner)))

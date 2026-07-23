@@ -111,28 +111,6 @@ copies or weakens that schema."
                   context))))))
   message)
 
-(defun qq-gateway-conversation--validate-read-cursor (cursor context)
-  "Validate recent read CURSOR in CONTEXT."
-  (unless (qq-gateway-wire-closed-object-p
-           cursor
-           '(read_through_message_id read_through_sequence)
-           '(server_read_sequence))
-    (error "qq: Gateway %s read cursor has invalid fields" context))
-  (let ((message-id (alist-get 'read_through_message_id cursor))
-        (sequence (alist-get 'read_through_sequence cursor))
-        (server-entry (assq 'server_read_sequence cursor)))
-    (unless (qq-gateway--canonical-decimal-p message-id)
-      (error "qq: Gateway %s read cursor message_id is malformed" context))
-    (unless (qq-gateway--canonical-decimal-p sequence)
-      (error "qq: Gateway %s read cursor sequence is malformed" context))
-    (when server-entry
-      (let ((server-sequence (cdr server-entry)))
-        (unless (and (qq-gateway--canonical-decimal-p server-sequence)
-                     (not (qq-gateway--decimal-less-p
-                           server-sequence sequence)))
-          (error "qq: Gateway %s server read cursor regresses" context)))))
-  (qq-gateway-wire-domain-copy cursor))
-
 (defun qq-gateway-conversation--identity-key (identity message)
   "Return a closed duplicate-detection key for IDENTITY and latest MESSAGE."
   (pcase (alist-get 'kind identity)
@@ -158,7 +136,7 @@ SEEN-IDENTITIES and SEEN-REVISIONS reject duplicate closed projections."
              row
              '(conversation activity_revision latest_message
                latest_message_recalled)
-             '(pinned read_cursor))
+             '(pinned))
       (error "qq: Gateway %s has invalid fields" context))
     (let* ((identity
            (qq-gateway-conversation--validate-identity
@@ -169,11 +147,6 @@ SEEN-IDENTITIES and SEEN-REVISIONS reject duplicate closed projections."
              (alist-get 'latest_message row)))
            (recalled (alist-get 'latest_message_recalled row))
            (pinned-entry (assq 'pinned row))
-           (read-entry (assq 'read_cursor row))
-           (read-cursor
-            (and read-entry
-                 (qq-gateway-conversation--validate-read-cursor
-                  (cdr read-entry) context)))
            (identity-key
             (qq-gateway-conversation--identity-key identity message)))
       (unless (qq-gateway--canonical-decimal-p revision)
@@ -197,8 +170,7 @@ SEEN-IDENTITIES and SEEN-REVISIONS reject duplicate closed projections."
         (activity_revision . ,revision)
         (latest_message . ,message)
         (latest_message_recalled . ,recalled)
-        ,@(when pinned-entry `((pinned . ,(cdr pinned-entry))))
-        ,@(when read-entry `((read_cursor . ,read-cursor)))))))
+        ,@(when pinned-entry `((pinned . ,(cdr pinned-entry))))))))
 
 (defun qq-gateway-conversation--validate-page (page requested-account-id)
   "Validate a closed recent-conversation PAGE for REQUESTED-ACCOUNT-ID."
