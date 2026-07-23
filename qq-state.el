@@ -3165,33 +3165,12 @@ canonical history."
               (cl-every (lambda (key) (memq key (append required optional)))
                         keys)))))
 
-(defun qq-state--native-recent-read-cursor-p (cursor)
-  "Return non-nil when CURSOR is closed confirmed native read metadata."
-  (and (or (qq-protocol--closed-object-p
-            cursor
-            '(read_through_message_id read_through_sequence))
-           (qq-protocol--closed-object-p
-            cursor
-            '(read_through_message_id read_through_sequence
-              server_read_sequence)))
-       (qq-protocol-message-id-p
-        (alist-get 'read_through_message_id cursor))
-       (qq-protocol--nonzero-decimal-string-p
-        (alist-get 'read_through_sequence cursor))
-       (or (not (assq 'server_read_sequence cursor))
-           (and (qq-protocol--nonzero-decimal-string-p
-                 (alist-get 'server_read_sequence cursor))
-                (<= (qq-protocol-decimal-string-compare
-                     (alist-get 'read_through_sequence cursor)
-                     (alist-get 'server_read_sequence cursor))
-                    0)))))
-
 (defun qq-state--prepare-native-recent-conversation (entry)
   "Validate and isolate one normalized native recent conversation ENTRY."
   (unless (qq-state--closed-plist-p
            entry
            '(:session-key :message :activity-revision :pinned-known-p
-             :pinned :read-cursor-known-p :read-cursor)
+             :pinned)
            nil)
     (error "qq: native recent conversation has invalid domain fields"))
   (let* ((session-key (plist-get entry :session-key))
@@ -3200,9 +3179,7 @@ canonical history."
          (message (copy-tree (plist-get entry :message)))
          (revision (plist-get entry :activity-revision))
          (pinned-known-p (plist-get entry :pinned-known-p))
-         (pinned (plist-get entry :pinned))
-         (read-cursor-known-p (plist-get entry :read-cursor-known-p))
-         (read-cursor (copy-tree (plist-get entry :read-cursor))))
+         (pinned (plist-get entry :pinned)))
     (unless (memq session-type '(private group))
       (error "qq: native recent conversation has unsupported session %S"
              session-key))
@@ -3223,13 +3200,6 @@ canonical history."
       (error "qq: native recent conversation pin ownership is malformed"))
     (when (and pinned-known-p (not (memq pinned '(t :false))))
       (error "qq: native recent conversation pin state is malformed"))
-    (unless (memq read-cursor-known-p '(nil t))
-      (error "qq: native recent conversation cursor ownership is malformed"))
-    (when (and read-cursor-known-p
-               (not (qq-state--native-recent-read-cursor-p read-cursor)))
-      (error "qq: native recent conversation read cursor is malformed"))
-    (when (and (not read-cursor-known-p) read-cursor)
-      (error "qq: unowned native recent read cursor must be absent"))
     (let ((peer-name (qq-state--present-string
                       (alist-get 'peer-name message))))
       (list
@@ -3243,8 +3213,6 @@ canonical history."
          ,@(when-let* ((peer-uin (alist-get 'peer-uin message)))
              `((peer-uin . ,peer-uin)))
          (recent-activity-revision . ,revision)
-         ,@(when read-cursor-known-p
-             `((native-read-cursor . ,read-cursor)))
          ,@(when pinned-known-p `((pinned . ,pinned))))))))
 
 (defun qq-state-apply-recent-conversations
@@ -3253,8 +3221,7 @@ canonical history."
 
 ENTRIES contain root-summary messages prepared by the native facade.  This
 operation never inserts those messages into the canonical timeline, replays a
-message patch journal, or infers unread state.  A confirmed `read_cursor' is
-stored only as opaque `native-read-cursor' session metadata.
+message patch journal, or infers unread state.
 
 The page order authoritatively replaces `qq-state-recent-session-keys'.
 SUMMARY-OBSERVATION-TOKEN is captured before asynchronous dispatch, so a live

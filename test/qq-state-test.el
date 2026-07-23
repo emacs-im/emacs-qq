@@ -120,16 +120,13 @@
      (message (qq-state-test--native-recent-message))
      (revision "12")
      pinned-known-p
-     (pinned :false)
-     read-cursor)
+     (pinned :false))
   "Return one state-domain native recent entry fixture."
   (list :session-key (alist-get 'session-key message)
         :message (copy-tree message)
         :activity-revision revision
         :pinned-known-p pinned-known-p
-        :pinned pinned
-        :read-cursor-known-p (and read-cursor t)
-        :read-cursor (copy-tree read-cursor)))
+        :pinned pinned))
 
 (ert-deftest qq-state-session-key-normalizes-type-and-id ()
   (qq-test-with-reset
@@ -565,7 +562,7 @@
      ;; Recent root summaries intentionally do not widen canonical history.
      (should-not (qq-state-session-messages "group:20001")))))
 
-(ert-deftest qq-state-native-recent-cursor-never-infers-unread-state ()
+(ert-deftest qq-state-native-recent-never-infers-unread-state ()
   (qq-test-with-reset
    (qq-state-upsert-session
     "group:20001"
@@ -574,27 +571,26 @@
       (first-unread-message-seq . "90")
       (read-position-available . t))
     nil)
-   (let ((cursor
-          '((read_through_message_id . "7348923749823749800")
-            (read_through_sequence . "99")
-            (server_read_sequence . "100"))))
-     (qq-state-apply-recent-conversations
-      (list (qq-state-test--native-recent-entry :read-cursor cursor)) 1)
-     (let ((session (qq-state-session "group:20001")))
-       (should (= (alist-get 'unread-count session) 9))
-       (should (equal (alist-get 'first-unread-message-id session)
-                      "7348923749823749700"))
-       (should (equal (alist-get 'first-unread-message-seq session) "90"))
-       (should (alist-get 'read-position-available session))
-       (should (equal (alist-get 'native-read-cursor session) cursor)))
-     ;; Cursor absence means the service has not observed one; it is not an
-     ;; authoritative command to erase already confirmed metadata.
-     (qq-state-apply-recent-conversations
-      (list (qq-state-test--native-recent-entry))
-      (qq-state-session-summary-observation-start))
-     (should (equal (alist-get 'native-read-cursor
-                               (qq-state-session "group:20001"))
-                    cursor)))))
+   (qq-state-apply-recent-conversations
+    (list (qq-state-test--native-recent-entry)) 1)
+   (let ((session (qq-state-session "group:20001")))
+     (should (= (alist-get 'unread-count session) 9))
+     (should (equal (alist-get 'first-unread-message-id session)
+                    "7348923749823749700"))
+     (should (equal (alist-get 'first-unread-message-seq session) "90"))
+     (should (alist-get 'read-position-available session))
+     (should-not (assq 'native-read-cursor session)))))
+
+(ert-deftest qq-state-native-recent-domain-rejects-read-cursor-fields ()
+  (qq-test-with-reset
+   (let ((entry
+          (append
+           (qq-state-test--native-recent-entry)
+           '(:read-cursor-known-p t
+             :read-cursor
+             ((read_through_message_id . "7348923749823749800"))))))
+     (should-error
+      (qq-state-apply-recent-conversations (list entry) 1)))))
 
 (ert-deftest qq-state-native-recent-keys-and-known-pin-are-authoritative ()
   (qq-test-with-reset

@@ -3115,7 +3115,8 @@
                     (when callback
                       (funcall
                        callback
-                       '((read_through_message_id
+                       '((account_id . "slot-a")
+                         (message_id
                           . "9007199254741004001"))))))
                  ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
                  ((symbol-function 'qq-native-recall-message)
@@ -5148,10 +5149,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                     (when callback
                       (funcall
                        callback
-                       `((read_through_message_id
-                          . ,(alist-get 'server-id message))
-                         (read_through_sequence
-                          . ,(alist-get 'message-seq message)))))
+                       `((account_id . "slot-a")
+                         (message_id . ,(alist-get 'server-id message)))))
                     "read-request")))
          ;; An already-read row does not move the native boundary backward.
          (goto-char (point-min))

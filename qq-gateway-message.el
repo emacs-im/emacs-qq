@@ -1906,70 +1906,42 @@ native query/event semantics are not yet part of the closed Gateway protocol."
   (qq-gateway-wire-domain-copy receipt))
 
 (defun qq-gateway-message--validate-read-receipt
-    (receipt owner message-id sequence)
-  "Validate read RECEIPT for OWNER, MESSAGE-ID, and SEQUENCE."
-  (unless (qq-gateway-message--closed-object-p
-           receipt
-           '(account_id read_through_message_id read_through_sequence)
-           '(server_read_sequence))
+    (receipt owner message-id)
+  "Validate read RECEIPT for OWNER and MESSAGE-ID."
+  (unless (qq-gateway--exact-object-keys-p
+           receipt '(account_id message_id))
     (error "qq: Gateway read receipt has invalid fields"))
   (unless (and (equal (alist-get 'account_id receipt) owner)
-               (equal (alist-get 'read_through_message_id receipt) message-id)
-               (equal (alist-get 'read_through_sequence receipt) sequence))
+               (equal (alist-get 'message_id receipt) message-id))
     (error "qq: Gateway read receipt contradicts request"))
-  (when-let* ((acknowledged (alist-get 'server_read_sequence receipt)))
-    (unless (and (qq-gateway--canonical-decimal-p acknowledged)
-                 (not (qq-gateway--decimal-less-p acknowledged sequence)))
-      (error "qq: Gateway acknowledged an older or malformed read cursor")))
-  (copy-tree receipt))
+  (qq-gateway-wire-domain-copy receipt))
 
 (defun qq-gateway-message--read-request (message owner)
-  "Return a closed native read request for normalized MESSAGE and OWNER.
+  "Return a closed reference-only read request for MESSAGE and OWNER.
 
-The result is a plist containing `:message-id', `:sequence', and `:params'.
-This is the single structural validator for both capability checks and the
-wire operation; it has no projection or transport side effects."
+The result is a plist containing `:message-id' and `:params'.  This is the
+single structural validator for both capability checks and the wire
+operation; it has no projection or transport side effects."
   (let* ((session-key (and (listp message)
                            (alist-get 'session-key message)))
          (kind (and session-key (qq-state-session-key-type session-key)))
          (message-id (and (listp message) (alist-get 'server-id message)))
-         (sequence (and (listp message) (alist-get 'message-seq message)))
-         conversation message-params)
+         conversation)
     (unless (and owner
                  (memq kind '(private group))
-                 (qq-gateway--canonical-decimal-p message-id)
-                 (qq-gateway--canonical-decimal-p sequence))
-      (user-error "qq: Native read report requires exact message identity"))
+                 (qq-gateway--canonical-decimal-p message-id))
+      (user-error "qq: Native read report requires an exact Message Reference"))
     (unless (equal (alist-get 'gateway-account-id message) owner)
       (user-error "qq: Read target belongs to another Gateway account"))
-    (setq message-params
-          `((message_id . ,message-id)
-            (sequence . ,sequence)))
-    (pcase kind
-      ('private
-       (let ((peer-uid (alist-get 'peer-uid message))
-             (sent-at (alist-get 'native-sent-at message)))
-         (unless (and (qq-gateway--non-empty-string-p peer-uid)
-                      (qq-gateway-message--uint32-p sent-at)
-                      (> sent-at 0))
-           (user-error
-            "qq: Private read report requires native peer UID and timestamp"))
-         (setq conversation `((kind . "private") (peer_uid . ,peer-uid))
-               message-params
-               (append message-params `((sent_at . ,sent-at))))))
-      ('group
-       (let ((group-uin (alist-get 'group-id message)))
-         (unless (qq-gateway--canonical-decimal-p group-uin)
-           (user-error "qq: Group read report requires exact group UIN"))
-         (setq conversation `((kind . "group") (group_uin . ,group-uin))))))
+    (setq conversation
+          (qq-gateway-message--conversation-params session-key))
     (list :message-id message-id
-          :sequence sequence
           :params
           `((conversation . ,conversation)
-            (message . ,message-params)))))
+            (message . ((message_id . ,message-id)))))))
 
 (defun qq-gateway-message-read-capable-p (message)
-  "Return non-nil when MESSAGE is a closed read cursor for the current owner."
+  "Return non-nil when MESSAGE is an exact reference for the current owner."
   (when-let* ((owner (qq-gateway-current-account-id)))
     (condition-case nil
         (progn
@@ -1979,23 +1951,23 @@ wire operation; it has no projection or transport side effects."
 
 (defun qq-gateway-message-mark-read
     (message &optional callback errback)
-  "Advance the selected account's read cursor through normalized MESSAGE.
+  "Mark the selected account's conversation read through MESSAGE.
 
-MESSAGE must retain its exact native sequence and, for private chat, timestamp
-and peer UID.  CALLBACK receives the validated receipt; ERRBACK receives an
-error body and reason."
+MESSAGE supplies only its stable public conversation locator and exact
+message ID.  Gateway resolves the corresponding Native read boundary.
+CALLBACK receives the validated acknowledgement; ERRBACK receives an error
+body and reason."
   (let* ((owner (or (qq-gateway-current-account-id)
                     (user-error "qq: Select a QQ account first")))
          (_owner (qq-gateway-message--ensure-projection-owner owner))
          (request (qq-gateway-message--read-request message owner))
-         (message-id (plist-get request :message-id))
-         (sequence (plist-get request :sequence)))
+         (message-id (plist-get request :message-id)))
     (qq-gateway-message--call
      "message.mark_read" owner
      (plist-get request :params)
      (lambda (result)
        (qq-gateway-message--validate-read-receipt
-        result owner message-id sequence))
+        result owner message-id))
      :callback callback
      :errback errback
      :stale-message

@@ -261,10 +261,7 @@ contact cache."
      :message normalized
      :activity-revision (alist-get 'activity_revision row)
      :pinned-known-p (and (assq 'pinned row) t)
-     :pinned (alist-get 'pinned row)
-     :read-cursor-known-p (and (assq 'read_cursor row) t)
-     :read-cursor (and (assq 'read_cursor row)
-                       (copy-tree (alist-get 'read_cursor row))))))
+     :pinned (alist-get 'pinned row))))
 
 (defun qq-native--apply-recent-page (page observation-token)
   "Normalize and apply validated recent PAGE for OBSERVATION-TOKEN."
@@ -1042,12 +1039,33 @@ response and reason."
   (eq operation (gethash session-key qq-native--read-operations)))
 
 (defun qq-native--read-message-after-p (candidate reference)
-  "Return non-nil when CANDIDATE has a sequence after REFERENCE."
-  (let ((candidate-sequence (alist-get 'message-seq candidate))
-        (reference-sequence (alist-get 'message-seq reference)))
-    (and (qq-gateway--canonical-decimal-p candidate-sequence)
-         (qq-gateway--canonical-decimal-p reference-sequence)
-         (qq-gateway--decimal-less-p reference-sequence candidate-sequence))))
+  "Return non-nil when CANDIDATE follows REFERENCE in their session timeline.
+
+Read coalescing is a client projection concern.  It therefore compares stable
+message identities in the cached timeline instead of depending on native
+sequence metadata."
+  (let ((candidate-session (alist-get 'session-key candidate))
+        (reference-session (alist-get 'session-key reference))
+        (candidate-id (alist-get 'server-id candidate))
+        (reference-id (alist-get 'server-id reference)))
+    (when (and candidate-session
+               (equal candidate-session reference-session)
+               (qq-protocol-message-id-p candidate-id)
+               (qq-protocol-message-id-p reference-id))
+      (let* ((messages (qq-state-session-messages candidate-session))
+             (candidate-position
+              (cl-position candidate-id messages
+                           :key (lambda (message)
+                                  (alist-get 'server-id message))
+                           :test #'equal))
+             (reference-position
+              (cl-position reference-id messages
+                           :key (lambda (message)
+                                  (alist-get 'server-id message))
+                           :test #'equal)))
+        (and candidate-position
+             reference-position
+             (> candidate-position reference-position))))))
 
 (defun qq-native--cancel-read-token (token)
   "Best-effort cancel one read-report transport TOKEN."
@@ -1077,8 +1095,8 @@ response and reason."
     (session-key operation success-p)
   "Advance OPERATION after one leaf settles with SUCCESS-P.
 
-The stable composite request remains active while a queued cursor exists and
-becomes terminal only after the actual queue is empty."
+The stable composite request remains active while a queued read intent exists
+and becomes terminal only after the actual queue is empty."
   (let ((request (qq-native--read-operation-request operation))
         advanced-p)
     (unwind-protect
@@ -1223,12 +1241,13 @@ becomes terminal only after the actual queue is empty."
 (defun qq-native-mark-message-read (message &optional callback errback)
   "Advance native read state through normalized MESSAGE.
 
-Only one report per session is in flight and at most one newest cursor is
-queued.  CALLBACK belongs only to a cursor that is actually dispatched;
-duplicate, older, and superseded cursors do not accumulate waiters.  ERRBACK
+Only one report per session is in flight and at most one newest message intent
+is queued.  CALLBACK belongs only to an intent that is actually dispatched;
+duplicate, older, and superseded intents do not accumulate waiters.  ERRBACK
 receives failure details."
   (unless (qq-native-message-read-capable-p message)
-    (user-error "qq: Native read report requires a current closed cursor"))
+    (user-error
+     "qq: Native read report requires a current stable message reference"))
   (let* ((session-key (alist-get 'session-key message))
          (owner (qq-gateway-current-account-id))
          (operation (gethash session-key qq-native--read-operations)))
@@ -1475,7 +1494,7 @@ request.  ERRBACK handles failure and COUNT limits the requested page size."
       (cl-every (lambda (method) (member method methods)) (cdr spec)))))
 
 (defun qq-native-message-read-capable-p (message)
-  "Return non-nil when MESSAGE is a closed, currently reportable read cursor."
+  "Return non-nil when MESSAGE is a current, stable read reference."
   (let ((account (qq-gateway-current-account)))
     (and (qq-native-ready-p)
          (qq-native-supports-p 'read-receipt)
