@@ -587,15 +587,22 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                 ((symbol-function 'qq-server-capabilities)
                  (lambda () qq-message-test-capabilities))
                 ((symbol-function 'qq-server-send)
-                 (lambda (method params callback _errback &optional _early)
-                   (setq sent-method method sent-params params)
-                   (funcall callback
-                            `((account_id . "slot-a")
-                              (sent_at . ,now)
-                              (server_sequence . "8765432109")
-                              (client_sequence . "42001")
-                              (random . 123)))
-                   "request-send")))
+                 (lambda (method params callback errback &optional _early)
+                   (pcase method
+                     ("message.send"
+                      (setq sent-method method sent-params params)
+                      (funcall callback
+                               `((account_id . "slot-a")
+                                 (sent_at . ,now)
+                                 (server_sequence . "8765432109")
+                                 (client_sequence . "42001")
+                                 (random . 123)))
+                      "request-send")
+                     ;; Private send immediately tries C2C history recovery.
+                     ("message.get_history"
+                      (funcall errback nil "history not mocked in this test")
+                      "request-history-skip")
+                     (_ (error "unexpected method %S" method))))))
         (should
          (equal
           (qq-message-send
@@ -635,6 +642,285 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                          "7348923749823749823"))
           (should (eq (alist-get 'status message) 'sent))
           (should (= (hash-table-count qq-message--pending-sends) 0)))))))
+(ert-deftest qq-message-private-rekeys-when-receipt-sequence-is-client-echo ()
+  "C2C PbSendMsgResp field 14 may echo client_sequence, not ContentHead.Sequence.
+
+client_sequence + session must still rekey even when conversation sequences differ."
+  (qq-message-test-with-state
+    (let ((now (floor (float-time))) local-id)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (method _params callback errback &optional _early)
+                   (pcase method
+                     ("message.send"
+                      (funcall callback
+                               `((account_id . "slot-a")
+                                 (sent_at . ,now)
+                                 ;; field-14 style client echo, not conversation seq
+                                 (server_sequence . "42001")
+                                 (client_sequence . "42001")
+                                 (random . 99)))
+                      "request-private-c2c")
+                     ("message.get_history"
+                      (funcall errback nil "history not mocked in this test")
+                      "request-history-skip")
+                     (_ (error "unexpected method %S" method))))))
+        (should
+         (equal
+          (qq-message-send
+           "private:10001"
+           '(((type . "text") (data . ((text . "c2c-hello"))))))
+          "request-private-c2c"))
+        (setq local-id
+              (alist-get 'local-id
+                         (car (qq-state-session-messages "private:10001"))))
+        (should (= (hash-table-count qq-message--pending-sends) 1))
+        ;; Live private self-echo: conversation sequence differs from receipt.
+        (qq-message--handle-event
+         "message.received"
+         (qq-message-test-event
+          :sent-at now
+          :sender '((uin . "10002") (uid . "u_self"))
+          :recipient '((uin . "10001") (uid . "u_peer"))
+          :sequence "9007199254740999"
+          :client-sequence "42001"
+          :random 99
+          :segments (list (qq-message-test-text-segment "c2c-hello"))))
+        (let* ((messages (qq-state-session-messages "private:10001"))
+               (message
+                (or (seq-find
+                     (lambda (it) (equal (alist-get 'local-id it) local-id))
+                     messages)
+                    (car messages))))
+          (should (= (length messages) 1))
+          (should (equal (alist-get 'local-id message) local-id))
+          (should (equal (alist-get 'server-id message)
+                         "7348923749823749823"))
+          (should (eq (alist-get 'status message) 'sent))
+          (should (= (hash-table-count qq-message--pending-sends) 0)))))))
+
+(ert-deftest qq-message-private-rekeys-when-push-sequence-is-outbound-client-seq ()
+  "Live C2C CommonMessage stores outbound client_sequence on ContentHead.Sequence.
+
+receipt.client_sequence=40909 and receipt.server_sequence=30202, while the
+push carries sequence=40909 and client_sequence=30202."
+  (qq-message-test-with-state
+    (let ((now (floor (float-time))) local-id)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (method _params callback errback &optional _early)
+                   (pcase method
+                     ("message.send"
+                      (funcall callback
+                               `((account_id . "slot-a")
+                                 (sent_at . ,now)
+                                 (server_sequence . "30202")
+                                 (client_sequence . "40909")
+                                 (random . 694993522)))
+                      "request-private-inverted")
+                     ("message.get_history"
+                      (funcall errback nil "history not mocked in this test")
+                      "request-history-skip")
+                     (_ (error "unexpected method %S" method))))))
+        (should
+         (equal
+          (qq-message-send
+           "private:10001"
+           '(((type . "text") (data . ((text . "test"))))))
+          "request-private-inverted"))
+        (setq local-id
+              (alist-get 'local-id
+                         (car (qq-state-session-messages "private:10001"))))
+        (should (= (hash-table-count qq-message--pending-sends) 1))
+        (qq-message--handle-event
+         "message.received"
+         (qq-message-test-event
+          :sent-at now
+          :sender '((uin . "10002") (uid . "u_self"))
+          :recipient '((uin . "10001") (uid . "u_peer"))
+          :sequence "40909"
+          :client-sequence "30202"
+          :random 694993522
+          :segments (list (qq-message-test-text-segment "test"))))
+        (let* ((messages (qq-state-session-messages "private:10001"))
+               (message
+                (or (seq-find
+                     (lambda (it) (equal (alist-get 'local-id it) local-id))
+                     messages)
+                    (car messages))))
+          (should (= (length messages) 1))
+          (should (equal (alist-get 'local-id message) local-id))
+          (should (equal (alist-get 'server-id message)
+                         "7348923749823749823"))
+          (should (eq (alist-get 'status message) 'sent))
+          (should (= (hash-table-count qq-message--pending-sends) 0)))))))
+
+(ert-deftest qq-message-private-send-recovers-snowflake-via-c2c-history ()
+  "When OlPush self-echo is missing, fetch SsoGetC2cMsg by server_sequence."
+  (qq-message-test-with-state
+    (let ((now (floor (float-time))) local-id methods)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (push method methods)
+                   (pcase method
+                     ("message.send"
+                      (funcall callback
+                               `((account_id . "slot-a")
+                                 (sent_at . ,now)
+                                 (server_sequence . "30203")
+                                 (client_sequence . "40910")
+                                 (random . 1689609174)))
+                      "request-private-recover")
+                     ("message.get_history"
+                      (should
+                       (equal params
+                              '((account_id . "slot-a")
+                                (conversation
+                                 . ((kind . "private")
+                                    (peer_uin . "10001")))
+                                (start_sequence . "30203")
+                                (end_sequence . "30203"))))
+                      (funcall callback
+                               `((account_id . "slot-a")
+                                 (requested_start_sequence . "30203")
+                                 (requested_end_sequence . "30203")
+                                 (response_start_sequence . "30203")
+                                 (response_end_sequence . "30203")
+                                 (unsupported_message_count . 0)
+                                 (messages
+                                  .
+                                  (,(alist-get
+                                     'message
+                                     (qq-message-test-event
+                                      :sent-at now
+                                      :message-id "72057595727537110"
+                                      :sender '((uin . "10002")
+                                                (uid . "u_self"))
+                                      :recipient '((uin . "10001")
+                                                   (uid . "u_peer"))
+                                      :sequence "40910"
+                                      :client-sequence "30203"
+                                      :random 1689609174
+                                      :segments
+                                      (list
+                                       (qq-message-test-text-segment
+                                        "rekey-probe"))))))))
+                      "request-private-history")
+                     (_ (error "unexpected method %S" method))))))
+        (should
+         (equal
+          (qq-message-send
+           "private:10001"
+           '(((type . "text") (data . ((text . "rekey-probe"))))))
+          "request-private-recover"))
+        (setq local-id
+              (alist-get 'local-id
+                         (car (qq-state-session-messages "private:10001"))))
+        (let* ((messages (qq-state-session-messages "private:10001"))
+               (message
+                (or (seq-find
+                     (lambda (it) (equal (alist-get 'local-id it) local-id))
+                     messages)
+                    (car messages))))
+          (should (equal (nreverse methods)
+                         '("message.send" "message.get_history")))
+          (should (= (length messages) 1))
+          (should (equal (alist-get 'local-id message) local-id))
+          (should (equal (alist-get 'server-id message)
+                         "72057595727537110"))
+          (should (eq (alist-get 'status message) 'sent))
+          (should (= (hash-table-count qq-message--pending-sends) 0)))))))
+
+(ert-deftest qq-message-group-send-recovers-snowflake-via-group-history ()
+  "When the group self-echo push never arrives, fetch SsoGetGroupMsg by sequence."
+  (qq-message-test-with-state
+    (let ((now (floor (float-time))) local-id methods)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (push method methods)
+                   (pcase method
+                     ("message.send"
+                      (funcall callback
+                               `((account_id . "slot-a")
+                                 (sent_at . ,now)
+                                 (server_sequence . "8765432112")
+                                 (client_sequence . "42005")
+                                 (random . 7777)))
+                      "request-group-recover")
+                     ("message.get_history"
+                      (should
+                       (equal params
+                              '((account_id . "slot-a")
+                                (conversation
+                                 . ((kind . "group")
+                                    (group_uin . "8209413637")))
+                                (start_sequence . "8765432112")
+                                (end_sequence . "8765432112"))))
+                      (funcall callback
+                               `((account_id . "slot-a")
+                                 (requested_start_sequence . "8765432112")
+                                 (requested_end_sequence . "8765432112")
+                                 (response_start_sequence . "8765432112")
+                                 (response_end_sequence . "8765432112")
+                                 (unsupported_message_count . 0)
+                                 (messages
+                                  .
+                                  (,(alist-get
+                                     'message
+                                     (qq-message-test-event
+                                      :sent-at now
+                                      :message-id "72057595727537120"
+                                      :sender '((uin . "10002")
+                                                (uid . "u_self"))
+                                      :conversation
+                                      '((kind . "group")
+                                        (group_uin . "8209413637"))
+                                      :sequence "8765432112"
+                                      :random 7777
+                                      :message-type 82
+                                      :segments
+                                      (list
+                                       (qq-message-test-text-segment
+                                        "group-rekey-probe"))))))))
+                      "request-group-history")
+                     (_ (error "unexpected method %S" method))))))
+        (should
+         (equal
+          (qq-message-send
+           "group:8209413637"
+           '(((type . "text") (data . ((text . "group-rekey-probe"))))))
+          "request-group-recover"))
+        (setq local-id
+              (alist-get 'local-id
+                         (car (qq-state-session-messages "group:8209413637"))))
+        (let* ((messages (qq-state-session-messages "group:8209413637"))
+               (message
+                (or (seq-find
+                     (lambda (it) (equal (alist-get 'local-id it) local-id))
+                     messages)
+                    (car messages))))
+          (should (equal (nreverse methods)
+                         '("message.send" "message.get_history")))
+          (should (= (length messages) 1))
+          (should (equal (alist-get 'local-id message) local-id))
+          (should (equal (alist-get 'server-id message)
+                         "72057595727537120"))
+          (should (eq (alist-get 'status message) 'sent))
+          (should (= (hash-table-count qq-message--pending-sends) 0)))))))
 
 (ert-deftest qq-message-send-lifts-reference-out-of-rich-content ()
   (qq-message-test-with-state
@@ -651,15 +937,22 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                   ((symbol-function 'qq-server-capabilities)
                    (lambda () qq-message-test-capabilities))
                   ((symbol-function 'qq-server-send)
-                   (lambda (method params callback _errback &optional _early)
-                     (setq sent-method method sent-params params)
-                     (funcall callback
-                              `((account_id . "slot-a")
-                                (sent_at . ,now)
-                                (server_sequence . "8765432110")
-                                (client_sequence . "42002")
-                                (random . 124)))
-                     "request-rich-send")))
+                   (lambda (method params callback errback &optional _early)
+                     (pcase method
+                       ("message.send"
+                        (setq sent-method method sent-params params)
+                        (funcall callback
+                                 `((account_id . "slot-a")
+                                   (sent_at . ,now)
+                                   (server_sequence . "8765432110")
+                                   (client_sequence . "42002")
+                                   (random . 124)))
+                        "request-rich-send")
+                       ;; Send recovery fetches the snowflake from history.
+                       ("message.get_history"
+                        (funcall errback nil "history not mocked in this test")
+                        "request-history-skip")
+                       (_ (error "unexpected method %S" method))))))
           (should
            (equal
             (qq-message-send "group:8209413637" segments)
@@ -710,15 +1003,21 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                 ((symbol-function 'qq-server-capabilities)
                  (lambda () qq-message-test-capabilities))
                 ((symbol-function 'qq-server-send)
-                 (lambda (_method params callback _errback &optional _early)
-                   (setq sent-params params)
-                   (funcall callback
-                            `((account_id . "slot-a")
-                              (sent_at . ,now)
-                              (server_sequence . "8765432111")
-                              (client_sequence . "42003")
-                              (random . 125)))
-                   "request-image-send")))
+                 (lambda (method params callback errback &optional _early)
+                   (pcase method
+                     ("message.send"
+                      (setq sent-params params)
+                      (funcall callback
+                               `((account_id . "slot-a")
+                                 (sent_at . ,now)
+                                 (server_sequence . "8765432111")
+                                 (client_sequence . "42003")
+                                 (random . 125)))
+                      "request-image-send")
+                     ("message.get_history"
+                      (funcall errback nil "history not mocked in this test")
+                      "request-history-skip")
+                     (_ (error "unexpected method %S" method))))))
         (should
          (equal
           (qq-message-send
