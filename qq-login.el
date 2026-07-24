@@ -631,10 +631,10 @@ Return its current snapshot, or nil while account creation is in flight."
     (unless (bolp)
       (insert "\n"))
     (insert
-     (propertize "Scan with mobile QQ to verify this new device.\n"
+     (propertize "Scan with mobile QQ when a QR is shown.\n"
                  'face 'bold)
-     "After scanning, confirm the login on your phone.  "
-     "The native service will continue automatically.\n"))
+     "Confirm the login on your phone when prompted.  "
+     "The native service continues automatically.\n"))
   (when-let* ((account-id (plist-get model :account-id)))
     (insert (format "Managed account: %s\n" account-id))))
 
@@ -649,40 +649,31 @@ Return its current snapshot, or nil while account creation is in flight."
     (qq-login--present session "Waiting for mobile QQ confirmation…" nil)))
 
 (defun qq-login--unusual-device (session account challenge)
-  "Read unusual-device proof for SESSION ACCOUNT and CHALLENGE."
-  (setf (qq-login--session-prompting-p session) t)
-  (unwind-protect
-      (let* ((account-id (alist-get 'account_id account))
-             (challenge-id (alist-get 'challenge_id challenge))
-             (device-sig (read-passwd "Device verification signature (hex): ")))
-        (unwind-protect
-            (progn
-              (setf (qq-login--session-retry-failed-p session) nil
-                    (qq-login--session-submitted-challenge-id session)
-                    (copy-sequence challenge-id))
-              (qq-login--present
-               session "Submitting device verification…" nil)
-              (qq-login--request
-               session
-               (lambda (success failure)
-                 (qq-account-login-unusual-device
-                  account-id challenge-id device-sig success failure))))
-          (clear-string device-sig)))
-    (when (qq-login--session-p session)
-      (setf (qq-login--session-prompting-p session) nil))))
+  "Display Rust-owned unusual-device confirmation for SESSION ACCOUNT CHALLENGE.
+
+Gateway harvests checkSig, runs TransEmp31/12, and continues EasyLogin or
+PasswordLogin UnusualDevice automatically.  Emacs only shows wait status and
+an optional public QR URL."
+  (ignore account)
+  (let ((qr-url (alist-get 'qr_url challenge)))
+    (when (qq-account--non-empty-string-p qr-url)
+      (qq-login--prepare-qr session qr-url))
+    (setf (qq-login--session-retry-failed-p session) nil)
+    (qq-login--present
+     session
+     "Confirm this login on your phone QQ…"
+     nil)))
 
 (defun qq-login--challenge (session account challenge)
   "Continue SESSION ACCOUNT using projected CHALLENGE."
   (pcase (alist-get 'kind challenge)
     ("new_device" (qq-login--new-device session account challenge))
-    ((or "captcha" "unusual_device")
+    ("unusual_device" (qq-login--unusual-device session account challenge))
+    ("captcha"
      (if (equal (alist-get 'challenge_id challenge)
                 (qq-login--session-submitted-challenge-id session))
          (qq-login--present session "Waiting for QQ login to continue…" nil)
-       (pcase (alist-get 'kind challenge)
-         ("captcha" (qq-login--captcha session account challenge))
-         ("unusual_device"
-          (qq-login--unusual-device session account challenge)))))
+       (qq-login--captcha session account challenge)))
     (kind (error "qq: unsupported login challenge kind %S" kind))))
 
 (defun qq-login--start-account (session account)
@@ -703,8 +694,8 @@ Return its current snapshot, or nil while account creation is in flight."
             (challenge (alist-get 'challenge account)))
         (when (and (qq-login--session-qr-display session)
                    (not (and (equal phase "logging_in")
-                             (equal (alist-get 'kind challenge)
-                                    "new_device"))))
+                             (member (alist-get 'kind challenge)
+                                     '("new_device" "unusual_device")))))
           (qq-login--clear-qr session)
           (qq-login--changed))
         (pcase phase

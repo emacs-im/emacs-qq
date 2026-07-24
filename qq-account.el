@@ -497,8 +497,11 @@ snapshot; ERRBACK receives a failure body and reason."
 
 ;;;###autoload
 (defun qq-account-login-unusual-device
-    (account-id challenge-id device-sig-hex &optional callback errback)
-  "Continue ACCOUNT-ID's unusual-device CHALLENGE-ID using DEVICE-SIG-HEX.
+    (account-id challenge-id &optional device-sig-hex callback errback)
+  "Continue ACCOUNT-ID's unusual-device CHALLENGE-ID.
+
+DEVICE-SIG-HEX is ignored: Gateway owns checkSig and TransEmp polling.
+Kept as an optional argument for older callers.
 
 CALLBACK receives the account snapshot; ERRBACK receives a failure body and
 reason."
@@ -508,20 +511,22 @@ reason."
      (unless (equal (alist-get 'kind challenge) "unusual_device")
        (user-error "qq: Selected account has no unusual-device challenge"))
      (list account-id (alist-get 'challenge_id challenge)
-           (read-passwd "Device sig (hex): ")
+           nil
            #'qq-account--interactive-success
            #'qq-account--interactive-error)))
+  (unless (qq-account--non-empty-string-p account-id)
+    (user-error "qq: Account ID must be a non-empty opaque string"))
   (unless (qq-account--non-empty-string-p challenge-id)
     (user-error "qq: Challenge ID must be a non-empty string"))
-  (unless (and (stringp device-sig-hex)
-               (string-match-p
-                "\\`\\(?:[[:xdigit:]][[:xdigit:]]\\)+\\'" device-sig-hex))
-    (user-error "qq: Device sig must contain a non-empty even number of hex digits"))
-  (qq-account--login-command
-   "account.login.unusual_device" account-id
-   (lambda (secret)
-     `((challenge_id . ,challenge-id) (device_sig_hex . ,secret)))
-   device-sig-hex callback errback))
+  (ignore device-sig-hex)
+  (qq-rpc-call
+   "account.login.unusual_device"
+   `((account_id . ,account-id) (challenge_id . ,challenge-id))
+   :projector
+   (lambda (snapshot)
+     (qq-account--upsert-account snapshot 'response))
+   :callback callback
+   :errback errback))
 
 ;;;###autoload
 (defun qq-account-stop (account-id &optional callback errback)
