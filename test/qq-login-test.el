@@ -21,12 +21,12 @@
   "Run BODY with an isolated login interaction and account registry."
   (declare (indent 0) (debug t))
   `(let ((qq-login--current nil)
-         (qq-gateway--accounts (make-hash-table :test #'equal))
-         (qq-gateway--account-order nil)
-         (qq-gateway--current-account-id nil)
-         (qq-gateway--gateway-instance-id nil)
-         (qq-gateway-accounts-changed-hook nil)
-         (qq-gateway-current-account-changed-hook nil)
+         (qq-account--accounts (make-hash-table :test #'equal))
+         (qq-account--account-order nil)
+         (qq-account--current-account-id nil)
+         (qq-account--gateway-instance-id nil)
+         (qq-account-registry-changed-hook nil)
+         (qq-account-selection-changed-hook nil)
          (qq-login-change-hook nil)
          (qq-login-open-verification-url nil))
      (unwind-protect
@@ -57,16 +57,16 @@
 
 (ert-deftest qq-login-chooser-lists-quick-identities-and-new-account ()
   (qq-login-test-with-state
-    (qq-gateway--upsert-account
+    (qq-account--upsert-account
      (qq-login-test-account "slot-b" "stopped" "10002") 'test)
     (let ((session (qq-login-test-session))
           choices)
-      (cl-letf (((symbol-function 'qq-gateway--method-available-p)
+      (cl-letf (((symbol-function 'qq-rpc-method-available-p)
                  (lambda (method)
                    (member method
                            '("account.login.list"
                              "account.login.quick"))))
-                ((symbol-function 'qq-gateway-account-login-list)
+                ((symbol-function 'qq-account-login-list)
                  (lambda (success _failure)
                    (funcall
                     success
@@ -95,7 +95,7 @@
       (should
        (equal (qq-login--session-quick-login-uin session) "10002"))
       (should-not (qq-login--session-create-p session))
-      (should (equal (qq-gateway-current-account-id) "slot-b")))))
+      (should (equal (qq-account-current-id) "slot-b")))))
 
 (ert-deftest qq-login-new-account-is-a-choice-alongside-easylogin ()
   (qq-login-test-with-state
@@ -106,7 +106,7 @@
        (list
         (qq-login-test-quick-account
          "10001" "u_stored" 1784700000)))
-      (cl-letf (((symbol-function 'qq-gateway--method-available-p)
+      (cl-letf (((symbol-function 'qq-rpc-method-available-p)
                  (lambda (_method) t))
                 ((symbol-function 'completing-read)
                  (lambda (&rest _arguments) "New account")))
@@ -125,7 +125,7 @@
        (list
         (qq-login-test-quick-account
          "10001" "u_stored" 1784700000)))
-      (cl-letf (((symbol-function 'qq-gateway--method-available-p)
+      (cl-letf (((symbol-function 'qq-rpc-method-available-p)
                  (lambda (_method) t))
                 ((symbol-function 'completing-read)
                  (lambda (&rest _arguments) "10001 — Quick login")))
@@ -138,7 +138,7 @@
 
 (ert-deftest qq-login-quick-choice-reuses-the-selected-unbound-slot ()
   (qq-login-test-with-state
-    (qq-gateway--upsert-account
+    (qq-account--upsert-account
      (qq-login-test-account "slot-a" "login_required") 'test)
     (let ((session (qq-login-test-session)))
       (setf
@@ -147,7 +147,7 @@
        (list
         (qq-login-test-quick-account
          "10001" "u_stored" 1784700000)))
-      (cl-letf (((symbol-function 'qq-gateway--method-available-p)
+      (cl-letf (((symbol-function 'qq-rpc-method-available-p)
                  (lambda (_method) t))
                 ((symbol-function 'completing-read)
                  (lambda (&rest _arguments) "10001 — Quick login")))
@@ -160,12 +160,12 @@
 
 (ert-deftest qq-login-quick-choice-prefers-bound-slot-over-selected-empty-slot ()
   (qq-login-test-with-state
-    (qq-gateway--replace-accounts
+    (qq-account--replace-accounts
      (list
       (qq-login-test-account "slot-empty" "stopped")
       (qq-login-test-account "slot-bound" "stopped" "10001"))
      'test "gateway-test")
-    (qq-gateway--set-current-account "slot-empty")
+    (qq-account--set-current-account "slot-empty")
     (let ((session (qq-login-test-session)))
       (setf
        (qq-login--session-login-accounts-loaded-p session) t
@@ -173,7 +173,7 @@
        (list
         (qq-login-test-quick-account
          "10001" "u_stored" 1784700000)))
-      (cl-letf (((symbol-function 'qq-gateway--method-available-p)
+      (cl-letf (((symbol-function 'qq-rpc-method-available-p)
                  (lambda (_method) t))
                 ((symbol-function 'completing-read)
                  (lambda (&rest _arguments) "10001 — Quick login")))
@@ -181,14 +181,14 @@
       (should
        (equal (qq-login--session-account-id session) "slot-bound"))
       (should
-       (equal (qq-gateway-current-account-id) "slot-bound")))))
+       (equal (qq-account-current-id) "slot-bound")))))
 
 (ert-deftest qq-login-continues-active-runtime-before-opening-chooser ()
   (qq-login-test-with-state
-    (qq-gateway--upsert-account
+    (qq-account--upsert-account
      (qq-login-test-account "slot-a" "logging_in" "10001") 'test)
     (let ((session (qq-login-test-session)))
-      (cl-letf (((symbol-function 'qq-gateway-account-login-list)
+      (cl-letf (((symbol-function 'qq-account-login-list)
                  (lambda (&rest _arguments)
                    (ert-fail "active login opened the account chooser"))))
         (should (qq-login--resolve-account-choice session)))
@@ -197,7 +197,7 @@
 
 (ert-deftest qq-login-chooser-shows-unselected-online-account-as-online ()
   (qq-login-test-with-state
-    (qq-gateway--replace-accounts
+    (qq-account--replace-accounts
      (list
       (qq-login-test-account "slot-online" "online" "10001")
       (qq-login-test-account "slot-stopped" "stopped" "10002"))
@@ -210,7 +210,7 @@
        (list
         (qq-login-test-quick-account "10001" "uid-1" 1784700001)
         (qq-login-test-quick-account "10002" "uid-2" 1784700000)))
-      (cl-letf (((symbol-function 'qq-gateway--method-available-p)
+      (cl-letf (((symbol-function 'qq-rpc-method-available-p)
                  (lambda (_method) t))
                 ((symbol-function 'completing-read)
                  (lambda (_prompt collection &rest _arguments)
@@ -227,19 +227,19 @@
       (should-not (qq-login--session-quick-login-uin session))
       (should-not (qq-login--session-create-p session))
       (should
-       (equal (qq-gateway-current-account-id) "slot-online")))))
+       (equal (qq-account-current-id) "slot-online")))))
 
 (ert-deftest qq-login-starts-a-stopped-account ()
   (qq-login-test-with-state
-    (qq-gateway--upsert-account
+    (qq-account--upsert-account
      (qq-login-test-account "slot-a" "stopped") 'test)
     (let ((session (qq-login-test-session "slot-a"))
           started)
-      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-login--schedule)
                  #'ignore)
-                ((symbol-function 'qq-gateway-account-start)
+                ((symbol-function 'qq-account-start)
                  (lambda (account-id success _failure)
                    (setq started account-id)
                    (funcall success
@@ -252,18 +252,18 @@
 
 (ert-deftest qq-login-login-required-uses-selected-easylogin-identity ()
   (qq-login-test-with-state
-    (qq-gateway--upsert-account
+    (qq-account--upsert-account
      (qq-login-test-account "slot-a" "login_required" "10001") 'test)
     (let ((session (qq-login-test-session "slot-a"))
           sent)
       (setf (qq-login--session-quick-login-uin session) "10001")
-      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-login--schedule) #'ignore)
                 ((symbol-function 'read-passwd)
                  (lambda (&rest _arguments)
                    (ert-fail "EasyLogin prompted for a password")))
-                ((symbol-function 'qq-gateway-account-login-quick)
+                ((symbol-function 'qq-account-login-quick)
                  (lambda (account-id uin qimei success _failure)
                    (setq sent (list account-id uin qimei))
                    (funcall
@@ -278,11 +278,11 @@
 
 (ert-deftest qq-login-easylogin-failure-falls-back-to-password-on-retry ()
   (qq-login-test-with-state
-    (qq-gateway--upsert-account
+    (qq-account--upsert-account
      (qq-login-test-account "slot-a" "login_required" "10001") 'test)
     (let ((session (qq-login-test-session "slot-a")))
       (setf (qq-login--session-quick-login-uin session) "10001")
-      (cl-letf (((symbol-function 'qq-gateway-account-login-quick)
+      (cl-letf (((symbol-function 'qq-account-login-quick)
                  (lambda (_account-id _uin _qimei _success failure)
                    (funcall
                     failure
@@ -290,7 +290,7 @@
                     "stored record disappeared")
                    "quick-login-request")))
         (qq-login--quick
-         session (qq-gateway-account "slot-a")))
+         session (qq-account-get "slot-a")))
       (should-not (qq-login--session-quick-login-uin session))
       (should
        (string-match-p
@@ -299,12 +299,12 @@
 
 (ert-deftest qq-login-password-preserves-exact-uin-and-clears-input-secret ()
   (qq-login-test-with-state
-    (qq-gateway--upsert-account
+    (qq-account--upsert-account
      (qq-login-test-account "slot-a" "login_required") 'test)
     (let ((session (qq-login-test-session "slot-a"))
           (password (copy-sequence "correct horse"))
           sent)
-      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-login--schedule)
                  #'ignore)
@@ -312,7 +312,7 @@
                  (lambda (&rest _arguments) "9007199254740993"))
                 ((symbol-function 'read-passwd)
                  (lambda (&rest _arguments) password))
-                ((symbol-function 'qq-gateway-account-login-password)
+                ((symbol-function 'qq-account-login-password)
                  (lambda (account-id uin secret qimei success _failure)
                    (setq sent
                          (list account-id uin (copy-sequence secret) qimei))
@@ -337,15 +337,15 @@
              "slot-a" "logging_in" "10001" challenge))
            (session (qq-login-test-session "slot-a"))
            rendered)
-      (qq-gateway--upsert-account account 'test)
+      (qq-account--upsert-account account 'test)
       (let ((qq-login-open-verification-url t))
-        (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+        (cl-letf (((symbol-function 'qq-server-ready-p)
                    (lambda () t))
                   ((symbol-function 'qq-login--schedule)
                    #'ignore)
                   ((symbol-function 'qq-login--prepare-qr)
                    (lambda (_session url) (setq rendered url)))
-                  ((symbol-function 'qq-gateway-rpc-call)
+                  ((symbol-function 'qq-rpc-call)
                    (lambda (&rest _arguments)
                      (ert-fail "QR projection sent an RPC"))))
           (qq-login--drive session)))
@@ -389,7 +389,7 @@
 
 (ert-deftest qq-login-does-not-automatically-restart-a-failed-attempt ()
   (qq-login-test-with-state
-    (qq-gateway--upsert-account
+    (qq-account--upsert-account
      (qq-login-test-account
       "slot-a" "failed" "10001" nil
       '((code . "login_pipeline_failed")
@@ -397,9 +397,9 @@
      'test)
     (let ((session (qq-login-test-session "slot-a")))
       (setf (qq-login--session-retry-failed-p session) nil)
-      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
                  (lambda () t))
-                ((symbol-function 'qq-gateway-account-start)
+                ((symbol-function 'qq-account-start)
                  (lambda (&rest _arguments)
                    (ert-fail "failed login restarted without user action"))))
         (qq-login--drive session))
@@ -433,32 +433,32 @@
   (qq-login-test-with-state
     (let ((session (qq-login-test-session nil t nil t))
           created-label)
-      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-login--schedule)
                  #'ignore)
                 ((symbol-function 'qq-login--read-label)
                  (lambda () (ert-fail "label was read twice")))
-                ((symbol-function 'qq-gateway-account-create)
+                ((symbol-function 'qq-account-create)
                  (lambda (label success _failure)
                    (setq created-label label)
                    (let ((snapshot
                           (qq-login-test-account
                            "slot-new" "stopped")))
-                     (qq-gateway--upsert-account snapshot 'response)
+                     (qq-account--upsert-account snapshot 'response)
                      (funcall success snapshot)))))
         (qq-login--drive session))
       (should-not created-label)
       (should (equal (qq-login--session-account-id session) "slot-new"))
       (should-not (qq-login--session-create-p session))
-      (should (equal (qq-gateway-current-account-id) "slot-new")))))
+      (should (equal (qq-account-current-id) "slot-new")))))
 
 (ert-deftest qq-login-finishes-when-account-is-online ()
   (qq-login-test-with-state
-    (qq-gateway--upsert-account
+    (qq-account--upsert-account
      (qq-login-test-account "slot-a" "online" "10001") 'test)
     (let ((session (qq-login-test-session "slot-a")))
-      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
                  (lambda () t)))
         (qq-login--drive session))
       (should-not (qq-login--session-active-p session))
@@ -466,11 +466,11 @@
 
 (ert-deftest qq-login-does-not-project-a-login-view-for-an-online-account ()
   (qq-login-test-with-state
-    (qq-gateway--upsert-account
+    (qq-account--upsert-account
      (qq-login-test-account "slot-a" "online" "10001") 'test)
-    (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+    (cl-letf (((symbol-function 'qq-server-ready-p)
                (lambda () t))
-              ((symbol-function 'qq-native-connect)
+              ((symbol-function 'qq-core-connect)
                (lambda ()
                  (ert-fail "online account reconnected the Gateway")))
               ((symbol-function 'qq-login--changed)

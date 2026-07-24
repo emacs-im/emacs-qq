@@ -14,18 +14,14 @@
 (require 'appkit-core)
 (require 'qq-state)
 
-(declare-function qq-native-disconnect "qq-native")
-(declare-function qq-transport-stop "qq-transport")
-(declare-function qq-gateway-account "qq-gateway" (account-id))
-(declare-function qq-gateway-current-account-id "qq-gateway")
+(declare-function qq-core-disconnect "qq-core")
+(declare-function qq-account-get "qq-account" (account-id))
+(declare-function qq-account-current-id "qq-account")
 
 (defun qq-runtime--gateway-shutdown (_app)
   "Stop transport resources owned by the Gateway Appkit application."
-  (cond
-   ((fboundp 'qq-native-disconnect)
-    (qq-native-disconnect))
-   ((fboundp 'qq-transport-stop)
-    (qq-transport-stop))))
+  (when (fboundp 'qq-core-disconnect)
+    (qq-core-disconnect)))
 
 (appkit-define-app-kind qq
   :shutdown #'qq-runtime--gateway-shutdown)
@@ -64,8 +60,8 @@ Gateway selection is only the final interactive fallback."
            (copy-sequence qq-runtime--context-account-id))
       (and qq-runtime--account-id
            (copy-sequence qq-runtime--account-id))
-      (and (fboundp 'qq-gateway-current-account-id)
-           (qq-gateway-current-account-id))))
+      (and (fboundp 'qq-account-current-id)
+           (qq-account-current-id))))
 
 (defun qq-runtime-require-account-id (&optional operation)
   "Return the account owning the current context, or reject OPERATION.
@@ -78,8 +74,8 @@ OPERATION is a short human-readable description used in the error message."
 (defun qq-runtime-account-display-name (account-id)
   "Return a concise display name for stable ACCOUNT-ID."
   (let* ((account
-          (and (fboundp 'qq-gateway-account)
-               (qq-gateway-account account-id)))
+          (and (fboundp 'qq-account-get)
+               (qq-account-get account-id)))
          (label (alist-get 'label account))
          (uin (alist-get 'uin account)))
     (cond

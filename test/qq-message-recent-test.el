@@ -1,12 +1,12 @@
-;;; qq-gateway-conversation-test.el --- Recent conversation adapter tests -*- lexical-binding: t; -*-
+;;; qq-message-recent-test.el --- Recent conversation adapter tests -*- lexical-binding: t; -*-
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'ert)
-(require 'qq-gateway-conversation)
+(require 'qq-message)
 
-(defun qq-gateway-conversation-test-account (&optional account-id uin uid phase)
+(defun qq-message-recent-test-account (&optional account-id uin uid phase)
   "Return a managed ACCOUNT-ID fixture for UIN, UID, and PHASE."
   `((account_id . ,(or account-id "slot-a"))
     (label . "Primary")
@@ -16,7 +16,7 @@
     (challenge)
     (problem)))
 
-(cl-defun qq-gateway-conversation-test-message
+(cl-defun qq-message-recent-test-message
     (&key
      (message-id "7348923749823749823")
      (sequence "9007199254740999")
@@ -38,12 +38,12 @@ SEQUENCE, SENDER, RECIPIENT, and CONVERSATION provide its native context."
     (sub_type . 0)
     (segments . [((kind . "text") (payload . ((text . "hello"))))])))
 
-(cl-defun qq-gateway-conversation-test-row
+(cl-defun qq-message-recent-test-row
     (&key
      (identity '((kind . "private")
                  (peer_uin . "10001") (peer_uid . "u_peer")))
      (revision "12")
-     (message (qq-gateway-conversation-test-message))
+     (message (qq-message-recent-test-message))
      (recalled :false)
      (pinned 'absent))
   "Return a closed recent-conversation row for IDENTITY and REVISION.
@@ -56,10 +56,10 @@ symbol `absent' omits unknown pin state."
     (latest_message . ,(copy-tree message))
     (latest_message_recalled . ,recalled)))
 
-(cl-defun qq-gateway-conversation-test-page
+(cl-defun qq-message-recent-test-page
     (&key
      (account-id "slot-a")
-     (rows (list (qq-gateway-conversation-test-row)))
+     (rows (list (qq-message-recent-test-row)))
      (truncated :false))
   "Return ACCOUNT-ID's closed page containing ROWS.
 
@@ -68,32 +68,32 @@ TRUNCATED is its exact wire boolean."
     (conversations . ,(vconcat (mapcar #'copy-tree rows)))
     (truncated . ,truncated)))
 
-(defmacro qq-gateway-conversation-test-with-state (&rest body)
+(defmacro qq-message-recent-test-with-state (&rest body)
   "Run BODY with one isolated selected Gateway account."
   (declare (indent 0) (debug t))
-  `(let ((qq-gateway--accounts (make-hash-table :test #'equal))
-         (qq-gateway--account-order nil)
-         (qq-gateway--current-account-id nil)
-         (qq-gateway--gateway-instance-id nil)
-         (qq-gateway--resync-request-id nil)
-         (qq-gateway-accounts-changed-hook nil)
-         (qq-gateway-current-account-changed-hook nil)
-         (qq-gateway-desync-hook nil)
-         (qq-gateway-transport--gateway-instance-id "gateway-a")
-         (qq-gateway-transport--capabilities '("conversation.list_recent"))
-         (qq-gateway-transport--state 'ready))
-     (qq-gateway--replace-accounts
-      (list (qq-gateway-conversation-test-account)) 'ready "gateway-a")
-     (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+  `(let ((qq-account--accounts (make-hash-table :test #'equal))
+         (qq-account--account-order nil)
+         (qq-account--current-account-id nil)
+         (qq-account--gateway-instance-id nil)
+         (qq-account--resync-request-id nil)
+         (qq-account-registry-changed-hook nil)
+         (qq-account-selection-changed-hook nil)
+         (qq-account-desync-hook nil)
+         (qq-server--gateway-instance-id "gateway-a")
+         (qq-server--capabilities '("conversation.list_recent"))
+         (qq-server--state 'ready))
+     (qq-account--replace-accounts
+      (list (qq-message-recent-test-account)) 'ready "gateway-a")
+     (cl-letf (((symbol-function 'qq-server-ready-p)
                 (lambda () t))
-               ((symbol-function 'qq-gateway-transport-capabilities)
+               ((symbol-function 'qq-server-capabilities)
                 (lambda () '("conversation.list_recent"))))
        ,@body)))
 
-(ert-deftest qq-gateway-conversation-requests-slot-and-returns-domain-page ()
-  (qq-gateway-conversation-test-with-state
+(ert-deftest qq-message-recent-requests-slot-and-returns-domain-page ()
+  (qq-message-recent-test-with-state
     (let (method params success delivered)
-      (cl-letf (((symbol-function 'qq-gateway-transport-send)
+      (cl-letf (((symbol-function 'qq-server-send)
                  (lambda (request-method request-params callback _errback
                           &optional _early)
                    (setq method request-method
@@ -101,14 +101,14 @@ TRUNCATED is its exact wire boolean."
                          success callback)
                    "recent-1")))
         (should (equal
-                 (qq-gateway-conversation-list-recent
+                 (qq-message-list-recent
                   "slot-a"
                   :callback (lambda (page) (setq delivered page))
                   :limit 37)
                  "recent-1"))
         (should (equal method "conversation.list_recent"))
         (should (equal params '((account_id . "slot-a") (limit . 37))))
-        (funcall success (qq-gateway-conversation-test-page)))
+        (funcall success (qq-message-recent-test-page)))
       (should (proper-list-p (alist-get 'conversations delivered)))
       (let* ((row (car (alist-get 'conversations delivered)))
              (message (alist-get 'latest_message row)))
@@ -118,122 +118,122 @@ TRUNCATED is its exact wire boolean."
         (should (equal (alist-get 'message_id message)
                        "7348923749823749823"))))))
 
-(ert-deftest qq-gateway-conversation-domain-page-preserves-optional-pinned-state ()
-  (qq-gateway-conversation-test-with-state
+(ert-deftest qq-message-recent-domain-page-preserves-optional-pinned-state ()
+  (qq-message-recent-test-with-state
     (let* ((pinned-page
-            (qq-gateway-conversation-test-page
-             :rows (list (qq-gateway-conversation-test-row :pinned t))))
+            (qq-message-recent-test-page
+             :rows (list (qq-message-recent-test-row :pinned t))))
            (unknown-page
-            (qq-gateway-conversation-test-page
-             :rows (list (qq-gateway-conversation-test-row))))
+            (qq-message-recent-test-page
+             :rows (list (qq-message-recent-test-row))))
            (pinned-row
             (car (alist-get 'conversations
-                            (qq-gateway-conversation--check-page
-                             (qq-gateway-wire-domain-copy pinned-page)))))
+                            (qq-message--recent-check-page
+                             (qq-server-wire-domain-copy pinned-page)))))
            (unknown-row
             (car (alist-get 'conversations
-                            (qq-gateway-conversation--check-page
-                             (qq-gateway-wire-domain-copy unknown-page))))))
+                            (qq-message--recent-check-page
+                             (qq-server-wire-domain-copy unknown-page))))))
       (should (eq (alist-get 'pinned pinned-row) t))
       (should-not (assq 'pinned unknown-row)))))
 
-(ert-deftest qq-gateway-conversation-projection-preserves-stable-account-page ()
-  (qq-gateway-conversation-test-with-state
-    (let* ((page (qq-gateway-conversation-test-page))
+(ert-deftest qq-message-recent-projection-preserves-stable-account-page ()
+  (qq-message-recent-test-with-state
+    (let* ((page (qq-message-recent-test-page))
            (validated
-            (qq-gateway-conversation--check-page
-             (qq-gateway-wire-domain-copy page)))
+            (qq-message--recent-check-page
+             (qq-server-wire-domain-copy page)))
            (row (car (alist-get 'conversations validated))))
       (should (equal (alist-get 'account_id validated) "slot-a"))
       (should-not (assq 'generation validated))
       (should-not (assq 'latest_message_generation row)))))
 
-(ert-deftest qq-gateway-conversation-projection-allows-forward-compatible-fields ()
-  (qq-gateway-conversation-test-with-state
+(ert-deftest qq-message-recent-projection-allows-forward-compatible-fields ()
+  (qq-message-recent-test-with-state
     (let* ((row
             (append
-             (qq-gateway-conversation-test-row)
+             (qq-message-recent-test-row)
              '((read_cursor
                 . ((read_through_message_id
                     . "7348923749823749823"))))))
            (page
             (append
-             (qq-gateway-conversation-test-page :rows (list row))
+             (qq-message-recent-test-page :rows (list row))
              '((server_extension . t))))
            (domain
-            (qq-gateway-conversation--check-page
-             (qq-gateway-wire-domain-copy page)))
+            (qq-message--recent-check-page
+             (qq-server-wire-domain-copy page)))
            (projected-row (car (alist-get 'conversations domain))))
       (should (eq (alist-get 'server_extension domain) t))
       (should (assq 'read_cursor projected-row)))))
 
-(ert-deftest qq-gateway-conversation-projection-checks-identity-contract ()
-  (qq-gateway-conversation-test-with-state
+(ert-deftest qq-message-recent-projection-checks-identity-contract ()
+  (qq-message-recent-test-with-state
     (let ()
       (let* ((message
-              (qq-gateway-conversation-test-message
+              (qq-message-recent-test-message
                :conversation
                '((kind . "group") (group_uin . "8209413637"))))
-             (row (qq-gateway-conversation-test-row :message message))
-             (page (qq-gateway-conversation-test-page :rows (list row))))
+             (row (qq-message-recent-test-row :message message))
+             (page (qq-message-recent-test-page :rows (list row))))
         (should-error
-         (qq-gateway-conversation--check-page
-          (qq-gateway-wire-domain-copy page))))
+         (qq-message--recent-check-page
+          (qq-server-wire-domain-copy page))))
       (let* ((identity '((kind . "group") (group_uin . "8209413637")))
              (message
-              (qq-gateway-conversation-test-message
+              (qq-message-recent-test-message
                :conversation
                '((kind . "group") (group_uin . "8209413638"))))
-             (row (qq-gateway-conversation-test-row
+             (row (qq-message-recent-test-row
                    :identity identity :message message))
-             (page (qq-gateway-conversation-test-page :rows (list row))))
+             (page (qq-message-recent-test-page :rows (list row))))
         (should-error
-         (qq-gateway-conversation--check-page
-          (qq-gateway-wire-domain-copy page)))))))
+         (qq-message--recent-check-page
+          (qq-server-wire-domain-copy page)))))))
 
-(ert-deftest qq-gateway-conversation-limit-is-closed-before-send ()
-  (qq-gateway-conversation-test-with-state
+(ert-deftest qq-message-recent-limit-is-closed-before-send ()
+  (qq-message-recent-test-with-state
     (let ((sent 0)
           (qq-recent-contact-count 23))
-      (cl-letf (((symbol-function 'qq-gateway-transport-send)
+      (cl-letf (((symbol-function 'qq-server-send)
                  (lambda (&rest _arguments) (cl-incf sent))))
         (dolist (invalid '(0 501 1.5 "10"))
           (should-error
-           (qq-gateway-conversation-list-recent
+           (qq-message-list-recent
             "slot-a" :limit invalid)
            :type 'user-error))
-        (qq-gateway-conversation-list-recent "slot-a")
+        (qq-message-list-recent "slot-a")
         (should (= sent 1))))))
 
-(ert-deftest qq-gateway-conversation-is-stateless-and-account-addressed ()
-  (qq-gateway-conversation-test-with-state
+(ert-deftest qq-message-recent-is-stateless-and-account-addressed ()
+  (qq-message-recent-test-with-state
     (let (params success delivered)
-      (cl-letf (((symbol-function 'qq-gateway-transport-send)
+      (cl-letf (((symbol-function 'qq-server-send)
                  (lambda (_method request-params callback _errback
                           &optional _early)
                    (setq params request-params
                          success callback)
                    "recent-explicit")))
         ;; Selection is product state and is intentionally irrelevant here.
-        (setq qq-gateway--current-account-id nil)
+        (setq qq-account--current-account-id nil)
         (should
          (equal
-          (qq-gateway-conversation-list-recent
+          (qq-message-list-recent
            "slot-b" :limit 11
            :callback (lambda (page) (setq delivered page)))
           "recent-explicit"))
         (should (equal params '((account_id . "slot-b") (limit . 11))))
         (funcall success
-                 (qq-gateway-conversation-test-page :account-id "slot-b")))
+                 (qq-message-recent-test-page :account-id "slot-b")))
       (should (equal (alist-get 'account_id delivered) "slot-b")))))
 
-(ert-deftest qq-gateway-conversation-transport-signal-propagates ()
-  (qq-gateway-conversation-test-with-state
-    (cl-letf (((symbol-function 'qq-gateway-transport-send)
+(ert-deftest qq-message-recent-transport-signal-propagates ()
+  (qq-message-recent-test-with-state
+    (cl-letf (((symbol-function 'qq-server-send)
                (lambda (&rest _arguments) (error "transport exploded"))))
       (should-error
-       (qq-gateway-conversation-list-recent
+       (qq-message-list-recent
         "slot-a" :errback #'ignore :limit 10)))))
 
-(provide 'qq-gateway-conversation-test)
-;;; qq-gateway-conversation-test.el ends here
+(provide 'qq-message-recent-test)
+;;; qq-message-recent-test.el ends here

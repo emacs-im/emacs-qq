@@ -1,23 +1,23 @@
-;;; qq-gateway-media-test.el --- Tests for native remote media -*- lexical-binding: t; -*-
+;;; qq-remote-media-test.el --- Tests for remote media -*- lexical-binding: t; -*-
 
 ;;; Code:
 
 (require 'ert)
 (require 'cl-lib)
-(require 'qq-gateway-media)
+(require 'qq-remote-media)
 
-(defconst qq-gateway-media-test-id
+(defconst qq-remote-media-test-id
   "media-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
 
-(defconst qq-gateway-media-test-capabilities
+(defconst qq-remote-media-test-capabilities
   '("media.list" "media.status" "media.materialize" "media.cancel"
     "media.release"
     "resource.derive_playable_record" "resource.open_local"
     "resource.close_local"))
 
-(cl-defun qq-gateway-media-test-snapshot
+(cl-defun qq-remote-media-test-snapshot
     (&key
-     (media-id qq-gateway-media-test-id)
+     (media-id qq-remote-media-test-id)
      (account-id "slot-a")
      (message-id "7348923749823749823")
      (segment-index 0)
@@ -45,7 +45,7 @@
     (updated_at . ,updated-at)
     ,@(when error `((error . ,error)))))
 
-(cl-defun qq-gateway-media-test-resource
+(cl-defun qq-remote-media-test-resource
     (&key
      (resource-id "res-native-silk")
      (phase "ready")
@@ -70,79 +70,79 @@
     (expires_at . 1784786400)
     (error)))
 
-(defmacro qq-gateway-media-test-with-state (&rest body)
+(defmacro qq-remote-media-test-with-state (&rest body)
   "Run BODY with isolated remote-media and resource projections."
   (declare (indent 0) (debug t))
-  `(let ((qq-gateway-media--media (make-hash-table :test #'equal))
-         (qq-gateway-media--order nil)
-         (qq-gateway-media--gateway-instance-id nil)
-         (qq-gateway-media--refresh-owner nil)
-         (qq-gateway-media--resync-request-id nil)
-         (qq-gateway-media--playable-resources (make-hash-table :test #'equal))
-         (qq-gateway-media-changed-hook nil)
-         (qq-gateway-media-desync-hook nil)
-         (qq-gateway-resource--resources (make-hash-table :test #'equal))
-         (qq-gateway-resource--order nil)
-         (qq-gateway-resource--refresh-owner nil)
-         (qq-gateway-resource-changed-hook nil))
+  `(let ((qq-remote-media--media (make-hash-table :test #'equal))
+         (qq-remote-media--order nil)
+         (qq-remote-media--gateway-instance-id nil)
+         (qq-remote-media--refresh-owner nil)
+         (qq-remote-media--resync-request-id nil)
+         (qq-remote-media--playable-resources (make-hash-table :test #'equal))
+         (qq-remote-media-changed-hook nil)
+         (qq-remote-media-desync-hook nil)
+         (qq-resource--resources (make-hash-table :test #'equal))
+         (qq-resource--order nil)
+         (qq-resource--refresh-owner nil)
+         (qq-resource-changed-hook nil))
      ,@body))
 
-(ert-deftest qq-gateway-media-accessors-copy-projected-values ()
-  (qq-gateway-media-test-with-state
-    (qq-gateway-media--replace
-     (list (qq-gateway-media-test-snapshot)) 'test)
-    (let* ((public (qq-gateway-media qq-gateway-media-test-id))
+(ert-deftest qq-remote-media-accessors-copy-projected-values ()
+  (qq-remote-media-test-with-state
+    (qq-remote-media--replace
+     (list (qq-remote-media-test-snapshot)) 'test)
+    (let* ((public (qq-remote-media qq-remote-media-test-id))
            (public-account-id (alist-get 'account_id public)))
       (aset public-account-id 0 ?Y)
       (should (equal
                (alist-get 'account_id
-                          (qq-gateway-media qq-gateway-media-test-id))
+                          (qq-remote-media qq-remote-media-test-id))
                "slot-a")))))
 
-(ert-deftest qq-gateway-media-materialize-starts-background-state-machine ()
-  (qq-gateway-media-test-with-state
+(ert-deftest qq-remote-media-materialize-starts-background-state-machine ()
+  (qq-remote-media-test-with-state
     (let (delivered)
-      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
                  (lambda () t))
-                ((symbol-function 'qq-gateway-transport-capabilities)
-                 (lambda () qq-gateway-media-test-capabilities))
-                ((symbol-function 'qq-gateway-transport-send)
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-remote-media-test-capabilities))
+                ((symbol-function 'qq-server-send)
                  (lambda (method params callback _errback &optional _early)
                    (should (equal method "media.materialize"))
                    (should (equal params
-                                  `((media_id . ,qq-gateway-media-test-id))))
+                                  `((media_id . ,qq-remote-media-test-id))))
                    (funcall
                     callback
-                    `((media . ,(qq-gateway-media-test-snapshot
+                    `((media . ,(qq-remote-media-test-snapshot
                                   :phase "materializing"
                                   :bytes-done "0"
                                   :updated-at 1784700001))))
                    "materialize-request")))
         (should
          (equal
-          (qq-gateway-media-materialize
-           qq-gateway-media-test-id
+          (qq-remote-media-materialize
+           qq-remote-media-test-id
            (lambda (result) (setq delivered result)))
           "materialize-request"))
         (should (equal (alist-get 'phase delivered) "materializing"))
-        (should (qq-gateway-media qq-gateway-media-test-id))
-        (should-not (qq-gateway-resource "res-native-silk"))))))
+        (should (qq-remote-media qq-remote-media-test-id))
+        (should-not (qq-resource "res-native-silk"))))))
 
-(ert-deftest qq-gateway-media-await-materialized-follows-events-and-is-locally-cancellable ()
-  (qq-gateway-media-test-with-state
+(ert-deftest qq-remote-media-await-materialized-follows-events-and-is-locally-cancellable ()
+  (qq-remote-media-test-with-state
     (let (delivered failed)
-      (qq-gateway-media--upsert
-       (qq-gateway-media-test-snapshot :phase "materializing") 'test)
+      (qq-remote-media--upsert
+       (qq-remote-media-test-snapshot :phase "materializing") 'test)
       (let ((watch
-             (qq-gateway-media-await-materialized
-              qq-gateway-media-test-id
+             (qq-remote-media-await-materialized
+              qq-remote-media-test-id
               (lambda (media) (setq delivered media))
               (lambda (_body reason) (setq failed reason)))))
         (should-not delivered)
-        (qq-gateway-media--handle-event
+        (qq-remote-media--handle-event
          "media.changed"
          `((media
-            . ,(qq-gateway-media-test-snapshot
+            . ,(qq-remote-media-test-snapshot
                 :phase "materialized"
                 :resource-id "res-native-silk"
                 :bytes-done "128"
@@ -150,32 +150,32 @@
         (should (equal (alist-get 'resource_id delivered)
                        "res-native-silk"))
         (should-not failed)
-        (should-not (qq-gateway-watch-active-p watch))))))
+        (should-not (qq-request-watch-active-p watch))))))
 
-(ert-deftest qq-gateway-media-cancel-operation-mutates-service-lifecycle ()
-  (qq-gateway-media-test-with-state
+(ert-deftest qq-remote-media-cancel-operation-mutates-service-lifecycle ()
+  (qq-remote-media-test-with-state
       (let ((operation
-           (qq-gateway-media-operation-create
-            :active-p t :media-id qq-gateway-media-test-id
+           (qq-remote-media-operation-create
+            :active-p t :media-id qq-remote-media-test-id
             :account-id "slot-a"))
           canceled)
-      (cl-letf (((symbol-function 'qq-gateway--method-available-p)
+      (cl-letf (((symbol-function 'qq-rpc-method-available-p)
                  (lambda (method) (equal method "media.cancel")))
-                ((symbol-function 'qq-gateway-media-cancel)
+                ((symbol-function 'qq-remote-media-cancel)
                  (lambda (media-id &optional _callback _errback)
                    (setq canceled media-id)
                    "cancel-request")))
-        (should (qq-gateway-media-cancel-operation operation))
-        (should-not (qq-gateway-media-operation-active-p operation))
-        (should (equal canceled qq-gateway-media-test-id))))))
+        (should (qq-remote-media-cancel-operation operation))
+        (should-not (qq-remote-media-operation-active-p operation))
+        (should (equal canceled qq-remote-media-test-id))))))
 
-(ert-deftest qq-gateway-media-playback-pipeline-reuses-derived-wav ()
-  (qq-gateway-media-test-with-state
+(ert-deftest qq-remote-media-playback-pipeline-reuses-derived-wav ()
+  (qq-remote-media-test-with-state
     (let* ((account-id "slot-a")
            (path (make-temp-file "qq-playback-" nil ".wav" "RIFF"))
-           (raw (qq-gateway-media-test-resource
+           (raw (qq-remote-media-test-resource
                  :resource-id "res-native-silk"))
-           (playable (qq-gateway-media-test-resource
+           (playable (qq-remote-media-test-resource
                       :resource-id "res-playback-wav"
                       :suggested-name "voice.wav"
                       :size "1964"
@@ -190,51 +190,51 @@
             (alist-get 'suggested_name playable) "voice.wav"
             (alist-get 'media_type playable) "audio/wav")
       (unwind-protect
-          (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+          (cl-letf (((symbol-function 'qq-account-current-id)
                      (lambda () account-id))
-                    ((symbol-function 'qq-gateway-account)
+                    ((symbol-function 'qq-account-get)
                      (lambda (candidate)
                        (and (equal candidate account-id)
                             `((account_id . ,account-id)
                               (phase . "online")))))
-                    ((symbol-function 'qq-gateway-media-materialize)
+                    ((symbol-function 'qq-remote-media-materialize)
                      (lambda (_media-id callback _errback)
                        (setq materialize-callback callback)
                        "materialize"))
-                    ((symbol-function 'qq-gateway-media-await-materialized)
+                    ((symbol-function 'qq-remote-media-await-materialized)
                      (lambda (_media-id callback _errback)
                        (let ((watch
-                              (qq-gateway-watch-create
+                              (qq-request-watch-create
                                :active-p t :cancel-function #'ignore)))
                          (setq media-ready-callback
                                (lambda (media)
-                                 (qq-gateway-watch-cancel watch)
+                                 (qq-request-watch-cancel watch)
                                  (funcall callback media)))
                          watch)))
-                    ((symbol-function 'qq-gateway-resource-status)
+                    ((symbol-function 'qq-resource-status)
                      (lambda (_resource-id callback _errback)
                        (setq status-callback callback)
                        "resource-status"))
-                    ((symbol-function 'qq-gateway-resource-await-ready)
+                    ((symbol-function 'qq-resource-await-ready)
                      (lambda (resource-id callback _errback)
                        (let* ((watch
-                               (qq-gateway-watch-create
+                               (qq-request-watch-create
                                 :active-p t :cancel-function #'ignore))
                               (deliver
                                (lambda (resource)
-                                 (qq-gateway-watch-cancel watch)
+                                 (qq-request-watch-cancel watch)
                                  (funcall callback resource))))
                          (if (equal resource-id "res-native-silk")
                              (setq raw-ready-callback deliver)
                            (setq playable-ready-callback deliver))
                          watch)))
                     ((symbol-function
-                      'qq-gateway-resource-derive-playable-record)
+                      'qq-resource-derive-playable-record)
                      (lambda (_source _name callback _errback)
                        (cl-incf derive-count)
                        (setq derive-callback callback)
                        "derive"))
-                    ((symbol-function 'qq-gateway-resource-open-local)
+                    ((symbol-function 'qq-resource-open-local)
                      (lambda (resource-id callback _errback)
                        (cl-incf open-count)
                        (setq open-callback
@@ -254,43 +254,43 @@
                    (setq derive-callback nil
                          playable-ready-callback nil)
                    (let ((operation
-                          (qq-gateway-media-prepare-record-playback
-                           qq-gateway-media-test-id
+                          (qq-remote-media-prepare-record-playback
+                           qq-remote-media-test-id
                            (lambda (result) (push result delivered)))))
                      (should
-                      (qq-gateway-media-operation-active-p operation))
+                      (qq-remote-media-operation-active-p operation))
                      (funcall
                       materialize-callback
-                      (qq-gateway-media-test-snapshot
+                      (qq-remote-media-test-snapshot
                        :phase "materializing"
                        :updated-at 1784700001))
                      (funcall
                       media-ready-callback
-                      (qq-gateway-media-test-snapshot
+                      (qq-remote-media-test-snapshot
                        :phase "materialized"
                        :resource-id "res-native-silk"
                        :bytes-done "128"
                        :updated-at 1784700002))
                      (funcall status-callback raw)
                      (puthash "res-native-silk" raw
-                              qq-gateway-resource--resources)
+                              qq-resource--resources)
                      (funcall raw-ready-callback raw)
                      (if derive-p
                          (progn
                            (funcall
                             derive-callback
-                            (qq-gateway-media-test-resource
+                            (qq-remote-media-test-resource
                              :resource-id "res-playback-wav"
                              :phase "staging"
                              :suggested-name "voice.wav"
                              :size "1964"))
                            (puthash "res-playback-wav" playable
-                                    qq-gateway-resource--resources)
+                                    qq-resource--resources)
                            (funcall playable-ready-callback playable))
                        (should-not derive-callback))
                      (funcall open-callback)
                      (should-not
-                      (qq-gateway-media-operation-active-p operation)))))
+                      (qq-remote-media-operation-active-p operation)))))
               (drive t)
               (drive nil))
             (should (= derive-count 1))
@@ -307,103 +307,103 @@
               delivered)))
         (delete-file path)))))
 
-(ert-deftest qq-gateway-media-events-project-and-remove-opaque_handles ()
-  (qq-gateway-media-test-with-state
+(ert-deftest qq-remote-media-events-project-and-remove-opaque_handles ()
+  (qq-remote-media-test-with-state
     (let (changes)
-      (add-hook 'qq-gateway-media-changed-hook
+      (add-hook 'qq-remote-media-changed-hook
                 (lambda (reason media-id)
                   (push (list reason media-id) changes)))
-      (qq-gateway-media--handle-event
+      (qq-remote-media--handle-event
        "media.changed"
-       `((media . ,(qq-gateway-media-test-snapshot))))
-      (should (qq-gateway-media qq-gateway-media-test-id))
-      (qq-gateway-media--handle-event
+       `((media . ,(qq-remote-media-test-snapshot))))
+      (should (qq-remote-media qq-remote-media-test-id))
+      (qq-remote-media--handle-event
        "media.changed"
-       `((media . ,(qq-gateway-media-test-snapshot))))
+       `((media . ,(qq-remote-media-test-snapshot))))
       (should (= (length changes) 1))
-      (qq-gateway-media--handle-event
-       "media.removed" `((media_id . ,qq-gateway-media-test-id)))
-      (should-not (qq-gateway-media qq-gateway-media-test-id))
+      (qq-remote-media--handle-event
+       "media.removed" `((media_id . ,qq-remote-media-test-id)))
+      (should-not (qq-remote-media qq-remote-media-test-id))
       (should (equal (car changes)
-                     `(removed ,qq-gateway-media-test-id))))))
+                     `(removed ,qq-remote-media-test-id))))))
 
-(ert-deftest qq-gateway-media-ready-uses-typed-single-flight-resync ()
-  (qq-gateway-media-test-with-state
+(ert-deftest qq-remote-media-ready-uses-typed-single-flight-resync ()
+  (qq-remote-media-test-with-state
     (let ((capabilities '("media.list")) calls)
-      (cl-letf (((symbol-function 'qq-gateway-transport-capabilities)
+      (cl-letf (((symbol-function 'qq-server-capabilities)
                  (lambda () capabilities))
-                ((symbol-function 'qq-gateway-media-refresh)
+                ((symbol-function 'qq-remote-media-refresh)
                  (lambda (_callback _errback reason &optional _owner)
                    (push reason calls)
                    "media-list-request")))
-        (qq-gateway-media--handle-ready "gateway-a")
-        (qq-gateway-media--handle-ready "gateway-a")
+        (qq-remote-media--handle-ready "gateway-a")
+        (qq-remote-media--handle-ready "gateway-a")
         (should (equal calls '(ready)))
-        (should (equal qq-gateway-media--gateway-instance-id "gateway-a"))
-        (should (equal (car qq-gateway-media--resync-request-id)
+        (should (equal qq-remote-media--gateway-instance-id "gateway-a"))
+        (should (equal (car qq-remote-media--resync-request-id)
                        'media-resync))
         (setq capabilities nil)
-        (qq-gateway-media--handle-ready "gateway-b")
-        (should (equal qq-gateway-media--gateway-instance-id "gateway-b"))
-        (should-not qq-gateway-media--resync-request-id)
+        (qq-remote-media--handle-ready "gateway-b")
+        (should (equal qq-remote-media--gateway-instance-id "gateway-b"))
+        (should-not qq-remote-media--resync-request-id)
         (should (equal calls '(ready)))))))
 
-(ert-deftest qq-gateway-media-newest-refresh-owns-full-replacement ()
-  (qq-gateway-media-test-with-state
+(ert-deftest qq-remote-media-newest-refresh-owns-full-replacement ()
+  (qq-remote-media-test-with-state
     (let ((old-id "media-11111111-2222-4333-8444-555555555555")
           (new-id "media-11111111-2222-4333-8444-555555555556")
           requests old-callback old-error new-callback)
-      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
                  (lambda () t))
-                ((symbol-function 'qq-gateway-transport-capabilities)
+                ((symbol-function 'qq-server-capabilities)
                  (lambda () '("media.list")))
-                ((symbol-function 'qq-gateway-transport-send)
+                ((symbol-function 'qq-server-send)
                  (lambda (_method _params callback errback &optional _early)
                    (setq requests
                          (append requests (list (cons callback errback))))
                    (intern (format "media-request-%d" (length requests))))))
-        (qq-gateway-media-refresh
+        (qq-remote-media-refresh
          (lambda (_) (setq old-callback t))
          (lambda (body _failure) (setq old-error body)))
-        (qq-gateway-media-refresh
+        (qq-remote-media-refresh
          (lambda (_) (setq new-callback t)) #'ignore)
         (funcall
          (car (nth 1 requests))
-         `((media . [,(qq-gateway-media-test-snapshot :media-id new-id)])))
+         `((media . [,(qq-remote-media-test-snapshot :media-id new-id)])))
         (funcall
          (car (nth 0 requests))
-         `((media . [,(qq-gateway-media-test-snapshot :media-id old-id)])))
+         `((media . [,(qq-remote-media-test-snapshot :media-id old-id)])))
         (should new-callback)
         (should-not old-callback)
         (should (equal (alist-get 'code old-error) "superseded_request"))
-        (should (qq-gateway-media new-id))
-        (should-not (qq-gateway-media old-id))
-        (should-not qq-gateway-media--refresh-owner)))))
+        (should (qq-remote-media new-id))
+        (should-not (qq-remote-media old-id))
+        (should-not qq-remote-media--refresh-owner)))))
 
-(ert-deftest qq-gateway-media-reset-cancels-pending-refresh ()
-  (qq-gateway-media-test-with-state
+(ert-deftest qq-remote-media-reset-cancels-pending-refresh ()
+  (qq-remote-media-test-with-state
     (let (late-success canceled failures)
-      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
                  (lambda () t))
-                ((symbol-function 'qq-gateway-transport-capabilities)
+                ((symbol-function 'qq-server-capabilities)
                  (lambda () '("media.list")))
-                ((symbol-function 'qq-gateway-transport-send)
+                ((symbol-function 'qq-server-send)
                  (lambda (_method _params success _failure &optional _early)
                    (setq late-success success)
                    'media-refresh-token))
-                ((symbol-function 'qq-gateway-transport-cancel)
+                ((symbol-function 'qq-server-cancel)
                  (lambda (token) (push token canceled) t)))
-        (qq-gateway-media-refresh
+        (qq-remote-media-refresh
          nil (lambda (body _reason) (push body failures)))
-        (qq-gateway-media-reset)
+        (qq-remote-media-reset)
         (should (equal canceled '(media-refresh-token)))
         (should (= (length failures) 1))
-        (should-not qq-gateway-media--refresh-owner)
+        (should-not qq-remote-media--refresh-owner)
         (funcall late-success
-                 `((media . [,(qq-gateway-media-test-snapshot)])))
+                 `((media . [,(qq-remote-media-test-snapshot)])))
         (should (= (length failures) 1))
-        (should-not (qq-gateway-media-list))))))
+        (should-not (qq-remote-media-list))))))
 
-(provide 'qq-gateway-media-test)
+(provide 'qq-remote-media-test)
 
-;;; qq-gateway-media-test.el ends here
+;;; qq-remote-media-test.el ends here

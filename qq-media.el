@@ -16,9 +16,10 @@
 (require 'appkit-media)
 (require 'qq-api)
 (require 'qq-customize)
-(require 'qq-gateway-directory)
-(require 'qq-gateway-media)
-(require 'qq-gateway-transport)
+(require 'qq-directory)
+(require 'qq-remote-media)
+(require 'qq-rpc)
+(require 'qq-server)
 (require 'qq-runtime)
 (require 'qq-state)
 
@@ -208,7 +209,7 @@ transfer callbacks can run outside a safe redisplay context; immediate
   "Return validated native record media ID from SEGMENT, or nil."
   (when (equal (alist-get 'type segment) "record")
     (let ((media-id (alist-get 'media_id (alist-get 'data segment))))
-      (and (qq-gateway-media--id-p media-id) media-id))))
+      (and (qq-remote-media--id-p media-id) media-id))))
 
 (defun qq-media--native-record-key (media-id)
   "Return logical media cache key for native record MEDIA-ID."
@@ -243,11 +244,11 @@ and ephemeral filesystem path retained by the private player state."
 
 (defun qq-media--close-native-record-access (access-id)
   "Best-effort revoke local resource ACCESS-ID."
-  (when (qq-gateway-resource--local-access-id-p access-id)
+  (when (qq-resource--local-access-id-p access-id)
     (condition-case error-data
-        (when (and (qq-gateway-transport-ready-p)
-                   (qq-gateway--method-available-p "resource.close_local"))
-          (qq-gateway-resource-close-local
+        (when (and (qq-server-ready-p)
+                   (qq-rpc-method-available-p "resource.close_local"))
+          (qq-resource-close-local
            access-id nil
            (lambda (_body reason)
              (message "qq: failed to close record playback lease: %s" reason))))
@@ -274,9 +275,9 @@ and ephemeral filesystem path retained by the private player state."
       (setq entry (plist-put entry :status (or status 'stopped)))
       (setq entry (plist-put entry :error error-text))
       (puthash media-id entry qq-media--native-record-playbacks)
-      (when (and (qq-gateway-media-operation-p operation)
-                 (qq-gateway-media-operation-active-p operation))
-        (qq-gateway-media-cancel-operation operation))
+      (when (and (qq-remote-media-operation-p operation)
+                 (qq-remote-media-operation-active-p operation))
+        (qq-remote-media-cancel-operation operation))
       (when (processp process)
         (set-process-filter process nil)
         (set-process-sentinel process nil)
@@ -423,7 +424,7 @@ and ephemeral filesystem path retained by the private player state."
     (if (not (and entry
                   (equal qq-media--native-record-current-id media-id)
                   (eq (plist-get entry :status) 'preparing)
-                  (qq-gateway-account (plist-get entry :account-id))))
+                  (qq-account-get (plist-get entry :account-id))))
         (qq-media--close-native-record-access
          (alist-get 'access_id (alist-get 'access result)))
       (qq-media--start-native-record-player media-id result))))
@@ -507,7 +508,7 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
          (qq-media--notify-native-record-state media-id)
          (condition-case error-data
              (let ((operation
-                    (qq-gateway-media-prepare-record-playback
+                    (qq-remote-media-prepare-record-playback
                      media-id
                      (apply-partially #'qq-media--native-record-prepared media-id)
                      (apply-partially
@@ -531,7 +532,7 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
       (qq-media--notify-native-record-state media-id)
     (qq-media--note-cache-updated nil)))
 
-(add-hook 'qq-gateway-media-changed-hook
+(add-hook 'qq-remote-media-changed-hook
           #'qq-media--native-remote-media-changed)
 
 (defun qq-media--image-from-file (file height)
@@ -1054,8 +1055,8 @@ states never probe a second interface such as get_file."
 (defun qq-media--native-record-methods-ready-p ()
   "Return non-nil when native record playback can start for this account."
   (and (qq-runtime-current-account-id)
-       (qq-gateway-transport-ready-p)
-       (cl-every #'qq-gateway--method-available-p
+       (qq-server-ready-p)
+       (cl-every #'qq-rpc-method-available-p
                  qq-media--native-record-required-methods)))
 
 (defun qq-media--native-record-capabilities (media-id)
@@ -1063,7 +1064,7 @@ states never probe a second interface such as get_file."
   (let* ((playback (gethash media-id qq-media--native-record-playbacks))
          (playback-status (plist-get playback :status))
          (playback-error (plist-get playback :error))
-         (remote (qq-gateway-media media-id))
+         (remote (qq-remote-media media-id))
          (phase (alist-get 'phase remote))
          (problem (alist-get 'error remote))
          (problem-message (alist-get 'message problem))
@@ -1664,8 +1665,8 @@ fallback for identities observed outside that directory."
       (funcall done resource)
     (if (and (qq-runtime-current-account-id)
              (member "contact.get_user_avatar"
-                     (qq-gateway-transport-capabilities)))
-        (qq-gateway-directory-get-user-avatar user-id done error)
+                     (qq-server-capabilities)))
+        (qq-directory-get-user-avatar user-id done error)
       (funcall error nil "native avatar locator is unavailable"))))
 
 (defun qq-media-open-user-avatar (user-id)

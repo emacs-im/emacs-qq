@@ -10,14 +10,13 @@
 ;;; Code:
 
 (require 'subr-x)
-(require 'url-util)
 
 (defgroup qq nil
-  "Native QQ client for Emacs."
+  "QQ client for Emacs."
   :group 'comm)
 
-(defcustom qq-native-websocket-url "ws://127.0.0.1:3002/"
-  "Native service WebSocket endpoint used by emacs-qq.
+(defcustom qq-server-websocket-url "ws://127.0.0.1:3002/"
+  "QQ service WebSocket endpoint used by emacs-qq.
 
 The service is a long-lived process which owns zero or more QQ account
 runtimes.  Closing this WebSocket only disconnects this Emacs client; it does
@@ -25,7 +24,7 @@ not stop or log out any managed account."
   :type 'string
   :group 'qq)
 
-(defcustom qq-native-auth-token-file
+(defcustom qq-server-auth-token-file
   (locate-user-emacs-file "qq/service-token")
   "File containing the native service authentication token.
 
@@ -35,12 +34,12 @@ bytes.  On Unix the file must not be accessible by group or other users."
   :type 'file
   :group 'qq)
 
-(defcustom qq-native-client-name "emacs-qq"
+(defcustom qq-server-client-name "emacs-qq"
   "Client name sent in the native protocol handshake."
   :type 'string
   :group 'qq)
 
-(defcustom qq-native-request-timeout 30
+(defcustom qq-server-request-timeout 30
   "Seconds before an unanswered native request fails locally.
 
 Nil disables request timeouts."
@@ -48,7 +47,7 @@ Nil disables request timeouts."
                  (number :tag "Seconds"))
   :group 'qq)
 
-(defcustom qq-native-ready-timeout 10
+(defcustom qq-server-ready-timeout 10
   "Seconds to wait for the ready snapshot after a successful handshake.
 
 The service sends this authoritative snapshot immediately after the handshake
@@ -57,12 +56,12 @@ response.  Nil disables this additional protocol timeout."
                  (number :tag "Seconds"))
   :group 'qq)
 
-(defcustom qq-native-reconnect-delay 3
+(defcustom qq-server-reconnect-delay 3
   "Seconds before reconnecting the native service WebSocket."
   :type 'number
   :group 'qq)
 
-(defcustom qq-native-reconnect-max-attempts nil
+(defcustom qq-server-reconnect-max-attempts nil
   "Maximum native service reconnect attempts before stopping.
 
 Set to nil to retry indefinitely.  The counter is reset only after an
@@ -90,15 +89,6 @@ is used in graphical Emacs; terminal frames use its UTF-8 rendering."
   :type 'integer
   :group 'qq)
 
-(defvar qq-onebot-websocket-url "ws://127.0.0.1:3001/"
-  "Dormant v1 OneBot endpoint retained until legacy modules are removed.")
-
-(defvar qq-onebot-token nil
-  "Dormant v1 OneBot token retained until legacy modules are removed.")
-
-(defvar qq-onebot-token-env-var "NAPCAT_ONEBOT_TOKEN"
-  "Dormant v1 OneBot token variable retained for legacy module loading.")
-
 (defcustom qq-recent-contact-count 50
   "Default amount of recent sessions requested during refresh."
   :type 'integer
@@ -108,9 +98,6 @@ is used in graphical Emacs; terminal frames use its UTF-8 rendering."
   "Default amount of messages fetched per history request."
   :type 'integer
   :group 'qq)
-
-(defvar qq-transport-request-timeout 30
-  "Dormant v1 OneBot request timeout retained for legacy module loading.")
 
 (defcustom qq-chat-history-auto-load-threshold 2000
   "Character distance from a timeline edge that triggers history paging.
@@ -507,40 +494,6 @@ already materialized and decoded the immutable resource before launch."
   "Seconds used to weakly dedupe self-message event echoes."
   :type 'integer
   :group 'qq)
-
-(defvar qq-transport-reconnect-delay 3
-  "Dormant v1 OneBot reconnect delay retained for legacy module loading.")
-
-(defvar qq-transport-reconnect-max-attempts nil
-  "Dormant v1 OneBot retry limit retained for legacy module loading.")
-
-(defun qq-set-token (token)
-  "Set dormant v1 OneBot TOKEN for the current Emacs session."
-  (interactive (list (read-passwd "NapCat OneBot token: ")))
-  (setq qq-onebot-token token)
-  (message "qq: token set for current session"))
-
-(defun qq-current-token ()
-  "Return the dormant v1 OneBot token from variable or environment."
-  (let ((custom-token (and (stringp qq-onebot-token)
-                           (not (string-empty-p qq-onebot-token))
-                           qq-onebot-token))
-        (env-token (let ((raw (getenv qq-onebot-token-env-var)))
-                     (and (stringp raw)
-                          (not (string-empty-p raw))
-                          raw))))
-    (or custom-token env-token)))
-
-(defun qq-build-websocket-url ()
-  "Return `qq-onebot-websocket-url' with token query appended when needed."
-  (let ((url qq-onebot-websocket-url)
-        (token (qq-current-token)))
-    (if (or (null token) (string-empty-p token))
-        url
-      (concat url
-              (if (string-match-p "\\?" url) "&" "?")
-              "access_token="
-              (url-hexify-string token)))))
 
 (provide 'qq-customize)
 

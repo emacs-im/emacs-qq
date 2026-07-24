@@ -354,11 +354,11 @@
 (ert-deftest qq-media-native-avatar-resolves-directory-cache-miss ()
   (let ((qq-state--friends-by-id (make-hash-table :test #'equal))
         result call)
-    (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+    (cl-letf (((symbol-function 'qq-account-current-id)
                (lambda () "slot-a"))
-              ((symbol-function 'qq-gateway-transport-capabilities)
+              ((symbol-function 'qq-server-capabilities)
                (lambda () '("contact.get_user_avatar")))
-              ((symbol-function 'qq-gateway-directory-get-user-avatar)
+              ((symbol-function 'qq-directory-get-user-avatar)
                (lambda (user-id done &optional _error)
                  (setq call user-id)
                  (funcall
@@ -1706,19 +1706,19 @@
                     (data . ((duration_seconds . 17)
                              (media_id . ,media-id)))))
          (qq-media--native-record-playbacks (make-hash-table :test #'equal))
-         (qq-gateway-media--media (make-hash-table :test #'equal))
+         (qq-remote-media--media (make-hash-table :test #'equal))
          (account-id "10001"))
     (puthash media-id
              `((media_id . ,media-id)
                (phase . "materializing")
                (bytes_done . "4096")
                (bytes_total . "8192"))
-             qq-gateway-media--media)
-    (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+             qq-remote-media--media)
+    (cl-letf (((symbol-function 'qq-account-current-id)
                (lambda () account-id))
-              ((symbol-function 'qq-gateway-transport-ready-p)
+              ((symbol-function 'qq-server-ready-p)
                (lambda () t))
-              ((symbol-function 'qq-gateway--method-available-p)
+              ((symbol-function 'qq-rpc-method-available-p)
                (lambda (_method) t))
               ((symbol-function 'qq-media-native-record-playback-available-p)
                (lambda () t)))
@@ -1746,15 +1746,15 @@
          (qq-media--native-record-current-id nil)
          (account-id "10001")
          operation prepared-id)
-    (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+    (cl-letf (((symbol-function 'qq-account-current-id)
                (lambda () account-id))
               ((symbol-function 'qq-media-native-record-playback-available-p)
                (lambda () t))
-              ((symbol-function 'qq-gateway-media-prepare-record-playback)
+              ((symbol-function 'qq-remote-media-prepare-record-playback)
                (lambda (called-media-id _callback &optional _errback)
                  (setq prepared-id called-media-id
                        operation
-                       (qq-gateway-media-operation-create
+                       (qq-remote-media-operation-create
                         :active-p t
                         :media-id called-media-id
                         :account-id account-id))))
@@ -1767,9 +1767,9 @@
       (should (eq (plist-get (qq-media-native-record-playback-state media-id)
                              :status)
                   'preparing))
-      (should (qq-gateway-media-operation-active-p operation))
+      (should (qq-remote-media-operation-active-p operation))
       (qq-media-play-native-record segment)
-      (should-not (qq-gateway-media-operation-active-p operation))
+      (should-not (qq-remote-media-operation-active-p operation))
       (should-not qq-media--native-record-current-id)
       (should (eq (plist-get (qq-media-native-record-playback-state media-id)
                              :status)
@@ -1835,14 +1835,14 @@
          (account-id "10001")
          operation)
     (unwind-protect
-        (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+        (cl-letf (((symbol-function 'qq-account-current-id)
                    (lambda () account-id))
                   ((symbol-function 'qq-media-native-record-playback-available-p)
                    (lambda () t))
-                  ((symbol-function 'qq-gateway-media-prepare-record-playback)
+                  ((symbol-function 'qq-remote-media-prepare-record-playback)
                    (lambda (called-media-id _callback &optional _errback)
                      (setq operation
-                            (qq-gateway-media-operation-create
+                            (qq-remote-media-operation-create
                              :active-p t
                              :media-id called-media-id
                              :account-id account-id))))
@@ -1854,7 +1854,7 @@
                             :owner-handle)))
             (should (appkit-handle-alive-p handle)))
           (appkit-stop-app owner)
-          (should-not (qq-gateway-media-operation-active-p operation))
+          (should-not (qq-remote-media-operation-active-p operation))
           (should-not qq-media--native-record-current-id)
           (should (eq (plist-get (qq-media-native-record-playback-state media-id)
                                  :status)

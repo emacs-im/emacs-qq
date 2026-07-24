@@ -16,9 +16,10 @@
 (require 'subr-x)
 (require 'browse-url)
 (require 'qq-customize)
-(require 'qq-gateway)
-(require 'qq-gateway-transport)
-(require 'qq-native)
+(require 'qq-account)
+(require 'qq-rpc)
+(require 'qq-server)
+(require 'qq-core)
 
 (cl-defstruct (qq-login--session
                (:constructor qq-login--session-create))
@@ -136,7 +137,7 @@
     (let* ((code (alist-get 'code body))
            (error-text
             (format "Login failed%s: %s"
-                    (if (qq-gateway--non-empty-string-p code)
+                    (if (qq-account--non-empty-string-p code)
                         (format " [%s]" code)
                       "")
                     (or reason "native request failed"))))
@@ -158,7 +159,7 @@
             (copy-sequence account-id)
             (qq-login--session-create-p session) nil
             (qq-login--session-in-flight-p session) nil)
-      (qq-gateway--set-current-account account-id)
+      (qq-account--set-current-account account-id)
       (qq-login--present session "Managed account created." nil)
       (qq-login--schedule session))))
 
@@ -190,8 +191,8 @@ SUCCESS defaults to `qq-login--request-success'.  FAILURE defaults to
 
 (defun qq-login--quick-login-available-p ()
   "Return non-nil when the Gateway exposes the complete EasyLogin API."
-  (and (qq-gateway--method-available-p "account.login.list")
-       (qq-gateway--method-available-p "account.login.quick")))
+  (and (qq-rpc-method-available-p "account.login.list")
+       (qq-rpc-method-available-p "account.login.quick")))
 
 (defun qq-login--active-runtime-p (account)
   "Return non-nil when managed ACCOUNT already has an active runtime."
@@ -200,7 +201,7 @@ SUCCESS defaults to `qq-login--request-success'.  FAILURE defaults to
 
 (defun qq-login--in-progress-account ()
   "Return the selected account when its lifecycle should be continued."
-  (when-let* ((account (qq-gateway-current-account)))
+  (when-let* ((account (qq-account-current)))
     (and (qq-login--active-runtime-p account)
          account)))
 
@@ -220,7 +221,7 @@ SUCCESS defaults to `qq-login--request-success'.  FAILURE defaults to
   (qq-login--request
    session
    (lambda (success failure)
-     (qq-gateway-account-login-list success failure))
+     (qq-account-login-list success failure))
    #'qq-login--quick-account-list-success))
 
 (defun qq-login--managed-account-title (account)
@@ -265,7 +266,7 @@ user-facing label."
         managed-choices
         quick-choices
         represented-uins)
-    (dolist (account (qq-gateway-accounts))
+    (dolist (account (qq-account-list))
       (let ((quick-account
              (qq-login--quick-account-for-managed account quick-accounts)))
         (when quick-account
@@ -294,8 +295,8 @@ user-facing label."
   "Return a managed slot already bound to QUICK-ACCOUNT, or nil."
   (let* ((uin (alist-get 'uin quick-account))
          (uid (alist-get 'uid quick-account))
-         (current (qq-gateway-current-account))
-         (accounts (qq-gateway-accounts))
+         (current (qq-account-current))
+         (accounts (qq-account-list))
          (bound
           (cl-remove-if-not
            (lambda (account)
@@ -338,7 +339,7 @@ user-facing label."
                (copy-sequence account-id)
                (qq-login--session-create-p session) nil
                (qq-login--session-quick-login-uin session) nil)
-         (qq-gateway--set-current-account account-id)))
+         (qq-account--set-current-account account-id)))
       (`(quick . ,account)
        (let ((managed (qq-login--matching-managed-account account)))
          (setf (qq-login--session-quick-login-uin session)
@@ -351,7 +352,7 @@ user-facing label."
                (qq-login--session-label session) nil
                (qq-login--session-label-read-p session) t)
          (when managed
-           (qq-gateway--set-current-account
+           (qq-account--set-current-account
             (alist-get 'account_id managed)))))
       (`(new)
        (setf (qq-login--session-account-id session) nil
@@ -393,10 +394,10 @@ Return its current snapshot, or nil while account creation is in flight."
   (let ((account-id (qq-login--session-account-id session)))
     (cond
      (account-id
-      (or (qq-gateway-account account-id)
+      (or (qq-account-get account-id)
           (user-error "qq: QQ account does not exist: %s" account-id)))
      ((or (qq-login--session-create-p session)
-          (null (qq-gateway-accounts)))
+          (null (qq-account-list)))
       (unless (qq-login--session-in-flight-p session)
         (unless (qq-login--session-label-read-p session)
           (setf (qq-login--session-label session) (qq-login--read-label)
@@ -405,24 +406,24 @@ Return its current snapshot, or nil while account creation is in flight."
         (qq-login--request
          session
          (lambda (success failure)
-           (qq-gateway-account-create
+           (qq-account-create
             (qq-login--session-label session) success failure))
          #'qq-login--create-success))
       nil)
      (t
       (let ((selected
-             (or (qq-gateway-current-account-id)
-                 (and (= (length (qq-gateway-accounts)) 1)
-                      (alist-get 'account_id (car (qq-gateway-accounts))))
-                 (qq-gateway--read-account-id "Login account: "))))
+             (or (qq-account-current-id)
+                 (and (= (length (qq-account-list)) 1)
+                      (alist-get 'account_id (car (qq-account-list))))
+                 (qq-account--read-account-id "Login account: "))))
         (setf (qq-login--session-account-id session)
               (copy-sequence selected))
-        (qq-gateway--set-current-account selected)
-        (qq-gateway-account selected))))))
+        (qq-account--set-current-account selected)
+        (qq-account-get selected))))))
 
 (defun qq-login--open-captcha-url (url)
   "Offer the CAPTCHA URL to the user."
-  (when (qq-gateway--non-empty-string-p url)
+  (when (qq-account--non-empty-string-p url)
     (message "qq: complete QQ captcha verification: %s" url)
     (when qq-login-open-verification-url
       (browse-url url))))
@@ -441,7 +442,7 @@ Return its current snapshot, or nil while account creation is in flight."
               (qq-login--request
                session
                (lambda (success failure)
-                 (qq-gateway-account-login-password
+                 (qq-account-login-password
                   account-id uin password nil success failure))))
           (clear-string password)))
     (when (qq-login--session-p session)
@@ -465,7 +466,7 @@ Return its current snapshot, or nil while account creation is in flight."
     (qq-login--request
      session
      (lambda (success failure)
-       (qq-gateway-account-login-quick
+       (qq-account-login-quick
         (alist-get 'account_id account) uin nil success failure))
      nil
      #'qq-login--quick-error)))
@@ -490,7 +491,7 @@ Return its current snapshot, or nil while account creation is in flight."
               (qq-login--request
                session
                (lambda (success failure)
-                 (qq-gateway-account-login-captcha
+                 (qq-account-login-captcha
                   account-id challenge-id ticket rand-str sid success failure))))
           (clear-string ticket)))
     (when (qq-login--session-p session)
@@ -581,7 +582,7 @@ Return its current snapshot, or nil while account creation is in flight."
   "Display Rust-owned new-device verification for SESSION ACCOUNT CHALLENGE."
   (ignore account)
   (let ((qr-url (alist-get 'qr_url challenge)))
-    (unless (qq-gateway--non-empty-string-p qr-url)
+    (unless (qq-account--non-empty-string-p qr-url)
       (error "qq: new-device challenge has no scannable qr_url"))
     (qq-login--prepare-qr session qr-url)
     (setf (qq-login--session-retry-failed-p session) nil)
@@ -604,7 +605,7 @@ Return its current snapshot, or nil while account creation is in flight."
               (qq-login--request
                session
                (lambda (success failure)
-                 (qq-gateway-account-login-unusual-device
+                 (qq-account-login-unusual-device
                   account-id challenge-id device-sig success failure))))
           (clear-string device-sig)))
     (when (qq-login--session-p session)
@@ -631,7 +632,7 @@ Return its current snapshot, or nil while account creation is in flight."
   (qq-login--request
    session
    (lambda (success failure)
-     (qq-gateway-account-start
+     (qq-account-start
       (alist-get 'account_id account) success failure))))
 
 (defun qq-login--drive-ready (session)
@@ -691,7 +692,7 @@ Return its current snapshot, or nil while account creation is in flight."
   (when (and (qq-login--current-p session)
              (not (qq-login--session-in-flight-p session))
              (not (qq-login--session-prompting-p session))
-             (qq-gateway-transport-ready-p))
+             (qq-server-ready-p))
     (condition-case error-data
         (qq-login--drive-ready session)
       (quit
@@ -732,15 +733,15 @@ the caller has already made the optional label choice, including choosing nil."
       (qq-login-cancel))
     (let ((online-account
            (and (not create-p)
-                (qq-gateway-transport-ready-p)
+                (qq-server-ready-p)
                 (if account-id
-                    (qq-gateway-account account-id)
-                  (qq-gateway-current-account)))))
+                    (qq-account-get account-id)
+                  (qq-account-current)))))
       (if (and online-account
                (equal (alist-get 'phase online-account) "online"))
           (progn
             (when account-id
-              (qq-gateway--set-current-account account-id))
+              (qq-account--set-current-account account-id))
             (message "qq: account %s is already online"
                      (or (alist-get 'uin online-account)
                          (alist-get 'account_id online-account)))
@@ -761,10 +762,10 @@ the caller has already made the optional label choice, including choosing nil."
           (qq-login--changed)
           (condition-case error-data
               (progn
-                (unless (qq-native-running-p)
+                (unless (qq-core-running-p)
                   (qq-login--present
                    session "Connecting to native QQ service…" nil)
-                  (qq-native-connect))
+                  (qq-core-connect))
                 (qq-login--schedule session)
                 session)
             (error
@@ -790,8 +791,8 @@ follows projected account phases until the account is online."
   (interactive (list (qq-login--read-label)))
   (qq-login--start nil t label t))
 
-(add-hook 'qq-gateway-ready-hook #'qq-login--projection-changed t)
-(add-hook 'qq-gateway-accounts-changed-hook #'qq-login--projection-changed t)
+(add-hook 'qq-account-registry-ready-hook #'qq-login--projection-changed t)
+(add-hook 'qq-account-registry-changed-hook #'qq-login--projection-changed t)
 
 (provide 'qq-login)
 

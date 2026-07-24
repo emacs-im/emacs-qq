@@ -53,8 +53,8 @@ Appkit 视图。多个账号的根页、聊天、联系人和资料页可以同�
 #+begin_src emacs-lisp
 (require 'qq)
 
-(setq qq-native-websocket-url "ws://127.0.0.1:3002/")
-(setq qq-native-auth-token-file "~/.emacs.d/qq/service-token")
+(setq qq-server-websocket-url "ws://127.0.0.1:3002/")
+(setq qq-server-auth-token-file "~/.emacs.d/qq/service-token")
 #+end_src
 
 执行 ~M-x qq~ 打开主界面。
@@ -187,14 +187,19 @@ eask link add appkit ../appkit.el
 
 - QQ 运行时只依赖 Appkit 的 view、presentation、media、chat-buffer、completion
   和 chat-timeline 基础设施，不依赖 ~disco.el~。
+- ~qq-server.el~ 独占 WebSocket、JSON wire value 和连接生命周期；~qq-rpc.el~
+  在其上提供带所有权的请求与事件分派。
+- ~qq-account.el~、~qq-message.el~、~qq-directory.el~、~qq-resource.el~、
+  ~qq-attachment.el~ 和 ~qq-remote-media.el~ 各自拥有一个闭合的 QQ 领域投影；
+  ~qq-core.el~ 是界面调用的产品操作层。
 - ~qq-runtime.el~ 持有一个全局账号管理 Appkit app，并为每个稳定 ~account_id~
   持有一个独立的业务 app；~qq-state.el~ 以相同边界分区规范状态。
 - ~qq-root.el~ 提供全局账号管理页，并把各账号的最近会话投影到相互独立、带稳定 key
   的单行列表。
 - ~qq-chat.el~ 把 QQ 消息投影到 Appkit 的共享时间线，并负责结构化输入适配。
 - ~qq-media.el~ 负责 QQ 特有的头像、图片、文件、视频和表情资源解析。
-- ~qq-api.el~ 是严格协议边界；来自该分支的响应必须通过封闭结构校验后才能
-  进入客户端状态。
+- 尚未接入 ~qq-core.el~ 的界面功能仍可复用 ~qq-api.el~ 中的闭合数据契约，但调用
+  会显式失败；包内不存在 OneBot transport 或后端回退。
 - 聊天快捷键尽量遵循 telega 的搜索与过滤习惯；QQ 特有命令放在独立扩展按键上。
 
 跨 ~emacs-qq~、~NapCatQQ-emacs~、Appkit 和参考客户端的架构决策，不放进可发布

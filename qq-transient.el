@@ -18,7 +18,7 @@
 (require 'transient)
 (require 'appkit-media)
 (require 'qq-api)
-(require 'qq-native)
+(require 'qq-core)
 (require 'qq-chat)
 (require 'qq-media)
 (require 'qq-protocol)
@@ -166,7 +166,7 @@
 
 (defun qq-transient--presence-inapt-p ()
   "Return non-nil when account presence control is unavailable."
-  (not (qq-native-presence-capable-p)))
+  (not (qq-core-presence-capable-p)))
 
 (defun qq-transient--chat-info-inapt-p ()
   "Return non-nil when the current chat has no profile page."

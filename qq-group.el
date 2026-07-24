@@ -17,7 +17,7 @@
 (require 'appkit-invalidation)
 (require 'appkit-transaction)
 (require 'qq-api)
-(require 'qq-native)
+(require 'qq-core)
 (require 'qq-media)
 (require 'qq-runtime)
 (require 'qq-state)
@@ -209,7 +209,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
     (user-error "qq: this buffer has no group identity"))
   (unless (and (stringp name) (not (string-empty-p name)))
     (user-error "qq: group name must be a non-empty string"))
-  (qq-native-set-group-name
+  (qq-core-set-group-name
    qq-group--group-id name
    (apply-partially #'qq-group--apply-setting
                     (current-buffer) qq-group--group-id 'name name
@@ -224,7 +224,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
     (user-error "qq: this buffer has no group identity"))
   (unless (stringp remark)
     (user-error "qq: group remark must be a string"))
-  (qq-native-set-group-remark
+  (qq-core-set-group-remark
    qq-group--group-id remark
    (apply-partially #'qq-group--apply-setting
                     (current-buffer) qq-group--group-id 'remark
@@ -251,7 +251,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
   (unless qq-group--group-id
     (user-error "qq: this buffer has no group identity"))
   (setq enabled (and enabled t))
-  (qq-native-set-group-whole-mute
+  (qq-core-set-group-whole-mute
    qq-group--group-id enabled
    (apply-partially #'qq-group--apply-whole-mute
                     (current-buffer) qq-group--group-id enabled)))
@@ -262,7 +262,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
   (unless qq-group--group-id
     (user-error "qq: this buffer has no group identity"))
   (let ((pinned (not (eq (alist-get 'pinned qq-group--profile) t))))
-    (qq-native-set-group-pinned
+    (qq-core-set-group-pinned
      qq-group--group-id pinned
      (apply-partially #'qq-group--apply-setting
                       (current-buffer) qq-group--group-id 'pinned
@@ -290,7 +290,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
   (interactive)
   (unless qq-group--group-id
     (user-error "qq: this buffer has no group identity"))
-  (qq-native-clock-in-group
+  (qq-core-clock-in-group
    qq-group--group-id
    (apply-partially #'qq-group--finish-clock-in
                     (current-buffer) qq-group--group-id)))
@@ -310,7 +310,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
   (interactive)
   (unless qq-group--group-id
     (user-error "qq: this buffer has no group identity"))
-  (qq-native-get-group-at-all-remaining
+  (qq-core-get-group-at-all-remaining
    qq-group--group-id
    (apply-partially #'qq-group--finish-at-all-remaining
                     (current-buffer) qq-group--group-id)))
@@ -335,7 +335,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
     (unless (yes-or-no-p
              (format "确认退出群聊 %s（%s）？" group-name group-id))
       (user-error "qq: 已取消退出群聊"))
-    (qq-native-leave-group
+    (qq-core-leave-group
      group-id
      (apply-partially #'qq-group--finish-leave
                       (current-buffer) group-id))))
@@ -566,7 +566,7 @@ RESOURCE identifies a presentation-only media dependency update."
     (user-error "qq: this buffer has no group identity"))
   (let ((view (qq-group--ensure-view)))
     (when qq-group--request
-      (qq-native-cancel-request qq-group--request))
+      (qq-request-cancel qq-group--request))
     (let ((buffer (current-buffer))
           (group-id qq-group--group-id)
           (owner (list 'group-profile qq-group--group-id)))
@@ -577,7 +577,7 @@ RESOURCE identifies a presentation-only media dependency update."
       (qq-group--request-sync view)
       (condition-case error-data
           (let ((request
-                  (qq-native-get-group
+                  (qq-core-get-group
                    group-id
                    (lambda (profile)
                      (when (qq-group--request-current-p
@@ -617,7 +617,7 @@ RESOURCE identifies a presentation-only media dependency update."
 (defun qq-group--cancel-request ()
   "Cancel the active group-profile request."
   (when qq-group--request
-    (qq-native-cancel-request qq-group--request))
+    (qq-request-cancel qq-group--request))
   (setq qq-group--request nil
         qq-group--request-owner nil
         qq-group--loading nil))
@@ -742,7 +742,7 @@ RESOURCE identifies a presentation-only media dependency update."
 (defun qq-group-open (group-id)
   "Open the native group profile for exact native string GROUP-ID."
   (interactive "sQQ group number: ")
-  (unless (qq-native-group-id-p group-id)
+  (unless (qq-core-group-id-p group-id)
     (user-error "qq: group profile requires an exact native group id"))
   (let* ((owner (qq-runtime-require-account-id "opening a group profile"))
          (view

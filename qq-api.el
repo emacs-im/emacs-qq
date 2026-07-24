@@ -1,10 +1,11 @@
-;;; qq-api.el --- OneBot actions and event handlers for emacs-qq -*- lexical-binding: t; -*-
+;;; qq-api.el --- Unported QQ feature contracts -*- lexical-binding: t; -*-
 
 ;; Author: 0WD0 <wd.1105848296@gmail.com>
 
 ;;; Commentary:
 
-;; High-level NapCat actions, bootstrap, and event handling.
+;; Closed contracts retained by UI features that have not reached `qq-core'
+;; yet.  Calls fail explicitly; this module owns no transport or backend.
 
 ;;; Code:
 
@@ -17,9 +18,7 @@
 (declare-function qq-state-apply-guild-directory "qq-state" (directory))
 (declare-function qq-state-apply-guild-navigation "qq-state" (navigation))
 (require 'qq-state)
-(require 'qq-transport)
 
-(declare-function qq-transport-cancel "qq-transport" (echo))
 (declare-function qq-state-apply-poke-notice "qq-state" (notice))
 (declare-function qq-state-merge-guild-message "qq-state" (event))
 (declare-function qq-state-merge-guild-forum-post "qq-state" (post))
@@ -187,11 +186,9 @@ exactly once."
    ((qq-api--snapshot-subscription-p request-token)
     (qq-api--snapshot-cancel-subscription request-token))
    (request-token
-    (unwind-protect
-        (qq-transport-cancel request-token)
-      ;; Cancellation is also an API ownership boundary.  Settle a registered
-      ;; materialization window even if the transport entry raced to absence.
-      (qq-api--run-request-finalizer request-token)))))
+    ;; Unported operations own no transport.  Cancellation only revokes their
+    ;; local callback/materialization window.
+    (qq-api--run-request-finalizer request-token))))
 
 (defun qq-api-message-id-p (value)
   "Return non-nil when VALUE is a canonical NT message snowflake.
@@ -1684,8 +1681,7 @@ segments.  A resolve action result itself must be terminal or available."
               ((null (gethash resource qq-api--snapshot-queued))))
     (setf (qq-api--snapshot-request-settled-p active) t)
     (remhash resource qq-api--snapshot-active)
-    (when-let* ((token (qq-api--snapshot-request-transport-token active)))
-      (qq-transport-cancel token))))
+    (setf (qq-api--snapshot-request-transport-token active) nil)))
 
 (defun qq-api--snapshot-cancel-subscription (subscriber)
   "Cancel only authoritative snapshot SUBSCRIBER's callback ownership."
@@ -4744,18 +4740,12 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
          (_validated (qq-api--validate-guild-message-event event)))
     (copy-tree record)))
 
-(defun qq-api-handle-event (event)
-  "Ignore dormant v1 OneBot EVENT in emacs-qq v2."
-  (ignore event)
-  nil)
-
 (defun qq-api--handle-state-reset (event)
   "Clear OneBot essence correlation when state EVENT is a reset."
   (when (eq (plist-get event :type) 'reset)
     (clrhash qq-api--pending-essences)
     (clrhash qq-api--essence-revisions)))
 
-(add-hook 'qq-transport-event-hook #'qq-api-handle-event)
 (add-hook 'qq-state-change-hook #'qq-api--handle-state-reset)
 
 (provide 'qq-api)
