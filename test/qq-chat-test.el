@@ -5269,11 +5269,14 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
          (should-not (appkit-chat-history-window-last-key))
          (should-not (appkit-chat-history-loading-p)))))))
 
-(ert-deftest qq-chat-native-private-history-unlocks-on-live-frontier ()
+(ert-deftest qq-chat-native-private-history-bootstraps-and-pages-by-time-cursor ()
   (qq-chat-test-with-reset
    (let ((session-key "private:10001")
-         (message-id "7348923749823749823")
-         live-p)
+         (older-id "7348923749823749822")
+         (latest-id "7348923749823749823")
+         (first-cursor '((timestamp . 1784700000) (random . 7)))
+         (second-cursor '((timestamp . 1784699900) (random . 9)))
+         older-call)
      (qq-state-upsert-session
       session-key '((type . private) (target-id . "10001")) nil)
      (with-temp-buffer
@@ -5281,43 +5284,59 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
        (setq qq-chat--session-key session-key)
        (cl-letf (((symbol-function 'qq-native-history-frontier)
                   (lambda (_session-key)
-                    (if live-p
-                        `(:sequence "500"
-                          :message-id ,message-id :source live-event)
-                      '(:unavailable-reason private-latest-sequence))))
+                    '(:unavailable-reason private-latest-sequence)))
                  ((symbol-function 'qq-native-fetch-latest-history)
                   (lambda (_session-key callback &optional _errback _count)
+                    (puthash
+                     session-key
+                     (list (qq-chat-test--gateway-message
+                            session-key latest-id "500" 500 "latest"))
+                     qq-state--messages-by-session)
                     (funcall
                      callback
-                     '(:history-frontier-unavailable private-latest-sequence
-                       :batch-message-ids nil
-                       :message-count 0 :added-count 0))
-                    nil))
+                     `(:history-at-latest-p t
+                       :private-history-p t
+                       :response-private-cursor ,first-cursor
+                       :batch-message-ids (,latest-id)
+                       :message-count 1 :added-count 1))
+                    (qq-chat-test-native-request "latest-private")))
+                 ((symbol-function 'qq-native-fetch-private-history-page)
+                  (lambda (_session cursor callback
+                           &optional _errback count _properties)
+                    (setq older-call (list cursor count))
+                    (puthash
+                     session-key
+                     (list (qq-chat-test--gateway-message
+                            session-key older-id "499" 499 "older")
+                           (qq-chat-test--gateway-message
+                            session-key latest-id "500" 500 "latest"))
+                     qq-state--messages-by-session)
+                    (funcall
+                     callback
+                     `(:private-history-p t
+                       :response-private-cursor ,second-cursor
+                       :history-at-oldest-p t
+                       :batch-message-ids (,older-id)
+                       :message-count 1 :added-count 1))
+                    (qq-chat-test-native-request "older-private")))
                  ((symbol-function 'qq-chat--ensure-view) #'ignore)
                  ((symbol-function 'qq-chat--sync-timeline) #'ignore)
                  ((symbol-function 'qq-chat--update-frame) #'ignore))
          (qq-chat--load-initial-history (current-buffer) session-key)
-         (should (appkit-chat-history-window-empty-p))
-         (should qq-chat--gateway-history-awaiting-frontier-p)
-         (should-not (appkit-chat-history-older-loaded-p))
-
-         (setq live-p t)
-         (puthash
-          session-key
-          (list (qq-chat-test--gateway-message
-                 session-key message-id "500" 500 "live"))
-          qq-state--messages-by-session)
-         (qq-chat--observe-message-frontier
-          `(:type message :session-key ,session-key
-            :mutation create :source event
-            :message-anchor ,message-id
-            :message ((server-id . ,message-id)
-                      (message-seq . "500"))))
+         (should
+          (equal qq-chat--gateway-private-history-cursor first-cursor))
          (should-not qq-chat--gateway-history-awaiting-frontier-p)
-         (should (equal qq-chat--gateway-history-start-sequence "500"))
-         (should (equal qq-chat--gateway-history-end-sequence "500"))
-         (should (equal (appkit-chat-history-window-first-key) message-id))
-         (should-not (appkit-chat-history-older-loaded-p)))))))
+         (should-not (appkit-chat-history-older-loaded-p))
+         (should
+          (equal (appkit-chat-history-window-first-key) latest-id))
+
+         (qq-chat-load-older-messages t)
+         (should (equal older-call (list first-cursor qq-history-fetch-count)))
+         (should
+          (equal qq-chat--gateway-private-history-cursor second-cursor))
+         (should (appkit-chat-history-older-loaded-p))
+         (should
+          (equal (appkit-chat-history-window-first-key) older-id)))))))
 
 (ert-deftest qq-chat-native-older-history-advances-through-empty-sequence-gaps ()
   (qq-chat-test-with-reset
@@ -6282,16 +6301,15 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
    (with-temp-buffer
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001"
-           qq-chat--gateway-history-start-sequence "200"
-           qq-chat--gateway-history-end-sequence "300")
+           qq-chat--gateway-private-history-cursor
+           '((timestamp . 200) (random . 3)))
      (qq-chat--set-history-window "200" "300")
      (let (callback old-view replacement-view projection-calls)
-       (cl-letf (((symbol-function 'qq-native-fetch-history-range)
-                  (lambda (_session start end success
-                           &optional _failure _properties)
+       (cl-letf (((symbol-function 'qq-native-fetch-private-history-page)
+                  (lambda (_session _cursor success
+                           &optional _failure _count _properties)
                     (setq callback success)
-                    (qq-chat-test-native-request
-                     (format "older:%s:%s" start end)))))
+                    (qq-chat-test-native-request "older-private"))))
          (qq-chat-load-older-messages t))
        (should (appkit-chat-history-loading-p))
        (setq old-view (appkit-current-view))
@@ -6310,10 +6328,11 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                   (lambda (&rest arguments)
                     (push arguments projection-calls))))
          (funcall callback
-                  '(:added-count 1
+                  '(:private-history-p t
+                    :response-private-cursor
+                    ((timestamp . 150) (random . 4))
+                    :added-count 1
                     :message-count 2
-                    :requested-start-sequence "180"
-                    :requested-end-sequence "199"
                     :batch-message-ids ("150" "200"))))
        (should-not projection-calls)
        (should-not (appkit-chat-history-loading-p))

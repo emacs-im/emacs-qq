@@ -339,6 +339,58 @@
        (should-not legacy-called)
        (should-not (qq-media--resource-fetching-p "avatar:10001"))))))
 
+(ert-deftest qq-media-native-avatar-prefers-friend-directory-url ()
+  (let ((qq-state--friends-by-id (make-hash-table :test #'equal)))
+    (puthash
+     "10001"
+     '((user_id . "10001")
+       (avatar_url . "https://example.invalid/friend-avatar.png"))
+     qq-state--friends-by-id)
+    (should
+     (equal
+      (qq-media--native-user-avatar-resource "10001")
+      '((url . "https://example.invalid/friend-avatar.png"))))))
+
+(ert-deftest qq-media-native-avatar-resolves-directory-cache-miss ()
+  (let ((qq-state--friends-by-id (make-hash-table :test #'equal))
+        result call)
+    (cl-letf (((symbol-function 'qq-gateway-current-account-id)
+               (lambda () "slot-a"))
+              ((symbol-function 'qq-gateway-transport-capabilities)
+               (lambda () '("contact.get_user_avatar")))
+              ((symbol-function 'qq-gateway-directory-get-user-avatar)
+               (lambda (user-id done &optional _error)
+                 (setq call user-id)
+                 (funcall
+                  done
+                  '((url . "https://example.invalid/resolved-avatar.png")))
+                 "avatar-request")))
+      (qq-media--fetch-native-user-avatar
+       "10001" (lambda (resource) (setq result resource)) #'ignore)
+      (should (equal call "10001"))
+      (should
+       (equal result
+              '((url . "https://example.invalid/resolved-avatar.png")))))))
+
+(ert-deftest qq-media-open-user-avatar-resolves-directory-cache-miss ()
+  (qq-media-test-with-reset
+   (let (opened)
+     (cl-letf (((symbol-function 'qq-media--fetch-native-user-avatar)
+                (lambda (user-id done _error)
+                  (should (equal user-id "10001"))
+                  (funcall
+                   done
+                   '((url . "https://example.invalid/resolved-avatar.png")))))
+               ((symbol-function 'qq-media-open-resource)
+                (lambda (resource kind key)
+                  (setq opened (list resource kind key)))))
+       (qq-media-open-user-avatar "10001")
+       (should
+        (equal
+         opened
+         '(((url . "https://example.invalid/resolved-avatar.png"))
+           image "avatar:10001")))))))
+
 (ert-deftest qq-media-message-avatar-keeps-guild-and-qq-identities-disjoint ()
   (let (guild-request user-request)
     (cl-letf (((symbol-function 'qq-media-guild-member-avatar-image)

@@ -1270,17 +1270,40 @@ transport or protocol failure."
       failure))
    callback errback))
 
+(defun qq-native-fetch-private-history-page
+    (session-key cursor callback &optional errback count properties)
+  "Fetch one private roaming-history page for SESSION-KEY.
+
+CURSOR is nil for the initial server-clock request or the exact continuation
+cursor returned by the previous page.  CALLBACK receives merge metadata
+prefixed by optional PROPERTIES."
+  (qq-native--start-request
+   (lambda (success failure)
+     (qq-gateway-message-get-private-history
+      session-key cursor
+      (lambda (meta)
+        (funcall success
+                 (apply #'qq-native--history-meta meta properties)))
+      failure
+      (min 100 (max 1 (or count qq-history-fetch-count)))))
+   callback errback))
+
 (defun qq-native-fetch-latest-history
     (session-key callback &optional errback count)
   "Fetch the native service's latest known history for SESSION-KEY.
 
 Native group history uses the directory's exact latest sequence.  Native
-private history uses only a live observed sequence; when none exists CALLBACK
-receives metadata with `:history-frontier-unavailable' instead of a guessed
-request.  ERRBACK handles failure and COUNT limits the requested page size."
-  (let* ((frontier (qq-native-history-frontier session-key))
+private history starts from the service clock through `SsoGetRoamMsg' and does
+not require a live message sequence.  ERRBACK handles failure and COUNT limits
+the requested page size."
+  (let* ((kind (qq-state-session-key-type session-key))
+         (frontier (qq-native-history-frontier session-key))
          (sequence (plist-get frontier :sequence)))
     (cond
+     ((eq kind 'private)
+      (qq-native-fetch-private-history-page
+       session-key nil callback errback count
+       (list :history-at-latest-p t)))
      (sequence
       (pcase-let ((`(,start-sequence . ,end-sequence)
                    (qq-gateway-message-history-range-ending-at
@@ -1339,6 +1362,7 @@ request.  ERRBACK handles failure and COUNT limits the requested page size."
 (defconst qq-native--capability-methods
   '((recent-conversations "conversation.list_recent")
     (contacts "contact.list_friends" "contact.list_groups")
+    (avatar "contact.get_user_avatar")
     (group-members "contact.list_group_members")
     (group-settings "group.set_name" "group.set_remark"
                     "group.set_whole_mute" "group.set_pinned")
@@ -1356,7 +1380,7 @@ request.  ERRBACK handles failure and COUNT limits the requested page size."
     (mention "message.send")
     (poke "message.poke")
     (recall "message.recall")
-    (explicit-history "message.get_history")
+    (explicit-history "message.get_history" "message.get_private_history")
     (read-receipt "message.mark_read"))
   "Product capabilities and every required negotiated Gateway method.")
 

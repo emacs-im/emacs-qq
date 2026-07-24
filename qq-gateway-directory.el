@@ -64,7 +64,12 @@
     (qq-gateway-directory--assert-unique friends 'uin "friend list")
     (dolist (friend friends)
       (unless (gethash (alist-get 'category_id friend) category-ids)
-        (error "qq: Gateway friend belongs to an unknown category"))))
+        (error "qq: Gateway friend belongs to an unknown category"))
+      (unless (and (qq-gateway--non-empty-string-p
+                    (alist-get 'avatar_url friend))
+                   (string-prefix-p "https://"
+                                    (alist-get 'avatar_url friend)))
+        (error "qq: Gateway friend avatar must be an HTTPS URL"))))
   result)
 
 (defun qq-gateway-directory--friend-to-state (friend category-name)
@@ -78,7 +83,8 @@
     (personal_sign . ,(alist-get 'personal_sign friend))
     (qid . ,(alist-get 'qid friend))
     (age . ,(alist-get 'age friend))
-    (gender . ,(alist-get 'gender friend))))
+    (gender . ,(alist-get 'gender friend))
+    (avatar_url . ,(alist-get 'avatar_url friend))))
 
 (defun qq-gateway-directory--friends-to-state (result)
   "Convert friend-list RESULT to ordered shared categories."
@@ -498,6 +504,33 @@ force the Native Session to replace its contact cache."
    'groups "contact.list_groups"
    `((refresh . ,(if refresh t :false)))
    #'qq-gateway-directory--project-groups
+   callback errback))
+
+(defun qq-gateway-directory--project-user-avatar (result owner user-uin)
+  "Return avatar resource from RESULT for OWNER and USER-UIN."
+  (unless
+      (and
+       (qq-gateway--exact-object-keys-p result '(account_id user_uin url))
+       (equal (alist-get 'account_id result) owner)
+       (equal (alist-get 'user_uin result) user-uin)
+       (qq-gateway--non-empty-string-p (alist-get 'url result))
+       (string-prefix-p "https://" (alist-get 'url result)))
+    (error "qq: Gateway returned an invalid user avatar locator"))
+  `((url . ,(alist-get 'url result))))
+
+(defun qq-gateway-directory-get-user-avatar
+    (user-uin callback &optional errback)
+  "Resolve USER-UIN's native HTTPS avatar resource.
+
+CALLBACK receives a media resource alist containing `url'."
+  (unless (qq-gateway--canonical-decimal-p user-uin)
+    (user-error "qq: User avatar requires an exact decimal UIN"))
+  (qq-gateway-directory--request
+   (list 'user-avatar user-uin)
+   "contact.get_user_avatar"
+   `((user_uin . ,user-uin))
+   (lambda (result owner)
+     (qq-gateway-directory--project-user-avatar result owner user-uin))
    callback errback))
 
 (defun qq-gateway-directory-set-friend-pinned

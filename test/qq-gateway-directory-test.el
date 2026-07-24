@@ -8,7 +8,8 @@
 
 (defconst qq-gateway-directory-test-capabilities
   '("contact.list_friends" "contact.list_groups"
-    "contact.list_group_members" "group.set_name" "group.set_remark"
+    "contact.list_group_members" "contact.get_user_avatar"
+    "group.set_name" "group.set_remark"
     "friend.set_pinned" "group.set_whole_mute" "group.set_pinned" "group.set_member_card"
     "group.set_member_special_title" "group.kick_member" "group.clock_in"
     "group.get_at_all_remaining" "group.leave")
@@ -32,6 +33,8 @@
     (friends
      . [((uid . "u_alice")
          (uin . "9007199254740999")
+         (avatar_url
+          . "https://q.qlogo.cn/headimg_dl?dst_uin=9007199254740999&spec=640&img_type=jpg")
          (category_id . 7)
          (nickname . "Alice")
          (remark . "A")
@@ -41,6 +44,8 @@
          (gender . 2))
         ((uid . "u_bob")
          (uin . "10003")
+         (avatar_url
+          . "https://q.qlogo.cn/headimg_dl?dst_uin=10003&spec=640&img_type=jpg")
          (category_id . 3)
          (nickname . "Bob")
          (remark)
@@ -201,6 +206,10 @@
         (should (equal (alist-get 'category_name
                                   (qq-state-friend "9007199254740999"))
                        "Work"))
+        (should
+         (equal
+          (alist-get 'avatar_url (qq-state-friend "9007199254740999"))
+          "https://q.qlogo.cn/headimg_dl?dst_uin=9007199254740999&spec=640&img_type=jpg"))
         (should (equal (gethash "u_alice"
                                 qq-gateway-message--peer-uin-by-uid)
                        "9007199254740999"))
@@ -225,6 +234,40 @@
         (should (= (alist-get 'member_count (car callback-value)) 2))
         (should (= (length (alist-get 'friends (car callback-value))) 1))
         (should (qq-state-friend-categories-loaded-p))))))
+
+(ert-deftest qq-gateway-directory-user-avatar-validates-owned-https-locator ()
+  (qq-gateway-directory-test-with-state
+    (let (sent-method sent-params resource)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-directory-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall
+                    callback
+                    '((account_id . "slot-a")
+                      (user_uin . "9007199254740999")
+                      (url
+                       . "https://q.qlogo.cn/headimg_dl?dst_uin=9007199254740999&spec=640&img_type=jpg")))
+                   "request-avatar")))
+        (should
+         (equal
+          (qq-gateway-directory-get-user-avatar
+           "9007199254740999"
+           (lambda (value) (setq resource value)))
+          "request-avatar"))
+        (should (equal sent-method "contact.get_user_avatar"))
+        (should
+         (equal sent-params
+                '((account_id . "slot-a")
+                  (user_uin . "9007199254740999"))))
+        (should
+         (equal
+          resource
+          '((url
+             . "https://q.qlogo.cn/headimg_dl?dst_uin=9007199254740999&spec=640&img_type=jpg"))))))))
 
 (ert-deftest qq-gateway-directory-friend-unknown-category-is-atomic ()
   (qq-gateway-directory-test-with-state

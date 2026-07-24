@@ -11,7 +11,7 @@
   '("message.send" "message.poke"
     "message.recall_poke" "message.recall" "message.set_reaction"
     "message.set_essence" "message.set_todo" "message.get_history"
-    "message.mark_read")
+    "message.get_private_history" "message.mark_read")
   "Native Gateway capabilities exercised by message tests.")
 
 (defun qq-gateway-message-test-account (&optional account-id uin uid)
@@ -183,6 +183,16 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (requested_end_sequence . ,end-sequence)
     (response_start_sequence . ,response-start)
     (response_end_sequence . ,response-end)
+    (unsupported_message_count . ,unsupported-count)
+    (messages . ,(vconcat (mapcar #'copy-tree (append messages nil))))))
+
+(cl-defun qq-gateway-message-test-private-history-result
+    (messages requested response &key complete (unsupported-count 0))
+  "Return a closed private history result containing MESSAGES."
+  `((account_id . "slot-a")
+    (requested_cursor . ,(copy-tree requested))
+    (response_cursor . ,(copy-tree response))
+    (complete . ,(if complete t :false))
     (unsupported_message_count . ,unsupported-count)
     (messages . ,(vconcat (mapcar #'copy-tree (append messages nil))))))
 
@@ -1413,6 +1423,68 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (should
          (equal (plist-get callback-meta :requested-start-sequence)
                 "18446744073709551516"))))))
+
+(ert-deftest qq-gateway-message-private-history-bootstraps-and-keeps-cursor ()
+  (qq-gateway-message-test-with-state
+    (let (sent-method sent-params callback-meta)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall
+                    callback
+                    (qq-gateway-message-test-private-history-result
+                     nil
+                     '((timestamp . 1784700000) (random . 0))
+                     '((timestamp . 1784699900) (random . 7))))
+                   "request-private-history")))
+        (should
+         (equal
+          (qq-gateway-message-get-private-history
+           "private:10001" nil
+           (lambda (meta) (setq callback-meta meta))
+           nil 20)
+          "request-private-history"))
+        (should (equal sent-method "message.get_private_history"))
+        (should
+         (equal
+          sent-params
+          '((account_id . "slot-a")
+            (conversation . ((kind . "private") (peer_uin . "10001")))
+            (limit . 20))))
+        (should (plist-get callback-meta :private-history-p))
+        (should-not (plist-get callback-meta :history-at-oldest-p))
+        (should
+         (equal
+          (plist-get callback-meta :response-private-cursor)
+          '((timestamp . 1784699900) (random . 7))))))))
+
+(ert-deftest qq-gateway-message-private-history-rejects-stalled-empty-page ()
+  (qq-gateway-message-test-with-state
+    (let ((cursor '((timestamp . 1784699900) (random . 7)))
+          failure)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-message-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (_method _params callback errback &optional _early)
+                   (condition-case error-data
+                       (funcall
+                        callback
+                        (qq-gateway-message-test-private-history-result
+                         nil cursor cursor))
+                     (error
+                      (funcall errback nil (error-message-string error-data))))
+                   "request-private-history")))
+        (qq-gateway-message-get-private-history
+         "private:10001" cursor nil
+         (lambda (_body reason) (setq failure reason))
+         20)
+        (should (string-match-p "did not advance" failure))))))
 
 (ert-deftest qq-gateway-message-history-merges-once-and-deduplicates-live-row ()
   (qq-gateway-message-test-with-state

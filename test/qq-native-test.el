@@ -1612,19 +1612,29 @@
         (should (eq (plist-get properties :history-at-latest-p) t))
         (should (= (plist-get callback-meta :message-count) 0))))))
 
-(ert-deftest qq-native-private-latest-never-guesses-a-sequence ()
-  (let (callback-meta fetched)
+(ert-deftest qq-native-private-latest-uses-server-clock-roaming-cursor ()
+  (let (callback-meta call)
     (cl-letf (((symbol-function 'qq-native-history-frontier)
                (lambda (_session-key)
                  '(:unavailable-reason private-latest-sequence)))
-              ((symbol-function 'qq-native-fetch-history-range)
-               (lambda (&rest _) (setq fetched t))))
-      (should-not
-       (qq-native-fetch-latest-history
-        "private:10001" (lambda (meta) (setq callback-meta meta))))
-      (should-not fetched)
-      (should (eq (plist-get callback-meta :history-frontier-unavailable)
-                  'private-latest-sequence)))))
+              ((symbol-function 'qq-native-fetch-private-history-page)
+               (lambda (session cursor callback _errback count properties)
+                 (setq call (list session cursor count properties))
+                 (funcall callback
+                          '(:message-count 0 :batch-message-ids nil))
+                 (let ((request (qq-native-request-create)))
+                   (qq-native-request-finish request)
+                   request))))
+      (let ((request
+             (qq-native-fetch-latest-history
+              "private:10001"
+              (lambda (meta) (setq callback-meta meta))
+              nil 20)))
+        (should (qq-native-request-p request)))
+      (should
+       (equal call
+              '("private:10001" nil 20 (:history-at-latest-p t))))
+      (should (= (plist-get callback-meta :message-count) 0)))))
 
 (ert-deftest qq-native-around-requires-cached-exact-sequence ()
   (let (range failure)
