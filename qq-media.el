@@ -226,6 +226,16 @@ and ephemeral filesystem path retained by the private player state."
     (when-let* ((entry
                  (and media-id
                       (gethash media-id qq-media--native-record-playbacks))))
+      ;; Emacs does not guarantee that a process exit sentinel has run before
+      ;; the next state read.  Finalize an exited process synchronously so UI
+      ;; state and local-access lease ownership cannot remain stuck at
+      ;; `playing'.  The sentinel checks exact process ownership and is
+      ;; idempotent if an exit event was already queued.
+      (when-let* ((process (plist-get entry :process))
+                  ((processp process))
+                  ((not (process-live-p process))))
+        (qq-media--native-record-player-sentinel process "state poll\n")
+        (setq entry (gethash media-id qq-media--native-record-playbacks)))
       (list :media-id media-id
             :status (plist-get entry :status)
             :error (plist-get entry :error)))))
