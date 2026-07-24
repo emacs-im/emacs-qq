@@ -11,7 +11,12 @@
 
 (defmacro qq-root-test-with-reset (&rest body)
   "Run BODY with a clean in-memory qq-state store."
-  `(let ((qq-state-change-hook nil))
+  `(let ((qq-state-change-hook nil)
+         (qq-state--partitions (make-hash-table :test #'equal))
+         (qq-state--active-account-id nil)
+         (qq-root--scope "slot-a")
+         (qq-runtime--account-id "slot-a"))
+     (qq-state-select-account "slot-a")
      (qq-state-reset)
      (unwind-protect
          (progn ,@body)
@@ -24,19 +29,24 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
   (declare (indent 0) (debug t))
   `(let* ((qq-root-buffer-name
            (generate-new-buffer-name " *qq-root-test*"))
-          (app (appkit-start-app 'qq :id (make-symbol "qq-root-test")))
-          (qq-runtime--app app)
+          (qq-runtime--accounts (make-hash-table :test #'equal))
+          (runtime (qq-runtime-ensure-account "slot-a"))
+          (app (qq-runtime-account-app runtime))
           (buffer (get-buffer-create qq-root-buffer-name))
           view)
      (unwind-protect
          (with-current-buffer buffer
            (qq-root-mode)
+           (qq-runtime-bind-account "slot-a")
+           (setq-local qq-root--scope "slot-a")
            (setq view
                  (appkit-attach-view
                   :app app
                   :id 'root
                   :mode 'qq-root-mode
-                  :sync-function #'qq-root--sync-invalidations
+                  :sync-function
+                  (qq-runtime-account-sync-function
+                   "slot-a" #'qq-root--sync-invalidations)
                   :parts '(header entries geometry)))
            ,@body)
        (when (appkit-app-live-p app)
@@ -53,13 +63,14 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
     (cl-letf (((symbol-function 'qq-state-self-info) #'ignore)
               ((symbol-function 'qq-state-connection-status)
                (lambda () 'ready))
-              ((symbol-function 'qq-gateway-current-account)
-               (lambda () account))
+              ((symbol-function 'qq-gateway-account)
+               (lambda (_account-id) account))
               ((symbol-function 'qq-gateway-accounts)
                (lambda () (list account))))
-      (should
-       (equal (qq-root--header-line)
-              " emacs-qq  [ready]  Work (10001) — online")))))
+      (let ((qq-root--scope "slot-work"))
+        (should
+         (equal (qq-root--header-line)
+                " emacs-qq  [ready]  Work (10001) — online"))))))
 
 (ert-deftest qq-root-header-rejects-stale-self-info-after-account-switch ()
   (let ((selected
@@ -77,13 +88,14 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                  '((user_id . "20002") (nickname . "Old account"))))
               ((symbol-function 'qq-state-connection-status)
                (lambda () 'ready))
-              ((symbol-function 'qq-gateway-current-account)
-               (lambda () selected))
+              ((symbol-function 'qq-gateway-account)
+               (lambda (_account-id) selected))
               ((symbol-function 'qq-gateway-accounts)
                (lambda () (list selected other))))
-      (should
-       (equal (qq-root--header-line)
-              " emacs-qq  [ready]  Work (10001) — online · 1/2 online")))))
+      (let ((qq-root--scope "slot-work"))
+        (should
+         (equal (qq-root--header-line)
+                " emacs-qq  [ready]  Work (10001) — online · 1/2 online"))))))
 
 (ert-deftest qq-root-distinguishes-important-and-muted-unread-sessions ()
   (qq-root-test-with-reset
@@ -106,7 +118,8 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                  :display "[QR]\n")))
     (cl-letf (((symbol-function 'qq-login-view-model)
                (lambda () model)))
-      (let* ((entries (qq-root--project-entries))
+      (let* ((qq-root--scope 'gateway)
+             (entries (qq-root--project-entries))
              (login
               (seq-find
                (lambda (entry)
@@ -413,12 +426,14 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                   (lambda (candidate invalidations)
                     (cl-incf syncs)
                     (funcall original-sync candidate invalidations))))
-         (qq-root--handle-state-change '(:type connection))
          (qq-root--handle-state-change
-          '(:type action :session-key "group:1"))
+          '(:type connection :account-id "slot-a"))
          (qq-root--handle-state-change
-          '(:type message :session-key "group:1"))
-         (qq-root--handle-state-change '(:type heartbeat))
+          '(:type action :account-id "slot-a" :session-key "group:1"))
+         (qq-root--handle-state-change
+          '(:type message :account-id "slot-a" :session-key "group:1"))
+         (qq-root--handle-state-change
+          '(:type heartbeat :account-id "slot-a"))
          (should (= syncs 0))
          (should (string-empty-p (buffer-string)))
          (let ((invalidations (appkit-view-invalidations-ensure view)))
@@ -435,10 +450,27 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
   (qq-root-test-with-reset
    (qq-root-test-with-live-view
      (qq-root--handle-state-change
-      '(:type action :session-key "private:7"))
+      '(:type action :account-id "slot-a" :session-key "private:7"))
      (let ((invalidations (appkit-view-invalidations-ensure view)))
        (should-not (appkit-invalidations-structure-p invalidations))
        (should-not (appkit-invalidations-parts invalidations))
+       (should
+        (equal '((session . "private:7"))
+               (appkit-invalidations-entry-keys invalidations)))))))
+
+(ert-deftest qq-root-state-events-require-the-exact-account-owner ()
+  (qq-root-test-with-reset
+   (qq-root-test-with-live-view
+     (qq-root--handle-state-change
+      '(:type message :session-key "private:7"))
+     (qq-root--handle-state-change
+      '(:type message :account-id "slot-b" :session-key "private:7"))
+     (let ((invalidations (appkit-view-invalidations-ensure view)))
+       (should-not (appkit-invalidations-any-p invalidations)))
+     (qq-root--handle-state-change
+      '(:type message :account-id "slot-a" :session-key "private:7"))
+     (let ((invalidations (appkit-view-invalidations-ensure view)))
+       (should (appkit-invalidations-structure-p invalidations))
        (should
         (equal '((session . "private:7"))
                (appkit-invalidations-entry-keys invalidations)))))))
@@ -474,7 +506,8 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
   (qq-root-test-with-reset
    (qq-root-test-with-live-view
      (let ((before (buffer-string)))
-       (qq-root--handle-state-change '(:type self-info))
+       (qq-root--handle-state-change
+        '(:type self-info :account-id "slot-a"))
        (let ((invalidations (appkit-view-invalidations-ensure view)))
          (should (equal '(header)
                         (appkit-invalidations-parts invalidations)))
@@ -591,9 +624,10 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                 (lambda () 'root-window))
                ((symbol-function 'qq-root--compute-fill-column)
                 (lambda (&optional _window) 100)))
-       (qq-root--handle-state-change '(:type connection))
        (qq-root--handle-state-change
-        '(:type message :session-key "group:1"))
+        '(:type connection :account-id "slot-a"))
+       (qq-root--handle-state-change
+        '(:type message :account-id "slot-a" :session-key "group:1"))
        (qq-root--handle-media-cache-update "avatar:1")
        (should-not (qq-root--reflow-visible))))))
 
@@ -606,9 +640,10 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                ((symbol-function 'appkit-request-sync)
                 (lambda (&rest _args)
                   (ert-fail "closed-root hook requested a sync"))))
-       (qq-root--handle-state-change '(:type connection))
        (qq-root--handle-state-change
-        '(:type message :session-key "group:1"))
+        '(:type connection :account-id "slot-a"))
+       (qq-root--handle-state-change
+        '(:type message :account-id "slot-a" :session-key "group:1"))
        (qq-root--handle-media-cache-update "avatar:1"))
      (should-not qq-runtime--app))))
 
@@ -654,7 +689,8 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                     (should (eq window 'renamed-root-window))
                     100)))
          (qq-root--handle-state-change
-          '(:type action :session-key "private:1"))
+          '(:type action :account-id "slot-a"
+            :session-key "private:1"))
          (qq-root--handle-media-cache-update "avatar:1")
          (should (qq-root--reflow-visible)))
        (setq calls (nreverse calls))
@@ -684,6 +720,66 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                 (lambda (&rest _args)
                   (ert-fail "root sync forced an immediate window update"))))
        (appkit-sync-invalidations view)))))
+
+(ert-deftest qq-root-keeps-manager-and-two-account-roots-live-together ()
+  (let ((qq-runtime--app nil)
+        (qq-runtime--accounts (make-hash-table :test #'equal))
+        (qq-state--partitions (make-hash-table :test #'equal))
+        (qq-state--active-account-id nil)
+        (qq-gateway--accounts (make-hash-table :test #'equal))
+        (qq-gateway--account-order nil)
+        (qq-gateway--current-account-id nil)
+        (qq-gateway-accounts-changed-hook nil)
+        (qq-gateway-current-account-changed-hook nil)
+        (qq-state-change-hook nil)
+        manager root-a root-b)
+    (unwind-protect
+        (progn
+          (qq-gateway--replace-accounts
+           '(((account_id . "slot-a") (label . "Work")
+              (phase . "online") (uin . "10001"))
+             ((account_id . "slot-b") (label . "Personal")
+              (phase . "online") (uin . "20002")))
+           'ready "gateway-test")
+          (qq-runtime-with-account "slot-a"
+            (qq-state-upsert-session
+             "private:1"
+             '((type . private) (target-id . "1") (title . "Alice A"))
+             nil))
+          (qq-runtime-with-account "slot-b"
+            (qq-state-upsert-session
+             "private:1"
+             '((type . private) (target-id . "1") (title . "Alice B"))
+             nil))
+          (cl-letf
+              (((symbol-function 'qq-login-view-model) #'ignore)
+               ((symbol-function 'qq-gateway-transport-state)
+                (lambda () 'ready)))
+            (save-window-excursion
+              (setq manager (qq-root-open 'gateway)
+                    root-a (qq-root-open "slot-a")
+                    root-b (qq-root-open "slot-b"))))
+          (should (buffer-live-p manager))
+          (should (buffer-live-p root-a))
+          (should (buffer-live-p root-b))
+          (should-not (eq manager root-a))
+          (should-not (eq root-a root-b))
+          (with-current-buffer manager
+            (should (eq qq-root--scope 'gateway))
+            (should (string-match-p "Work" (buffer-string)))
+            (should (string-match-p "Personal" (buffer-string))))
+          (with-current-buffer root-a
+            (should (equal qq-runtime--account-id "slot-a"))
+            (should (string-match-p "Alice A" (buffer-string)))
+            (should-not (string-match-p "Alice B" (buffer-string))))
+          (with-current-buffer root-b
+            (should (equal qq-runtime--account-id "slot-b"))
+            (should (string-match-p "Alice B" (buffer-string)))
+            (should-not (string-match-p "Alice A" (buffer-string)))))
+      (qq-runtime-stop)
+      (dolist (buffer (list manager root-a root-b))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
 
 (provide 'qq-root-test)
 

@@ -39,9 +39,6 @@
 (defvar qq-search-history nil
   "Minibuffer history for QQ message search queries.")
 
-(defconst qq-search-buffer-name "*qq-search*"
-  "Name of the session message-search buffer.")
-
 (cl-defstruct (qq-search--entry
                (:constructor qq-search--entry-create))
   key
@@ -294,14 +291,20 @@ EWOC markers would otherwise retain the previous account's messages."
   "Return the live Appkit view owning the current search buffer."
   (unless qq-search--session-key
     (error "QQ: cannot attach a search view without a session identity"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner
+          (or qq-runtime--account-id
+              (user-error "qq: search buffer has no account owner")))
+         (app (qq-runtime-app owner))
+         (sync-function
+          (qq-runtime-account-sync-function
+           owner #'qq-search--sync-invalidations))
          (current (appkit-current-view)))
     (cond
      ((and (appkit-view-live-p current)
            (eq app (appkit-view-app current))
            (equal qq-search--view-id (appkit-view-id current)))
       (setf (appkit-view-sync-function current)
-            #'qq-search--sync-invalidations
+            sync-function
             (appkit-view-parts current) '(results))
       current)
      ((appkit-view-live-p current)
@@ -316,8 +319,9 @@ EWOC markers would otherwise retain the previous account's messages."
               :app app
               :id qq-search--view-id
               :mode 'qq-search-mode
-              :sync-function #'qq-search--sync-invalidations
+              :sync-function sync-function
               :parts '(results))))
+        (qq-runtime-bind-account owner)
         (qq-search--setup-view view)
         (setq qq-search--session-key session-key)
         view)))))
@@ -645,7 +649,7 @@ empty continuation pages while next-result navigation is pending."
   (add-hook 'change-major-mode-hook #'qq-search--cancel-request nil t))
 
 (defun qq-search-open (session-key &optional query)
-  "Open `*qq-search*' for SESSION-KEY and search for QUERY."
+  "Open the current account's search view for SESSION-KEY and QUERY."
   (let* ((identity (qq-state-session-key-identity session-key))
          (type (alist-get 'type identity)))
     (unless (memq type '(group private))
@@ -655,13 +659,14 @@ empty continuation pages while next-result navigation is pending."
             (read-string "Search messages: " nil 'qq-search-history)))
   (unless (and (stringp query) (not (string-empty-p query)))
     (user-error "qq: empty search query"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner (qq-runtime-require-account-id "searching messages"))
          (view
-          (appkit-open-view
-           :app app
+          (qq-runtime-open-account-view
+           :account-id owner
            :id qq-search--view-id
            :mode 'qq-search-mode
-           :buffer-name qq-search-buffer-name
+           :buffer-name
+           (qq-runtime-account-buffer-name "search" session-key owner)
            :sync-function #'qq-search--sync-invalidations
            :parts '(results)
            :setup #'qq-search--setup-view))

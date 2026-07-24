@@ -24,10 +24,11 @@
   "Return Appkit view identity for GUILD-ID and CHANNEL-ID."
   (list 'guild-channel-inspect guild-id channel-id))
 
-(defun qq-guild-channel--buffer-name (guild-id channel-id)
-  "Return inspect buffer name for GUILD-ID and CHANNEL-ID."
+(defun qq-guild-channel--buffer-name (account-id guild-id channel-id)
+  "Return ACCOUNT-ID-qualified inspect buffer name for CHANNEL-ID."
   (let ((channel (qq-state-guild-channel guild-id channel-id)))
-    (format "*qq-channel:%s*" (or (alist-get 'name channel) channel-id))))
+    (qq-runtime-account-buffer-name
+     "channel" (or (alist-get 'name channel) channel-id) account-id)))
 
 (defun qq-guild-channel--refresh-model ()
   "Refresh current inspect model from authoritative directory state."
@@ -85,9 +86,11 @@
 
 (defun qq-guild-channel--setup-view (view)
   "Register exact directory-state ownership for inspect VIEW."
-  (let ((handler
+  (let* ((owner qq-runtime--account-id)
+         (handler
          (lambda (event)
            (when (and (appkit-view-live-p view)
+                      (equal (plist-get event :account-id) owner)
                       (memq (plist-get event :type)
                             '(reset guild-directory-refreshed)))
              (appkit-with-live-view view
@@ -117,13 +120,15 @@
          (kind (alist-get 'kind channel)))
     (unless (eq (qq-guild-channel-open-mode kind) 'inspect)
       (user-error "qq: %s channel does not use inspect mode" kind))
-    (let* ((app (qq-runtime-app))
+    (let* ((owner
+            (qq-runtime-require-account-id "opening a Guild channel"))
            (view
-            (appkit-open-view
-             :app app
+            (qq-runtime-open-account-view
+             :account-id owner
              :id (qq-guild-channel--view-id guild-id channel-id)
              :mode 'qq-guild-channel-mode
-             :buffer-name (qq-guild-channel--buffer-name guild-id channel-id)
+             :buffer-name
+             (qq-guild-channel--buffer-name owner guild-id channel-id)
              :state (cons guild-id channel-id)
              :sync-function #'qq-guild-channel--sync-invalidations
              :parts '(channel)

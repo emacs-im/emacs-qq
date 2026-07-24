@@ -71,6 +71,7 @@
      (unwind-protect
          (with-temp-buffer
            (qq-red-packet-mode)
+           (setq-local qq-runtime--account-id "slot-a")
            (setq qq-red-packet--session-key "private:10002"
                  qq-red-packet--message-id qq-red-packet-test--message-id
                  qq-red-packet--segment (qq-red-packet-test--segment)
@@ -154,6 +155,7 @@
 
 (ert-deftest qq-password-red-packet-page-does-not-request-unsupported-detail ()
   (let* ((segment (qq-red-packet-test--segment))
+         (qq-runtime--context-account-id "slot-a")
          (data (alist-get 'data segment))
          detail-called
          buffer)
@@ -245,6 +247,7 @@
 
 (ert-deftest qq-red-packet-renamed-live-and-detached-buffer-is-reused ()
   (let ((qq-runtime--app nil)
+        (qq-runtime--context-account-id "slot-a")
         buffer first-view
         (calls 0))
     (unwind-protect
@@ -294,6 +297,7 @@
 
 (ert-deftest qq-red-packet-runtime-replacement-resets-owned-work-via-setup ()
   (let ((qq-runtime--app nil)
+        (qq-runtime--context-account-id "slot-a")
         buffer old-view new-view
         cancelled
         (calls 0))

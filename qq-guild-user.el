@@ -49,9 +49,10 @@
   "Return the Appkit identity for NATIVE-ID in GUILD-ID."
   (list 'guild-user guild-id native-id))
 
-(defun qq-guild-user--buffer-name (guild-id native-id)
-  "Return the fallback buffer name for NATIVE-ID in GUILD-ID."
-  (format "*qq-guild-user:%s:%s*" guild-id native-id))
+(defun qq-guild-user--buffer-name (account-id guild-id native-id)
+  "Return ACCOUNT-ID-qualified member buffer name for NATIVE-ID in GUILD-ID."
+  (qq-runtime-account-buffer-name
+   "guild-user" (format "%s:%s" guild-id native-id) account-id))
 
 (defun qq-guild-user--position-key (kind &optional value)
   "Return a stable current-member position key for KIND and VALUE."
@@ -374,7 +375,13 @@ RESOURCE identifies a presentation-only avatar update."
   "Return the live Appkit view owning the current member buffer."
   (unless (and qq-guild-user--guild-id qq-guild-user--native-id)
     (error "QQ: Cannot attach a member view without its native identity"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner
+          (or qq-runtime--account-id
+              (user-error "qq: Guild member buffer has no account owner")))
+         (app (qq-runtime-app owner))
+         (sync-function
+          (qq-runtime-account-sync-function
+           owner #'qq-guild-user--sync-invalidations))
          (view-id
           (qq-guild-user--view-id
            qq-guild-user--guild-id qq-guild-user--native-id))
@@ -386,7 +393,7 @@ RESOURCE identifies a presentation-only avatar update."
       (setf (appkit-view-state current)
             (list qq-guild-user--guild-id qq-guild-user--native-id)
             (appkit-view-sync-function current)
-            #'qq-guild-user--sync-invalidations
+            sync-function
             (appkit-view-parts current) '(profile))
       current)
      ((appkit-view-live-p current)
@@ -399,8 +406,9 @@ RESOURCE identifies a presentation-only avatar update."
               :state (list qq-guild-user--guild-id
                            qq-guild-user--native-id)
               :mode 'qq-guild-user-mode
-              :sync-function #'qq-guild-user--sync-invalidations
+              :sync-function sync-function
               :parts '(profile))))
+        (qq-runtime-bind-account owner)
         (qq-guild-user--setup-view view)
         view)))))
 
@@ -435,16 +443,18 @@ RESOURCE identifies a presentation-only avatar update."
     (user-error "QQ: Channel member page requires a native Guild id"))
   (unless (qq-protocol--nonzero-decimal-string-p native-id)
     (user-error "QQ: Channel member page requires a native tinyId"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner (qq-runtime-require-account-id "opening a Guild member"))
+         (app (qq-runtime-app owner))
          (view-id (qq-guild-user--view-id guild-id native-id))
          (fresh-p (null (appkit-view-for-id app view-id)))
          (view
-          (appkit-open-view
-           :app app
+          (qq-runtime-open-account-view
+           :account-id owner
            :id view-id
            :state (list guild-id native-id)
            :mode 'qq-guild-user-mode
-           :buffer-name (qq-guild-user--buffer-name guild-id native-id)
+           :buffer-name
+           (qq-guild-user--buffer-name owner guild-id native-id)
            :sync-function #'qq-guild-user--sync-invalidations
            :parts '(profile)
            :setup #'qq-guild-user--setup-view))

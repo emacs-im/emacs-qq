@@ -71,9 +71,9 @@
 (defvar-local qq-group--media-hook-function nil
   "View-owned media cache hook installed for this group buffer.")
 
-(defun qq-group--buffer-name (_group-id)
-  "Return the shared group profile buffer name."
-  "*qq-group*")
+(defun qq-group--buffer-name (account-id group-id)
+  "Return ACCOUNT-ID-qualified profile buffer name for GROUP-ID."
+  (qq-runtime-account-buffer-name "group" group-id account-id))
 
 (defun qq-group--profile-key (&optional group-id)
   "Return the stable presentation key for opaque GROUP-ID.
@@ -527,13 +527,6 @@ GROUP-ID defaults to the identity selected in the current buffer."
   (let ((view (appkit-current-view)))
     (and (qq-group--view-current-p view) view)))
 
-(defun qq-group--live-view ()
-  "Return the registered live group-profile view without starting QQ."
-  (when (appkit-app-live-p qq-runtime--app)
-    (when-let* ((view (appkit-view-for-id qq-runtime--app
-                                          qq-group--view-id)))
-      (and (qq-group--view-current-p view) view))))
-
 (cl-defun qq-group--request-sync (&optional view &key resource)
   "Request one coalesced group-profile sync for live VIEW.
 
@@ -673,14 +666,20 @@ RESOURCE identifies a presentation-only media dependency update."
   "Return the live Appkit view owning the current group buffer."
   (unless qq-group--group-id
     (error "QQ: cannot attach a group view without an opaque group identity"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner
+          (or qq-runtime--account-id
+              (user-error "qq: group buffer has no account owner")))
+         (app (qq-runtime-app owner))
+         (sync-function
+          (qq-runtime-account-sync-function
+           owner #'qq-group--sync-invalidations))
          (current (appkit-current-view)))
     (cond
      ((and (appkit-view-live-p current)
            (eq app (appkit-view-app current))
            (equal qq-group--view-id (appkit-view-id current)))
       (setf (appkit-view-sync-function current)
-            #'qq-group--sync-invalidations
+            sync-function
             (appkit-view-parts current) '(profile))
       current)
      ((appkit-view-live-p current)
@@ -691,8 +690,9 @@ RESOURCE identifies a presentation-only media dependency update."
               :app app
               :id qq-group--view-id
               :mode 'qq-group-mode
-              :sync-function #'qq-group--sync-invalidations
+              :sync-function sync-function
               :parts '(profile))))
+        (qq-runtime-bind-account owner)
         (qq-group--setup-view view)
         view)))))
 
@@ -744,13 +744,13 @@ RESOURCE identifies a presentation-only media dependency update."
   (interactive "sQQ group number: ")
   (unless (qq-native-group-id-p group-id)
     (user-error "qq: group profile requires an exact native group id"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner (qq-runtime-require-account-id "opening a group profile"))
          (view
-          (appkit-open-view
-           :app app
+          (qq-runtime-open-account-view
+           :account-id owner
            :id qq-group--view-id
            :mode 'qq-group-mode
-           :buffer-name (qq-group--buffer-name group-id)
+           :buffer-name (qq-group--buffer-name owner group-id)
            :sync-function #'qq-group--sync-invalidations
            :parts '(profile)
            :setup #'qq-group--setup-view))

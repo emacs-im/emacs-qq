@@ -23,6 +23,7 @@ BODY may refer to the lexical variable `view'."
      (unwind-protect
          (with-temp-buffer
            (qq-search-mode)
+           (setq-local qq-runtime--account-id "slot-a")
            (setq qq-search--session-key "group:20001")
            (let ((view (qq-search--ensure-view)))
              ,@body))
@@ -348,7 +349,7 @@ BODY may refer to the lexical variable `view'."
 
 (ert-deftest qq-search-open-reuses-renamed-view-across-session-replacement ()
   (let ((qq-runtime--app nil)
-        (qq-search-buffer-name "*qq-search-rename-test*")
+        (qq-runtime--context-account-id "slot-a")
         callbacks
         cancelled
         first
@@ -378,7 +379,10 @@ BODY may refer to the lexical variable `view'."
               (should (eq first-view
                           (with-current-buffer second (appkit-current-view))))
               (should (eq qq-search--view-id (appkit-view-id first-view)))
-              (should-not (get-buffer qq-search-buffer-name))
+              (should-not
+               (get-buffer
+                (qq-runtime-account-buffer-name
+                 "search" "group:20001" "slot-a")))
               (should (equal cancelled '(first-request)))
               (with-current-buffer second
                 (should (equal qq-search--session-key "private:10002"))
@@ -412,7 +416,7 @@ BODY may refer to the lexical variable `view'."
 (ert-deftest qq-search-detach-erases-renamed-buffer-before-runtime-replacement ()
   "A detached singleton must not retain rendered data from the old account."
   (let ((qq-runtime--app nil)
-        (qq-search-buffer-name "*qq-search-detach-privacy-test*")
+        (qq-runtime--context-account-id "slot-a")
         buffer
         old-view
         (cancel-count 0))

@@ -53,12 +53,16 @@
 (defvar-local qq-root--fill-column nil
   "Last root width measured from a window that actually displayed it.")
 
+(defvar-local qq-root--scope nil
+  "Stable account ID shown by this root, or `gateway' for account management.")
+
 (cl-defstruct (qq-root--entry
                (:constructor qq-root--entry-create))
   key
   type
   text
   face
+  account
   session
   width)
 
@@ -138,9 +142,14 @@ used only when its QQ number agrees with ACCOUNT."
 
 (defun qq-root--header-line ()
   "Return dynamic header line for the root buffer."
-  (let* ((self-info (qq-state-self-info))
-         (status (qq-state-connection-status))
-         (account (qq-gateway-current-account))
+  (let* ((gateway-p (eq qq-root--scope 'gateway))
+         (self-info (and (not gateway-p) (qq-state-self-info)))
+         (status
+          (if gateway-p
+              (qq-gateway-transport-state)
+            (qq-state-connection-status)))
+         (owner (and (not gateway-p) qq-root--scope))
+         (account (qq-gateway-account owner))
          (accounts (qq-gateway-accounts))
          (online-count
           (cl-count-if
@@ -149,13 +158,13 @@ used only when its QQ number agrees with ACCOUNT."
            accounts))
          (account-count (length accounts))
          (account-summary
-          (if account
+          (cond
+           (gateway-p "account manager")
+           (account
               (format "%s — %s"
                       (qq-root--account-title account self-info)
-                      (alist-get 'phase account))
-            (if accounts
-                "no account selected"
-              "no managed account")))
+                      (alist-get 'phase account)))
+           (t "account no longer managed")))
          (registry-summary
           (and (> account-count 1)
                (format " · %d/%d online" online-count account-count))))
@@ -371,11 +380,59 @@ message title rather than like dimmed preview content."
                                    :face (qq-root--entry-face entry)))
     ('blank (insert "\n"))
     ('login (qq-login-insert-view (qq-root--entry-text entry)))
+    ('account
+     (let* ((account (qq-root--entry-account entry))
+            (account-id (alist-get 'account_id account))
+            (label (or (alist-get 'label account)
+                       (alist-get 'uin account)
+                       account-id))
+            (uin (alist-get 'uin account))
+            (phase (alist-get 'phase account))
+            (start (point)))
+       (insert (format "  %-16s  %s%s\n"
+                       phase label
+                       (if (and uin (not (equal label uin)))
+                           (format " (%s)" uin)
+                         "")))
+       (add-text-properties
+        start (point)
+        (list 'qq-root-row-type 'account
+              'qq-root-account-id account-id
+              'mouse-face 'highlight
+              'help-echo "Open this account's persistent QQ view"))))
     ('session (qq-root--insert-session-line (qq-root--entry-session entry)))
     (type (error "qq: unknown root entry type %S" type))))
 
-(defun qq-root--project-entries ()
-  "Project current state into stable-keyed root entries."
+(defun qq-root--project-gateway-entries ()
+  "Project every managed account into the Gateway manager root."
+  (let ((accounts (qq-gateway-accounts)))
+    (append
+     (list
+      (qq-root--entry-create
+       :key 'accounts-heading :type 'note
+       :text (format "Managed accounts: %d" (length accounts))
+       :face 'font-lock-doc-face)
+      (qq-root--entry-create :key 'accounts-gap :type 'blank))
+     (mapcar
+      (lambda (account)
+        (qq-root--entry-create
+         :key (cons 'account (alist-get 'account_id account))
+         :type 'account
+         :account account))
+      accounts)
+     (unless accounts
+       (list
+        (qq-root--entry-create
+         :key 'no-accounts :type 'note
+         :text "No managed QQ accounts.  Start login to create one.")))
+     (when-let* ((login (qq-login-view-model)))
+       (list
+        (qq-root--entry-create :key 'login-gap :type 'blank)
+        (qq-root--entry-create
+         :key 'login :type 'login :text login))))))
+
+(defun qq-root--project-account-entries ()
+  "Project the current account state into stable-keyed root entries."
   (let* ((sessions (qq-state-sessions))
          (width (qq-root--buffer-width))
          (metadata
@@ -390,11 +447,6 @@ message title rather than like dimmed preview content."
            (qq-root--entry-create :key 'metadata-gap :type 'blank))))
     (append
      metadata
-     (when-let* ((login (qq-login-view-model)))
-       (list
-        (qq-root--entry-create
-         :key 'login :type 'login :text login)
-        (qq-root--entry-create :key 'login-gap :type 'blank)))
      (mapcar
       (lambda (session)
         (qq-root--entry-create
@@ -408,11 +460,21 @@ message title rather than like dimmed preview content."
         (qq-root--entry-create
          :key 'empty :type 'note :text "No sessions available yet."))))))
 
+(defun qq-root--project-entries ()
+  "Project this root buffer's explicit account or Gateway scope."
+  (if (eq qq-root--scope 'gateway)
+      (qq-root--project-gateway-entries)
+    (unless (and (stringp qq-root--scope)
+                 (equal qq-root--scope qq-runtime--account-id))
+      (error "qq: account root has no stable account scope"))
+    (qq-root--project-account-entries)))
+
 (defun qq-root--session-entry-keys ()
   "Return stable entry keys for all current sessions."
-  (mapcar (lambda (session)
-            (qq-root--session-entry-key (alist-get 'key session)))
-          (qq-state-sessions)))
+  (unless (eq qq-root--scope 'gateway)
+    (mapcar (lambda (session)
+              (qq-root--session-entry-key (alist-get 'key session)))
+            (qq-state-sessions))))
 
 (defun qq-root--sync-invalidations (view invalidations)
   "Synchronize VIEW from coalesced Appkit INVALIDATIONS.
@@ -478,18 +540,24 @@ When POS is nil, use point."
   "Return root session key at POS, or current point when POS is nil."
   (qq-root--line-property 'qq-root-session-key pos))
 
+(defun qq-root--account-id-at-point (&optional pos)
+  "Return managed account ID at POS, or nil."
+  (qq-root--line-property 'qq-root-account-id pos))
+
 (defun qq-root--session-at-point ()
   "Return root session object at point, or nil."
   (when-let* ((session-key (qq-root--session-key-at-point)))
     (qq-state-session session-key)))
 
 (defun qq-root-open-at-point ()
-  "Open the session at point."
+  "Open the session or managed account at point."
   (interactive)
-  (let ((session-key (qq-root--session-key-at-point)))
-    (unless session-key
-      (user-error "qq: no session at point"))
-    (qq-chat-open session-key)))
+  (cond
+   ((qq-root--session-key-at-point)
+    (qq-chat-open (qq-root--session-key-at-point)))
+   ((qq-root--account-id-at-point)
+    (qq-root-open-account (qq-root--account-id-at-point)))
+   (t (user-error "qq: no session or account at point"))))
 
 (defun qq-root-open-avatar-at-point ()
   "Open avatar/icon for the session at point."
@@ -631,6 +699,21 @@ offered."
   (interactive)
   (qq-chat-open (qq-root--read-session-key "Open session: ")))
 
+(defun qq-root-switch-account ()
+  "Select a managed account and open its persistent root view.
+
+Views belonging to other accounts remain live and visible."
+  (interactive)
+  (call-interactively #'qq-gateway-account-select)
+  (qq-root-open))
+
+(defun qq-root-open-account (account-id)
+  "Open stable ACCOUNT-ID's persistent root without closing other accounts."
+  (interactive (list (qq-gateway--read-account-id "Open QQ account: ")))
+  (unless (qq-gateway-account account-id)
+    (user-error "qq: QQ account does not exist: %s" account-id))
+  (qq-root-open account-id))
+
 (defun qq-root-search (&optional query)
   "Choose a searchable session and open message results for optional QUERY."
   (interactive)
@@ -691,25 +774,33 @@ offered."
             #'qq-root--on-window-size-change nil t)
   (add-hook 'text-scale-mode-hook #'qq-root--on-text-scale-change nil t))
 
-(defun qq-root--live-view ()
-  "Return the existing live Appkit root view, or nil.
+(defun qq-root--live-view (&optional account-id)
+  "Return ACCOUNT-ID's existing live Appkit root view, or nil.
 
 This lookup reads the current runtime registry directly.  It deliberately
 does not call `qq-runtime-app', because state and media hooks must not create
 an application session merely to discover that no root is open."
-  (when (appkit-app-live-p qq-runtime--app)
-    (when-let* ((view (appkit-view-for-id qq-runtime--app 'root)))
+  (let* ((gateway-p (eq account-id 'gateway))
+         (owner (and (not gateway-p)
+                     (or account-id (qq-runtime-current-account-id))))
+         (runtime (and owner (qq-runtime-account owner)))
+         (app (if (and runtime (not gateway-p))
+                  (qq-runtime-account-app runtime)
+                (and (appkit-app-live-p qq-runtime--app)
+                     qq-runtime--app))))
+    (when app
+    (when-let* ((view (appkit-view-for-id app 'root)))
       (and (with-current-buffer (appkit-view-buffer view)
              (derived-mode-p 'qq-root-mode))
-           view))))
+           view)))))
 
 (cl-defun qq-root--queue-invalidation
-    (&key structure part parts entry entries position)
+    (&key account-id structure part parts entry entries position)
   "Queue one coalesced root invalidation when its view is live.
 
-STRUCTURE, PART, PARTS, ENTRY, ENTRIES, and POSITION are forwarded to
-`appkit-request-sync'."
-  (when-let* ((view (qq-root--live-view)))
+ACCOUNT-ID chooses the account root.  STRUCTURE, PART, PARTS, ENTRY, ENTRIES,
+and POSITION are forwarded to `appkit-request-sync'."
+  (when-let* ((view (qq-root--live-view account-id)))
     (appkit-request-sync
      view
      :structure structure
@@ -720,32 +811,74 @@ STRUCTURE, PART, PARTS, ENTRY, ENTRIES, and POSITION are forwarded to
      :position position)
     view))
 
-(defun qq-root-open ()
-  "Open the emacs-qq root buffer."
+(defun qq-root--setup-scope (scope _view)
+  "Bind the current root buffer to explicit SCOPE."
+  (setq-local qq-root--scope scope))
+
+(defun qq-root-open (&optional account-id)
+  "Open ACCOUNT-ID's root, or the current UI account's root.
+
+ACCOUNT-ID may be `gateway' to open the multi-account manager."
   (interactive)
-  (let* ((app (qq-runtime-app))
-         (existing (appkit-view-for-id app 'root))
-         (view
-          (appkit-open-view
-           :app app
-           :id 'root
-           :mode 'qq-root-mode
-           :buffer-name qq-root-buffer-name
-           :sync-function #'qq-root--sync-invalidations
-           :parts '(header entries geometry)
-           :select t))
-         (buffer (appkit-view-buffer view)))
-    (with-current-buffer buffer
-      (unless existing
-        ;; A newly attached (including reattached) view gets one explicit
-        ;; initial projection after it has a real display window.
-        (appkit-invalidate view :structure t :part 'header)
-        (appkit-sync-invalidations view))
-      (qq-root--reflow-visible nil)
-      (unless (qq-root--session-key-at-point)
-        (goto-char (point-min))
-        (qq-root-button-forward)))
-    buffer))
+  (let ((owner
+         (and (not (eq account-id 'gateway))
+              (or account-id (qq-runtime-current-account-id)))))
+    (if owner
+        (qq-runtime-with-account owner
+          (let* ((app (qq-runtime-app owner))
+             (existing (appkit-view-for-id app 'root))
+             (name (qq-runtime-account-display-name owner))
+             (view
+              (qq-runtime-open-account-view
+               :account-id owner
+               :id 'root
+               :mode 'qq-root-mode
+               :buffer-name (format "*qq-root:%s*" name)
+               :sync-function #'qq-root--sync-invalidations
+               :parts '(header entries geometry)
+               :setup (apply-partially #'qq-root--setup-scope owner)
+               :select t))
+             (buffer (appkit-view-buffer view)))
+        (with-current-buffer buffer
+          (setq-local qq-root--scope owner)
+          (unless existing
+            ;; A newly attached (including reattached) view gets one explicit
+            ;; initial projection after it has a real display window.
+            (appkit-invalidate view :structure t :part 'header)
+            (appkit-sync-invalidations view))
+          (qq-root--reflow-visible nil)
+          (unless (qq-root--session-key-at-point)
+            (goto-char (point-min))
+            (qq-root-button-forward)))
+            buffer))
+      (let* ((app (qq-runtime-gateway-app))
+             (existing (appkit-view-for-id app 'root))
+             (view
+              (appkit-open-view
+               :app app
+               :id 'root
+               :mode 'qq-root-mode
+               :buffer-name qq-root-buffer-name
+               :sync-function #'qq-root--sync-invalidations
+               :parts '(header entries geometry)
+               :setup (apply-partially #'qq-root--setup-scope 'gateway)
+               :select t))
+             (buffer (appkit-view-buffer view)))
+        (with-current-buffer buffer
+          (setq-local qq-root--scope 'gateway)
+          (unless existing
+            (appkit-invalidate view :structure t :part 'header)
+            (appkit-sync-invalidations view))
+          (qq-root--reflow-visible nil)
+          (unless (qq-root--session-key-at-point)
+            (goto-char (point-min))
+            (qq-root-button-forward)))
+        buffer))))
+
+(defun qq-root-open-gateway ()
+  "Open the Gateway-wide account manager root."
+  (interactive)
+  (qq-root-open 'gateway))
 
 (defun qq-root--reflow-visible (&optional force)
   "Queue root geometry invalidation when its visible width changed.
@@ -779,41 +912,57 @@ pixel-valued alignment follows text scaling."
         (_ (format "avatar:%s" target-id))))))
 
 (defun qq-root--handle-media-cache-update (media-key)
-  "Invalidate root rows whose avatar is identified by MEDIA-KEY."
-  (when (and (stringp media-key) (qq-root--live-view))
-    (let (keys)
-      (dolist (session (qq-state-sessions))
-        (when (equal media-key (qq-root--session-avatar-media-key session))
-          (push (qq-root--session-entry-key (alist-get 'key session)) keys)))
-      (when keys
-        (qq-root--queue-invalidation :entries keys)))))
+  "Invalidate every account root row identified by MEDIA-KEY."
+  (when (stringp media-key)
+    (dolist (runtime (qq-runtime-accounts))
+      (let ((owner (qq-runtime-account-id runtime)))
+        (when (qq-root--live-view owner)
+          (qq-runtime-with-account owner
+            (let (keys)
+              (dolist (session (qq-state-sessions))
+                (when (equal media-key
+                             (qq-root--session-avatar-media-key session))
+                  (push
+                   (qq-root--session-entry-key (alist-get 'key session))
+                   keys)))
+              (when keys
+                (qq-root--queue-invalidation
+                 :account-id owner :entries keys)))))))))
 
 (defun qq-root--handle-state-change (event)
   "Apply state EVENT to the persistent root view."
   (let ((type (plist-get event :type))
-        (session-key (plist-get event :session-key)))
-    (pcase type
-      ((or 'connection 'self-info)
-       (qq-root--queue-invalidation :part 'header))
-      ('action
-       (when session-key
+        (session-key (plist-get event :session-key))
+        (owner (plist-get event :account-id)))
+    (when owner
+      (pcase type
+        ((or 'connection 'self-info)
+         (qq-root--queue-invalidation :account-id owner :part 'header))
+        ('action
+         (when session-key
+           (qq-root--queue-invalidation
+            :account-id owner
+            :entry (qq-root--session-entry-key session-key))))
+        ((or 'session 'message 'history)
          (qq-root--queue-invalidation
-          :entry (qq-root--session-entry-key session-key))))
-      ((or 'session 'message 'history)
-       (qq-root--queue-invalidation
-        :structure t
-        :entry (and session-key
-                    (qq-root--session-entry-key session-key))))
-      ((or 'reset 'sessions-refreshed 'friends-refreshed 'groups-refreshed)
-       (qq-root--queue-invalidation :structure t)))))
+          :account-id owner
+          :structure t
+          :entry (and session-key
+                      (qq-root--session-entry-key session-key))))
+        ((or 'reset 'sessions-refreshed 'friends-refreshed 'groups-refreshed)
+         (qq-root--queue-invalidation :account-id owner :structure t))))))
 
 (defun qq-root--handle-login-change ()
   "Reconcile the root after the foreground login presentation changes."
-  (qq-root--queue-invalidation :structure t))
+  (qq-root--queue-invalidation :account-id 'gateway :structure t))
 
 (defun qq-root--handle-gateway-account-change (&rest _arguments)
-  "Refresh the header after a managed-account projection change."
-  (qq-root--queue-invalidation :part 'header))
+  "Refresh account manager rows and every account-root header."
+  (qq-root--queue-invalidation
+   :account-id 'gateway :structure t :part 'header)
+  (dolist (runtime (qq-runtime-accounts))
+    (qq-root--queue-invalidation
+     :account-id (qq-runtime-account-id runtime) :part 'header)))
 
 (add-hook 'qq-media-cache-update-hook #'qq-root--handle-media-cache-update)
 (add-hook 'qq-state-change-hook #'qq-root--handle-state-change)

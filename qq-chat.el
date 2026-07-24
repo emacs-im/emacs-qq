@@ -440,9 +440,15 @@ They are inactive in the composer so typing is never stolen.")
 
 (defun qq-chat--buffer-name (session-key)
   "Return canonical buffer name for SESSION-KEY."
-  (format "*qq-chat:%s*"
-          (or (alist-get 'title (qq-state-session session-key))
-              session-key)))
+  (let* ((owner (qq-runtime-current-account-id))
+         (account-name
+          (if owner
+              (qq-runtime-account-display-name owner)
+            "unbound")))
+    (format "*qq-chat:%s:%s*"
+            account-name
+            (or (alist-get 'title (qq-state-session session-key))
+                session-key))))
 
 (defun qq-chat--ensure-buffer-name ()
   "Rename current chat buffer to reflect latest session title."
@@ -2321,7 +2327,13 @@ projection.  A replacement or detached view is inert."
 
 (defun qq-chat--ensure-view ()
   "Return the live appkit view owning the current QQ chat buffer."
-  (let* ((app (qq-runtime-app))
+  (let* ((owner (or (qq-runtime-current-account-id)
+                    (user-error "qq: chat buffer has no account owner")))
+         (_runtime (qq-runtime-bind-account owner))
+         (app (qq-runtime-app owner))
+         (sync-function
+          (qq-runtime-account-sync-function
+           owner #'qq-chat--sync-invalidations))
          (id (qq-chat--view-id))
          (current (appkit-current-view)))
     (cond
@@ -2330,7 +2342,7 @@ projection.  A replacement or detached view is inert."
            (equal id (appkit-view-id current)))
       (setf (appkit-view-state current) qq-chat--session-key
             (appkit-view-sync-function current)
-            #'qq-chat--sync-invalidations
+            sync-function
             (appkit-view-parts current)
             '(frame timeline composer geometry))
       current)
@@ -2342,7 +2354,7 @@ projection.  A replacement or detached view is inert."
        :id id
        :state qq-chat--session-key
        :mode 'qq-chat-mode
-       :sync-function #'qq-chat--sync-invalidations
+       :sync-function sync-function
        :parts '(frame timeline composer geometry))))))
 
 (defun qq-chat--header-line-update ()
@@ -3827,12 +3839,12 @@ a replacement app instance."
        (qq-chat--message-current-account-p message)))
 
 (defun qq-chat--message-current-account-p (message)
-  "Return non-nil when MESSAGE belongs to the selected Gateway account slot."
+  "Return non-nil when MESSAGE belongs to this chat buffer's account."
   (let ((account-id (and (listp message)
                          (alist-get 'gateway-account-id message))))
     (and (stringp account-id)
          (not (string-empty-p account-id))
-         (equal account-id (qq-gateway-current-account-id)))))
+         (equal account-id (qq-runtime-current-account-id)))))
 
 (defun qq-chat--message-essence-capable-p (message)
   "Return non-nil when MESSAGE supports an essence mutation."
@@ -6683,45 +6695,52 @@ Emacs integer arithmetic is arbitrary precision, so this never rounds them."
   "Create or reuse SESSION-KEY's chat view without loading history."
   (unless session-key
     (user-error "qq: session key is required"))
-  (qq-state-upsert-session session-key nil nil)
-  (let* ((view
-          (appkit-open-view
-           :app (qq-runtime-app)
-           :id (list 'chat session-key)
-           :mode 'qq-chat-mode
-           :buffer-name (qq-chat--buffer-name session-key)
-           :state session-key
-           :sync-function #'qq-chat--sync-invalidations
-           :parts '(frame timeline composer geometry)))
-         (buffer (appkit-view-buffer view)))
-    (with-current-buffer buffer
-      (let ((fresh-p (null qq-chat--session-key)))
-        (setq qq-chat--session-key session-key)
-        (qq-completion-preload-members)
-        (if fresh-p
-            (progn
-              ;; A fresh buffer has no proven contiguous window yet.  Do not
-              ;; render every cache island while the initial/around request is
-              ;; still choosing its exact slice.
-              (appkit-chat-history-window-clear)
-              (qq-chat--ensure-view)
-              (qq-chat--header-line-update)
-              (qq-chat--sync-timeline :messages nil)
-              (qq-chat--update-frame))
-          (qq-chat-render)))
-      (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max))))
-    buffer))
+  (let ((owner (or (qq-runtime-current-account-id)
+                   (user-error "qq: Select a QQ account first"))))
+    (qq-runtime-with-account owner
+      (qq-state-upsert-session session-key nil nil)
+      (let* ((view
+              (qq-runtime-open-account-view
+               :account-id owner
+               :id (list 'chat session-key)
+               :mode 'qq-chat-mode
+               :buffer-name (qq-chat--buffer-name session-key)
+               :state session-key
+               :sync-function #'qq-chat--sync-invalidations
+               :parts '(frame timeline composer geometry)))
+             (buffer (appkit-view-buffer view)))
+        (with-current-buffer buffer
+          (let ((fresh-p (null qq-chat--session-key)))
+            (setq qq-chat--session-key session-key)
+            (qq-completion-preload-members)
+            (if fresh-p
+                (progn
+                  ;; A fresh buffer has no proven contiguous window yet.  Do not
+                  ;; render every cache island while the initial/around request is
+                  ;; still choosing its exact slice.
+                  (appkit-chat-history-window-clear)
+                  (qq-chat--ensure-view)
+                  (qq-chat--header-line-update)
+                  (qq-chat--sync-timeline :messages nil)
+                  (qq-chat--update-frame))
+              (qq-chat-render)))
+          (goto-char
+           (or (appkit-chatbuf-input-logical-end-position) (point-max))))
+        buffer))))
 
 (defun qq-chat-open (session-key)
   "Open chat for SESSION-KEY and load its official initial position."
   (interactive)
-  (let ((buffer (qq-chat--open-buffer session-key)))
-    (with-current-buffer buffer
-      (qq-chat--cancel-open-message-request)
-      (qq-chat--load-initial-history buffer session-key))
-    (pop-to-buffer buffer)
-    (with-current-buffer buffer
-      (qq-chat--on-window-size-change))))
+  (let ((owner (or (qq-runtime-current-account-id)
+                   (user-error "qq: Select a QQ account first"))))
+    (qq-runtime-with-account owner
+      (let ((buffer (qq-chat--open-buffer session-key)))
+        (with-current-buffer buffer
+          (qq-chat--cancel-open-message-request)
+          (qq-chat--load-initial-history buffer session-key))
+        (pop-to-buffer buffer)
+        (with-current-buffer buffer
+          (qq-chat--on-window-size-change))))))
 
 (defun qq-chat--finish-open-message (target query)
   "Jump to loaded TARGET and highlight its actual text matching QUERY."
@@ -6939,7 +6958,8 @@ redisplay has not processed the queued event yet."
 (defun qq-chat--handle-state-change (event)
   "Queue state EVENT invalidations for open QQ chats."
   (let ((event-session-key (plist-get event :session-key))
-        (event-type (plist-get event :type)))
+        (event-type (plist-get event :type))
+        (event-owner (plist-get event :account-id)))
     (when (eq event-type 'reset)
       ;; The remembered destination belongs to the previous runtime/account,
       ;; not to any particular chat buffer.
@@ -6949,7 +6969,8 @@ redisplay has not processed the queued event yet."
                              sessions-refreshed friends-refreshed groups-refreshed))
       (dolist (buffer (buffer-list))
         (with-current-buffer buffer
-          (when (derived-mode-p 'qq-chat-mode)
+          (when (and (derived-mode-p 'qq-chat-mode)
+                     (equal event-owner qq-runtime--account-id))
             ;; Reset is a hard ownership boundary even after runtime shutdown
             ;; has made the AppKit view non-live.  Rotate/clear opaque owners
             ;; before any best-effort cancellation can run callbacks.

@@ -13,27 +13,30 @@
 
 BODY may refer to the lexical variables `app', `buffer', and `view'."
   (declare (indent 0) (debug t))
-  `(let* ((qq-guilds-buffer-name
-           (generate-new-buffer-name " *qq-guilds-test*"))
-          (app (appkit-start-app 'qq :id (make-symbol "qq-guilds-test")))
-          (qq-runtime--app app)
-          (buffer (get-buffer-create qq-guilds-buffer-name))
+  `(let* ((qq-runtime--context-account-id "slot-a")
+          (app
+           (qq-runtime-account-app
+            (qq-runtime-ensure-account "slot-a")))
+          (buffer
+           (get-buffer-create
+            (generate-new-buffer-name " *qq-guilds-test*")))
           view)
      (unwind-protect
          (with-current-buffer buffer
            (qq-guilds-mode)
+           (qq-runtime-bind-account "slot-a")
            (setq view
                  (appkit-attach-view
                   :app app
                   :id qq-guilds--view-id
                   :mode 'qq-guilds-mode
-                  :sync-function #'qq-guilds--sync-invalidations
+                  :sync-function
+                  (qq-runtime-account-sync-function
+                   "slot-a" #'qq-guilds--sync-invalidations)
                   :parts '(directory)))
            (qq-guilds--setup-view view)
-           (cl-letf (((symbol-function 'qq-runtime-app) (lambda () app)))
-             ,@body))
-       (when (appkit-app-live-p app)
-         (appkit-stop-app app))
+           ,@body)
+       (qq-runtime-stop-account "slot-a" t)
        (when (buffer-live-p buffer)
          (kill-buffer buffer)))))
 
@@ -101,12 +104,14 @@ Each item is either a channel id string or a cons of id and display name."
 
 (ert-deftest qq-guilds-renders-hierarchy-with-native-directory-rows ()
   (let ((qq-state-change-hook nil))
+    (qq-state-select-account "slot-a")
     (qq-state-reset)
     (unwind-protect
         (progn
           (qq-state-apply-guild-directory (qq-guilds-test--directory))
           (with-temp-buffer
             (qq-guilds-mode)
+            (qq-runtime-bind-account "slot-a")
             (qq-guilds-render)
             (goto-char (point-min))
             (should (search-forward "Synthetic guild" nil t))
@@ -124,6 +129,7 @@ Each item is either a channel id string or a cons of id and display name."
 
 (ert-deftest qq-guilds-folds-one-guild-without-replacing-the-directory-view ()
   (let ((qq-state-change-hook nil))
+    (qq-state-select-account "slot-a")
     (qq-state-reset)
     (unwind-protect
         (progn
@@ -156,6 +162,7 @@ Each item is either a channel id string or a cons of id and display name."
   (let ((qq-state-change-hook nil)
         (first-id (qq-guilds-test--channel-id 1))
         (second-id (qq-guilds-test--channel-id 2)))
+    (qq-state-select-account "slot-a")
     (qq-state-reset)
     (unwind-protect
         (let ((directory
@@ -270,10 +277,12 @@ Each item is either a channel id string or a cons of id and display name."
 (ert-deftest qq-guilds-refresh-settles-loading-after-authoritative-response ()
   (let ((qq-state-change-hook nil)
         action-called)
+    (qq-state-select-account "slot-a")
     (qq-state-reset)
     (unwind-protect
         (with-temp-buffer
           (qq-guilds-mode)
+          (qq-runtime-bind-account "slot-a")
           (cl-letf (((symbol-function 'qq-api-refresh-guild-directory)
                      (lambda (&optional callback _errback)
                        (setq action-called t)
@@ -289,13 +298,17 @@ Each item is either a channel id string or a cons of id and display name."
       (qq-state-reset))))
 
 (ert-deftest qq-guilds-state-and-completion-coalesce-one-appkit-sync ()
-  (let ((buffer (get-buffer-create qq-guilds-buffer-name))
+  (let ((buffer
+         (get-buffer-create
+          (qq-runtime-account-buffer-name "guilds" nil "slot-a")))
         (qq-state-change-hook '(qq-guilds--handle-state-change))
         sync-count)
+    (qq-state-select-account "slot-a")
     (qq-state-reset)
     (unwind-protect
         (with-current-buffer buffer
           (qq-guilds-mode)
+          (qq-runtime-bind-account "slot-a")
           (let ((view (qq-guilds--ensure-view)))
             (cl-letf (((symbol-function 'qq-guilds--reconcile-directory)
                        (lambda ()
@@ -376,6 +389,7 @@ Each item is either a channel id string or a cons of id and display name."
   (let ((qq-state-change-hook nil)
         (first-id (qq-guilds-test--channel-id 1))
         (second-id (qq-guilds-test--channel-id 2)))
+    (qq-state-select-account "slot-a")
     (qq-state-reset)
     (unwind-protect
         (progn
@@ -423,6 +437,7 @@ Each item is either a channel id string or a cons of id and display name."
 
 (ert-deftest qq-guilds-loading-and-error-retain-the-directory-snapshot ()
   (let ((qq-state-change-hook nil))
+    (qq-state-select-account "slot-a")
     (qq-state-reset)
     (unwind-protect
         (progn
@@ -484,6 +499,7 @@ Each item is either a channel id string or a cons of id and display name."
          (deleted-id (nth 9 ids))
          (target-id (nth 24 ids))
          (added-id (qq-guilds-test--channel-id 41)))
+    (qq-state-select-account "slot-a")
     (qq-state-reset)
     (unwind-protect
         (progn
@@ -558,11 +574,13 @@ Each item is either a channel id string or a cons of id and display name."
                    (setq queued candidate
                          owning-buffer (current-buffer)))))
         (qq-guilds--handle-state-change
-         '(:type guild-directory-refreshed)))
+         '(:type guild-directory-refreshed :account-id "slot-a")))
       (should (eq queued view))
       (should (eq owning-buffer buffer))
       (should (equal renamed (buffer-name buffer)))
-      (should-not (get-buffer qq-guilds-buffer-name)))))
+      (should-not
+       (get-buffer
+        (qq-runtime-account-buffer-name "guilds" nil "slot-a"))))))
 
 (ert-deftest qq-guilds-hook-does-not-create-a-runtime-app-when-closed ()
   (let ((qq-runtime--app nil))
@@ -573,14 +591,18 @@ Each item is either a channel id string or a cons of id and display name."
                (lambda (&rest _arguments)
                  (ert-fail "closed Guild hook requested a sync"))))
       (qq-guilds--handle-state-change
-       '(:type guild-directory-refreshed)))
+       '(:type guild-directory-refreshed :account-id "slot-a")))
     (should-not qq-runtime--app)))
 
 (ert-deftest qq-guilds-dead-view-rejects-stale-refresh-and-state-events ()
-  (let ((buffer (get-buffer-create qq-guilds-buffer-name)) queued cancelled)
+  (let ((buffer
+         (get-buffer-create
+          (qq-runtime-account-buffer-name "guilds" nil "slot-a")))
+        queued cancelled)
     (unwind-protect
         (with-current-buffer buffer
           (qq-guilds-mode)
+          (qq-runtime-bind-account "slot-a")
           (let ((view (qq-guilds--ensure-view))
                 (owner (list 'dead-guild-refresh)))
             (setq qq-guilds--refresh-owner owner
@@ -592,7 +614,7 @@ Each item is either a channel id string or a cons of id and display name."
                        (lambda (&rest _args) (setq queued t))))
               (appkit-kill-view view)
               (qq-guilds--handle-state-change
-               '(:type guild-directory-refreshed))
+               '(:type guild-directory-refreshed :account-id "slot-a"))
               (qq-guilds--finish-refresh view buffer owner)
               (should-not queued)
               (should (eq cancelled 'dead-request))

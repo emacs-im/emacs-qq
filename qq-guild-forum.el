@@ -53,10 +53,11 @@
   "Return Appkit view identity for forum GUILD-ID and CHANNEL-ID."
   (list 'guild-forum guild-id channel-id))
 
-(defun qq-guild-forum--buffer-name (guild-id channel-id)
-  "Return forum buffer name for GUILD-ID and CHANNEL-ID."
+(defun qq-guild-forum--buffer-name (account-id guild-id channel-id)
+  "Return ACCOUNT-ID-qualified forum buffer name for CHANNEL-ID."
   (let ((channel (qq-state-guild-channel guild-id channel-id)))
-    (format "*qq-forum:%s*" (or (alist-get 'name channel) channel-id))))
+    (qq-runtime-account-buffer-name
+     "forum" (or (alist-get 'name channel) channel-id) account-id)))
 
 (defun qq-guild-forum--messages ()
   "Return current forum posts in newest-first directory order."
@@ -375,9 +376,11 @@ An empty CURSOR replaces the authoritative first page."
 
 (defun qq-guild-forum--setup-view (view)
   "Register state and media ownership for forum VIEW."
-  (let ((state-handler
+  (let* ((owner qq-runtime--account-id)
+         (state-handler
          (lambda (event)
            (when (and (appkit-view-live-p view)
+                      (equal (plist-get event :account-id) owner)
                       (or (eq (plist-get event :type) 'reset)
                           (equal (plist-get event :session-key)
                                  (appkit-view-state view))))
@@ -437,13 +440,14 @@ An empty CURSOR replaces the authoritative first page."
          (_kind (unless (equal (alist-get 'kind channel) "forum")
                   (user-error "qq: channel is not a forum")))
          (session-key (qq-state-guild-channel-session-key guild-id channel-id))
-         (app (qq-runtime-app))
+         (owner (qq-runtime-require-account-id "opening a Guild forum"))
          (view
-          (appkit-open-view
-           :app app
+          (qq-runtime-open-account-view
+           :account-id owner
            :id (qq-guild-forum--view-id guild-id channel-id)
            :mode 'qq-guild-forum-mode
-           :buffer-name (qq-guild-forum--buffer-name guild-id channel-id)
+           :buffer-name
+           (qq-guild-forum--buffer-name owner guild-id channel-id)
            :state session-key
            :sync-function #'qq-guild-forum--sync-invalidations
            :parts '(posts header)

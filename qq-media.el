@@ -19,6 +19,7 @@
 (require 'qq-gateway-directory)
 (require 'qq-gateway-media)
 (require 'qq-gateway-transport)
+(require 'qq-runtime)
 (require 'qq-state)
 
 (defvar qq-media-animated-face-image-height)
@@ -422,8 +423,7 @@ and ephemeral filesystem path retained by the private player state."
     (if (not (and entry
                   (equal qq-media--native-record-current-id media-id)
                   (eq (plist-get entry :status) 'preparing)
-                  (equal (plist-get entry :account-id)
-                         (qq-gateway-current-account-id))))
+                  (qq-gateway-account (plist-get entry :account-id))))
         (qq-media--close-native-record-access
          (alist-get 'access_id (alist-get 'access result)))
       (qq-media--start-native-record-player media-id result))))
@@ -485,7 +485,7 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
                   (not (equal qq-media--native-record-current-id media-id)))
          (qq-media--dispose-native-record-entry
           qq-media--native-record-current-id 'stopped))
-       (let* ((account-id (qq-gateway-current-account-id))
+       (let* ((account-id (qq-runtime-current-account-id))
               (owner-handle
                (and account-id owner
                     (appkit-register-handle
@@ -531,14 +531,8 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
       (qq-media--notify-native-record-state media-id)
     (qq-media--note-cache-updated nil)))
 
-(defun qq-media--native-account-changed (&rest _ignored)
-  "Stop record playback before the selected account owner changes."
-  (qq-media--stop-all-native-record-playback))
-
 (add-hook 'qq-gateway-media-changed-hook
           #'qq-media--native-remote-media-changed)
-(add-hook 'qq-gateway-current-account-changed-hook
-          #'qq-media--native-account-changed)
 
 (defun qq-media--image-from-file (file height)
   "Create an Emacs image object from FILE at pixel HEIGHT, or nil."
@@ -1059,7 +1053,7 @@ states never probe a second interface such as get_file."
 
 (defun qq-media--native-record-methods-ready-p ()
   "Return non-nil when native record playback can start for this account."
-  (and (qq-gateway-current-account-id)
+  (and (qq-runtime-current-account-id)
        (qq-gateway-transport-ready-p)
        (cl-every #'qq-gateway--method-available-p
                  qq-media--native-record-required-methods)))
@@ -1113,7 +1107,7 @@ states never probe a second interface such as get_file."
                         (or problem-message "materialization failed")
                         68 nil nil t)))
               ((not player-ready) "Player unavailable")
-              ((not (qq-gateway-current-account-id)) "Select an account")
+              ((not (qq-runtime-current-account-id)) "Select an account")
               ((not methods-ready) "Playback unavailable")
               (t "Remote voice"))))))
     (list :open (and open t)
@@ -1668,7 +1662,7 @@ fallback for identities observed outside that directory."
   "Resolve USER-ID avatar and call DONE or ERROR."
   (if-let* ((resource (qq-media--native-user-avatar-resource user-id)))
       (funcall done resource)
-    (if (and (qq-gateway-current-account-id)
+    (if (and (qq-runtime-current-account-id)
              (member "contact.get_user_avatar"
                      (qq-gateway-transport-capabilities)))
         (qq-gateway-directory-get-user-avatar user-id done error)

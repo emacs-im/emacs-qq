@@ -11,8 +11,8 @@
 ;;
 ;; A request's `owner' is only the observation context in which its callback
 ;; may still be delivered; it is not Gateway authority and is never serialized
-;; onto the wire.  Nil denotes global work, a string follows one stable selected
-;; account slot across Native Session replacement. Exact session identity is
+;; onto the wire.  Nil denotes global work, while a string follows one stable
+;; account slot across Native Session replacement.  Exact session identity is
 ;; deliberately kept behind the Gateway boundary; product callers never
 ;; coordinate it.
 
@@ -21,6 +21,7 @@
 (require 'cl-lib)
 (require 'qq-gateway)
 (require 'qq-gateway-transport)
+(require 'qq-runtime)
 
 (cl-defstruct (qq-native-request
                (:constructor qq-native-request--create))
@@ -43,7 +44,7 @@
 (defun qq-native-request-create (&optional owner cancel-function)
   "Create and register an active request for OWNER context.
 
-Nil denotes global work and a non-empty string denotes a stable selected
+Nil denotes global work and a non-empty string denotes a stable managed
 account slot.  These scopes only control callback delivery; they do not
 authorize a request or add fields to its wire parameters.
 
@@ -85,7 +86,7 @@ A string owner denotes a stable managed-account slot and deliberately survives
 Native Session replacement."
   (let ((owner (qq-native-request-owner request)))
     (or (null owner)
-        (equal owner (qq-gateway-current-account-id)))))
+        (and (qq-gateway-account owner) t))))
 
 (defun qq-native-request--invoke (callback &rest arguments)
   "Invoke leaf CALLBACK with ARGUMENTS while isolating consumer errors."
@@ -95,6 +96,13 @@ Native Session replacement."
       (error
        (message "qq: native request callback failed: %s"
                 (error-message-string error-data))))))
+
+(defun qq-native-request--invoke-owned (owner callback &rest arguments)
+  "Invoke CALLBACK with ARGUMENTS inside OWNER's state partition."
+  (if owner
+      (qq-runtime-with-account owner
+        (apply #'qq-native-request--invoke callback arguments))
+    (apply #'qq-native-request--invoke callback arguments)))
 
 (defun qq-native-cancel-request (request)
   "Cancel REQUEST locally and revoke its adapter work exactly once."
@@ -119,33 +127,37 @@ Native Session replacement."
 STARTER is called with success and error continuations and returns its opaque
 adapter token.  CALLBACK receives one successful value; ERRBACK receives an
 error body and human-readable reason.  OWNER uses the scope vocabulary of
-`qq-native-request-create' and defaults to the stable selected account slot.
+`qq-native-request-create' and defaults to the current UI account.
 
 The request retires before invoking either leaf callback.  Late callbacks and
-callbacks for a replaced OWNER are inert.  Product-specific replacement and
-projection policy belongs to the product operation, not this lifecycle type.
+callbacks for a removed OWNER are inert.  Native Session replacement does not
+change the stable account slot.  Product-specific replacement and projection
+policy belongs to the product operation, not this lifecycle type.
 
 A nil token must be paired with a synchronous failure callback.  A non-nil
 token is accepted work and its callback runs later on the event loop."
   (let* ((owner (if owner-supplied-p
                     owner
-                  (qq-gateway-current-account-id)))
+                  (qq-runtime-current-account-id)))
          (request (qq-native-request-create owner)))
     (condition-case error-data
         (cl-labels
             ((success
                (value)
                (when (qq-native-request-active-p request)
-                 (if (qq-native-request--owner-current-p request)
+                   (if (qq-native-request--owner-current-p request)
                      (when (qq-native-request-finish request)
-                       (qq-native-request--invoke callback value))
+                       (qq-native-request--invoke-owned
+                        (qq-native-request-owner request) callback value))
                    (qq-native-cancel-request request))))
              (failure
                (body reason)
                (when (qq-native-request-active-p request)
-                 (if (qq-native-request--owner-current-p request)
+                   (if (qq-native-request--owner-current-p request)
                      (when (qq-native-request-fail request)
-                       (qq-native-request--invoke errback body reason))
+                       (qq-native-request--invoke-owned
+                        (qq-native-request-owner request)
+                        errback body reason))
                    (qq-native-cancel-request request)))))
           (let ((token (funcall starter #'success #'failure)))
             (when (qq-native-request-active-p request)

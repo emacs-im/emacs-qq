@@ -92,8 +92,7 @@
 (ert-deftest qq-guild-forum-is-a-feed-directory-with-opaque-pagination ()
   (let* ((qq-state-change-hook nil)
          (qq-media-cache-update-hook nil)
-         (app (appkit-start-app 'qq :id (make-symbol "qq-forum-test")))
-         (qq-runtime--app app)
+         (qq-runtime--context-account-id "slot-a")
          (session-key
           (qq-state-guild-channel-session-key
            qq-guild-forum-test--guild-id qq-guild-forum-test--channel-id))
@@ -105,6 +104,7 @@
            "B_synthetic_older" 1784000000 "Older post"))
          cursors
          buffer)
+    (qq-state-select-account "slot-a")
     (qq-state-reset)
     (unwind-protect
         (progn
@@ -114,8 +114,7 @@
                 "Newest post")
           (qq-state-apply-guild-directory
            (qq-guild-forum-test--directory))
-          (cl-letf (((symbol-function 'qq-runtime-app) (lambda () app))
-                    ((symbol-function 'qq-media-message-avatar-image)
+          (cl-letf (((symbol-function 'qq-media-message-avatar-image)
                      (lambda (_message) nil))
                     ((symbol-function 'qq-api-fetch-guild-forum-page)
                      (lambda (candidate-session cursor callback
@@ -162,15 +161,13 @@
           (should (equal (nreverse cursors) '("" "opaque-page-2"))))
       (when (buffer-live-p buffer)
         (kill-buffer buffer))
-      (when (appkit-app-live-p app)
-        (appkit-stop-app app))
+      (qq-runtime-stop-account "slot-a" t)
       (qq-state-reset))))
 
 (ert-deftest qq-guild-forum-post-owns-native-comments-and-reply-pagination ()
   (let* ((qq-state-change-hook nil)
          (qq-media-cache-update-hook nil)
-         (app (appkit-start-app 'qq :id (make-symbol "qq-post-test")))
-         (qq-runtime--app app)
+         (qq-runtime--context-account-id "slot-a")
          (session-key
           (qq-state-guild-channel-session-key
            qq-guild-forum-test--guild-id qq-guild-forum-test--channel-id))
@@ -192,14 +189,14 @@
          comment-cursors
          reply-cursors
          buffer)
+    (qq-state-select-account "slot-a")
     (qq-state-reset)
     (unwind-protect
         (progn
           (qq-state-apply-guild-directory (qq-guild-forum-test--directory))
           (qq-state-replace-guild-forum-posts session-key (list closed-post))
           (let ((post (car (qq-state-session-messages session-key))))
-            (cl-letf (((symbol-function 'qq-runtime-app) (lambda () app))
-                      ((symbol-function 'qq-media-message-avatar-image)
+            (cl-letf (((symbol-function 'qq-media-message-avatar-image)
                        (lambda (_message) nil))
                       ((symbol-function 'qq-api-fetch-guild-forum-comments)
                        (lambda (candidate cursor callback &optional _errback)
@@ -258,8 +255,7 @@
           (should (equal reply-cursors '("reply=opaque-next"))))
       (when (buffer-live-p buffer)
         (kill-buffer buffer))
-      (when (appkit-app-live-p app)
-        (appkit-stop-app app))
+      (qq-runtime-stop-account "slot-a" t)
       (qq-state-reset))))
 
 (ert-deftest qq-api-guild-forum-comments-enforce-native-cursor-relations ()

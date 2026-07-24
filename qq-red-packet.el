@@ -64,9 +64,10 @@
   "Return the Appkit identity for MESSAGE-ID in SESSION-KEY."
   (list 'red-packet session-key message-id))
 
-(defun qq-red-packet--buffer-name (session-key message-id)
-  "Return the fallback buffer name for MESSAGE-ID in SESSION-KEY."
-  (format "*qq-red-packet:%s:%s*" session-key message-id))
+(defun qq-red-packet--buffer-name (account-id session-key message-id)
+  "Return ACCOUNT-ID-qualified red-packet buffer name for MESSAGE-ID."
+  (qq-runtime-account-buffer-name
+   "red-packet" (format "%s:%s" session-key message-id) account-id))
 
 (defun qq-red-packet--position-key (kind &optional value)
   "Return a stable current-packet position key for KIND and VALUE."
@@ -540,7 +541,13 @@
   "Return the live Appkit view owning the current red-packet buffer."
   (unless (and qq-red-packet--session-key qq-red-packet--message-id)
     (error "QQ: Cannot attach a red-packet view without its identity"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner
+          (or qq-runtime--account-id
+              (user-error "qq: red-packet buffer has no account owner")))
+         (app (qq-runtime-app owner))
+         (sync-function
+          (qq-runtime-account-sync-function
+           owner #'qq-red-packet--sync-invalidations))
          (view-id
           (qq-red-packet--view-id
            qq-red-packet--session-key qq-red-packet--message-id))
@@ -552,7 +559,7 @@
       (setf (appkit-view-state current)
             (list qq-red-packet--session-key qq-red-packet--message-id)
             (appkit-view-sync-function current)
-            #'qq-red-packet--sync-invalidations
+            sync-function
             (appkit-view-parts current) '(packet))
       current)
      ((appkit-view-live-p current)
@@ -565,8 +572,9 @@
               :state (list qq-red-packet--session-key
                            qq-red-packet--message-id)
               :mode 'qq-red-packet-mode
-              :sync-function #'qq-red-packet--sync-invalidations
+              :sync-function sync-function
               :parts '(packet))))
+        (qq-runtime-bind-account owner)
         (qq-red-packet--setup-view view)
         view)))))
 
@@ -599,16 +607,18 @@
                (member (alist-get 'wallet_kind (alist-get 'data segment))
                        '("red-packet" "password-red-packet")))
     (error "QQ: Red-packet view requires an interactive wallet kind"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner (qq-runtime-require-account-id "opening a red packet"))
+         (app (qq-runtime-app owner))
          (view-id (qq-red-packet--view-id session-key message-id))
          (fresh-p (null (appkit-view-for-id app view-id)))
          (view
-          (appkit-open-view
-           :app app
+          (qq-runtime-open-account-view
+           :account-id owner
            :id view-id
            :state (list session-key message-id)
            :mode 'qq-red-packet-mode
-           :buffer-name (qq-red-packet--buffer-name session-key message-id)
+           :buffer-name
+           (qq-red-packet--buffer-name owner session-key message-id)
            :sync-function #'qq-red-packet--sync-invalidations
            :parts '(packet)
            :setup #'qq-red-packet--setup-view))

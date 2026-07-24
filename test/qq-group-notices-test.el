@@ -28,6 +28,7 @@ BODY may refer to the lexical variable `view'."
      (unwind-protect
          (with-temp-buffer
            (qq-group-notices-mode)
+           (setq-local qq-runtime--account-id "slot-a")
            (setq qq-group-notices--group-id "20001")
            (let ((view (qq-group-notices--ensure-view)))
              ,@body))
@@ -239,9 +240,12 @@ BODY may refer to the lexical variable `view'."
   (let* ((buffer-name
           (generate-new-buffer-name " *qq-group-notices-runtime*"))
          (buffer (get-buffer-create buffer-name))
-         (app-one (appkit-start-app 'qq :id 'notices-old-runtime))
-         (app-two nil)
-         (qq-runtime--app app-one)
+         (qq-runtime--accounts (make-hash-table :test #'equal))
+         (qq-state--partitions (make-hash-table :test #'equal))
+         (qq-runtime--context-account-id "slot-a")
+         (_app-one
+          (qq-runtime-account-app
+           (qq-runtime-ensure-account "slot-a")))
          (old-items (copy-tree qq-group-notices-test--items))
          replacement-buffer
          callback
@@ -251,13 +255,14 @@ BODY may refer to the lexical variable `view'."
           (alist-get 'text (car old-items)) "OLD ACCOUNT PRIVATE CONTENT")
     (unwind-protect
         (cl-letf (((symbol-function 'qq-group-notices--buffer-name)
-                   (lambda () buffer-name))
+                   (lambda (&rest _arguments) buffer-name))
                   ((symbol-function 'pop-to-buffer)
                    (lambda (candidate &rest _arguments) candidate))
                   ((symbol-function 'qq-api-cancel-request)
                    (lambda (request) (push request cancelled))))
           (with-current-buffer buffer
             (qq-group-notices-mode)
+            (qq-runtime-bind-account "slot-a")
             (setq qq-group-notices--group-id "20001"
                   qq-group-notices--group-name "Old Account Group")
             (let ((view-one (qq-group-notices--ensure-view)))
@@ -272,7 +277,7 @@ BODY may refer to the lexical variable `view'."
               ;; Reusing the same live view must not discard its active state.
               (should (eq view-one (qq-group-notices--ensure-view)))
               (should qq-group-notices--items)
-              (appkit-stop-app app-one)
+              (qq-runtime-stop-account "slot-a")
               (should-not (appkit-view-live-p view-one))
               (should-not qq-group-notices--items)
               (should-not qq-group-notices--error)
@@ -282,8 +287,7 @@ BODY may refer to the lexical variable `view'."
               (should-not
                (string-match-p "OLD ACCOUNT" (buffer-string)))
               (should (equal cancelled '(old-notice-request)))))
-          (setq app-two (appkit-start-app 'qq :id 'notices-new-runtime)
-                qq-runtime--app app-two)
+          (qq-runtime-ensure-account "slot-a")
           (cl-letf (((symbol-function 'qq-api-get-group-notices)
                      (lambda (group-id success &optional _failure)
                        (setq calls (1+ (or calls 0))
@@ -293,7 +297,7 @@ BODY may refer to the lexical variable `view'."
             (setq replacement-buffer
                   (qq-group-notices-open "20001" "New Group"))
             (should (buffer-live-p replacement-buffer))
-            (should-not (eq buffer replacement-buffer)))
+            (should (eq buffer replacement-buffer)))
           (with-current-buffer replacement-buffer
             (let ((view-two (appkit-current-view)))
               (should (appkit-view-live-p view-two))
@@ -309,10 +313,7 @@ BODY may refer to the lexical variable `view'."
                              qq-group-notices-test--items))
               (should-not
                (string-match-p "OLD ACCOUNT" (buffer-string))))))
-      (when (appkit-app-live-p app-one)
-        (appkit-stop-app app-one))
-      (when (appkit-app-live-p app-two)
-        (appkit-stop-app app-two))
+      (qq-runtime-stop-account "slot-a" t)
       (when (buffer-live-p buffer)
         (kill-buffer buffer))
       (when (buffer-live-p replacement-buffer)

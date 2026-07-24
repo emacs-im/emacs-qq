@@ -118,10 +118,9 @@
 (defvar-local qq-user--media-hook-function nil
   "View-owned media cache hook installed for this user buffer.")
 
-(defun qq-user--buffer-name (user-id)
-  "Return profile buffer name for USER-ID."
-  (ignore user-id)
-  "*qq-user*")
+(defun qq-user--buffer-name (account-id user-id)
+  "Return ACCOUNT-ID-qualified profile buffer name for USER-ID."
+  (qq-runtime-account-buffer-name "user" user-id account-id))
 
 (defun qq-user--profile-key (&optional user-id)
   "Return the stable presentation key for USER-ID's profile.
@@ -715,12 +714,6 @@ Return a closed alist containing `verification_message' and `answers'."
   (let ((view (appkit-current-view)))
     (and (qq-user--view-current-p view) view)))
 
-(defun qq-user--live-view ()
-  "Return the registered live user-profile view without starting QQ."
-  (when (appkit-app-live-p qq-runtime--app)
-    (when-let* ((view (appkit-view-for-id qq-runtime--app qq-user--view-id)))
-      (and (qq-user--view-current-p view) view))))
-
 (cl-defun qq-user--request-sync (&optional view &key resource)
   "Request one coalesced profile sync for live VIEW.
 
@@ -1174,14 +1167,20 @@ stale."
   "Return the live Appkit view owning the current user buffer."
   (unless qq-user--user-id
     (error "QQ: cannot attach a user view without an opaque user identity"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner
+          (or qq-runtime--account-id
+              (user-error "qq: user buffer has no account owner")))
+         (app (qq-runtime-app owner))
+         (sync-function
+          (qq-runtime-account-sync-function
+           owner #'qq-user--sync-invalidations))
          (current (appkit-current-view)))
     (cond
      ((and (appkit-view-live-p current)
            (eq app (appkit-view-app current))
            (equal qq-user--view-id (appkit-view-id current)))
       (setf (appkit-view-sync-function current)
-            #'qq-user--sync-invalidations
+            sync-function
             (appkit-view-parts current) '(profile))
       current)
      ((appkit-view-live-p current)
@@ -1192,8 +1191,9 @@ stale."
               :app app
               :id qq-user--view-id
               :mode 'qq-user-mode
-              :sync-function #'qq-user--sync-invalidations
+              :sync-function sync-function
               :parts '(profile))))
+        (qq-runtime-bind-account owner)
         (qq-user--setup-view view)
         view)))))
 
@@ -1239,13 +1239,13 @@ stale."
   (interactive "sQQ number: ")
   (unless (qq-api-user-id-p user-id)
     (user-error "qq: user profile requires a decimal string user id"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner (qq-runtime-require-account-id "opening a user profile"))
          (view
-          (appkit-open-view
-           :app app
+          (qq-runtime-open-account-view
+           :account-id owner
            :id qq-user--view-id
            :mode 'qq-user-mode
-           :buffer-name (qq-user--buffer-name user-id)
+           :buffer-name (qq-user--buffer-name owner user-id)
            :sync-function #'qq-user--sync-invalidations
            :parts '(profile)
            :setup #'qq-user--setup-view))
@@ -1290,13 +1290,14 @@ stale."
     (error "qq: invalid global-user search result"))
   (let* ((copy (copy-tree result))
          (user-id (alist-get 'user_id copy))
-         (app (qq-runtime-app))
+         (owner
+          (qq-runtime-require-account-id "opening a user search result"))
          (view
-          (appkit-open-view
-           :app app
+          (qq-runtime-open-account-view
+           :account-id owner
            :id qq-user--view-id
            :mode 'qq-user-mode
-           :buffer-name (qq-user--buffer-name user-id)
+           :buffer-name (qq-user--buffer-name owner user-id)
            :sync-function #'qq-user--sync-invalidations
            :parts '(profile)
            :setup #'qq-user--setup-view))

@@ -160,22 +160,27 @@ account data is not left visible."
                 (error-message-string error-data))))))
 
 (defun qq--stop-current-runtime-for-reset ()
-  "Detach and stop the exact current runtime without losing a replacement.
+  "Detach and stop current Gateway/account UI apps without losing replacements.
 
-The global is revoked before Appkit shutdown.  If a shutdown hook creates a
+Registries are revoked before Appkit shutdown.  If a shutdown hook creates a
 replacement runtime reentrantly, that new app remains visible to the drain
-loop instead of being overwritten by a trailing unconditional nil assignment."
-  (when-let* ((app (and (appkit-app-p qq-runtime--app) qq-runtime--app)))
-    (when (eq qq-runtime--app app)
+loop instead of being overwritten by a trailing unconditional assignment."
+  (let ((gateway (and (appkit-app-p qq-runtime--app) qq-runtime--app))
+        (account-apps
+         (mapcar #'qq-runtime-account-app (qq-runtime-accounts))))
+    (when gateway
       (setq qq-runtime--app nil))
-    (condition-case error-data
-        (appkit-stop-app app)
-      (error
-       (message "qq: runtime cleanup failed: %s"
-                (error-message-string error-data)))
-      (quit
-       (message "qq: runtime cleanup was interrupted")))
-    app))
+    (dolist (runtime (qq-runtime-accounts))
+      (remhash (qq-runtime-account-id runtime) qq-runtime--accounts))
+    (dolist (app (append account-apps (and gateway (list gateway))))
+      (condition-case error-data
+          (appkit-stop-app app)
+        (error
+         (message "qq: runtime cleanup failed: %s"
+                  (error-message-string error-data)))
+        (quit
+         (message "qq: runtime cleanup was interrupted"))))
+    (or gateway (car account-apps))))
 
 (defun qq--drain-reset-resources (&optional initial-buffers)
   "Stop and kill account resources until reentrant creation quiesces.
@@ -189,15 +194,16 @@ current, detached, or legacy QQ buffers created by shutdown/kill hooks."
     (while (not done)
       (let ((buffers (delete-dups
                       (append pending (qq--collect-client-buffers))))
-            (app (and (appkit-app-p qq-runtime--app) qq-runtime--app)))
+            (app (and (appkit-app-p qq-runtime--app) qq-runtime--app))
+            (account-runtimes (qq-runtime-accounts)))
         (setq pending nil)
-        (if (and (null app) (null buffers))
+        (if (and (null app) (null account-runtimes) (null buffers))
             (setq done t)
           (cl-incf passes)
           (when (> passes qq--reset-drain-limit)
             (error "QQ reset did not quiesce after %d cleanup passes"
                    qq--reset-drain-limit))
-          (when app
+          (when (or app account-runtimes)
             (qq--stop-current-runtime-for-reset))
           (qq--kill-client-buffers buffers))))
     (setq qq-runtime--app nil)
@@ -207,8 +213,8 @@ current, detached, or legacy QQ buffers created by shutdown/kill hooks."
 (defun qq ()
   "Start emacs-qq and open the root buffer."
   (interactive)
-  (qq-runtime-app)
-  (qq-root-open)
+  (qq-runtime-gateway-app)
+  (qq-root-open-gateway)
   (unless (qq-login-active-p)
     (qq-login)))
 
