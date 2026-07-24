@@ -9,7 +9,8 @@
 (defconst qq-gateway-test-capabilities
   '("account.list" "account.create" "account.status" "account.set_presence"
     "account.start"
-    "account.login.password" "account.login.captcha"
+    "account.login.list" "account.login.password" "account.login.quick"
+    "account.login.captcha"
     "account.login.unusual_device"
     "account.stop" "account.logout" "account.remove"))
 
@@ -311,6 +312,93 @@
           (should (stringp (alist-get 'uin params)))
           (should (equal (alist-get 'password params)
                          "correct horse battery staple")))))))
+
+(ert-deftest qq-gateway-quick-login-list-projects-closed-ordered-identities ()
+  (let (sent-method sent-params delivered)
+    (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+               (lambda () t))
+              ((symbol-function 'qq-gateway-transport-capabilities)
+               (lambda () qq-gateway-test-capabilities))
+              ((symbol-function 'qq-gateway-transport-send)
+               (lambda (method params callback _errback &optional _early)
+                 (setq sent-method method sent-params params)
+                 (funcall
+                  callback
+                  '((accounts
+                     . [((uin . "10002")
+                         (uid . "u_newer")
+                         (generated_at_unix . 1784700001))
+                        ((uin . "10001")
+                         (uid . "u_older")
+                         (generated_at_unix . 1784700000))])))
+                 "quick-list-request")))
+      (should
+       (equal
+        (qq-gateway-account-login-list
+         (lambda (accounts) (setq delivered accounts)))
+        "quick-list-request"))
+      (should (equal sent-method "account.login.list"))
+      (should-not sent-params)
+      (should
+       (equal
+        (mapcar (lambda (account) (alist-get 'uin account)) delivered)
+        '("10002" "10001")))
+      (aset (alist-get 'uid (car delivered)) 0 ?X)
+      (should
+       (equal
+        (alist-get
+         'uid
+         (car
+          (qq-gateway--project-quick-login-accounts
+           '((accounts
+              ((uin . "10002")
+               (uid . "u_newer")
+               (generated_at_unix . 1784700001)))))))
+        "u_newer")))))
+
+(ert-deftest qq-gateway-quick-login-list-rejects-duplicates-and-open-shapes ()
+  (should-error
+   (qq-gateway--project-quick-login-accounts
+    '((accounts
+       ((uin . "10001") (uid . "u_a") (generated_at_unix . 1))
+       ((uin . "10001") (uid . "u_b") (generated_at_unix . 2))))))
+  (should-error
+   (qq-gateway--project-quick-login-accounts
+    '((accounts
+       ((uin . "10001") (uid . "u_a") (generated_at_unix . 1)
+        (credential . "must-not-cross-wire")))))))
+
+(ert-deftest qq-gateway-quick-login-sends-only-slot-identity-and-qimei ()
+  (qq-gateway-test-with-state
+    (let (sent-method sent-params delivered)
+      (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-gateway-transport-capabilities)
+                 (lambda () qq-gateway-test-capabilities))
+                ((symbol-function 'qq-gateway-transport-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall
+                    callback
+                    (qq-gateway-test-account
+                     "slot-a" "logging_in" "10001"))
+                   "quick-login-request")))
+        (should
+         (equal
+          (qq-gateway-account-login-quick
+           "slot-a" "10001" "qimei-a"
+           (lambda (snapshot) (setq delivered snapshot)))
+          "quick-login-request"))
+        (should (equal sent-method "account.login.quick"))
+        (should
+         (equal sent-params
+                '((account_id . "slot-a")
+                  (uin . "10001")
+                  (qimei . "qimei-a"))))
+        (should (equal (alist-get 'phase delivered) "logging_in"))
+        (should
+         (equal (alist-get 'phase (qq-gateway-account "slot-a"))
+                "logging_in"))))))
 
 (ert-deftest qq-gateway-account-remove-consumes-returned-snapshot ()
   (qq-gateway-test-with-state
