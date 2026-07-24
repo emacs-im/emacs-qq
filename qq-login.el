@@ -29,6 +29,7 @@
   create-p
   label
   label-read-p
+  managed-accounts-loaded-p
   login-accounts-loaded-p
   login-accounts
   quick-login-uin
@@ -194,16 +195,27 @@ SUCCESS defaults to `qq-login--request-success'.  FAILURE defaults to
   (and (qq-rpc-method-available-p "account.login.list")
        (qq-rpc-method-available-p "account.login.quick")))
 
+(defun qq-login--managed-account-list-success (session _accounts)
+  "Continue SESSION after its authoritative managed-account refresh."
+  (when (qq-login--current-p session)
+    (setf (qq-login--session-in-flight-p session) nil
+          (qq-login--session-managed-accounts-loaded-p session) t)
+    (qq-login--present session "Preparing account choices…" nil)
+    (qq-login--schedule session)))
+
+(defun qq-login--request-managed-accounts (session)
+  "Refresh the authoritative managed-account catalog for SESSION."
+  (qq-login--present session "Loading managed QQ accounts…" nil)
+  (qq-login--request
+   session
+   (lambda (success failure)
+     (qq-account-refresh-accounts success failure 'login))
+   #'qq-login--managed-account-list-success))
+
 (defun qq-login--active-runtime-p (account)
   "Return non-nil when managed ACCOUNT already has an active runtime."
   (member (alist-get 'phase account)
           '("online" "starting" "logging_in" "stopping")))
-
-(defun qq-login--in-progress-account ()
-  "Return the selected account when its lifecycle should be continued."
-  (when-let* ((account (qq-account-current)))
-    (and (qq-login--active-runtime-p account)
-         account)))
 
 (defun qq-login--quick-account-list-success (session accounts)
   "Install EasyLogin ACCOUNTS for current SESSION and schedule its chooser."
@@ -215,6 +227,25 @@ SUCCESS defaults to `qq-login--request-success'.  FAILURE defaults to
     (qq-login--present session "Choose a QQ account." nil)
     (qq-login--schedule session)))
 
+(defun qq-login--quick-account-list-error (session body reason)
+  "Continue SESSION without EasyLogin candidates after BODY and REASON.
+
+The managed-account selector is the login entry point, not an optional
+credential-store feature.  A failed EasyLogin catalog therefore removes only
+that candidate source; managed accounts and new-account login remain usable."
+  (when (qq-login--current-p session)
+    (let ((code (alist-get 'code body)))
+      (setf (qq-login--session-in-flight-p session) nil
+            (qq-login--session-login-accounts-loaded-p session) t
+            (qq-login--session-login-accounts session) nil)
+      (message "qq: EasyLogin accounts unavailable%s: %s"
+               (if (qq-account--non-empty-string-p code)
+                   (format " [%s]" code)
+                 "")
+               (or reason "native request failed"))
+      (qq-login--present session "Choose a QQ account." nil)
+      (qq-login--schedule session))))
+
 (defun qq-login--request-quick-accounts (session)
   "Request completion-safe EasyLogin identities for SESSION."
   (qq-login--present session "Loading quick-login accounts…" nil)
@@ -222,7 +253,8 @@ SUCCESS defaults to `qq-login--request-success'.  FAILURE defaults to
    session
    (lambda (success failure)
      (qq-account-login-list success failure))
-   #'qq-login--quick-account-list-success))
+   #'qq-login--quick-account-list-success
+   #'qq-login--quick-account-list-error))
 
 (defun qq-login--managed-account-title (account)
   "Return the compact user-facing identity for managed ACCOUNT."
@@ -260,6 +292,26 @@ user-facing label."
        (equal uin (alist-get 'uin quick-account)))
      quick-accounts)))
 
+(defun qq-login--uniquify-account-choices (choices)
+  "Return CHOICES with exact identities appended only to duplicate labels."
+  (let ((counts (make-hash-table :test #'equal)))
+    (dolist (choice choices)
+      (puthash (car choice)
+               (1+ (gethash (car choice) counts 0))
+               counts))
+    (mapcar
+     (lambda (choice)
+       (if (= (gethash (car choice) counts) 1)
+           choice
+         (let ((identity
+                (pcase (cdr choice)
+                  (`(managed . ,account) (alist-get 'account_id account))
+                  (`(quick . ,account) (alist-get 'uin account))
+                  (`(new) "new"))))
+           (cons (format "%s [%s]" (car choice) identity)
+                 (cdr choice)))))
+     choices)))
+
 (defun qq-login--account-choices (session)
   "Return unified managed-account and EasyLogin choices for SESSION."
   (let ((quick-accounts (qq-login--session-login-accounts session))
@@ -287,9 +339,10 @@ user-facing label."
          (cons (qq-login--quick-account-label quick-account)
                (cons 'quick quick-account))
          quick-choices)))
-    (append (nreverse managed-choices)
-            (nreverse quick-choices)
-            '(("New account" . (new))))))
+    (qq-login--uniquify-account-choices
+     (append (nreverse managed-choices)
+             (nreverse quick-choices)
+             '(("New account" . (new)))))))
 
 (defun qq-login--matching-managed-account (quick-account)
   "Return a managed slot already bound to QUICK-ACCOUNT, or nil."
@@ -367,25 +420,32 @@ user-facing label."
   "Resolve SESSION's account source before driving its lifecycle.
 
 Return non-nil once SESSION names a managed slot or requests creation.  A nil
-return means the asynchronous EasyLogin identity request is still pending."
-  (let ((in-progress (qq-login--in-progress-account)))
-    (cond
-     ((or (qq-login--session-account-id session)
-          (qq-login--session-create-p session))
-      t)
-     (in-progress
-      (setf (qq-login--session-account-id session)
-            (copy-sequence (alist-get 'account_id in-progress)))
-      t)
-     ((not (qq-login--quick-login-available-p))
-      ;; Credential storage is optional.  Retain the account/password path
-      ;; when the Gateway deliberately omits EasyLogin capabilities.
-      t)
-     ((not (qq-login--session-login-accounts-loaded-p session))
-      (qq-login--request-quick-accounts session)
-      nil)
-     (t
-      (qq-login--read-account-choice session)))))
+return means an asynchronous account-catalog request is still pending."
+  (cond
+   ((or (qq-login--session-account-id session)
+        (qq-login--session-create-p session))
+    t)
+   ((not (qq-login--session-managed-accounts-loaded-p session))
+    ;; `gateway.ready' seeds the projection and account events maintain it,
+    ;; but an interactive selector is a consistency boundary of its own.
+    ;; Refresh once so a client that reconnected late cannot hide accounts
+    ;; created or changed by another Gateway client.
+    (qq-login--request-managed-accounts session)
+    nil)
+   ((not (qq-login--session-login-accounts-loaded-p session))
+    (if (qq-login--quick-login-available-p)
+        (progn
+          (qq-login--request-quick-accounts session)
+          nil)
+      ;; Credential storage contributes EasyLogin identities, but it never
+      ;; owns the selector itself.  An empty optional source is now a known
+      ;; result, so the same pass can present managed accounts plus the
+      ;; new-account action.
+      (setf (qq-login--session-login-accounts-loaded-p session) t
+            (qq-login--session-login-accounts session) nil)
+      (qq-login--read-account-choice session)))
+   (t
+    (qq-login--read-account-choice session))))
 
 (defun qq-login--ensure-account (session)
   "Resolve or create SESSION's account.
@@ -732,11 +792,10 @@ the caller has already made the optional label choice, including choosing nil."
     (when (qq-login-active-p)
       (qq-login-cancel))
     (let ((online-account
-           (and (not create-p)
+           (and account-id
+                (not create-p)
                 (qq-server-ready-p)
-                (if account-id
-                    (qq-account-get account-id)
-                  (qq-account-current)))))
+                (qq-account-get account-id))))
       (if (and online-account
                (equal (alist-get 'phase online-account) "online"))
           (progn
@@ -753,6 +812,7 @@ the caller has already made the optional label choice, including choosing nil."
                 :create-p create-p
                 :label label
                 :label-read-p label-read-p
+                :managed-accounts-loaded-p nil
                 :login-accounts-loaded-p nil
                 :login-accounts nil
                 :quick-login-uin nil

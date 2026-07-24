@@ -211,7 +211,11 @@ current, detached, or legacy QQ buffers created by shutdown/kill hooks."
 
 ;;;###autoload
 (defun qq ()
-  "Start emacs-qq and open the root buffer."
+  "Start emacs-qq, open its root buffer, and select a QQ account.
+
+After the service becomes ready, the selector combines managed accounts,
+available EasyLogin identities, and a new-account action.  An authorization
+interaction already in progress remains visible instead of being replaced."
   (interactive)
   (qq-runtime-gateway-app)
   (qq-root-open-gateway)
