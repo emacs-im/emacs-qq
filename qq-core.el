@@ -1373,7 +1373,7 @@ the requested page size."
 (defconst qq-core--capability-methods
   '((recent-conversations "conversation.list_recent")
     (contacts "contact.list_friends" "contact.list_groups")
-    (avatar "contact.get_user_avatar")
+    (avatar "contact.get_user_avatar" "contact.get_group_avatar")
     (group-members "contact.list_group_members")
     (group-settings "group.set_name" "group.set_remark"
                     "group.set_whole_mute" "group.set_pinned")

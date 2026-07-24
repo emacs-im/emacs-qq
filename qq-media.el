@@ -1689,7 +1689,7 @@ fallback for identities observed outside that directory."
   (qq-media--resolve-resource
    (format "group-avatar:%s" group-id)
    (lambda (done)
-     (qq-api-get-group-avatar group-id done))
+     (qq-directory-get-group-avatar group-id done #'qq-api--default-error))
    (lambda (resource)
      (qq-media-open-resource
       resource 'image (format "group-avatar:%s" group-id)))))
@@ -1876,7 +1876,7 @@ Use FALLBACK until the preview is available."
   (qq-media--ensure-resource-image
    (format "group-avatar:%s" group-id)
    (lambda (done error)
-     (qq-api-get-group-avatar group-id done error))
+     (qq-directory-get-group-avatar group-id done error))
    qq-media-avatar-image-height))
 
 (defun qq-media-group-avatar-display-string (group-id)

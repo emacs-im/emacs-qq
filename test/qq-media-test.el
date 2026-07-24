@@ -1694,7 +1694,7 @@
     (cl-letf (((symbol-function 'qq-media--cached-image) (lambda (_key) nil))
               ((symbol-function 'qq-api-get-avatar)
                (lambda (&rest _args) (setq api-called t)))
-              ((symbol-function 'qq-api-get-group-avatar)
+              ((symbol-function 'qq-directory-get-group-avatar)
                (lambda (&rest _args) (setq api-called t))))
       (should (equal (qq-media-avatar-cached-display-string "10001") "@"))
       (should (equal (qq-media-group-avatar-cached-display-string "20001") "#"))
