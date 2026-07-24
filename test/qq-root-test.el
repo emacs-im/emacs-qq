@@ -63,9 +63,9 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
     (cl-letf (((symbol-function 'qq-state-self-info) #'ignore)
               ((symbol-function 'qq-state-connection-status)
                (lambda () 'ready))
-              ((symbol-function 'qq-gateway-account)
+              ((symbol-function 'qq-account-get)
                (lambda (_account-id) account))
-              ((symbol-function 'qq-gateway-accounts)
+              ((symbol-function 'qq-account-list)
                (lambda () (list account))))
       (let ((qq-root--scope "slot-work"))
         (should
@@ -88,9 +88,9 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                  '((user_id . "20002") (nickname . "Old account"))))
               ((symbol-function 'qq-state-connection-status)
                (lambda () 'ready))
-              ((symbol-function 'qq-gateway-account)
+              ((symbol-function 'qq-account-get)
                (lambda (_account-id) selected))
-              ((symbol-function 'qq-gateway-accounts)
+              ((symbol-function 'qq-account-list)
                (lambda () (list selected other))))
       (let ((qq-root--scope "slot-work"))
         (should
@@ -726,16 +726,16 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
         (qq-runtime--accounts (make-hash-table :test #'equal))
         (qq-state--partitions (make-hash-table :test #'equal))
         (qq-state--active-account-id nil)
-        (qq-gateway--accounts (make-hash-table :test #'equal))
-        (qq-gateway--account-order nil)
-        (qq-gateway--current-account-id nil)
-        (qq-gateway-accounts-changed-hook nil)
-        (qq-gateway-current-account-changed-hook nil)
+        (qq-account--accounts (make-hash-table :test #'equal))
+        (qq-account--account-order nil)
+        (qq-account--current-account-id nil)
+        (qq-account-registry-changed-hook nil)
+        (qq-account-selection-changed-hook nil)
         (qq-state-change-hook nil)
         manager root-a root-b)
     (unwind-protect
         (progn
-          (qq-gateway--replace-accounts
+          (qq-account--replace-accounts
            '(((account_id . "slot-a") (label . "Work")
               (phase . "online") (uin . "10001"))
              ((account_id . "slot-b") (label . "Personal")
@@ -753,7 +753,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
              nil))
           (cl-letf
               (((symbol-function 'qq-login-view-model) #'ignore)
-               ((symbol-function 'qq-gateway-transport-state)
+               ((symbol-function 'qq-server-state)
                 (lambda () 'ready)))
             (save-window-excursion
               (setq manager (qq-root-open 'gateway)

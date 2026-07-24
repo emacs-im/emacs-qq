@@ -25,14 +25,14 @@
 (require 'qq-customize)
 (require 'qq-runtime)
 (require 'qq-state)
-(require 'qq-gateway-rpc)
-(require 'qq-gateway)
-(require 'qq-gateway-resource)
-(require 'qq-gateway-media)
-(require 'qq-gateway-message)
-(require 'qq-gateway-conversation)
-(require 'qq-gateway-directory)
-(require 'qq-native)
+(require 'qq-rpc)
+(require 'qq-account)
+(require 'qq-resource)
+(require 'qq-remote-media)
+(require 'qq-message)
+(require 'qq-message)
+(require 'qq-directory)
+(require 'qq-core)
 (require 'qq-login)
 (require 'qq-chat)
 (require 'qq-search)
@@ -222,13 +222,13 @@ current, detached, or legacy QQ buffers created by shutdown/kill hooks."
 (defun qq-connect ()
   "Connect Emacs to the native QQ service."
   (interactive)
-  (qq-native-connect))
+  (qq-core-connect))
 
 ;;;###autoload
 (defun qq-disconnect ()
   "Disconnect Emacs without changing any managed QQ account state."
   (interactive)
-  (qq-native-disconnect))
+  (qq-core-disconnect))
 
 ;;;###autoload
 (defun qq-refresh ()
@@ -237,8 +237,8 @@ current, detached, or legacy QQ buffers created by shutdown/kill hooks."
 When transport is not connected yet, start it and wait for bootstrap.
 When transport is already open, request a fresh snapshot immediately."
   (interactive)
-  (if (qq-native-running-p)
-      (qq-native-refresh)
+  (if (qq-core-running-p)
+      (qq-core-refresh)
     (progn
       (qq-connect)
       (message "qq: connecting; initial refresh will run when the service is ready"))))
@@ -267,7 +267,7 @@ Appkit detaches renamed views; legacy QQ major modes are included too."
             (qq-media-clear-cache))
         (unwind-protect
             (progn
-              (qq-native-reset-session-state)
+              (qq-core-reset-session-state)
               (qq-state-reset))
           (unwind-protect
               (qq--drain-reset-resources buffers)

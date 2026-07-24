@@ -1,4 +1,4 @@
-;;; qq-native-request.el --- Native request ownership -*- lexical-binding: t; -*-
+;;; qq-request.el --- QQ request ownership -*- lexical-binding: t; -*-
 
 ;; Author: 0WD0 <wd.1105848296@gmail.com>
 
@@ -19,29 +19,46 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 'qq-gateway)
-(require 'qq-gateway-transport)
+(require 'qq-account)
+(require 'qq-server)
 (require 'qq-runtime)
 
-(cl-defstruct (qq-native-request
-               (:constructor qq-native-request--create))
+(cl-defstruct (qq-request-watch
+               (:constructor qq-request-watch-create))
+  "Cancellable local observer of a projected service resource."
+  active-p
+  cancel-function)
+
+(defun qq-request-watch-cancel (watch)
+  "Detach active projection WATCH exactly once."
+  (when (and (qq-request-watch-p watch)
+             (qq-request-watch-active-p watch))
+    (let ((cancel (qq-request-watch-cancel-function watch)))
+      (setf (qq-request-watch-active-p watch) nil
+            (qq-request-watch-cancel-function watch) nil)
+      (when cancel
+        (funcall cancel))
+      t)))
+
+(cl-defstruct (qq-request
+               (:constructor qq-request--create))
   "Opaque, exactly-once native request handle."
   owner
   (state 'active)
   token
   cancel-function)
 
-(defvar qq-native-request--active (make-hash-table :test #'eq)
+(defvar qq-request--active (make-hash-table :test #'eq)
   "Active native requests, keyed by request identity.")
 
-(defun qq-native-request--copy-owner (owner)
+(defun qq-request--copy-owner (owner)
   "Return an isolated copy of callback observation OWNER context."
   (cond
    ((null owner) nil)
    ((and (stringp owner) (> (length owner) 0)) (copy-sequence owner))
    (t (error "qq: invalid native request owner context %S" owner))))
 
-(defun qq-native-request-create (&optional owner cancel-function)
+(defun qq-request-create (&optional owner cancel-function)
   "Create and register an active request for OWNER context.
 
 Nil denotes global work and a non-empty string denotes a stable managed
@@ -49,46 +66,46 @@ account slot.  These scopes only control callback delivery; they do not
 authorize a request or add fields to its wire parameters.
 
 CANCEL-FUNCTION revokes adapter work and is called at most once.  Callers that
-only own a Gateway transport token should use `qq-native-request-start'."
+only own a Gateway transport token should use `qq-request-start'."
   (let ((request
-          (qq-native-request--create
-           :owner (qq-native-request--copy-owner owner)
+          (qq-request--create
+           :owner (qq-request--copy-owner owner)
            :cancel-function cancel-function)))
-    (puthash request t qq-native-request--active)
+    (puthash request t qq-request--active)
     request))
 
-(defun qq-native-request-active-p (request)
+(defun qq-request-active-p (request)
   "Return non-nil when REQUEST still owns asynchronous work."
-  (and (qq-native-request-p request)
-       (eq (qq-native-request-state request) 'active)))
+  (and (qq-request-p request)
+       (eq (qq-request-state request) 'active)))
 
-(defun qq-native-request--retire (request state)
+(defun qq-request--retire (request state)
   "Move active REQUEST to terminal STATE exactly once."
-  (when (qq-native-request-active-p request)
-    (setf (qq-native-request-state request) state
-          (qq-native-request-token request) nil
-          (qq-native-request-cancel-function request) nil)
-    (remhash request qq-native-request--active)
+  (when (qq-request-active-p request)
+    (setf (qq-request-state request) state
+          (qq-request-token request) nil
+          (qq-request-cancel-function request) nil)
+    (remhash request qq-request--active)
     t))
 
-(defun qq-native-request-finish (request)
+(defun qq-request-finish (request)
   "Mark REQUEST successfully settled without invoking a callback."
-  (qq-native-request--retire request 'settled))
+  (qq-request--retire request 'settled))
 
-(defun qq-native-request-fail (request)
+(defun qq-request-fail (request)
   "Mark REQUEST failed without invoking an error callback."
-  (qq-native-request--retire request 'failed))
+  (qq-request--retire request 'failed))
 
-(defun qq-native-request--owner-current-p (request)
+(defun qq-request--owner-current-p (request)
   "Return non-nil when REQUEST may deliver account-scoped callbacks.
 
 A string owner denotes a stable managed-account slot and deliberately survives
 Native Session replacement."
-  (let ((owner (qq-native-request-owner request)))
+  (let ((owner (qq-request-owner request)))
     (or (null owner)
-        (and (qq-gateway-account owner) t))))
+        (and (qq-account-get owner) t))))
 
-(defun qq-native-request--invoke (callback &rest arguments)
+(defun qq-request--invoke (callback &rest arguments)
   "Invoke leaf CALLBACK with ARGUMENTS while isolating consumer errors."
   (when callback
     (condition-case error-data
@@ -97,37 +114,37 @@ Native Session replacement."
        (message "qq: native request callback failed: %s"
                 (error-message-string error-data))))))
 
-(defun qq-native-request--invoke-owned (owner callback &rest arguments)
+(defun qq-request--invoke-owned (owner callback &rest arguments)
   "Invoke CALLBACK with ARGUMENTS inside OWNER's state partition."
   (if owner
       (qq-runtime-with-account owner
-        (apply #'qq-native-request--invoke callback arguments))
-    (apply #'qq-native-request--invoke callback arguments)))
+        (apply #'qq-request--invoke callback arguments))
+    (apply #'qq-request--invoke callback arguments)))
 
-(defun qq-native-cancel-request (request)
+(defun qq-request-cancel (request)
   "Cancel REQUEST locally and revoke its adapter work exactly once."
-  (when (qq-native-request-active-p request)
-    (let ((cancel (qq-native-request-cancel-function request))
-          (token (qq-native-request-token request)))
+  (when (qq-request-active-p request)
+    (let ((cancel (qq-request-cancel-function request))
+          (token (qq-request-token request)))
       ;; Revoke callback ownership before adapter cancellation can reenter.
-      (qq-native-request--retire request 'cancelled)
+      (qq-request--retire request 'cancelled)
       (condition-case error-data
           (cond
            (cancel (funcall cancel))
-           (token (qq-gateway-transport-cancel token)))
+           (token (qq-server-cancel token)))
         (error
          (message "qq: native request cancellation failed: %s"
                   (error-message-string error-data))))
       t)))
 
-(cl-defun qq-native-request-start
+(cl-defun qq-request-start
     (starter &key callback errback (owner nil owner-supplied-p))
   "Start one callback-scoped request through STARTER.
 
 STARTER is called with success and error continuations and returns its opaque
 adapter token.  CALLBACK receives one successful value; ERRBACK receives an
 error body and human-readable reason.  OWNER uses the scope vocabulary of
-`qq-native-request-create' and defaults to the current UI account.
+`qq-request-create' and defaults to the current UI account.
 
 The request retires before invoking either leaf callback.  Late callbacks and
 callbacks for a removed OWNER are inert.  Native Session replacement does not
@@ -139,56 +156,56 @@ token is accepted work and its callback runs later on the event loop."
   (let* ((owner (if owner-supplied-p
                     owner
                   (qq-runtime-current-account-id)))
-         (request (qq-native-request-create owner)))
+         (request (qq-request-create owner)))
     (condition-case error-data
         (cl-labels
             ((success
                (value)
-               (when (qq-native-request-active-p request)
-                   (if (qq-native-request--owner-current-p request)
-                     (when (qq-native-request-finish request)
-                       (qq-native-request--invoke-owned
-                        (qq-native-request-owner request) callback value))
-                   (qq-native-cancel-request request))))
+               (when (qq-request-active-p request)
+                   (if (qq-request--owner-current-p request)
+                     (when (qq-request-finish request)
+                       (qq-request--invoke-owned
+                        (qq-request-owner request) callback value))
+                   (qq-request-cancel request))))
              (failure
                (body reason)
-               (when (qq-native-request-active-p request)
-                   (if (qq-native-request--owner-current-p request)
-                     (when (qq-native-request-fail request)
-                       (qq-native-request--invoke-owned
-                        (qq-native-request-owner request)
+               (when (qq-request-active-p request)
+                   (if (qq-request--owner-current-p request)
+                     (when (qq-request-fail request)
+                       (qq-request--invoke-owned
+                        (qq-request-owner request)
                         errback body reason))
-                   (qq-native-cancel-request request)))))
+                   (qq-request-cancel request)))))
           (let ((token (funcall starter #'success #'failure)))
-            (when (qq-native-request-active-p request)
+            (when (qq-request-active-p request)
               (unless token
                 (error "qq: native request starter returned without settling"))
-              (setf (qq-native-request-token request) token)))
+              (setf (qq-request-token request) token)))
           request)
       ((error quit)
-       (qq-native-cancel-request request)
+       (qq-request-cancel request)
        (signal (car error-data) (cdr error-data))))))
 
-(defun qq-native-request-revoke-stale (&rest _ignored)
+(defun qq-request-revoke-stale (&rest _ignored)
   "Cancel requests whose callback observation context is no longer current."
   (let (stale)
     (maphash
      (lambda (request _present)
-       (when (and (qq-native-request-owner request)
-                  (not (qq-native-request--owner-current-p request)))
+       (when (and (qq-request-owner request)
+                  (not (qq-request--owner-current-p request)))
          (push request stale)))
-     qq-native-request--active)
+     qq-request--active)
     (dolist (request stale)
-      (qq-native-cancel-request request))))
+      (qq-request-cancel request))))
 
-(defun qq-native-request-revoke-all ()
+(defun qq-request-revoke-all ()
   "Cancel every active native request."
   (let (requests)
     (maphash (lambda (request _present) (push request requests))
-             qq-native-request--active)
+             qq-request--active)
     (dolist (request requests)
-      (qq-native-cancel-request request))))
+      (qq-request-cancel request))))
 
-(provide 'qq-native-request)
+(provide 'qq-request)
 
-;;; qq-native-request.el ends here
+;;; qq-request.el ends here

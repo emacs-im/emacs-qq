@@ -21,7 +21,7 @@
 (require 'appkit-ewoc)
 (require 'qq-api)
 (require 'qq-chat)
-(require 'qq-gateway)
+(require 'qq-account)
 (require 'qq-media)
 (require 'qq-login)
 (require 'qq-runtime)
@@ -146,11 +146,11 @@ used only when its QQ number agrees with ACCOUNT."
          (self-info (and (not gateway-p) (qq-state-self-info)))
          (status
           (if gateway-p
-              (qq-gateway-transport-state)
+              (qq-server-state)
             (qq-state-connection-status)))
          (owner (and (not gateway-p) qq-root--scope))
-         (account (qq-gateway-account owner))
-         (accounts (qq-gateway-accounts))
+         (account (qq-account-get owner))
+         (accounts (qq-account-list))
          (online-count
           (cl-count-if
            (lambda (snapshot)
@@ -405,7 +405,7 @@ message title rather than like dimmed preview content."
 
 (defun qq-root--project-gateway-entries ()
   "Project every managed account into the Gateway manager root."
-  (let ((accounts (qq-gateway-accounts)))
+  (let ((accounts (qq-account-list)))
     (append
      (list
       (qq-root--entry-create
@@ -704,13 +704,13 @@ offered."
 
 Views belonging to other accounts remain live and visible."
   (interactive)
-  (call-interactively #'qq-gateway-account-select)
+  (call-interactively #'qq-account-select)
   (qq-root-open))
 
 (defun qq-root-open-account (account-id)
   "Open stable ACCOUNT-ID's persistent root without closing other accounts."
-  (interactive (list (qq-gateway--read-account-id "Open QQ account: ")))
-  (unless (qq-gateway-account account-id)
+  (interactive (list (qq-account--read-account-id "Open QQ account: ")))
+  (unless (qq-account-get account-id)
     (user-error "qq: QQ account does not exist: %s" account-id))
   (qq-root-open account-id))
 
@@ -967,9 +967,9 @@ pixel-valued alignment follows text scaling."
 (add-hook 'qq-media-cache-update-hook #'qq-root--handle-media-cache-update)
 (add-hook 'qq-state-change-hook #'qq-root--handle-state-change)
 (add-hook 'qq-login-change-hook #'qq-root--handle-login-change)
-(add-hook 'qq-gateway-accounts-changed-hook
+(add-hook 'qq-account-registry-changed-hook
           #'qq-root--handle-gateway-account-change)
-(add-hook 'qq-gateway-current-account-changed-hook
+(add-hook 'qq-account-selection-changed-hook
           #'qq-root--handle-gateway-account-change)
 
 (provide 'qq-root)

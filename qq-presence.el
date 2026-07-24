@@ -9,7 +9,7 @@
 
 ;;; Code:
 
-(require 'qq-native)
+(require 'qq-core)
 (require 'qq-protocol)
 
 (defun qq-presence--label (presence)
@@ -40,7 +40,7 @@ body and human-readable reason."
   (setq presence
         (qq-protocol-validate-account-presence
          presence "account presence" 'user-error))
-  (qq-native-set-presence
+  (qq-core-set-presence
    presence
    (or callback (apply-partially #'qq-presence--report-success presence))
    (or errback #'qq-presence--report-error)))

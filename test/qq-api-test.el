@@ -331,9 +331,7 @@ The authoritative post-state reports UNREAD-COUNT."
     (clrhash qq-api--request-finalizers)
     (unwind-protect
         (cl-letf (((symbol-function 'qq-api-call)
-                   (lambda (&rest _args) 'async-request))
-                  ((symbol-function 'qq-transport-cancel)
-                   (lambda (token) (eq token 'async-request))))
+                   (lambda (&rest _args) 'async-request)))
           (should
            (eq 'async-request
                (qq-api--call-with-materialization-owner
@@ -345,55 +343,6 @@ The authoritative post-state reports UNREAD-COUNT."
           (should (= 0 (hash-table-count
                         qq-state--materialization-request-owners)))
           (should-not (gethash 'async-request qq-api--request-finalizers)))
-      (clrhash qq-api--request-finalizers)
-      (qq-state-reset))))
-
-(ert-deftest qq-api-cancel-request-settles-owner-after-transport-race ()
-  (let ((qq-state-change-hook nil))
-    (qq-state-reset)
-    (clrhash qq-api--request-finalizers)
-    (unwind-protect
-        (cl-letf (((symbol-function 'qq-api-call)
-                   (lambda (&rest _args) 'raced-request))
-                  ((symbol-function 'qq-transport-cancel)
-                   (lambda (_token) nil)))
-          (should
-           (eq 'raced-request
-               (qq-api--call-with-materialization-owner
-                "group:20001" "action" nil #'ignore)))
-          (should (= 1 (hash-table-count
-                        qq-state--materialization-request-owners)))
-          (should-not (qq-api-cancel-request 'raced-request))
-          (should (= 0 (hash-table-count
-                        qq-state--materialization-request-owners)))
-          (should-not (gethash 'raced-request qq-api--request-finalizers)))
-      (clrhash qq-api--request-finalizers)
-      (qq-state-reset))))
-
-(ert-deftest qq-api-cancel-request-settles-owner-when-transport-signals ()
-  (let ((qq-state-change-hook nil))
-    (qq-state-reset)
-    (clrhash qq-api--request-finalizers)
-    (unwind-protect
-        (cl-letf (((symbol-function 'qq-api-call)
-                   (lambda (&rest _args) 'signalling-request))
-                  ((symbol-function 'qq-transport-cancel)
-                   (lambda (_token) (error "transport cancel failed"))))
-          (qq-api--call-with-materialization-owner
-           "group:20001" "action" nil #'ignore)
-          (should (= 1 (hash-table-count
-                        qq-state--materialization-request-owners)))
-          (should
-           (gethash 'signalling-request qq-api--request-finalizers))
-          (should
-           (equal '(error "transport cancel failed")
-                  (condition-case err
-                      (qq-api-cancel-request 'signalling-request)
-                    (error err))))
-          (should (= 0 (hash-table-count
-                        qq-state--materialization-request-owners)))
-          (should-not
-           (gethash 'signalling-request qq-api--request-finalizers)))
       (clrhash qq-api--request-finalizers)
       (qq-state-reset))))
 
@@ -409,16 +358,14 @@ The authoritative post-state reports UNREAD-COUNT."
                    (lambda (_action _params success &optional error)
                      (setq success-callback success
                            error-callback error)
-                     'late-request))
-                  ((symbol-function 'qq-transport-cancel)
-                   (lambda (_token) t)))
+                     'late-request)))
           (qq-api--call-with-materialization-owner
            "group:20001" "action" nil
            (lambda (&rest _args) (push 'success calls))
            (lambda (&rest _args) (push 'error calls)))
           (should (qq-api-cancel-request 'late-request))
-          ;; An alternate transport may still deliver stale closures after it
-          ;; reported cancellation.  API ownership rejects both outcomes.
+          ;; A stale adapter closure may still run after cancellation.  Local
+          ;; API ownership rejects both outcomes.
           (funcall success-callback '((status . "ok")))
           (funcall error-callback nil "late failure")
           (should-not calls)
@@ -2314,19 +2261,15 @@ The authoritative post-state reports UNREAD-COUNT."
 
 (ert-deftest qq-api-directory-snapshot-cancel-cleans-orphaned-active-request ()
   (let ((qq-api--snapshot-active (make-hash-table :test #'eq))
-        (qq-api--snapshot-queued (make-hash-table :test #'eq))
-        cancelled)
+        (qq-api--snapshot-queued (make-hash-table :test #'eq)))
     (cl-letf (((symbol-function 'qq-api-call)
-               (lambda (&rest _args) "wire-request"))
-              ((symbol-function 'qq-transport-cancel)
-               (lambda (token) (setq cancelled token))))
+               (lambda (&rest _args) "unported-request")))
       (let ((active (qq-api-refresh-friend-categories #'ignore))
             queued)
         (setq queued (qq-api-refresh-friend-categories #'ignore))
         (qq-api-cancel-request active)
         (should (gethash 'friend-categories qq-api--snapshot-active))
         (qq-api-cancel-request queued)
-        (should (equal cancelled "wire-request"))
         (should-not (gethash 'friend-categories qq-api--snapshot-active))
         (should-not (gethash 'friend-categories qq-api--snapshot-queued))))))
 
