@@ -27,6 +27,9 @@
   create-p
   label
   label-read-p
+  login-accounts-loaded-p
+  login-accounts
+  quick-login-uin
   in-flight-p
   prompting-p
   retry-failed-p
@@ -158,20 +161,23 @@
       (qq-login--present session "Managed account created." nil)
       (qq-login--schedule session))))
 
-(defun qq-login--request (session starter &optional success)
+(defun qq-login--request (session starter &optional success failure)
   "Run asynchronous lifecycle STARTER for SESSION.
 
-SUCCESS defaults to `qq-login--request-success'."
+SUCCESS defaults to `qq-login--request-success'.  FAILURE defaults to
+`qq-login--request-error'."
   (setf (qq-login--session-in-flight-p session) t)
   (qq-login--changed)
   (condition-case error-data
       (funcall starter
                (apply-partially
                 (or success #'qq-login--request-success) session)
-               (apply-partially #'qq-login--request-error session))
+               (apply-partially
+                (or failure #'qq-login--request-error) session))
     (error
      (setf (qq-login--session-in-flight-p session) nil)
-     (qq-login--request-error
+     (funcall
+      (or failure #'qq-login--request-error)
       session nil
       (format "could not start native request: %s"
               (error-message-string error-data))))))
@@ -180,6 +186,138 @@ SUCCESS defaults to `qq-login--request-success'."
   "Read an optional label for a newly managed account."
   (let ((label (string-trim (read-string "Account label (optional): "))))
     (and (not (string-empty-p label)) label)))
+
+(defun qq-login--quick-login-available-p ()
+  "Return non-nil when the Gateway exposes the complete EasyLogin API."
+  (and (qq-gateway--method-available-p "account.login.list")
+       (qq-gateway--method-available-p "account.login.quick")))
+
+(defun qq-login--in-progress-account ()
+  "Return the selected account when its lifecycle should be continued."
+  (when-let* ((account (qq-gateway-current-account)))
+    (and (member (alist-get 'phase account)
+                 '("online" "starting" "logging_in" "stopping"))
+         account)))
+
+(defun qq-login--quick-account-list-success (session accounts)
+  "Install EasyLogin ACCOUNTS for current SESSION and schedule its chooser."
+  (when (qq-login--current-p session)
+    (setf (qq-login--session-in-flight-p session) nil
+          (qq-login--session-login-accounts-loaded-p session) t
+          (qq-login--session-login-accounts session)
+          (copy-tree accounts))
+    (qq-login--present session "Choose a QQ account to log in." nil)
+    (qq-login--schedule session)))
+
+(defun qq-login--request-quick-accounts (session)
+  "Request completion-safe EasyLogin identities for SESSION."
+  (qq-login--present session "Loading quick-login accounts…" nil)
+  (qq-login--request
+   session
+   (lambda (success failure)
+     (qq-gateway-account-login-list success failure))
+   #'qq-login--quick-account-list-success))
+
+(defun qq-login--quick-account-label (account)
+  "Return the completion label for EasyLogin ACCOUNT."
+  (format "%s — Quick login" (alist-get 'uin account)))
+
+(defun qq-login--matching-managed-account (quick-account)
+  "Return a managed slot already bound to QUICK-ACCOUNT, or nil."
+  (let* ((uin (alist-get 'uin quick-account))
+         (uid (alist-get 'uid quick-account))
+         (current (qq-gateway-current-account))
+         (accounts (qq-gateway-accounts))
+         (bound
+          (cl-remove-if-not
+           (lambda (account)
+             (equal (alist-get 'uin account) uin))
+           accounts)))
+    (dolist (account bound)
+      (when (and (alist-get 'uid account)
+                 (not (equal (alist-get 'uid account) uid)))
+        (error "qq: stored quick-login identity contradicts managed UIN %s"
+               uin)))
+    (or
+     (and current
+          (equal (alist-get 'uin current) uin)
+          current)
+     (car bound)
+     ;; An explicitly selected unbound slot is safe to bind.  This matters
+     ;; after `account.start' has already brought it to `login_required'.
+     (and current
+          (null (alist-get 'uin current))
+          (null (alist-get 'uid current))
+          current))))
+
+(defun qq-login--read-account-choice (session)
+  "Read and install one EasyLogin or new-account choice for SESSION."
+  (let* ((quick-accounts (qq-login--session-login-accounts session))
+         (choices
+          (append
+           (mapcar
+            (lambda (account)
+              (cons (qq-login--quick-account-label account)
+                    (cons 'quick account)))
+            quick-accounts)
+           '(("New account" . (new)))))
+         choice)
+    (setf (qq-login--session-prompting-p session) t)
+    (unwind-protect
+        (setq choice
+              (cdr
+               (assoc
+                (completing-read "QQ login: " choices nil t)
+                choices)))
+      (when (qq-login--session-p session)
+        (setf (qq-login--session-prompting-p session) nil)))
+    (pcase choice
+      (`(quick . ,account)
+       (let ((managed (qq-login--matching-managed-account account)))
+         (setf (qq-login--session-quick-login-uin session)
+               (copy-sequence (alist-get 'uin account))
+               (qq-login--session-account-id session)
+               (and managed
+                    (copy-sequence (alist-get 'account_id managed)))
+               (qq-login--session-create-p session) (null managed)
+               ;; A quick-login identity already provides the useful label.
+               (qq-login--session-label session) nil
+               (qq-login--session-label-read-p session) t)
+         (when managed
+           (qq-gateway--set-current-account
+            (alist-get 'account_id managed)))))
+      (`(new)
+       (setf (qq-login--session-account-id session) nil
+             (qq-login--session-create-p session) t
+             (qq-login--session-label session) nil
+             (qq-login--session-label-read-p session) nil
+             (qq-login--session-quick-login-uin session) nil))
+      (_ (error "qq: invalid login account choice")))
+    t))
+
+(defun qq-login--resolve-account-choice (session)
+  "Resolve SESSION's account source before driving its lifecycle.
+
+Return non-nil once SESSION names a managed slot or requests creation.  A nil
+return means the asynchronous EasyLogin identity request is still pending."
+  (let ((in-progress (qq-login--in-progress-account)))
+    (cond
+     ((or (qq-login--session-account-id session)
+          (qq-login--session-create-p session))
+      t)
+     (in-progress
+      (setf (qq-login--session-account-id session)
+            (copy-sequence (alist-get 'account_id in-progress)))
+      t)
+     ((not (qq-login--quick-login-available-p))
+      ;; Credential storage is optional.  Retain the account/password path
+      ;; when the Gateway deliberately omits EasyLogin capabilities.
+      t)
+     ((not (qq-login--session-login-accounts-loaded-p session))
+      (qq-login--request-quick-accounts session)
+      nil)
+     (t
+      (qq-login--read-account-choice session)))))
 
 (defun qq-login--ensure-account (session)
   "Resolve or create SESSION's account.
@@ -241,6 +379,29 @@ Return its current snapshot, or nil while account creation is in flight."
           (clear-string password)))
     (when (qq-login--session-p session)
       (setf (qq-login--session-prompting-p session) nil))))
+
+(defun qq-login--quick-error (session body reason)
+  "Pause SESSION after EasyLogin failure BODY described by REASON."
+  (when (qq-login--session-p session)
+    ;; Continuing the same session retries this stable managed slot through
+    ;; password login instead of repeatedly using a rejected stored record.
+    (setf (qq-login--session-quick-login-uin session) nil))
+  (qq-login--request-error session body reason))
+
+(defun qq-login--quick (session account)
+  "Begin EasyLogin for SESSION ACCOUNT using its selected stored identity."
+  (let ((uin (qq-login--session-quick-login-uin session)))
+    (unless uin
+      (error "qq: quick login has no selected UIN"))
+    (setf (qq-login--session-retry-failed-p session) nil)
+    (qq-login--present session (format "Quick logging in QQ %s…" uin) nil)
+    (qq-login--request
+     session
+     (lambda (success failure)
+       (qq-gateway-account-login-quick
+        (alist-get 'account_id account) uin nil success failure))
+     nil
+     #'qq-login--quick-error)))
 
 (defun qq-login--captcha (session account challenge)
   "Read CAPTCHA proof for SESSION ACCOUNT and CHALLENGE."
@@ -408,52 +569,55 @@ Return its current snapshot, or nil while account creation is in flight."
 
 (defun qq-login--drive-ready (session)
   "Progress SESSION while the Gateway is ready."
-  (when-let* ((account (qq-login--ensure-account session)))
-    (let ((phase (alist-get 'phase account))
-          (challenge (alist-get 'challenge account)))
-      (when (and (qq-login--session-qr-display session)
-                 (not (and (equal phase "logging_in")
-                           (equal (alist-get 'kind challenge)
-                                  "new_device"))))
-        (qq-login--clear-qr session)
-        (qq-login--changed))
-      (pcase phase
-        ((or "stopped" "logged_out" "failed")
-         (if (qq-login--session-retry-failed-p session)
-             (qq-login--start-account session account)
-           (let* ((problem (alist-get 'problem account))
-                  (code (alist-get 'code problem))
-                  (message-text (alist-get 'message problem)))
+  (when (qq-login--resolve-account-choice session)
+    (when-let* ((account (qq-login--ensure-account session)))
+      (let ((phase (alist-get 'phase account))
+            (challenge (alist-get 'challenge account)))
+        (when (and (qq-login--session-qr-display session)
+                   (not (and (equal phase "logging_in")
+                             (equal (alist-get 'kind challenge)
+                                    "new_device"))))
+          (qq-login--clear-qr session)
+          (qq-login--changed))
+        (pcase phase
+          ((or "stopped" "logged_out" "failed")
+           (if (qq-login--session-retry-failed-p session)
+               (qq-login--start-account session account)
+             (let* ((problem (alist-get 'problem account))
+                    (code (alist-get 'code problem))
+                    (message-text (alist-get 'message problem)))
+               (qq-login--present
+                session
+                "QQ login is not running."
+                (cond
+                 ((and code message-text)
+                  (format "[%s] %s" code message-text))
+                 (message-text message-text)
+                 (t "Run `M-x qq` again to retry."))))))
+          ("login_required"
+           (if (qq-login--session-quick-login-uin session)
+               (qq-login--quick session account)
+             (qq-login--password session account)))
+          ("logging_in"
+           (if challenge
+               (qq-login--challenge session account challenge)
              (qq-login--present
               session
-              "QQ login is not running."
-              (cond
-               ((and code message-text)
-                (format "[%s] %s" code message-text))
-               (message-text message-text)
-               (t "Run `M-x qq` again to retry."))))))
-        ("login_required"
-         (qq-login--password session account))
-        ("logging_in"
-         (if challenge
-             (qq-login--challenge session account challenge)
-           (qq-login--present
+              (if (qq-login--session-qr-display session)
+                  "Waiting for mobile QQ confirmation…"
+                "QQ login is continuing in the native service…")
+              nil)))
+          ("online"
+           (qq-login--finish
             session
-            (if (qq-login--session-qr-display session)
-                "Waiting for mobile QQ confirmation…"
-              "QQ login is continuing in the native service…")
-            nil)))
-        ("online"
-         (qq-login--finish
-          session
-          (format "qq: account %s is online"
-                  (or (alist-get 'uin account)
-                      (alist-get 'account_id account)))))
-        ("starting"
-         (qq-login--present session "Starting native QQ account…" nil))
-        ("stopping"
-         (qq-login--present session "Stopping native QQ account…" nil))
-        (_ (error "qq: unsupported account phase %S" phase))))))
+            (format "qq: account %s is online"
+                    (or (alist-get 'uin account)
+                        (alist-get 'account_id account)))))
+          ("starting"
+           (qq-login--present session "Starting native QQ account…" nil))
+          ("stopping"
+           (qq-login--present session "Stopping native QQ account…" nil))
+          (_ (error "qq: unsupported account phase %S" phase)))))))
 
 (defun qq-login--drive (session)
   "Progress current foreground authorization SESSION by one state."
@@ -506,6 +670,9 @@ the caller has already made the optional label choice, including choosing nil."
             :create-p create-p
             :label label
             :label-read-p label-read-p
+            :login-accounts-loaded-p nil
+            :login-accounts nil
+            :quick-login-uin nil
             :retry-failed-p t
             :status "Preparing QQ login…")))
       (setq qq-login--current session)
@@ -526,9 +693,10 @@ the caller has already made the optional label choice, including choosing nil."
 (defun qq-login (&optional account-id)
   "Log in or continue authorization for managed ACCOUNT-ID.
 
-When ACCOUNT-ID is nil, use the selected account, ask when selection is
-  ambiguous, or create the first managed account.  The command follows projected
-account phases until the account is online."
+When ACCOUNT-ID is nil, continue a running authorization or offer every
+Gateway EasyLogin identity together with `New account'.  The selected
+identity reuses a matching managed slot or creates one as needed.  The command
+then follows projected account phases until the account is online."
   (interactive)
   (qq-login--start account-id nil nil nil))
 

@@ -393,6 +393,49 @@ snapshot; ERRBACK receives a failure body and reason."
          :errback errback)
       (clear-string secret-copy))))
 
+(defun qq-gateway--project-quick-login-accounts (result)
+  "Validate RESULT and return its ordered EasyLogin account metadata."
+  (unless (and (qq-gateway--exact-object-keys-p result '(accounts))
+               (listp (alist-get 'accounts result)))
+    (error "qq: Gateway returned an invalid quick-login account list"))
+  (let ((seen-uins (make-hash-table :test #'equal))
+        accounts)
+    (dolist (account (alist-get 'accounts result))
+      (unless
+          (and
+           (qq-gateway--exact-object-keys-p
+            account '(uin uid generated_at_unix))
+           (qq-gateway--uint64-decimal-p (alist-get 'uin account))
+           (qq-gateway--non-empty-string-p (alist-get 'uid account))
+           (integerp (alist-get 'generated_at_unix account))
+           (>= (alist-get 'generated_at_unix account) 0))
+        (error "qq: Gateway returned invalid quick-login account metadata"))
+      (let ((uin (alist-get 'uin account)))
+        (when (gethash uin seen-uins)
+          (error "qq: Gateway returned duplicate quick-login UIN %s" uin))
+        (puthash uin t seen-uins))
+      (push (qq-gateway-value-copy account) accounts))
+    (nreverse accounts)))
+
+;;;###autoload
+(defun qq-gateway-account-login-list (&optional callback errback)
+  "List identities with reusable native EasyLogin credentials.
+
+CALLBACK receives ordered non-secret account metadata.  ERRBACK receives a
+failure body and reason.  The Gateway advertises this operation only when its
+encrypted credential store is available."
+  (interactive
+   (list (lambda (accounts)
+           (message "qq: %d quick-login account%s available"
+                    (length accounts)
+                    (if (= (length accounts) 1) "" "s")))
+         #'qq-gateway--interactive-error))
+  (qq-gateway-rpc-call
+   "account.login.list" nil
+   :projector #'qq-gateway--project-quick-login-accounts
+   :callback callback
+   :errback errback))
+
 ;;;###autoload
 (defun qq-gateway-account-login-password
     (account-id uin password &optional qimei callback errback)
@@ -421,6 +464,31 @@ reason."
      `((uin . ,uin) (password . ,secret)
        ,@(when qimei `((qimei . ,qimei)))))
    password callback errback))
+
+;;;###autoload
+(defun qq-gateway-account-login-quick
+    (account-id uin &optional qimei callback errback)
+  "Begin native EasyLogin for ACCOUNT-ID using the stored identity for UIN.
+
+QIMEI is optional.  CALLBACK receives the account snapshot; ERRBACK receives
+a failure body and reason.  No reusable credential material crosses the
+Gateway protocol."
+  (unless (qq-gateway--uint64-decimal-p uin)
+    (user-error "qq: UIN must be a canonical nonzero uint64 string"))
+  (unless (or (null qimei) (qq-gateway--non-empty-string-p qimei))
+    (user-error "qq: QIMEI must be a non-empty string or nil"))
+  (unless (qq-gateway--non-empty-string-p account-id)
+    (user-error "qq: Account ID must be a non-empty opaque string"))
+  (qq-gateway-rpc-call
+   "account.login.quick"
+   `((account_id . ,account-id)
+     (uin . ,uin)
+     ,@(when qimei `((qimei . ,qimei))))
+   :projector
+   (lambda (snapshot)
+     (qq-gateway--upsert-account snapshot 'response))
+   :callback callback
+   :errback errback))
 
 ;;;###autoload
 (defun qq-gateway-account-login-captcha
