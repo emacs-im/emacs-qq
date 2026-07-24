@@ -5436,6 +5436,9 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
          (qq-chat-load-older-messages t)
          (should (equal call '("80" . "99")))
          (should (equal qq-chat--gateway-history-start-sequence "80"))
+         ;; Extending the lower edge must retain the newer cursor.  Replacing
+         ;; both edges here made a following forward page restart at 100.
+         (should (equal qq-chat--gateway-history-end-sequence "119"))
          (should (equal (appkit-chat-history-window-first-key) current-id))
          (should-not (appkit-chat-history-older-loaded-p)))))))
 
@@ -5482,9 +5485,66 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                  ((symbol-function 'qq-chat--ensure-view) #'ignore))
          (qq-chat-load-newer-messages t)
          (should (equal call '("101" . "105")))
+         ;; Extending the upper edge must retain the older cursor.  Replacing
+         ;; both edges here made a following backward page overlap 81..100.
+         (should (equal qq-chat--gateway-history-start-sequence "81"))
          (should (equal qq-chat--gateway-history-end-sequence "105"))
          (should-not (appkit-chat-history-window-last-key))
          (should (equal qq-chat--remote-latest-id latest-id)))))))
+
+(ert-deftest qq-chat-private-sequence-window-pages-newer-via-c2c-range ()
+  "Private forward paging uses SsoGetC2cMsg sequence ranges, not roam cursors."
+  (qq-chat-test-with-reset
+   (let* ((session-key "private:10001")
+          (current-id "7348923749823749900")
+          (latest-id "7348923749823749905")
+          (roam-cursor '((timestamp . 1784700000) (random . 7)))
+          call)
+     (qq-state-upsert-session
+      session-key '((type . private) (target-id . "10001")) nil)
+     (puthash
+      session-key
+      (list (qq-chat-test--gateway-message
+             session-key current-id "100" 100))
+      qq-state--messages-by-session)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key session-key
+             qq-chat--gateway-history-start-sequence "81"
+             qq-chat--gateway-history-end-sequence "100"
+             qq-chat--gateway-private-history-cursor (copy-tree roam-cursor))
+       (qq-chat--set-history-window current-id current-id)
+       (cl-letf (((symbol-function 'qq-core-history-frontier)
+                  (lambda (_session-key)
+                    `(:sequence "105"
+                      :message-id ,latest-id :source live-event)))
+                 ((symbol-function 'qq-core-fetch-history-range)
+                  (lambda (_session start end callback &optional _errback _props)
+                    (setq call (cons start end))
+                    (puthash
+                     session-key
+                     (list (qq-chat-test--gateway-message
+                            session-key current-id "100" 100)
+                           (qq-chat-test--gateway-message
+                            session-key latest-id "105" 105))
+                     qq-state--messages-by-session)
+                    (funcall
+                     callback
+                     `(:requested-start-sequence ,start
+                       :requested-end-sequence ,end
+                       :batch-message-ids (,latest-id)
+                       :message-count 1 :added-count 1))
+                    nil))
+                 ((symbol-function 'qq-core-fetch-private-history-page)
+                  (lambda (&rest _args)
+                    (ert-fail "forward paging must not use SsoGetRoamMsg")))
+                 ((symbol-function 'qq-chat--ensure-view) #'ignore))
+         (qq-chat-load-newer-messages t)
+         (should (equal call '("101" . "105")))
+         (should (equal qq-chat--gateway-history-start-sequence "81"))
+         (should (equal qq-chat--gateway-history-end-sequence "105"))
+         (should (equal qq-chat--gateway-private-history-cursor roam-cursor))
+         (should-not (appkit-chat-history-window-last-key)))))))
 
 
 

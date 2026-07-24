@@ -263,15 +263,33 @@ latest edge; otherwise it is the exact cursor used to fetch newer history."
   "Return non-nil after this buffer established an exact history window."
   (appkit-chat-history-window-known-p))
 
-(defun qq-chat--record-gateway-history-range (meta)
-  "Record exact native sequence or private cursor coverage in META."
+(defun qq-chat--record-gateway-history-range (meta &optional direction)
+  "Record exact native history coverage in META for DIRECTION.
+
+DIRECTION defaults to `replace' for initial, around, and seek requests which
+establish a new contiguous sequence window.  `older' extends only the lower
+sequence edge; `newer' extends only the upper edge; `private-older' advances
+only the backwards roaming cursor.
+
+Never replace both sequence edges after a directional page.  Doing so loses
+the opposite edge: loading one older page used to discard the known newer
+cursor, and the next forward request would repeat or skip the wrong range."
   (let ((start (plist-get meta :requested-start-sequence))
         (end (plist-get meta :requested-end-sequence))
         (private-cursor (plist-get meta :response-private-cursor)))
     (when (and start end)
-      (setq qq-chat--gateway-history-start-sequence start
-            qq-chat--gateway-history-end-sequence end
-            qq-chat--gateway-history-awaiting-frontier-p nil))
+      (pcase (or direction 'replace)
+        ('replace
+         (setq qq-chat--gateway-history-start-sequence start
+               qq-chat--gateway-history-end-sequence end))
+        ('older
+         (setq qq-chat--gateway-history-start-sequence start))
+        ('newer
+         (setq qq-chat--gateway-history-end-sequence end))
+        ('private-older nil)
+        (value
+         (error "qq: Unknown native history direction %S" value)))
+      (setq qq-chat--gateway-history-awaiting-frontier-p nil))
     (when private-cursor
       (setq qq-chat--gateway-private-history-cursor
             (copy-tree private-cursor)
@@ -5301,7 +5319,7 @@ batch is authoritative latest history."
                (when (and (equal qq-chat--session-key session-key)
                           (appkit-chat-history-request-current-p owner))
                  (appkit-chat-history-request-end owner)
-                 (qq-chat--record-gateway-history-range meta)
+                 (qq-chat--record-gateway-history-range meta 'newer)
                  (let* ((bounds (qq-chat--history-batch-bounds meta))
                         (newest (cdr bounds))
                         (added (or (plist-get meta :added-count) 0))
@@ -5552,7 +5570,7 @@ than jumping across an unfilled cached gap."
            (when (and (equal qq-chat--session-key session-key)
                       (appkit-chat-history-request-current-p owner))
              (appkit-chat-history-request-end owner)
-             (qq-chat--record-gateway-history-range meta)
+             (qq-chat--record-gateway-history-range meta 'private-older)
              (let* ((bounds (qq-chat--history-batch-bounds meta))
                     (oldest (car bounds))
                     (added (or (plist-get meta :added-count) 0))
@@ -5605,7 +5623,7 @@ than jumping across an unfilled cached gap."
                (when (and (equal qq-chat--session-key session-key)
                           (appkit-chat-history-request-current-p owner))
                  (appkit-chat-history-request-end owner)
-                 (qq-chat--record-gateway-history-range meta)
+                 (qq-chat--record-gateway-history-range meta 'older)
                  (let* ((bounds (qq-chat--history-batch-bounds meta))
                         (oldest (car bounds))
                         (added (or (plist-get meta :added-count) 0))
