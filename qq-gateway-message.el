@@ -905,8 +905,13 @@ Return a list of `(NATIVE-MESSAGE . NORMALIZED-MESSAGE)' pairs."
        (setq qq-state--message-order-counter initial-order)
        (signal (car error-data) (cdr error-data))))))
 
-(defun qq-gateway-message--merge-history (session-key result owner)
-  "Merge native history RESULT into SESSION-KEY for OWNER."
+(defun qq-gateway-message--merge-history
+    (session-key result owner &optional properties)
+  "Merge native history RESULT into SESSION-KEY for OWNER.
+
+Optional PROPERTIES are prefixed to the returned and emitted metadata.  This
+lets private roaming history retain its time/random continuation cursor
+without pretending that it covered a sequence range."
   (let ((rows (qq-gateway-message--normalize-history
                result owner session-key))
         (known-ids (make-hash-table :test #'equal))
@@ -936,7 +941,9 @@ Return a list of `(NATIVE-MESSAGE . NORMALIZED-MESSAGE)' pairs."
     (setq batch-ids (delete-dups (nreverse batch-ids)))
     (let* ((oldest (qq-state-session-oldest-message-id session-key))
            (meta
-            (list
+            (append
+             properties
+             (list
              :session-key session-key
              :account-id owner
              :message-count (length rows)
@@ -954,7 +961,7 @@ Return a list of `(NATIVE-MESSAGE . NORMALIZED-MESSAGE)' pairs."
              :response-end-sequence
              (alist-get 'response_end_sequence result)
              :unsupported-message-count
-             (alist-get 'unsupported_message_count result))))
+             (alist-get 'unsupported_message_count result)))))
       (apply #'qq-state--emit 'history
              :mutation 'history :source 'response meta)
       meta)))
@@ -1002,6 +1009,93 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
      :projector
      (lambda (result)
        (qq-gateway-message--merge-history session-key result owner))
+     :callback callback
+     :errback errback)))
+
+(defun qq-gateway-message--private-history-cursor (cursor context)
+  "Return a closed copy of private history CURSOR for CONTEXT."
+  (unless
+      (and (qq-gateway--exact-object-keys-p cursor '(timestamp random))
+           (seq-every-p
+            (lambda (field)
+              (let ((value (alist-get field cursor)))
+                (and (integerp value)
+                     (<= 0 value 4294967295))))
+            '(timestamp random)))
+    (error "qq: %s must contain uint32 timestamp and random fields" context))
+  `((timestamp . ,(alist-get 'timestamp cursor))
+    (random . ,(alist-get 'random cursor))))
+
+(defun qq-gateway-message--merge-private-history
+    (session-key result owner requested-cursor)
+  "Validate and merge private roaming history RESULT.
+
+REQUESTED-CURSOR is nil for the server-clock bootstrap request."
+  (unless
+      (and
+       (qq-gateway--exact-object-keys-p
+        result
+        '(account_id requested_cursor response_cursor complete
+          unsupported_message_count messages))
+       (equal (alist-get 'account_id result) owner)
+       (memq (alist-get 'complete result) '(t :false))
+       (integerp (alist-get 'unsupported_message_count result))
+       (>= (alist-get 'unsupported_message_count result) 0)
+       (listp (alist-get 'messages result)))
+    (error "qq: Gateway returned an invalid private history page"))
+  (let* ((requested
+          (qq-gateway-message--private-history-cursor
+           (alist-get 'requested_cursor result)
+           "Gateway private history requested cursor"))
+         (response
+          (qq-gateway-message--private-history-cursor
+           (alist-get 'response_cursor result)
+           "Gateway private history response cursor"))
+         (complete (eq (alist-get 'complete result) t))
+         (messages (alist-get 'messages result)))
+    (when (and requested-cursor
+               (not (equal requested requested-cursor)))
+      (error "qq: Gateway private history echoed another request cursor"))
+    (when (and (not complete)
+               (null messages)
+               (equal requested response))
+      (error "qq: Gateway private history cursor did not advance"))
+    (qq-gateway-message--merge-history
+     session-key result owner
+     (list :private-history-p t
+           :requested-private-cursor requested
+           :response-private-cursor response
+           :history-at-oldest-p complete))))
+
+(defun qq-gateway-message-get-private-history
+    (session-key cursor &optional callback errback limit)
+  "Fetch one backwards private roaming page for SESSION-KEY.
+
+CURSOR is nil for the server-clock bootstrap request.  Otherwise it is the
+exact `response_cursor' returned by the previous page.  CALLBACK receives
+merge metadata containing `:response-private-cursor' and
+`:history-at-oldest-p'."
+  (unless (eq (qq-state-session-key-type session-key) 'private)
+    (user-error "qq: Private roaming history requires a private session"))
+  (setq limit (or limit qq-history-fetch-count))
+  (qq-gateway-message--validate-history-count limit)
+  (when cursor
+    (setq cursor
+          (qq-gateway-message--private-history-cursor
+           cursor "Private history cursor")))
+  (let* ((conversation (qq-gateway-message--conversation-params session-key))
+         (owner (or (qq-gateway-current-account-id)
+                    (user-error "qq: Select a QQ account first"))))
+    (qq-gateway-message--ensure-projection-owner owner)
+    (qq-gateway-message--call
+     "message.get_private_history" owner
+     `((conversation . ,conversation)
+       ,@(when cursor `((cursor . ,cursor)))
+       (limit . ,limit))
+     :projector
+     (lambda (result)
+       (qq-gateway-message--merge-private-history
+        session-key result owner cursor))
      :callback callback
      :errback errback)))
 

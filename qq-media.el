@@ -16,7 +16,9 @@
 (require 'appkit-media)
 (require 'qq-api)
 (require 'qq-customize)
+(require 'qq-gateway-directory)
 (require 'qq-gateway-media)
+(require 'qq-gateway-transport)
 (require 'qq-state)
 
 (defvar qq-media-animated-face-image-height)
@@ -1644,27 +1646,46 @@ OWNER lifecycle-owns an external player when the primary segment is a video."
 (defun qq-media--native-user-avatar-resource (user-id)
   "Return an authoritative cached avatar resource for USER-ID, or nil.
 
-Native message snapshots may carry an avatar URL.  Until the native service
-adds a dedicated avatar operation, never synthesize a URL or fall back to the
-removed OneBot request."
-  (catch 'resource
-    (dolist (session (qq-state-sessions))
-      (dolist (message (qq-state-session-messages (alist-get 'key session)))
-        (when (and (equal (format "%s" (or (alist-get 'sender-id message) ""))
-                          (format "%s" user-id))
-                   (appkit-media-url-present-p
-                    (alist-get 'sender-avatar-url message)))
-          (throw 'resource
-                 `((url . ,(alist-get 'sender-avatar-url message)))))))
-    nil))
+The native friend directory is preferred.  Message snapshots remain a useful
+fallback for identities observed outside that directory."
+  (or
+   (when-let* ((friend (qq-state-friend user-id))
+               (url (alist-get 'avatar_url friend))
+               ((appkit-media-url-present-p url)))
+     `((url . ,url)))
+   (catch 'resource
+     (dolist (session (qq-state-sessions))
+       (dolist (message (qq-state-session-messages (alist-get 'key session)))
+         (when (and (equal (format "%s" (or (alist-get 'sender-id message) ""))
+                           (format "%s" user-id))
+                    (appkit-media-url-present-p
+                     (alist-get 'sender-avatar-url message)))
+           (throw 'resource
+                  `((url . ,(alist-get 'sender-avatar-url message)))))))
+     nil)))
+
+(defun qq-media--fetch-native-user-avatar (user-id done error)
+  "Resolve USER-ID avatar and call DONE or ERROR."
+  (if-let* ((resource (qq-media--native-user-avatar-resource user-id)))
+      (funcall done resource)
+    (if (and (qq-gateway-current-account-id)
+             (member "contact.get_user_avatar"
+                     (qq-gateway-transport-capabilities)))
+        (qq-gateway-directory-get-user-avatar user-id done error)
+      (funcall error nil "native avatar locator is unavailable"))))
 
 (defun qq-media-open-user-avatar (user-id)
   "Open avatar for USER-ID."
   (unless user-id
     (user-error "qq: missing user id for avatar"))
-  (if-let* ((resource (qq-media--native-user-avatar-resource user-id)))
-      (qq-media-open-resource resource 'image (format "avatar:%s" user-id))
-    (user-error "qq: no native avatar resource is available for %s" user-id)))
+  (let ((key (format "avatar:%s" user-id)))
+    (qq-media--resolve-resource
+     key
+     (lambda (done)
+       (qq-media--fetch-native-user-avatar
+        user-id done #'qq-api--default-error))
+     (lambda (resource)
+       (qq-media-open-resource resource 'image key)))))
 
 (defun qq-media-open-group-avatar (group-id)
   "Open group avatar for GROUP-ID."
@@ -1804,12 +1825,11 @@ retain their native member cache identity and its existing URL handling."
 (defun qq-media-avatar-image (user-id)
   "Return inline avatar image for USER-ID, triggering fetch when needed."
   (let ((key (format "avatar:%s" user-id)))
-    (or (qq-media--cached-image key)
-        (when-let* ((resource (qq-media--native-user-avatar-resource user-id)))
-          (qq-media--ensure-resource-image
-           key
-           (lambda (done _error) (funcall done resource))
-           qq-media-avatar-image-height)))))
+    (qq-media--ensure-resource-image
+     key
+     (lambda (done error)
+       (qq-media--fetch-native-user-avatar user-id done error))
+     qq-media-avatar-image-height)))
 
 (defun qq-media-avatar-display-string (user-id)
   "Return inline display string for USER-ID avatar.
