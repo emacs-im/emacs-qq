@@ -43,6 +43,7 @@
          :create-p create-p
          :label label
          :label-read-p label-read-p
+         :managed-accounts-loaded-p t
          :login-accounts-loaded-p nil
          :login-accounts nil
          :quick-login-uin nil
@@ -97,6 +98,41 @@
       (should-not (qq-login--session-create-p session))
       (should (equal (qq-account-current-id) "slot-b")))))
 
+(ert-deftest qq-login-refreshes-managed-accounts-before-opening-chooser ()
+  (qq-login-test-with-state
+    (let ((session (qq-login-test-session))
+          choices
+          refresh-reason)
+      (setf (qq-login--session-managed-accounts-loaded-p session) nil)
+      (cl-letf (((symbol-function 'qq-account-refresh-accounts)
+                 (lambda (success _failure reason)
+                   (setq refresh-reason reason)
+                   (let ((accounts
+                          (list
+                           (qq-login-test-account
+                            "slot-remote" "online" "10001"))))
+                     (qq-account--replace-accounts
+                      accounts 'login "gateway-test")
+                     (funcall success accounts))
+                   "managed-list-request"))
+                ((symbol-function 'qq-rpc-method-available-p)
+                 (lambda (_method) nil))
+                ((symbol-function 'qq-login--schedule) #'ignore)
+                ((symbol-function 'completing-read)
+                 (lambda (_prompt collection &rest _arguments)
+                   (setq choices collection)
+                   "10001 — Online")))
+        (should-not (qq-login--resolve-account-choice session))
+        (should
+         (qq-login--session-managed-accounts-loaded-p session))
+        (should (eq refresh-reason 'login))
+        (should (qq-login--resolve-account-choice session)))
+      (should
+       (equal (mapcar #'car choices)
+              '("10001 — Online" "New account")))
+      (should
+       (equal (qq-login--session-account-id session) "slot-remote")))))
+
 (ert-deftest qq-login-new-account-is-a-choice-alongside-easylogin ()
   (qq-login-test-with-state
     (let ((session (qq-login-test-session)))
@@ -115,6 +151,103 @@
       (should-not (qq-login--session-account-id session))
       (should-not (qq-login--session-quick-login-uin session))
       (should-not (qq-login--session-label-read-p session)))))
+
+(ert-deftest qq-login-chooser-does-not-depend-on-easylogin-capabilities ()
+  (qq-login-test-with-state
+    (qq-account--replace-accounts
+     (list
+      (qq-login-test-account "slot-online" "online" "10001")
+      (qq-login-test-account "slot-login" "logging_in"))
+     'test "gateway-test")
+    (let ((session (qq-login-test-session))
+          choices)
+      (cl-letf (((symbol-function 'qq-rpc-method-available-p)
+                 (lambda (_method) nil))
+                ((symbol-function 'qq-account-login-list)
+                 (lambda (&rest _arguments)
+                   (ert-fail "unadvertised EasyLogin list was requested")))
+                ((symbol-function 'completing-read)
+                 (lambda (_prompt collection &rest _arguments)
+                   (setq choices collection)
+                   "10001 — Online")))
+        (should (qq-login--resolve-account-choice session)))
+      (should
+       (equal (mapcar #'car choices)
+              '("10001 — Online"
+                "Unbound account — Logging In"
+                "New account")))
+      (should
+       (qq-login--session-login-accounts-loaded-p session))
+      (should-not (qq-login--session-login-accounts session))
+      (should
+       (equal (qq-login--session-account-id session) "slot-online"))
+      (should (equal (qq-account-current-id) "slot-online")))))
+
+(ert-deftest qq-login-empty-registry-still-opens-new-account-chooser ()
+  (qq-login-test-with-state
+    (let ((session (qq-login-test-session))
+          choices)
+      (cl-letf (((symbol-function 'qq-rpc-method-available-p)
+                 (lambda (_method) nil))
+                ((symbol-function 'completing-read)
+                 (lambda (_prompt collection &rest _arguments)
+                   (setq choices collection)
+                   "New account")))
+        (should (qq-login--resolve-account-choice session)))
+      (should (equal (mapcar #'car choices) '("New account")))
+      (should (qq-login--session-create-p session))
+      ;; The label belongs to the explicitly selected new-account branch.  It
+      ;; must never replace the account selector itself.
+      (should-not (qq-login--session-label-read-p session)))))
+
+(ert-deftest qq-login-chooser-disambiguates-duplicate-managed-labels ()
+  (qq-login-test-with-state
+    (qq-account--replace-accounts
+     (list
+      (qq-login-test-account "slot-a" "stopped")
+      (qq-login-test-account "slot-b" "stopped"))
+     'test "gateway-test")
+    (let ((session (qq-login-test-session))
+          choices)
+      (setf (qq-login--session-login-accounts-loaded-p session) t)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt collection &rest _arguments)
+                   (setq choices collection)
+                   "Unbound account — Stopped [slot-b]")))
+        (should (qq-login--resolve-account-choice session)))
+      (should
+       (equal (mapcar #'car choices)
+              '("Unbound account — Stopped [slot-a]"
+                "Unbound account — Stopped [slot-b]"
+                "New account")))
+      (should
+       (equal (qq-login--session-account-id session) "slot-b")))))
+
+(ert-deftest qq-login-easylogin-list-failure-falls-back-to-account-chooser ()
+  (qq-login-test-with-state
+    (qq-account--upsert-account
+     (qq-login-test-account "slot-a" "stopped" "10001") 'test)
+    (let ((session (qq-login-test-session))
+          scheduled)
+      (cl-letf (((symbol-function 'qq-rpc-method-available-p)
+                 (lambda (_method) t))
+                ((symbol-function 'qq-account-login-list)
+                 (lambda (_success failure)
+                   (funcall failure
+                            '((code . "credential_store_failed"))
+                            "credential catalog unavailable")
+                   "quick-list-request"))
+                ((symbol-function 'qq-login--schedule)
+                 (lambda (_session) (setq scheduled t))))
+        (should-not (qq-login--resolve-account-choice session)))
+      (should scheduled)
+      (should
+       (qq-login--session-login-accounts-loaded-p session))
+      (should-not (qq-login--session-login-accounts session))
+      (should-not (qq-login--session-in-flight-p session))
+      (should
+       (equal (qq-login--session-status session)
+              "Choose a QQ account.")))))
 
 (ert-deftest qq-login-quick-choice-creates-an-unlabeled-slot-when-needed ()
   (qq-login-test-with-state
@@ -183,15 +316,21 @@
       (should
        (equal (qq-account-current-id) "slot-bound")))))
 
-(ert-deftest qq-login-continues-active-runtime-before-opening-chooser ()
+(ert-deftest qq-login-active-runtime-remains-an-explicit-chooser-entry ()
   (qq-login-test-with-state
     (qq-account--upsert-account
      (qq-login-test-account "slot-a" "logging_in" "10001") 'test)
-    (let ((session (qq-login-test-session)))
-      (cl-letf (((symbol-function 'qq-account-login-list)
-                 (lambda (&rest _arguments)
-                   (ert-fail "active login opened the account chooser"))))
+    (let ((session (qq-login-test-session))
+          choices)
+      (setf (qq-login--session-login-accounts-loaded-p session) t)
+      (cl-letf (((symbol-function 'completing-read)
+                (lambda (_prompt collection &rest _arguments)
+                   (setq choices collection)
+                   "10001 — Logging In")))
         (should (qq-login--resolve-account-choice session)))
+      (should
+       (equal (mapcar #'car choices)
+              '("10001 — Logging In" "New account")))
       (should
        (equal (qq-login--session-account-id session) "slot-a")))))
 
@@ -464,7 +603,7 @@
       (should-not (qq-login--session-active-p session))
       (should-not qq-login--current))))
 
-(ert-deftest qq-login-does-not-project-a-login-view-for-an-online-account ()
+(ert-deftest qq-login-explicit-online-account-does-not-project-login-view ()
   (qq-login-test-with-state
     (qq-account--upsert-account
      (qq-login-test-account "slot-a" "online" "10001") 'test)
@@ -476,9 +615,26 @@
               ((symbol-function 'qq-login--changed)
                (lambda ()
                  (ert-fail "online account projected a login view"))))
-      (should-not (qq-login)))
+      (should-not (qq-login "slot-a")))
     (should-not (qq-login-active-p))
     (should-not qq-login--current)))
+
+(ert-deftest qq-login-generic-entry-selects-even-the-current-online-account ()
+  (qq-login-test-with-state
+    (qq-account--upsert-account
+     (qq-login-test-account "slot-a" "online" "10001") 'test)
+    (let (scheduled)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-core-running-p)
+                 (lambda () t))
+                ((symbol-function 'qq-login--schedule)
+                 (lambda (_session) (setq scheduled t))))
+        (let ((session (qq-login)))
+          (should (qq-login--session-p session))
+          (should (qq-login--session-active-p session))
+          (should-not (qq-login--session-account-id session))))
+      (should scheduled))))
 
 (provide 'qq-login-test)
 
