@@ -94,6 +94,22 @@
         (should (eq (oref suffix inapt-if)
                     'qq-transient--presence-inapt-p))))))
 
+(ert-deftest qq-transient-root-exposes-managed-account-switch ()
+  (cl-letf (((symbol-function 'qq-connect)
+             (lambda () (interactive)))
+            ((symbol-function 'qq-disconnect)
+             (lambda () (interactive)))
+            ((symbol-function 'qq-reset-session-state)
+             (lambda () (interactive))))
+    (let* ((objects (transient-suffixes 'qq-root-transient))
+           (account-switch
+            (seq-find
+             (lambda (suffix) (equal (oref suffix key) "A"))
+             objects)))
+      (should account-switch)
+      (should
+       (eq (oref account-switch command) 'qq-gateway-account-select)))))
+
 (ert-deftest qq-transient-message-prefix-exposes-essence-toggle ()
   (let* ((objects (transient-suffixes 'qq-chat-message-transient))
          (essence

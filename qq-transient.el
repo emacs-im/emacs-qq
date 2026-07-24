@@ -455,6 +455,7 @@ Prefer this over inline button rows."
    ["Connection"
     ("l" "Login / continue" qq-login)
     ("n" "Login new account" qq-login-new-account)
+    ("A" "Switch account…" qq-gateway-account-select)
     ("c" "Connect" qq-connect)
     ("C" "Disconnect" qq-disconnect)
     ("p" "Presence…" qq-presence-transient

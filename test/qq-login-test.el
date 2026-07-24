@@ -195,6 +195,40 @@
       (should
        (equal (qq-login--session-account-id session) "slot-a")))))
 
+(ert-deftest qq-login-chooser-shows-unselected-online-account-as-online ()
+  (qq-login-test-with-state
+    (qq-gateway--replace-accounts
+     (list
+      (qq-login-test-account "slot-online" "online" "10001")
+      (qq-login-test-account "slot-stopped" "stopped" "10002"))
+     'test "gateway-test")
+    (let ((session (qq-login-test-session))
+          choices)
+      (setf
+       (qq-login--session-login-accounts-loaded-p session) t
+       (qq-login--session-login-accounts session)
+       (list
+        (qq-login-test-quick-account "10001" "uid-1" 1784700001)
+        (qq-login-test-quick-account "10002" "uid-2" 1784700000)))
+      (cl-letf (((symbol-function 'qq-gateway--method-available-p)
+                 (lambda (_method) t))
+                ((symbol-function 'completing-read)
+                 (lambda (_prompt collection &rest _arguments)
+                   (setq choices collection)
+                   "10001 — Online")))
+        (should (qq-login--resolve-account-choice session)))
+      (should
+       (equal (mapcar #'car choices)
+              '("10001 — Online"
+                "10002 — Quick login"
+                "New account")))
+      (should
+       (equal (qq-login--session-account-id session) "slot-online"))
+      (should-not (qq-login--session-quick-login-uin session))
+      (should-not (qq-login--session-create-p session))
+      (should
+       (equal (qq-gateway-current-account-id) "slot-online")))))
+
 (ert-deftest qq-login-starts-a-stopped-account ()
   (qq-login-test-with-state
     (qq-gateway--upsert-account
@@ -429,6 +463,22 @@
         (qq-login--drive session))
       (should-not (qq-login--session-active-p session))
       (should-not qq-login--current))))
+
+(ert-deftest qq-login-does-not-project-a-login-view-for-an-online-account ()
+  (qq-login-test-with-state
+    (qq-gateway--upsert-account
+     (qq-login-test-account "slot-a" "online" "10001") 'test)
+    (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
+               (lambda () t))
+              ((symbol-function 'qq-native-connect)
+               (lambda ()
+                 (ert-fail "online account reconnected the Gateway")))
+              ((symbol-function 'qq-login--changed)
+               (lambda ()
+                 (ert-fail "online account projected a login view"))))
+      (should-not (qq-login)))
+    (should-not (qq-login-active-p))
+    (should-not qq-login--current)))
 
 (provide 'qq-login-test)
 
