@@ -354,6 +354,22 @@
       "group:8209413637" "slot-a")
      :type 'user-error)))
 
+(ert-deftest qq-attachment-sendable-accepts-numeric-or-reordered-conversation ()
+  "Conversation identity is kind + target id, never raw alist ordering or JSON number/string kind."
+  (qq-attachment-test-with-state
+    ;; Snapshot projected with a JSON number group_uin and reversed key order:
+    ;; raw alist `equal' would fail, but kind + target-id must still match.
+    (qq-attachment--upsert
+     (qq-attachment-test-snapshot
+      :conversation '((group_uin . 8209413637) (kind . "group"))
+      :phase "ready" :fast-path t :updated-at 1784700005)
+     'ready)
+    (should
+     (equal
+      (qq-attachment-assert-sendable
+       qq-attachment-test-id "group:8209413637" "slot-a")
+      qq-attachment-test-id))))
+
 (ert-deftest qq-attachment-await-observer-is-explicitly-cancellable ()
   (qq-attachment-test-with-state
     (qq-attachment--upsert

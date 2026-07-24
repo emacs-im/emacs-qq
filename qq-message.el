@@ -143,9 +143,42 @@ Account state partitions remain available for simultaneous account views."
         (error "qq: Gateway endpoint UID contradicts owning account"))
       t)))
 
+(defun qq-message--resolve-private-peer-uin (owner peer)
+  "Return PEER with a decimal UIN, resolving from OWNER's known UID map.
+
+Live private self-echoes sometimes carry only the peer UID.  Dropping those
+pushes left optimistic sends stuck without a snowflake."
+  (let ((uin (alist-get 'uin peer))
+        (uid (alist-get 'uid peer)))
+    (cond
+     ((qq-account--uint64-decimal-p uin) peer)
+     ((qq-account--non-empty-string-p uid)
+      (let ((resolved
+             (or (gethash (qq-message--peer-key owner uid)
+                          qq-message--peer-uin-by-uid)
+                 (when-let* ((session
+                              (seq-find
+                               (lambda (candidate)
+                                 (and (eq (alist-get 'type candidate)
+                                          'private)
+                                      (equal (alist-get 'peer-uid candidate)
+                                             uid)))
+                               (qq-state-sessions))))
+                   (alist-get
+                    'target-id
+                    (qq-state-session-key-identity
+                     (alist-get 'key session)))))))
+        (unless (qq-account--uint64-decimal-p resolved)
+          (error "qq: Private message peer lacks an exact UIN"))
+        (if (equal (alist-get 'uin peer) resolved)
+            peer
+          (append `((uin . ,resolved)) peer))))
+     (t (error "qq: Private message peer lacks an exact UIN")))))
+
 (defun qq-message--private-context (message account)
   "Return private projection context for MESSAGE and owning ACCOUNT."
-  (let* ((sender (alist-get 'sender message))
+  (let* ((owner (alist-get 'account_id account))
+         (sender (alist-get 'sender message))
          (recipient (alist-get 'recipient message))
          (sender-self (qq-message--endpoint-self-p sender account))
          (recipient-self
@@ -156,8 +189,7 @@ Account state partitions remain available for simultaneous account views."
       (`(nil t) (setq outgoing nil peer sender))
       (`(t t) (setq outgoing t peer recipient))
       (_ (error "qq: Private message endpoints do not identify owning account")))
-    (unless (qq-account--uint64-decimal-p (alist-get 'uin peer))
-      (error "qq: Private message peer lacks an exact UIN"))
+    (setq peer (qq-message--resolve-private-peer-uin owner peer))
     (list :outgoing outgoing :peer peer)))
 
 (defun qq-message--segment-to-internal (segment)
@@ -200,27 +232,98 @@ Account state partitions remain available for simultaneous account views."
            qq-message--peer-uin-by-uid)
   (cons uid uin))
 
+(defun qq-message--decimal-equal-p (left right)
+  "Return non-nil when LEFT and RIGHT are the same decimal identity text."
+  (equal (format "%s" (or left ""))
+         (format "%s" (or right ""))))
+
+(defun qq-message--random-compatible-p (message-random pending-random)
+  "Return non-nil when MESSAGE-RANDOM is absent or equals PENDING-RANDOM.
+
+Private self-echoes often omit ContentHead.random; requiring it blocked rekey."
+  (or (null message-random)
+      (and (numberp message-random)
+           (numberp pending-random)
+           (= message-random pending-random))))
+
+(defun qq-message--pending-send-matches-p
+    (pending message session-key &optional client-sequence-hit)
+  "Return non-nil when PENDING receipt metadata matches MESSAGE in SESSION-KEY.
+
+When CLIENT-SEQUENCE-HIT is non-nil, MESSAGE already keyed the same outbound
+client_sequence as the send receipt (via ContentHead field 5 or 11).  In that
+case only session + random (if present) are required.
+
+Live C2C evidence: after PbSendMsg, receipt.client_sequence is the outbound
+request field 4, while receipt.server_sequence is PbSendMsgResp field 11.  The
+later CommonMessage often stores those values inverted relative to group
+pushes — ContentHead.Sequence carries the outbound client_sequence and
+ContentHead.client_sequence carries the conversation sequence — so equality
+must accept either field against either receipt value."
+  (and (equal session-key (plist-get pending :session-key))
+       (qq-message--random-compatible-p
+        (alist-get 'random message)
+        (plist-get pending :random))
+       (or client-sequence-hit
+           (let ((server-sequence (plist-get pending :server-sequence))
+                 (pending-client (plist-get pending :client-sequence))
+                 (push-sequence (alist-get 'sequence message))
+                 (push-client (alist-get 'client_sequence message)))
+             (or (qq-message--decimal-equal-p push-sequence server-sequence)
+                 (qq-message--decimal-equal-p push-client server-sequence)
+                 (qq-message--decimal-equal-p push-sequence pending-client)
+                 (qq-message--decimal-equal-p push-client pending-client))))))
+
+(defun qq-message--pending-lookup-key (owner sequence)
+  "Return pending-send hash key for OWNER and SEQUENCE when SEQUENCE is usable."
+  (and sequence
+       (not (member (format "%s" sequence) '("" "0" "nil")))
+       (qq-message--pending-send-key owner (format "%s" sequence))))
+
+(defun qq-message--find-pending-send (owner message session-key)
+  "Return (KEY . PENDING) for OWNER's MESSAGE, preferring client_sequence.
+
+Group self-echoes sometimes omit ContentHead.client_sequence (wire 0 / absent).
+Private self-echoes often keep the outbound client_sequence on ContentHead
+field 5 instead of field 11.  Try both before falling back to a full scan."
+  (let* ((client-sequence (alist-get 'client_sequence message))
+         (push-sequence (alist-get 'sequence message))
+         (candidate-keys
+          (delq nil
+                (delete-dups
+                 (list (qq-message--pending-lookup-key owner client-sequence)
+                       (qq-message--pending-lookup-key owner push-sequence))))))
+    (or
+     (seq-some
+      (lambda (client-key)
+        (when-let* ((pending (gethash client-key qq-message--pending-sends))
+                    ((qq-message--pending-send-matches-p
+                      pending message session-key t)))
+          (cons client-key pending)))
+      candidate-keys)
+     (let (found)
+       (maphash
+        (lambda (candidate-key candidate)
+          (when (and (null found)
+                     (equal (car candidate-key) owner)
+                     (qq-message--pending-send-matches-p
+                      candidate message session-key nil))
+            (setq found (cons candidate-key candidate))))
+        qq-message--pending-sends)
+       found))))
 (defun qq-message--attach-pending-local-id
     (normalized owner message session-key)
   "Attach OWNER's pending local ID to NORMALIZED when MESSAGE metadata matches.
 
 SESSION-KEY must equal the conversation recorded with the send receipt."
-  (let* ((key (qq-message--pending-send-key
-               owner (alist-get 'client_sequence message)))
-         (pending (gethash key qq-message--pending-sends)))
+  (when-let* ((match (qq-message--find-pending-send owner message session-key))
+              (pending (cdr match)))
     ;; Consume the receipt only after the authoritative message has merged.
     ;; This keeps normalization free of correlation side effects, which is
     ;; required when a complete history page is preflighted before commit.
-    (when pending
-      (unless (and (equal session-key (plist-get pending :session-key))
-                   (equal (alist-get 'sequence message)
-                          (plist-get pending :server-sequence))
-                   (= (alist-get 'random message)
-                      (plist-get pending :random)))
-        (error "qq: Self message contradicts its exact send receipt"))
-      (setf (alist-get 'local-id normalized nil nil #'eq)
-            (plist-get pending :local-id)))
-    normalized))
+    (setf (alist-get 'local-id normalized nil nil #'eq)
+          (plist-get pending :local-id)))
+  normalized)
 
 (defun qq-message-normalize-snapshot
     (message owner account &optional recalled-p)
@@ -330,13 +433,13 @@ ordering and pending-send correlation owned by the selected live projection."
   (when-let* ((peer-uid (alist-get 'peer-uid normalized))
               (peer-uin (alist-get 'peer-uin normalized)))
     (qq-message--remember-peer-identity owner peer-uid peer-uin))
-  (let* ((key (qq-message--pending-send-key
-               owner (alist-get 'client_sequence message)))
-         (pending (gethash key qq-message--pending-sends)))
-    (when (and pending
-               (equal (alist-get 'local-id normalized)
-                      (plist-get pending :local-id)))
-      (remhash key qq-message--pending-sends))))
+  (when-let* ((match (qq-message--find-pending-send owner message
+                                                    (alist-get 'session-key normalized)))
+              (key (car match))
+              (pending (cdr match))
+              ((equal (alist-get 'local-id normalized)
+                      (plist-get pending :local-id))))
+    (remhash key qq-message--pending-sends)))
 
 (defun qq-message--merge-normalized (normalized &optional source)
   "Merge native NORMALIZED message and publish a state event from SOURCE."
@@ -1157,6 +1260,52 @@ owns the outbound domain schema and segment limits."
       (user-error "qq: Enter message content before sending"))
     (list :reply-to reply-to :segments native-segments)))
 
+(defun qq-message--recover-send-from-receipt
+    (session-key owner receipt)
+  "Recover the authoritative snowflake for a just-sent message.
+
+The `message.send' protocol receipt carries the conversation `server_sequence'
+(PbSendMsgResp field 11) but not the NT snowflake `message_id'.  The snowflake
+arrives later, unreliably, as a self-echo `message.received' push — a push
+that frequently omits ContentHead fields, never reaches the sending session,
+or reaches it before its snowflake is assigned.  Relying on that push left
+outgoing rows stuck on their optimistic `local-*' id for both group and
+private chats.
+
+This deterministic fallback fetches the single conversation sequence from
+history (`SsoGetGroupMsg' / `SsoGetC2cMsg', both routed through
+`message.get_history') right after the receipt.  The returned message carries
+the snowflake as `server-id' and reuses the normal pending-rekey merge, so the
+optimistic row is promoted even when the self-echo push never arrives.
+
+The fetch is skipped when the receipt has no nonzero conversation sequence,
+when Gateway is not ready, when the account is gone, or when a racing
+self-echo push already consumed the pending receipt."
+  (when (and (memq (qq-state-session-key-type session-key) '(private group))
+             (qq-account-get owner)
+             (fboundp 'qq-server-ready-p)
+             (qq-server-ready-p))
+    (let* ((client-sequence
+            (format "%s" (or (alist-get 'client_sequence receipt) "")))
+           (server-sequence
+            (format "%s" (or (alist-get 'server_sequence receipt) "")))
+           (pending-key
+            (qq-message--pending-lookup-key owner client-sequence)))
+      (when (and pending-key
+                 (gethash pending-key qq-message--pending-sends)
+                 (qq-account--uint64-decimal-p server-sequence t)
+                 (not (equal server-sequence "0")))
+        (condition-case err
+            (qq-runtime-with-account owner
+              (qq-message-get-history
+               session-key server-sequence server-sequence
+               nil
+               (lambda (_body reason)
+                 (message "qq: send history recovery failed: %s" reason))))
+          (error
+           (message "qq: send history recovery failed: %s"
+                    (error-message-string err))))))))
+
 (defun qq-message--send-request
     (session-key segments raw-message method params callback errback)
   "Send prepared SEGMENTS through METHOD with PARAMS for SESSION-KEY."
@@ -1183,15 +1332,30 @@ owns the outbound domain schema and segment limits."
                   (qq-state-session-messages session-key))
                (puthash
                 (qq-message--pending-send-key
-                 owner (alist-get 'client_sequence receipt))
+                 owner
+                 (format "%s" (alist-get 'client_sequence receipt)))
                 (list :session-key session-key
                       :local-id local-id
                       :server-sequence
                       (alist-get 'server_sequence receipt)
+                      :client-sequence
+                      (format "%s" (alist-get 'client_sequence receipt))
                       :random (alist-get 'random receipt))
                 qq-message--pending-sends))
              receipt)
-           :callback callback
+           :callback
+           (lambda (receipt)
+             (let ((value
+                    (if callback
+                        (funcall callback receipt)
+                      receipt)))
+               ;; The receipt carries the conversation sequence but not the
+               ;; NT snowflake, and the self-echo push that would deliver it
+               ;; is unreliable.  Deterministically recover the authoritative
+               ;; snowflake from history so the optimistic pending row rekeys.
+               (qq-message--recover-send-from-receipt
+                session-key owner receipt)
+               value))
            :errback #'fail
            :stale-message "QQ account or Gateway connection changed during send")
         (error

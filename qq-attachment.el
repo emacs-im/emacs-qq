@@ -140,10 +140,13 @@ behalf of one caller."
 
 (defun qq-attachment--same-identity-p (left right)
   "Return non-nil when LEFT and RIGHT describe the same attachment."
-  (cl-every (lambda (key)
-              (equal (alist-get key left) (alist-get key right)))
-            '(attachment_id resource_id account_id conversation use
-              bytes_total created_at)))
+  (and (cl-every (lambda (key)
+                   (equal (alist-get key left) (alist-get key right)))
+                 '(attachment_id resource_id account_id use
+                   bytes_total created_at))
+       (qq-attachment--conversation-equal-p
+        (alist-get 'conversation left)
+        (alist-get 'conversation right))))
 
 (defun qq-attachment--upsert (raw-snapshot reason)
   "Merge RAW-SNAPSHOT for REASON without regressing its lifecycle."
@@ -591,6 +594,23 @@ cancellable operation with the same ownership semantics as the image helper."
       session-key resource-id success failure))
    callback errback))
 
+(defun qq-attachment--conversation-equal-p (left right)
+  "Return non-nil when LEFT and RIGHT name the same private/group target.
+
+Compare by kind + target id rather than raw alist `equal', so key order from
+JSON projection cannot false-fail a sendable check."
+  (let ((left-kind (alist-get 'kind left))
+        (right-kind (alist-get 'kind right)))
+    (and (equal left-kind right-kind)
+         (pcase left-kind
+           ("private"
+            (equal (format "%s" (or (alist-get 'peer_uin left) ""))
+                   (format "%s" (or (alist-get 'peer_uin right) ""))))
+           ("group"
+            (equal (format "%s" (or (alist-get 'group_uin left) ""))
+                   (format "%s" (or (alist-get 'group_uin right) ""))))
+           (_ nil)))))
+
 (defun qq-attachment-assert-sendable
     (attachment-id session-key account-id &optional expected-use)
   "Return ATTACHMENT-ID after strict SESSION-KEY and ACCOUNT-ID checks.
@@ -613,7 +633,8 @@ and may be \"record\"."
       (user-error "qq: Prepared attachment %s is not ready" attachment-id))
     (unless (equal (alist-get 'account_id snapshot) account-id)
       (user-error "qq: Prepared attachment belongs to another account"))
-    (unless (equal (alist-get 'conversation snapshot) conversation)
+    (unless (qq-attachment--conversation-equal-p
+             (alist-get 'conversation snapshot) conversation)
       (user-error "qq: Prepared attachment belongs to another conversation"))
     (unless (equal (alist-get 'kind (alist-get 'use snapshot)) expected-use)
       (user-error "qq: Prepared attachment is not %s" expected-use))
