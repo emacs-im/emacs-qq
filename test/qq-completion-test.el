@@ -8,41 +8,51 @@
 (defmacro qq-completion-test-with-group (&rest body)
   "Evaluate BODY in a temporary writable QQ group composer."
   (declare (indent 0) (debug t))
-  `(unwind-protect
-       (progn
-         (qq-state-reset)
-         (qq-state-upsert-session
-          "group:20001"
-          '((type . group) (target-id . "20001") (title . "Group")) nil)
-         (with-temp-buffer
-           (qq-chat-mode)
-           (setq-local qq-chat--session-key "group:20001")
-           (qq-chat--ensure-view)
-           (appkit-chatbuf-install-prompt "qq> ")
-           ,@body))
-     (qq-state-reset)))
+  `(let ((qq-runtime--accounts (make-hash-table :test #'equal))
+         (qq-state--partitions (make-hash-table :test #'equal))
+         (qq-state--active-account-id nil))
+     (unwind-protect
+         (qq-runtime-with-account "slot-a"
+           (qq-state-reset)
+           (qq-state-upsert-session
+            "group:20001"
+            '((type . group) (target-id . "20001") (title . "Group")) nil)
+           (with-temp-buffer
+             (qq-chat-mode)
+             (qq-runtime-bind-account "slot-a")
+             (setq-local qq-chat--session-key "group:20001")
+             (qq-chat--ensure-view)
+             (appkit-chatbuf-install-prompt "qq> ")
+             ,@body))
+       (qq-runtime-stop-account "slot-a" t)
+       (qq-state-reset))))
 
 (defmacro qq-completion-test-with-private (&rest body)
   "Evaluate BODY in a temporary private chat with peer and self identity."
   (declare (indent 0) (debug t))
-  `(unwind-protect
-       (progn
-         (qq-state-reset)
-         (qq-state-set-self-info
-          '((user_id . "90001") (nickname . "Myself")))
-         (qq-state-upsert-session
-          "private:10001"
-          '((type . private)
-            (target-id . "10001")
-            (peer-uin . "10001")
-            (title . "Alice"))
-          nil)
-         (with-temp-buffer
-           (qq-chat-mode)
-           (setq-local qq-chat--session-key "private:10001")
-           (qq-chat--ensure-view)
-           ,@body))
-     (qq-state-reset)))
+  `(let ((qq-runtime--accounts (make-hash-table :test #'equal))
+         (qq-state--partitions (make-hash-table :test #'equal))
+         (qq-state--active-account-id nil))
+     (unwind-protect
+         (qq-runtime-with-account "slot-a"
+           (qq-state-reset)
+           (qq-state-set-self-info
+            '((user_id . "90001") (nickname . "Myself")))
+           (qq-state-upsert-session
+            "private:10001"
+            '((type . private)
+              (target-id . "10001")
+              (peer-uin . "10001")
+              (title . "Alice"))
+            nil)
+           (with-temp-buffer
+             (qq-chat-mode)
+             (qq-runtime-bind-account "slot-a")
+             (setq-local qq-chat--session-key "private:10001")
+             (qq-chat--ensure-view)
+             ,@body))
+       (qq-runtime-stop-account "slot-a" t)
+       (qq-state-reset))))
 
 (defconst qq-completion-test--member
   '((user_id . "10001")
@@ -666,7 +676,9 @@
                          (list qq-completion-test--member))))))))
 
 (ert-deftest qq-completion-runtime-replacement-invalidates-member-cache ()
-  (let ((qq-runtime--app nil)
+  (let ((qq-runtime--accounts (make-hash-table :test #'equal))
+        (qq-state--partitions (make-hash-table :test #'equal))
+        (qq-state--active-account-id nil)
         (qq-state-change-hook nil)
         (old-member
          '((user_id . "10002") (nickname . "OLD_ACCOUNT_SECRET")))
@@ -677,6 +689,10 @@
         buffer app-a app-b view-a view-b fingerprint successes requests)
     (unwind-protect
         (progn
+          (setq app-a
+                (qq-runtime-account-app
+                 (qq-runtime-ensure-account "slot-a")))
+          (qq-state-select-account "slot-a")
           (qq-state-reset)
           (qq-state-upsert-session
            "group:20001"
@@ -685,11 +701,10 @@
                 (generate-new-buffer " *qq-completion-runtime-cache-test*"))
           (with-current-buffer buffer
             (qq-chat-mode)
+            (qq-runtime-bind-account "slot-a")
             (setq-local qq-chat--session-key "group:20001")
             (appkit-chatbuf-install-prompt "qq> ")
-            (setq app-a (appkit-start-app 'qq :id 'default)
-                  qq-runtime--app app-a
-                  view-a (qq-chat--ensure-view)
+            (setq view-a (qq-chat--ensure-view)
                   fingerprint appkit--view-fingerprint)
             (cl-letf
                 (((symbol-function 'qq-native-search-group-members)
@@ -698,7 +713,11 @@
                     (setq successes (append successes (list callback))
                           requests
                           (append requests
-                                  (list (list qq-runtime--app query))))
+                                  (list
+                                   (list
+                                    (appkit-view-app
+                                     (appkit-current-view))
+                                    query))))
                     (intern (format "request-%d" (length successes))))))
               ;; Runtime A first caches an account-private member, then leaves
               ;; another same-query callback in flight across shutdown.
@@ -710,13 +729,14 @@
               (qq-completion--request-members "alice")
               (should (= (length successes) 2))
               (appkit-stop-app app-a)
-              (setq qq-runtime--app nil)
               (should-not (appkit-current-view))
 
-              ;; Runtime B has the same stable Appkit fingerprint and reuses
-              ;; this detached chat buffer, but is a distinct app generation.
-              (setq app-b (appkit-start-app 'qq :id 'default)
-                    qq-runtime--app app-b
+              ;; The replacement account Appkit has the same stable
+              ;; fingerprint and reuses this detached chat buffer, but is a
+              ;; distinct application incarnation.
+              (setq app-b
+                    (qq-runtime-account-app
+                     (qq-runtime-ensure-account "slot-a"))
                     view-b (qq-chat--ensure-view))
               (should-not (eq view-a view-b))
               (should (equal appkit--view-fingerprint fingerprint))
@@ -760,9 +780,9 @@
         (appkit-stop-app app-a))
       (when (appkit-app-live-p app-b)
         (appkit-stop-app app-b))
+      (qq-runtime-stop-account "slot-a" t)
       (when (buffer-live-p buffer)
         (kill-buffer buffer))
-      (setq qq-runtime--app nil)
       (qq-state-reset))))
 
 (ert-deftest qq-completion-replacement-view-rejects-favorite-response ()

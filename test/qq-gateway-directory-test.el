@@ -126,7 +126,6 @@
          (qq-gateway-accounts-changed-hook nil)
          (qq-gateway-current-account-changed-hook nil)
          (qq-gateway-desync-hook nil)
-         (qq-gateway-message--projection-owner nil)
          (qq-gateway-message--peer-uin-by-uid
           (make-hash-table :test #'equal))
          (qq-gateway-message--pending-recalls
@@ -137,19 +136,23 @@
           (make-hash-table :test #'equal))
          (qq-gateway-directory--member-pages
           (make-hash-table :test #'equal))
-         (qq-gateway-directory--cache-owner nil)
-         (qq-gateway-directory--observed-account-id nil)
-         (qq-gateway-directory--observed-account-phase nil)
+         (qq-gateway-directory--account-phases
+          (make-hash-table :test #'equal))
+         (qq-runtime--app nil)
+         (qq-runtime--accounts (make-hash-table :test #'equal))
+         (qq-state--partitions (make-hash-table :test #'equal))
+         (qq-state--active-account-id nil)
          (qq-gateway-transport--state 'ready)
          (qq-state-change-hook nil))
      (unwind-protect
          (progn
-           (qq-state-reset)
            (qq-gateway--replace-accounts
             (list (qq-gateway-directory-test-account)) 'ready "gateway-test")
-           (qq-gateway-message--ensure-projection-owner
-            (qq-gateway-current-account-id))
+           (qq-state-select-account "slot-a")
+           (qq-state-reset)
+           (qq-gateway-message--sync-account "slot-a")
            ,@body)
+       (qq-runtime-stop)
        (qq-state-reset))))
 
 (ert-deftest qq-gateway-directory-member-page-accessor-owns-strings ()
@@ -158,7 +161,6 @@
            (qq-gateway-wire-domain-copy
             (qq-gateway-directory-test-members-result)))
           (owner "slot-a"))
-      (qq-gateway-directory--set-cache-owner owner)
       (qq-gateway-directory--project-members result owner "8209413637")
       (let* ((page
               (qq-gateway-directory-group-member-page "8209413637"))
@@ -210,7 +212,7 @@
          (equal
           (alist-get 'avatar_url (qq-state-friend "9007199254740999"))
           "https://q.qlogo.cn/headimg_dl?dst_uin=9007199254740999&spec=640&img_type=jpg"))
-        (should (equal (gethash "u_alice"
+        (should (equal (gethash '("slot-a" "u_alice")
                                 qq-gateway-message--peer-uin-by-uid)
                        "9007199254740999"))
         (should (= (hash-table-count
@@ -463,13 +465,11 @@
 (ert-deftest qq-gateway-directory-leave-revokes-owned-group-caches ()
   (qq-gateway-directory-test-with-state
     (let (sent-method sent-params callback-value)
-      (qq-gateway-directory--set-cache-owner
-       (qq-gateway-current-account-id))
-      (puthash "8209413637" '((member_count . 3))
+      (puthash '("slot-a" "8209413637") '((member_count . 3))
                qq-gateway-directory--member-pages)
       (dolist (resource '(groups (group-members . "8209413637")))
         (puthash
-         resource
+         (qq-gateway-directory--request-key "slot-a" resource)
          (qq-gateway-directory--request-record-create
           :resource resource :owner "slot-a" :state 'active)
          qq-gateway-directory--active-requests))
@@ -494,11 +494,12 @@
        (equal sent-params
               '((account_id . "slot-a") (group_uin . "8209413637"))))
       (should (equal (alist-get 'group_uin callback-value) "8209413637"))
-      (should-not (gethash "8209413637"
+      (should-not (gethash '("slot-a" "8209413637")
                            qq-gateway-directory--member-pages))
-      (should-not (gethash 'groups
+      (should-not (gethash '("slot-a" groups)
                            qq-gateway-directory--active-requests))
-      (should-not (gethash '(group-members . "8209413637")
+      (should-not (gethash
+                   '("slot-a" (group-members . "8209413637"))
                            qq-gateway-directory--active-requests)))))
 
 (ert-deftest qq-gateway-directory-group-member-settings-update-owned-page ()
@@ -638,7 +639,7 @@
                (qq-gateway-directory-group-member-page "8209413637")))
           (should (= (alist-get 'member_count page) 3))
           (should (= (length (alist-get 'members page)) 3)))
-        (should (equal (gethash "u_unknown"
+        (should (equal (gethash '("slot-a" "u_unknown")
                                 qq-gateway-message--peer-uin-by-uid)
                        "10003"))))))
 
@@ -690,7 +691,7 @@
         (should (equal callbacks '(second)))
         (should (qq-state-friend-categories-loaded-p))))))
 
-(ert-deftest qq-gateway-directory-account-switch-rejects-stale-response ()
+(ert-deftest qq-gateway-directory-account-switch-preserves-owned-response ()
   (qq-gateway-directory-test-with-state
     (let (response-callback failure cancelled)
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
@@ -710,27 +711,29 @@
           "slot-b" "10003" "u_other_self")
          'changed)
         (qq-gateway-account-select "slot-b")
-        (qq-gateway-directory--handle-account-selection "slot-a" "slot-b")
-        (should (equal cancelled "request-friends"))
+        (should-not cancelled)
         (funcall response-callback
                  (qq-gateway-directory-test-friends-result))
-        (should (string-match-p "account changed" failure))
-        (should-not (qq-state-friend-categories-loaded-p))))))
+        (should-not failure)
+        (qq-state-with-account "slot-a"
+          (should (qq-state-friend-categories-loaded-p)))
+        (qq-state-with-account "slot-b"
+          (should-not (qq-state-friend-categories-loaded-p)))))))
 
 (ert-deftest qq-gateway-directory-online-phase-exit-cancels-native-session-cache ()
   (qq-gateway-directory-test-with-state
-    (let ((qq-gateway-directory--cache-owner "slot-a")
-          (qq-gateway-directory--observed-account-id "slot-a")
-          (qq-gateway-directory--observed-account-phase "online")
-          cancelled failure)
-      (puthash "8209413637" '((members . test))
+    (let (cancelled failure)
+      (puthash "slot-a" "online"
+               qq-gateway-directory--account-phases)
+      (puthash '("slot-a" "8209413637") '((members . test))
                qq-gateway-directory--member-pages)
       (let ((request
              (qq-gateway-directory--request-record-create
               :resource 'friends :owner "slot-a" :state 'active
               :transport-token "old-token"
               :errback (lambda (_body reason) (setq failure reason)))))
-        (puthash 'friends request qq-gateway-directory--active-requests)
+        (puthash '("slot-a" friends) request
+                 qq-gateway-directory--active-requests)
         (let ((account (qq-gateway-directory-test-account)))
           (setf (alist-get 'phase account) "stopped")
           (qq-gateway--upsert-account account 'changed))
@@ -738,7 +741,6 @@
                    (lambda (token) (setq cancelled token) t)))
           (qq-gateway-directory--handle-account-registry-change
            'changed "slot-a"))
-        (should (equal qq-gateway-directory--cache-owner "slot-a"))
         (should (equal cancelled "old-token"))
         (should (eq (qq-gateway-directory--request-record-state request)
                     'cancelled))

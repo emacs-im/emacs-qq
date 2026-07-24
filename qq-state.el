@@ -99,6 +99,179 @@ and ACTION is an alist:
 - expires-at: float-time auto-clear deadline
 - timer: Emacs timer that clears this sender's action")
 
+(defconst qq-state--partition-variables
+  '(qq-state--connection-status
+    qq-state--last-heartbeat
+    qq-state--self-info
+    qq-state--status
+    qq-state--sessions
+    qq-state--recent-session-keys
+    qq-state--recent-session-key-set
+    qq-state--messages-by-session
+    qq-state--message-patch-journal
+    qq-state--message-observation-clock
+    qq-state--materialization-request-counter
+    qq-state--materialization-request-owners
+    qq-state--friends-by-id
+    qq-state--friend-order
+    qq-state--friend-categories
+    qq-state--friend-categories-loaded-p
+    qq-state--groups-by-id
+    qq-state--group-order
+    qq-state--groups-loaded-p
+    qq-state--guilds-by-id
+    qq-state--guild-order
+    qq-state--guild-categories
+    qq-state--guild-channels-by-key
+    qq-state--guild-channel-order
+    qq-state--guild-directory-loaded-p
+    qq-state--requests
+    qq-state--message-session-index
+    qq-state--local-message-session-index
+    qq-state--message-order-counter
+    qq-state--local-message-counter
+    qq-state--session-summary-observation-clock
+    qq-state--actions)
+  "Mutable store variables isolated by one stable Gateway account ID.")
+
+(cl-defstruct (qq-state-partition
+               (:constructor qq-state-partition--create))
+  "One account-owned canonical QQ state partition."
+  account-id
+  values)
+
+(defvar qq-state--partitions (make-hash-table :test #'equal)
+  "Canonical state partitions keyed by stable Gateway account ID.")
+
+(defvar qq-state--active-account-id nil
+  "Account whose partition is temporarily installed in store variables.")
+
+(defun qq-state--fresh-partition-values ()
+  "Return fresh initial values for one account state partition."
+  `((qq-state--connection-status . disconnected)
+    (qq-state--last-heartbeat)
+    (qq-state--self-info)
+    (qq-state--status)
+    (qq-state--sessions . ,(make-hash-table :test #'equal))
+    (qq-state--recent-session-keys)
+    (qq-state--recent-session-key-set . ,(make-hash-table :test #'equal))
+    (qq-state--messages-by-session . ,(make-hash-table :test #'equal))
+    (qq-state--message-patch-journal . ,(make-hash-table :test #'equal))
+    (qq-state--message-observation-clock . 0)
+    (qq-state--materialization-request-counter . 0)
+    (qq-state--materialization-request-owners . ,(make-hash-table :test #'eql))
+    (qq-state--friends-by-id . ,(make-hash-table :test #'equal))
+    (qq-state--friend-order)
+    (qq-state--friend-categories)
+    (qq-state--friend-categories-loaded-p)
+    (qq-state--groups-by-id . ,(make-hash-table :test #'equal))
+    (qq-state--group-order)
+    (qq-state--groups-loaded-p)
+    (qq-state--guilds-by-id . ,(make-hash-table :test #'equal))
+    (qq-state--guild-order)
+    (qq-state--guild-categories)
+    (qq-state--guild-channels-by-key . ,(make-hash-table :test #'equal))
+    (qq-state--guild-channel-order)
+    (qq-state--guild-directory-loaded-p)
+    (qq-state--requests)
+    (qq-state--message-session-index . ,(make-hash-table :test #'equal))
+    (qq-state--local-message-session-index . ,(make-hash-table :test #'equal))
+    (qq-state--message-order-counter . 0)
+    (qq-state--local-message-counter . 0)
+    (qq-state--session-summary-observation-clock . 0)
+    (qq-state--actions . ,(make-hash-table :test #'equal))))
+
+(defun qq-state--capture-values ()
+  "Capture the currently installed store values without copying them."
+  (mapcar (lambda (variable)
+            (cons variable (symbol-value variable)))
+          qq-state--partition-variables))
+
+(defun qq-state--install-values (values)
+  "Install account partition VALUES into the canonical store variables."
+  (dolist (variable qq-state--partition-variables)
+    (set variable (alist-get variable values)))
+  values)
+
+(defun qq-state-partition (account-id)
+  "Return ACCOUNT-ID's state partition, creating it when necessary."
+  (unless (and (stringp account-id) (not (string-empty-p account-id)))
+    (error "qq: state partition requires a stable account ID"))
+  (or (gethash account-id qq-state--partitions)
+      (let ((partition
+             (qq-state-partition--create
+              :account-id (copy-sequence account-id)
+              :values (qq-state--fresh-partition-values))))
+        (puthash (copy-sequence account-id) partition qq-state--partitions)
+        partition)))
+
+(defun qq-state-partition-account-ids ()
+  "Return stable account IDs that currently own canonical state."
+  (let (account-ids)
+    (maphash (lambda (account-id _partition)
+               (push (copy-sequence account-id) account-ids))
+             qq-state--partitions)
+    (nreverse account-ids)))
+
+(defun qq-state-active-account-id ()
+  "Return the account whose state is installed during the current call."
+  (and qq-state--active-account-id
+       (copy-sequence qq-state--active-account-id)))
+
+(defun qq-state--save-active-partition ()
+  "Save installed scalar values back to the active partition."
+  (when-let* ((account-id qq-state--active-account-id)
+              (partition (gethash account-id qq-state--partitions)))
+    (setf (qq-state-partition-values partition)
+          (qq-state--capture-values))))
+
+(defun qq-state-select-account (account-id)
+  "Install ACCOUNT-ID as the synchronous UI state context.
+
+Emacs executes commands serially.  Account-scoped buffers select their owner
+before command dispatch, while asynchronous work uses
+`qq-state-call-with-account' and restores this UI context afterward."
+  (unless (equal account-id qq-state--active-account-id)
+    (qq-state--save-active-partition)
+    (qq-state--install-values
+     (qq-state-partition-values (qq-state-partition account-id)))
+    (setq qq-state--active-account-id (copy-sequence account-id)))
+  (qq-state-partition account-id))
+
+(defun qq-state-call-with-account (account-id function)
+  "Call FUNCTION with ACCOUNT-ID's canonical state installed."
+  (unless (functionp function)
+    (error "qq: account state callback must be a function"))
+  (if (equal account-id qq-state--active-account-id)
+      (funcall function)
+    (let ((previous-account-id qq-state--active-account-id)
+          (previous-values (qq-state--capture-values))
+          (partition (qq-state-partition account-id)))
+      (qq-state--save-active-partition)
+      (qq-state--install-values (qq-state-partition-values partition))
+      (setq qq-state--active-account-id (copy-sequence account-id))
+      (unwind-protect
+          (funcall function)
+        (qq-state--save-active-partition)
+        (qq-state--install-values previous-values)
+        (setq qq-state--active-account-id previous-account-id)))))
+
+(defmacro qq-state-with-account (account-id &rest body)
+  "Evaluate BODY against ACCOUNT-ID's canonical state partition."
+  (declare (indent 1) (debug t))
+  `(qq-state-call-with-account ,account-id (lambda () ,@body)))
+
+(defun qq-state-drop-partition (account-id)
+  "Reset and forget ACCOUNT-ID's canonical state partition."
+  (when (gethash account-id qq-state--partitions)
+    (qq-state-with-account account-id
+      (qq-state-reset))
+    (remhash account-id qq-state--partitions)
+    (when (equal account-id qq-state--active-account-id)
+      (setq qq-state--active-account-id nil)
+      (qq-state--install-values (qq-state--fresh-partition-values)))
+    t))
+
 (defun qq-state--emit (type &rest plist)
   "Emit state TYPE event with extra PLIST fields.
 
@@ -112,7 +285,11 @@ Preferred keys (callers should populate when applicable):
 `:message'        normalized message alist (copy)
 `:message-anchor' stable timeline key (server-id or local-id)
 `:previous-anchor' prior key when rekeying (pending local-id → snowflake)"
-  (let ((event (append (list :type type) plist)))
+  (let ((event
+         (append (list :type type)
+                 (and qq-state--active-account-id
+                      (list :account-id qq-state--active-account-id))
+                 plist)))
     (run-hook-wrapped
      'qq-state-change-hook
      (lambda (function value)

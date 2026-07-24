@@ -108,9 +108,9 @@
       (push (qq-group-notices--note-entry 'empty "暂无群公告。") entries))
     (nreverse entries)))
 
-(defun qq-group-notices--buffer-name ()
-  "Return the shared announcement buffer name."
-  "*qq-group-notices*")
+(defun qq-group-notices--buffer-name (account-id group-id)
+  "Return ACCOUNT-ID-qualified announcement buffer name for GROUP-ID."
+  (qq-runtime-account-buffer-name "group-notices" group-id account-id))
 
 (defun qq-group-notices--header-line ()
   "Return the dynamic header line for this announcement view."
@@ -253,14 +253,20 @@ the stopped account."
 
 (defun qq-group-notices--ensure-view ()
   "Return the live Appkit view owning the current announcement buffer."
-  (let* ((app (qq-runtime-app))
+  (let* ((owner
+          (or qq-runtime--account-id
+              (user-error "qq: group-notices buffer has no account owner")))
+         (app (qq-runtime-app owner))
+         (sync-function
+          (qq-runtime-account-sync-function
+           owner #'qq-group-notices--sync-invalidations))
          (current (appkit-current-view)))
     (cond
      ((and (appkit-view-live-p current)
            (eq app (appkit-view-app current))
            (equal qq-group-notices--view-id (appkit-view-id current)))
       (setf (appkit-view-sync-function current)
-            #'qq-group-notices--sync-invalidations
+            sync-function
             (appkit-view-parts current) '(notices))
       current)
      ((appkit-view-live-p current)
@@ -271,8 +277,9 @@ the stopped account."
               :app app
               :id qq-group-notices--view-id
               :mode 'qq-group-notices-mode
-              :sync-function #'qq-group-notices--sync-invalidations
+              :sync-function sync-function
               :parts '(notices))))
+        (qq-runtime-bind-account owner)
         (qq-group-notices--setup-view view)
         view)))))
 
@@ -424,13 +431,13 @@ the stopped account."
   (interactive "sQQ group number: ")
   (unless (qq-api-group-id-p group-id)
     (user-error "qq: group notices require a canonical uint32 group id"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner (qq-runtime-require-account-id "opening group notices"))
          (view
-          (appkit-open-view
-           :app app
+          (qq-runtime-open-account-view
+           :account-id owner
            :id qq-group-notices--view-id
            :mode 'qq-group-notices-mode
-           :buffer-name (qq-group-notices--buffer-name)
+           :buffer-name (qq-group-notices--buffer-name owner group-id)
            :sync-function #'qq-group-notices--sync-invalidations
            :parts '(notices)
            :setup #'qq-group-notices--setup-view))

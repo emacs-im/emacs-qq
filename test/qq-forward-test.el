@@ -61,11 +61,12 @@
 (defmacro qq-forward-test--with-clean-viewers (&rest body)
   "Run BODY with forward viewer buffers cleaned before and after."
   (declare (indent 0) (debug t))
-  `(progn
+  `(let ((qq-runtime--context-account-id "slot-a"))
      (qq-forward-test--kill-viewers)
      (unwind-protect
          (progn ,@body)
-       (qq-forward-test--kill-viewers))))
+       (qq-forward-test--kill-viewers)
+       (qq-runtime-stop-account "slot-a" t))))
 
 (defun qq-forward-test--sync-buffer (buffer)
   "Synchronously consume pending invalidations for forward BUFFER."

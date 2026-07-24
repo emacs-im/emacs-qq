@@ -44,6 +44,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
      (unwind-protect
          (with-temp-buffer
            (qq-group-mode)
+           (setq-local qq-runtime--account-id "slot-a")
            (setq qq-group--group-id "20001")
            (let ((buffer (current-buffer))
                  (view (qq-group--ensure-view)))
@@ -393,9 +394,13 @@ BODY may refer to the lexical variables `buffer' and `view'."
   (should (eq (lookup-key qq-group-mode-map (kbd "L"))
               #'qq-group-leave)))
 
-(ert-deftest qq-group-reuses-one-profile-buffer-like-telega ()
-  (should (equal (qq-group--buffer-name "20001") "*qq-group*"))
-  (should (equal (qq-group--buffer-name "20002") "*qq-group*")))
+(ert-deftest qq-group-profile-buffer-name-is-account-qualified ()
+  (should
+   (equal (qq-group--buffer-name "slot-a" "20001")
+          "*qq-group:slot-a:20001*"))
+  (should-not
+   (equal (qq-group--buffer-name "slot-a" "20001")
+          (qq-group--buffer-name "slot-b" "20001"))))
 
 (ert-deftest qq-group-open-reuses-renamed-live-view-and-media-hook ()
   (qq-group-test-with-profile-view
@@ -421,7 +426,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
         (should (eq profile qq-group--profile))
         (should (eq hook qq-group--media-hook-function))
         (should (equal renamed (buffer-name buffer)))
-        (should-not (get-buffer (qq-group--buffer-name "20001")))
+        (should-not (get-buffer (qq-group--buffer-name "slot-a" "20001")))
         (setq calls nil)
         (funcall hook "group-avatar:20001"))
       (should (= 1 (length calls)))
@@ -459,7 +464,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
                 :app (qq-runtime-app)
                 :id qq-group--view-id
                 :mode 'qq-group-mode
-                :buffer-name (qq-group--buffer-name "20001")
+                :buffer-name (qq-group--buffer-name "slot-a" "20001")
                 :sync-function #'qq-group--sync-invalidations
                 :parts '(profile)
                 :setup #'qq-group--setup-view)))

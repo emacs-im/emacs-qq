@@ -20,6 +20,7 @@
 (require 'qq-gateway-resource)
 (require 'qq-gateway-transport)
 (require 'qq-gateway-wire)
+(require 'qq-runtime)
 (require 'qq-state)
 
 (defvar qq-gateway-attachment-changed-hook nil
@@ -210,8 +211,8 @@ behalf of one caller."
 MEDIA-NAME is used only in local errors.  CALLBACK receives the queued
 snapshot; later progress is projected through
 `qq-gateway-attachment-changed-hook'."
-  (let* ((account-id (or (qq-gateway-current-account-id)
-                         (user-error "qq: Select a QQ account first")))
+  (let* ((account-id (or (qq-runtime-current-account-id)
+                         (user-error "qq: select a QQ account first")))
          (resource (qq-gateway-resource resource-id))
          (conversation
           (qq-gateway-attachment--conversation-params session-key)))
@@ -225,15 +226,24 @@ snapshot; later progress is projected through
        (conversation . ,conversation)
        (use . ,use))
      :current-p
-     (lambda () (equal account-id (qq-gateway-current-account-id)))
+     (lambda () (qq-gateway-account account-id))
      :stale-code "invalid_gateway_result"
-     :stale-message "Selected QQ account changed during attachment preparation"
+     :stale-message "QQ account was removed during attachment preparation"
      :projector
      (lambda (result)
-       (qq-gateway-attachment--upsert
-        (alist-get 'attachment result) 'prepare-response))
-     :callback callback
-     :errback errback)))
+       (qq-runtime-with-account account-id
+         (qq-gateway-attachment--upsert
+          (alist-get 'attachment result) 'prepare-response)))
+     :callback
+     (and callback
+          (lambda (value)
+            (qq-runtime-with-account account-id
+              (funcall callback value))))
+     :errback
+     (and errback
+          (lambda (body reason)
+            (qq-runtime-with-account account-id
+              (funcall errback body reason)))))))
 
 (defun qq-gateway-attachment-prepare-image
     (session-key resource-id &optional summary sub-type callback errback)
@@ -393,8 +403,8 @@ the final ready resource ID plus success and failure callbacks.  CALLBACK runs
 only after the Prepared Attachment reaches `ready'.  Return a cancellable
 local operation that owns every service object created before that handoff."
   (let* ((path (expand-file-name path))
-         (account-id (or (qq-gateway-current-account-id)
-                         (user-error "qq: Select a QQ account first")))
+         (account-id (or (qq-runtime-current-account-id)
+                         (user-error "qq: select a QQ account first")))
          (operation
           (qq-gateway-attachment-operation-create :active-p t)))
     (cl-labels
@@ -447,12 +457,11 @@ local operation that owns every service object created before that handoff."
                       (lambda (ready)
                         (when
                             (qq-gateway-attachment-operation-active-p operation)
-                          (if (not (equal account-id
-                                          (qq-gateway-current-account-id)))
+                          (if (not (qq-gateway-account account-id))
                               (fail
                                nil
                                (format
-                                "Selected QQ account changed during %s preparation"
+                                "QQ account was removed during %s preparation"
                                 media-name))
                             (setf
                              (qq-gateway-attachment-operation-active-p operation)
@@ -472,10 +481,10 @@ local operation that owns every service object created before that handoff."
             (setf (qq-gateway-attachment-operation-resource-watch
                    operation)
                   nil)
-            (if (not (equal account-id (qq-gateway-current-account-id)))
+            (if (not (qq-gateway-account account-id))
                 (fail
                  nil
-                 (format "Selected QQ account changed during %s"
+                 (format "QQ account was removed during %s"
                          transform-phase))
               (start-request
                (lambda ()
@@ -497,10 +506,10 @@ local operation that owns every service object created before that handoff."
                 (setf
                  (qq-gateway-attachment-operation-source-resource-id operation)
                  nil))
-              (if (not (equal account-id (qq-gateway-current-account-id)))
+              (if (not (qq-gateway-account account-id))
                   (fail
                    nil
-                   (format "Selected QQ account changed during %s"
+                   (format "QQ account was removed during %s"
                            transform-phase))
                 ;; A distinct derived resource no longer depends on the staged
                 ;; source once the transform request has returned.
@@ -512,10 +521,10 @@ local operation that owns every service object created before that handoff."
             (setf (qq-gateway-attachment-operation-resource-watch
                    operation)
                   nil)
-            (if (not (equal account-id (qq-gateway-current-account-id)))
+            (if (not (qq-gateway-account account-id))
                 (fail
                  nil
-                 (format "Selected QQ account changed during %s staging"
+                 (format "QQ account was removed during %s staging"
                          media-name))
               (start-request
                (lambda ()

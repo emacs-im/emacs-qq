@@ -12,10 +12,20 @@
 (defmacro qq-chat-test-with-reset (&rest body)
   "Run BODY with clean qq state and disabled live-update hooks."
   `(let ((qq-state-change-hook nil)
-         (qq-media-cache-update-hook nil))
+         (qq-media-cache-update-hook nil)
+         (qq-runtime--accounts (make-hash-table :test #'equal))
+         (qq-state--partitions (make-hash-table :test #'equal))
+         (qq-state--active-account-id nil)
+         (qq-chat-mode-hook
+          (cons (lambda ()
+                  (qq-runtime-bind-account "slot-a"))
+                qq-chat-mode-hook)))
      (qq-state-reset)
      (unwind-protect
-         (progn ,@body)
+         (qq-runtime-with-account "slot-a"
+           (qq-state-reset)
+           ,@body)
+       (qq-runtime-stop-account "slot-a" t)
        (qq-state-reset))))
 
 (defun qq-chat-test-sync-invalidations ()
@@ -212,7 +222,8 @@
      (let ((updates 0))
        (cl-letf (((symbol-function 'qq-chat--header-line-update)
                   (lambda () (cl-incf updates))))
-         (qq-chat--handle-state-change '(:type connection :status ready))
+         (qq-chat--handle-state-change
+          '(:type connection :account-id "slot-a" :status ready))
          (qq-chat-test-sync-invalidations)
          (should (= updates 1)))))))
 
@@ -856,6 +867,7 @@
      (qq-chat-render)
      (qq-chat--handle-state-change
       (list :type 'message
+            :account-id "slot-a"
             :session-key "group:20001"
             :message-anchor "90"
             :mutation 'update
@@ -878,6 +890,7 @@
        (should (= (alist-get 'count reaction) 2)))
      (qq-chat--handle-state-change
       '(:type message
+        :account-id "slot-a"
         :session-key "group:20001"
         :message-anchor "90"
         :mutation update
@@ -1096,6 +1109,7 @@
          (setq owner qq-chat--filter-owner)
          (qq-chat--handle-state-change
           '(:type message
+            :account-id "slot-a"
             :session-key "group:20001"
             :message-anchor "90"
             :mutation update
@@ -1145,7 +1159,8 @@
                  ((symbol-function 'qq-api-cancel-request)
                   (lambda (token) (setq canceled token))))
          (qq-chat-filter-search "needle")
-         (qq-chat--handle-state-change '(:type reset))
+         (qq-chat--handle-state-change
+          '(:type reset :account-id "slot-a"))
          (should (eq canceled 'pre-reset-token))
          (should-not qq-chat--msg-filter)
          (should-not qq-chat--filter-owner)
@@ -1191,7 +1206,8 @@
                   (lambda (&rest _arguments) (setq dispatch-called t)))
                  ((symbol-function 'appkit-view-live-p)
                   (lambda (_view) nil)))
-         (qq-chat--handle-state-change '(:type reset))
+         (qq-chat--handle-state-change
+          '(:type reset :account-id "slot-a"))
          (should (eq canceled 'pre-reset-forward-token))
          (should owner-cleared-before-cancel-p)
          (should-not qq-chat--message-selection)
@@ -1218,6 +1234,9 @@
 
 (ert-deftest qq-chat-public-reset-cleans-forwarding-after-view-shutdown ()
   (let ((qq-runtime--app (appkit-start-app 'qq :id 'chat-reset-test))
+        (qq-runtime--accounts (make-hash-table :test #'equal))
+        (qq-state--partitions (make-hash-table :test #'equal))
+        (qq-state--active-account-id nil)
         (qq-state-change-hook '(qq-chat--handle-state-change))
         (qq-media-cache-update-hook nil)
         (qq-transport--pending (make-hash-table :test #'equal))
@@ -1231,6 +1250,8 @@
         view plan dispatch-called)
     (unwind-protect
         (progn
+          (qq-state-select-account "slot-a")
+          (qq-runtime-ensure-account "slot-a")
           (qq-state-reset)
           (qq-state-upsert-session
            "group:20001"
@@ -1239,6 +1260,7 @@
            nil)
           (with-current-buffer buffer
             (qq-chat-mode)
+            (qq-runtime-bind-account "slot-a")
             (setq qq-chat--session-key "group:20001")
             (qq-chat--set-empty-history-window)
             (qq-chat-render)
@@ -1266,6 +1288,7 @@
           (should-not dispatch-called))
       (when (buffer-live-p buffer)
         (kill-buffer buffer))
+      (qq-runtime-stop-account "slot-a" t)
       (when (appkit-app-live-p qq-runtime--app)
         (appkit-stop-app qq-runtime--app))
       (setq qq-runtime--app nil)
@@ -2257,8 +2280,34 @@
                   (lambda () (push 'frame events)))
                  ((symbol-function 'qq-chat--header-line-update)
                   (lambda () (push 'header-line events))))
-         (qq-chat--handle-state-change '(:type heartbeat :timestamp 1.0))
+         (qq-chat--handle-state-change
+          '(:type heartbeat :account-id "slot-a" :timestamp 1.0))
          (should-not events))))))
+
+(ert-deftest qq-chat-state-events-require-the-exact-account-owner ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (let ((view (qq-chat--ensure-view))
+           calls)
+       (cl-letf (((symbol-function 'appkit-request-sync)
+                  (lambda (&rest arguments)
+                    (push arguments calls))))
+         (qq-chat--handle-state-change
+          '(:type connection :status ready))
+         (qq-chat--handle-state-change
+          '(:type connection :account-id "slot-b" :status ready))
+         (should-not calls)
+         (should-not (appkit-view-pending-events-snapshot view))
+         (qq-chat--handle-state-change
+          '(:type connection :account-id "slot-a" :status ready))
+         (should (= (length calls) 1))
+         (should
+          (equal (appkit-view-pending-events-snapshot view)
+                 '((:type connection
+                    :account-id "slot-a"
+                    :status ready)))))))))
 
 (ert-deftest qq-chat-state-callback-enqueues-before-one-atomic-sync-request ()
   (qq-chat-test-with-reset
@@ -2271,7 +2320,9 @@
                   (lambda (candidate &rest options)
                     (should
                      (equal (appkit-view-pending-events-snapshot candidate)
-                            '((:type connection :status ready))))
+                            '((:type connection
+                               :account-id "slot-a"
+                               :status ready))))
                     (push (cons candidate options) calls)))
                  ((symbol-function 'appkit-invalidate)
                   (lambda (&rest _)
@@ -2279,7 +2330,8 @@
                  ((symbol-function 'appkit-schedule-sync)
                   (lambda (&rest _)
                     (ert-fail "state callback used bare scheduling"))))
-         (qq-chat--handle-state-change '(:type connection :status ready)))
+         (qq-chat--handle-state-change
+          '(:type connection :account-id "slot-a" :status ready)))
        (should (equal calls (list (list view :part 'frame))))))))
 
 (ert-deftest qq-chat-message-state-change-uses-one-projected-sync-path ()
@@ -2295,6 +2347,7 @@
                   (lambda () (setq render-called t))))
          (qq-chat--handle-state-change
           '(:type message
+            :account-id "slot-a"
             :session-key "private:10001"
             :mutation create
             :message-anchor "9007199254741004645"
@@ -2316,7 +2369,8 @@
                  ((symbol-function 'qq-chat--update-frame)
                   (lambda () (push 'frame events))))
          (qq-chat--handle-state-change
-          '(:type session :session-key "private:10001" :mutation session))
+          '(:type session :account-id "slot-a"
+            :session-key "private:10001" :mutation session))
          (qq-chat-test-sync-invalidations)
          (should (equal events '(frame header))))))))
 
@@ -2330,7 +2384,8 @@
        (cl-letf (((symbol-function 'qq-chat--apply-read-state-change)
                   (lambda () (setq called t))))
          (qq-chat--handle-state-change
-          '(:type session :session-key "private:10001" :mutation read))
+          '(:type session :account-id "slot-a"
+            :session-key "private:10001" :mutation read))
          (qq-chat-test-sync-invalidations)
          (should called))))))
 
@@ -2370,6 +2425,7 @@
         "private:10001" "9007199254741007777")
        (qq-chat--handle-state-change
         (list :type 'message
+              :account-id "slot-a"
               :session-key "private:10001"
               :mutation 'update
               :message-anchor "9007199254741007777"
@@ -2413,6 +2469,7 @@
         "private:10001" "9007199254741008888")
        (qq-chat--handle-state-change
         (list :type 'message
+              :account-id "slot-a"
               :session-key "private:10001"
               :mutation 'update
               :message-anchor "9007199254741008888"
@@ -2437,7 +2494,8 @@
                   (lambda () (push 'frame events)))
                  ((symbol-function 'qq-chat--sync-timeline)
                   (lambda (&rest args) (push (cons 'timeline args) events))))
-         (qq-chat--handle-state-change '(:type friends-refreshed :count 1))
+         (qq-chat--handle-state-change
+          '(:type friends-refreshed :account-id "slot-a" :count 1))
          (qq-chat-test-sync-invalidations)
          (should (equal (mapcar (lambda (event)
                                   (if (consp event) (car event) event))
@@ -3413,7 +3471,8 @@
                   (lambda () (setq header-updated t)))
                  ((symbol-function 'qq-chat--update-frame)
                   (lambda () (setq frame-updated t))))
-         (qq-chat--handle-state-change '(:type sessions-refreshed :count 1))
+         (qq-chat--handle-state-change
+          '(:type sessions-refreshed :account-id "slot-a" :count 1))
          (qq-chat-test-sync-invalidations)
          (should header-updated)
          (should-not frame-updated))))))
@@ -4148,27 +4207,32 @@
          (should-not qq-chat--pending-jump-id))))))
 
 (ert-deftest qq-chat-jump-reports-missing-around-target-without-retry ()
-  (with-temp-buffer
-    (qq-chat-mode)
-    (setq qq-chat--session-key "private:10001"
-          qq-chat--pending-jump-id "100")
-    (let ((requests 0)
-          failure)
-      (cl-letf (((symbol-function 'qq-native-fetch-history-around)
-                 (lambda (_session _target callback &optional _errback _count)
-                   (cl-incf requests)
-                   (funcall callback '(:message-count 0))))
-                ((symbol-function 'qq-chat--note-history-window) #'ignore)
-                ((symbol-function 'qq-chat--finish-jump-if-loaded)
-                 (lambda (_target) nil))
-                ((symbol-function 'qq-chat--jump-fail)
-                 (lambda (target reason) (setq failure (list target reason)))))
-        (qq-chat--seek-history-for-jump
-         "private:10001" "100" (current-buffer))
-        (should (= requests 1))
-        (should-not failure)
-        (qq-chat-test-sync-until-idle)
-        (should (equal failure '("100" "around window omitted target")))))))
+  (qq-chat-test-with-reset
+    (with-temp-buffer
+      (qq-chat-mode)
+      (setq qq-chat--session-key "private:10001"
+            qq-chat--pending-jump-id "100")
+      (let ((requests 0)
+            failure)
+        (cl-letf (((symbol-function 'qq-native-fetch-history-around)
+                   (lambda (_session _target callback
+                            &optional _errback _count)
+                     (cl-incf requests)
+                     (funcall callback '(:message-count 0))))
+                  ((symbol-function 'qq-chat--note-history-window) #'ignore)
+                  ((symbol-function 'qq-chat--finish-jump-if-loaded)
+                   (lambda (_target) nil))
+                  ((symbol-function 'qq-chat--jump-fail)
+                   (lambda (target reason)
+                     (setq failure (list target reason)))))
+          (qq-chat--seek-history-for-jump
+           "private:10001" "100" (current-buffer))
+          (should (= requests 1))
+          (should-not failure)
+          (qq-chat-test-sync-until-idle)
+          (should
+           (equal failure
+                  '("100" "around window omitted target"))))))))
 
 
 (ert-deftest qq-chat-input-segments-keep-cjk-text-after-image-object ()
@@ -4850,7 +4914,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
 
 
 (ert-deftest qq-chat-around-success-clears-loading-and-owner ()
-  (with-temp-buffer
+  (qq-chat-test-with-reset
+   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
     (let (loading-during-request)
@@ -4884,10 +4949,11 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (should-not (appkit-chat-history-loading-p))
         (should-not (appkit-chat-history-request-owner))
         (should (equal (appkit-chat-history-window-first-key) "m19"))
-        (should (equal (appkit-chat-history-window-last-key) "m20"))))))
+        (should (equal (appkit-chat-history-window-last-key) "m20")))))))
 
 (ert-deftest qq-chat-around-failure-clears-loading-and-owner ()
-  (with-temp-buffer
+  (qq-chat-test-with-reset
+   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
     (let (loading-during-request failure)
@@ -4911,7 +4977,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (qq-chat-test-sync-until-idle)
         (should (equal failure '("m20" "network failure")))
         (should-not (appkit-chat-history-loading-p))
-        (should-not (appkit-chat-history-request-owner))))))
+        (should-not (appkit-chat-history-request-owner)))))))
 
 (ert-deftest qq-chat-around-batch-advances-captured-frontier-to-normalized-newest ()
   (qq-chat-test-with-reset
@@ -4987,7 +5053,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
 
 
 (ert-deftest qq-chat-auto-loads-newer-only-near-partial-window-footer ()
-  (with-temp-buffer
+  (qq-chat-test-with-reset
+   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
     (qq-chat--ensure-view)
@@ -5013,10 +5080,11 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (appkit-chat-history-newer-stalled-set "m20")
         (qq-chat--maybe-auto-load-newer 975)
         (qq-chat-test-sync-until-idle)
-        (should-not calls)))))
+        (should-not calls))))))
 
 (ert-deftest qq-chat-window-scroll-loads-newer-from-selected-viewport-edge ()
-  (with-temp-buffer
+  (qq-chat-test-with-reset
+   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
     (qq-chat--ensure-view)
@@ -5046,10 +5114,11 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (qq-chat--window-scroll window 100)
         (should-not calls)
         (qq-chat-test-sync-until-idle)
-        (should (equal calls '(t)))))))
+        (should (equal calls '(t))))))))
 
 (ert-deftest qq-chat-window-scroll-loads-newer-and-reads-inactive-window ()
-  (with-temp-buffer
+  (qq-chat-test-with-reset
+   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
     (qq-chat--ensure-view)
@@ -5080,10 +5149,11 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (should (= read-position 700))
         (should-not calls)
         (qq-chat-test-sync-until-idle)
-        (should (equal calls '(t)))))))
+        (should (equal calls '(t))))))))
 
 (ert-deftest qq-chat-post-command-auto-loads-older-near-top ()
-  (with-temp-buffer
+  (qq-chat-test-with-reset
+   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
     (qq-chat--ensure-view)
@@ -5100,7 +5170,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (qq-chat--maybe-auto-load-older)
         (should-not called)
         (qq-chat-test-sync-until-idle)
-        (should (eq called t))))))
+        (should (eq called t)))))))
 
 (ert-deftest qq-chat-read-position-follows-cursor-without-regressing ()
   (qq-chat-test-with-reset
@@ -5523,8 +5593,9 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
      (should-not (assoc "service:u:mail:x" by-key)))))
 
 (ert-deftest qq-chat-forward-dataline-source-capability-matrix ()
-  (let ((message-id "9007199254743009336")
-        individual-calls merged-called)
+  (qq-chat-test-with-reset
+   (let ((message-id "9007199254743009336")
+         individual-calls merged-called)
     (with-temp-buffer
       (qq-chat-mode)
       (setq qq-chat--session-key "dataline:desktop:dev:a")
@@ -5578,7 +5649,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
           (should-error
            (qq-chat-forward-merged plan "group:30001")
            :type 'user-error))
-        (should-not dispatch-called)))))
+        (should-not dispatch-called))))))
 
 (ert-deftest qq-chat-forward-source-capability-is-a-closed-session-allowlist ()
   (dolist (session-key '("private:10001" "group:20001" "service:u:mail:x"))
@@ -6156,7 +6227,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
       (should-not qq-chat--forward-request-owner))))
 
 (ert-deftest qq-chat-forward-post-handoff-quit-retains-installed-owner ()
-  (with-temp-buffer
+  (qq-chat-test-with-reset
+   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
     (let ((plan (qq-chat-test--forward-plan (current-buffer)))
@@ -6188,7 +6260,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (should (= dispatch-count 1))
         (funcall success-callback '((kind . "individual")))
         (should-not qq-chat--forward-request)
-        (should-not qq-chat--forward-request-owner)))))
+        (should-not qq-chat--forward-request-owner))))))
 
 (ert-deftest qq-chat-forward-plan-revalidates-recall-before-dispatch ()
   (qq-chat-test-with-reset
@@ -6681,6 +6753,58 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
        (setq qq-chat--session-key "group:20001")
        (should-not (qq-chat--friend-pin-capable-p))
        (should-error (qq-chat-unpin-friend) :type 'user-error)))))
+
+(ert-deftest qq-chat-same-session-key-stays-independent-in-two-accounts ()
+  (let ((qq-runtime--accounts (make-hash-table :test #'equal))
+        (qq-state--partitions (make-hash-table :test #'equal))
+        (qq-state--active-account-id nil)
+        (qq-state-change-hook nil)
+        (qq-media-cache-update-hook nil)
+        buffer-a buffer-b)
+    (unwind-protect
+        (progn
+          (qq-runtime-with-account "slot-a"
+            (qq-state-upsert-session
+             "private:10001"
+             '((type . private) (target-id . "10001") (title . "Alice A"))
+             nil)
+            (setq buffer-a (qq-chat--open-buffer "private:10001")))
+          (qq-runtime-with-account "slot-b"
+            (qq-state-upsert-session
+             "private:10001"
+             '((type . private) (target-id . "10001") (title . "Alice B"))
+             nil)
+            (setq buffer-b (qq-chat--open-buffer "private:10001")))
+          (should (buffer-live-p buffer-a))
+          (should (buffer-live-p buffer-b))
+          (should-not (eq buffer-a buffer-b))
+          (with-current-buffer buffer-a
+            (should (equal qq-runtime--account-id "slot-a"))
+            (should (equal qq-chat--session-key "private:10001"))
+            (appkit-chatbuf-input-set-text "draft-a"))
+          (with-current-buffer buffer-b
+            (should (equal qq-runtime--account-id "slot-b"))
+            (should (equal qq-chat--session-key "private:10001"))
+            (appkit-chatbuf-input-set-text "draft-b"))
+          (with-current-buffer buffer-a
+            (should (equal (appkit-chatbuf-input-string) "draft-a"))
+            (qq-runtime-with-account qq-runtime--account-id
+              (should
+               (equal (alist-get 'title
+                                 (qq-state-session "private:10001"))
+                      "Alice A"))))
+          (with-current-buffer buffer-b
+            (should (equal (appkit-chatbuf-input-string) "draft-b"))
+            (qq-runtime-with-account qq-runtime--account-id
+              (should
+               (equal (alist-get 'title
+                                 (qq-state-session "private:10001"))
+                      "Alice B")))))
+      (qq-runtime-stop-account "slot-a" t)
+      (qq-runtime-stop-account "slot-b" t)
+      (dolist (buffer (list buffer-a buffer-b))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
 
 (provide (quote qq-chat-test))
 

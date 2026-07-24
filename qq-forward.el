@@ -456,21 +456,22 @@ the fork-native forward action using an explicit locator-qualified reference."
             (presentation . ,(qq-forward--legacy-presentation data)))))))
    (t nil)))
 
-(defun qq-forward--buffer-name (name-key)
-  "Return forward viewer buffer name for display-only NAME-KEY."
-  (format "*qq-forward:%s*" name-key))
+(defun qq-forward--buffer-name (account-id name-key)
+  "Return ACCOUNT-ID-qualified forward buffer name for NAME-KEY."
+  (qq-runtime-account-buffer-name "forward" name-key account-id))
 
 (defun qq-forward--view-id (buffer-key)
   "Return the exact appkit view identity for canonical BUFFER-KEY."
   (list 'forward buffer-key))
 
-(defun qq-forward--orphan-buffer (buffer-key)
-  "Return a detached forward buffer with canonical BUFFER-KEY, or nil."
+(defun qq-forward--orphan-buffer (account-id buffer-key)
+  "Return ACCOUNT-ID's detached forward BUFFER-KEY buffer, or nil."
   (cl-find-if
    (lambda (buffer)
      (and (buffer-live-p buffer)
           (with-current-buffer buffer
             (and (derived-mode-p 'qq-forward-mode)
+                 (equal qq-runtime--account-id account-id)
                  (equal qq-forward--buffer-key buffer-key)
                  (not (appkit-view-live-p (appkit-current-view)))))))
    (buffer-list)))
@@ -729,7 +730,13 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
   "Return the live appkit view owning the current forward buffer."
   (unless qq-forward--buffer-key
     (error "qq: forward buffer has no canonical identity"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner
+          (or qq-runtime--account-id
+              (user-error "qq: forward buffer has no account owner")))
+         (app (qq-runtime-app owner))
+         (sync-function
+          (qq-runtime-account-sync-function
+           owner #'qq-forward--sync-invalidations))
          (id (qq-forward--view-id qq-forward--buffer-key))
          (current (appkit-current-view)))
     (cond
@@ -738,7 +745,7 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
            (equal id (appkit-view-id current)))
       (setf (appkit-view-state current) qq-forward--buffer-key
             (appkit-view-sync-function current)
-            #'qq-forward--sync-invalidations
+            sync-function
             (appkit-view-parts current) '(timeline geometry))
       current)
      ((appkit-view-live-p current)
@@ -750,8 +757,9 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
               :id id
               :state qq-forward--buffer-key
               :mode 'qq-forward-mode
-              :sync-function #'qq-forward--sync-invalidations
+              :sync-function sync-function
               :parts '(timeline geometry))))
+        (qq-runtime-bind-account owner)
         (qq-forward--setup-view view)
         view)))))
 
@@ -1051,20 +1059,23 @@ width is unchanged so pixel-aligned media follows text scaling."
             (format "%s:%s:%x"
                     (car reference) (cdr reference)
                     (sxhash-equal buffer-key))))
-         (app (qq-runtime-app))
+         (owner (qq-runtime-require-account-id "opening forwarded messages"))
+         (app (qq-runtime-app owner))
          (view-id (qq-forward--view-id buffer-key))
          (existing (appkit-view-for-id app view-id))
          (orphan (and (null existing)
-                      (qq-forward--orphan-buffer buffer-key)))
+                      (qq-forward--orphan-buffer owner buffer-key)))
          (fresh-p (and (null existing) (null orphan)))
          (view existing)
          (buffer (or (and existing (appkit-view-buffer existing))
                      orphan
-                     (generate-new-buffer (qq-forward--buffer-name name-key)))))
+                     (generate-new-buffer
+                      (qq-forward--buffer-name owner name-key)))))
     (with-current-buffer buffer
       (unless existing
         (when fresh-p
           (qq-forward-mode)
+          (qq-runtime-bind-account owner)
           (setq qq-forward--buffer-key buffer-key
                 qq-forward--source (copy-tree source)
                 qq-forward--lookup-id lookup-id

@@ -192,6 +192,11 @@
       (unwind-protect
           (cl-letf (((symbol-function 'qq-gateway-current-account-id)
                      (lambda () account-id))
+                    ((symbol-function 'qq-gateway-account)
+                     (lambda (candidate)
+                       (and (equal candidate account-id)
+                            `((account_id . ,account-id)
+                              (phase . "online")))))
                     ((symbol-function 'qq-gateway-media-materialize)
                      (lambda (_media-id callback _errback)
                        (setq materialize-callback callback)

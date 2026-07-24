@@ -11,10 +11,19 @@
 (defmacro qq-transient-test-with-reset (&rest body)
   "Run BODY with clean qq state."
   `(let ((qq-state-change-hook nil)
-         (qq-media-cache-update-hook nil))
-     (qq-state-reset)
+         (qq-media-cache-update-hook nil)
+         (qq-runtime--accounts (make-hash-table :test #'equal))
+         (qq-state--partitions (make-hash-table :test #'equal))
+         (qq-state--active-account-id nil)
+         (qq-chat-mode-hook
+          (cons (lambda ()
+                  (qq-runtime-bind-account "slot-a"))
+                qq-chat-mode-hook)))
      (unwind-protect
-         (progn ,@body)
+         (qq-runtime-with-account "slot-a"
+           (qq-state-reset)
+           ,@body)
+       (qq-runtime-stop-account "slot-a" t)
        (qq-state-reset))))
 
 (defun qq-transient-test--forward-plan (buffer session-key &rest anchors)
@@ -108,7 +117,7 @@
              objects)))
       (should account-switch)
       (should
-       (eq (oref account-switch command) 'qq-gateway-account-select)))))
+       (eq (oref account-switch command) 'qq-root-switch-account)))))
 
 (ert-deftest qq-transient-message-prefix-exposes-essence-toggle ()
   (let* ((objects (transient-suffixes 'qq-chat-message-transient))

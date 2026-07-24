@@ -211,7 +211,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (make-hash-table :test #'equal))
          (qq-gateway-attachment--order nil)
          (qq-gateway-attachment-changed-hook nil)
-         (qq-gateway-message--projection-owner nil)
          (qq-gateway-message--peer-uin-by-uid
           (make-hash-table :test #'equal))
          (qq-gateway-message--pending-recalls
@@ -224,6 +223,10 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (make-hash-table :test #'equal))
          (qq-gateway-message--live-frontiers
           (make-hash-table :test #'equal))
+         (qq-runtime--app nil)
+         (qq-runtime--accounts (make-hash-table :test #'equal))
+         (qq-state--partitions (make-hash-table :test #'equal))
+         (qq-state--active-account-id nil)
          (qq-gateway-message-event-hook nil)
          (qq-gateway-message-projection-error-hook nil)
          (qq-gateway-transport--state 'ready)
@@ -233,7 +236,10 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
            (qq-state-reset)
            (qq-gateway--replace-accounts
             (list (qq-gateway-message-test-account)) 'ready "gateway-test")
-           ,@body)
+           (qq-runtime-with-account "slot-a"
+             (qq-state-reset)
+             ,@body))
+       (qq-runtime-stop)
        (qq-state-reset))))
 
 (ert-deftest qq-gateway-message-conversation-params-use-session-identity ()
@@ -415,23 +421,33 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
       (should (equal (alist-get 'peer-uin message) "10001"))
       (should (equal (alist-get 'peer-uid message) "u_peer"))
       (should (equal (alist-get 'peer-uid session) "u_peer"))
-      (should (equal (gethash "u_peer"
+      (should (equal (gethash '("slot-a" "u_peer")
                               qq-gateway-message--peer-uin-by-uid)
                      "10001")))))
 
-(ert-deftest qq-gateway-message-observes-other-account-without-projecting ()
+(ert-deftest qq-gateway-message-projects-nonselected-managed-account ()
   (qq-gateway-message-test-with-state
     (let (observed)
       (add-hook 'qq-gateway-message-event-hook
                 (lambda (event data) (setq observed (list event data))))
+      (qq-gateway--upsert-account
+       (qq-gateway-message-test-account
+        "slot-b" "10003" "u_other_self")
+       'changed)
       (qq-gateway-message--handle-event
        "message.received"
        (qq-gateway-message-test-event
-        :account-id "slot-b"))
+        :account-id "slot-b"
+        :recipient '((uin . "10003") (uid . "u_other_self"))))
       (should (equal (car observed) "message.received"))
       (should (equal (alist-get 'account_id (cadr observed)) "slot-b"))
-      (should-not qq-gateway-message--projection-owner)
-      (should-not (qq-state-sessions)))))
+      (should-not (qq-state-sessions))
+      (qq-runtime-with-account "slot-b"
+        (should (qq-state-session "private:10001"))
+        (should
+         (equal (alist-get 'gateway-account-id
+                           (car (qq-state-session-messages "private:10001")))
+                "slot-b"))))))
 
 (ert-deftest qq-gateway-message-temp-is-valid-but-not-projected ()
   (qq-gateway-message-test-with-state
@@ -1379,13 +1395,13 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
      (equal (alist-get 'sequence
                        (qq-gateway-message-live-frontier "private:10001"))
             "100"))
-    (qq-gateway-message-revoke-projection)
+    (qq-gateway-message-reset-correlations)
     (should-not (qq-gateway-message-live-frontier "private:10001"))))
 
 (ert-deftest qq-gateway-message-revoke-clears-essence-correlation ()
   (qq-gateway-message-test-with-state
     (puthash '(owner target) t qq-gateway-message--pending-essences)
-    (qq-gateway-message-revoke-projection)
+    (qq-gateway-message-reset-correlations)
     (should (= (hash-table-count qq-gateway-message--pending-essences) 0))))
 
 (ert-deftest qq-gateway-message-history-request-preserves-large-sequences ()
@@ -1711,9 +1727,9 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (should-not (qq-state-sessions))
         (should (= qq-state--message-order-counter initial-order))))))
 
-(ert-deftest qq-gateway-message-history-stale-owner-cannot-mutate-state ()
+(ert-deftest qq-gateway-message-history-survives-ui-account-selection ()
   (qq-gateway-message-test-with-state
-    (let (response-callback failure)
+    (let (response-callback failure delivered)
       (cl-letf (((symbol-function 'qq-gateway-transport-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-gateway-transport-capabilities)
@@ -1723,7 +1739,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                    (setq response-callback callback)
                    "request-history")))
         (qq-gateway-message-get-history
-         "group:8209413637" "100" "100" nil
+         "group:8209413637" "100" "100"
+         (lambda (_metadata) (setq delivered t))
          (lambda (_body reason) (setq failure reason)))
         (qq-gateway--upsert-account
          (qq-gateway-message-test-account
@@ -1733,8 +1750,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (funcall
          response-callback
          (qq-gateway-message-test-history-result nil "100" "100"))
-        (should (string-match-p "account or Gateway connection changed"
-                                failure))
+        (should delivered)
+        (should-not failure)
         (should-not (qq-state-sessions))))))
 
 (ert-deftest qq-gateway-message-history-recovers-lost-self-event ()
@@ -1786,22 +1803,30 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                          "7348923749823749823"))
           (should (= (hash-table-count qq-gateway-message--pending-sends) 0)))))))
 
-(ert-deftest qq-gateway-message-selection-change-revokes-old-state ()
+(ert-deftest qq-gateway-message-selection-change-preserves-account-partitions ()
   (qq-gateway-message-test-with-state
     (qq-gateway-message--handle-event
-     "message.received" (qq-gateway-message-test-event))
+    "message.received" (qq-gateway-message-test-event))
     (should (qq-state-sessions))
-    (should (equal qq-gateway-message--projection-owner "slot-a"))
     (qq-gateway--upsert-account
      (qq-gateway-message-test-account
-      "slot-b" "10003" "u_other_self")
+     "slot-b" "10003" "u_other_self")
      'changed)
-    (let ((qq-gateway-current-account-changed-hook
-           '(qq-gateway-message--handle-selection-change)))
-      (qq-gateway-account-select "slot-b"))
-    (should-not (qq-state-sessions))
-    (should (equal (alist-get 'user_id (qq-state-self-info)) "10003"))
-    (should (equal qq-gateway-message--projection-owner "slot-b"))))
+    (qq-gateway-message--handle-account-change 'changed "slot-b")
+    (qq-gateway-account-select "slot-b")
+    (should (qq-state-sessions))
+    (qq-state-with-account "slot-b"
+      (should-not (qq-state-sessions)))
+    (qq-gateway-message--handle-event
+     "message.received"
+     (qq-gateway-message-test-event
+      :account-id "slot-b"
+      :recipient '((uin . "10003") (uid . "u_other_self"))
+      :message-id "7348923749823749824"))
+    (qq-state-with-account "slot-a"
+      (should (= (length (qq-state-sessions)) 1)))
+    (qq-state-with-account "slot-b"
+      (should (= (length (qq-state-sessions)) 1)))))
 
 (ert-deftest qq-gateway-message-same-slot-restart-preserves-state-and-pending ()
   (qq-gateway-message-test-with-state
@@ -1822,7 +1847,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
              (local-id (alist-get 'local-id pending))
              sent-params delivered)
         (puthash '(old-runtime) t qq-gateway-message--pending-recalls)
-        (puthash session-key
+        (puthash (qq-gateway-message--frontier-key "slot-a" session-key)
                  '((message_id . "7348923749823749823")
                    (sequence . "9007199254740999"))
                  qq-gateway-message--live-frontiers)
@@ -1833,7 +1858,6 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (qq-gateway--upsert-account
          (qq-gateway-message-test-account) 'changed)
         (qq-gateway-message--handle-account-change 'changed "slot-a")
-        (should (equal qq-gateway-message--projection-owner "slot-a"))
         (should (= (hash-table-count qq-gateway-message--pending-recalls) 1))
         (should (= (hash-table-count qq-gateway-message--live-frontiers) 1))
         (let ((retained
@@ -1875,11 +1899,9 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                 '((message_id . "7348923749823749823"))))
         (should-not (assq 'generation sent-params))))))
 
-(ert-deftest qq-gateway-message-account-ready-claims-selected-owner ()
+(ert-deftest qq-gateway-message-account-ready-synchronizes-every-owner ()
   (qq-gateway-message-test-with-state
-    (should-not qq-gateway-message--projection-owner)
     (qq-gateway-message--handle-account-change 'ready nil)
-    (should (equal qq-gateway-message--projection-owner "slot-a"))
     (should (equal (alist-get 'user_id (qq-state-self-info)) "10002"))
     (should (eq (qq-state-connection-status) 'ready))))
 

@@ -100,9 +100,9 @@
       (push (qq-user-photo--note-entry 'empty "No public photos.") entries))
     (nreverse entries)))
 
-(defun qq-user-photo--buffer-name (user-id)
-  "Return photo-wall buffer name for USER-ID."
-  (format "*qq-photos:%s*" user-id))
+(defun qq-user-photo--buffer-name (account-id user-id)
+  "Return ACCOUNT-ID-qualified photo-wall buffer name for USER-ID."
+  (qq-runtime-account-buffer-name "photos" user-id account-id))
 
 (defun qq-user-photo--header-line ()
   "Return dynamic header line for a photo-wall buffer."
@@ -242,7 +242,13 @@
   "Return the live Appkit view owning the current photo-wall buffer."
   (unless qq-user-photo--user-id
     (error "QQ: cannot attach a photo-wall view without a user identity"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner
+          (or qq-runtime--account-id
+              (user-error "qq: photo-wall buffer has no account owner")))
+         (app (qq-runtime-app owner))
+         (sync-function
+          (qq-runtime-account-sync-function
+           owner #'qq-user-photo--sync-invalidations))
          (view-id (qq-user-photo--view-id qq-user-photo--user-id))
          (current (appkit-current-view)))
     (cond
@@ -250,7 +256,7 @@
            (eq app (appkit-view-app current))
            (equal view-id (appkit-view-id current)))
       (setf (appkit-view-sync-function current)
-            #'qq-user-photo--sync-invalidations
+            sync-function
             (appkit-view-parts current) '(photos))
       current)
      ((appkit-view-live-p current)
@@ -261,8 +267,9 @@
               :app app
               :id view-id
               :mode 'qq-user-photo-mode
-              :sync-function #'qq-user-photo--sync-invalidations
+              :sync-function sync-function
               :parts '(photos))))
+        (qq-runtime-bind-account owner)
         (qq-user-photo--setup-view view)
         view)))))
 
@@ -451,13 +458,13 @@ the stable-key projection is reconciled."
   "Open native photo wall for USER-ID titled with DISPLAY-NAME."
   (unless (qq-api-user-id-p user-id)
     (user-error "qq: photo wall requires a decimal string user id"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner (qq-runtime-require-account-id "opening a photo wall"))
          (view
-          (appkit-open-view
-           :app app
+          (qq-runtime-open-account-view
+           :account-id owner
            :id (qq-user-photo--view-id user-id)
            :mode 'qq-user-photo-mode
-           :buffer-name (qq-user-photo--buffer-name user-id)
+           :buffer-name (qq-user-photo--buffer-name owner user-id)
            :sync-function #'qq-user-photo--sync-invalidations
            :parts '(photos)
            :setup #'qq-user-photo--setup-view))

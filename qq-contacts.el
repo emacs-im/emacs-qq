@@ -904,17 +904,27 @@
   (let ((view (appkit-current-view)))
     (and (qq-contacts--view-current-p view (current-buffer)) view)))
 
-(defun qq-contacts--live-view ()
-  "Return the existing live Appkit contacts view, or nil.
+(defun qq-contacts--live-view (&optional account-id)
+  "Return ACCOUNT-ID's existing live Appkit contacts view, or nil.
 
-This registry lookup deliberately does not call `qq-runtime-app'.  State and
+ACCOUNT-ID defaults to the current UI context.  This lookup deliberately
+does not create an account runtime.  State and
 media hooks must not start a QQ application merely to discover that the
 directory is closed, and the registered view remains authoritative when its
 owning buffer has been renamed."
-  (when (appkit-app-live-p qq-runtime--app)
-    (when-let* ((view (appkit-view-for-id
-                       qq-runtime--app qq-contacts--view-id)))
-      (and (qq-contacts--view-current-p view (appkit-view-buffer view)) view))))
+  (when-let* ((owner (or account-id (qq-runtime-current-account-id)))
+              (runtime (qq-runtime-account owner))
+              (app (qq-runtime-account-app runtime))
+              (view (appkit-view-for-id app qq-contacts--view-id)))
+    (and (qq-contacts--view-current-p view (appkit-view-buffer view)) view)))
+
+(defun qq-contacts--live-views ()
+  "Return every live account-scoped contacts view."
+  (delq nil
+        (mapcar
+         (lambda (runtime)
+           (qq-contacts--live-view (qq-runtime-account-id runtime)))
+         (qq-runtime-accounts))))
 
 (defun qq-contacts--ensure-window-avatars (window)
   "Start avatar work only for directory rows visible in WINDOW."
@@ -959,14 +969,20 @@ owning buffer has been renamed."
 
 (defun qq-contacts--ensure-view ()
   "Return the live Appkit view owning the current contacts buffer."
-  (let* ((app (qq-runtime-app))
+  (let* ((owner
+          (or qq-runtime--account-id
+              (user-error "qq: contacts buffer has no account owner")))
+         (app (qq-runtime-app owner))
+         (sync-function
+          (qq-runtime-account-sync-function
+           owner #'qq-contacts--sync-invalidations))
          (current (appkit-current-view)))
     (cond
      ((and (appkit-view-live-p current)
            (eq app (appkit-view-app current))
            (equal qq-contacts--view-id (appkit-view-id current)))
       (setf (appkit-view-sync-function current)
-            #'qq-contacts--sync-invalidations
+            sync-function
             (appkit-view-parts current) '(directory))
       current)
      ((appkit-view-live-p current)
@@ -977,8 +993,9 @@ owning buffer has been renamed."
               :app app
               :id qq-contacts--view-id
               :mode 'qq-contacts-mode
-              :sync-function #'qq-contacts--sync-invalidations
+              :sync-function sync-function
               :parts '(directory))))
+        (qq-runtime-bind-account owner)
         (qq-contacts--setup-view view)
         view)))))
 
@@ -1822,7 +1839,8 @@ user as part of the same backend operation."
   "Invalidate the open directory after relevant state EVENT."
   (when (memq (plist-get event :type)
               '(reset friends-refreshed groups-refreshed sessions-refreshed))
-    (when-let* ((view (qq-contacts--live-view)))
+    (when-let* ((owner (plist-get event :account-id))
+                (view (qq-contacts--live-view owner)))
       (appkit-with-live-view view
         (qq-contacts--queue-view-sync view)))))
 
@@ -1835,10 +1853,10 @@ user as part of the same backend operation."
         (setq keys (list (cons 'friend (match-string 1 media-key))
                          (cons 'member (match-string 1 media-key))
                          (cons 'stranger (match-string 1 media-key)))))
-       ((string-match "\\`group-avatar:\\([1-9][0-9]*\\)\\'" media-key)
+      ((string-match "\\`group-avatar:\\([1-9][0-9]*\\)\\'" media-key)
         (setq keys (list (cons 'group (match-string 1 media-key))))))
       (when keys
-        (when-let* ((view (qq-contacts--live-view)))
+        (dolist (view (qq-contacts--live-views))
           (appkit-with-live-view view
             (qq-contacts--queue-view-sync view keys)))))))
 
@@ -1935,14 +1953,21 @@ user as part of the same backend operation."
 (defun qq-contacts-open ()
   "Open the persistent native QQ contacts directory."
   (interactive)
-  (let* ((app (qq-runtime-app))
+  (let* ((owner
+          (or (qq-runtime-current-account-id)
+              (user-error "qq: select a QQ account first")))
+         (account (qq-gateway-account owner))
+         (_ (unless account
+              (user-error "qq: QQ account does not exist: %s" owner)))
+         (app (qq-runtime-app owner))
          (fresh-p (null (appkit-view-for-id app qq-contacts--view-id)))
          (view
-          (appkit-open-view
-           :app app
+          (qq-runtime-open-account-view
+           :account-id owner
            :id qq-contacts--view-id
            :mode 'qq-contacts-mode
-           :buffer-name qq-contacts-buffer-name
+           :buffer-name
+           (qq-runtime-account-buffer-name "contacts" nil owner)
            :sync-function #'qq-contacts--sync-invalidations
            :parts '(directory)
            :setup #'qq-contacts--setup-view

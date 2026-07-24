@@ -17,6 +17,7 @@
 (require 'qq-gateway)
 (require 'qq-gateway-rpc)
 (require 'qq-gateway-resource)
+(require 'qq-runtime)
 
 (defvar qq-gateway-media-changed-hook nil
   "Hook called with REASON and MEDIA-ID after remote-media state changes.")
@@ -276,9 +277,10 @@ CALLBACK receives the release receipt; ERRBACK receives failure details."
     t))
 
 (defun qq-gateway-media--account-current-p (operation)
-  "Return non-nil when OPERATION still belongs to the selected account slot."
-  (equal (qq-gateway-media-operation-account-id operation)
-         (qq-gateway-current-account-id)))
+  "Return non-nil when OPERATION's stable account still exists."
+  (and (qq-gateway-account
+        (qq-gateway-media-operation-account-id operation))
+       t))
 
 (defun qq-gateway-media-prepare-record-playback
     (media-id callback &optional errback)
@@ -291,7 +293,7 @@ ERRBACK receives a response body and human-readable failure reason.
 Return a cancellable `qq-gateway-media-operation'."
   (unless (qq-gateway-media--id-p media-id)
     (user-error "qq: Record media ID must be an opaque media- UUID"))
-  (let* ((account-id (qq-gateway-current-account-id))
+  (let* ((account-id (qq-runtime-current-account-id))
          (operation
           (qq-gateway-media-operation-create
            :active-p t :media-id media-id :account-id account-id)))
@@ -308,9 +310,9 @@ Return a cancellable `qq-gateway-media-operation'."
           ()
           (if (qq-gateway-media--account-current-p operation)
               t
-            (fail '((code . "account_changed")
-                    (message . "Selected QQ account changed during record playback preparation"))
-                  "Selected QQ account changed during record playback preparation")
+            (fail '((code . "account_removed")
+                    (message . "QQ account was removed during record playback preparation"))
+                  "QQ account was removed during record playback preparation")
             nil))
          (start-request
           (thunk)

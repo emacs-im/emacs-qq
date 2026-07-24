@@ -8,11 +8,11 @@
 
 (ert-deftest qq-guild-channel-inspector-does-not-invent-a-chat-timeline ()
   (let* ((qq-state-change-hook nil)
+         (qq-runtime--context-account-id "slot-a")
          (guild-id "9007199254740993")
          (channel-id "9007199254741999")
-         (app (appkit-start-app 'qq :id (make-symbol "qq-channel-test")))
-         (qq-runtime--app app)
          buffer)
+    (qq-state-select-account "slot-a")
     (qq-state-reset)
     (unwind-protect
         (progn
@@ -34,8 +34,7 @@
                            (avatar_seq . "2")
                            (pinned_at)
                            (latest_sequence . "0"))))))
-          (cl-letf (((symbol-function 'qq-runtime-app) (lambda () app)))
-            (setq buffer (qq-guild-channel-open guild-id channel-id)))
+          (setq buffer (qq-guild-channel-open guild-id channel-id))
           (with-current-buffer buffer
             (should (derived-mode-p 'qq-guild-channel-mode))
             (should-not (appkit-chatbuf-input-start-position))
@@ -43,8 +42,7 @@
             (should (string-match-p "直播频道需要独立" (buffer-string)))))
       (when (buffer-live-p buffer)
         (kill-buffer buffer))
-      (when (appkit-app-live-p app)
-        (appkit-stop-app app))
+      (qq-runtime-stop-account "slot-a" t)
       (qq-state-reset))))
 
 (provide 'qq-guild-channel-test)

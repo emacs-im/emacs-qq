@@ -30,9 +30,6 @@
 (declare-function qq-state-guild-channel-session-key
                   "qq-state" (guild-id channel-id))
 
-(defconst qq-guilds-buffer-name "*qq-guilds*"
-  "Name of the QQ Guild directory buffer.")
-
 (defvar-local qq-guilds--loading nil)
 (defvar-local qq-guilds--error nil)
 (defvar-local qq-guilds--refresh-owner nil)
@@ -342,28 +339,30 @@ GUILD-MATCH-P means the parent Guild itself matched the active filter."
          (and (derived-mode-p 'qq-guilds-mode)
               (eq view (appkit-current-view))))))
 
-(defun qq-guilds--live-view ()
-  "Return the existing live Appkit Guild directory view, or nil.
-
-This registry lookup deliberately does not call `qq-runtime-app'.  State
-hooks must not start a QQ application merely to discover that the directory
-is closed, and the registered view remains authoritative when its owning
-buffer has been renamed."
-  (when (appkit-app-live-p qq-runtime--app)
-    (when-let* ((view (appkit-view-for-id
-                       qq-runtime--app qq-guilds--view-id)))
-      (and (qq-guilds--view-current-p view (appkit-view-buffer view)) view))))
+(defun qq-guilds--live-view (account-id)
+  "Return ACCOUNT-ID's existing live Guild directory view, or nil."
+  (when-let* ((runtime (qq-runtime-account account-id))
+              (view
+               (appkit-view-for-id
+                (qq-runtime-account-app runtime) qq-guilds--view-id)))
+    (and (qq-guilds--view-current-p view (appkit-view-buffer view)) view)))
 
 (defun qq-guilds--ensure-view ()
   "Return the live Appkit view owning the current Guild directory."
-  (let* ((app (qq-runtime-app))
+  (let* ((owner
+          (or qq-runtime--account-id
+              (user-error "qq: Guild directory has no account owner")))
+         (app (qq-runtime-app owner))
+         (sync-function
+          (qq-runtime-account-sync-function
+           owner #'qq-guilds--sync-invalidations))
          (current (appkit-current-view)))
     (cond
      ((and (appkit-view-live-p current)
            (eq app (appkit-view-app current))
            (equal qq-guilds--view-id (appkit-view-id current)))
       (setf (appkit-view-sync-function current)
-            #'qq-guilds--sync-invalidations
+            sync-function
             (appkit-view-parts current) '(directory))
       current)
      ((appkit-view-live-p current)
@@ -374,8 +373,9 @@ buffer has been renamed."
               :app app
               :id qq-guilds--view-id
               :mode 'qq-guilds-mode
-              :sync-function #'qq-guilds--sync-invalidations
+              :sync-function sync-function
               :parts '(directory))))
+        (qq-runtime-bind-account owner)
         (qq-guilds--setup-view view)
         view)))))
 
@@ -489,7 +489,8 @@ buffer has been renamed."
 (defun qq-guilds--handle-state-change (event)
   "Invalidate the open Guild directory after relevant state EVENT."
   (when (memq (plist-get event :type) '(reset guild-directory-refreshed))
-    (when-let* ((view (qq-guilds--live-view)))
+    (when-let* ((owner (plist-get event :account-id))
+                (view (qq-guilds--live-view owner)))
       (appkit-with-live-view view
         (qq-guilds--queue-view-sync view)))))
 
@@ -576,14 +577,16 @@ buffer has been renamed."
 (defun qq-guilds-open ()
   "Open the QQ Guild directory buffer."
   (interactive)
-  (let* ((app (qq-runtime-app))
+  (let* ((owner (qq-runtime-require-account-id "opening the Guild directory"))
+         (app (qq-runtime-app owner))
          (fresh-p (null (appkit-view-for-id app qq-guilds--view-id)))
          (view
-          (appkit-open-view
-           :app app
+          (qq-runtime-open-account-view
+           :account-id owner
            :id qq-guilds--view-id
            :mode 'qq-guilds-mode
-           :buffer-name qq-guilds-buffer-name
+           :buffer-name
+           (qq-runtime-account-buffer-name "guilds" nil owner)
            :sync-function #'qq-guilds--sync-invalidations
            :parts '(directory)
            :setup #'qq-guilds--setup-view

@@ -25,6 +25,7 @@
 (require 'qq-gateway-transport)
 (require 'qq-native-request)
 (require 'qq-protocol)
+(require 'qq-runtime)
 (require 'qq-state)
 
 (cl-defstruct (qq-native--read-operation
@@ -40,38 +41,35 @@
   next-errback
   token)
 
-(defvar qq-native--bootstrap-owner nil
-  "Account owner whose initial directory refresh is running or complete.")
+(cl-defstruct (qq-native--bootstrap
+               (:constructor qq-native--bootstrap-create))
+  "One account's directory bootstrap in a Gateway instance."
+  owner
+  instance-id
+  token
+  pending)
 
-(defvar qq-native--bootstrap-instance-id nil
-  "Gateway instance whose selected-slot bootstrap is running or complete.")
+(defvar qq-native--bootstraps (make-hash-table :test #'equal)
+  "Directory bootstrap state keyed by stable account ID.")
 
-(defvar qq-native--bootstrap-pending 0
-  "Number of recent/directory parts pending for the current bootstrap.")
+(defvar qq-native--observed-account-phases (make-hash-table :test #'equal)
+  "Last observed Native Session phase keyed by stable account ID.")
 
-(defvar qq-native--bootstrap-token nil
-  "Opaque identity of the current bootstrap attempt.")
+(defvar qq-native--recent-resync-contexts (make-hash-table :test #'equal)
+  "One in-flight recent resync context per stable account ID.")
 
-(defvar qq-native--friend-directory-owner nil
-  "Stable account slot that produced the displayed friend directory.")
+(defvar qq-native--recent-requests (make-hash-table :test #'equal)
+  "Newest recent-session request keyed by stable account ID.")
 
-(defvar qq-native--group-directory-owner nil
-  "Stable account slot that produced the displayed group directory.")
-
-(defvar qq-native--observed-account-id nil
-  "Selected account slot whose phase is recorded by the native facade.")
-
-(defvar qq-native--observed-account-phase nil
-  "Last observed phase of `qq-native--observed-account-id'.")
-
-(defvar qq-native--recent-resync-context nil
-  "Selected slot/Gateway context with one lag resync currently in flight.")
-
-(defvar qq-native--recent-request nil
-  "Newest product request allowed to replace the recent-session projection.")
+(defvar qq-native--recent-bootstrap-instances (make-hash-table :test #'equal)
+  "Gateway instance last used to bootstrap each online account's recents.")
 
 (defvar qq-native--read-operations (make-hash-table :test #'equal)
-  "Newest in-flight and coalesced native read intent per session.")
+  "Newest read intent keyed by stable account ID and session.")
+
+(defun qq-native--read-operation-key (owner session-key)
+  "Return read-operation key for OWNER and SESSION-KEY."
+  (list owner session-key))
 
 (defun qq-native--revoke-read-operations (&rest _ignored)
   "Revoke every in-flight or coalesced read intent.
@@ -90,17 +88,17 @@ cancellation cannot reenter the old operation."
       (qq-native-cancel-request request))))
 
 (defun qq-native--revoke-stale-read-operations (&rest _ignored)
-  "Revoke read work when the selected stable account slot has changed."
-  (let ((owner (qq-gateway-current-account-id))
-        stale-p)
+  "Revoke read work whose stable account slot no longer exists."
+  (let (stale)
     (maphash
      (lambda (_session-key operation)
-       (unless (equal owner
-                      (qq-native--read-operation-owner operation))
-         (setq stale-p t)))
+       (unless (qq-gateway-account
+                (qq-native--read-operation-owner operation))
+         (push operation stale)))
      qq-native--read-operations)
-    (when stale-p
-      (qq-native--revoke-read-operations))))
+    (dolist (operation stale)
+      (qq-native-cancel-request
+       (qq-native--read-operation-request operation)))))
 
 
 (defun qq-native-running-p ()
@@ -140,7 +138,7 @@ This never stops or logs out a managed QQ account."
   "Start asynchronous product work through STARTER.
 
 CALLBACK and ERRBACK are product-facing leaf callbacks.  When omitted, OWNER
-defaults to the stable selected account slot; an explicitly supplied nil marks
+defaults to the current UI account; an explicitly supplied nil marks
 global work.  Omitting OWNER without a selected slot is a user error.
 Return one uniform `qq-native-request'."
   (qq-native-request-start
@@ -149,19 +147,12 @@ Return one uniform `qq-native-request'."
    :errback (or errback #'qq-native--default-error)
    :owner (if owner-supplied-p
               owner
-            (or (qq-gateway-current-account-id)
+            (or (qq-runtime-current-account-id)
                 (user-error "qq: Select a QQ account first")))))
 
 (defun qq-native--directory-refresh-success
-    (kind owner callback value)
-  "Record directory KIND observation OWNER, then call CALLBACK with VALUE."
-  (when (equal owner (qq-gateway-current-account-id))
-    (pcase kind
-      ('friends
-       (setq qq-native--friend-directory-owner (copy-sequence owner)))
-      ('groups
-       (setq qq-native--group-directory-owner (copy-sequence owner)))
-      (_ (error "qq: unknown native directory kind %S" kind))))
+    (_kind _owner callback value)
+  "Deliver a completed account-scoped directory VALUE to CALLBACK."
   (when callback
     (funcall callback value)))
 
@@ -171,7 +162,7 @@ Return one uniform `qq-native-request'."
 
 ERRBACK receives the service response and reason.  REFRESH forces the service's
 contact cache."
-  (let ((owner (or (qq-gateway-current-account-id)
+  (let ((owner (or (qq-runtime-current-account-id)
                    (user-error "qq: Select a QQ account first"))))
     (qq-native--start-request
      (lambda (success failure)
@@ -186,7 +177,7 @@ contact cache."
 
 ERRBACK receives the service response and reason.  REFRESH forces the service's
 contact cache."
-  (let ((owner (or (qq-gateway-current-account-id)
+  (let ((owner (or (qq-runtime-current-account-id)
                    (user-error "qq: Select a QQ account first"))))
     (qq-native--start-request
      (lambda (success failure)
@@ -259,11 +250,11 @@ contact cache."
 
 (defun qq-native--apply-recent-page (page observation-token)
   "Normalize and apply recent PAGE for OBSERVATION-TOKEN."
-  (let ((account (qq-gateway-current-account)))
+  (let ((account (qq-gateway-account (alist-get 'account_id page))))
     (unless (and account
                  (equal (alist-get 'account_id account)
                         (alist-get 'account_id page)))
-      (error "qq: recent page no longer belongs to the selected account slot"))
+      (error "qq: recent page no longer belongs to a managed account slot"))
     (qq-state-apply-recent-conversations
      (seq-keep
       (lambda (row)
@@ -273,21 +264,24 @@ contact cache."
      observation-token)))
 
 (defun qq-native-refresh-recent-conversations
-    (&optional callback errback limit)
-  "Refresh the selected account slot's native recent conversations.
+    (&optional callback errback limit account-id)
+  "Refresh ACCOUNT-ID's native recent conversations.
 
 This operation is slot-scoped: a restart of the same managed account does not
 invalidate its result.  CALLBACK receives the resulting state session list;
 ERRBACK receives a service/client error.  LIMIT defaults at the Gateway
-adapter boundary."
-  (let ((account-id (or (qq-gateway-current-account-id)
-                        (user-error "qq: Select a QQ account first")))
-        (observation-token (qq-state-session-summary-observation-start))
+adapter boundary.  ACCOUNT-ID defaults to the current UI account."
+  (let* ((account-id (or account-id (qq-runtime-current-account-id)
+                         (user-error "qq: Select a QQ account first")))
+        (observation-token
+         (qq-runtime-with-account account-id
+           (qq-state-session-summary-observation-start)))
         (error-fn (or errback #'qq-native--default-error))
+        (previous (gethash account-id qq-native--recent-requests))
         request)
-    (when qq-native--recent-request
-      (qq-native-cancel-request qq-native--recent-request))
-    (setq qq-native--recent-request nil)
+    (when previous
+      (qq-native-cancel-request previous))
+    (remhash account-id qq-native--recent-requests)
     (setq request
           (qq-native--start-request
            (lambda (success failure)
@@ -297,26 +291,31 @@ adapter boundary."
               :errback failure
               :limit limit))
            (lambda (page)
-             (when (eq request qq-native--recent-request)
-               (setq qq-native--recent-request nil))
-             (condition-case error-data
-                 (qq-gateway--invoke
-                  callback
-                  (qq-native--apply-recent-page page observation-token))
-               (error
-                (let ((reason (error-message-string error-data)))
-                  (qq-gateway--invoke
-                   error-fn
-                   `((code . "client_projection_failed")
-                     (message . ,reason))
-                   reason)))))
+             (when (eq request
+                       (gethash account-id qq-native--recent-requests))
+               (remhash account-id qq-native--recent-requests))
+             (qq-runtime-with-account account-id
+               (condition-case error-data
+                   (qq-gateway--invoke
+                    callback
+                    (qq-native--apply-recent-page page observation-token))
+                 (error
+                  (let ((reason (error-message-string error-data)))
+                    (qq-gateway--invoke
+                     error-fn
+                     `((code . "client_projection_failed")
+                       (message . ,reason))
+                     reason))))))
            (lambda (body reason)
-             (when (eq request qq-native--recent-request)
-               (setq qq-native--recent-request nil))
-             (qq-gateway--invoke error-fn body reason))
+             (when (eq request
+                       (gethash account-id qq-native--recent-requests))
+               (remhash account-id qq-native--recent-requests))
+             (qq-runtime-with-account account-id
+               (qq-gateway--invoke error-fn body reason)))
            :owner account-id))
     (when (qq-native-request-active-p request)
-      (setq qq-native--recent-request request))
+      (puthash (copy-sequence account-id) request
+               qq-native--recent-requests))
     request))
 
 (defun qq-native--group-profile-from-state (group-id)
@@ -363,13 +362,15 @@ absent, one authoritative group refresh is performed first."
            (when callback
              (funcall callback profile))
          (funcall (or errback #'qq-native--default-error)
-                  nil "group is not present in the selected account")))
+                  nil "group is not present in this account")))
      errback t)))
 
 (defun qq-native-refresh ()
   "Refresh primary native recent and directory data."
   (interactive)
-  (let* ((online-p (equal (alist-get 'phase (qq-gateway-current-account))
+  (let* ((owner (or (qq-runtime-current-account-id)
+                    (user-error "qq: select a QQ account first")))
+         (online-p (equal (alist-get 'phase (qq-gateway-account owner))
                           "online"))
          (contacts-p (and online-p (qq-native-supports-p 'contacts))))
     (delq nil
@@ -492,7 +493,7 @@ locally selected managed account without changing its lifecycle phase."
         (qq-protocol-validate-account-presence
          presence "account presence" 'user-error))
   (let ((account-id
-         (or (qq-gateway-current-account-id)
+         (or (qq-runtime-current-account-id)
              (user-error "qq: Select a managed QQ account first"))))
     (qq-native--start-request
      (lambda (success failure)
@@ -709,7 +710,7 @@ Staging and preparation may run concurrently, but the immutable segment order
 is retained.  This composite request owns preparation operations until they
 produce ready attachments, then owns those attachments until `message.send'
 accepts them.  Cancellation or failure releases everything still owned here."
-  (let* ((owner (or (qq-gateway-current-account-id)
+  (let* ((owner (or (qq-runtime-current-account-id)
                     (user-error "qq: Select a QQ account first")))
          (optimistic-segments (copy-tree segments))
          (resolved (vconcat (copy-tree segments)))
@@ -777,7 +778,7 @@ accepts them.  Cancellation or failure releases everything still owned here."
            (finish t nil receipt))
          (dispatch
            ()
-           (if (not (equal owner (qq-gateway-current-account-id)))
+           (if (not (qq-gateway-account owner))
                (qq-native-cancel-request request)
              (condition-case error-data
                  (let ((token
@@ -804,7 +805,7 @@ accepts them.  Cancellation or failure releases everything still owned here."
                ;; The prepared attachment keeps the bytes alive, so the
                ;; composite never needs to retain the extra resource lease.
                (qq-native--release-send-resource resource-id)
-               (unless (equal owner (qq-gateway-current-account-id))
+               (unless (qq-gateway-account owner)
                  (qq-native-cancel-request request))
                (when active
                  (aset resolved (plist-get plan :index)
@@ -980,7 +981,11 @@ response and reason."
 
 (defun qq-native--read-operation-current-p (session-key operation)
   "Return non-nil when OPERATION still owns SESSION-KEY."
-  (eq operation (gethash session-key qq-native--read-operations)))
+  (eq operation
+      (gethash
+       (qq-native--read-operation-key
+        (qq-native--read-operation-owner operation) session-key)
+       qq-native--read-operations)))
 
 (defun qq-native--read-message-after-p (candidate reference)
   "Return non-nil when CANDIDATE follows REFERENCE in their session timeline.
@@ -1014,7 +1019,10 @@ sequence metadata."
 (defun qq-native--cancel-read-operation (session-key operation)
   "Revoke OPERATION, its queued intent, and its transport token."
   (when (qq-native--read-operation-current-p session-key operation)
-    (remhash session-key qq-native--read-operations))
+    (remhash
+     (qq-native--read-operation-key
+      (qq-native--read-operation-owner operation) session-key)
+     qq-native--read-operations))
   (let ((token (qq-native--read-operation-token operation)))
     (setf (qq-native--read-operation-token operation) nil
           (qq-native--read-operation-next-message operation) nil
@@ -1042,7 +1050,10 @@ and becomes terminal only after the actual queue is empty."
         ;; Publish the successor before leaf delivery so callback reentry sees
         ;; the stable composite request still in flight.
         (qq-native--dispatch-read-operation session-key operation))
-    (remhash session-key qq-native--read-operations)
+    (remhash
+     (qq-native--read-operation-key
+      (qq-native--read-operation-owner operation) session-key)
+     qq-native--read-operations)
     (if success-p
         (qq-native-request-finish
          (qq-native--read-operation-request operation))
@@ -1064,8 +1075,11 @@ and becomes terminal only after the actual queue is empty."
           (qq-native-cancel-request request)
         (qq-native--advance-read-operation session-key operation success-p)
         (if success-p
-            (qq-native-request--invoke callback value)
-          (qq-native-request--invoke callback body value))))))
+            (qq-native-request--invoke-owned
+             (qq-native--read-operation-owner operation) callback value)
+          (qq-native-request--invoke-owned
+           (qq-native--read-operation-owner operation)
+           callback body value))))))
 
 (defun qq-native--dispatch-read-operation (session-key operation)
   "Dispatch OPERATION's current leaf for SESSION-KEY."
@@ -1090,7 +1104,7 @@ and becomes terminal only after the actual queue is empty."
 (defun qq-native--start-mark-message-read (message callback errback)
   "Start one native read report for exact MESSAGE."
   (let* ((session-key (alist-get 'session-key message))
-         (owner (qq-gateway-current-account-id))
+         (owner (qq-runtime-current-account-id))
          request
          operation)
     (condition-case error-data
@@ -1107,7 +1121,8 @@ and becomes terminal only after the actual queue is empty."
                  (lambda ()
                    (qq-native--cancel-read-operation session-key operation))))
           (setf (qq-native--read-operation-request operation) request)
-          (puthash session-key operation qq-native--read-operations)
+          (puthash (qq-native--read-operation-key owner session-key)
+                   operation qq-native--read-operations)
           (qq-native--dispatch-read-operation session-key operation)
           request)
       ((error quit)
@@ -1126,13 +1141,10 @@ receives failure details."
     (user-error
      "qq: Native read report requires a current stable message reference"))
   (let* ((session-key (alist-get 'session-key message))
-         (owner (qq-gateway-current-account-id))
-         (operation (gethash session-key qq-native--read-operations)))
-    (when (and operation
-               (not (equal owner
-                           (qq-native--read-operation-owner operation))))
-      (qq-native--revoke-read-operations)
-      (setq operation nil))
+         (owner (qq-runtime-current-account-id))
+         (operation
+          (gethash (qq-native--read-operation-key owner session-key)
+                   qq-native--read-operations)))
     (cond
      ((null operation)
       (qq-native--start-mark-message-read message callback errback))
@@ -1396,154 +1408,162 @@ the requested page size."
 
 (defun qq-native-message-read-capable-p (message)
   "Return non-nil when MESSAGE is a current, stable read reference."
-  (let ((account (qq-gateway-current-account)))
+  (let ((account (qq-gateway-account (qq-runtime-current-account-id))))
     (and (qq-native-ready-p)
          (qq-native-supports-p 'read-receipt)
          (equal (alist-get 'phase account) "online")
          (qq-gateway-message-read-capable-p message))))
 
 (defun qq-native-presence-capable-p ()
-  "Return non-nil when the selected account can accept presence changes."
+  "Return non-nil when the current account can accept presence changes."
   (and (qq-native-ready-p)
        (qq-native-supports-p 'presence)
-       (let ((account (qq-gateway-current-account)))
+       (let ((account
+              (qq-gateway-account (qq-runtime-current-account-id))))
          (and account
               (equal (alist-get 'phase account) "online")))))
 
-(defun qq-native--bootstrap-complete (token failed-p)
-  "Complete one bootstrap part owned by opaque TOKEN.
+(defun qq-native--bootstrap-complete (owner token failed-p)
+  "Complete one OWNER directory bootstrap part identified by TOKEN."
+  (when-let* ((bootstrap (gethash owner qq-native--bootstraps)))
+    (when (eq token (qq-native--bootstrap-token bootstrap))
+      (if failed-p
+          (remhash owner qq-native--bootstraps)
+        (setf (qq-native--bootstrap-pending bootstrap)
+              (max 0 (1- (qq-native--bootstrap-pending bootstrap)))))
+      t)))
 
-FAILED-P revokes the whole bootstrap context so a later typed account change
-may retry it."
-  (when (eq token qq-native--bootstrap-token)
-    (if failed-p
-        (setq qq-native--bootstrap-instance-id nil
-              qq-native--bootstrap-owner nil
-              qq-native--bootstrap-pending 0
-              qq-native--bootstrap-token nil)
-      (setq qq-native--bootstrap-pending
-            (max 0 (1- qq-native--bootstrap-pending))))
-    t))
+(defun qq-native--bootstrap-success (owner token _value)
+  "Record one successful OWNER bootstrap part identified by TOKEN."
+  (qq-native--bootstrap-complete owner token nil))
 
-(defun qq-native--bootstrap-success (token _value)
-  "Record one successful bootstrap part owned by TOKEN."
-  (qq-native--bootstrap-complete token nil))
-
-(defun qq-native--bootstrap-failure (token _body reason)
-  "Record failed bootstrap TOKEN and report REASON."
-  (when (qq-native--bootstrap-complete token t)
+(defun qq-native--bootstrap-failure (owner token _body reason)
+  "Record failed OWNER bootstrap TOKEN and report REASON."
+  (when (qq-native--bootstrap-complete owner token t)
     (qq-native--default-error nil reason)))
 
-(defun qq-native--invalidate-directory-bootstrap ()
-  "Invalidate Native Session-sensitive observations without blanking state."
-  (setq qq-native--bootstrap-instance-id nil
-        qq-native--bootstrap-owner nil
-        qq-native--bootstrap-pending 0
-        qq-native--bootstrap-token nil
-        qq-native--friend-directory-owner nil
-        qq-native--group-directory-owner nil))
-
-(defun qq-native--observe-account-context (&optional force)
-  "Observe the account phase and invalidate session-sensitive caches when needed.
-
-FORCE marks a typed Gateway ready boundary.  Otherwise stable account identity
-changes and transitions into or out of `online' are the lifecycle boundaries;
-no public Native Session identity or counter is required."
-  (let* ((account (qq-gateway-current-account))
-         (account-id (and account (alist-get 'account_id account)))
-         (phase (and account (alist-get 'phase account)))
-         (slot-changed-p
-          (not (equal account-id qq-native--observed-account-id)))
-         (online-boundary-p
-          (and (not slot-changed-p)
-               (not (equal phase qq-native--observed-account-phase))
-               (or (equal phase "online")
-                   (equal qq-native--observed-account-phase "online")))))
-    (when (or force slot-changed-p online-boundary-p)
-      (qq-native--invalidate-directory-bootstrap))
-    (setq qq-native--observed-account-id
-          (and account-id (copy-sequence account-id))
-          qq-native--observed-account-phase
-          (and phase (copy-sequence phase)))))
-
-(defun qq-native--maybe-bootstrap (&rest _arguments)
-  "Load recent state and live directories for the selected account slot."
-  (qq-native--observe-account-context)
-  (when (qq-gateway-transport-ready-p)
-    (let* ((account (qq-gateway-current-account))
-           (owner (qq-gateway-current-account-id))
+(defun qq-native--maybe-bootstrap-account (owner)
+  "Load live friend and group directories for online account OWNER."
+  (when (and (qq-gateway-transport-ready-p)
+             (qq-native-supports-p 'contacts))
+    (let* ((account (qq-gateway-account owner))
            (instance-id (qq-gateway-transport-gateway-instance-id))
-           (online-p (equal (alist-get 'phase account) "online"))
-           (recent-needed (qq-native-supports-p 'recent-conversations))
-           (contacts-p (and online-p (qq-native-supports-p 'contacts)))
-           (friends-current-p
-            (equal owner qq-native--friend-directory-owner))
-           (groups-current-p
-            (equal owner qq-native--group-directory-owner))
-           (friends-needed
-            (and contacts-p
-                 (or (not (qq-state-friend-categories-loaded-p))
-                     (not friends-current-p))))
-           (groups-needed
-            (and contacts-p
-                 (or (not (qq-state-groups-loaded-p))
-                     (not groups-current-p))))
-           ;; Preserve the old projection while asking the newly-online
-           ;; Native Session to rebuild its source cache.
-           (friends-refresh
-            (and friends-needed
-                 (qq-state-friend-categories-loaded-p)
-                 (not friends-current-p)))
-           (groups-refresh
-            (and groups-needed
-                 (qq-state-groups-loaded-p)
-                 (not groups-current-p)))
-           (part-count (+ (if recent-needed 1 0)
-                          (if friends-needed 1 0)
-                          (if groups-needed 1 0))))
-      (when (and owner instance-id
-                 (> part-count 0)
-                 (not (and (equal owner qq-native--bootstrap-owner)
-                           (equal instance-id
-                                  qq-native--bootstrap-instance-id))))
-        (let ((token (list 'qq-native-bootstrap)))
-          (setq qq-native--bootstrap-instance-id (copy-sequence instance-id)
-                qq-native--bootstrap-owner (copy-sequence owner)
-                qq-native--bootstrap-pending part-count
-                qq-native--bootstrap-token token)
-          (when recent-needed
-            (qq-native-refresh-recent-conversations
-             (apply-partially #'qq-native--bootstrap-success token)
-             (apply-partially #'qq-native--bootstrap-failure token)))
-          (when friends-needed
+           (existing (gethash owner qq-native--bootstraps)))
+      (when (and account instance-id
+                 (equal (alist-get 'phase account) "online")
+                 (not (and existing
+                           (equal
+                            instance-id
+                            (qq-native--bootstrap-instance-id existing)))))
+        (qq-runtime-with-account owner
+          (let* ((token (list 'qq-native-bootstrap owner))
+                 (friends-refresh
+                  (and (qq-state-friend-categories-loaded-p) t))
+                 (groups-refresh (and (qq-state-groups-loaded-p) t))
+                 (bootstrap
+                  (qq-native--bootstrap-create
+                   :owner (copy-sequence owner)
+                   :instance-id (copy-sequence instance-id)
+                   :token token
+                   :pending 2)))
+            ;; Publish before dispatch because preflight errors may settle
+            ;; synchronously.
+            (puthash (copy-sequence owner) bootstrap
+                     qq-native--bootstraps)
             (qq-native-refresh-friend-categories
-             (apply-partially #'qq-native--bootstrap-success token)
-             (apply-partially #'qq-native--bootstrap-failure token)
-             friends-refresh))
-          (when groups-needed
+             (apply-partially
+              #'qq-native--bootstrap-success owner token)
+             (apply-partially
+              #'qq-native--bootstrap-failure owner token)
+             friends-refresh)
             (qq-native-refresh-joined-groups
-             (apply-partially #'qq-native--bootstrap-success token)
-             (apply-partially #'qq-native--bootstrap-failure token)
+             (apply-partially
+              #'qq-native--bootstrap-success owner token)
+             (apply-partially
+              #'qq-native--bootstrap-failure owner token)
              groups-refresh)))))))
 
+(defun qq-native--maybe-bootstrap-all (&rest _arguments)
+  "Load account-scoped directories for every online managed account."
+  (dolist (account (qq-gateway-accounts))
+    (qq-native--maybe-bootstrap-account
+     (alist-get 'account_id account))))
+
 (defun qq-native--handle-ready (_instance-id)
-  "Start a fresh selected-slot bootstrap after typed Gateway ready."
+  "Start fresh account bootstraps after typed Gateway ready."
   ;; Account replacement publishes before this hook.  Discard the prior
   ;; connection's completed context even when the service instance survived,
   ;; because transient conversation events may have arrived while detached.
-  (setq qq-native--recent-resync-context nil)
-  (qq-native--observe-account-context t)
-  (qq-native--maybe-bootstrap))
+  (clrhash qq-native--bootstraps)
+  (clrhash qq-native--observed-account-phases)
+  (clrhash qq-native--recent-resync-contexts)
+  (dolist (account (qq-gateway-accounts))
+    (puthash (alist-get 'account_id account)
+             (alist-get 'phase account)
+             qq-native--observed-account-phases))
+  (qq-native--maybe-bootstrap-all)
+  (clrhash qq-native--recent-bootstrap-instances)
+  (qq-native--bootstrap-managed-recents))
 
-(defun qq-native--handle-account-registry-change (reason _account-id)
+(defun qq-native--managed-recent-bootstrap-failed
+    (account-id _body reason)
+  "Release ACCOUNT-ID's bootstrap marker and report REASON."
+  (remhash account-id qq-native--recent-bootstrap-instances)
+  (qq-native--default-error nil reason))
+
+(defun qq-native--bootstrap-managed-recents ()
+  "Bootstrap recent conversations for every online managed account."
+  (when (and (qq-gateway-transport-ready-p)
+             (qq-native-supports-p 'recent-conversations))
+    (let ((instance-id (qq-gateway-transport-gateway-instance-id)))
+      (dolist (account (qq-gateway-accounts))
+        (let ((account-id (alist-get 'account_id account)))
+          (if (equal (alist-get 'phase account) "online")
+              (unless
+                  (equal instance-id
+                         (gethash account-id
+                                  qq-native--recent-bootstrap-instances))
+                ;; Publish before dispatch because preflight failure callbacks
+                ;; may run synchronously.
+                (puthash (copy-sequence account-id)
+                         (copy-sequence instance-id)
+                         qq-native--recent-bootstrap-instances)
+                (qq-native-refresh-recent-conversations
+                 nil
+                 (apply-partially
+                  #'qq-native--managed-recent-bootstrap-failed account-id)
+                 nil account-id))
+            (remhash account-id qq-native--recent-bootstrap-instances)))))))
+
+(defun qq-native--handle-account-registry-change (reason account-id)
   "Bootstrap after account registry REASON other than typed ready."
   (unless (eq reason 'ready)
-    (qq-native--maybe-bootstrap)))
+    (when account-id
+      (let* ((account (qq-gateway-account account-id))
+             (old-phase
+              (gethash account-id qq-native--observed-account-phases))
+             (new-phase (and account (alist-get 'phase account)))
+             (online-boundary-p
+              (and old-phase
+                   (not (equal old-phase new-phase))
+                   (or (equal old-phase "online")
+                       (equal new-phase "online")))))
+        (when (or (null account) online-boundary-p)
+          (remhash account-id qq-native--bootstraps)
+          (remhash account-id qq-native--recent-resync-contexts))
+        (if account
+            (puthash account-id new-phase
+                     qq-native--observed-account-phases)
+          (remhash account-id qq-native--observed-account-phases))))
+    (qq-native--maybe-bootstrap-all)
+    (qq-native--bootstrap-managed-recents)))
 
-(defun qq-native--recent-resync-complete (context failed-p &rest arguments)
-  "Release lag resync CONTEXT; report failure from ARGUMENTS when FAILED-P."
-  (when (equal context qq-native--recent-resync-context)
-    (setq qq-native--recent-resync-context nil))
+(defun qq-native--recent-resync-complete
+    (account-id context failed-p &rest arguments)
+  "Release ACCOUNT-ID lag resync CONTEXT and optionally report failure."
+  (when (equal context
+               (gethash account-id qq-native--recent-resync-contexts))
+    (remhash account-id qq-native--recent-resync-contexts))
   (when failed-p
     (qq-native--default-error nil (cadr arguments))))
 
@@ -1551,55 +1571,53 @@ no public Native Session identity or counter is required."
   "Coalesce a recent-conversation resync after transient event loss."
   (when (and (qq-gateway-transport-ready-p)
              (qq-native-supports-p 'recent-conversations))
-    (when-let* ((account-id (qq-gateway-current-account-id))
-                (instance-id (qq-gateway-transport-gateway-instance-id)))
-      (let ((context (list instance-id account-id)))
-        (unless (equal context qq-native--recent-resync-context)
-          ;; Publish ownership before starting because a preflight failure
-          ;; reports through the error callback before the starter returns.
-          (setq qq-native--recent-resync-context (copy-tree context))
-          (qq-native-refresh-recent-conversations
-           (apply-partially
-            #'qq-native--recent-resync-complete context nil)
-           (apply-partially
-            #'qq-native--recent-resync-complete context t)))))))
+    (when-let* ((instance-id
+                 (qq-gateway-transport-gateway-instance-id)))
+      (dolist (account (qq-gateway-accounts))
+        (when (equal (alist-get 'phase account) "online")
+          (let* ((account-id (alist-get 'account_id account))
+                 (context (list instance-id account-id)))
+            (unless
+                (equal
+                 context
+                 (gethash account-id qq-native--recent-resync-contexts))
+              ;; Publish before dispatch because preflight errors can settle
+              ;; synchronously.
+              (puthash account-id (copy-tree context)
+                       qq-native--recent-resync-contexts)
+              (qq-native-refresh-recent-conversations
+               (apply-partially
+                #'qq-native--recent-resync-complete
+                account-id context nil)
+               (apply-partially
+                #'qq-native--recent-resync-complete
+                account-id context t)
+               nil account-id))))))))
 
 (defun qq-native-activate ()
-  "Make the selected native account own shared client projection state."
-  (qq-gateway-message-activate-projection)
-  (qq-native--maybe-bootstrap)
+  "Activate account-scoped native projections for all managed accounts."
+  (qq-native--maybe-bootstrap-all)
   t)
 
 (defun qq-native-reset-session-state ()
-  "Revoke account projection and request caches."
-  (setq qq-native--bootstrap-instance-id nil
-        qq-native--bootstrap-owner nil
-        qq-native--bootstrap-pending 0
-        qq-native--bootstrap-token nil
-        qq-native--friend-directory-owner nil
-        qq-native--group-directory-owner nil
-        qq-native--observed-account-id nil
-        qq-native--observed-account-phase nil
-        qq-native--recent-resync-context nil
-        qq-native--recent-request nil)
+  "Revoke account projections and request caches."
+  (clrhash qq-native--bootstraps)
+  (clrhash qq-native--observed-account-phases)
+  (clrhash qq-native--recent-resync-contexts)
+  (clrhash qq-native--recent-requests)
+  (clrhash qq-native--recent-bootstrap-instances)
   (qq-native--revoke-read-operations)
   (qq-native-request-revoke-all)
   (qq-gateway-attachment-reset)
   (qq-gateway-media-reset)
   (qq-gateway-resource-reset)
   (qq-gateway-directory-reset)
-  (qq-gateway-message-revoke-projection))
+  (qq-gateway-message-reset-correlations))
 
-(add-hook 'qq-gateway-current-account-changed-hook
-          #'qq-native--revoke-read-operations)
 (add-hook 'qq-gateway-accounts-changed-hook
           #'qq-native--revoke-stale-read-operations)
-(add-hook 'qq-gateway-current-account-changed-hook
-          #'qq-native-request-revoke-stale)
 (add-hook 'qq-gateway-accounts-changed-hook
           #'qq-native-request-revoke-stale)
-(add-hook 'qq-gateway-current-account-changed-hook
-          #'qq-native--maybe-bootstrap t)
 (add-hook 'qq-gateway-accounts-changed-hook
           #'qq-native--handle-account-registry-change t)
 (add-hook 'qq-gateway-ready-hook #'qq-native--handle-ready t)

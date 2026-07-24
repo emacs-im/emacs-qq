@@ -41,6 +41,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
      (unwind-protect
          (with-temp-buffer
            (qq-user-mode)
+           (setq-local qq-runtime--account-id "slot-a")
            (setq qq-user--user-id "10001")
            (let ((buffer (current-buffer))
                  (view (qq-user--ensure-view)))
@@ -201,9 +202,61 @@ BODY may refer to the lexical variables `buffer' and `view'."
   (should (eq (lookup-key qq-user-mode-map (kbd "p"))
               #'qq-user-open-photo-wall)))
 
-(ert-deftest qq-user-reuses-one-profile-buffer-like-telega ()
-  (should (equal (qq-user--buffer-name "10001") "*qq-user*"))
-  (should (equal (qq-user--buffer-name "10002") "*qq-user*")))
+(ert-deftest qq-user-profile-buffer-name-is-account-qualified ()
+  (should
+   (equal (qq-user--buffer-name "slot-a" "10001")
+          "*qq-user:slot-a:10001*"))
+  (should-not
+   (equal (qq-user--buffer-name "slot-a" "10001")
+          (qq-user--buffer-name "slot-b" "10001"))))
+
+(ert-deftest qq-user-keeps-the-same-profile-independent-in-two-accounts ()
+  (let ((qq-runtime--accounts (make-hash-table :test #'equal))
+        (qq-state--partitions (make-hash-table :test #'equal))
+        buffer-a buffer-b)
+    (unwind-protect
+        (save-window-excursion
+          (cl-letf
+              (((symbol-function 'pop-to-buffer)
+                (lambda (buffer &rest _arguments) buffer))
+               ((symbol-function 'qq-api-get-user)
+                (lambda (user-id callback &optional _errback)
+                  (funcall
+                   callback
+                   `((user_id . ,user-id)
+                     (nickname
+                      . ,(if (equal (qq-runtime-current-account-id) "slot-a")
+                             "Work Alice"
+                           "Personal Alice"))))
+                  'profile-request))
+               ((symbol-function 'qq-api-get-user-like)
+                (lambda (_user-id callback &optional _errback)
+                  (funcall callback 0)
+                  'like-request))
+               ((symbol-function 'qq-api-get-user-photo-wall)
+                (lambda (_user-id callback &optional _errback)
+                  (funcall callback nil)
+                  'photo-request)))
+            (qq-runtime-with-account "slot-a"
+              (setq buffer-a (qq-user-open "10001")))
+            (qq-runtime-with-account "slot-b"
+              (setq buffer-b (qq-user-open "10001"))))
+          (should (buffer-live-p buffer-a))
+          (should (buffer-live-p buffer-b))
+          (should-not (eq buffer-a buffer-b))
+          (with-current-buffer buffer-a
+            (should (equal qq-runtime--account-id "slot-a"))
+            (should (equal (alist-get 'nickname qq-user--profile)
+                           "Work Alice")))
+          (with-current-buffer buffer-b
+            (should (equal qq-runtime--account-id "slot-b"))
+            (should (equal (alist-get 'nickname qq-user--profile)
+                           "Personal Alice"))))
+      (qq-runtime-stop-account "slot-a" t)
+      (qq-runtime-stop-account "slot-b" t)
+      (dolist (buffer (list buffer-a buffer-b))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
 
 (ert-deftest qq-user-open-reuses-renamed-live-view-and-media-hook ()
   (qq-user-test-with-profile-view
@@ -229,7 +282,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
         (should (eq profile qq-user--profile))
         (should (eq hook qq-user--media-hook-function))
         (should (equal renamed (buffer-name buffer)))
-        (should-not (get-buffer (qq-user--buffer-name "10001")))
+        (should-not (get-buffer (qq-user--buffer-name "slot-a" "10001")))
         (setq calls nil)
         (funcall hook "avatar:10001"))
       (should (= 1 (length calls)))
@@ -279,7 +332,7 @@ BODY may refer to the lexical variables `buffer' and `view'."
                 :app (qq-runtime-app)
                 :id qq-user--view-id
                 :mode 'qq-user-mode
-                :buffer-name (qq-user--buffer-name "10001")
+                :buffer-name (qq-user--buffer-name "slot-a" "10001")
                 :sync-function #'qq-user--sync-invalidations
                 :parts '(profile)
                 :setup #'qq-user--setup-view)))
@@ -921,6 +974,7 @@ BODY may refer to the lexical variable `view'."
      (unwind-protect
          (with-temp-buffer
            (qq-user-photo-mode)
+           (setq-local qq-runtime--account-id "slot-a")
            (setq qq-user-photo--user-id "10001")
            (let ((view (qq-user-photo--ensure-view)))
              ,@body))
@@ -1044,6 +1098,7 @@ BODY may refer to the lexical variable `view'."
 
 (ert-deftest qq-user-photo-replacement-runtime-removes-old-account-photo ()
   (let ((qq-runtime--app nil)
+        (qq-runtime--context-account-id "slot-a")
         (calls 0)
         buffer)
     (unwind-protect

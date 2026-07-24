@@ -26,6 +26,7 @@
      (unwind-protect
          (with-temp-buffer
            (qq-guild-user-mode)
+           (setq-local qq-runtime--account-id "slot-a")
            (setq qq-guild-user--guild-id "9007199254740993"
                  qq-guild-user--native-id "144115219000000001")
            (let ((view (qq-guild-user--ensure-view)))
@@ -79,6 +80,7 @@
 
 (ert-deftest qq-guild-user-renamed-live-and-detached-buffer-is-reused ()
   (let ((qq-runtime--app nil)
+        (qq-runtime--context-account-id "slot-a")
         buffer first-view
         (calls 0))
     (unwind-protect
@@ -121,6 +123,7 @@
 
 (ert-deftest qq-guild-user-runtime-replacement-resets-owned-work-via-setup ()
   (let ((qq-runtime--app nil)
+        (qq-runtime--context-account-id "slot-a")
         buffer old-view old-hook new-view new-hook
         cancelled
         (calls 0))

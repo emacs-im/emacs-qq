@@ -13,6 +13,63 @@
          (progn ,@body)
        (qq-state-reset))))
 
+(ert-deftest qq-state-partitions-keep-account-projections-independent ()
+  (let ((qq-state--partitions (make-hash-table :test #'equal))
+        (qq-state--active-account-id nil)
+        (qq-state-change-hook nil))
+    (qq-state-with-account "slot-a"
+      (qq-state-set-self-info
+       '((user_id . "10001") (nickname . "Alice")))
+      (qq-state-upsert-session
+       "private:20001" '((title . "A peer")) nil))
+    (qq-state-with-account "slot-b"
+      (qq-state-set-self-info
+       '((user_id . "10002") (nickname . "Bob")))
+      (qq-state-upsert-session
+       "private:20001" '((title . "B peer")) nil))
+    (qq-state-with-account "slot-a"
+      (should (equal (alist-get 'nickname (qq-state-self-info)) "Alice"))
+      (should
+       (equal (alist-get 'title (qq-state-session "private:20001"))
+              "A peer")))
+    (qq-state-with-account "slot-b"
+      (should (equal (alist-get 'nickname (qq-state-self-info)) "Bob"))
+      (should
+       (equal (alist-get 'title (qq-state-session "private:20001"))
+              "B peer")))
+    (should
+     (equal (sort (qq-state-partition-account-ids) #'string-lessp)
+            '("slot-a" "slot-b")))))
+
+(ert-deftest qq-state-partition-events-carry-stable-account-context ()
+  (let ((qq-state--partitions (make-hash-table :test #'equal))
+        (qq-state--active-account-id nil)
+        (qq-state-change-hook nil)
+        event)
+    (add-hook 'qq-state-change-hook
+              (lambda (value) (setq event value)))
+    (qq-state-with-account "slot-a"
+      (qq-state-set-connection-status 'ready))
+    (should (eq (plist-get event :type) 'connection))
+    (should (equal (plist-get event :account-id) "slot-a"))
+    (should-not (qq-state-active-account-id))))
+
+(ert-deftest qq-state-reset-affects-only-the-addressed-partition ()
+  (let ((qq-state--partitions (make-hash-table :test #'equal))
+        (qq-state--active-account-id nil)
+        (qq-state-change-hook nil))
+    (dolist (account-id '("slot-a" "slot-b"))
+      (qq-state-with-account account-id
+        (qq-state-upsert-session
+         "private:20001" `((title . ,account-id)) nil)))
+    (qq-state-with-account "slot-a"
+      (qq-state-reset)
+      (should-not (qq-state-sessions)))
+    (qq-state-with-account "slot-b"
+      (should
+       (equal (alist-get 'title (qq-state-session "private:20001"))
+              "slot-b")))))
+
 (ert-deftest qq-state-change-hook-errors-are-isolated-after-commit ()
   (qq-test-with-reset
    (let (seen)

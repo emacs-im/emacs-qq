@@ -60,13 +60,14 @@
         (alist-get 'channel-id post)
         (alist-get 'id post)))
 
-(defun qq-guild-forum-post--buffer-name (post)
-  "Return a stable detail buffer name for POST."
+(defun qq-guild-forum-post--buffer-name (account-id post)
+  "Return ACCOUNT-ID-qualified detail buffer name for POST."
   (let* ((title (or (alist-get 'forum-title post) ""))
          (label (if (string-empty-p title)
                     (or (alist-get 'sender-name post) "帖子")
                   title)))
-    (format "*qq-post:%s*" (truncate-string-to-width label 32 nil nil "…"))))
+    (qq-runtime-account-buffer-name
+     "post" (truncate-string-to-width label 32 nil nil "…") account-id)))
 
 (defun qq-guild-forum-post--comment-at-point (&optional position)
   "Return the closed comment represented at POSITION or point."
@@ -523,13 +524,13 @@
   "Open normalized native forum POST and its comment directory."
   (unless (equal (alist-get 'message-type post) "guild-forum-post")
     (user-error "qq: this item is not a native forum post"))
-  (let* ((app (qq-runtime-app))
+  (let* ((owner (qq-runtime-require-account-id "opening a Guild forum post"))
          (view
-          (appkit-open-view
-           :app app
+          (qq-runtime-open-account-view
+           :account-id owner
            :id (qq-guild-forum-post--view-id post)
            :mode 'qq-guild-forum-post-mode
-           :buffer-name (qq-guild-forum-post--buffer-name post)
+           :buffer-name (qq-guild-forum-post--buffer-name owner post)
            :state (alist-get 'id post)
            :sync-function #'qq-guild-forum-post--sync-invalidations
            :parts '(comments header)
