@@ -44,6 +44,47 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
        (when (buffer-live-p buffer)
          (kill-buffer buffer)))))
 
+(ert-deftest qq-root-header-shows-gateway-online-account-before-self-info ()
+  (let ((account
+         '((account_id . "slot-work")
+           (label . "Work")
+           (phase . "online")
+           (uin . "10001"))))
+    (cl-letf (((symbol-function 'qq-state-self-info) #'ignore)
+              ((symbol-function 'qq-state-connection-status)
+               (lambda () 'ready))
+              ((symbol-function 'qq-gateway-current-account)
+               (lambda () account))
+              ((symbol-function 'qq-gateway-accounts)
+               (lambda () (list account))))
+      (should
+       (equal (qq-root--header-line)
+              " emacs-qq  [ready]  Work (10001) — online")))))
+
+(ert-deftest qq-root-header-rejects-stale-self-info-after-account-switch ()
+  (let ((selected
+         '((account_id . "slot-work")
+           (label . "Work")
+           (phase . "online")
+           (uin . "10001")))
+        (other
+         '((account_id . "slot-personal")
+           (label . "Personal")
+           (phase . "stopped")
+           (uin . "20002"))))
+    (cl-letf (((symbol-function 'qq-state-self-info)
+               (lambda ()
+                 '((user_id . "20002") (nickname . "Old account"))))
+              ((symbol-function 'qq-state-connection-status)
+               (lambda () 'ready))
+              ((symbol-function 'qq-gateway-current-account)
+               (lambda () selected))
+              ((symbol-function 'qq-gateway-accounts)
+               (lambda () (list selected other))))
+      (should
+       (equal (qq-root--header-line)
+              " emacs-qq  [ready]  Work (10001) — online · 1/2 online")))))
+
 (ert-deftest qq-root-distinguishes-important-and-muted-unread-sessions ()
   (qq-root-test-with-reset
    (qq-state-upsert-session
@@ -447,6 +488,16 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                     (ert-fail "header invalidation touched an EWOC node"))))
          (appkit-sync-invalidations view))
        (should (equal before (buffer-string)))))))
+
+(ert-deftest qq-root-gateway-account-event-invalidates-only-header ()
+  (qq-root-test-with-reset
+   (qq-root-test-with-live-view
+     (qq-root--handle-gateway-account-change 'changed "slot-a")
+     (let ((invalidations (appkit-view-invalidations-ensure view)))
+       (should (equal '(header)
+                      (appkit-invalidations-parts invalidations)))
+       (should-not (appkit-invalidations-structure-p invalidations))
+       (should-not (appkit-invalidations-entry-keys invalidations))))))
 
 (ert-deftest qq-root-entries-part-reconciles-the-stable-key-projection ()
   (qq-root-test-with-reset

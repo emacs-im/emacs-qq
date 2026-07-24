@@ -21,6 +21,7 @@
 (require 'appkit-ewoc)
 (require 'qq-api)
 (require 'qq-chat)
+(require 'qq-gateway)
 (require 'qq-media)
 (require 'qq-login)
 (require 'qq-runtime)
@@ -113,18 +114,53 @@ of accidentally borrowing the selected chat window."
       (format-time-string "%m-%d %H:%M" (seconds-to-time timestamp))
     ""))
 
+(defun qq-root--account-title (account self-info)
+  "Return the user-facing title for selected ACCOUNT and SELF-INFO.
+
+SELF-INFO may lag behind a Gateway account switch.  Its nickname is therefore
+used only when its QQ number agrees with ACCOUNT."
+  (let* ((account-uin (alist-get 'uin account))
+         (self-uin (alist-get 'user_id self-info))
+         (self-current-p
+          (and self-info
+               account-uin
+               (equal account-uin self-uin)))
+         (nickname (and self-current-p
+                        (alist-get 'nickname self-info)))
+         (label (alist-get 'label account))
+         (uin (or account-uin
+                  (and self-current-p self-uin)))
+         (title (or nickname label uin "Unbound account")))
+    (concat title
+            (if (and uin (not (equal title uin)))
+                (format " (%s)" uin)
+              ""))))
+
 (defun qq-root--header-line ()
   "Return dynamic header line for the root buffer."
   (let* ((self-info (qq-state-self-info))
          (status (qq-state-connection-status))
-         (nickname (alist-get 'nickname self-info))
-         (user-id (alist-get 'user_id self-info)))
+         (account (qq-gateway-current-account))
+         (accounts (qq-gateway-accounts))
+         (online-count
+          (cl-count-if
+           (lambda (snapshot)
+             (equal (alist-get 'phase snapshot) "online"))
+           accounts))
+         (account-count (length accounts))
+         (account-summary
+          (if account
+              (format "%s — %s"
+                      (qq-root--account-title account self-info)
+                      (alist-get 'phase account))
+            (if accounts
+                "no account selected"
+              "no managed account")))
+         (registry-summary
+          (and (> account-count 1)
+               (format " · %d/%d online" online-count account-count))))
     (format " emacs-qq  [%s]  %s%s"
-            status
-            (or nickname "not logged in")
-            (if user-id
-                (format " (%s)" user-id)
-              ""))))
+            status account-summary (or registry-summary ""))))
 
 (defun qq-root--activity-metrics (&optional sessions)
   "Return root activity metrics for SESSIONS or current state."
@@ -775,9 +811,17 @@ pixel-valued alignment follows text scaling."
   "Reconcile the root after the foreground login presentation changes."
   (qq-root--queue-invalidation :structure t))
 
+(defun qq-root--handle-gateway-account-change (&rest _arguments)
+  "Refresh the header after a managed-account projection change."
+  (qq-root--queue-invalidation :part 'header))
+
 (add-hook 'qq-media-cache-update-hook #'qq-root--handle-media-cache-update)
 (add-hook 'qq-state-change-hook #'qq-root--handle-state-change)
 (add-hook 'qq-login-change-hook #'qq-root--handle-login-change)
+(add-hook 'qq-gateway-accounts-changed-hook
+          #'qq-root--handle-gateway-account-change)
+(add-hook 'qq-gateway-current-account-changed-hook
+          #'qq-root--handle-gateway-account-change)
 
 (provide 'qq-root)
 
