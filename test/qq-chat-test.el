@@ -2057,7 +2057,7 @@
             (sender-id . "10001")
             (sender-name . "Renamed User")))
          (expected
-          (list (appkit-name-color-face "u_42")
+          (list (appkit-name-color-face "10001")
                 'qq-msg-user-title)))
     (should (equal expected (qq-chat--message-title-face original)))
     (should
@@ -2867,7 +2867,9 @@
       (should (eq 'ordinary (get-text-property 0 'qq-chat-mention-kind other)))
       (should (eq 'qq-msg-mention-self (get-text-property 0 'face self)))
       (should (eq 'qq-msg-mention-self (get-text-property 0 'face all)))
-      (should (eq 'qq-msg-mention (get-text-property 0 'face other)))
+      (should
+       (equal (list (appkit-name-color-face "10002") 'qq-msg-mention)
+              (get-text-property 0 'face other)))
       (should (equal "90001"
                      (get-text-property 0 'qq-chat-mention-user-id self)))
       (should-not (get-text-property 0 'qq-chat-mention-user-id all))
@@ -5442,7 +5444,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
          (should (equal (appkit-chat-history-window-first-key) current-id))
          (should-not (appkit-chat-history-older-loaded-p)))))))
 
-(ert-deftest qq-chat-native-newer-history-clamps-to-known-live-sequence ()
+(ert-deftest qq-chat-native-newer-group-history-uses-server-frontier-window ()
   (qq-chat-test-with-reset
    (let* ((session-key "group:20001")
           (current-id "7348923749823749900")
@@ -5461,13 +5463,9 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
              qq-chat--gateway-history-start-sequence "81"
              qq-chat--gateway-history-end-sequence "100")
        (qq-chat--set-history-window current-id current-id)
-       (cl-letf (((symbol-function 'qq-core-history-frontier)
-                  (lambda (_session-key)
-                    `(:sequence "105"
-                      :message-id ,latest-id :source live-event)))
-                 ((symbol-function 'qq-core-fetch-history-range)
-                  (lambda (_session start end callback &optional _errback _props)
-                    (setq call (cons start end))
+       (cl-letf (((symbol-function 'qq-core-fetch-group-history-window)
+                  (lambda (_session after callback &optional _errback count)
+                    (setq call (list after count))
                     (puthash
                      session-key
                      (list (qq-chat-test--gateway-message
@@ -5477,14 +5475,19 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                      qq-state--messages-by-session)
                     (funcall
                      callback
-                     `(:requested-start-sequence ,start
-                       :requested-end-sequence ,end
+                     `(:group-history-window-p t
+                       :requested-after-sequence ,after
+                       :history-frontier-sequence "105"
+                       :requested-start-sequence "101"
+                       :requested-end-sequence "105"
+                       :next-after-sequence "105"
+                       :history-at-latest-p t
                        :batch-message-ids (,latest-id)
                        :message-count 1 :added-count 1))
                     nil))
                  ((symbol-function 'qq-chat--ensure-view) #'ignore))
          (qq-chat-load-newer-messages t)
-         (should (equal call '("101" . "105")))
+         (should (equal call (list "100" qq-history-fetch-count)))
          ;; Extending the upper edge must retain the older cursor.  Replacing
          ;; both edges here made a following backward page overlap 81..100.
          (should (equal qq-chat--gateway-history-start-sequence "81"))

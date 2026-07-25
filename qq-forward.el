@@ -495,15 +495,20 @@ the fork-native forward action using an explicit locator-qualified reference."
         'rear-nonsticky '(qq-forward-message qq-forward-entry-id)))
 
 (defun qq-forward--message-reply-target (message)
-  "Return native reply target cons from normalized MESSAGE, or nil."
+  "Return native reply target plist from normalized MESSAGE, or nil."
   (when-let* ((reply
                (seq-find (lambda (segment)
                            (equal (alist-get 'type segment) "reply"))
                          (alist-get 'segments message)))
               (target (alist-get 'target (alist-get 'data reply))))
     (pcase (alist-get 'kind target)
-      ("entry" (cons 'entry (alist-get 'entry_id target)))
-      ("unresolved" (cons 'unresolved (alist-get 'message_id target))))))
+      ("entry"
+       (list :kind 'entry :id (alist-get 'entry_id target)))
+      ("native"
+       (list :kind 'native
+             :id (alist-get 'message_id target)
+             :sequence (alist-get 'sequence target)
+             :sender-name (alist-get 'sender_name target))))))
 
 (defun qq-forward--messages-by-entry (messages)
   "Return an equal-tested native entry id index for MESSAGES."
@@ -519,8 +524,9 @@ context.  A target-content change therefore changes the reply row context and
 causes appkit to redraw that row without a global message-state dependency.
 MESSAGES-BY-ENTRY is the projection-local native entry index."
   (when-let* ((target (qq-forward--message-reply-target message)))
-    (let* ((target-id (cdr target))
-           (source (and (eq (car target) 'entry)
+    (let* ((target-kind (plist-get target :kind))
+           (target-id (plist-get target :id))
+           (source (and (eq target-kind 'entry)
                         (gethash target-id messages-by-entry)))
            (sender (and source
                         (qq-forward--present-string
@@ -536,14 +542,17 @@ MESSAGES-BY-ENTRY is the projection-local native entry index."
                            (truncate-string-to-width preview 56 nil nil t)))
                   ((and preview (not (string-empty-p preview)))
                    (truncate-string-to-width preview 64 nil nil t))
-                  ((and (eq (car target) 'entry) target-id)
+                  ((and (eq target-kind 'entry) target-id)
                    (format "entry %s" target-id))
-                  (target-id (format "unresolved message %s" target-id))
-                  (t "unresolved reply"))))
-      (list :target-kind (car target)
+                  ((plist-get target :sender-name)
+                   (format "%s's message"
+                           (plist-get target :sender-name)))
+                  (target-id (format "native message %s" target-id))
+                  (t "native reply"))))
+      (list :target-kind target-kind
             :target-id target-id
             :jump-entry-id (and source
-                                (eq (car target) 'entry)
+                                (eq target-kind 'entry)
                                 (alist-get 'id source))
             :body body))))
 

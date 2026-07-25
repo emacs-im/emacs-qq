@@ -424,9 +424,11 @@ list are indistinguishable — both mean \"do not claim a count\"."
           (qq-forward-test--native-message
            "3" "message answer" :segments
            '(((kind . "reply")
-              (payload . ((target . ((kind . "unresolved")
+              (payload . ((target . ((kind . "native")
                                      (message_id
-                                      . "9007199254742007031"))))))
+                                      . "9007199254742007031")
+                                     (sequence . "4000000001")
+                                     (sender_name . "Original"))))))
              ((kind . "text") (payload . ((text . "message answer")))))))
          (wrong-domain
           (qq-forward-test--native-message
@@ -444,18 +446,22 @@ list are indistinguishable — both mean \"do not claim a count\"."
            (qq-forward--messages-by-entry qq-forward--messages))
           (entry-target
            (qq-forward--message-reply-target (nth 2 qq-forward--messages)))
-          (unresolved-target
+          (native-target
            (qq-forward--message-reply-target (nth 3 qq-forward--messages)))
           (wrong-target
            (qq-forward--message-reply-target (nth 4 qq-forward--messages))))
-      (should (eq (gethash (cdr entry-target) messages-by-entry)
+      (should (eq (gethash (plist-get entry-target :id) messages-by-entry)
                   (car qq-forward--messages)))
-      (should (equal unresolved-target
-                     '(unresolved . "9007199254742007031")))
+      (should (equal native-target
+                     '(:kind native
+                       :id "9007199254742007031"
+                       :sequence "4000000001"
+                       :sender-name "Original")))
       ;; message_id is diagnostic metadata here.  Even when two snapshots
-      ;; share it, unresolved must not guess the first row.
-      (should-not (gethash (cdr unresolved-target) messages-by-entry))
-      (should-not (gethash (cdr wrong-target) messages-by-entry)))))
+      ;; share it, a native target must not guess the first forward row.
+      (should-not (gethash (plist-get native-target :id) messages-by-entry))
+      (should-not (gethash (plist-get wrong-target :id)
+                           messages-by-entry)))))
 
 (ert-deftest qq-forward-remote-viewer-passes-source-and-isolates-locators ()
   (qq-forward-test--with-clean-viewers

@@ -11,7 +11,8 @@
   '("message.send" "message.poke"
     "message.recall_poke" "message.recall" "message.set_reaction"
     "message.set_essence" "message.set_todo" "message.get_history"
-    "message.get_private_history" "message.mark_read")
+    "message.get_group_history_window" "message.get_private_history"
+    "message.mark_read")
   "Native Gateway capabilities exercised by message tests.")
 
 (defun qq-message-test-account (&optional account-id uin uid)
@@ -196,6 +197,22 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (unsupported_message_count . ,unsupported-count)
     (messages . ,(vconcat (mapcar #'copy-tree (append messages nil))))))
 
+(cl-defun qq-message-test-group-history-window-result
+    (messages after frontier start end next
+              &key caught-up (unsupported-count 0))
+  "Return a closed authoritative group history window result."
+  `((account_id . "slot-a")
+    (requested_after_sequence . ,after)
+    (frontier_sequence . ,frontier)
+    (requested_start_sequence . ,start)
+    (requested_end_sequence . ,end)
+    (response_start_sequence . ,start)
+    (response_end_sequence . ,end)
+    (next_after_sequence . ,next)
+    (caught_up . ,(if caught-up t :false))
+    (unsupported_message_count . ,unsupported-count)
+    (messages . ,(vconcat (mapcar #'copy-tree (append messages nil))))))
+
 (defmacro qq-message-test-with-state (&rest body)
   "Run BODY with one selected account and isolated message projection state."
   (declare (indent 0) (debug t))
@@ -352,7 +369,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
             '((kind . "reply")
               (payload
                . ((target
-                   . ((kind . "unresolved")
+                   . ((kind . "native")
                       (message_id . "7348923749823749111"))))))
             '((kind . "face") (payload . ((id . "178"))))
             '((kind . "record") (payload . ((duration_seconds . 17))))
@@ -1738,6 +1755,71 @@ push carries sequence=40909 and client_sequence=30202."
         (should
          (equal (plist-get callback-meta :requested-start-sequence)
                 "18446744073709551516"))))))
+
+(ert-deftest qq-message-group-history-window-anchors-at-server-frontier ()
+  (qq-message-test-with-state
+    (let (sent-method sent-params callback-meta)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall
+                    callback
+                    (qq-message-test-group-history-window-result
+                     nil nil "100" "81" "100" "100" :caught-up t))
+                   "request-group-window")))
+        (should
+         (equal
+          (qq-message-get-group-history-window
+           "group:8209413637" nil
+           (lambda (meta) (setq callback-meta meta))
+           nil 20)
+          "request-group-window"))
+        (should (equal sent-method "message.get_group_history_window"))
+        (should
+         (equal
+          sent-params
+          '((account_id . "slot-a")
+            (conversation . ((kind . "group")
+                             (group_uin . "8209413637")))
+            (limit . 20))))
+        (should (plist-get callback-meta :group-history-window-p))
+        (should (plist-get callback-meta :history-at-latest-p))
+        (should
+         (equal (plist-get callback-meta :history-frontier-sequence)
+                "100"))
+        (should
+         (equal (plist-get callback-meta :next-after-sequence) "100"))))))
+
+(ert-deftest qq-message-group-history-window-advances-across-unsupported-slots ()
+  (qq-message-test-with-state
+    (let (sent-params callback-meta)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (_method params callback _errback &optional _early)
+                   (setq sent-params params)
+                   (funcall
+                    callback
+                    (qq-message-test-group-history-window-result
+                     nil "100" "140" "101" "120" "120"
+                     :unsupported-count 20))
+                   "request-group-window")))
+        (qq-message-get-group-history-window
+         "group:8209413637" "100"
+         (lambda (meta) (setq callback-meta meta))
+         nil 20)
+        (should (equal (alist-get 'after_sequence sent-params) "100"))
+        (should-not (plist-get callback-meta :history-at-latest-p))
+        (should
+         (equal (plist-get callback-meta :next-after-sequence) "120"))
+        (should
+         (= (plist-get callback-meta :unsupported-message-count) 20))))))
 
 (ert-deftest qq-message-private-history-bootstraps-and-keeps-cursor ()
   (qq-message-test-with-state

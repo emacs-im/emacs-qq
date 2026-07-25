@@ -199,8 +199,8 @@ pushes left optimistic sends stuck without a snowflake."
     (pcase kind
       ("reply"
        `((type . "reply")
-         (data . ((message_id
-                   . ,(alist-get 'message_id (alist-get 'target payload)))))))
+         (data . ,(qq-state--native-reply-data
+                   (alist-get 'target payload)))))
       ("unsupported"
        `((type . "__unsupported")
          (data . ((native_keys . ,(copy-tree (alist-get 'native_keys payload)))
@@ -1101,6 +1101,120 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
      :projector
      (lambda (result)
        (qq-message--merge-history session-key result owner))
+     :callback callback
+     :errback errback)))
+
+(defun qq-message--optional-history-sequence (value context)
+  "Validate optional history sequence VALUE for CONTEXT."
+  (when value
+    (qq-message--validate-sequence value context)))
+
+(defun qq-message--merge-group-history-window
+    (session-key result owner after-sequence)
+  "Validate and merge one forward-capable group history RESULT.
+
+AFTER-SEQUENCE is nil for the authoritative latest-window request and is the
+exclusive sequence cursor for a forward continuation."
+  (unless
+      (and
+       (qq-account--exact-object-keys-p
+        result
+        '(account_id requested_after_sequence frontier_sequence
+          requested_start_sequence requested_end_sequence
+          response_start_sequence response_end_sequence next_after_sequence
+          caught_up unsupported_message_count messages))
+       (equal (alist-get 'account_id result) owner)
+       (memq (alist-get 'caught_up result) '(t :false))
+       (integerp (alist-get 'unsupported_message_count result))
+       (>= (alist-get 'unsupported_message_count result) 0)
+       (listp (alist-get 'messages result)))
+    (error "qq: Gateway returned an invalid group history window"))
+  (let* ((requested-after
+          (qq-message--optional-history-sequence
+           (alist-get 'requested_after_sequence result)
+           "Gateway group history requested cursor"))
+         (frontier
+          (qq-message--validate-sequence
+           (alist-get 'frontier_sequence result)
+           "Gateway group history frontier"))
+         (requested-start
+          (qq-message--optional-history-sequence
+           (alist-get 'requested_start_sequence result)
+           "Gateway group history requested start"))
+         (requested-end
+          (qq-message--optional-history-sequence
+           (alist-get 'requested_end_sequence result)
+           "Gateway group history requested end"))
+         (response-start
+          (qq-message--optional-history-sequence
+           (alist-get 'response_start_sequence result)
+           "Gateway group history response start"))
+         (response-end
+          (qq-message--optional-history-sequence
+           (alist-get 'response_end_sequence result)
+           "Gateway group history response end"))
+         (next
+          (qq-message--validate-sequence
+           (alist-get 'next_after_sequence result)
+           "Gateway group history next cursor"))
+         (caught-up (eq (alist-get 'caught_up result) t)))
+    (unless (equal requested-after after-sequence)
+      (error "qq: Gateway group history echoed another cursor"))
+    (unless (eq (null requested-start) (null requested-end))
+      (error "qq: Gateway group history returned a partial requested range"))
+    (unless (eq (null response-start) (null response-end))
+      (error "qq: Gateway group history returned a partial response range"))
+    (when (and requested-start requested-end)
+      (qq-message--validate-history-range requested-start requested-end)
+      (unless (equal requested-end next)
+        (error "qq: Gateway group history next cursor contradicts its range")))
+    (when (and after-sequence
+               (qq-account--decimal-less-p next after-sequence))
+      (error "qq: Gateway group history cursor moved backwards"))
+    (when (if caught-up
+              (not (equal next frontier))
+            (not (qq-account--decimal-less-p next frontier)))
+      (error "qq: Gateway group history caught-up state contradicts its frontier"))
+    (qq-message--merge-history
+     session-key result owner
+     (list :group-history-window-p t
+           :requested-after-sequence requested-after
+           :history-frontier-sequence frontier
+           :next-after-sequence next
+           :history-at-latest-p caught-up
+           :history-at-oldest-p
+           (and (null after-sequence)
+                (or (equal frontier "0")
+                    (equal requested-start "0")))))))
+
+(defun qq-message-get-group-history-window
+    (session-key after-sequence &optional callback errback limit)
+  "Fetch one authoritative group history window for SESSION-KEY.
+
+Nil AFTER-SEQUENCE anchors a page at the current server frontier.  Otherwise
+it is an exclusive exact cursor and the service advances toward that frontier.
+CALLBACK receives merge metadata including `:next-after-sequence' and
+`:history-at-latest-p'."
+  (unless (eq (qq-state-session-key-type session-key) 'group)
+    (user-error "qq: Group history windows require a group session"))
+  (setq limit (or limit qq-history-fetch-count))
+  (qq-message--validate-history-count limit)
+  (when after-sequence
+    (qq-message--validate-sequence
+     after-sequence "Group history continuation cursor"))
+  (let* ((conversation (qq-message--conversation-params session-key))
+         (owner (qq-message--current-owner)))
+    (qq-message--sync-account owner)
+    (qq-message--call
+     "message.get_group_history_window" owner
+     `((conversation . ,conversation)
+       ,@(when after-sequence
+           `((after_sequence . ,after-sequence)))
+       (limit . ,limit))
+     :projector
+     (lambda (result)
+       (qq-message--merge-group-history-window
+        session-key result owner after-sequence))
      :callback callback
      :errback errback)))
 
