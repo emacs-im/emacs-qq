@@ -3392,6 +3392,89 @@
     (should (equal (plist-get meta :oldest-message-id) "90"))
     (should (= (length (qq-state-session-messages "private:10001")) 2))))
 
+(defun qq-state-test--native-correlated-row
+    (session-key message-id sequence random order &optional local-id text)
+  "Return a normalized native row for correlation regression tests."
+  `((id . ,message-id)
+    (server-id . ,message-id)
+    ,@(when local-id `((local-id . ,local-id)))
+    (session-key . ,session-key)
+    (time . 1784944699)
+    (message-seq . ,sequence)
+    (native-random . ,random)
+    (sender-id . "1105848296")
+    (sender-name . "_WD_")
+    (self-p . t)
+    (status . sent)
+    (segments . (((type . "text")
+                  (data . ((text . ,(or text "image")))))))
+    (preview . ,(or text "image"))
+    (message-type . "group")
+    (group-id . "820941363")
+    (order . ,order)))
+
+(ert-deftest qq-state-native-history-correlation-keeps-live-message-id ()
+  (qq-test-with-reset
+   (let* ((session-key "group:820941363")
+          (live-id "2083983882109904220")
+          (history-id "72057595033281691")
+          (live
+           (qq-state-test--native-correlated-row
+            session-key live-id "105525" 995353755 1 "local-1" "live"))
+          (history
+           (qq-state-test--native-correlated-row
+            session-key history-id "105525" 995353755 2 nil "history")))
+     (qq-state--merge-normalized-message session-key live nil 'event)
+     (qq-state--merge-normalized-message session-key history nil 'history)
+     (let ((messages (qq-state-session-messages session-key)))
+       (should (= (length messages) 1))
+       (should (equal (alist-get 'server-id (car messages)) live-id))
+       (should (equal (alist-get 'local-id (car messages)) "local-1"))
+       (should (equal (alist-get 'preview (car messages)) "history"))))))
+
+(ert-deftest qq-state-live-correlation-promotes-stale-history-message-id ()
+  (qq-test-with-reset
+   (let* ((session-key "group:820941363")
+          (live-id "2083983882109904220")
+          (history-id "72057595033281691")
+          (history
+           (qq-state-test--native-correlated-row
+            session-key history-id "105525" 995353755 1 nil "history"))
+          (live
+           (qq-state-test--native-correlated-row
+            session-key live-id "105525" 995353755 2 "local-1" "live"))
+          previous-anchor)
+     (qq-state--merge-normalized-message session-key history nil 'history)
+     (cl-multiple-value-bind (_merged _mutation previous)
+         (qq-state--merge-normalized-message session-key live nil 'event)
+       (setq previous-anchor previous))
+     (let ((messages (qq-state-session-messages session-key)))
+       (should (= (length messages) 1))
+       (should (equal previous-anchor history-id))
+       (should (equal (alist-get 'server-id (car messages)) live-id))
+       (should (equal (alist-get 'local-id (car messages)) "local-1"))))))
+
+(ert-deftest qq-state-history-revisit-collapses-existing-correlated-send-pair ()
+  (qq-test-with-reset
+   (let* ((session-key "group:820941363")
+          (live-id "2083983882109904220")
+          (history-id "72057595033281691")
+          (live
+           (qq-state-test--native-correlated-row
+            session-key live-id "105525" 995353755 1 "local-1" "live"))
+          (history
+           (qq-state-test--native-correlated-row
+            session-key history-id "105525" 995353755 2 nil "history")))
+     ;; Reproduce a store written by the old projection before correlation
+     ;; became part of the merge transaction.
+     (puthash session-key (list live history) qq-state--messages-by-session)
+     (qq-state--reindex-session-messages session-key (list live history))
+     (qq-state--merge-normalized-message session-key history nil 'history)
+     (let ((messages (qq-state-session-messages session-key)))
+       (should (= (length messages) 1))
+       (should (equal (alist-get 'server-id (car messages)) live-id))
+       (should (equal (alist-get 'local-id (car messages)) "local-1"))))))
+
 (ert-deftest qq-state-history-batch-sorts-store-once ()
   (qq-test-with-reset
    (let ((sort-count 0)

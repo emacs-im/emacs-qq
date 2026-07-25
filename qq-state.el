@@ -1769,11 +1769,10 @@ missing wire identity."
   "Map one validated native reply TARGET to timeline segment data."
   (unless (and (listp target)
                (equal (alist-get 'kind target) "native")
-               (qq-protocol-message-id-p (alist-get 'message_id target)))
+               (qq-account--uint64-decimal-p
+                (alist-get 'sequence target)))
     (error "qq: native reply target is invalid"))
-  `((message_id . ,(alist-get 'message_id target))
-    ,@(when (assq 'sequence target)
-        `((message_seq . ,(alist-get 'sequence target))))
+  `((message_seq . ,(alist-get 'sequence target))
     ,@(when (assq 'sender target)
         `((sender . ,(copy-tree (alist-get 'sender target)))))
     ,@(when (assq 'sender_name target)
@@ -1978,6 +1977,34 @@ pending message model."
                 (null (alist-get 'server-id it))
                 (null (alist-get 'local-id it))
                 (equal (alist-get 'id it) id)))))))
+
+(defun qq-state--native-message-correlation-key (message)
+  "Return MESSAGE's transport-stable correlation key, or nil.
+
+The key is scoped by the caller's session.  It is intentionally not a public
+message identity: group history in some QQ builds exposes a legacy UID in
+place of ContentHead `newId', while sequence plus random remain equal to the
+live push and let the client avoid rendering the same transport record twice."
+  (let ((sequence (alist-get 'message-seq message))
+        (random (alist-get 'native-random message)))
+    (when (and (qq-protocol--nonzero-decimal-string-p sequence)
+               (integerp random)
+               (<= 0 random #xffffffff))
+      (cons sequence random))))
+
+(defun qq-state--native-message-correlation-match
+    (messages message &optional excluded)
+  "Return a transport-correlated row for MESSAGE in MESSAGES, or nil.
+
+EXCLUDED, when non-nil, is ignored.  This lets a caller detect two rows with
+different projected ids but the same native transport record."
+  (when-let* ((key (qq-state--native-message-correlation-key message)))
+    (qq-state--find-message
+     messages
+     (lambda (candidate)
+       (and (not (eq candidate excluded))
+            (equal (qq-state--native-message-correlation-key candidate)
+                   key))))))
 
 (defun qq-state--pending-segment-signature (segment)
   "Return stable optimistic reconciliation signature for one SEGMENT.
@@ -2492,23 +2519,52 @@ delta from being applied twice."
         updated))))
 
 (defun qq-state--merge-normalized-message
-    (session-key message &optional summary-observation-token)
+    (session-key message &optional summary-observation-token source)
   "Merge normalized MESSAGE into SESSION-KEY.
 
 Unread state is deliberately not inferred from message delivery.  The Linux QQ
 kernel's authoritative read-state snapshot is the only source of unread count
 and position, including updates caused by another logged-in client.
 
+SOURCE may be `history'.  A history row transport-correlated with an existing
+live row then enriches that row without replacing its authoritative live
+message id.  Live observations perform the inverse promotion and remove a
+stale correlated history row.
+
 Return three values via `cl-values':
 1. merged local message object
 2. mutation symbol `create' or `update'
-3. previous timeline anchor when a pending local-id is promoted to server-id,
-   else nil"
+3. previous timeline anchor when an identity is promoted or a correlated
+   duplicate is collapsed, else nil"
   (let* ((messages (copy-tree (or (gethash session-key qq-state--messages-by-session) '())))
          (direct (qq-state--direct-message-match messages message))
+         (native-correlation
+          (qq-state--native-message-correlation-match
+           messages message direct))
+         (history-p (eq source 'history))
+         (identity-match
+          (cond
+           ((null direct) native-correlation)
+           ((not (and history-p native-correlation)) direct)
+           ((alist-get 'local-id direct) direct)
+           ((alist-get 'local-id native-correlation) native-correlation)
+           (t direct)))
+         (redundant
+          (and direct native-correlation
+               ;; A live observation makes its direct id authoritative.  For
+               ;; history, collapse an already duplicated pair only when an
+               ;; optimistic local id proves which row came from the live
+               ;; send path; otherwise do not guess between two old ids.
+               (or (not history-p)
+                   (alist-get 'local-id direct)
+                   (alist-get 'local-id native-correlation))
+               (if (eq identity-match direct)
+                   native-correlation
+                 direct)))
          (poke-echo (and (null direct)
+                         (null native-correlation)
                          (qq-state--poke-echo-match messages message)))
-         (existing (or direct
+         (existing (or identity-match
                        poke-echo
                        (qq-state--weak-pending-match messages message)))
          ;; If the real notice won the race, the later synthetic callback must
@@ -2522,16 +2578,24 @@ Return three values via `cl-values':
                   (existing
                    (qq-state--merge-alists existing message))
                   (t message)))
+         (merged
+          (if (and history-p native-correlation existing)
+              (let ((preserved (copy-tree merged)))
+                (dolist (key '(id server-id local-id))
+                  (when (assq key existing)
+                    (setf (alist-get key preserved nil nil #'eq)
+                          (alist-get key existing))))
+                preserved)
+            merged))
          (old-order (and existing (alist-get 'order existing)))
          (previous-anchor
-          (and existing
-               (let ((old-local (alist-get 'local-id existing))
-                     (new-server (alist-get 'server-id merged)))
-                 (and old-local
-                      new-server
-                      (not (equal old-local new-server))
-                      (not (alist-get 'server-id existing))
-                      old-local))))
+          (or (and redundant (qq-state-message-anchor redundant))
+              (and existing
+                   (let ((old-anchor (qq-state-message-anchor existing))
+                         (new-anchor (qq-state-message-anchor merged)))
+                     (and old-anchor new-anchor
+                          (not (equal old-anchor new-anchor))
+                          old-anchor)))))
          (mutation (if existing 'update 'create)))
     (when poke-echo
       (setf (alist-get 'poke-echo-reconciled-p merged nil nil #'eq) t))
@@ -2544,9 +2608,16 @@ Return three values via `cl-values':
                (not (qq-state-message-recalled-p merged)))
       (setq merged (qq-state--as-recalled-message merged)))
     (setq merged (qq-state--materialize-message-patches session-key merged))
+    (when redundant
+      (when-let* ((redundant-id (alist-get 'server-id redundant)))
+        (remhash redundant-id qq-state--message-session-index))
+      (setq messages (delq redundant messages)))
     (if existing
         (setq messages (qq-state--replace-message messages existing merged))
       (push merged messages))
+    (when (and previous-anchor
+               (qq-protocol--nonzero-decimal-string-p previous-anchor))
+      (remhash previous-anchor qq-state--message-session-index))
     (setq messages (qq-state--sort-messages messages))
     (puthash session-key messages qq-state--messages-by-session)
     (qq-state-upsert-session

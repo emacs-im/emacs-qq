@@ -2732,6 +2732,53 @@
        (goto-char (point-min))
        (should (search-forward "hi" nil t))))))
 
+(ert-deftest qq-chat-correlated-duplicate-collapse-keeps-canonical-node ()
+  "A historical duplicate is removed without rekeying onto an existing row."
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((title . "Group")
+      (target-id . "20001")
+      (type . group))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat--set-history-window nil nil)
+     (let* ((legacy-id "72057595033281691")
+            (snowflake "2083983882109904220")
+            (legacy `((server-id . ,legacy-id)
+                      (sender-id . "90001")
+                      (sender-name . "Me")
+                      (time . 100)
+                      (raw-message . "same")))
+            (canonical `((local-id . "local-1")
+                         (server-id . ,snowflake)
+                         (sender-id . "90001")
+                         (sender-name . "Me")
+                         (time . 100)
+                         (raw-message . "same"))))
+       (puthash "group:20001" (list legacy canonical)
+                qq-state--messages-by-session)
+       (qq-chat--sync-timeline)
+       (let ((canonical-node (appkit-chat-timeline-node snowflake)))
+         (should (appkit-chat-timeline-node legacy-id))
+         (should canonical-node)
+         (setq qq-chat--message-selection
+               (qq-chat-test--selection legacy-id))
+         (puthash "group:20001" (list canonical)
+                  qq-state--messages-by-session)
+         (qq-chat--apply-message-state-change
+          (list :type 'message
+                :message-anchor snowflake
+                :previous-anchor legacy-id
+                :message canonical))
+         (should-not (appkit-chat-timeline-node legacy-id))
+         (should (eq canonical-node
+                     (appkit-chat-timeline-node snowflake)))
+         (should
+          (equal (qq-chat--message-selection-anchors) (list snowflake))))))))
+
 (ert-deftest qq-chat-projected-sync-restores-empty-timeline-placeholder ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
@@ -4216,7 +4263,7 @@
                      (funcall callback '(:message-count 0))))
                   ((symbol-function 'qq-chat--note-history-window) #'ignore)
                   ((symbol-function 'qq-chat--finish-jump-if-loaded)
-                   (lambda (_target) nil))
+                   (lambda (_target &optional _sequence) nil))
                   ((symbol-function 'qq-chat--jump-fail)
                    (lambda (target reason)
                      (setq failure (list target reason)))))
@@ -4320,6 +4367,43 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
     (qq-chat--segment-media-meta-line
      '((type . "record") (data . ((duration_seconds . 0)))))
     "")))
+
+(ert-deftest qq-chat-native-record-adapts-state-to-appkit-voice-note ()
+  (let* ((segment
+          '((type . "record")
+            (data
+             . ((media_id
+                 . "media-11223344-5566-7788-99aa-bbccddeeff00")
+                (duration_seconds . 17)
+                (summary . "[语音]")))))
+         (action #'ignore)
+         control)
+    (with-temp-buffer
+      (let ((inhibit-read-only t))
+        (cl-letf (((symbol-function 'qq-media-segment-capabilities)
+                   (lambda (_segment)
+                     '(:open t :status "Playing"
+                       :remote-status "materialized")))
+                  ((symbol-function 'qq-chat--segment-media-card-context)
+                   (lambda (_segment &optional _capabilities)
+                     (list :open-action action)))
+                  ((symbol-function 'qq-media-native-record-playback-state)
+                   (lambda (_segment)
+                     '(:status playing :duration-seconds 17
+                       :played-seconds 4)))
+                  ((symbol-function 'appkit-chat-ins-insert-voice-note)
+                   (lambda (&rest keys)
+                     (setq control keys)
+                     (insert "VOICE-CONTROL\n"))))
+          (qq-chat--insert-segment-media-line segment nil nil)
+          (should (string-match-p "VOICE-CONTROL" (buffer-string)))
+          (should (eq (plist-get control :state) 'playing))
+          (should (= (plist-get control :duration-seconds) 17))
+          (should (= (plist-get control :played-seconds) 4))
+          (should (eq (plist-get control :action) action))
+          ;; The Appkit control owns the duration; the card header no longer
+          ;; duplicates it as a QQ-specific detail.
+          (should-not (string-match-p "(0:17)" (buffer-string))))))))
 
 (ert-deftest qq-chat-media-card-captures-exact-account-owner ()
   "Closing a view keeps app ownership; a same-id app cannot take it over."

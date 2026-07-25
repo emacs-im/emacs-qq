@@ -448,7 +448,8 @@ ordering and pending-send correlation owned by the selected live projection."
       (unless (string-empty-p title)
         (qq-state-upsert-session session-key `((title . ,title)) nil)))
     (cl-multiple-value-bind (merged mutation previous-anchor)
-        (qq-state--merge-normalized-message session-key normalized)
+        (qq-state--merge-normalized-message
+         session-key normalized nil source)
       (when merged
         (apply #'qq-state--emit
                'message
@@ -1008,12 +1009,14 @@ without pretending that it covered a sequence range."
           (unless (string-empty-p title)
             (qq-state-upsert-session session-key `((title . ,title)) nil)))
         (cl-multiple-value-bind (merged _mutation _previous-anchor)
-            (qq-state--merge-normalized-message session-key normalized)
+            (qq-state--merge-normalized-message
+             session-key normalized nil 'history)
           (qq-message--finalize-message-context
            owner native normalized)
           (qq-message--apply-pending-recall owner normalized merged)
           (qq-message--apply-pending-reactions owner normalized merged)
-          (qq-message--apply-pending-essence owner normalized merged))
+          (qq-message--apply-pending-essence owner normalized merged)
+          (setq message-id (alist-get 'server-id merged)))
         (unless (gethash message-id known-ids)
           (cl-incf added)
           (puthash message-id t known-ids))

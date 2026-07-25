@@ -506,7 +506,6 @@ the fork-native forward action using an explicit locator-qualified reference."
        (list :kind 'entry :id (alist-get 'entry_id target)))
       ("native"
        (list :kind 'native
-             :id (alist-get 'message_id target)
              :sequence (alist-get 'sequence target)
              :sender-name (alist-get 'sender_name target))))))
 
@@ -547,7 +546,9 @@ MESSAGES-BY-ENTRY is the projection-local native entry index."
                   ((plist-get target :sender-name)
                    (format "%s's message"
                            (plist-get target :sender-name)))
-                  (target-id (format "native message %s" target-id))
+                  ((plist-get target :sequence)
+                   (format "native message #%s"
+                           (plist-get target :sequence)))
                   (t "native reply"))))
       (list :target-kind target-kind
             :target-id target-id
