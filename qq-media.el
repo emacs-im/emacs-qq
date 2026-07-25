@@ -14,9 +14,9 @@
 (require 'seq)
 (require 'subr-x)
 (require 'appkit-media)
+(require 'qq-account)
 (require 'qq-api)
 (require 'qq-customize)
-(require 'qq-directory)
 (require 'qq-remote-media)
 (require 'qq-rpc)
 (require 'qq-server)
@@ -2043,6 +2043,70 @@ OWNER lifecycle-owns an external player when the primary segment is a video."
       (qq-media-segment-open segment :owner owner)
     (user-error "qq: message has no openable media segment")))
 
+(defun qq-media--avatar-owner ()
+  "Return the managed account owning an avatar request."
+  (let ((owner (qq-runtime-current-account-id)))
+    (unless (and owner (qq-account-get owner))
+      (user-error "qq: avatar resolution requires a managed QQ account"))
+    owner))
+
+(defun qq-media--project-avatar-locator
+    (result owner identity-key identity)
+  "Project RESULT into an HTTPS avatar resource.
+
+OWNER is the requesting account.  IDENTITY-KEY and IDENTITY identify the
+exact user or group whose avatar was requested."
+  (unless
+      (and
+       (qq-account--exact-object-keys-p
+        result (list 'account_id identity-key 'url))
+       (equal (alist-get 'account_id result) owner)
+       (equal (alist-get identity-key result) identity)
+       (qq-account--non-empty-string-p (alist-get 'url result))
+       (string-prefix-p "https://" (alist-get 'url result)))
+    (error "qq: Gateway returned an invalid avatar locator"))
+  `((url . ,(alist-get 'url result))))
+
+(defun qq-media--fetch-avatar-locator
+    (method identity-key identity callback errback)
+  "Resolve one native avatar through METHOD.
+
+IDENTITY-KEY names the exact decimal IDENTITY parameter.  CALLBACK receives
+an owned media resource alist; ERRBACK follows the native RPC convention."
+  (unless (qq-account--canonical-decimal-p identity)
+    (user-error "qq: avatar resolution requires an exact decimal identity"))
+  (let ((owner (qq-media--avatar-owner)))
+    (qq-rpc-call
+     method
+     `((account_id . ,owner) (,identity-key . ,identity))
+     :current-p (lambda () (and (qq-account-get owner) t))
+     :stale-code "account_removed"
+     :stale-message "QQ account was removed during avatar resolution"
+     :projector
+     (lambda (result)
+       (qq-media--project-avatar-locator
+        result owner identity-key identity))
+     :callback
+     (lambda (resource)
+       (qq-runtime-with-account owner
+         (qq-account--invoke callback resource)))
+     :errback
+     (lambda (body reason)
+       (qq-runtime-with-account owner
+         (qq-account--invoke errback body reason))))))
+
+(defun qq-media--fetch-native-user-avatar-locator
+    (user-id callback &optional errback)
+  "Resolve USER-ID's native HTTPS avatar and call CALLBACK."
+  (qq-media--fetch-avatar-locator
+   "contact.get_user_avatar" 'user_uin user-id callback errback))
+
+(defun qq-media--fetch-native-group-avatar
+    (group-id callback &optional errback)
+  "Resolve GROUP-ID's native HTTPS avatar and call CALLBACK."
+  (qq-media--fetch-avatar-locator
+   "contact.get_group_avatar" 'group_uin group-id callback errback))
+
 (defun qq-media--native-user-avatar-resource (user-id)
   "Return an authoritative cached avatar resource for USER-ID, or nil.
 
@@ -2071,7 +2135,7 @@ fallback for identities observed outside that directory."
     (if (and (qq-runtime-current-account-id)
              (member "contact.get_user_avatar"
                      (qq-server-capabilities)))
-        (qq-directory-get-user-avatar user-id done error)
+        (qq-media--fetch-native-user-avatar-locator user-id done error)
       (funcall error nil "native avatar locator is unavailable"))))
 
 (defun qq-media-open-user-avatar (user-id)
@@ -2094,7 +2158,8 @@ fallback for identities observed outside that directory."
   (qq-media--resolve-resource
    (format "group-avatar:%s" group-id)
    (lambda (done)
-     (qq-directory-get-group-avatar group-id done #'qq-api--default-error))
+     (qq-media--fetch-native-group-avatar
+      group-id done #'qq-api--default-error))
    (lambda (resource)
      (qq-media-open-resource
       resource 'image (format "group-avatar:%s" group-id)))))
@@ -2281,7 +2346,7 @@ Use FALLBACK until the preview is available."
   (qq-media--ensure-resource-image
    (format "group-avatar:%s" group-id)
    (lambda (done error)
-     (qq-directory-get-group-avatar group-id done error))
+     (qq-media--fetch-native-group-avatar group-id done error))
    qq-media-avatar-image-height))
 
 (defun qq-media-group-avatar-display-string (group-id)

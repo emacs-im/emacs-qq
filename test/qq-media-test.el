@@ -351,14 +351,92 @@
       (qq-media--native-user-avatar-resource "10001")
       '((url . "https://example.invalid/friend-avatar.png"))))))
 
-(ert-deftest qq-media-native-avatar-resolves-directory-cache-miss ()
+(ert-deftest qq-media-user-avatar-locator-validates-owner-and-identity ()
+  (let (sent-method sent-params resource)
+    (cl-letf (((symbol-function 'qq-runtime-current-account-id)
+               (lambda () "slot-a"))
+              ((symbol-function 'qq-account-get)
+               (lambda (account-id)
+                 (and (equal account-id "slot-a")
+                      '((account_id . "slot-a")))))
+              ((symbol-function 'qq-server-ready-p)
+               (lambda () t))
+              ((symbol-function 'qq-server-capabilities)
+               (lambda () '("contact.get_user_avatar")))
+              ((symbol-function 'qq-server-send)
+               (lambda (method params callback _errback)
+                 (setq sent-method method sent-params params)
+                 (funcall
+                  callback
+                  '((account_id . "slot-a")
+                    (user_uin . "9007199254740999")
+                    (url
+                     . "https://q.qlogo.cn/headimg_dl?dst_uin=9007199254740999&spec=640&img_type=jpg")))
+                 "request-avatar")))
+      (should
+       (equal
+        (qq-media--fetch-native-user-avatar-locator
+         "9007199254740999"
+         (lambda (value) (setq resource value)))
+        "request-avatar"))
+      (should (equal sent-method "contact.get_user_avatar"))
+      (should
+       (equal sent-params
+              '((account_id . "slot-a")
+                (user_uin . "9007199254740999"))))
+      (should
+       (equal
+        resource
+        '((url
+           . "https://q.qlogo.cn/headimg_dl?dst_uin=9007199254740999&spec=640&img_type=jpg")))))))
+
+(ert-deftest qq-media-group-avatar-locator-validates-owner-and-identity ()
+  (let (sent-method sent-params resource)
+    (cl-letf (((symbol-function 'qq-runtime-current-account-id)
+               (lambda () "slot-a"))
+              ((symbol-function 'qq-account-get)
+               (lambda (account-id)
+                 (and (equal account-id "slot-a")
+                      '((account_id . "slot-a")))))
+              ((symbol-function 'qq-server-ready-p)
+               (lambda () t))
+              ((symbol-function 'qq-server-capabilities)
+               (lambda () '("contact.get_group_avatar")))
+              ((symbol-function 'qq-server-send)
+               (lambda (method params callback _errback)
+                 (setq sent-method method sent-params params)
+                 (funcall
+                  callback
+                  '((account_id . "slot-a")
+                    (group_uin . "8209413637")
+                    (url
+                     . "https://p.qlogo.cn/gh/8209413637/8209413637/640/")))
+                 "request-group-avatar")))
+      (should
+       (equal
+        (qq-media--fetch-native-group-avatar
+         "8209413637"
+         (lambda (value) (setq resource value)))
+        "request-group-avatar"))
+      (should (equal sent-method "contact.get_group_avatar"))
+      (should
+       (equal sent-params
+              '((account_id . "slot-a")
+                (group_uin . "8209413637"))))
+      (should
+       (equal
+        resource
+        '((url
+           . "https://p.qlogo.cn/gh/8209413637/8209413637/640/")))))))
+
+(ert-deftest qq-media-native-avatar-resolves-media-cache-miss ()
   (let ((qq-state--friends-by-id (make-hash-table :test #'equal))
         result call)
     (cl-letf (((symbol-function 'qq-account-current-id)
                (lambda () "slot-a"))
               ((symbol-function 'qq-server-capabilities)
                (lambda () '("contact.get_user_avatar")))
-              ((symbol-function 'qq-directory-get-user-avatar)
+              ((symbol-function 'qq-media--fetch-native-user-avatar-locator)
                (lambda (user-id done &optional _error)
                  (setq call user-id)
                  (funcall
@@ -1709,7 +1787,7 @@
     (cl-letf (((symbol-function 'qq-media--cached-image) (lambda (_key) nil))
               ((symbol-function 'qq-api-get-avatar)
                (lambda (&rest _args) (setq api-called t)))
-              ((symbol-function 'qq-directory-get-group-avatar)
+              ((symbol-function 'qq-media--fetch-native-group-avatar)
                (lambda (&rest _args) (setq api-called t))))
       (should (equal (qq-media-avatar-cached-display-string "10001") "@"))
       (should (equal (qq-media-group-avatar-cached-display-string "20001") "#"))
