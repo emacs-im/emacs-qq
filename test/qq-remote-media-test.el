@@ -15,6 +15,21 @@
     "resource.derive_playable_record" "resource.open_local"
     "resource.close_local"))
 
+(cl-defun qq-remote-media-test-part
+    (&key
+     (phase "available")
+     (bytes-done "0")
+     (expected-size "128")
+     (bytes-total "128")
+     resource-id error)
+  "Return one remote-media part fixture."
+  `(,@(when expected-size `((expected_size . ,expected-size)))
+    (phase . ,phase)
+    (bytes_done . ,bytes-done)
+    ,@(when bytes-total `((bytes_total . ,bytes-total)))
+    ,@(when resource-id `((resource_id . ,resource-id)))
+    ,@(when error `((error . ,error)))))
+
 (cl-defun qq-remote-media-test-snapshot
     (&key
      (media-id qq-remote-media-test-id)
@@ -28,7 +43,7 @@
      (updated-at 1784700000)
      (expected-size "128")
      (bytes-total "128")
-     resource-id error)
+     resource-id error thumbnail)
   "Return one closed native remote-media fixture."
   `((media_id . ,media-id)
     (account_id . ,account-id)
@@ -36,14 +51,14 @@
     (segment_index . ,segment-index)
     (kind . "record")
     (duration_seconds . ,duration-seconds)
-    ,@(when expected-size `((expected_size . ,expected-size)))
-    (phase . ,phase)
-    (bytes_done . ,bytes-done)
-    ,@(when bytes-total `((bytes_total . ,bytes-total)))
-    ,@(when resource-id `((resource_id . ,resource-id)))
+    (content
+     . ,(qq-remote-media-test-part
+         :phase phase :bytes-done bytes-done
+         :expected-size expected-size :bytes-total bytes-total
+         :resource-id resource-id :error error))
+    ,@(when thumbnail `((thumbnail . ,thumbnail)))
     (created_at . ,created-at)
-    (updated_at . ,updated-at)
-    ,@(when error `((error . ,error)))))
+    (updated_at . ,updated-at)))
 
 (cl-defun qq-remote-media-test-resource
     (&key
@@ -110,7 +125,8 @@
                  (lambda (method params callback _errback &optional _early)
                    (should (equal method "media.materialize"))
                    (should (equal params
-                                  `((media_id . ,qq-remote-media-test-id))))
+                                  `((media_id . ,qq-remote-media-test-id)
+                                    (part . "content"))))
                    (funcall
                     callback
                     `((media . ,(qq-remote-media-test-snapshot
@@ -124,9 +140,55 @@
            qq-remote-media-test-id
            (lambda (result) (setq delivered result)))
           "materialize-request"))
-        (should (equal (alist-get 'phase delivered) "materializing"))
+        (should
+         (equal
+          (alist-get
+           'phase (qq-remote-media-part delivered 'content))
+          "materializing"))
         (should (qq-remote-media qq-remote-media-test-id))
         (should-not (qq-resource "res-native-silk"))))))
+
+(ert-deftest qq-remote-media-thumbnail-materialization-selects-exact-part ()
+  (qq-remote-media-test-with-state
+    (let (delivered)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-remote-media-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (should (equal method "media.materialize"))
+                   (should
+                    (equal
+                     params
+                     `((media_id . ,qq-remote-media-test-id)
+                       (part . "thumbnail"))))
+                   (let ((snapshot
+                          (qq-remote-media-test-snapshot
+                           :thumbnail
+                           (qq-remote-media-test-part
+                            :phase "materializing"
+                            :expected-size "64"
+                            :bytes-total "64"))))
+                     (setf (alist-get 'kind snapshot) "video")
+                     (funcall callback `((media . ,snapshot))))
+                   "thumbnail-request")))
+        (should
+         (equal
+          (qq-remote-media-materialize-part
+           qq-remote-media-test-id 'thumbnail
+           (lambda (media) (setq delivered media)))
+          "thumbnail-request"))
+        (should
+         (equal
+          (alist-get
+           'phase (qq-remote-media-part delivered 'content))
+          "available"))
+        (should
+         (equal
+          (alist-get
+           'phase (qq-remote-media-part delivered 'thumbnail))
+          "materializing"))))))
 
 (ert-deftest qq-remote-media-await-materialized-follows-events-and-is-locally-cancellable ()
   (qq-remote-media-test-with-state
@@ -147,8 +209,11 @@
                 :resource-id "res-native-silk"
                 :bytes-done "128"
                 :updated-at 1784700001))))
-        (should (equal (alist-get 'resource_id delivered)
-                       "res-native-silk"))
+        (should
+         (equal
+          (alist-get
+           'resource_id (qq-remote-media-part delivered 'content))
+          "res-native-silk"))
         (should-not failed)
         (should-not (qq-request-watch-active-p watch))))))
 
@@ -157,17 +222,18 @@
       (let ((operation
            (qq-remote-media-operation-create
             :active-p t :media-id qq-remote-media-test-id
-            :account-id "slot-a"))
+            :part 'content :account-id "slot-a"))
           canceled)
       (cl-letf (((symbol-function 'qq-rpc-method-available-p)
                  (lambda (method) (equal method "media.cancel")))
-                ((symbol-function 'qq-remote-media-cancel)
-                 (lambda (media-id &optional _callback _errback)
-                   (setq canceled media-id)
+                ((symbol-function 'qq-remote-media-cancel-part)
+                 (lambda (media-id part &optional _callback _errback)
+                   (setq canceled (list media-id part))
                    "cancel-request")))
         (should (qq-remote-media-cancel-operation operation))
         (should-not (qq-remote-media-operation-active-p operation))
-        (should (equal canceled qq-remote-media-test-id))))))
+        (should
+         (equal canceled (list qq-remote-media-test-id 'content)))))))
 
 (ert-deftest qq-remote-media-playback-pipeline-reuses-derived-wav ()
   (qq-remote-media-test-with-state

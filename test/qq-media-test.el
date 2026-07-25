@@ -1710,9 +1710,10 @@
          (account-id "10001"))
     (puthash media-id
              `((media_id . ,media-id)
-               (phase . "materializing")
-               (bytes_done . "4096")
-               (bytes_total . "8192"))
+               (content
+                . ((phase . "materializing")
+                   (bytes_done . "4096")
+                   (bytes_total . "8192"))))
              qq-remote-media--media)
     (cl-letf (((symbol-function 'qq-account-current-id)
                (lambda () account-id))
@@ -1736,6 +1737,51 @@
       (let ((caps (qq-media-segment-capabilities segment)))
         (should (plist-get caps :open))
         (should (equal (plist-get caps :status) "Paused"))))))
+
+(ert-deftest qq-media-native-video-routes-content-and-thumbnail-by-part ()
+  (let* ((media-id "media-11223344-5566-7788-99aa-bbccddeeff00")
+         (segment `((type . "video")
+                    (data . ((width . 640)
+                             (height . 360)
+                             (duration_seconds . 23)
+                             (media_id . ,media-id)))))
+         content-call thumbnail-call)
+    (should
+     (equal
+      (qq-media--segment-resource-key segment)
+      (qq-media--native-video-key media-id)))
+    (should
+     (equal
+      (qq-media-segment-preview-key segment)
+      (qq-media--native-video-thumbnail-key media-id)))
+    (cl-letf (((symbol-function 'qq-media--fetch-native-video-resource)
+               (lambda (called-segment key callback _errback)
+                 (setq content-call (list called-segment key))
+                 (funcall callback '((file . "/tmp/video.mp4")))))
+              ((symbol-function
+                'qq-media--fetch-native-video-thumbnail-resource)
+               (lambda (called-segment key done _error)
+                 (setq thumbnail-call (list called-segment key))
+                 (funcall done '((file . "/tmp/poster.png")))))
+              ((symbol-function 'qq-media--ensure-resource-image)
+               (lambda (_key fetcher _spec &optional _builder)
+                 (funcall fetcher #'ignore #'ignore)
+                 'poster-image))
+              ((symbol-function 'appkit-media-video-preview-display-image)
+               (lambda (image _client) image)))
+      (let (resolved)
+        (qq-media--fetch-segment-resource
+         segment (lambda (resource) (setq resolved resource)) #'ignore)
+        (should (equal resolved '((file . "/tmp/video.mp4"))))
+        (should
+         (equal
+          content-call
+          (list segment (qq-media--native-video-key media-id)))))
+      (should (eq (qq-media-segment-preview-image segment) 'poster-image))
+      (should
+       (equal
+        thumbnail-call
+        (list segment (qq-media--native-video-thumbnail-key media-id)))))))
 
 (ert-deftest qq-media-native-record-second-click-cancels-preparation ()
   (let* ((media-id "media-10213243-5465-7687-98a9-bacbdcedfe0f")
