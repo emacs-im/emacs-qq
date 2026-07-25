@@ -410,8 +410,8 @@ Chat timelines rescale these resources to the shared two-text-line geometry."
   "Directory of LinuxQQ built-in base face PNGs (`<id>.png').
 
 Used as the primary source for inline QQ faces so chat rendering does not
-depend on NapCat `get_base_emoji' succeeding.  Falls back to the API when
-a file is missing (newer / animated faces)."
+depend on a backend request.  When a file is missing, chat rendering keeps
+the textual face description."
   :type 'directory
   :group 'qq)
 

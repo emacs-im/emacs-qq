@@ -4605,27 +4605,6 @@ Lisp booleans and are encoded as JSON true or `:false'."
       #'qq-api--friend-add-callback "submitted" user-id callback errback)
      errback)))
 
-(defun qq-api-get-base-emoji
-    (emoji-id callback &optional errback emoji-type download hints)
-  "Fetch QQ base emoji resource for EMOJI-ID and pass it to CALLBACK.
-
-HINTS may carry native `sticker_id', `sticker_pack_id' and `description'
-needed to resolve newer animated faces absent from static face_config."
-  (qq-api-call
-   "get_base_emoji"
-   `((emoji_id . ,(format "%s" emoji-id))
-     ,@(when emoji-type `((emoji_type . ,emoji-type)))
-     ,@(when-let* ((value (alist-get 'sticker_id hints)))
-         `((sticker_id . ,value)))
-     ,@(when-let* ((value (alist-get 'sticker_pack_id hints)))
-         `((sticker_pack_id . ,value)))
-     ,@(when-let* ((value (alist-get 'description hints)))
-         `((description . ,value)))
-     (download . ,(if (or (null download) download) t :false)))
-   (lambda (response)
-     (funcall callback (qq-api--response-data response)))
-   errback))
-
 (defun qq-api-fetch-custom-face-info (callback &optional errback count)
   "Fetch detailed favorite custom-face resources and pass them to CALLBACK."
   (qq-api-call
