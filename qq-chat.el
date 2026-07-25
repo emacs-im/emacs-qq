@@ -276,6 +276,7 @@ the opposite edge: loading one older page used to discard the known newer
 cursor, and the next forward request would repeat or skip the wrong range."
   (let ((start (plist-get meta :requested-start-sequence))
         (end (plist-get meta :requested-end-sequence))
+        (next (plist-get meta :next-after-sequence))
         (private-cursor (plist-get meta :response-private-cursor)))
     (when (and start end)
       (pcase (or direction 'replace)
@@ -287,6 +288,21 @@ cursor, and the next forward request would repeat or skip the wrong range."
         ('newer
          (setq qq-chat--gateway-history-end-sequence end))
         ('private-older nil)
+        (value
+         (error "qq: Unknown native history direction %S" value)))
+      (setq qq-chat--gateway-history-awaiting-frontier-p nil))
+    ;; A group window can advance across unsupported sequence slots without
+    ;; yielding a visible message.  Its explicit continuation cursor, rather
+    ;; than the last decoded row, is therefore the authoritative newer edge.
+    (when (and (plist-get meta :group-history-window-p) next)
+      (pcase (or direction 'replace)
+        ('replace
+         (unless (and start end)
+           (setq qq-chat--gateway-history-start-sequence next
+                 qq-chat--gateway-history-end-sequence next)))
+        ('newer
+         (setq qq-chat--gateway-history-end-sequence next))
+        ((or 'older 'private-older) nil)
         (value
          (error "qq: Unknown native history direction %S" value)))
       (setq qq-chat--gateway-history-awaiting-frontier-p nil))
@@ -839,19 +855,28 @@ bounds."
             (setq newest id)))))
     (cons oldest newest)))
 
+(defun qq-chat--message-reply-data (message)
+  "Return normalized reply segment data from MESSAGE, or nil."
+  (when-let* ((segment
+               (seq-find
+                (lambda (candidate)
+                  (equal (alist-get 'type candidate) "reply"))
+                (alist-get 'segments message))))
+    (alist-get 'data segment)))
+
 (defun qq-chat--message-reply-id (message)
   "Return reply target message id extracted from MESSAGE segments, or nil."
-  (let ((segments (alist-get 'segments message))
-        reply-id)
-    (while (and segments (not reply-id))
-      (let* ((segment (car segments))
-             (type (alist-get 'type segment))
-             (data (alist-get 'data segment)))
-        (when (equal type "reply")
-          (setq reply-id (or (alist-get 'id data)
-                             (alist-get 'message_id data))))
-        (setq segments (cdr segments))))
-    (and reply-id (format "%s" reply-id))))
+  (when-let* ((data (qq-chat--message-reply-data message))
+              (reply-id (or (alist-get 'id data)
+                            (alist-get 'message_id data))))
+    (format "%s" reply-id)))
+
+(defun qq-chat--message-reply-sequence (message)
+  "Return MESSAGE's conversation-scoped reply seek sequence, or nil."
+  (when-let* ((data (qq-chat--message-reply-data message))
+              (sequence (or (alist-get 'message_seq data)
+                            (alist-get 'sequence data))))
+    (format "%s" sequence)))
 
 (defun qq-chat--message-line-properties (message anchor)
   "Return shared line properties for MESSAGE using ANCHOR."
@@ -3043,10 +3068,13 @@ Return non-nil on success.  When HIGHLIGHT is non-nil, pulse the block."
   (max 1 (or qq-chat-jump-history-count qq-history-fetch-count)))
 
 (defun qq-chat--fetch-history-around
-    (session-key message-id callback &optional errback count)
-  "Fetch native history around MESSAGE-ID."
-  (qq-core-fetch-history-around
-   session-key message-id callback errback count))
+    (session-key message-id callback &optional errback count sequence-hint)
+  "Fetch native history around MESSAGE-ID, optionally using SEQUENCE-HINT."
+  (if sequence-hint
+      (qq-core-fetch-history-around
+       session-key message-id callback errback count sequence-hint)
+    (qq-core-fetch-history-around
+     session-key message-id callback errback count)))
 
 (defun qq-chat--finish-jump-if-loaded (target)
   "If TARGET is rendered, jump+highlight and clear pending jump.
@@ -3065,8 +3093,9 @@ Return non-nil on success."
                (format " (%s)" reason)
              "")))
 
-(defun qq-chat--seek-history-for-jump (session-key target buffer)
-  "Load the fork-native history window centered on TARGET."
+(defun qq-chat--seek-history-for-jump
+    (session-key target buffer &optional sequence-hint)
+  "Load native history centered on TARGET, using optional SEQUENCE-HINT."
   (qq-chat--cancel-initial-history-request)
   (qq-chat--adopt-gateway-message-frontier)
   (let ((owner (qq-chat--begin-around-history-window))
@@ -3096,18 +3125,23 @@ Return non-nil on success."
              (appkit-chat-history-request-end owner)
              (qq-chat--request-callback-sync
               view (lambda () (qq-chat--jump-fail target reason)))))))
-     (qq-chat--jump-history-count))))
+     (qq-chat--jump-history-count)
+     sequence-hint)))
 
-(defun qq-chat-goto-message (message-id &optional no-pop)
+(defun qq-chat-goto-message (message-id &optional no-pop sequence-hint)
   "Goto MESSAGE-ID in the current chatbuf (telega `telega-chatbuf--goto-msg').
 
 Push the message at point onto the pop ring unless NO-POP.  Already loaded
-targets jump immediately; other targets use the fork-native
-`get_msg_history_around' action exactly once."
+targets jump immediately; other targets seek by SEQUENCE-HINT or cached native
+sequence metadata."
   (interactive
-   (list (or (get-text-property (point) 'qq-chat-reply-id)
-             (qq-chat--message-reply-id (qq-chat--message-at-point))
-             (read-string "Message id: "))))
+   (let ((message (qq-chat--message-at-point)))
+     (list (or (get-text-property (point) 'qq-chat-reply-id)
+               (qq-chat--message-reply-id message)
+               (read-string "Message id: "))
+           nil
+           (or (get-text-property (point) 'qq-chat-reply-sequence)
+               (qq-chat--message-reply-sequence message)))))
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
   (let ((id (and message-id (format "%s" message-id)))
@@ -3127,7 +3161,8 @@ targets jump immediately; other targets use the fork-native
       (qq-chat--cancel-open-message-request)
       (setq qq-chat--pending-jump-id id)
       (message "qq: loading…")
-      (qq-chat--seek-history-for-jump session-key id buffer))))
+      (qq-chat--seek-history-for-jump
+       session-key id buffer sequence-hint))))
 
 (defun qq-chat-goto-reply (&optional message)
   "Goto the message that MESSAGE replies to.
@@ -3141,7 +3176,8 @@ telega's `telega-msg-goto-reply-to-message'."
                   (user-error "qq: no message at point")))
          (reply-id (or (qq-chat--message-reply-id msg)
                        (user-error "qq: message is not a reply"))))
-    (qq-chat-goto-message reply-id)))
+    (qq-chat-goto-message
+     reply-id nil (qq-chat--message-reply-sequence msg))))
 
 (defun qq-chat-goto-pop-message ()
   "Pop a message from the jump ring and goto it.
@@ -3159,22 +3195,31 @@ Bound to timeline `x', corresponding to telega's
     (let ((qq-chat--messages-pop-ring nil))
       (qq-chat-goto-message id 'no-pop))))
 
-(defun qq-chat--insert-reply-preview-line (reply-id properties prefix-state)
-  "Insert one inline reply preview line for REPLY-ID.
+(defun qq-chat--insert-reply-preview-line (reply-data properties prefix-state)
+  "Insert one inline reply preview line for normalized REPLY-DATA.
 
 Telega uses `telega-ins--with-props' together with its goto-reply action on the
-reply header.  Here the line is a button (RET / mouse-1) that jumps to REPLY-ID
-via `qq-chat-goto-message'."
-  (let* ((source (qq-chat--message-by-server-id reply-id))
-         (sender (and source (car (qq-chat--message-sender-display-parts source))))
+reply header.  Here the line is a button (RET / mouse-1) that jumps by exact
+message identity plus its conversation-scoped native sequence hint."
+  (let* ((reply-id (or (alist-get 'message_id reply-data)
+                       (alist-get 'id reply-data)))
+         (sequence (or (alist-get 'message_seq reply-data)
+                       (alist-get 'sequence reply-data)))
+         (source (qq-chat--message-by-server-id reply-id))
+         (sender (or (and source
+                          (car (qq-chat--message-sender-display-parts source)))
+                     (alist-get 'sender_name reply-data)))
          (preview (and source (string-trim (or (qq-state-message-preview source) ""))))
          (body (cond
                 ((and sender preview (not (string-empty-p preview)))
                  (format "%s: %s" sender
                          (truncate-string-to-width preview 56 nil nil t)))
-                ((and preview (not (string-empty-p preview)))
-                 (truncate-string-to-width preview 64 nil nil t))
-                (t (format "id %s" reply-id))))
+                 ((and preview (not (string-empty-p preview)))
+                  (truncate-string-to-width preview 64 nil nil t))
+                 (sender (format "%s's message" sender))
+                 ((alist-get 'id reply-data)
+                  (format "id %s" reply-id))
+                 (t (format "message %s" reply-id))))
          (reply-start (point))
          (target (format "%s" reply-id))
          (map (let ((map (make-sparse-keymap)))
@@ -3182,11 +3227,11 @@ via `qq-chat-goto-message'."
                 (define-key map [mouse-1]
                   (lambda ()
                     (interactive)
-                    (qq-chat-goto-message target)))
+                    (qq-chat-goto-message target nil sequence)))
                 (define-key map (kbd "RET")
                   (lambda ()
                     (interactive)
-                    (qq-chat-goto-message target)))
+                    (qq-chat-goto-message target nil sequence)))
                 map)))
     (insert (format "↪ %s\n" body))
     (add-text-properties
@@ -3200,8 +3245,9 @@ via `qq-chat-goto-message'."
                    'button t
                    'category 'default-button
                    'action (lambda (_button)
-                             (qq-chat-goto-message target))
+                             (qq-chat-goto-message target nil sequence))
                    'qq-chat-reply-id target
+                   'qq-chat-reply-sequence sequence
                    'qq-chat-reply-button t)))
     (appkit-ui-apply-line-prefix reply-start (point) prefix-state)))
 
@@ -3266,12 +3312,19 @@ via `qq-chat-goto-message'."
               (buttonize
                text #'qq-chat--open-mention-user target
                (format "Open %s's profile (QQ %s)" label target))
-            text)))
+            text))
+         (color-face
+          (and (eq kind 'ordinary)
+               profile-p
+               (appkit-name-color-face target)))
+         (mention-face
+          (cond
+           ((memq kind '(at-me at-all)) 'qq-msg-mention-self)
+           (color-face (list color-face 'qq-msg-mention))
+           (t 'qq-msg-mention))))
     (add-text-properties
      0 (length display)
-     (list 'face (if (memq kind '(at-me at-all))
-                     'qq-msg-mention-self
-                   'qq-msg-mention)
+     (list 'face mention-face
            'qq-chat-mention-kind kind
            'qq-chat-mention-user-id (and profile-p target)
            'rear-nonsticky '(qq-chat-mention-kind
@@ -4170,8 +4223,10 @@ on the first inline line when the body is pure inline content."
 
 (defun qq-chat--message-sender-color-key (message)
   "Return MESSAGE's stable sender key for shared name coloring."
-  (or (qq-chat--present-string (alist-get 'sender-native-id message))
-      (qq-chat--present-string (alist-get 'sender-id message))
+  ;; Mentions identify users by UIN, so headings use that same immutable key
+  ;; whenever it is available.  Both surfaces then choose one AppKit color.
+  (or (qq-chat--present-string (alist-get 'sender-id message))
+      (qq-chat--present-string (alist-get 'sender-native-id message))
       (qq-chat--message-sender-name message)))
 
 (defun qq-chat--message-title-face (message)
@@ -4285,7 +4340,7 @@ Visual model (telega-inspired; later appkit):
          (insert-date (plist-get context :insert-date))
          (insert-unread (plist-get context :insert-unread))
          (title-face (qq-chat--message-title-face message))
-         (reply-id (qq-chat--message-reply-id message))
+         (reply-data (qq-chat--message-reply-data message))
          (properties (qq-chat--message-line-properties message anchor))
          (status-suffix (qq-chat--status-suffix message))
          (compact (plist-get context :compact))
@@ -4337,8 +4392,9 @@ Visual model (telega-inspired; later appkit):
       ;; Same-sender continuations still need segment-rich bodies (faces,
       ;; images, …).  Never dump plain `preview'/CQ text here — that is what
       ;; produced visible "[face:178]" while the image path already worked.
-      (when reply-id
-        (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
+      (when reply-data
+        (qq-chat--insert-reply-preview-line
+         reply-data properties body-prefix-state))
       (qq-chat--insert-compact-message-body
        message body-prefix-state properties short-time))
      (t
@@ -4346,8 +4402,9 @@ Visual model (telega-inspired; later appkit):
        message properties layout
        :title-face title-face
        :status-suffix status-suffix)
-      (when reply-id
-        (qq-chat--insert-reply-preview-line reply-id properties body-prefix-state))
+      (when reply-data
+        (qq-chat--insert-reply-preview-line
+         reply-data properties body-prefix-state))
       (qq-chat--insert-message-body message body-prefix-state properties)))
     ;; Gray tips and pokes bypass the ordinary heading/body layout.  Give their
     ;; single visual row the same stable selection stripe without manufacturing
@@ -5275,8 +5332,8 @@ batch is authoritative latest history."
     (when newest
       (qq-chat--set-history-window oldest (unless at-latest newest)))))
 
-(defun qq-chat--load-newer-gateway-messages (&optional quiet)
-  "Extend the current native Gateway sequence range toward newer messages."
+(defun qq-chat--load-newer-sequence-gateway-messages (&optional quiet)
+  "Extend a sequence-anchored Gateway range toward newer messages."
   (unless qq-chat--gateway-history-end-sequence
     (user-error "qq: Native history has no newer sequence cursor; refresh first"))
   (let* ((session-key qq-chat--session-key)
@@ -5361,6 +5418,76 @@ batch is authoritative latest history."
                  (appkit-chat-history-request-end owner)
                  (qq-chat--request-callback-sync view)
                  (qq-api--default-error response reason))))))))))
+
+(defun qq-chat--load-newer-group-gateway-messages (&optional quiet)
+  "Extend the current group window using the Gateway's live frontier."
+  (unless qq-chat--gateway-history-end-sequence
+    (user-error "qq: Native group history has no forward cursor; refresh first"))
+  (let* ((session-key qq-chat--session-key)
+         (after-sequence qq-chat--gateway-history-end-sequence)
+         (requested (min 100 (max 1 qq-history-fetch-count)))
+         (buffer (current-buffer))
+         (view (qq-chat--ensure-view))
+         (cursor (appkit-chat-history-window-last-key))
+         (owner (list 'newer-group-history session-key after-sequence))
+         (point-anchor
+          (and (not (appkit-chatbuf-point-in-input-p))
+               (get-text-property (point) 'qq-chat-message-anchor)))
+         (point-anchor-offset 0))
+    (when point-anchor
+      (when-let* ((anchor-pos (qq-chat--message-position point-anchor)))
+        (setq point-anchor-offset (- (point) anchor-pos))))
+    (appkit-chat-history-request-begin 'newer owner)
+    (when view
+      (appkit-request-sync view :part 'frame))
+    (qq-core-fetch-group-history-window
+     session-key after-sequence
+     (lambda (meta)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (when (and (equal qq-chat--session-key session-key)
+                      (appkit-chat-history-request-current-p owner))
+             ;; Settle the request before projection.  Any render scheduled by
+             ;; state merging can now observe an idle history controller.
+             (appkit-chat-history-request-end owner)
+             (qq-chat--record-gateway-history-range meta 'newer)
+             (let* ((bounds (qq-chat--history-batch-bounds meta))
+                    (newest (cdr bounds))
+                    (added (or (plist-get meta :added-count) 0))
+                    (caught-up (plist-get meta :history-at-latest-p)))
+               (when caught-up
+                 (setq qq-chat--remote-latest-id
+                       (or newest qq-chat--remote-latest-id)))
+               (qq-chat--set-history-window
+                (appkit-chat-history-window-first-key)
+                (unless caught-up (or newest cursor)))
+               (qq-chat--request-callback-sync
+                view
+                (and point-anchor
+                     (lambda ()
+                       (when-let* ((anchor-pos
+                                    (qq-chat--message-position point-anchor)))
+                         (goto-char (+ anchor-pos point-anchor-offset))))))
+               (unless quiet
+                 (if caught-up
+                     (message "qq: newer native group history caught up")
+                   (message "qq: loaded %d newer native group message%s"
+                            added (if (= added 1) "" "s")))))))))
+     (lambda (response reason)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (when (and (equal qq-chat--session-key session-key)
+                      (appkit-chat-history-request-current-p owner))
+             (appkit-chat-history-request-end owner)
+             (qq-chat--request-callback-sync view)
+             (qq-api--default-error response reason)))))
+     requested)))
+
+(defun qq-chat--load-newer-gateway-messages (&optional quiet)
+  "Extend the current Gateway history window toward newer messages."
+  (if (eq (qq-state-session-key-type qq-chat--session-key) 'group)
+      (qq-chat--load-newer-group-gateway-messages quiet)
+    (qq-chat--load-newer-sequence-gateway-messages quiet)))
 
 (defun qq-chat-load-newer-messages (&optional quiet)
   "Extend the current contiguous history window by one newer page."
@@ -6384,18 +6511,26 @@ never installed."
              (unavailable
               (plist-get meta :history-frontier-unavailable))
              (_range (qq-chat--record-gateway-history-range meta))
-             (frontier (qq-core-history-frontier session-key))
+             (group-window-p
+              (plist-get meta :group-history-window-p))
+             (frontier
+              (unless group-window-p
+                (qq-core-history-frontier session-key)))
              (frontier-id (plist-get frontier :message-id))
-             (frontier-sequence (plist-get frontier :sequence))
+             (frontier-at-start
+              (plist-get owner :remote-latest-id))
+             (observed-frontier qq-chat--remote-latest-id)
+             (live-advanced
+              (not (equal observed-frontier frontier-at-start)))
              (bounds (qq-chat--history-batch-bounds meta))
              (oldest (car bounds))
-             (newest (cdr bounds)))
-        (when (and frontier-sequence
-                   qq-chat--gateway-history-end-sequence
-                   (qq-core-history-range-after
-                    qq-chat--gateway-history-end-sequence
-                    1 frontier-sequence))
-          (setq qq-chat--gateway-history-end-sequence frontier-sequence))
+             (newest (cdr bounds))
+             (latest-id
+              (cond
+               (live-advanced observed-frontier)
+               (group-window-p newest)
+               (frontier-id frontier-id)
+               (t newest))))
         (cond
          (unavailable
           (setq qq-chat--remote-latest-id nil)
@@ -6404,10 +6539,10 @@ never installed."
           ;; have older history.  The first live event installs its sequence.
           (appkit-chat-history-older-loaded-set nil))
          ((or oldest
-              (and frontier-id
-                   (qq-chat--message-by-server-id frontier-id)))
-          (setq oldest (or oldest frontier-id)
-                qq-chat--remote-latest-id (or frontier-id newest))
+              (and latest-id
+                   (qq-chat--message-by-server-id latest-id)))
+          (setq oldest (or oldest latest-id)
+                qq-chat--remote-latest-id latest-id)
           (qq-chat--set-history-window oldest nil)
           (appkit-chat-history-older-loaded-set
            (or (plist-get meta :history-at-oldest-p)
@@ -6440,15 +6575,17 @@ never installed."
 When GOTO-LATEST-P is non-nil, move to the attached live edge after the
 accepted Appkit projection."
   (let* ((frontier (qq-core-history-frontier session-key))
+         (remote-latest-id (plist-get frontier :message-id))
          (owner (list :kind 'initial-gateway-history
                       :session-key session-key
                       :view (with-current-buffer buffer
                               (qq-chat--ensure-view))
+                      :remote-latest-id remote-latest-id
                       :goto-latest-p goto-latest-p)))
     (with-current-buffer buffer
       (qq-chat--cancel-initial-history-request)
       (appkit-chat-history-window-clear)
-      (setq qq-chat--remote-latest-id (plist-get frontier :message-id)
+      (setq qq-chat--remote-latest-id remote-latest-id
             qq-chat--gateway-history-start-sequence nil
             qq-chat--gateway-history-end-sequence nil
             qq-chat--gateway-private-history-cursor nil

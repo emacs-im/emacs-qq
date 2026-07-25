@@ -1295,7 +1295,20 @@ prefixed by optional PROPERTIES."
       (lambda (meta)
         (funcall success
                  (apply #'qq-core--history-meta meta properties)))
-      failure
+       failure
+       (min 100 (max 1 (or count qq-history-fetch-count)))))
+   callback errback))
+
+(defun qq-core-fetch-group-history-window
+    (session-key after-sequence callback &optional errback count)
+  "Fetch a server-frontier group window for SESSION-KEY.
+
+Nil AFTER-SEQUENCE requests the latest page.  A non-nil exact sequence is an
+exclusive forward cursor returned by an earlier window."
+  (qq-core--start-request
+   (lambda (success failure)
+     (qq-message-get-group-history-window
+      session-key after-sequence success failure
       (min 100 (max 1 (or count qq-history-fetch-count)))))
    callback errback))
 
@@ -1303,55 +1316,34 @@ prefixed by optional PROPERTIES."
     (session-key callback &optional errback count)
   "Fetch the native service's latest known history for SESSION-KEY.
 
-Native group history uses the directory's exact latest sequence.  Native
-private history starts from the service clock through `SsoGetRoamMsg' and does
-not require a live message sequence.  ERRBACK handles failure and COUNT limits
-the requested page size."
-  (let* ((kind (qq-state-session-key-type session-key))
-         (frontier (qq-core-history-frontier session-key))
-         (sequence (plist-get frontier :sequence)))
-    (cond
-     ((eq kind 'private)
-      (qq-core-fetch-private-history-page
-       session-key nil callback errback count
-       (list :history-at-latest-p t)))
-     (sequence
-      (pcase-let ((`(,start-sequence . ,end-sequence)
-                   (qq-message-history-range-ending-at
-                    sequence
-                    (min 100 (max 1 (or count qq-history-fetch-count))))))
-        (qq-core-fetch-history-range
-         session-key start-sequence end-sequence callback errback
-         (list :history-at-latest-p t :history-frontier frontier))))
-     ((plist-get frontier :empty-p)
-      (qq-account--invoke
-       callback
-       (qq-core--history-meta
-        (list :session-key session-key
-              :message-count 0 :added-count 0 :batch-message-ids nil)
-        :history-at-latest-p t :history-at-oldest-p t
-        :history-frontier frontier))
-      nil)
-     (t
-      (qq-account--invoke
-       callback
-       (qq-core--history-meta
-        (list :session-key session-key
-              :message-count 0 :added-count 0 :batch-message-ids nil)
-        :history-frontier-unavailable
-        (plist-get frontier :unavailable-reason)
-        :history-frontier frontier))
-      nil))))
+Group history asks the service for an authoritative frontier and page in one
+operation; it never trusts a possibly stale contact-directory sequence.
+Private history starts from the service clock through `SsoGetRoamMsg'.
+ERRBACK handles failure and COUNT limits the requested page size."
+  (pcase (qq-state-session-key-type session-key)
+    ('group
+     (qq-core-fetch-group-history-window
+      session-key nil callback errback count))
+    ('private
+     (qq-core-fetch-private-history-page
+      session-key nil callback errback count
+      (list :history-at-latest-p t)))
+    (_
+     (user-error "qq: Native history supports private and group chats"))))
 
 (defun qq-core-fetch-history-around
-    (session-key message-id callback &optional errback count)
-  "Fetch native history around exact MESSAGE-ID in SESSION-KEY."
+    (session-key message-id callback &optional errback count sequence-hint)
+  "Fetch native history around exact MESSAGE-ID in SESSION-KEY.
+
+SEQUENCE-HINT is conversation-scoped metadata carried by a native reply.
+It is used only when the target message is not already cached."
   (let* ((message
           (seq-find
            (lambda (candidate)
              (equal (alist-get 'server-id candidate) message-id))
            (qq-state-session-messages session-key)))
-         (sequence (alist-get 'message-seq message)))
+         (sequence (or (alist-get 'message-seq message)
+                       sequence-hint)))
     (if (not sequence)
         (qq-account--client-error
          (or errback #'qq-core--default-error)
@@ -1391,7 +1383,9 @@ the requested page size."
     (mention "message.send")
     (poke "message.poke")
     (recall "message.recall")
-    (explicit-history "message.get_history" "message.get_private_history")
+    (explicit-history "message.get_history"
+                      "message.get_group_history_window"
+                      "message.get_private_history")
     (read-receipt "message.mark_read"))
   "Product capabilities and every required negotiated Gateway method.")
 

@@ -1765,6 +1765,22 @@ missing wire identity."
       ,@(when (equal state "resolvable")
           `((resolver . ,(copy-tree (alist-get 'resolver remote))))))))
 
+(defun qq-state--native-reply-data (target)
+  "Map one validated native reply TARGET to timeline segment data."
+  (unless (and (listp target)
+               (equal (alist-get 'kind target) "native")
+               (qq-protocol-message-id-p (alist-get 'message_id target)))
+    (error "qq: native reply target is invalid"))
+  `((message_id . ,(alist-get 'message_id target))
+    ,@(when (assq 'sequence target)
+        `((message_seq . ,(alist-get 'sequence target))))
+    ,@(when (assq 'sender target)
+        `((sender . ,(copy-tree (alist-get 'sender target)))))
+    ,@(when (assq 'sender_name target)
+        `((sender_name . ,(alist-get 'sender_name target))))
+    ,@(when (assq 'sent_at target)
+        `((sent_at . ,(alist-get 'sent_at target))))))
+
 (defun qq-state--emacs-search-segment-to-internal (segment)
   "Map one validated fork-native search SEGMENT to the timeline model."
   (let ((kind (alist-get 'kind segment))
@@ -1775,13 +1791,8 @@ missing wire identity."
          (data . ,(qq-state--emacs-video-segment-data payload))))
       ("reply"
        (let ((target (alist-get 'target payload)))
-         (unless (equal (alist-get 'kind target) "unresolved")
-           (error "qq: search snapshot reply must use an unresolved target"))
          `((type . "reply")
-           (data
-            . ,(if-let* ((message-id (alist-get 'message_id target)))
-                   `((message_id . ,message-id))
-                 nil)))))
+           (data . ,(qq-state--native-reply-data target)))))
       ("forward"
        `((type . "forward")
          (data . ((content . ,(copy-tree (alist-get 'content payload)))))))

@@ -1627,14 +1627,11 @@
   (should-not
    (qq-core-history-range-after "100" 20 "100")))
 
-(ert-deftest qq-core-latest-history-uses-authoritative-range ()
-  (let (sent properties callback-meta)
-    (cl-letf (((symbol-function 'qq-core-history-frontier)
-               (lambda (_session-key)
-                 '(:sequence "9007199254741005" :authoritative-p t)))
-              ((symbol-function 'qq-core-fetch-history-range)
-               (lambda (_session start end callback _errback metadata)
-                 (setq sent (cons start end) properties metadata)
+(ert-deftest qq-core-latest-group-history-uses-server-frontier-window ()
+  (let (call callback-meta)
+    (cl-letf (((symbol-function 'qq-core-fetch-group-history-window)
+               (lambda (session after callback _errback count)
+                 (setq call (list session after count))
                  (funcall callback '(:message-count 0 :batch-message-ids nil))
                  (let ((request (qq-request-create)))
                    (qq-request-finish request)
@@ -1644,9 +1641,8 @@
               "group:8209413637"
               (lambda (meta) (setq callback-meta meta)) nil 20)))
         (should (qq-request-p request))
-        (should (equal sent
-                       '("9007199254740986" . "9007199254741005")))
-        (should (eq (plist-get properties :history-at-latest-p) t))
+        (should
+         (equal call '("group:8209413637" nil 20)))
         (should (= (plist-get callback-meta :message-count) 0))))))
 
 (ert-deftest qq-core-private-latest-uses-server-clock-roaming-cursor ()

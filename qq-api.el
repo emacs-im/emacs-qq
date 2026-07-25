@@ -838,14 +838,49 @@ segments.  A resolve action result itself must be terminal or available."
                           (alist-get 'entry_id target)))
               (qq-api--signal-schema-error
                protocol-p "qq: %s reply entry target is invalid" context)))
-           ("unresolved"
+           ("native"
             (unless (qq-api--exact-object-keys-p
-                     target '(kind) '(message_id))
+                     target '(kind message_id)
+                     '(sequence sender sender_name sent_at))
               (qq-api--signal-schema-error
-               protocol-p "qq: %s unresolved reply target is invalid" context))
-            (when (assq 'message_id target)
-              (qq-api-validate-message-id
-               (alist-get 'message_id target) context protocol-p)))
+               protocol-p "qq: %s native reply target is invalid" context))
+            (qq-api-validate-message-id
+             (alist-get 'message_id target) context protocol-p)
+            (when (assq 'sequence target)
+              (unless (qq-account--uint64-decimal-p
+                       (alist-get 'sequence target))
+                (qq-api--signal-schema-error
+                 protocol-p
+                 "qq: %s native reply sequence must be canonical nonzero uint64 text"
+                 context)))
+            (when (assq 'sender target)
+              (let ((sender (alist-get 'sender target)))
+                (unless
+                    (and
+                     (qq-api--exact-object-keys-p sender nil '(uin uid))
+                     (or (assq 'uin sender) (assq 'uid sender))
+                     (or (not (assq 'uin sender))
+                         (qq-account--uint64-decimal-p
+                          (alist-get 'uin sender)))
+                     (or (not (assq 'uid sender))
+                         (qq-api-non-empty-string-p
+                          (alist-get 'uid sender))))
+                  (qq-api--signal-schema-error
+                   protocol-p "qq: %s native reply sender is invalid"
+                   context))))
+            (when (and (assq 'sender_name target)
+                       (not (qq-api-non-empty-string-p
+                             (alist-get 'sender_name target))))
+              (qq-api--signal-schema-error
+               protocol-p "qq: %s native reply sender_name is invalid"
+               context))
+            (when (and (assq 'sent_at target)
+                       (not (and (qq-api--uint32-p
+                                  (alist-get 'sent_at target))
+                                 (> (alist-get 'sent_at target) 0))))
+              (qq-api--signal-schema-error
+               protocol-p "qq: %s native reply sent_at is invalid"
+               context)))
            (_
             (qq-api--signal-schema-error
              protocol-p "qq: %s reply target has invalid kind" context)))))
