@@ -71,7 +71,7 @@
   "Return non-nil when reply is unavailable for the message at point."
   (let ((message (qq-transient--message-at-point)))
     (or (null message)
-        (null (alist-get 'server-id message))
+        (null (qq-message-reply-target qq-chat--session-key message))
         (qq-state-message-recalled-p message))))
 
 (defun qq-transient--goto-reply-inapt-p ()
@@ -92,12 +92,17 @@
   (let* ((message (qq-transient--message-at-point))
          (poke-p (and message (qq-state-poke-message-p message)))
          (recall-reference
-          (and poke-p (qq-state-poke-recall-reference message))))
+          (and poke-p (qq-state-poke-recall-reference message)))
+         (recall-target
+          (and message
+               (not poke-p)
+               (qq-message-recall-target qq-chat--session-key message))))
     (or (null message)
-        (null (alist-get 'server-id message))
         (not (alist-get 'self-p message))
+        (and (not poke-p) (null recall-target))
         (and poke-p
-             (or (null recall-reference)
+             (or (null (qq-message-exact-id message))
+                 (null recall-reference)
                  (qq-protocol-poke-recall-reference-expired-p
                   recall-reference)))
         (qq-state-message-recalled-p message))))
