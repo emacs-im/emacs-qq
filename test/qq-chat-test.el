@@ -4154,6 +4154,54 @@
        (should (equal "200"
                       (get-text-property (point) (quote qq-chat-message-anchor))))))))
 
+(ert-deftest qq-chat-goto-reply-jumps-to-sequence-only-history-anchor ()
+  (qq-chat-test-with-reset
+   (let* ((session-key "group:20001")
+          (history-anchor "history:slot-a:group:20001:100:none")
+          (source
+           `((id . ,history-anchor)
+             (server-id)
+             (session-key . ,session-key)
+             (message-seq . "100")
+             (message-type . "group")
+             (sender-id . "10001")
+             (sender-name . "Alice")
+             (time . 1710000100)
+             (raw-message . "source")
+             (preview . "source")
+             (segments . (((type . "text")
+                           (data . ((text . "source"))))))))
+          (reply
+           `((id . "200")
+             (server-id . "200")
+             (session-key . ,session-key)
+             (message-seq . "101")
+             (message-type . "group")
+             (sender-id . "10002")
+             (sender-name . "Bob")
+             (time . 1710000200)
+             (raw-message . "reply body")
+             (preview . "reply body")
+             (segments . (((type . "reply")
+                           (data . ((message_seq . "100"))))
+                          ((type . "text")
+                           (data . ((text . "reply body")))))))))
+     (qq-state-upsert-session
+      session-key
+      '((type . group) (title . "Group") (target-id . "20001"))
+      nil)
+     (puthash session-key (list source reply) qq-state--messages-by-session)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key session-key)
+       (qq-chat--set-history-window history-anchor "200")
+       (qq-chat-render)
+       (goto-char (qq-chat--message-position "200"))
+       (qq-chat-goto-reply)
+       (should
+        (equal history-anchor
+               (get-text-property (point) 'qq-chat-message-anchor)))))))
+
 (ert-deftest qq-chat-message-reply-id-from-segments ()
   (should
    (equal "42"

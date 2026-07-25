@@ -325,13 +325,29 @@ SESSION-KEY must equal the conversation recorded with the send receipt."
           (plist-get pending :local-id)))
   normalized)
 
+(defun qq-message--history-observation-anchor
+    (owner session-key sequence random)
+  "Return an opaque local anchor for one sequence-only history observation.
+
+OWNER and SESSION-KEY scope QQ's conversation-local SEQUENCE.  RANDOM is
+retained when present so the anchor remains descriptive, but it is not exposed
+as a server message identity."
+  (unless (and (stringp owner) (not (string-empty-p owner)))
+    (error "qq: Sequence-only history requires an account owner"))
+  (unless (qq-protocol--nonzero-decimal-string-p sequence)
+    (error "qq: Sequence-only history requires a nonzero native sequence"))
+  (format "history:%s:%s:%s:%s"
+          owner session-key sequence
+          (if (integerp random) random "none")))
+
 (defun qq-message-normalize-snapshot
-    (message owner account &optional recalled-p)
+    (message owner account &optional recalled-p history-p)
   "Purely normalize one Gateway MESSAGE for OWNER and ACCOUNT.
 
 OWNER is the stable opaque account-id.  ACCOUNT supplies the QQ identity needed
 to resolve private endpoints.  When RECALLED-P is non-nil, return a recalled
-root-summary row.
+root-summary row.  When HISTORY-P is non-nil, a group-history observation may
+lack an exact NT snowflake and receives an opaque client-only timeline anchor.
 
 MESSAGE is already in the domain representation owned by the RPC or event
 boundary.  This function checks only client-owned relationships and does not
@@ -360,7 +376,20 @@ order."
              peer-name (alist-get 'group_name conversation)
              session-key (qq-state-session-key 'group group-id)))
       ("temp" (error "qq: Temp conversations are not projected yet")))
-    (let* ((segments
+    (let* ((server-id
+            (qq-protocol-optional-message-id
+             (alist-get 'message_id message) "Native message snapshot"))
+           (history-anchor
+            (when (null server-id)
+              (unless history-p
+                (error "qq: Live Native message snapshot requires message_id"))
+              (unless (equal kind "group")
+                (error "qq: Only group history may omit message_id"))
+              (qq-message--history-observation-anchor
+               owner session-key
+               (alist-get 'sequence message)
+               (alist-get 'random message))))
+           (segments
             (unless recalled-p
               (mapcar #'qq-message--segment-to-internal
                       (alist-get 'segments message))))
@@ -374,8 +403,8 @@ order."
               (or (and (equal kind "group")
                        (alist-get 'sender_card conversation))
                   peer-name sender-id "unknown"))))
-      `((id . ,(alist-get 'message_id message))
-        (server-id . ,(alist-get 'message_id message))
+      `((id . ,(or server-id history-anchor))
+        (server-id . ,server-id)
         (session-key . ,session-key)
         (time . ,(alist-get 'sent_at message))
         (message-seq . ,(alist-get 'sequence message))
@@ -408,16 +437,18 @@ order."
         (user-id . ,(alist-get 'uin sender))
         (target-id . ,(if group-id group-id (alist-get 'uin peer)))))))
 
-(defun qq-message--normalize-message (data)
+(defun qq-message--normalize-message (data &optional history-p)
   "Normalize native message event DATA for projection.
 
 Unlike `qq-message-normalize-snapshot', this wrapper attaches local
-ordering and pending-send correlation owned by the selected live projection."
+ordering and pending-send correlation owned by the selected projection.
+HISTORY-P allows the explicitly sequence-only group-history shape."
   (let* ((owner (qq-message--event-owner data))
          (message (alist-get 'message data))
          (account (qq-account-get owner))
          (normalized
-          (qq-message-normalize-snapshot message owner account)))
+          (qq-message-normalize-snapshot
+           message owner account nil history-p)))
     (setf (alist-get 'order normalized nil nil #'eq)
           (qq-state--next-message-order)
           (alist-get 'raw-event normalized nil nil #'eq)
@@ -969,12 +1000,12 @@ Return a list of `(NATIVE-MESSAGE . NORMALIZED-MESSAGE)' pairs."
           (dolist (message (alist-get 'messages result))
             (let* ((data (qq-message--history-message-data
                           owner message))
-                   (normalized (qq-message--normalize-message data))
+                   (normalized (qq-message--normalize-message data t))
                    (local-id (alist-get 'local-id normalized)))
               (unless (equal (alist-get 'session-key normalized) session-key)
                 (error "qq: Gateway history message contradicts requested conversation"))
-              (qq-state-validate-message-session
-               session-key (alist-get 'server-id normalized))
+              (when-let* ((server-id (alist-get 'server-id normalized)))
+                (qq-state-validate-message-session session-key server-id))
               (qq-message--validate-pending-recall owner normalized)
               (when local-id
                 (when (gethash local-id pending-local-ids)
@@ -995,16 +1026,16 @@ lets private roaming history retain its time/random continuation cursor
 without pretending that it covered a sequence range."
   (let ((rows (qq-message--normalize-history
                result owner session-key))
-        (known-ids (make-hash-table :test #'equal))
+        (known-anchors (make-hash-table :test #'equal))
         (added 0)
         batch-ids)
     (dolist (message (qq-state-session-messages session-key))
-      (when-let* ((message-id (alist-get 'server-id message)))
-        (puthash message-id t known-ids)))
+      (when-let* ((anchor (qq-state-message-anchor message)))
+        (puthash anchor t known-anchors)))
     (dolist (row rows)
       (let* ((native (car row))
              (normalized (cdr row))
-             (message-id (alist-get 'server-id normalized)))
+             (message-anchor (qq-state-message-anchor normalized)))
         (when-let* ((title (alist-get 'peer-name normalized)))
           (unless (string-empty-p title)
             (qq-state-upsert-session session-key `((title . ,title)) nil)))
@@ -1016,11 +1047,11 @@ without pretending that it covered a sequence range."
           (qq-message--apply-pending-recall owner normalized merged)
           (qq-message--apply-pending-reactions owner normalized merged)
           (qq-message--apply-pending-essence owner normalized merged)
-          (setq message-id (alist-get 'server-id merged)))
-        (unless (gethash message-id known-ids)
+          (setq message-anchor (qq-state-message-anchor merged)))
+        (unless (gethash message-anchor known-anchors)
           (cl-incf added)
-          (puthash message-id t known-ids))
-        (push message-id batch-ids)))
+          (puthash message-anchor t known-anchors))
+        (push message-anchor batch-ids)))
     (setq batch-ids (delete-dups (nreverse batch-ids)))
     (let* ((oldest (qq-state-session-oldest-message-id session-key))
            (meta

@@ -833,7 +833,7 @@ rekeyed (see `qq-chat--rekey-message-node-if-needed')."
         (alist-get 'last-message-id session))))
 
 (defun qq-chat--history-batch-bounds (meta)
-  "Return (OLDEST . NEWEST) exact ids for history batch META.
+  "Return (OLDEST . NEWEST) timeline anchors for history batch META.
 
 Derive ordering from the already normalized session timeline instead of the
 wire array: native batch direction is not part of the client identity
@@ -848,7 +848,7 @@ bounds."
           (when id
             (puthash (format "%s" id) t members)))
         (dolist (message (qq-state-session-messages qq-chat--session-key))
-          (when-let* ((id (alist-get 'server-id message))
+          (when-let* ((id (qq-state-message-anchor message))
                       ((gethash id members)))
             (unless oldest
               (setq oldest id))
@@ -3026,11 +3026,11 @@ Label matches telega's unread bar wording (\"Unread Messages\")."
          (qq-chat--filtered-timeline-messages)
        (qq-state-session-messages qq-chat--session-key)))))
 
-(defun qq-chat--message-position (server-id)
-  "Return buffer position of SERVER-ID's projected row, or nil."
-  (and server-id
+(defun qq-chat--message-position (anchor)
+  "Return buffer position of timeline ANCHOR's projected row, or nil."
+  (and anchor
        (appkit-chat-timeline-live-p)
-       (appkit-chat-timeline-key-position (format "%s" server-id))))
+       (appkit-chat-timeline-key-position (format "%s" anchor))))
 
 (defun qq-chat--message-end-position (start)
   "Return end position of the message block starting at START."
@@ -3067,11 +3067,11 @@ Label matches telega's unread bar wording (\"Unread Messages\")."
                                          qq-chat-timeline-mode-map t))
                      "x"))))))
 
-(defun qq-chat--goto-loaded-message (server-id &optional highlight)
-  "Goto SERVER-ID only if already displayed (telega `--goto-loaded-msg').
+(defun qq-chat--goto-loaded-message (anchor &optional highlight)
+  "Goto timeline ANCHOR only if already displayed (telega `--goto-loaded-msg').
 
 Return non-nil on success.  When HIGHLIGHT is non-nil, pulse the block."
-  (when-let* ((id (and server-id (format "%s" server-id)))
+  (when-let* ((id (and anchor (format "%s" anchor)))
               (pos (qq-chat--message-position id)))
     (goto-char pos)
     (when-let* ((win (get-buffer-window (current-buffer) t)))
@@ -3110,9 +3110,9 @@ Return non-nil on success."
           (if sequence
               (qq-chat--message-by-sequence sequence)
             (qq-chat--message-by-server-id target)))
-         (resolved-id (and source (alist-get 'server-id source))))
-    (when (and resolved-id
-               (qq-chat--goto-loaded-message resolved-id t))
+         (resolved-anchor (qq-state-message-anchor source)))
+    (when (and resolved-anchor
+               (qq-chat--goto-loaded-message resolved-anchor t))
       (setq qq-chat--pending-jump-id nil)
       t)))
 
@@ -3265,7 +3265,7 @@ message identity plus its conversation-scoped native sequence hint."
                  (sequence (format "message #%s" sequence))
                  (t "replied message")))
          (reply-start (point))
-         (target (or (and source (alist-get 'server-id source))
+         (target (or (qq-state-message-anchor source)
                      (and reply-id (not sequence)
                           (format "%s" reply-id))))
          (map (let ((map (make-sparse-keymap)))
