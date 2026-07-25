@@ -4,8 +4,8 @@
 
 ;;; Commentary:
 
-;; Dedicated user profile view backed by the fork-native `emacs_get_user'
-;; action, with a Telega-style summary card and asynchronously filled details.
+;; Dedicated user profile view backed by the native Gateway profile method,
+;; with a Telega-style summary card and asynchronously filled details.
 
 ;;; Code:
 
@@ -15,7 +15,9 @@
 (require 'appkit-invalidation)
 (require 'appkit-transaction)
 (require 'qq-api)
+(require 'qq-core)
 (require 'qq-media)
+(require 'qq-request)
 (require 'qq-runtime)
 (require 'qq-state)
 (require 'qq-user-photo)
@@ -118,6 +120,13 @@
 (defvar-local qq-user--media-hook-function nil
   "View-owned media cache hook installed for this user buffer.")
 
+(defun qq-user--cancel-operation (request)
+  "Cancel native REQUEST or one still-unported social request."
+  (when request
+    (if (qq-request-p request)
+        (qq-request-cancel request)
+      (qq-api-cancel-request request))))
+
 (defun qq-user--buffer-name (account-id user-id)
   "Return ACCOUNT-ID-qualified profile buffer name for USER-ID."
   (qq-runtime-account-buffer-name "user" user-id account-id))
@@ -142,8 +151,11 @@ USER-ID defaults to the opaque identity selected in the current buffer."
 
 (defun qq-user--avatar-display-string ()
   "Return the current user's avatar, honoring exact search context."
-  (if-let* ((url (qq-user--present-string
-                  (alist-get 'avatar_url qq-user--search-result))))
+  (if-let* ((url
+             (or (qq-user--present-string
+                  (alist-get 'avatar_url qq-user--search-result))
+                 (qq-user--present-string
+                  (alist-get 'avatar_url qq-user--profile)))))
       (qq-media-url-preview-display-string
        (format "avatar:%s" qq-user--user-id)
        url "@" qq-media-avatar-image-height)
@@ -176,12 +188,13 @@ USER-ID defaults to the opaque identity selected in the current buffer."
       (when face
         (add-text-properties start (point) (list 'face face))))))
 
-(defun qq-user--sex-label (sex)
-  "Return display label for native SEX string."
-  (pcase sex
+(defun qq-user--gender-label (gender)
+  "Return display label for native GENDER string."
+  (pcase gender
     ("male" "男")
     ("female" "女")
     ("private" "保密")
+    ("unknown" "未知")
     (_ nil)))
 
 (defun qq-user--birthday-label (birthday)
@@ -202,59 +215,71 @@ USER-ID defaults to the opaque identity selected in the current buffer."
     (let ((parts (delq nil
                        (mapcar #'qq-user--present-string
                                (list (alist-get 'country location)
-                                     (alist-get 'province location)
-                                     (alist-get 'city location))))))
+                                     (alist-get 'city location)
+                                     (alist-get 'home_city location)
+                                     (alist-get 'district location))))))
       (and parts (string-join parts " · ")))))
-
-(defun qq-user--status-label (status)
-  "Return display label for STATUS object."
-  (when (consp status)
-    (qq-user--present-string (alist-get 'description status))))
 
 (defun qq-user--relationship-label (relationship)
   "Return display label for RELATIONSHIP object."
   (when (consp relationship)
-    (when-let* ((kind (pcase (alist-get 'kind relationship)
-                        ("friend" "好友")
-                        ("stranger" "陌生人"))))
-      (string-join
-       (delq nil
-             (list kind
-                   (and (eq (alist-get 'special_care relationship) t)
-                        "特别关心")
-                   (and (eq (alist-get 'blocked_by_me relationship) t)
-                        "已屏蔽")
-                   (and (eq (alist-get 'muted relationship) t)
-                        "消息免打扰")))
-       " · "))))
+    (pcase (alist-get 'kind relationship)
+      ("self" "自己")
+      ("friend" "好友")
+      ("stranger" "陌生人"))))
 
 (defun qq-user--level-label (level)
-  "Return display label for QQ LEVEL object."
+  "Return display label for native QQ LEVEL object."
   (when (consp level)
-    (let ((parts
-           (cl-loop for (field label) in '((crowns "皇冠")
-                                           (suns "太阳")
-                                           (moons "月亮")
-                                           (stars "星星"))
-                    for count = (alist-get field level)
-                    when (and (integerp count) (> count 0))
-                    collect (format "%d %s" count label))))
-      (and parts (string-join parts " · ")))))
+    (let* ((value (alist-get 'value level))
+           (icons
+            (cl-loop for (field label) in '((crowns "皇冠")
+                                            (suns "太阳")
+                                            (moons "月亮")
+                                            (stars "星星"))
+                     for count = (alist-get field level)
+                     when (and (integerp count) (> count 0))
+                     collect (format "%d %s" count label))))
+      (when (and (integerp value) (>= value 0))
+        (string-join
+         (cons (number-to-string value) icons)
+         " · ")))))
+
+(defun qq-user--status-label (status)
+  "Return display label for native STATUS object."
+  (when (consp status)
+    (let ((code (alist-get 'code status))
+          (extended (alist-get 'extended_code status)))
+      (when (and (integerp code) (integerp extended))
+        (if (> extended 0)
+            (format "在线 · 扩展状态 %d" extended)
+          (pcase code
+            (10 "在线")
+            (20 "离线")
+            (30 "离开")
+            (40 "隐身")
+            (50 "忙碌")
+            (60 "Q我吧")
+            (70 "请勿打扰")
+            (_ (format "状态 %d" code))))))))
 
 (defun qq-user--vip-label (vip)
-  "Return display label for VIP object."
+  "Return display label for native VIP object."
   (when (consp vip)
-    (pcase (alist-get 'kind vip)
-      ((or "svip" "vip")
-       (let ((name (if (equal (alist-get 'kind vip) "svip") "SVIP" "VIP"))
-             (level (alist-get 'level vip)))
-         (concat name
-                 (if (and (integerp level) (> level 0))
-                     (format " %d" level)
-                   "")
-                 (if (eq (alist-get 'annual vip) t) " · 年费" ""))))
-      ("none" "无")
-      (_ nil))))
+    (let ((kind (alist-get 'kind vip))
+          (level (alist-get 'level vip))
+          (annual (alist-get 'annual vip)))
+      (when (member kind '("vip" "svip"))
+        (concat (upcase kind)
+                (if (and (integerp level) (> level 0))
+                    (format " %d" level)
+                  "")
+                (if (eq annual t) " · 年费" ""))))))
+
+(defun qq-user--registration-time-label (timestamp)
+  "Return a local date for native registration TIMESTAMP."
+  (when (and (integerp timestamp) (> timestamp 0))
+    (format-time-string "%Y-%m-%d" (seconds-to-time timestamp))))
 
 (defun qq-user--photo-at-point ()
   "Return inline native photo at point, or nil."
@@ -581,10 +606,6 @@ Return a closed alist containing `verification_message' and `answers'."
    :face 'qq-user-action-button :help-echo "查看头像 (a)")
   (insert "  ")
   (appkit-ui-insert-action-button
-   " 照片墙 " #'qq-user-open-photo-wall
-   :face 'qq-user-action-button :help-echo "打开照片墙 (p)")
-  (insert "  ")
-  (appkit-ui-insert-action-button
    " 复制 QQ " #'qq-user-copy-id
    :face 'qq-user-action-button :help-echo "复制 QQ 号 (w)")
   (insert "\n"))
@@ -616,10 +637,7 @@ Return a closed alist containing `verification_message' and `answers'."
            (insert "  "
                    (propertize (qq-user--display-name)
                                'face 'qq-user-card-title)
-                   "\n")
-           (when-let* ((status (qq-user--status-label
-                                (alist-get 'status qq-user--profile))))
-             (insert "   " (propertize status 'face 'shadow) "\n")))
+                   "\n"))
          (insert "\n")
          (qq-user--insert-action-buttons)
          (qq-user--insert-friend-add-status)
@@ -636,7 +654,7 @@ Return a closed alist containing `verification_message' and `answers'."
                     (if (qq-user--like-limit-reached-p)
                         " · l 今日已达上限"
                       " · l 点赞"))
-                  " · a 头像 · p 照片墙 · w 复制 · q 退出"))
+                  " · a 头像 · w 复制 · q 退出"))
          (insert "\n")
          (appkit-view-insert-heading-line "资料" :face 'bold)
          (when-let* ((nickname (qq-user--present-string
@@ -651,13 +669,12 @@ Return a closed alist containing `verification_message' and `answers'."
           "关系" (qq-user--relationship-label
                   (alist-get 'relationship qq-user--profile)))
          (when-let* ((relationship (alist-get 'relationship qq-user--profile))
-                     (category (alist-get 'friend_category relationship))
-                     (name (qq-user--present-string (alist-get 'name category))))
+                     (name (qq-user--present-string
+                            (alist-get 'category_name relationship))))
            (qq-user--insert-field "分组" name))
          (qq-user--insert-field
-          "状态" (qq-user--status-label (alist-get 'status qq-user--profile)))
-         (qq-user--insert-field "性别" (qq-user--sex-label
-                                        (alist-get 'sex qq-user--profile)))
+          "性别" (qq-user--gender-label
+                  (alist-get 'gender qq-user--profile)))
          (let ((age (alist-get 'age qq-user--profile)))
            (when (and (integerp age) (> age 0))
              (qq-user--insert-field "年龄" age)))
@@ -665,12 +682,17 @@ Return a closed alist containing `verification_message' and `answers'."
           "生日" (qq-user--birthday-label (alist-get 'birthday qq-user--profile)))
          (qq-user--insert-field
           "地区" (qq-user--location-label (alist-get 'location qq-user--profile)))
-         (qq-user--insert-field "职业" (alist-get 'occupation qq-user--profile))
-         (qq-user--insert-field "学校" (alist-get 'college qq-user--profile))
+         (qq-user--insert-field "学校" (alist-get 'school qq-user--profile))
          (qq-user--insert-field
-          "等级" (qq-user--level-label (alist-get 'qq_level qq-user--profile)))
+          "等级" (qq-user--level-label (alist-get 'level qq-user--profile)))
          (qq-user--insert-field
           "会员" (qq-user--vip-label (alist-get 'vip qq-user--profile)))
+         (qq-user--insert-field
+          "注册日期"
+          (qq-user--registration-time-label
+           (alist-get 'registration_time qq-user--profile)))
+         (qq-user--insert-field
+          "状态" (qq-user--status-label (alist-get 'status qq-user--profile)))
          (cond
           ((and (integerp qq-user--like-count)
                 (>= qq-user--like-count 0))
@@ -687,12 +709,11 @@ Return a closed alist containing `verification_message' and `answers'."
                      ((not (null labels))))
            (qq-user--insert-field "标签" (string-join labels " · ")))
          (when-let* ((signature (qq-user--present-string
-                                 (alist-get 'signature qq-user--profile))))
+                                 (alist-get 'personal_sign qq-user--profile))))
            (insert "\n")
            (appkit-view-insert-heading-line "个性签名" :face 'bold)
            (insert signature "\n"))
-         (insert "\n")
-         (qq-user--insert-photo-wall)))
+         (insert "\n")))
        (add-text-properties
         (point-min) (point-max)
         (list 'qq-user-profile-key (qq-user--profile-key)
@@ -753,7 +774,7 @@ RESOURCE identifies a presentation-only media dependency update."
     (user-error "qq: this buffer has no user identity"))
   (let ((view (qq-user--ensure-view)))
     (when qq-user--request
-      (qq-api-cancel-request qq-user--request))
+      (qq-user--cancel-operation qq-user--request))
     (let ((buffer (current-buffer))
           (user-id qq-user--user-id)
           (owner (list 'user-profile qq-user--user-id)))
@@ -764,7 +785,7 @@ RESOURCE identifies a presentation-only media dependency update."
       (qq-user--request-sync view)
       (condition-case error-data
           (let ((request
-                 (qq-api-get-user
+                 (qq-core-get-user-profile
                   user-id
                   (lambda (profile)
                     (when (qq-user--request-current-p
@@ -800,7 +821,6 @@ RESOURCE identifies a presentation-only media dependency update."
                  qq-user--request-owner nil)
            (qq-user--request-sync view)))))
     (qq-user--refresh-like view)
-    (qq-user--refresh-photos view)
     (qq-user--sync-now view)))
 
 (defun qq-user--like-request-current-p (view buffer user-id owner)
@@ -821,7 +841,7 @@ RESOURCE identifies a presentation-only media dependency update."
           qq-user--like-request-owner nil
           qq-user--like-loading nil)
     (when request
-      (qq-api-cancel-request request))))
+      (qq-user--cancel-operation request))))
 
 (defun qq-user--apply-like-event (event)
   "Apply one owner-checked received-like EVENT to domain state."
@@ -865,12 +885,13 @@ RESOURCE identifies a presentation-only media dependency update."
     (qq-user--request-sync view)
     (condition-case error-data
         (let ((request
-               (qq-api-get-user-like
+               (qq-core-get-profile-like-summary
                 user-id
-                (lambda (count)
+                (lambda (summary)
                   (qq-user--accept-like-event
                    view buffer user-id owner
-                   (list :type 'success :count count)))
+                   (list :type 'success
+                         :count (alist-get 'total_count summary))))
                 (lambda (_response reason)
                   (qq-user--accept-like-event
                    view buffer user-id owner
@@ -907,7 +928,7 @@ RESOURCE identifies a presentation-only media dependency update."
           qq-user--photo-request-owner nil
           qq-user--photo-loading nil)
     (when request
-      (qq-api-cancel-request request))))
+      (qq-user--cancel-operation request))))
 
 (defun qq-user--apply-photo-event (event)
   "Apply one owner-checked inline photo-wall EVENT to domain state."
@@ -1028,15 +1049,15 @@ stale."
       (qq-user--request-sync view)
       (condition-case error-data
           (let ((request
-                 (qq-api-like-user
+                 (qq-core-send-profile-like
                   user-id
-                  (lambda (result)
-                    (when (qq-user--accept-send-like-event
-                           view buffer user-id owner
-                           (list :type 'success
-                                 :outcome (alist-get 'outcome result)))
-                      (when (equal (alist-get 'outcome result) "liked")
-                        (qq-user--refresh-like view))))
+                  (lambda (outcome)
+                    (let ((kind (alist-get 'kind outcome)))
+                      (when (qq-user--accept-send-like-event
+                             view buffer user-id owner
+                             (list :type 'success :outcome kind))
+                        (when (equal kind "liked")
+                          (qq-user--refresh-like view)))))
                   (lambda (response reason)
                     (when (qq-user--accept-send-like-event
                            view buffer user-id owner
@@ -1058,8 +1079,11 @@ stale."
 (defun qq-user-open-avatar ()
   "Open the current profile user's avatar."
   (interactive)
-  (if-let* ((url (qq-user--present-string
-                  (alist-get 'avatar_url qq-user--search-result))))
+  (if-let* ((url
+             (or (qq-user--present-string
+                  (alist-get 'avatar_url qq-user--search-result))
+                 (qq-user--present-string
+                  (alist-get 'avatar_url qq-user--profile)))))
       (qq-media-open-image-url (format "avatar:%s" qq-user--user-id) url)
     (qq-media-open-user-avatar qq-user--user-id)))
 
@@ -1072,11 +1096,9 @@ stale."
   (message "qq: copied user id %s" qq-user--user-id))
 
 (defun qq-user-open-photo-wall ()
-  "Open the current user's native QQ photo wall."
+  "Explain why the native backend cannot open a photo wall yet."
   (interactive)
-  (unless qq-user--user-id
-    (user-error "qq: this buffer has no user identity"))
-  (qq-user-photo-open qq-user--user-id (qq-user--display-name)))
+  (user-error "qq: Native photo-wall protocol is not closed yet"))
 
 (defun qq-user-open-photo-at-point ()
   "Open inline native photo at point."
@@ -1114,7 +1136,7 @@ stale."
           qq-user--search-result nil
           qq-user--friend-add-state nil)
     (dolist (request requests)
-      (qq-api-cancel-request request))))
+      (qq-user--cancel-operation request))))
 
 (defun qq-user--clear-view-data ()
   "Clear account-scoped data projected by the current user view."
@@ -1216,8 +1238,6 @@ stale."
     (define-key map (kbd "l") #'qq-user-like)
     (define-key map (kbd "+") #'qq-user-add-friend)
     (define-key map (kbd "a") #'qq-user-open-avatar)
-    (define-key map (kbd "p") #'qq-user-open-photo-wall)
-    (define-key map (kbd "RET") #'qq-user-open-photo-at-point)
     (define-key map (kbd "TAB") #'forward-button)
     (define-key map (kbd "<backtab>") #'qq-user-button-backward)
     (define-key map (kbd "w") #'qq-user-copy-id)
@@ -1306,7 +1326,7 @@ stale."
       (qq-user--select-user user-id)
       (when-let* ((old qq-user--friend-add-state)
                   (request (qq-user--friend-add-state-request old)))
-        (qq-api-cancel-request request))
+        (qq-user--cancel-operation request))
       (setq qq-user--search-result copy
             qq-user--friend-add-state
             (qq-user--friend-add-state-create
