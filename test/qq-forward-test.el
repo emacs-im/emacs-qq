@@ -425,8 +425,6 @@ list are indistinguishable — both mean \"do not claim a count\"."
            "3" "message answer" :segments
            '(((kind . "reply")
               (payload . ((target . ((kind . "native")
-                                     (message_id
-                                      . "9007199254742007031")
                                      (sequence . "4000000001")
                                      (sender_name . "Original"))))))
              ((kind . "text") (payload . ((text . "message answer")))))))
@@ -454,11 +452,10 @@ list are indistinguishable — both mean \"do not claim a count\"."
                   (car qq-forward--messages)))
       (should (equal native-target
                      '(:kind native
-                       :id "9007199254742007031"
                        :sequence "4000000001"
                        :sender-name "Original")))
-      ;; message_id is diagnostic metadata here.  Even when two snapshots
-      ;; share it, a native target must not guess the first forward row.
+      ;; A received native reply carries only its conversation sequence.  It
+      ;; must not guess a forward entry from an unrelated message identity.
       (should-not (gethash (plist-get native-target :id) messages-by-entry))
       (should-not (gethash (plist-get wrong-target :id)
                            messages-by-entry)))))

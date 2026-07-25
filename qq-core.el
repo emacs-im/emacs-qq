@@ -1338,10 +1338,11 @@ ERRBACK handles failure and COUNT limits the requested page size."
 SEQUENCE-HINT is conversation-scoped metadata carried by a native reply.
 It is used only when the target message is not already cached."
   (let* ((message
-          (seq-find
-           (lambda (candidate)
-             (equal (alist-get 'server-id candidate) message-id))
-           (qq-state-session-messages session-key)))
+          (and message-id
+               (seq-find
+                (lambda (candidate)
+                  (equal (alist-get 'server-id candidate) message-id))
+                (qq-state-session-messages session-key))))
          (sequence (or (alist-get 'message-seq message)
                        sequence-hint)))
     (if (not sequence)

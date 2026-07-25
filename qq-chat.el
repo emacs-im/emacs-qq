@@ -864,12 +864,33 @@ bounds."
                 (alist-get 'segments message))))
     (alist-get 'data segment)))
 
+(defun qq-chat--message-by-sequence (sequence)
+  "Return the current conversation message carrying exact SEQUENCE.
+
+QQ reply locators use this conversation-scoped sequence; it is not a message
+identity and must never be compared with a snowflake `server-id'."
+  (when (and sequence qq-chat--session-key)
+    (seq-find
+     (lambda (message)
+       (equal (alist-get 'message-seq message) sequence))
+     (qq-state-session-messages qq-chat--session-key))))
+
 (defun qq-chat--message-reply-id (message)
-  "Return reply target message id extracted from MESSAGE segments, or nil."
-  (when-let* ((data (qq-chat--message-reply-data message))
-              (reply-id (or (alist-get 'id data)
-                            (alist-get 'message_id data))))
-    (format "%s" reply-id)))
+  "Return MESSAGE's resolved reply target snowflake, or nil.
+
+Native replies are located by conversation sequence.  Historical segment
+shapes without a sequence may still carry an exact `id'; a numeric-looking
+SourceMsg reserve value accompanying a sequence is deliberately not treated
+as a snowflake."
+  (when-let* ((data (qq-chat--message-reply-data message)))
+    (let ((sequence (or (alist-get 'message_seq data)
+                        (alist-get 'sequence data))))
+      (if sequence
+          (alist-get 'server-id
+                     (qq-chat--message-by-sequence sequence))
+        (when-let* ((reply-id (or (alist-get 'id data)
+                                  (alist-get 'message_id data))))
+          (format "%s" reply-id))))))
 
 (defun qq-chat--message-reply-sequence (message)
   "Return MESSAGE's conversation-scoped reply seek sequence, or nil."
@@ -3069,20 +3090,31 @@ Return non-nil on success.  When HIGHLIGHT is non-nil, pulse the block."
 
 (defun qq-chat--fetch-history-around
     (session-key message-id callback &optional errback count sequence-hint)
-  "Fetch native history around MESSAGE-ID, optionally using SEQUENCE-HINT."
+  "Fetch native history around MESSAGE-ID or exact SEQUENCE-HINT."
   (if sequence-hint
       (qq-core-fetch-history-around
        session-key message-id callback errback count sequence-hint)
     (qq-core-fetch-history-around
      session-key message-id callback errback count)))
 
-(defun qq-chat--finish-jump-if-loaded (target)
-  "If TARGET is rendered, jump+highlight and clear pending jump.
+(defun qq-chat--jump-target-key (target sequence)
+  "Return one buffer-local pending-jump key for TARGET or SEQUENCE."
+  (or (and target (format "%s" target))
+      (and sequence (concat "sequence:" sequence))))
+
+(defun qq-chat--finish-jump-if-loaded (target &optional sequence)
+  "If TARGET or SEQUENCE resolves to a rendered row, jump and finish.
 
 Return non-nil on success."
-  (when (and target (qq-chat--goto-loaded-message target t))
-    (setq qq-chat--pending-jump-id nil)
-    t))
+  (let* ((source
+          (if sequence
+              (qq-chat--message-by-sequence sequence)
+            (qq-chat--message-by-server-id target)))
+         (resolved-id (and source (alist-get 'server-id source))))
+    (when (and resolved-id
+               (qq-chat--goto-loaded-message resolved-id t))
+      (setq qq-chat--pending-jump-id nil)
+      t)))
 
 (defun qq-chat--jump-fail (target &optional reason)
   "Clear pending jump for TARGET and report not found."
@@ -3098,7 +3130,8 @@ Return non-nil on success."
   "Load native history centered on TARGET, using optional SEQUENCE-HINT."
   (qq-chat--cancel-initial-history-request)
   (qq-chat--adopt-gateway-message-frontier)
-  (let ((owner (qq-chat--begin-around-history-window))
+  (let ((jump-key (qq-chat--jump-target-key target sequence-hint))
+        (owner (qq-chat--begin-around-history-window))
         (view (qq-chat--ensure-view)))
     (qq-chat--fetch-history-around
      session-key
@@ -3114,9 +3147,10 @@ Return non-nil on success."
              (qq-chat--request-callback-sync
               view
               (lambda ()
-                (unless (qq-chat--finish-jump-if-loaded target)
+                (unless (qq-chat--finish-jump-if-loaded
+                         target sequence-hint)
                   (qq-chat--jump-fail
-                   target "around window omitted target"))))))))
+                   jump-key "around window omitted target"))))))))
      (lambda (_response reason)
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
@@ -3124,45 +3158,51 @@ Return non-nil on success."
                       (appkit-chat-history-request-current-p owner))
              (appkit-chat-history-request-end owner)
              (qq-chat--request-callback-sync
-              view (lambda () (qq-chat--jump-fail target reason)))))))
+              view (lambda () (qq-chat--jump-fail jump-key reason)))))))
      (qq-chat--jump-history-count)
      sequence-hint)))
 
 (defun qq-chat-goto-message (message-id &optional no-pop sequence-hint)
-  "Goto MESSAGE-ID in the current chatbuf (telega `telega-chatbuf--goto-msg').
+  "Goto MESSAGE-ID or SEQUENCE-HINT in the current chatbuf.
 
 Push the message at point onto the pop ring unless NO-POP.  Already loaded
-targets jump immediately; other targets seek by SEQUENCE-HINT or cached native
-sequence metadata."
+targets jump immediately; native reply targets seek by their conversation
+sequence without inventing a snowflake identity."
   (interactive
-   (let ((message (qq-chat--message-at-point)))
-     (list (or (get-text-property (point) 'qq-chat-reply-id)
-               (qq-chat--message-reply-id message)
-               (read-string "Message id: "))
-           nil
+   (let* ((message (qq-chat--message-at-point))
+          (sequence
            (or (get-text-property (point) 'qq-chat-reply-sequence)
-               (qq-chat--message-reply-sequence message)))))
+               (qq-chat--message-reply-sequence message)))
+          (message-id
+           (or (get-text-property (point) 'qq-chat-reply-id)
+               (qq-chat--message-reply-id message)
+               (unless sequence (read-string "Message id: ")))))
+     (list message-id nil sequence)))
   (unless qq-chat--session-key
     (user-error "qq: this buffer is not bound to a session"))
   (let ((id (and message-id (format "%s" message-id)))
+        (sequence (and sequence-hint (format "%s" sequence-hint)))
         (session-key qq-chat--session-key)
         (buffer (current-buffer)))
-    (unless (and id (not (string-empty-p id)))
-      (user-error "qq: no message id to jump to"))
+    (when (and id (string-empty-p id))
+      (setq id nil))
+    (when (and sequence (string-empty-p sequence))
+      (setq sequence nil))
+    (unless (or id sequence)
+      (user-error "qq: no message locator to jump to"))
+    (let ((jump-key (qq-chat--jump-target-key id sequence)))
     ;; telega: put message at point into messages-pop-ring.
-    (unless no-pop
-      (when-let* ((at-point (qq-chat--message-at-point))
-                  (cur-id (qq-chat--message-anchor at-point)))
-        (unless (equal (format "%s" cur-id) id)
-          (qq-chat--messages-pop-ring-push cur-id))))
-    (if (and (qq-chat--history-window-known-p)
-             (qq-chat--goto-loaded-message id t))
-        (setq qq-chat--pending-jump-id nil)
-      (qq-chat--cancel-open-message-request)
-      (setq qq-chat--pending-jump-id id)
-      (message "qq: loading…")
-      (qq-chat--seek-history-for-jump
-       session-key id buffer sequence-hint))))
+      (unless no-pop
+        (when-let* ((at-point (qq-chat--message-at-point))
+                    (cur-id (qq-chat--message-anchor at-point)))
+          (unless (equal (format "%s" cur-id) jump-key)
+            (qq-chat--messages-pop-ring-push cur-id))))
+      (unless (qq-chat--finish-jump-if-loaded id sequence)
+        (qq-chat--cancel-open-message-request)
+        (setq qq-chat--pending-jump-id jump-key)
+        (message "qq: loading…")
+        (qq-chat--seek-history-for-jump
+         session-key id buffer sequence)))))
 
 (defun qq-chat-goto-reply (&optional message)
   "Goto the message that MESSAGE replies to.
@@ -3174,10 +3214,11 @@ telega's `telega-msg-goto-reply-to-message'."
   (let* ((msg (or message
                   (qq-chat--message-at-point)
                   (user-error "qq: no message at point")))
-         (reply-id (or (qq-chat--message-reply-id msg)
-                       (user-error "qq: message is not a reply"))))
-    (qq-chat-goto-message
-     reply-id nil (qq-chat--message-reply-sequence msg))))
+         (reply-id (qq-chat--message-reply-id msg))
+         (sequence (qq-chat--message-reply-sequence msg)))
+    (unless (or reply-id sequence)
+      (user-error "qq: message is not a reply"))
+    (qq-chat-goto-message reply-id nil sequence)))
 
 (defun qq-chat-goto-pop-message ()
   "Pop a message from the jump ring and goto it.
@@ -3205,7 +3246,9 @@ message identity plus its conversation-scoped native sequence hint."
                        (alist-get 'id reply-data)))
          (sequence (or (alist-get 'message_seq reply-data)
                        (alist-get 'sequence reply-data)))
-         (source (qq-chat--message-by-server-id reply-id))
+         (source (if sequence
+                     (qq-chat--message-by-sequence sequence)
+                   (qq-chat--message-by-server-id reply-id)))
          (sender (or (and source
                           (car (qq-chat--message-sender-display-parts source)))
                      (alist-get 'sender_name reply-data)))
@@ -3217,11 +3260,14 @@ message identity plus its conversation-scoped native sequence hint."
                  ((and preview (not (string-empty-p preview)))
                   (truncate-string-to-width preview 64 nil nil t))
                  (sender (format "%s's message" sender))
-                 ((alist-get 'id reply-data)
+                 ((and reply-id (not sequence))
                   (format "id %s" reply-id))
-                 (t (format "message %s" reply-id))))
+                 (sequence (format "message #%s" sequence))
+                 (t "replied message")))
          (reply-start (point))
-         (target (format "%s" reply-id))
+         (target (or (and source (alist-get 'server-id source))
+                     (and reply-id (not sequence)
+                          (format "%s" reply-id))))
          (map (let ((map (make-sparse-keymap)))
                 (set-keymap-parent map button-map)
                 (define-key map [mouse-1]
@@ -3754,6 +3800,24 @@ a replacement app instance."
               (segment (qq-media-message-primary-segment message)))
     (qq-chat--segment-media-card-context segment)))
 
+(defun qq-chat--native-record-control-state (segment capabilities)
+  "Adapt native record SEGMENT and CAPABILITIES to Appkit voice-note state."
+  (let* ((playback (qq-media-native-record-playback-state segment))
+         (data (alist-get 'data segment))
+         (remote-status (plist-get capabilities :remote-status))
+         (state
+          (or (plist-get playback :status)
+              (pcase remote-status
+                ("materializing" 'preparing)
+                ("failed" 'failed)
+                (_ 'idle)))))
+    (list :state state
+          :duration-seconds
+          (or (plist-get playback :duration-seconds)
+              (alist-get 'duration_seconds data))
+          :played-seconds (or (plist-get playback :played-seconds) 0)
+          :status-text (plist-get capabilities :status))))
+
 (defun qq-chat--insert-segment-media-line (segment prefix-state properties)
   "Insert one rich media card for SEGMENT using PREFIX-STATE and PROPERTIES."
   (let* ((kind-label (qq-chat--segment-media-kind-label segment))
@@ -3761,13 +3825,16 @@ a replacement app instance."
          (capabilities (qq-media-segment-capabilities segment))
          (context (qq-chat--segment-media-card-context
                    segment capabilities))
+         (native-record-p (and (qq-media--native-record-media-id segment) t))
          (prefix-state (let ((appkit-ui-card-indent-prefix-state prefix-state))
                          (appkit-ui-card-prefix-state))))
     (appkit-chat-ins-insert-media-card
      :kind (qq-chat--segment-media-card-kind segment)
      :title (qq-chat--segment-media-summary segment)
-     :details (unless (string-empty-p meta) (list meta))
-     :status (plist-get capabilities :status)
+     :details (unless (or native-record-p (string-empty-p meta))
+                (list meta))
+     :status (unless native-record-p
+               (plist-get capabilities :status))
      :prefix prefix-state
      :title-face 'bold
      :meta-face 'shadow
@@ -3777,7 +3844,20 @@ a replacement app instance."
                              (downcase kind-label))
      :body-inserter
      (lambda (card-prefix-state)
-       (when (qq-media-segment-preview-capable-p segment)
+       (cond
+        (native-record-p
+         (let ((control (qq-chat--native-record-control-state
+                         segment capabilities)))
+           (appkit-chat-ins-insert-voice-note
+            :state (plist-get control :state)
+            :duration-seconds (plist-get control :duration-seconds)
+            :played-seconds (plist-get control :played-seconds)
+            :status-text (plist-get control :status-text)
+            :prefix card-prefix-state
+            :face 'shadow
+            :action (plist-get context :open-action)
+            :help-echo "Play, pause, or replay this voice note")))
+        ((qq-media-segment-preview-capable-p segment)
          (let ((preview-start (point))
                (preview (qq-media-segment-preview-image segment))
                (loading (qq-media-segment-preview-fetching-p segment))
@@ -3808,7 +3888,7 @@ a replacement app instance."
             (t
              (insert "[preview unavailable]\n")))
            (appkit-ui-apply-line-prefix preview-start (point) card-prefix-state)
-           (appkit-ui-append-face preview-start (point) 'shadow)))))))
+           (appkit-ui-append-face preview-start (point) 'shadow))))))))
 
 (defun qq-chat--insert-animated-face-segment (segment prefix-state properties)
   "Insert animated face SEGMENT below the avatar's two-line header."
@@ -7002,7 +7082,12 @@ search-result jump cannot race a latest/read-position request."
              view :entries (appkit-chat-timeline-keys))))))))
 
 (defun qq-chat--message-event-rekeys (event)
-  "Return explicit local-to-server row rekeys described by EVENT."
+  "Return the row rekey described by EVENT, when it is an identity promotion.
+
+When both the old and new keys already have timeline nodes, state has collapsed
+two independently projected observations of the same native message.  That is
+a deletion of the redundant old row, not a rekey: normal reconciliation must
+remove it while retaining the already rendered canonical row."
   (let* ((message (plist-get event :message))
          (new-key (and (listp message) (qq-chat--message-anchor message)))
          (old-keys
@@ -7015,7 +7100,10 @@ search-result jump cannot race a latest/read-position request."
                       (and (not (equal key new-key))
                            (appkit-chat-timeline-node key)))
                     old-keys)))
-    (and old-key new-key (list (cons old-key new-key)))))
+    (and old-key
+         new-key
+         (not (appkit-chat-timeline-node new-key))
+         (list (cons old-key new-key)))))
 
 (defun qq-chat--message-event-advances-frontier-p (event)
   "Return non-nil when EVENT introduces a canonical server message.

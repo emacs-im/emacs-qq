@@ -49,6 +49,9 @@
 (defvar qq-media--native-record-current-id nil
   "Media ID of the one preparing, playing, or paused native record.")
 
+(defvar qq-media--native-record-progress-timer nil
+  "Timer refreshing the one active native record progress row.")
+
 (defvar qq-media--account-generation 0
   "Account generation owning asynchronous media cache callbacks.")
 
@@ -119,12 +122,16 @@ the adopted transport `:token'.")
       (appkit-media-clear-video-decoration-cache 'qq)
     (error nil)
     (quit nil))
-  (let (keys transfers)
+  (let (keys transfers remote-operations)
     (maphash
      (lambda (key fetching)
        (push key keys)
-       (when (appkit-media-transfer-p fetching)
-         (push fetching transfers)))
+       (cond
+        ((appkit-media-transfer-p fetching)
+         (push fetching transfers))
+        ((and (qq-remote-media-operation-p fetching)
+              (qq-remote-media-operation-active-p fetching))
+         (push fetching remote-operations))))
      qq-media--fetching-cache)
     (maphash
      (lambda (_key entry)
@@ -140,6 +147,11 @@ the adopted transport `:token'.")
     (dolist (transfer transfers)
       (condition-case nil
           (appkit-media-cancel-transfer transfer)
+        (error nil)
+        (quit nil)))
+    (dolist (operation remote-operations)
+      (condition-case nil
+          (qq-remote-media-cancel-operation operation)
         (error nil)
         (quit nil))))
   (clrhash qq-media--resource-cache)
@@ -205,15 +217,27 @@ transfer callbacks can run outside a safe redisplay context; immediate
    (lambda ()
      (run-hook-with-args 'qq-media-cache-update-hook media-key))))
 
-(defun qq-media--native-record-media-id (segment)
-  "Return validated native record media ID from SEGMENT, or nil."
-  (when (equal (alist-get 'type segment) "record")
+(defun qq-media--native-media-id (segment expected-type)
+  "Return SEGMENT's native media ID when its type is EXPECTED-TYPE."
+  (when (equal (alist-get 'type segment) expected-type)
     (let ((media-id (alist-get 'media_id (alist-get 'data segment))))
       (and (qq-remote-media--id-p media-id) media-id))))
+
+(defun qq-media--native-record-media-id (segment)
+  "Return validated native record media ID from SEGMENT, or nil."
+  (qq-media--native-media-id segment "record"))
+
+(defun qq-media--native-image-media-id (segment)
+  "Return validated native image media ID from SEGMENT, or nil."
+  (qq-media--native-media-id segment "image"))
 
 (defun qq-media--native-record-key (media-id)
   "Return logical media cache key for native record MEDIA-ID."
   (format "record:%s" media-id))
+
+(defun qq-media--native-image-key (media-id)
+  "Return logical media cache key for native image MEDIA-ID."
+  (format "image:%s" media-id))
 
 (defun qq-media-native-record-playback-state (segment-or-media-id)
   "Return public playback state for SEGMENT-OR-MEDIA-ID, or nil.
@@ -238,7 +262,47 @@ and ephemeral filesystem path retained by the private player state."
         (setq entry (gethash media-id qq-media--native-record-playbacks)))
       (list :media-id media-id
             :status (plist-get entry :status)
+            :duration-seconds (plist-get entry :duration-seconds)
+            :played-seconds (qq-media--native-record-played-seconds entry)
             :error (plist-get entry :error)))))
+
+(defun qq-media--native-record-played-seconds (entry)
+  "Return current playback position represented by native record ENTRY."
+  (let* ((played (or (plist-get entry :played-seconds) 0.0))
+         (started-at (plist-get entry :started-at))
+         (duration (plist-get entry :duration-seconds))
+         (position
+          (if (and (eq (plist-get entry :status) 'playing)
+                   (numberp started-at))
+              (+ played (max 0.0 (- (float-time) started-at)))
+            played)))
+    (if (and (numberp duration) (> duration 0))
+        (min (float duration) position)
+      position)))
+
+(defun qq-media--cancel-native-record-progress-timer ()
+  "Cancel the native record progress redisplay timer."
+  (when (timerp qq-media--native-record-progress-timer)
+    (cancel-timer qq-media--native-record-progress-timer))
+  (setq qq-media--native-record-progress-timer nil))
+
+(defun qq-media--native-record-progress-tick ()
+  "Redisplay the active native record while its player is running."
+  (let* ((media-id qq-media--native-record-current-id)
+         (entry (and media-id
+                     (gethash media-id qq-media--native-record-playbacks)))
+         (process (and entry (plist-get entry :process))))
+    (if (and (eq (plist-get entry :status) 'playing)
+             (processp process)
+             (process-live-p process))
+        (qq-media--notify-native-record-state media-id)
+      (qq-media--cancel-native-record-progress-timer))))
+
+(defun qq-media--ensure-native-record-progress-timer ()
+  "Start one shared native record progress redisplay timer."
+  (unless (timerp qq-media--native-record-progress-timer)
+    (setq qq-media--native-record-progress-timer
+          (run-at-time 1 1 #'qq-media--native-record-progress-tick))))
 
 (defun qq-media--record-player-command ()
   "Return normalized native-record player arguments, or nil."
@@ -252,7 +316,7 @@ and ephemeral filesystem path retained by the private player state."
   "Notify open chats that native record MEDIA-ID changed playback state."
   (qq-media--note-cache-updated (qq-media--native-record-key media-id)))
 
-(defun qq-media--close-native-record-access (access-id)
+(defun qq-media--close-local-access (access-id)
   "Best-effort revoke local resource ACCESS-ID."
   (when (qq-resource--local-access-id-p access-id)
     (condition-case error-data
@@ -261,10 +325,10 @@ and ephemeral filesystem path retained by the private player state."
           (qq-resource-close-local
            access-id nil
            (lambda (_body reason)
-             (message "qq: failed to close record playback lease: %s" reason))))
+             (message "qq: failed to close local resource lease: %s" reason))))
       (error
        ;; The service TTL remains the disconnected-client fallback.
-       (message "qq: could not request record lease closure: %s"
+       (message "qq: could not request resource lease closure: %s"
                 (error-message-string error-data))))))
 
 (defun qq-media--dispose-native-record-entry (media-id &optional status error-text)
@@ -299,14 +363,16 @@ and ephemeral filesystem path retained by the private player state."
       (when (and (appkit-handle-p owner-handle)
                  (appkit-handle-alive-p owner-handle))
         (appkit-retire-handle owner-handle))
-      (qq-media--close-native-record-access access-id)
+      (qq-media--close-local-access access-id)
       (when (equal qq-media--native-record-current-id media-id)
-        (setq qq-media--native-record-current-id nil))
+        (setq qq-media--native-record-current-id nil)
+        (qq-media--cancel-native-record-progress-timer))
       (qq-media--notify-native-record-state media-id)
       entry)))
 
 (defun qq-media--stop-all-native-record-playback ()
   "Cancel every native-record preparation/player and revoke its lease."
+  (qq-media--cancel-native-record-progress-timer)
   (let (media-ids)
     (maphash (lambda (media-id _entry) (push media-id media-ids))
              qq-media--native-record-playbacks)
@@ -325,13 +391,21 @@ and ephemeral filesystem path retained by the private player state."
         (let ((buffer (plist-get entry :buffer))
               (access-id (plist-get entry :access-id))
               (owner-handle (plist-get entry :owner-handle))
-              (successful (= (process-exit-status process) 0)))
+              (successful (= (process-exit-status process) 0))
+              (played-seconds
+               (qq-media--native-record-played-seconds entry)))
           (setq entry (plist-put entry :process nil))
           (setq entry (plist-put entry :buffer nil))
           (setq entry (plist-put entry :access-id nil))
           (setq entry (plist-put entry :owner-handle nil))
           (setq entry (plist-put entry :status
                                  (if successful 'finished 'failed)))
+          (setq entry (plist-put entry :played-seconds
+                                 (if successful
+                                     (or (plist-get entry :duration-seconds)
+                                         played-seconds)
+                                   played-seconds)))
+          (setq entry (plist-put entry :started-at nil))
           (setq entry (plist-put entry :error
                                  (unless successful "record player exited abnormally")))
           (puthash media-id entry qq-media--native-record-playbacks)
@@ -341,9 +415,10 @@ and ephemeral filesystem path retained by the private player state."
           (when (and (appkit-handle-p owner-handle)
                      (appkit-handle-alive-p owner-handle))
             (appkit-retire-handle owner-handle))
-          (qq-media--close-native-record-access access-id)
+          (qq-media--close-local-access access-id)
           (when (equal qq-media--native-record-current-id media-id)
-            (setq qq-media--native-record-current-id nil))
+            (setq qq-media--native-record-current-id nil)
+            (qq-media--cancel-native-record-progress-timer))
           (qq-media--notify-native-record-state media-id))))))
 
 (defun qq-media--start-native-record-player (media-id result)
@@ -364,7 +439,7 @@ and ephemeral filesystem path retained by the private player state."
         (progn
           (when (buffer-live-p buffer)
             (kill-buffer buffer))
-          (qq-media--close-native-record-access access-id)
+          (qq-media--close-local-access access-id)
           (qq-media--dispose-native-record-entry
            media-id 'failed "record playback input or player is unavailable")
           (message "qq: Native record playback input or player is unavailable")
@@ -406,16 +481,18 @@ and ephemeral filesystem path retained by the private player state."
                   (set-process-plist process nil)
                   (when (buffer-live-p buffer)
                     (kill-buffer buffer))
-                  (qq-media--close-native-record-access access-id)
+                  (qq-media--close-local-access access-id)
                   nil)
               (setq entry (plist-put entry :operation nil))
               (setq entry (plist-put entry :process process))
               (setq entry (plist-put entry :status 'playing))
+              (setq entry (plist-put entry :started-at (float-time)))
               (setq entry (plist-put entry :error nil))
               (puthash media-id entry qq-media--native-record-playbacks)
               (setq qq-media--native-record-current-id media-id)
               (set-process-sentinel
                process #'qq-media--native-record-player-sentinel)
+              (qq-media--ensure-native-record-progress-timer)
               ;; Emacs does not promise to replay an exit event which arrived
               ;; while the sentinel was `ignore'.  Finalization is idempotent
               ;; because it checks exact process ownership.
@@ -435,7 +512,7 @@ and ephemeral filesystem path retained by the private player state."
                   (equal qq-media--native-record-current-id media-id)
                   (eq (plist-get entry :status) 'preparing)
                   (qq-account-get (plist-get entry :account-id))))
-        (qq-media--close-native-record-access
+        (qq-media--close-local-access
          (alist-get 'access_id (alist-get 'access result)))
       (qq-media--start-native-record-player media-id result))))
 
@@ -469,8 +546,14 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
            (condition-case error-data
                (progn
                  (signal-process process 'SIGSTOP)
+                 (setq entry
+                       (plist-put
+                        entry :played-seconds
+                        (qq-media--native-record-played-seconds entry)))
+                 (setq entry (plist-put entry :started-at nil))
                  (setq entry (plist-put entry :status 'paused))
                  (puthash media-id entry qq-media--native-record-playbacks)
+                 (qq-media--cancel-native-record-progress-timer)
                  (qq-media--notify-native-record-state media-id))
              (error
               (qq-media--dispose-native-record-entry
@@ -481,8 +564,10 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
            (condition-case error-data
                (progn
                  (signal-process process 'SIGCONT)
+                 (setq entry (plist-put entry :started-at (float-time)))
                  (setq entry (plist-put entry :status 'playing))
                  (puthash media-id entry qq-media--native-record-playbacks)
+                 (qq-media--ensure-native-record-progress-timer)
                  (qq-media--notify-native-record-state media-id))
              (error
               (qq-media--dispose-native-record-entry
@@ -506,6 +591,11 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
                       media-id 'stopped))))
               (next (list :status 'preparing
                           :account-id account-id
+                          :duration-seconds
+                          (alist-get 'duration_seconds
+                                     (alist-get 'data segment))
+                          :played-seconds 0.0
+                          :started-at nil
                           :owner-handle owner-handle
                           :operation nil
                           :process nil
@@ -538,8 +628,13 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
 
 (defun qq-media--native-remote-media-changed (_reason media-id)
   "Redisplay cards affected by remote MEDIA-ID state changes."
-  (if media-id
-      (qq-media--notify-native-record-state media-id)
+  (if-let* ((media (and media-id (qq-remote-media media-id))))
+      (pcase (alist-get 'kind media)
+        ("record" (qq-media--notify-native-record-state media-id))
+        ("image"
+         (qq-media--note-cache-updated
+          (qq-media--native-image-key media-id)))
+        (_ (qq-media--note-cache-updated nil)))
     (qq-media--note-cache-updated nil)))
 
 (add-hook 'qq-remote-media-changed-hook
@@ -729,6 +824,79 @@ resource alist.  SPEC is forwarded to IMAGE-BUILDER, which defaults to
                (when (gethash key qq-media--fetching-cache)
                  (qq-media--finish-resource-image-fetch key nil nil nil))))
             nil))))))
+
+(defun qq-media--native-image-animated-p (segment)
+  "Return non-nil when native image SEGMENT is known to be animated."
+  (let* ((data (alist-get 'data segment))
+         (summary (alist-get 'summary data)))
+    (or (qq-media--json-truthy-p (alist-get 'animated data))
+        (and (stringp summary)
+             (string-match-p "动画" summary)))))
+
+(defun qq-media--fetch-native-image-resource
+    (segment key callback errback)
+  "Materialize native image SEGMENT into persistent cache entry KEY.
+
+The Gateway grants only a short-lived local access path.  Copy it through
+Appkit's atomic image cache before closing the lease; CALLBACK therefore sees
+only a client-owned stable file."
+  (let ((media-id (qq-media--native-image-media-id segment))
+        (error-fn (or errback #'qq-api--default-error)))
+    (if (not media-id)
+        (funcall error-fn nil "image segment has no native media handle")
+      (condition-case error-data
+          (let ((operation
+                 (qq-remote-media-prepare-local-access
+                  media-id
+                  (lambda (result)
+                    (let* ((access (alist-get 'access result))
+                           (access-id (alist-get 'access_id access))
+                           (path (alist-get 'path access))
+                           (closed nil))
+                      (cl-labels
+                          ((close-access
+                            ()
+                            (unless closed
+                              (setq closed t)
+                              (qq-media--close-local-access access-id)))
+                           (finish
+                            (file)
+                            (close-access)
+                            (let ((resource
+                                   `((file . ,file)
+                                     (name . ,(file-name-nondirectory file))
+                                     ,@(when
+                                           (qq-media--native-image-animated-p
+                                            segment)
+                                         '((animated . t))))))
+                              (if (qq-media--native-image-animated-p segment)
+                                  (qq-media--prepare-animated-face-resource
+                                   resource callback)
+                                (funcall callback resource))))
+                           (fail-copy
+                            (reason)
+                            (close-access)
+                            (funcall error-fn nil reason)))
+                        (condition-case copy-error
+                            (appkit-media-cache-image-resource-async
+                             `((file . ,path))
+                             (qq-media--remote-image-cache-file-base key)
+                             #'finish #'fail-copy)
+                          ((error quit)
+                           (close-access)
+                           (funcall
+                            error-fn nil
+                            (error-message-string copy-error)))))))
+                  error-fn)))
+            ;; Preview ownership places a marker in this table before invoking
+            ;; the fetcher.  Do not overwrite a synchronous completion.
+            (when (and (qq-remote-media-operation-active-p operation)
+                       (gethash key qq-media--fetching-cache))
+              (puthash key operation qq-media--fetching-cache))
+            operation)
+        ((error quit)
+         (funcall error-fn nil (error-message-string error-data))
+         nil)))))
 
 (defun qq-media--resource-fetching-p (key)
   "Return non-nil when KEY is currently being fetched."
@@ -1133,14 +1301,86 @@ states never probe a second interface such as get_file."
           :remote-error remote-error
           :download-state nil)))
 
+(defconst qq-media--native-image-required-methods
+  '("media.materialize"
+    "media.cancel"
+    "resource.status"
+    "resource.open_local"
+    "resource.close_local")
+  "Native protocol methods required for image materialization.")
+
+(defun qq-media--native-image-methods-ready-p ()
+  "Return non-nil when native image materialization can start."
+  (and (qq-runtime-current-account-id)
+       (qq-server-ready-p)
+       (cl-every #'qq-rpc-method-available-p
+                 qq-media--native-image-required-methods)))
+
+(defun qq-media--native-image-capabilities (segment media-id)
+  "Return the action/status model for native image SEGMENT and MEDIA-ID."
+  (let* ((local-file (qq-media-segment-local-file segment))
+         (remote (qq-remote-media media-id))
+         (phase (alist-get 'phase remote))
+         (problem (alist-get 'error remote))
+         (problem-message (alist-get 'message problem))
+         (methods-ready (qq-media--native-image-methods-ready-p))
+         (download-state (qq-media-segment-download-state segment))
+         (download-status (plist-get download-state :status))
+         (resolve-remote (and methods-ready (not local-file)))
+         (remote-error
+          (cond
+           ((not (qq-runtime-current-account-id))
+            "select an account before loading this image")
+           ((not methods-ready)
+            "native image materialization methods are unavailable")
+           ((equal phase "failed")
+            (or problem-message "remote image materialization failed"))))
+         (status
+          (or (qq-media--transfer-status-text download-state)
+              (pcase phase
+                ("materializing"
+                 (let ((done (alist-get 'bytes_done remote))
+                       (total (or (alist-get 'bytes_total remote)
+                                  (alist-get 'expected_size remote))))
+                   (if total
+                       (format "Loading %s/%s bytes" done total)
+                     (format "Loading %s bytes" done))))
+                ("materialized" "Ready")
+                ("failed"
+                 (format "Retry: %s"
+                         (truncate-string-to-width
+                          (or problem-message "materialization failed")
+                          68 nil nil t)))
+                (_ (unless local-file "Remote image"))))))
+    (list :open (and (or local-file methods-ready) t)
+          :download (and resolve-remote
+                         (not (memq download-status
+                                    '(downloading downloaded))))
+          :save (and (or local-file methods-ready) t)
+          :copy-url nil
+          :status status
+          :local-file local-file
+          :remote-status (or phase 'unprojected)
+          :resolve-remote resolve-remote
+          :remote-url nil
+          :remote-error remote-error
+          :download-state download-state)))
+
 (defun qq-media-segment-capabilities (segment)
   "Return the centralized action/status model for media SEGMENT.
 
-Native records use only their opaque remote-media handle.  Other segments
-remain on the dormant v1 resource model while that client is retired."
-  (if-let* ((media-id (qq-media--native-record-media-id segment)))
-      (qq-media--native-record-capabilities media-id)
-    (qq-media--legacy-segment-capabilities segment)))
+Native records and images use only their opaque remote-media handles.  Other
+segments remain on the dormant v1 resource model while that client is
+retired."
+  (cond
+   ((qq-media--native-record-media-id segment)
+    (qq-media--native-record-capabilities
+     (qq-media--native-record-media-id segment)))
+   ((qq-media--native-image-media-id segment)
+    (qq-media--native-image-capabilities
+     segment (qq-media--native-image-media-id segment)))
+   (t
+    (qq-media--legacy-segment-capabilities segment))))
 
 (defun qq-media--segment-resource-key (segment)
   "Return logical resource cache key for SEGMENT, or nil."
@@ -1151,10 +1391,13 @@ remain on the dormant v1 resource model while that client is retired."
          (file-key (qq-media--segment-file-key segment))
          (url (qq-media--segment-url segment))
          (data (alist-get 'data segment))
-         (media-id (qq-media--native-record-media-id segment))
+         (record-media-id (qq-media--native-record-media-id segment))
+         (image-media-id (qq-media--native-image-media-id segment))
          (emoji-id (alist-get 'id data)))
     (pcase type
-      ("image" (or (and file-key (format "image:%s" file-key))
+      ("image" (or (and image-media-id
+                         (qq-media--native-image-key image-media-id))
+                    (and file-key (format "image:%s" file-key))
                    (and (appkit-media-url-present-p url) (format "image-url:%s" url))))
       ("video"
        (or (and resolver-identity
@@ -1165,7 +1408,8 @@ remain on the dormant v1 resource model while that client is retired."
       ("file"
        (or (and file-key (format "%s:%s" type file-key))
            (and (appkit-media-url-present-p url) (format "%s-url:%s" type url))))
-      ("record" (or (and media-id (qq-media--native-record-key media-id))
+      ("record" (or (and record-media-id
+                          (qq-media--native-record-key record-media-id))
                     (and file-key (format "record:%s" file-key))))
       ("face" (and emoji-id (format "face:%s" emoji-id)))
       ("mface" (or (and file-key (format "mface:%s" file-key))
@@ -1182,9 +1426,13 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
          (error-fn (or errback #'qq-api--default-error)))
     (pcase type
       ("image"
-       (qq-media--resolve-fileish-segment
-        segment "get_image" callback error-fn
-        "image segment has neither local file, file id, nor URL"))
+       (if-let* ((media-id (qq-media--native-image-media-id segment)))
+           (qq-media--fetch-native-image-resource
+            segment (qq-media--native-image-key media-id)
+            callback error-fn)
+         (qq-media--resolve-fileish-segment
+          segment "get_image" callback error-fn
+          "image segment has neither local file, file id, nor URL")))
       ((or "file" "video")
        (qq-media--resolve-fileish-segment
         segment
@@ -1373,6 +1621,7 @@ OWNER is forwarded exactly to lifecycle-own an external video player."
          (type (or (alist-get 'type segment) "media"))
          (cached-resource (qq-media--cached-resource (qq-media--segment-resource-key segment)))
          (seed (or (qq-media--segment-file-key segment)
+                   (alist-get 'media_id data)
                    (alist-get 'id data)
                    (alist-get 'emoji_id data)
                    (substring (md5 (prin1-to-string segment)) 0 8)))
@@ -2567,7 +2816,8 @@ not ready yet, show DESCRIPTION or the known human face name
 (defun qq-media-segment-preview-key (segment)
   "Return preview cache key for SEGMENT, or nil when unsupported."
   (when (qq-media-segment-preview-capable-p segment)
-    (let* ((type (alist-get 'type segment))
+    (let* ((native-image-id (qq-media--native-image-media-id segment))
+           (type (alist-get 'type segment))
            (resolver-identity
             (and (equal type "video")
                  (qq-media--video-resolver-cache-identity segment)))
@@ -2580,6 +2830,8 @@ not ready yet, show DESCRIPTION or the known human face name
            (file-key (qq-media--segment-file-key segment))
            (url (qq-media--segment-url segment)))
       (cond
+       (native-image-id
+        (qq-media--native-image-key native-image-id))
        (resolver-identity
         (format "preview:%s:%s" preview-type resolver-identity))
        (file-key
@@ -2683,6 +2935,7 @@ to NapCat `get_image' when there is no usable URL/local path.
 
 Preview failures are soft (no NapCat error spam)."
   (let ((key (qq-media-segment-preview-key segment))
+        (native-image-id (qq-media--native-image-media-id segment))
         (local (qq-media--segment-existing-path segment))
         (url (qq-media--segment-url segment)))
     (when key
@@ -2697,7 +2950,11 @@ Preview failures are soft (no NapCat error spam)."
         (qq-media--ensure-resource-image
          key
          (lambda (done error)
-           (if (qq-media-segment-preview-capable-p segment)
+           (cond
+            (native-image-id
+             (qq-media--fetch-native-image-resource
+              segment key done error))
+            ((qq-media-segment-preview-capable-p segment)
                (qq-media--resolve-fileish-segment
                 segment
                 "get_image"
@@ -2705,8 +2962,9 @@ Preview failures are soft (no NapCat error spam)."
                 ;; Soft-fail: clear fetching without user-error / NapCat spam.
                 (lambda (_response _reason)
                   (funcall error nil "preview image not found"))
-                "preview image not found")
-             (funcall done nil)))
+                "preview image not found"))
+            (t
+             (funcall done nil))))
          nil
          #'qq-media--preview-image-from-file)))))
 

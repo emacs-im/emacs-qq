@@ -1875,7 +1875,7 @@
                    (lambda () '("sh" "-c" "exit 0")))
                   ((symbol-function 'qq-media-native-record-playback-available-p)
                    (lambda () t))
-                  ((symbol-function 'qq-media--close-native-record-access)
+                  ((symbol-function 'qq-media--close-local-access)
                    (lambda (called-access-id) (push called-access-id closed)))
                   ((symbol-function 'qq-media--notify-native-record-state)
                    #'ignore))

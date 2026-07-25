@@ -370,7 +370,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
               (payload
                . ((target
                    . ((kind . "native")
-                      (message_id . "7348923749823749111"))))))
+                      (sequence . "4000000001"))))))
             '((kind . "face") (payload . ((id . "178"))))
             '((kind . "record") (payload . ((duration_seconds . 17))))
             '((kind . "unsupported")
@@ -409,8 +409,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                          "__unsupported")))
         (should
          (equal
-          (alist-get 'message_id (alist-get 'data (nth 2 internal)))
-          "7348923749823749111"))
+          (alist-get 'message_seq (alist-get 'data (nth 2 internal)))
+          "4000000001"))
         (should (equal (alist-get 'id (alist-get 'data (nth 3 internal)))
                        "178"))
         (should (= (alist-get 'duration_seconds

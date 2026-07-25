@@ -37,7 +37,7 @@
 
 (cl-defstruct (qq-remote-media-operation
                (:constructor qq-remote-media-operation-create))
-  "One cancellable inbound-record playback preparation."
+  "One cancellable remote-media materialization pipeline."
   active-p
   media-id
   account-id
@@ -281,6 +281,126 @@ CALLBACK receives the release receipt; ERRBACK receives failure details."
   (and (qq-account-get
         (qq-remote-media-operation-account-id operation))
        t))
+
+(defun qq-remote-media-prepare-local-access
+    (media-id callback &optional errback)
+  "Materialize remote MEDIA-ID and open a short-lived local access lease.
+
+CALLBACK receives an alist containing `media_id', `resource_id', and `access'.
+The callback owns the access lease and must close its `access_id' after
+copying or consuming the isolated file.  ERRBACK follows the Gateway failure
+convention.  Return a cancellable `qq-remote-media-operation'."
+  (unless (qq-remote-media--id-p media-id)
+    (user-error "qq: Media ID must be an opaque media- UUID"))
+  (let* ((account-id (qq-runtime-current-account-id))
+         (operation
+          (qq-remote-media-operation-create
+           :active-p t :media-id media-id :account-id account-id)))
+    (unless account-id
+      (user-error "qq: Select an account before materializing remote media"))
+    (cl-labels
+        ((fail
+          (body reason)
+          (when (qq-remote-media-operation-active-p operation)
+            (setf (qq-remote-media-operation-active-p operation) nil)
+            (qq-remote-media--cancel-operation-local operation)
+            (qq-account--invoke errback body reason)))
+         (ensure-account
+          ()
+          (if (qq-remote-media--account-current-p operation)
+              t
+            (fail
+             '((code . "account_removed")
+               (message . "QQ account was removed during media materialization"))
+             "QQ account was removed during media materialization")
+            nil))
+         (start-request
+          (thunk)
+          (when (and (qq-remote-media-operation-active-p operation)
+                     (ensure-account))
+            (condition-case error-data
+                (let ((request-id (funcall thunk)))
+                  (when (and request-id
+                             (qq-remote-media-operation-active-p operation))
+                    (setf
+                     (qq-remote-media-operation-request-id operation)
+                     request-id)))
+              (error (fail nil (error-message-string error-data))))))
+         (handoff-access
+          (access)
+          (if (not (and (qq-remote-media-operation-active-p operation)
+                        (ensure-account)))
+              (qq-resource-close-local (alist-get 'access_id access))
+            (setf (qq-remote-media-operation-active-p operation) nil
+                  (qq-remote-media-operation-request-id operation) nil)
+            (let ((result
+                   `((media_id . ,media-id)
+                     (resource_id
+                      . ,(qq-remote-media-operation-source-resource-id
+                          operation))
+                     (access . ,access))))
+              (if (not callback)
+                  (qq-resource-close-local (alist-get 'access_id access))
+                (condition-case error-data
+                    (funcall callback result)
+                  (error
+                   (qq-resource-close-local
+                    (alist-get 'access_id access))
+                   (message "qq: media access callback failed: %s"
+                            (error-message-string error-data))))))))
+         (resource-ready
+          (resource)
+          (when (and (qq-remote-media-operation-active-p operation)
+                     (ensure-account))
+            (setf (qq-remote-media-operation-watch operation) nil)
+            (start-request
+             (lambda ()
+               (qq-resource-open-local
+                (alist-get 'resource_id resource)
+                #'handoff-access #'fail)))))
+         (resource-status
+          (resource)
+          (when (qq-remote-media-operation-active-p operation)
+            (setf (qq-remote-media-operation-request-id operation) nil
+                  (qq-remote-media-operation-source-resource-id operation)
+                  (alist-get 'resource_id resource))
+            (let ((watch
+                   (qq-resource-await-ready
+                    (alist-get 'resource_id resource)
+                    #'resource-ready #'fail)))
+              (when (qq-request-watch-active-p watch)
+                (setf (qq-remote-media-operation-watch operation) watch)))))
+         (materialized
+          (media)
+          (when (qq-remote-media-operation-active-p operation)
+            (setf (qq-remote-media-operation-watch operation) nil)
+            (let ((owner (alist-get 'account_id media))
+                  (resource-id (alist-get 'resource_id media)))
+              (if (not (and (ensure-account)
+                            (equal owner account-id)))
+                  (when (qq-remote-media-operation-active-p operation)
+                    (fail nil "Remote media belongs to another managed account"))
+                (start-request
+                 (lambda ()
+                   (qq-resource-status
+                    resource-id #'resource-status #'fail)))))))
+         (await-media
+          ()
+          (let ((watch
+                 (qq-remote-media-await-materialized
+                  media-id #'materialized #'fail)))
+            (when (qq-request-watch-active-p watch)
+              (setf (qq-remote-media-operation-watch operation) watch))))
+         (materialize-started
+          (_media)
+          (when (qq-remote-media-operation-active-p operation)
+            (setf (qq-remote-media-operation-request-id operation) nil)
+            (await-media))))
+      (start-request
+       (lambda ()
+         (qq-remote-media-materialize
+          media-id #'materialize-started #'fail)))
+      operation)))
 
 (defun qq-remote-media-prepare-record-playback
     (media-id callback &optional errback)

@@ -840,19 +840,16 @@ segments.  A resolve action result itself must be terminal or available."
                protocol-p "qq: %s reply entry target is invalid" context)))
            ("native"
             (unless (qq-api--exact-object-keys-p
-                     target '(kind message_id)
-                     '(sequence sender sender_name sent_at))
+                     target '(kind sequence)
+                     '(sender sender_name sent_at))
               (qq-api--signal-schema-error
                protocol-p "qq: %s native reply target is invalid" context))
-            (qq-api-validate-message-id
-             (alist-get 'message_id target) context protocol-p)
-            (when (assq 'sequence target)
-              (unless (qq-account--uint64-decimal-p
-                       (alist-get 'sequence target))
-                (qq-api--signal-schema-error
-                 protocol-p
-                 "qq: %s native reply sequence must be canonical nonzero uint64 text"
-                 context)))
+            (unless (qq-account--uint64-decimal-p
+                     (alist-get 'sequence target))
+              (qq-api--signal-schema-error
+               protocol-p
+               "qq: %s native reply sequence must be canonical nonzero uint64 text"
+               context))
             (when (assq 'sender target)
               (let ((sender (alist-get 'sender target)))
                 (unless
