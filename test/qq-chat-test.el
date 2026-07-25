@@ -1997,6 +1997,7 @@
      (qq-chat-render)
      (qq-chat--set-reply-message
       '((server-id . "42")
+        (session-key . "private:10001")
         (sender-name . "Alice")
         (raw-message . "[CQ:image,file=x.png,url=http://example.com/x]")
         (preview . "[image]")
@@ -3897,7 +3898,8 @@
                             (mapcar (lambda (segment) (alist-get 'type segment))
                                     (qq-chat--current-input-segments))))
              (qq-chat--set-pending-reply
-              '((server-id . "42")
+             '((server-id . "42")
+                (session-key . "private:10001")
                 (raw-message . "source")
                 (segments . (((type . "text")
                               (data . ((text . "source"))))))))
@@ -3912,7 +3914,11 @@
              (should-not sent-raw)
              (should (equal "reply" (alist-get 'type (nth 0 sent-segments))))
              (should (equal "42"
-                            (alist-get 'id (alist-get 'data (nth 0 sent-segments)))))
+                            (alist-get
+                             'message_id
+                             (alist-get
+                              'target
+                              (alist-get 'data (nth 0 sent-segments))))))
              (should (equal "file" (alist-get 'type (nth 1 sent-segments))))
              (should (equal path
                             (alist-get 'file (alist-get 'data (nth 1 sent-segments)))))
@@ -3931,6 +3937,7 @@
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
      (let* ((reply '((server-id . "9007199254742007094")
+                     (session-key . "private:10001")
                      (raw-message . "source")))
             error-fn)
        (qq-chat--insert-input-segment-object
@@ -3965,6 +3972,7 @@
      (setq qq-chat--session-key "private:10001")
      (qq-chat-render)
      (let ((reply '((server-id . "9007199254742007094")
+                    (session-key . "private:10001")
                     (raw-message . "source"))))
        (qq-chat--insert-input-segment-object
         '((type . "at")
@@ -3988,7 +3996,9 @@
      (qq-chat-edit-draft)
      (insert "keep me")
      (qq-chat--set-reply-message
-      '((server-id . "9007199254742007094") (raw-message . "source")))
+      '((server-id . "9007199254742007094")
+        (session-key . "private:10001")
+        (raw-message . "source")))
      (let ((updates 0))
        (cl-letf (((symbol-function 'qq-chat--update-frame)
                   (lambda ()
@@ -4014,7 +4024,10 @@
      (qq-chat-render)
      (qq-chat-edit-draft)
      (insert "keep me")
-     (qq-chat--set-reply-message '((server-id . 42) (raw-message . "source")))
+     (qq-chat--set-reply-message
+      '((server-id . 42)
+        (session-key . "private:10001")
+        (raw-message . "source")))
      (cl-letf (((symbol-function 'qq-core-send-message)
                 (lambda (&rest _args)
                   (ert-fail "invalid reply id must fail before API send"))))
@@ -4083,6 +4096,7 @@
      (qq-chat-edit-draft)
      (insert "old draft")
      (let ((new-reply '((server-id . "9007199254742007095")
+                        (session-key . "private:10001")
                         (raw-message . "new source")))
            error-fn)
        (cl-letf (((symbol-function 'qq-core-send-message)
@@ -4214,6 +4228,37 @@
        (should
         (equal history-anchor
                (get-text-property (point) 'qq-chat-message-anchor)))))))
+
+(ert-deftest qq-chat-replies-to-sequence-only-group-history ()
+  (qq-chat-test-with-reset
+   (let* ((session-key "group:20001")
+          (message
+           `((id . "history:slot-a:group:20001:100:none")
+             (server-id)
+             (session-key . ,session-key)
+             (message-seq . "100")
+             (message-type . "group")
+             (sender-id . "10001")
+             (sender-name . "Alice")
+             (time . 1710000100)
+             (raw-message . "source")
+             (preview . "source")
+             (segments . (((type . "text")
+                           (data . ((text . "source")))))))))
+     (qq-state-upsert-session
+      session-key
+      '((type . group) (title . "Group") (target-id . "20001"))
+      nil)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key session-key)
+       (qq-chat-render)
+       (qq-chat--set-pending-reply message)
+       (should (eq (plist-get (appkit-chatbuf-aux-state) :aux-type) 'reply))
+       (should (eq (plist-get (appkit-chatbuf-aux-state) :aux-msg) message))
+       (should-not (plist-get (appkit-chatbuf-aux-state) :message-id))
+       (should (string-match-p "Reply to Alice"
+                               (qq-chat--reply-context-text)))))))
 
 (ert-deftest qq-chat-message-reply-id-from-segments ()
   (should
@@ -6809,7 +6854,9 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
       '((type . "at")
         (data . ((qq . "10001") (name . "Alice Card")))))
      (qq-chat--set-reply-message
-      '((server-id . "9007199254742007094") (raw-message . "source")))
+      '((server-id . "9007199254742007094")
+        (session-key . "private:10001")
+        (raw-message . "source")))
      ;; Match the send boundary, which normalizes live editable properties into
      ;; the canonical snapshot before the destructive clear.
      (qq-chat--sync-draft-from-buffer)
@@ -6862,7 +6909,9 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
       '((type . "at")
         (data . ((qq . "10001") (name . "Alice Card")))))
      (qq-chat--set-reply-message
-      '((server-id . "9007199254742007094") (raw-message . "source")))
+      '((server-id . "9007199254742007094")
+        (session-key . "private:10001")
+        (raw-message . "source")))
      (qq-chat--sync-draft-from-buffer)
      (let (failure old-view replacement-view draft-state aux-state segments
                    sync-views)

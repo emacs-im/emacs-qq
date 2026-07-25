@@ -1334,11 +1334,11 @@ merge metadata containing `:response-private-cursor' and
 (defun qq-message--prepare-outbound (session-key segments owner)
   "Translate UI SEGMENTS into one native outbound message.
 
-Return a plist with `:reply-to', either nil or an exact message-reference
-object, and `:segments', the ordered native content elements.  Reply is a
-request modifier rather than content.  This adapter checks only facts needed
-to translate the local shape or protect its attachment projection; Gateway
-owns the outbound domain schema and segment limits."
+Return a plist with `:reply-to', either nil or a closed reply target, and
+`:segments', the ordered native content elements.  Reply is a request modifier
+rather than content.  This adapter checks only facts needed to translate the
+local shape or protect its attachment projection; Gateway owns the outbound
+domain schema, observed source metadata, and segment limits."
   (let ((group-p (eq (qq-state-session-key-type session-key) 'group))
         reply-to
         native-segments)
@@ -1382,13 +1382,23 @@ owns the outbound domain schema and segment limits."
                    `((kind . "record")
                      (payload . ((attachment_id . ,attachment-id))))))
                 ("reply"
-                 (unless (qq-message--message-id-p
-                          (alist-get 'id data))
-                   (user-error "qq: Reply target has no exact Message ID"))
-                 (when reply-to
-                   (user-error "qq: A message has only one reply target"))
-                 (setq reply-to
-                       `((message_id . ,(alist-get 'id data))))
+                 (let ((target (alist-get 'target data)))
+                   (pcase (alist-get 'kind target)
+                     ("message"
+                      (unless (qq-message--message-id-p
+                               (alist-get 'message_id target))
+                        (user-error "qq: Reply target has an invalid Message ID")))
+                     ("sequence"
+                      (unless (and group-p
+                                   (qq-protocol-message-sequence-p
+                                    (alist-get 'sequence target)))
+                        (user-error
+                         "qq: Sequence reply target requires a valid group sequence")))
+                     (_
+                      (user-error "qq: Reply target is malformed")))
+                   (when reply-to
+                     (user-error "qq: A message has only one reply target"))
+                   (setq reply-to target))
                  nil)
                 (_
                  (user-error
@@ -1510,12 +1520,12 @@ self-echo push already consumed the pending receipt."
   "Send SEGMENTS to native private/group SESSION-KEY.
 
 Supported elements are text, base face (ID 0 through 259), group mention,
-reply, and already prepared image/record attachments.  One optional reply is
-lifted into the request envelope and carries only the exact target message ID;
-the enclosing conversation completes its stable Message Reference and Gateway
-resolves native metadata.  At least one and at most 128 non-reply content
-elements are required.  RAW-MESSAGE is an optional optimistic rendering
-override.
+reply, and already prepared image/record/video attachments.  One optional
+reply is lifted into the request envelope.  It carries either an exact target
+Message ID or, for id-less group history, the authoritative group sequence.
+Gateway resolves the observed native source metadata.  At least one and at
+most 128 non-reply content elements are required.  RAW-MESSAGE is an optional
+optimistic rendering override.
 OPTIMISTIC-SEGMENTS, when non-nil, are stored in the pending row instead of
 protocol-ready SEGMENTS so local media previews never enter the wire request.
 The original reply element remains part of this local rendering shape."
@@ -1733,6 +1743,23 @@ body and reason."
 An exact NT snowflake works in private and group chats.  A group message may
 instead use its conversation-local native sequence; private sequence values
 alone are not a complete native recall capability."
+  (when (and (listp message)
+             (equal (alist-get 'session-key message) session-key))
+    (let ((message-id (alist-get 'server-id message))
+          (sequence (alist-get 'message-seq message)))
+      (cond
+       ((qq-protocol-message-id-p message-id)
+        `((kind . "message") (message_id . ,message-id)))
+       ((and (eq (qq-state-session-key-type session-key) 'group)
+             (qq-protocol-message-sequence-p sequence))
+        `((kind . "sequence") (sequence . ,sequence)))))))
+
+(defun qq-message-reply-target (session-key message)
+  "Return MESSAGE's closed native reply target in SESSION-KEY, or nil.
+
+An exact NT snowflake works in private and group chats.  Group history may
+instead use its authoritative conversation-local sequence; Gateway retains
+the corresponding sender identity and timestamp inside the account actor."
   (when (and (listp message)
              (equal (alist-get 'session-key message) session-key))
     (let ((message-id (alist-get 'server-id message))

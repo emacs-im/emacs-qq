@@ -29,6 +29,12 @@
   "Return a native text segment containing TEXT."
   `((kind . "text") (payload . ((text . ,text)))))
 
+(defun qq-message-test-reply-segment (message-id)
+  "Return a UI reply segment targeting exact MESSAGE-ID."
+  `((type . "reply")
+    (data . ((target . ((kind . "message")
+                        (message_id . ,message-id)))))))
+
 (defun qq-message-test-wire-segment (segment)
   "Return an owned domain copy of readable SEGMENT."
   (copy-tree segment))
@@ -943,12 +949,12 @@ push carries sequence=40909 and client_sequence=30202."
   (qq-message-test-with-state
     (let ((now (floor (float-time))) sent-method sent-params)
       (let ((segments
-             '(((type . "reply")
-                (data . ((id . "7348923749823749823"))))
-               ((type . "at")
+             (list
+              (qq-message-test-reply-segment "7348923749823749823")
+              '((type . "at")
                 (data . ((qq . "10001") (name . "Alice"))))
-               ((type . "face") (data . ((id . "178"))))
-               ((type . "text") (data . ((text . " hello")))))))
+              '((type . "face") (data . ((id . "178"))))
+              '((type . "text") (data . ((text . " hello")))))))
         (cl-letf (((symbol-function 'qq-server-ready-p)
                    (lambda () t))
                   ((symbol-function 'qq-server-capabilities)
@@ -982,7 +988,8 @@ push carries sequence=40909 and client_sequence=30202."
               (conversation
                . ((kind . "group") (group_uin . "8209413637")))
               (reply_to
-               . ((message_id . "7348923749823749823")))
+               . ((kind . "message")
+                  (message_id . "7348923749823749823")))
               (segments
                . (((kind . "mention")
                    (payload
@@ -1097,9 +1104,9 @@ push carries sequence=40909 and client_sequence=30202."
          (equal
           (qq-message-send
            "private:10001"
-           '(((type . "reply")
-              (data . ((id . "7348923749823749823"))))
-             ((type . "text") (data . ((text . "hello"))))))
+           (list
+            (qq-message-test-reply-segment "7348923749823749823")
+            '((type . "text") (data . ((text . "hello"))))))
           "request-unloaded-reply"))
         (should (equal sent-method "message.send"))
         (should
@@ -1108,7 +1115,8 @@ push carries sequence=40909 and client_sequence=30202."
           '((account_id . "slot-a")
             (conversation . ((kind . "private") (peer_uin . "10001")))
             (reply_to
-             . ((message_id . "7348923749823749823")))
+             . ((kind . "message")
+                (message_id . "7348923749823749823")))
             (segments
              . (((kind . "text")
                  (payload . ((text . "hello")))))))))
@@ -1118,9 +1126,9 @@ push carries sequence=40909 and client_sequence=30202."
           (should
            (equal
             (alist-get 'segments pending)
-            '(((type . "reply")
-               (data . ((id . "7348923749823749823"))))
-              ((type . "text") (data . ((text . "hello")))))))
+            (list
+             (qq-message-test-reply-segment "7348923749823749823")
+             '((type . "text") (data . ((text . "hello")))))))
           (should (eq (alist-get 'status pending) 'pending)))))))
 
 (ert-deftest
@@ -1136,18 +1144,17 @@ push carries sequence=40909 and client_sequence=30202."
           (should-error
            (qq-message-send
             "private:10001"
-            `(((type . "reply")
-               (data . ((id . ,message-id))))
-              ((type . "text") (data . ((text . "hello"))))))
+            (list
+             (qq-message-test-reply-segment message-id)
+             '((type . "text") (data . ((text . "hello"))))))
            :type 'user-error))
         (should-error
          (qq-message-send
           "private:10001"
-          '(((type . "reply")
-             (data . ((id . "7348923749823749823"))))
-            ((type . "text") (data . ((text . "hello"))))
-            ((type . "reply")
-             (data . ((id . "7348923749823749824"))))))
+          (list
+           (qq-message-test-reply-segment "7348923749823749823")
+           '((type . "text") (data . ((text . "hello"))))
+           (qq-message-test-reply-segment "7348923749823749824")))
          :type 'user-error)
         (should-not sent)
         (should-not (qq-state-session-messages "private:10001"))))))
@@ -1159,9 +1166,10 @@ push carries sequence=40909 and client_sequence=30202."
                  (lambda (&rest _arguments) (setq sent t))))
         (dolist
             (segments
-             '(nil
-               (((type . "reply")
-                 (data . ((id . "7348923749823749823")))))))
+             (list nil
+                   (list
+                    (qq-message-test-reply-segment
+                     "7348923749823749823"))))
           (should-error
            (qq-message-send "private:10001" segments)
            :type 'user-error))
@@ -1171,8 +1179,7 @@ push carries sequence=40909 and client_sequence=30202."
 (ert-deftest qq-message-reply-does-not-count-toward-content-limit ()
   (qq-message-test-with-state
     (let* ((reply
-             '((type . "reply")
-               (data . ((id . "18446744073709551615")))))
+             (qq-message-test-reply-segment "18446744073709551615"))
            (contents
             (cl-loop repeat 128
                      collect
@@ -1184,7 +1191,8 @@ push carries sequence=40909 and client_sequence=30202."
       (should
        (equal
         (plist-get outbound :reply-to)
-        '((message_id . "18446744073709551615")))))))
+        '((kind . "message")
+          (message_id . "18446744073709551615")))))))
 
 (ert-deftest qq-message-poke-uses-exact-uin-and-local-gray-tip ()
   (qq-message-test-with-state
@@ -1704,6 +1712,40 @@ push carries sequence=40909 and client_sequence=30202."
         (should
          (qq-state-message-recalled-p
           (car (qq-state-session-messages session-key))))))))
+
+(ert-deftest qq-message-group-reply-uses-sequence-without-a-snowflake ()
+  (qq-message-test-with-state
+    (let* ((session-key "group:8209413637")
+           (wire-message
+            (alist-get
+             'message
+             (qq-message-test-event
+              :message-id nil
+              :sequence "105544"
+              :conversation
+              '((kind . "group")
+                (group_uin . "8209413637")
+                (group_name . "Protocol Lab")
+                (sender_card . "Alice")))))
+           (message
+            (qq-message-normalize-snapshot
+             wire-message "slot-a" (qq-account-get "slot-a") nil t))
+           (target (qq-message-reply-target session-key message))
+           (outbound
+            (qq-message--prepare-outbound
+             session-key
+             (list
+              `((type . "reply") (data . ((target . ,target))))
+              '((type . "text") (data . ((text . "ack")))))
+             "slot-a")))
+      (should
+       (equal target
+              '((kind . "sequence") (sequence . "105544"))))
+      (should (equal (plist-get outbound :reply-to) target))
+      (should
+       (equal
+        (plist-get outbound :segments)
+        '(((kind . "text") (payload . ((text . "ack"))))))))))
 
 (ert-deftest qq-message-history-range-stays-exact-decimal ()
   (should
