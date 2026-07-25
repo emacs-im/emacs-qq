@@ -526,60 +526,6 @@ force the Native Session to replace its contact cache."
    #'qq-directory--project-groups
    callback errback))
 
-(defun qq-directory--project-user-avatar (result owner user-uin)
-  "Return avatar resource from RESULT for OWNER and USER-UIN."
-  (unless
-      (and
-       (qq-account--exact-object-keys-p result '(account_id user_uin url))
-       (equal (alist-get 'account_id result) owner)
-       (equal (alist-get 'user_uin result) user-uin)
-       (qq-account--non-empty-string-p (alist-get 'url result))
-       (string-prefix-p "https://" (alist-get 'url result)))
-    (error "qq: Gateway returned an invalid user avatar locator"))
-  `((url . ,(alist-get 'url result))))
-
-(defun qq-directory--project-group-avatar (result owner group-uin)
-  "Return avatar resource from RESULT for OWNER and GROUP-UIN."
-  (unless
-      (and
-       (qq-account--exact-object-keys-p result '(account_id group_uin url))
-       (equal (alist-get 'account_id result) owner)
-       (equal (alist-get 'group_uin result) group-uin)
-       (qq-account--non-empty-string-p (alist-get 'url result))
-       (string-prefix-p "https://" (alist-get 'url result)))
-    (error "qq: Gateway returned an invalid group avatar locator"))
-  `((url . ,(alist-get 'url result))))
-
-(defun qq-directory-get-user-avatar
-    (user-uin callback &optional errback)
-  "Resolve USER-UIN's native HTTPS avatar resource.
-
-CALLBACK receives a media resource alist containing `url'."
-  (unless (qq-account--canonical-decimal-p user-uin)
-    (user-error "qq: User avatar requires an exact decimal UIN"))
-  (qq-directory--request
-   (list 'user-avatar user-uin)
-   "contact.get_user_avatar"
-   `((user_uin . ,user-uin))
-   (lambda (result owner)
-     (qq-directory--project-user-avatar result owner user-uin))
-   callback errback))
-
-(defun qq-directory-get-group-avatar
-    (group-uin callback &optional errback)
-  "Resolve GROUP-UIN's native HTTPS avatar resource.
-
-CALLBACK receives a media resource alist containing `url'."
-  (unless (qq-account--canonical-decimal-p group-uin)
-    (user-error "qq: Group avatar requires an exact decimal UIN"))
-  (qq-directory--request
-   (list 'group-avatar group-uin)
-   "contact.get_group_avatar"
-   `((group_uin . ,group-uin))
-   (lambda (result owner)
-     (qq-directory--project-group-avatar result owner group-uin))
-   callback errback))
-
 (defun qq-directory-set-friend-pinned
     (friend-uin pinned &optional callback errback)
   "Set FRIEND-UIN's conversation PINNED state through the native service."

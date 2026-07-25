@@ -8,8 +8,7 @@
 
 (defconst qq-directory-test-capabilities
   '("contact.list_friends" "contact.list_groups"
-    "contact.list_group_members" "contact.get_user_avatar"
-    "contact.get_group_avatar"
+    "contact.list_group_members"
     "group.set_name" "group.set_remark"
     "friend.set_pinned" "group.set_whole_mute" "group.set_pinned" "group.set_member_card"
     "group.set_member_special_title" "group.kick_member" "group.clock_in"
@@ -237,74 +236,6 @@
         (should (= (alist-get 'member_count (car callback-value)) 2))
         (should (= (length (alist-get 'friends (car callback-value))) 1))
         (should (qq-state-friend-categories-loaded-p))))))
-
-(ert-deftest qq-directory-user-avatar-validates-owned-https-locator ()
-  (qq-directory-test-with-state
-    (let (sent-method sent-params resource)
-      (cl-letf (((symbol-function 'qq-server-ready-p)
-                 (lambda () t))
-                ((symbol-function 'qq-server-capabilities)
-                 (lambda () qq-directory-test-capabilities))
-                ((symbol-function 'qq-server-send)
-                 (lambda (method params callback _errback &optional _early)
-                   (setq sent-method method sent-params params)
-                   (funcall
-                    callback
-                    '((account_id . "slot-a")
-                      (user_uin . "9007199254740999")
-                      (url
-                       . "https://q.qlogo.cn/headimg_dl?dst_uin=9007199254740999&spec=640&img_type=jpg")))
-                   "request-avatar")))
-        (should
-         (equal
-          (qq-directory-get-user-avatar
-           "9007199254740999"
-           (lambda (value) (setq resource value)))
-          "request-avatar"))
-        (should (equal sent-method "contact.get_user_avatar"))
-        (should
-         (equal sent-params
-                '((account_id . "slot-a")
-                  (user_uin . "9007199254740999"))))
-        (should
-         (equal
-          resource
-          '((url
-             . "https://q.qlogo.cn/headimg_dl?dst_uin=9007199254740999&spec=640&img_type=jpg"))))))))
-
-(ert-deftest qq-directory-group-avatar-validates-owned-https-locator ()
-  (qq-directory-test-with-state
-    (let (sent-method sent-params resource)
-      (cl-letf (((symbol-function 'qq-server-ready-p)
-                 (lambda () t))
-                ((symbol-function 'qq-server-capabilities)
-                 (lambda () qq-directory-test-capabilities))
-                ((symbol-function 'qq-server-send)
-                 (lambda (method params callback _errback &optional _early)
-                   (setq sent-method method sent-params params)
-                   (funcall
-                    callback
-                    '((account_id . "slot-a")
-                      (group_uin . "8209413637")
-                      (url
-                       . "https://p.qlogo.cn/gh/8209413637/8209413637/640/")))
-                   "request-group-avatar")))
-        (should
-         (equal
-          (qq-directory-get-group-avatar
-           "8209413637"
-           (lambda (value) (setq resource value)))
-          "request-group-avatar"))
-        (should (equal sent-method "contact.get_group_avatar"))
-        (should
-         (equal sent-params
-                '((account_id . "slot-a")
-                  (group_uin . "8209413637"))))
-        (should
-         (equal
-          resource
-          '((url
-             . "https://p.qlogo.cn/gh/8209413637/8209413637/640/"))))))))
 
 (ert-deftest qq-directory-friend-unknown-category-is-atomic ()
   (qq-directory-test-with-state
