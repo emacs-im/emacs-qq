@@ -1325,8 +1325,8 @@ gaps before filter-only rows enter canonical history."
 (defun qq-chat--forward-target-type-label (session)
   "Return a concise destination type label for SESSION."
   (pcase (format "%s" (or (alist-get 'type session)
-                            (qq-state-session-key-type
-                             (alist-get 'key session))))
+                          (qq-state-session-key-type
+                           (alist-get 'key session))))
     ("private" "好友")
     ("group" "群聊")
     (_ "会话")))
@@ -1795,8 +1795,8 @@ selection; success removes only the immutable selection snapshot in PLAN."
     (when (and qq-chat--session-key
                (not (qq-chat--msg-filter-active-p))
                (appkit-chat-history-autoload-newer-p
-               position footer qq-chat-history-auto-load-threshold
-               (appkit-chatbuf-composer-idle-p)))
+                position footer qq-chat-history-auto-load-threshold
+                (appkit-chatbuf-composer-idle-p)))
       (when-let* ((view (qq-chat--live-current-view)))
         (qq-chat--request-callback-sync
          view (lambda () (qq-chat-load-newer-messages t)))))))
@@ -2517,13 +2517,13 @@ required after text scaling because pixel-aligned avatars can still change."
   (let ((message (appkit-chat-timeline-row-payload row))
         (context (appkit-chat-timeline-row-context row)))
     (cond
-   ((and (listp message)
-         (eq (plist-get message :kind) qq-chat--empty-placeholder))
-    (qq-chat--render-empty-placeholder
-     (or (plist-get context :state)
-         (error "qq: empty timeline row lacks state context"))))
-   (t
-    (qq-chat--render-message message context)))))
+     ((and (listp message)
+           (eq (plist-get message :kind) qq-chat--empty-placeholder))
+      (qq-chat--render-empty-placeholder
+       (or (plist-get context :state)
+           (error "qq: empty timeline row lacks state context"))))
+     (t
+      (qq-chat--render-message message context)))))
 
 (defun qq-chat--render-canonical-input ()
   "Replace the live composer from canonical input state explicitly."
@@ -3257,13 +3257,13 @@ message identity plus its conversation-scoped native sequence hint."
                 ((and sender preview (not (string-empty-p preview)))
                  (format "%s: %s" sender
                          (truncate-string-to-width preview 56 nil nil t)))
-                 ((and preview (not (string-empty-p preview)))
-                  (truncate-string-to-width preview 64 nil nil t))
-                 (sender (format "%s's message" sender))
-                 ((and reply-id (not sequence))
-                  (format "id %s" reply-id))
-                 (sequence (format "message #%s" sequence))
-                 (t "replied message")))
+                ((and preview (not (string-empty-p preview)))
+                 (truncate-string-to-width preview 64 nil nil t))
+                (sender (format "%s's message" sender))
+                ((and reply-id (not sequence))
+                 (format "id %s" reply-id))
+                (sequence (format "message #%s" sequence))
+                (t "replied message")))
          (reply-start (point))
          (target (or (qq-state-message-anchor source)
                      (and reply-id (not sequence)
@@ -6511,13 +6511,13 @@ first unread message."
               (with-current-buffer buffer
                 (pcase-let* ((`(,oldest . ,newest)
                                (qq-chat--history-batch-bounds meta))
-                              (frontier-at-start
-                               (plist-get owner :remote-latest-id))
-                              (observed-frontier qq-chat--remote-latest-id)
-                              (latest
-                               (if (equal observed-frontier frontier-at-start)
-                                   newest
-                                 observed-frontier)))
+                             (frontier-at-start
+                              (plist-get owner :remote-latest-id))
+                             (observed-frontier qq-chat--remote-latest-id)
+                             (latest
+                              (if (equal observed-frontier frontier-at-start)
+                                  newest
+                                observed-frontier)))
                   (cond
                    (newest
                     (setq qq-chat--remote-latest-id latest)
