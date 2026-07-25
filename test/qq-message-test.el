@@ -1601,7 +1601,9 @@ push carries sequence=40909 and client_sequence=30202."
                    (setq sent-params params)
                    (funcall callback
                             '((account_id . "slot-a")
-                              (message_id . "7348923749823749823")))
+                              (target . ((kind . "message")
+                                         (message_id
+                                          . "7348923749823749823")))))
                    "request-recall")))
         (should (equal (qq-message-recall session-key message)
                        "request-recall"))
@@ -1611,7 +1613,8 @@ push carries sequence=40909 and client_sequence=30202."
           '((account_id . "slot-a")
             (conversation . ((kind . "group")
                              (group_uin . "8209413637")))
-            (message . ((message_id . "7348923749823749823"))))))
+            (target . ((kind . "message")
+                       (message_id . "7348923749823749823"))))))
         (should
          (qq-state-message-recalled-p
           (car (qq-state-session-messages session-key))))
@@ -1639,16 +1642,65 @@ push carries sequence=40909 and client_sequence=30202."
                    (setq sent-params params)
                    (funcall callback
                             '((account_id . "slot-a")
-                              (message_id . "7348923749823749823")))
+                              (target . ((kind . "message")
+                                         (message_id
+                                          . "7348923749823749823")))))
                    "request-recall")))
         (qq-message-recall session-key message)
         (should
          (equal
-          (alist-get 'message sent-params)
-          '((message_id . "7348923749823749823"))))
+          (alist-get 'target sent-params)
+          '((kind . "message")
+            (message_id . "7348923749823749823"))))
         (should
          (equal (alist-get 'conversation sent-params)
                 '((kind . "private") (peer_uin . "10001"))))
+        (should
+         (qq-state-message-recalled-p
+          (car (qq-state-session-messages session-key))))))))
+
+(ert-deftest qq-message-group-recall-uses-sequence-without-a-snowflake ()
+  (qq-message-test-with-state
+    (let* ((session-key "group:8209413637")
+           (wire-message
+            (alist-get
+             'message
+             (qq-message-test-event
+              :message-id nil
+              :sequence "105544"
+              :conversation
+              '((kind . "group")
+                (group_uin . "8209413637")
+                (group_name . "Protocol Lab")
+                (sender_card . "Alice")))))
+           (message
+            (qq-message-normalize-snapshot
+             wire-message "slot-a" (qq-account-get "slot-a") nil t))
+           sent-params)
+      (qq-message--merge-normalized message 'history)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (_method params callback _errback &optional _early)
+                   (setq sent-params params)
+                   (funcall
+                    callback
+                    '((account_id . "slot-a")
+                      (target . ((kind . "sequence")
+                                 (sequence . "105544")))))
+                   "request-sequence-recall")))
+        (should (equal (qq-message-recall session-key message)
+                       "request-sequence-recall"))
+        (should
+         (equal
+          sent-params
+          '((account_id . "slot-a")
+            (conversation . ((kind . "group")
+                             (group_uin . "8209413637")))
+            (target . ((kind . "sequence")
+                       (sequence . "105544"))))))
         (should
          (qq-state-message-recalled-p
           (car (qq-state-session-messages session-key))))))))
@@ -2000,6 +2052,7 @@ push carries sequence=40909 and client_sequence=30202."
             (alist-get
              'message
              (qq-message-test-event
+              :message-id nil
               :sequence "100"
               :conversation
               '((kind . "group")
@@ -2321,7 +2374,9 @@ push carries sequence=40909 and client_sequence=30202."
                      (funcall
                       callback
                       '((account_id . "slot-a")
-                        (message_id . "7348923749823749823")))
+                        (target . ((kind . "message")
+                                   (message_id
+                                    . "7348923749823749823")))))
                      "restart-recall")))
           (should
            (equal
@@ -2332,8 +2387,9 @@ push carries sequence=40909 and client_sequence=30202."
         (should delivered)
         (should (equal (alist-get 'account_id sent-params) "slot-a"))
         (should
-         (equal (alist-get 'message sent-params)
-                '((message_id . "7348923749823749823"))))
+         (equal (alist-get 'target sent-params)
+                '((kind . "message")
+                  (message_id . "7348923749823749823"))))
         (should-not (assq 'generation sent-params))))))
 
 (ert-deftest qq-message-account-ready-synchronizes-every-owner ()

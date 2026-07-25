@@ -968,10 +968,9 @@ CALLBACK receives the successful response; ERRBACK receives the failure
 response and reason."
   (unless (listp message)
     (user-error "qq: Recall requires a normalized message"))
-  (let ((session-key (alist-get 'session-key message))
-        (message-id (alist-get 'server-id message)))
-    (unless (and session-key (stringp message-id))
-      (user-error "qq: Recall requires exact session and message identity"))
+  (let ((session-key (alist-get 'session-key message)))
+    (unless session-key
+      (user-error "qq: Recall requires a normalized message"))
     (qq-core--start-request
      (lambda (success failure)
        (qq-message-recall

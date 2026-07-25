@@ -56,6 +56,14 @@ exact for canonical decimal strings and cannot lose NT sequence precision."
 The hard-cut wire identity is a nonzero decimal string with no leading zero."
   (qq-protocol--nonzero-decimal-string-p value))
 
+(defun qq-protocol-message-sequence-p (value)
+  "Return non-nil when VALUE is a canonical nonzero message sequence string.
+
+Sequences are conversation-local uint64 identities.  They stay decimal
+strings at the Elisp boundary just like message snowflakes, but this separate
+predicate prevents the two domains from being used interchangeably."
+  (qq-protocol--nonzero-decimal-string-p value))
+
 (defun qq-protocol-optional-message-id (value &optional context)
   "Return optional message-id VALUE after validating its wire representation.
 
