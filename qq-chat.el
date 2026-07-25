@@ -3011,7 +3011,9 @@ Telega-like aux bar:
 Never dump OneBot CQ / raw_message here — previews come from
 `qq-state-message-preview' (segment-first)."
   (let ((message (qq-chat--reply-message)))
-    (if-let* ((reply-id (alist-get 'server-id message))
+    (if-let* ((reply-target
+               (and message
+                    (qq-message-reply-target qq-chat--session-key message)))
               (name (or (car (qq-chat--message-sender-display-parts message))
                         "message"))
               (preview (string-trim (or (qq-state-message-preview message) "")))
@@ -4303,13 +4305,15 @@ on the first inline line when the body is pure inline content."
 (defun qq-chat--set-pending-reply (message)
   "Set MESSAGE as the pending reply target in current chat buffer."
   (qq-chat--ensure-composer-visible)
-  (let ((message-id (alist-get 'server-id message)))
-    (unless message-id
-      (user-error "qq: selected message has no server id"))
+  (let* ((target (qq-message-reply-target qq-chat--session-key message))
+         (label (or (alist-get 'message_id target)
+                    (alist-get 'sequence target))))
+    (unless target
+      (user-error "qq: selected message has no native reply target"))
     (qq-chat--set-reply-message message)
     (qq-chat--update-frame)
     (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max)))
-    (message "qq: next message will reply to %s" message-id)))
+    (message "qq: next message will reply to %s" label)))
 
 (defun qq-chat--delete-message-internal (message)
   "Recall MESSAGE after confirmation."
@@ -5979,15 +5983,15 @@ resolved at restoration time.  Return non-nil only when restoration happened."
          (restore-owner (make-symbol "qq-chat-send-restore"))
          (text (qq-chat--current-draft-string))
          (reply-message (qq-chat--reply-message))
-         (reply-id (and reply-message
-                        (qq-api-validate-message-id
-                         (alist-get 'server-id reply-message)
-                         "reply draft")))
+         (reply-target
+          (and reply-message
+               (or (qq-message-reply-target session-key reply-message)
+                   (user-error "qq: reply draft has no native target"))))
          (content-segments (qq-chat--current-input-segments))
          (send-segments (append
-                         (when reply-id
+                         (when reply-target
                            `(((type . "reply")
-                              (data . ((id . ,(format "%s" reply-id)))))))
+                              (data . ((target . ,reply-target))))))
                          content-segments))
          (raw-message (unless (appkit-chatbuf-input-has-objects-p)
                         text)))
