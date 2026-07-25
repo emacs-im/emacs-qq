@@ -40,6 +40,7 @@
   "One cancellable remote-media materialization pipeline."
   active-p
   media-id
+  part
   account-id
   request-id
   watch
@@ -57,6 +58,18 @@
   "Return a copy of remote MEDIA-ID, or nil."
   (qq-server-value-copy
    (and media-id (gethash media-id qq-remote-media--media))))
+
+(defun qq-remote-media--part-name (part)
+  "Return PART's Gateway wire name.
+
+PART is one of the symbols `content' and `thumbnail'."
+  (unless (memq part '(content thumbnail))
+    (error "qq: Unknown remote-media part %S" part))
+  (symbol-name part))
+
+(defun qq-remote-media-part (media part)
+  "Return PART snapshot from remote MEDIA, or nil when unavailable."
+  (alist-get part media))
 
 (defun qq-remote-media-list ()
   "Return copied remote-media snapshots in authoritative order."
@@ -160,8 +173,9 @@ CALLBACK receives the projected snapshot; ERRBACK receives failure details."
    :callback callback
    :errback errback))
 
-(defun qq-remote-media-materialize (media-id &optional callback errback)
-  "Start materializing remote MEDIA-ID without waiting for its download.
+(defun qq-remote-media-materialize-part
+    (media-id part &optional callback errback)
+  "Start materializing PART of remote MEDIA-ID without waiting.
 
 CALLBACK receives the current media snapshot, normally in `materializing'
 phase.  Progress and completion arrive through `media.changed'.  ERRBACK
@@ -169,7 +183,9 @@ receives failure details."
   (unless (qq-remote-media--id-p media-id)
     (user-error "qq: Media ID must be an opaque media- UUID"))
   (qq-rpc-call
-   "media.materialize" `((media_id . ,media-id))
+   "media.materialize"
+   `((media_id . ,media-id)
+     (part . ,(qq-remote-media--part-name part)))
    :projector
    (lambda (result)
      (qq-remote-media--upsert
@@ -177,15 +193,24 @@ receives failure details."
    :callback callback
    :errback errback))
 
-(defun qq-remote-media-cancel (media-id &optional callback errback)
-  "Idempotently cancel active materialization of remote MEDIA-ID.
+(defun qq-remote-media-materialize (media-id &optional callback errback)
+  "Start materializing remote MEDIA-ID content.
+
+Call CALLBACK with its current snapshot; call ERRBACK on failure."
+  (qq-remote-media-materialize-part
+   media-id 'content callback errback))
+
+(defun qq-remote-media-cancel-part (media-id part &optional callback errback)
+  "Idempotently cancel active PART materialization of remote MEDIA-ID.
 
 Completed media stays materialized.  An active operation returns to
 `available', preserving the reusable remote handle."
   (unless (qq-remote-media--id-p media-id)
     (user-error "qq: Media ID must be an opaque media- UUID"))
   (qq-rpc-call
-   "media.cancel" `((media_id . ,media-id))
+   "media.cancel"
+   `((media_id . ,media-id)
+     (part . ,(qq-remote-media--part-name part)))
    :projector
    (lambda (result)
      (qq-remote-media--upsert
@@ -193,11 +218,18 @@ Completed media stays materialized.  An active operation returns to
    :callback callback
    :errback errback))
 
-(defun qq-remote-media-await-materialized (media-id callback errback)
-  "Observe MEDIA-ID until it materializes or reaches another terminal state.
+(defun qq-remote-media-cancel (media-id &optional callback errback)
+  "Idempotently cancel remote MEDIA-ID content materialization.
+
+Call CALLBACK with its current snapshot; call ERRBACK on failure."
+  (qq-remote-media-cancel-part media-id 'content callback errback))
+
+(defun qq-remote-media-await-part-materialized
+    (media-id part callback errback)
+  "Observe MEDIA-ID until PART materializes or reaches a terminal state.
 
 Return a `qq-account-watch' that removes only this local observer.  CALLBACK
-receives the materialized media snapshot."
+receives the materialized media snapshot; ERRBACK receives terminal failure."
   (unless (qq-remote-media--id-p media-id)
     (user-error "qq: Media ID must be an opaque media- UUID"))
   (let (observer watch)
@@ -217,19 +249,32 @@ receives the materialized media snapshot."
                   (qq-request-watch-cancel watch)
                   (qq-account--client-error
                    errback "media_disappeared" "Remote media disappeared"))
-                 ((equal (alist-get 'phase media) "materialized")
+                 ((null (qq-remote-media-part media part))
+                  (qq-request-watch-cancel watch)
+                  (qq-account--client-error
+                   errback "media_part_unavailable"
+                   "Remote media part is unavailable"))
+                 ((equal
+                   (alist-get 'phase (qq-remote-media-part media part))
+                   "materialized")
                   (qq-request-watch-cancel watch)
                   (qq-account--invoke callback media))
-                 ((equal (alist-get 'phase media) "failed")
+                 ((equal
+                   (alist-get 'phase (qq-remote-media-part media part))
+                   "failed")
                   (qq-request-watch-cancel watch)
-                  (let ((problem (alist-get 'error media)))
+                  (let ((problem
+                         (alist-get
+                          'error (qq-remote-media-part media part))))
                     (qq-account--client-error
                      errback
                      (or (alist-get 'code problem) "media_materialize_failed")
                      "%s"
                      (or (alist-get 'message problem)
                          "Remote media materialization failed"))))
-                 ((equal (alist-get 'phase media) "available")
+                 ((equal
+                   (alist-get 'phase (qq-remote-media-part media part))
+                   "available")
                   (qq-request-watch-cancel watch)
                   (qq-account--client-error
                    errback "media_materialize_canceled"
@@ -237,6 +282,13 @@ receives the materialized media snapshot."
     (add-hook 'qq-remote-media-changed-hook observer)
     (funcall observer 'initial media-id)
     watch))
+
+(defun qq-remote-media-await-materialized (media-id callback errback)
+  "Observe MEDIA-ID content until it reaches a terminal state.
+
+Call CALLBACK on materialization or ERRBACK on another terminal outcome."
+  (qq-remote-media-await-part-materialized
+   media-id 'content callback errback))
 
 (defun qq-remote-media-release (media-id &optional callback errback)
   "Idempotently release remote MEDIA-ID without releasing its resources.
@@ -266,8 +318,9 @@ CALLBACK receives the release receipt; ERRBACK receives failure details."
     (qq-remote-media--cancel-operation-local operation)
     (when (qq-rpc-method-available-p "media.cancel")
       (condition-case error-data
-          (qq-remote-media-cancel
+          (qq-remote-media-cancel-part
            (qq-remote-media-operation-media-id operation)
+           (or (qq-remote-media-operation-part operation) 'content)
            nil
            (lambda (_body failure)
              (message "qq: Media cancellation failed: %s" failure)))
@@ -282,9 +335,9 @@ CALLBACK receives the release receipt; ERRBACK receives failure details."
         (qq-remote-media-operation-account-id operation))
        t))
 
-(defun qq-remote-media-prepare-local-access
-    (media-id callback &optional errback)
-  "Materialize remote MEDIA-ID and open a short-lived local access lease.
+(defun qq-remote-media-prepare-part-local-access
+    (media-id part callback &optional errback)
+  "Materialize PART of remote MEDIA-ID and open a local access lease.
 
 CALLBACK receives an alist containing `media_id', `resource_id', and `access'.
 The callback owns the access lease and must close its `access_id' after
@@ -295,7 +348,8 @@ convention.  Return a cancellable `qq-remote-media-operation'."
   (let* ((account-id (qq-runtime-current-account-id))
          (operation
           (qq-remote-media-operation-create
-           :active-p t :media-id media-id :account-id account-id)))
+           :active-p t :media-id media-id :part part
+           :account-id account-id)))
     (unless account-id
       (user-error "qq: Select an account before materializing remote media"))
     (cl-labels
@@ -374,12 +428,17 @@ convention.  Return a cancellable `qq-remote-media-operation'."
           (media)
           (when (qq-remote-media-operation-active-p operation)
             (setf (qq-remote-media-operation-watch operation) nil)
-            (let ((owner (alist-get 'account_id media))
-                  (resource-id (alist-get 'resource_id media)))
+            (let* ((owner (alist-get 'account_id media))
+                   (part-snapshot (qq-remote-media-part media part))
+                   (resource-id
+                    (and part-snapshot
+                         (alist-get 'resource_id part-snapshot))))
               (if (not (and (ensure-account)
-                            (equal owner account-id)))
+                            (equal owner account-id)
+                            resource-id))
                   (when (qq-remote-media-operation-active-p operation)
-                    (fail nil "Remote media belongs to another managed account"))
+                    (fail nil
+                          "Remote media part is unavailable or belongs to another managed account"))
                 (start-request
                  (lambda ()
                    (qq-resource-status
@@ -387,8 +446,8 @@ convention.  Return a cancellable `qq-remote-media-operation'."
          (await-media
           ()
           (let ((watch
-                 (qq-remote-media-await-materialized
-                  media-id #'materialized #'fail)))
+                 (qq-remote-media-await-part-materialized
+                  media-id part #'materialized #'fail)))
             (when (qq-request-watch-active-p watch)
               (setf (qq-remote-media-operation-watch operation) watch))))
          (materialize-started
@@ -398,9 +457,17 @@ convention.  Return a cancellable `qq-remote-media-operation'."
             (await-media))))
       (start-request
        (lambda ()
-         (qq-remote-media-materialize
-          media-id #'materialize-started #'fail)))
+         (qq-remote-media-materialize-part
+          media-id part #'materialize-started #'fail)))
       operation)))
+
+(defun qq-remote-media-prepare-local-access
+    (media-id callback &optional errback)
+  "Materialize remote MEDIA-ID content and open a local access lease.
+
+Call CALLBACK with the access result; call ERRBACK on failure."
+  (qq-remote-media-prepare-part-local-access
+   media-id 'content callback errback))
 
 (defun qq-remote-media-prepare-record-playback
     (media-id callback &optional errback)
@@ -416,7 +483,8 @@ Return a cancellable `qq-remote-media-operation'."
   (let* ((account-id (qq-runtime-current-account-id))
          (operation
           (qq-remote-media-operation-create
-           :active-p t :media-id media-id :account-id account-id)))
+           :active-p t :media-id media-id :part 'content
+           :account-id account-id)))
     (unless account-id
       (user-error "qq: Select an account before playing a record"))
     (cl-labels
@@ -526,15 +594,18 @@ Return a cancellable `qq-remote-media-operation'."
                   (alist-get 'resource_id resource))
             (await-resource (alist-get 'resource_id resource) #'source-ready)))
          (materialized
-          (media)
+         (media)
           (when (qq-remote-media-operation-active-p operation)
             (setf (qq-remote-media-operation-watch operation) nil)
-            (let ((account-id (alist-get 'account_id media))
-                  (resource-id (alist-get 'resource_id media)))
+            (let* ((account-id (alist-get 'account_id media))
+                   (content (qq-remote-media-part media 'content))
+                   (resource-id
+                    (and content (alist-get 'resource_id content))))
               (if (not (and (ensure-account)
                             (equal account-id
                                    (qq-remote-media-operation-account-id
-                                    operation))))
+                                    operation))
+                            resource-id))
                   (when (qq-remote-media-operation-active-p operation)
                     (fail nil "Remote record belongs to another managed account"))
                 (start-request
