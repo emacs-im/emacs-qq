@@ -20,6 +20,7 @@
 (require 'qq-attachment)
 (require 'qq-message)
 (require 'qq-directory)
+(require 'qq-profile)
 (require 'qq-remote-media)
 (require 'qq-server)
 (require 'qq-request)
@@ -341,6 +342,35 @@ adapter boundary.  ACCOUNT-ID defaults to the current UI account."
       (school . ,(copy-tree (alist-get 'school group)))
       (location . ,(copy-tree (alist-get 'location group)))
       (has_custom_avatar . ,(alist-get 'has_custom_avatar group)))))
+
+(defun qq-core-get-user-profile (user-id callback &optional errback)
+  "Fetch USER-ID's sparse native profile and call CALLBACK."
+  (unless (qq-protocol--nonzero-decimal-string-p user-id)
+    (user-error "qq: user profile requires an exact decimal UIN"))
+  (qq-core--start-request
+   (lambda (success failure)
+     (qq-profile-get user-id success failure))
+   callback errback))
+
+(defun qq-core-get-profile-like-summary
+    (user-id callback &optional errback)
+  "Fetch USER-ID's native profile-like summary and call CALLBACK."
+  (unless (qq-protocol--nonzero-decimal-string-p user-id)
+    (user-error "qq: profile likes require an exact decimal UIN"))
+  (qq-core--start-request
+   (lambda (success failure)
+     (qq-profile-get-like-summary user-id success failure))
+   callback errback))
+
+(defun qq-core-send-profile-like
+    (user-id callback &optional errback)
+  "Give USER-ID one native profile-card like and call CALLBACK."
+  (unless (qq-protocol--nonzero-decimal-string-p user-id)
+    (user-error "qq: profile likes require an exact decimal UIN"))
+  (qq-core--start-request
+   (lambda (success failure)
+     (qq-profile-send-like user-id success failure))
+   callback errback))
 
 (defun qq-core-get-group (group-id callback &optional errback)
   "Fetch native GROUP-ID profile and call CALLBACK.
@@ -1365,6 +1395,9 @@ It is used only when the target message is not already cached."
 (defconst qq-core--capability-methods
   '((recent-conversations "conversation.list_recent")
     (contacts "contact.list_friends" "contact.list_groups")
+    (user-profile "profile.get")
+    (profile-like-summary "profile.get_like_summary")
+    (profile-like "profile.send_like")
     (avatar "contact.get_user_avatar" "contact.get_group_avatar")
     (group-members "contact.list_group_members")
     (group-settings "group.set_name" "group.set_remark"

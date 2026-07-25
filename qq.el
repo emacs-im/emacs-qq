@@ -32,6 +32,7 @@
 (require 'qq-message)
 (require 'qq-message)
 (require 'qq-directory)
+(require 'qq-profile)
 (require 'qq-core)
 (require 'qq-login)
 (require 'qq-chat)
