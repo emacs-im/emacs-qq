@@ -1619,22 +1619,14 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
           (t
            (funcall error-fn nil "record segment has no file id")))))
       ("face"
-       (let* ((raw (alist-get 'raw data))
-              (hints
-               `((sticker_id . ,(or (alist-get 'sticker_id data)
-                                    (and (listp raw) (alist-get 'stickerId raw))))
-                 (sticker_pack_id . ,(or (alist-get 'sticker_pack_id data)
-                                         (and (listp raw) (alist-get 'packId raw))))
-                 (description . ,(or (alist-get 'description data)
-                                     (alist-get 'faceText data)
-                                     (and (listp raw) (alist-get 'faceText raw)))))))
-         (cond
-          ((not emoji-id)
-           (funcall error-fn nil "face segment has no id"))
-          ((qq-media--face-resource-from-local emoji-id)
-           (funcall callback (qq-media--face-resource-from-local emoji-id)))
-          (t
-           (qq-api-get-base-emoji emoji-id callback error-fn nil t hints)))))
+       (cond
+        ((not emoji-id)
+         (funcall error-fn nil "face segment has no id"))
+        ((qq-media--face-resource-from-local emoji-id)
+         (funcall callback (qq-media--face-resource-from-local emoji-id)))
+        (t
+         (funcall error-fn nil
+                  "base face has no local resource in the native backend"))))
       ("mface"
        (qq-media--resolve-fileish-segment
         segment "get_image" callback error-fn
@@ -2925,34 +2917,21 @@ cache; GIF is then handled by appkit's bounded inline-animation machinery."
 (defun qq-media-face-image (emoji-id)
   "Return inline QQ base face image for EMOJI-ID.
 
-Resolution order:
-1. LinuxQQ `default-emojis/<id>.png' (sync, offline)
-2. NapCat `get_base_emoji' (download/path lookup)"
+Resolve only from LinuxQQ `default-emojis/<id>.png'.  A missing native
+resource returns nil so the caller can render the face description; it must
+not make a removed OneBot request from the timeline renderer."
   (let* ((id (format "%s" emoji-id))
          (key (format "face:%s" id))
          (local (qq-media--face-resource-from-local id)))
-    ;; Seed resource cache so ensure-resource-image can build the image
-    ;; synchronously without waiting on NapCat.
     (when local
       (qq-media--cache-resource key local))
-    (qq-media--ensure-resource-image
-     key
-     (lambda (done error)
-       (if-let* ((resource (qq-media--face-resource-from-local id)))
-           (funcall done resource)
-         (qq-api-get-base-emoji
-          id
-          (lambda (resource)
-            ;; Merge description from local name table when API omits it.
-            (let* ((resource (copy-tree (or resource '())))
-                   (desc (or (alist-get 'description resource)
-                             (qq-media-face-name id))))
-              (when desc
-                (setf (alist-get 'description resource) desc))
-              (qq-media--prepare-animated-face-resource resource done)))
-          error)))
-     qq-media-face-image-height
-     #'qq-media--face-image-from-file)))
+    (when local
+      (qq-media--ensure-resource-image
+       key
+       (lambda (done _error)
+         (funcall done local))
+       qq-media-face-image-height
+       #'qq-media--face-image-from-file))))
 
 (defun qq-media-face-display-string (emoji-id &optional description)
   "Return inline display string for QQ face EMOJI-ID.

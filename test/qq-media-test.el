@@ -834,10 +834,10 @@
                       #x00 #x00 #x03 #x00 #x01 #x00 #x05 #xfe
                       #xd4 #xef #x00 #x00 #x00 #x00 #x49 #x45
                       #x4e #x44 #xae #x42 #x60 #x82)))
-           (cl-letf (((symbol-function 'qq-api-get-base-emoji)
+           (cl-letf (((symbol-function 'qq-api-call)
                       (lambda (&rest _args)
                         (setq api-called t)
-                        (ert-fail "get_base_emoji must not run when local PNG exists"))))
+                        (ert-fail "base-face rendering must not use OneBot"))))
              (should (equal (qq-media--local-base-emoji-file "178") png))
              (should (equal (qq-media-face-text-fallback "178") "/斜眼笑"))
              (let ((image (qq-media-face-image "178")))
@@ -848,6 +848,21 @@
              (should-not api-called)))
        (when (file-directory-p dir)
          (delete-directory dir t))))))
+
+(ert-deftest qq-media-missing-base-face-uses-text-without-onebot ()
+  "A missing local face must not interrupt native chat rendering."
+  (let ((qq-media-default-emoji-directory
+         (make-temp-file "qq-empty-default-emojis" t))
+        (api-called nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'qq-api-call)
+                   (lambda (&rest _args)
+                     (setq api-called t)
+                     (ert-fail "base-face rendering must not use OneBot"))))
+          (should-not (qq-media-face-image "178"))
+          (should (equal (qq-media-face-display-string "178") "/斜眼笑"))
+          (should-not api-called))
+      (delete-directory qq-media-default-emoji-directory t))))
 
 (ert-deftest qq-media-resolve-fileish-prefers-existing-local-path ()
   "Outbound attach paths must not hit NapCat get_image."
