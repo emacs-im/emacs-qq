@@ -1737,6 +1737,28 @@ body and reason."
      :stale-message
      "QQ account or Gateway connection changed during read report")))
 
+(defun qq-message-exact-id (message)
+  "Return MESSAGE's observed exact NT message ID, or nil.
+
+This accessor is deliberately narrower than `qq-state-message-anchor'.
+Sequence-only group history has a valid local timeline anchor and a native
+group locator, but neither is an exact NT message ID."
+  (when (listp message)
+    (let ((message-id (alist-get 'server-id message)))
+      (and (qq-protocol-message-id-p message-id) message-id))))
+
+(defun qq-message-group-sequence-target (session-key message)
+  "Return MESSAGE's group-local sequence target in SESSION-KEY, or nil.
+
+The returned tagged object is a QQ protocol locator scoped by SESSION-KEY.
+It is not a substitute for an exact NT message ID."
+  (when (and (listp message)
+             (equal (alist-get 'session-key message) session-key)
+             (eq (qq-state-session-key-type session-key) 'group))
+    (let ((sequence (alist-get 'message-seq message)))
+      (when (qq-protocol-message-sequence-p sequence)
+        `((kind . "sequence") (sequence . ,sequence))))))
+
 (defun qq-message-recall-target (session-key message)
   "Return MESSAGE's closed native recall target in SESSION-KEY, or nil.
 
@@ -1745,14 +1767,9 @@ instead use its conversation-local native sequence; private sequence values
 alone are not a complete native recall capability."
   (when (and (listp message)
              (equal (alist-get 'session-key message) session-key))
-    (let ((message-id (alist-get 'server-id message))
-          (sequence (alist-get 'message-seq message)))
-      (cond
-       ((qq-protocol-message-id-p message-id)
-        `((kind . "message") (message_id . ,message-id)))
-       ((and (eq (qq-state-session-key-type session-key) 'group)
-             (qq-protocol-message-sequence-p sequence))
-        `((kind . "sequence") (sequence . ,sequence)))))))
+    (if-let* ((message-id (qq-message-exact-id message)))
+        `((kind . "message") (message_id . ,message-id))
+      (qq-message-group-sequence-target session-key message))))
 
 (defun qq-message-reply-target (session-key message)
   "Return MESSAGE's closed native reply target in SESSION-KEY, or nil.
@@ -1762,14 +1779,9 @@ instead use its authoritative conversation-local sequence; Gateway retains
 the corresponding sender identity and timestamp inside the account actor."
   (when (and (listp message)
              (equal (alist-get 'session-key message) session-key))
-    (let ((message-id (alist-get 'server-id message))
-          (sequence (alist-get 'message-seq message)))
-      (cond
-       ((qq-protocol-message-id-p message-id)
-        `((kind . "message") (message_id . ,message-id)))
-       ((and (eq (qq-state-session-key-type session-key) 'group)
-             (qq-protocol-message-sequence-p sequence))
-        `((kind . "sequence") (sequence . ,sequence)))))))
+    (if-let* ((message-id (qq-message-exact-id message)))
+        `((kind . "message") (message_id . ,message-id))
+      (qq-message-group-sequence-target session-key message))))
 
 (defun qq-message-recall
     (session-key message &optional callback errback)

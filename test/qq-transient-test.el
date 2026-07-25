@@ -236,6 +236,7 @@
    (puthash
     "private:10001"
     '(((server-id . "9007199254742007089")
+       (session-key . "private:10001")
        (sender-id . "10001")
        (sender-name . "Alice")
        (time . 100)
@@ -271,6 +272,26 @@
      ;; A request owner disables another submission without changing selection.
      (setq qq-chat--forward-request-owner '(request-owner))
      (should (qq-transient--forward-selection-inapt-p)))))
+
+(ert-deftest qq-transient-group-sequence-is-a-native-reply-and-recall-capability ()
+  (let ((qq-chat--session-key "group:8209413637")
+        (message
+         '((id . "history:slot-a:group:8209413637:105544:none")
+           (server-id)
+           (session-key . "group:8209413637")
+           (message-seq . "105544")
+           (self-p)
+           (status . received))))
+    (cl-letf (((symbol-function 'qq-transient--message-at-point)
+               (lambda () message)))
+      (should-not (qq-transient--reply-inapt-p))
+      (should (qq-transient--recall-inapt-p))
+      (setf (alist-get 'self-p message) t)
+      (should-not (qq-transient--recall-inapt-p))
+      (setf (alist-get 'session-key message) "private:10001"
+            qq-chat--session-key "private:10001")
+      (should (qq-transient--reply-inapt-p))
+      (should (qq-transient--recall-inapt-p)))))
 
 (ert-deftest qq-transient-forward-entry-follows-dataline-variant ()
   (dolist
