@@ -197,6 +197,9 @@ buffer-local continuous history controller.")
 (defvar-local qq-chat--gateway-history-end-sequence nil
   "Highest native Gateway sequence covered by the current history window.")
 
+(defvar-local qq-chat--last-tail-poll-at nil
+  "Time of the latest automatic group-history poll at the live edge.")
+
 (defvar-local qq-chat--gateway-private-history-cursor nil
   "Exact time/random cursor for the next older private roaming-history page.")
 
@@ -226,6 +229,7 @@ buffer-local continuous history controller.")
         qq-chat--guild-history-end-sequence nil
         qq-chat--gateway-history-start-sequence nil
         qq-chat--gateway-history-end-sequence nil
+        qq-chat--last-tail-poll-at nil
         qq-chat--gateway-private-history-cursor nil
         qq-chat--gateway-history-awaiting-frontier-p nil
         qq-chat--guild-forum-next-cursor nil))
@@ -1786,18 +1790,43 @@ selection; success removes only the immutable selection snapshot in PLAN."
           (qq-chat--request-callback-sync
            view (lambda () (qq-chat-load-older-messages t))))))))
 
+(defun qq-chat--group-tail-poll-due-p (position footer composer-idle-p)
+  "Return non-nil when the attached group live edge should be polled."
+  (and qq-chat--session-key
+       composer-idle-p
+       (eq (qq-state-session-key-type qq-chat--session-key) 'group)
+       (qq-chat--history-window-known-p)
+       (null (appkit-chat-history-window-last-key))
+       qq-chat--gateway-history-end-sequence
+       (not (appkit-chat-history-loading-p))
+       (numberp qq-chat-history-auto-load-threshold)
+       (> position
+          (- footer (max 0 qq-chat-history-auto-load-threshold)))
+       (numberp qq-chat-history-tail-poll-interval)
+       (or (null qq-chat--last-tail-poll-at)
+           (>= (- (float-time) qq-chat--last-tail-poll-at)
+               (max 0 qq-chat-history-tail-poll-interval)))))
+
 (defun qq-chat--maybe-auto-load-newer (&optional position)
   "Load a newer page when POSITION approaches the timeline footer."
-  (let ((position (or position (point)))
-        (footer (or (appkit-chat-timeline-footer-start-position)
-                    (appkit-chatbuf-input-start-position)
-                    (point-max))))
+  (let* ((position (or position (point)))
+         (footer (or (appkit-chat-timeline-footer-start-position)
+                     (appkit-chatbuf-input-start-position)
+                     (point-max)))
+         (composer-idle-p (appkit-chatbuf-composer-idle-p))
+         (tail-poll-p
+          (qq-chat--group-tail-poll-due-p
+           position footer composer-idle-p)))
     (when (and qq-chat--session-key
                (not (qq-chat--msg-filter-active-p))
-               (appkit-chat-history-autoload-newer-p
-                position footer qq-chat-history-auto-load-threshold
-                (appkit-chatbuf-composer-idle-p)))
+               (or
+                (appkit-chat-history-autoload-newer-p
+                 position footer qq-chat-history-auto-load-threshold
+                 composer-idle-p)
+                tail-poll-p))
       (when-let* ((view (qq-chat--live-current-view)))
+        (when tail-poll-p
+          (setq qq-chat--last-tail-poll-at (float-time)))
         (qq-chat--request-callback-sync
          view (lambda () (qq-chat-load-newer-messages t)))))))
 
@@ -4287,16 +4316,23 @@ on the first inline line when the body is pure inline content."
   (let* ((message-id (alist-get 'server-id message))
          (poke-p (qq-state-poke-message-p message))
          (recall-reference
-          (and poke-p (qq-state-poke-recall-reference message))))
-    (unless message-id
-      (user-error "qq: selected message has no server id"))
+          (and poke-p (qq-state-poke-recall-reference message)))
+         (target
+          (unless poke-p
+            (qq-message-recall-target
+             (alist-get 'session-key message) message)))
+         (target-label
+          (or message-id
+              (alist-get 'sequence target))))
+    (unless (or (and poke-p message-id) target)
+      (user-error "qq: selected message has no native recall target"))
     (when (and poke-p (null recall-reference))
       (user-error "qq: poke has no native recall reference"))
     (when (and poke-p
                (qq-protocol-poke-recall-reference-expired-p
                 recall-reference))
       (user-error "qq: 戳一戳已超过 2 分钟撤回期限"))
-    (when (y-or-n-p (format "Recall message %s? " message-id))
+    (when (y-or-n-p (format "Recall message %s? " target-label))
       (if poke-p
           (qq-core-recall-poke message)
         (qq-core-recall-message message)))))
@@ -5584,7 +5620,10 @@ batch is authoritative latest history."
           (unless quiet (message "qq: initial history is still loading"))
         (qq-chat-return-to-latest)))
      ((not cursor)
-      (unless quiet (message "qq: latest history is already loaded")))
+      (if (and (eq (qq-state-session-key-type qq-chat--session-key) 'group)
+               qq-chat--gateway-history-end-sequence)
+          (qq-chat--load-newer-group-gateway-messages quiet)
+        (unless quiet (message "qq: latest history is already loaded"))))
      ((appkit-chat-history-loading-p)
       (unless quiet (message "qq: history load already in progress")))
      (t

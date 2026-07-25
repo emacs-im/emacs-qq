@@ -3355,6 +3355,19 @@
       (qq-chat--delete-message-internal message))
     (should (eq called message))))
 
+(ert-deftest qq-chat-recalls-sequence-only-group-message ()
+  (let ((qq-chat--session-key "group:20001")
+        (message '((id . "history:slot-a:group:20001:105544:none")
+                   (session-key . "group:20001")
+                   (message-seq . "105544")
+                   (segments . (((type . "text"))))))
+        called)
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+              ((symbol-function 'qq-core-recall-message)
+               (lambda (selected &rest _) (setq called selected))))
+      (qq-chat--delete-message-internal message))
+    (should (eq called message))))
+
 (ert-deftest qq-chat-refuses-an-unaddressable-poke-before-confirmation ()
   (let ((message
          '((server-id . "9007199254741004001")
@@ -5209,6 +5222,43 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (qq-chat-test-sync-until-idle)
         (should-not calls))))))
 
+(ert-deftest qq-chat-auto-polls-attached-group-tail-with-a-rate-limit ()
+  (qq-chat-test-with-reset
+   (with-temp-buffer
+    (qq-chat-mode)
+    (setq qq-chat--session-key "group:20001"
+          qq-chat--gateway-history-end-sequence "105544")
+    (qq-chat--ensure-view)
+    (qq-chat--set-history-window "m10" nil)
+    (let ((qq-chat-history-auto-load-threshold 50)
+          (qq-chat-history-tail-poll-interval 5)
+          (now 100.0)
+          calls)
+      (cl-letf (((symbol-function 'appkit-chat-timeline-footer-start-position)
+                 (lambda () 1000))
+                ((symbol-function 'appkit-chatbuf-composer-idle-p)
+                 (lambda () t))
+                ((symbol-function 'float-time)
+                 (lambda (&optional _time) now))
+                ((symbol-function 'qq-chat-load-newer-messages)
+                 (lambda (&optional quiet) (push quiet calls))))
+        (qq-chat--maybe-auto-load-newer 800)
+        (qq-chat-test-sync-until-idle)
+        (should-not calls)
+
+        (qq-chat--maybe-auto-load-newer 975)
+        (qq-chat-test-sync-until-idle)
+        (should (equal calls '(t)))
+
+        (qq-chat--maybe-auto-load-newer 975)
+        (qq-chat-test-sync-until-idle)
+        (should (equal calls '(t)))
+
+        (setq now 105.0)
+        (qq-chat--maybe-auto-load-newer 975)
+        (qq-chat-test-sync-until-idle)
+        (should (equal calls '(t t))))))))
+
 (ert-deftest qq-chat-window-scroll-loads-newer-from-selected-viewport-edge ()
   (qq-chat-test-with-reset
    (with-temp-buffer
@@ -5594,7 +5644,9 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
        (setq qq-chat--session-key session-key
              qq-chat--gateway-history-start-sequence "81"
              qq-chat--gateway-history-end-sequence "100")
-       (qq-chat--set-history-window current-id current-id)
+       ;; An attached window still polls after its exact native sequence;
+       ;; `last-key=nil' means no known gap, not "never ask the server again".
+       (qq-chat--set-history-window current-id nil)
        (cl-letf (((symbol-function 'qq-core-fetch-group-history-window)
                   (lambda (_session after callback &optional _errback count)
                     (setq call (list after count))

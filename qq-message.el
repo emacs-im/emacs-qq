@@ -469,7 +469,12 @@ HISTORY-P allows the explicitly sequence-only group-history shape."
               (key (car match))
               (pending (cdr match))
               ((equal (alist-get 'local-id normalized)
-                      (plist-get pending :local-id))))
+                      (plist-get pending :local-id)))
+              ;; A sequence-only group-history row correlates the optimistic
+              ;; send but cannot complete its identity promotion.  Keep the
+              ;; receipt until an observation carrying the real snowflake
+              ;; arrives.
+              ((alist-get 'server-id normalized)))
     (remhash key qq-message--pending-sends)))
 
 (defun qq-message--merge-normalized (normalized &optional source)
@@ -520,8 +525,18 @@ HISTORY-P allows the explicitly sequence-only group-history shape."
   "Return essence key for OWNER, GROUP-UIN, SEQUENCE, and RANDOM."
   (list owner group-uin sequence random))
 
-(defun qq-message--validate-pending-recall (owner normalized)
-  "Reject a pending recall that contradicts OWNER's NORMALIZED message."
+(defun qq-message--apply-recall-target (session-key target)
+  "Apply closed native recall TARGET in SESSION-KEY."
+  (pcase (alist-get 'kind target)
+    ("message"
+     (qq-state-apply-recall
+      session-key (alist-get 'message_id target)))
+    ("sequence"
+     (qq-state-apply-group-sequence-recall
+      session-key (alist-get 'sequence target)))))
+
+(defun qq-message--apply-pending-recall (owner normalized merged)
+  "Apply a pending recall for OWNER to MERGED NORMALIZED message when present."
   (when-let* ((conversation-key
                (qq-message--message-conversation-key normalized))
               (sequence (alist-get 'message-seq normalized))
@@ -529,24 +544,9 @@ HISTORY-P allows the explicitly sequence-only group-history shape."
                     owner conversation-key sequence))
               (recall (gethash key qq-message--pending-recalls))
               (target (alist-get 'target recall))
-              ((equal (alist-get 'kind target) "message"))
-              (expected-id (alist-get 'message_id target)))
-    (unless (equal expected-id (alist-get 'server-id normalized))
-      (error "qq: Sequence recall message_id contradicts received message")))
-  normalized)
-
-(defun qq-message--apply-pending-recall (owner normalized merged)
-  "Apply a pending recall for OWNER to MERGED NORMALIZED message when present."
-  (qq-message--validate-pending-recall owner normalized)
-  (when-let* ((conversation-key
-               (qq-message--message-conversation-key normalized))
-              (sequence (alist-get 'message-seq normalized))
-              (key (qq-message--pending-recall-key
-                    owner conversation-key sequence))
-              (recall (gethash key qq-message--pending-recalls)))
-    (let ((message-id (alist-get 'server-id merged)))
-      (remhash key qq-message--pending-recalls)
-      (qq-state-apply-recall (alist-get 'session-key merged) message-id))))
+              (session-key (alist-get 'session-key merged)))
+    (remhash key qq-message--pending-recalls)
+    (qq-message--apply-recall-target session-key target)))
 
 (defun qq-message--reaction-notice (reaction message)
   "Return legacy state notice for authoritative REACTION on MESSAGE."
@@ -719,19 +719,13 @@ responses never advance this observation; only `message.received' events do."
          (sequence (alist-get 'sequence target))
          (session-key
           (qq-message--recall-session-key owner conversation))
-         (message
-          (and session-key
-               (qq-message--message-by-sequence session-key sequence)))
-         (message-id
-          (if (equal (alist-get 'kind target) "message")
-              (alist-get 'message_id target)
-            (and message (alist-get 'server-id message)))))
-    (when (and message
-               (equal (alist-get 'kind target) "message")
-               (not (equal (alist-get 'server-id message) message-id)))
-      (error "qq: Recall target message_id contradicts cached sequence"))
-    (if (and session-key message-id)
-        (qq-state-apply-recall session-key message-id)
+         (message (and session-key
+                       (qq-message--message-by-sequence
+                        session-key sequence))))
+    (if (and session-key
+             (or (equal (alist-get 'kind target) "message")
+                 message))
+        (qq-message--apply-recall-target session-key target)
       (puthash
        (qq-message--pending-recall-key
         owner
@@ -1006,7 +1000,6 @@ Return a list of `(NATIVE-MESSAGE . NORMALIZED-MESSAGE)' pairs."
                 (error "qq: Gateway history message contradicts requested conversation"))
               (when-let* ((server-id (alist-get 'server-id normalized)))
                 (qq-state-validate-message-session session-key server-id))
-              (qq-message--validate-pending-recall owner normalized)
               (when local-id
                 (when (gethash local-id pending-local-ids)
                   (error "qq: Gateway history reuses one pending send receipt"))
@@ -1734,6 +1727,23 @@ body and reason."
      :stale-message
      "QQ account or Gateway connection changed during read report")))
 
+(defun qq-message-recall-target (session-key message)
+  "Return MESSAGE's closed native recall target in SESSION-KEY, or nil.
+
+An exact NT snowflake works in private and group chats.  A group message may
+instead use its conversation-local native sequence; private sequence values
+alone are not a complete native recall capability."
+  (when (and (listp message)
+             (equal (alist-get 'session-key message) session-key))
+    (let ((message-id (alist-get 'server-id message))
+          (sequence (alist-get 'message-seq message)))
+      (cond
+       ((qq-protocol-message-id-p message-id)
+        `((kind . "message") (message_id . ,message-id)))
+       ((and (eq (qq-state-session-key-type session-key) 'group)
+             (qq-protocol-message-sequence-p sequence))
+        `((kind . "sequence") (sequence . ,sequence)))))))
+
 (defun qq-message-recall
     (session-key message &optional callback errback)
   "Recall native MESSAGE in SESSION-KEY for the selected QQ account.
@@ -1743,20 +1753,19 @@ and reason.  A successful typed acknowledgement marks the local message
 recalled; a later `message.recalled' event is an idempotent reconciliation."
   (let* ((owner (qq-message--current-owner))
          (_owner (qq-message--sync-account owner))
-         (message-id (alist-get 'server-id message))
-         (conversation (qq-message--conversation-params session-key)))
-    (unless (and (equal (alist-get 'session-key message) session-key)
-                 (qq-message--message-id-p message-id))
-      (user-error "qq: Native recall requires an exact Message Reference"))
+         (conversation (qq-message--conversation-params session-key))
+         (target (or (qq-message-recall-target session-key message)
+                     (user-error
+                      "qq: Message has no native recall target"))))
     (unless (equal (alist-get 'gateway-account-id message) owner)
       (user-error "qq: Message is not owned by selected Gateway account"))
     (qq-message--call
      "message.recall" owner
      `((conversation . ,conversation)
-       (message . ((message_id . ,message-id))))
+       (target . ,target))
      :projector
      (lambda (receipt)
-       (qq-state-apply-recall session-key message-id)
+       (qq-message--apply-recall-target session-key target)
        receipt)
      :callback callback
      :errback errback

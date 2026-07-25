@@ -3257,6 +3257,57 @@ Return the updated canonical message, if one was present."
                       :message-patch patch)
       nil))))
 
+(defun qq-state-apply-group-sequence-recall (session-key sequence)
+  "Mark the unique group message at SEQUENCE in SESSION-KEY as recalled.
+
+Group recall is closed on the native wire by `(group, sequence)' even when a
+history row has not yet acquired its global NT message snowflake.  Do not
+manufacture a message id from legacy `msgUid' metadata.  If the cached row
+already has an exact id, delegate to `qq-state-apply-recall' so the durable
+id-scoped patch journal remains available to filtered projections.
+
+Return the updated canonical message, or nil when the sequence is not cached."
+  (let ((identity (qq-state-session-key-identity session-key)))
+    (unless (eq (alist-get 'type identity) 'group)
+      (error "qq: sequence recall requires an explicit group session"))
+    (unless (qq-protocol-message-sequence-p sequence)
+      (error "qq: sequence recall requires a canonical nonzero sequence string")))
+  (let* ((messages
+          (copy-tree
+           (or (gethash session-key qq-state--messages-by-session) '())))
+         (existing
+          (seq-find
+           (lambda (message)
+             (equal (alist-get 'message-seq message) sequence))
+           messages)))
+    (when existing
+      (if-let* ((message-id (alist-get 'server-id existing)))
+          (qq-state-apply-recall session-key message-id)
+        (let* ((observation-token
+                (qq-state--next-message-observation-token))
+               (patch (list :kind 'recall
+                            :observation-token observation-token))
+               (materialized
+                (qq-state--materialize-message-patches
+                 session-key existing))
+               (updated
+                (qq-state-message-apply-patch materialized patch)))
+          (setq messages
+                (qq-state--replace-message messages existing updated))
+          (puthash session-key messages qq-state--messages-by-session)
+          (qq-state--index-message updated)
+          (qq-state--sync-session-summary session-key)
+          (qq-state--emit
+           'message
+           :session-key session-key
+           :message (copy-tree updated)
+           :message-anchor (qq-state-message-anchor updated)
+           :mutation 'update
+           :source 'notice
+           :observation-token observation-token
+           :message-patch patch)
+          updated)))))
+
 (defun qq-state--reaction-with-notice (reactions like is-add own-operation-p)
   "Return REACTIONS after applying one emoji LIKE notice.
 
