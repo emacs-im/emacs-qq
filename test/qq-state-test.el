@@ -3454,6 +3454,29 @@
        (should (equal (alist-get 'server-id (car messages)) live-id))
        (should (equal (alist-get 'local-id (car messages)) "local-1"))))))
 
+(ert-deftest qq-state-live-correlation-promotes-sequence-only-history-anchor ()
+  (qq-test-with-reset
+   (let* ((session-key "group:820941363")
+          (live-id "2083983882109904220")
+          (history-anchor "history:slot-a:group:820941363:105525:none")
+          (history
+           (qq-state-test--native-correlated-row
+            session-key nil "105525" nil 1 nil "history"))
+          (live
+           (qq-state-test--native-correlated-row
+            session-key live-id "105525" 995353755 2 nil "live"))
+          previous-anchor)
+     (setf (alist-get 'id history nil nil #'eq) history-anchor)
+     (qq-state--merge-normalized-message session-key history nil 'history)
+     (cl-multiple-value-bind (_merged _mutation previous)
+         (qq-state--merge-normalized-message session-key live nil 'event)
+       (setq previous-anchor previous))
+     (let ((messages (qq-state-session-messages session-key)))
+       (should (= (length messages) 1))
+       (should (equal previous-anchor history-anchor))
+       (should (equal (alist-get 'id (car messages)) live-id))
+       (should (equal (alist-get 'server-id (car messages)) live-id))))))
+
 (ert-deftest qq-state-history-revisit-collapses-existing-correlated-send-pair ()
   (qq-test-with-reset
    (let* ((session-key "group:820941363")

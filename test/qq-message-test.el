@@ -1934,6 +1934,62 @@ push carries sequence=40909 and client_sequence=30202."
          (equal (plist-get (car history-events) :batch-message-ids)
                 '("7348923749823749823" "7348923749823749824")))))))
 
+(ert-deftest qq-message-group-history-keeps-sequence-only-row-and-promotes-live-id ()
+  (qq-message-test-with-state
+    (let* ((conversation
+            '((kind . "group")
+              (group_uin . "8209413637")
+              (group_name . "Protocol Lab")
+              (sender_card . "Alice")))
+           (history-message
+            (alist-get
+             'message
+             (qq-message-test-event
+              :message-id nil
+              :sequence "105525"
+              :random nil
+              :conversation conversation)))
+           (result
+            (qq-message-test-group-history-window-result
+             (list history-message)
+             nil "105525" "105525" "105525" "105525"
+             :caught-up t))
+           (meta
+            (qq-message--merge-history
+             "group:8209413637"
+             (qq-server-wire-domain-copy result)
+             "slot-a"
+             '(:group-history-window-p t)))
+           (history-anchor
+            (car (plist-get meta :batch-message-ids))))
+      (should (= (plist-get meta :added-count) 1))
+      (should (string-prefix-p "history:slot-a:group:8209413637:105525:"
+                               history-anchor))
+      (let ((messages (qq-state-session-messages "group:8209413637")))
+        (should (= (length messages) 1))
+        (should-not (alist-get 'server-id (car messages)))
+        (should (equal (qq-state-message-anchor (car messages))
+                       history-anchor)))
+
+      ;; The live push may add random as well as the authoritative snowflake.
+      ;; Group sequence is the native locator, so this promotes rather than
+      ;; duplicating the already rendered history observation.
+      (qq-message--handle-event
+       "message.received"
+       (qq-message-test-event
+        :message-id "2083983882109904220"
+        :sequence "105525"
+        :random 995353755
+        :conversation conversation))
+      (let ((messages (qq-state-session-messages "group:8209413637")))
+        (should (= (length messages) 1))
+        (should
+         (equal (alist-get 'server-id (car messages))
+                "2083983882109904220"))
+        (should
+         (equal (qq-state-message-anchor (car messages))
+                "2083983882109904220"))))))
+
 (ert-deftest qq-message-history-applies-earlier-sequence-recall ()
   (qq-message-test-with-state
     (qq-message--handle-event

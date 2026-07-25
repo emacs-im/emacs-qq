@@ -1982,15 +1982,22 @@ pending message model."
   "Return MESSAGE's transport-stable correlation key, or nil.
 
 The key is scoped by the caller's session.  It is intentionally not a public
-message identity: group history in some QQ builds exposes a legacy UID in
-place of ContentHead `newId', while sequence plus random remain equal to the
-live push and let the client avoid rendering the same transport record twice."
+message identity: group history in some QQ builds omits ContentHead `newId'
+while separately carrying a legacy UID.  Its conversation-scoped sequence
+still matches the live push and lets the client avoid rendering the same
+transport record twice."
   (let ((sequence (alist-get 'message-seq message))
         (random (alist-get 'native-random message)))
-    (when (and (qq-protocol--nonzero-decimal-string-p sequence)
-               (integerp random)
-               (<= 0 random #xffffffff))
-      (cons sequence random))))
+    (when (qq-protocol--nonzero-decimal-string-p sequence)
+      (if (equal (alist-get 'message-type message) "group")
+          ;; Group sequence is itself the conversation-scoped native locator
+          ;; used by history, reply seek, and recall.  Some history builds omit
+          ;; random, so requiring it would leave a duplicate when a live push
+          ;; later supplies the exact snowflake.
+          (cons 'group sequence)
+        (when (and (integerp random)
+                   (<= 0 random #xffffffff))
+          (list 'private sequence random))))))
 
 (defun qq-state--native-message-correlation-match
     (messages message &optional excluded)
