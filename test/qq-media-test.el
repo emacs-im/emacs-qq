@@ -15,6 +15,41 @@
          (progn ,@body)
        (qq-media-clear-cache))))
 
+(ert-deftest qq-media-session-avatar-projection-is-kind-exact ()
+  (cl-letf (((symbol-function 'qq-account-get) (lambda (_account-id) t))
+            ((symbol-function 'qq-media-avatar-display-string)
+             (lambda (target-id) (format "user:%s" target-id)))
+            ((symbol-function 'qq-media-group-avatar-display-string)
+             (lambda (target-id) (format "group:%s" target-id)))
+            ((symbol-function 'qq-media-avatar-cached-display-string)
+             (lambda (target-id) (format "cached-user:%s" target-id)))
+            ((symbol-function 'qq-media-group-avatar-cached-display-string)
+             (lambda (target-id) (format "cached-group:%s" target-id))))
+    (let ((private '((type . private) (target-id . "10001")))
+          (group '((type . group) (target-id . "20001")))
+          (dataline '((type . dataline) (target-id . "device")))
+          (channel '((type . guild-channel) (target-id . "30001"))))
+      (should (equal "avatar:10001"
+                     (qq-media-session-avatar-cache-key private)))
+      (should (equal "group-avatar:20001"
+                     (qq-media-session-avatar-cache-key group)))
+      (should-not (qq-media-session-avatar-cache-key dataline))
+      (should-not (qq-media-session-avatar-cache-key channel))
+      (should (equal "user:10001"
+                     (qq-media-session-avatar-display-string private)))
+      (should (equal "group:20001"
+                     (qq-media-session-avatar-display-string group)))
+      (should
+       (equal "cached-user:10001"
+              (qq-media-session-avatar-cached-display-string private)))
+      (should
+       (equal "cached-group:20001"
+              (qq-media-session-avatar-cached-display-string group)))
+      (should (equal "📱"
+                     (qq-media-session-avatar-display-string dataline)))
+      (should (equal "#"
+                     (qq-media-session-avatar-display-string channel))))))
+
 (ert-deftest qq-media-ensure-resource-image-uses-existing-disk-cache ()
   (qq-media-test-with-reset
    (let* ((qq-media-cache-directory (make-temp-file "qq-media-cache" t))
@@ -328,6 +363,21 @@
      (lambda (_file _spec)
        'image)))
    (should-not (qq-media--resource-fetching-p "avatar:10001"))))
+
+(ert-deftest qq-media-ensure-resource-image-contains-synchronous-fetch-failure ()
+  (qq-media-test-with-reset
+   (let (notified)
+     (cl-letf (((symbol-function 'qq-media--note-cache-updated)
+                (lambda (key) (setq notified key))))
+       (should-not
+        (qq-media--ensure-resource-image
+         "avatar:10001"
+         (lambda (_done _error)
+           (error "account lifecycle unavailable"))
+         20
+         (lambda (_file _spec) 'image)))
+       (should (equal "avatar:10001" notified))
+       (should-not (qq-media--resource-fetching-p "avatar:10001"))))))
 
 (ert-deftest qq-media-avatar-image-never-falls-back-to-onebot ()
   (qq-media-test-with-reset

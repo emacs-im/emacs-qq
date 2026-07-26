@@ -782,6 +782,56 @@ non-preview resource path."
                   (error-message-string err))
          (qq-media--finish-resource-image-fetch key nil nil resource)))))))
 
+(defun qq-media--accept-resource-image-fetch
+    (key fetched-resource spec builder)
+  "Consume FETCHED-RESOURCE for active image KEY using SPEC and BUILDER."
+  (when (gethash key qq-media--fetching-cache)
+    (let* ((resource (qq-media--cache-resource key fetched-resource))
+           (original-file (and resource (alist-get 'file resource)))
+           (file (and resource
+                      (qq-media--resource-image-file key resource))))
+      (cond
+       ((appkit-media-file-present-p file)
+        (qq-media--finish-resource-image-fetch
+         key file (funcall builder file spec) resource))
+       ((and (qq-media--prefer-remote-image-resource-p key resource)
+             (appkit-media-file-present-p original-file))
+        (let ((image (funcall builder original-file spec)))
+          (when image
+            (qq-media--cache-image key image)
+            (qq-media--note-cache-updated key)))
+        (qq-media--start-resource-image-download
+         key resource spec builder))
+       ((appkit-media-url-present-p (alist-get 'url resource))
+        (qq-media--start-resource-image-download
+         key resource spec builder))
+       (t
+        (qq-media--finish-resource-image-fetch key nil nil resource))))))
+
+(defun qq-media--reject-resource-image-fetch (key)
+  "Settle an active image fetch for KEY without a usable resource."
+  (when (gethash key qq-media--fetching-cache)
+    (qq-media--finish-resource-image-fetch key nil nil nil)))
+
+(defun qq-media--start-resource-image-fetch (key fetcher spec builder)
+  "Start FETCHER for image KEY and contain synchronous setup failures.
+
+Renderers must always be able to return their textual fallback.  Account
+lifecycle or transport setup can reject a fetch before returning a request
+handle, so synchronous failure follows the same settlement path as an
+asynchronous error."
+  (condition-case error-data
+      (funcall
+       fetcher
+       (lambda (resource)
+         (qq-media--accept-resource-image-fetch key resource spec builder))
+       (lambda (_response _reason)
+         (qq-media--reject-resource-image-fetch key)))
+    (error
+     (qq-media--reject-resource-image-fetch key)
+     (message "qq: failed to start image fetch for %s: %s"
+              key (error-message-string error-data)))))
+
 (defun qq-media--ensure-resource-image (key fetcher spec &optional image-builder)
   "Return cached image for KEY, triggering FETCHER when needed.
 
@@ -810,36 +860,7 @@ resource alist.  SPEC is forwarded to IMAGE-BUILDER, which defaults to
             nil)
            (t
             (puthash key t qq-media--fetching-cache)
-            (funcall
-             fetcher
-             (lambda (fetched-resource)
-               (when (gethash key qq-media--fetching-cache)
-                 (let* ((resource* (qq-media--cache-resource key fetched-resource))
-                        (original-file* (and resource* (alist-get 'file resource*)))
-                        (file* (and resource* (qq-media--resource-image-file key resource*))))
-                   (cond
-                    ((appkit-media-file-present-p file*)
-                     (qq-media--finish-resource-image-fetch
-                      key file*
-                      (funcall builder file* spec)
-                      resource*))
-                    ((and (qq-media--prefer-remote-image-resource-p key resource*)
-                          (appkit-media-file-present-p original-file*))
-                     (let ((image (funcall builder original-file* spec)))
-                       (when image
-                         (qq-media--cache-image key image)
-                         (qq-media--note-cache-updated key)))
-                     (qq-media--start-resource-image-download
-                      key resource* spec builder))
-                    ((appkit-media-url-present-p (alist-get 'url resource*))
-                     (qq-media--start-resource-image-download
-                      key resource* spec builder))
-                    (t
-                     (qq-media--finish-resource-image-fetch
-                      key nil nil resource*))))))
-             (lambda (_response _reason)
-               (when (gethash key qq-media--fetching-cache)
-                 (qq-media--finish-resource-image-fetch key nil nil nil))))
+            (qq-media--start-resource-image-fetch key fetcher spec builder)
             nil))))))
 
 (defun qq-media--native-image-animated-p (segment)
@@ -2168,9 +2189,10 @@ fallback for identities observed outside that directory."
   "Open session avatar for SESSION."
   (let ((target-id (alist-get 'target-id session)))
     (pcase (alist-get 'type session)
+      ('private (qq-media-open-user-avatar target-id))
       ('group (qq-media-open-group-avatar target-id))
       ('dataline (user-error "qq: dataline sessions have no QQ avatar"))
-      (_ (qq-media-open-user-avatar target-id)))))
+      (type (user-error "qq: %s sessions have no QQ avatar" type)))))
 
 (defun qq-media--guild-member-avatar-key (guild-id native-id)
   "Return the cache key for GUILD-ID member NATIVE-ID."
@@ -2363,13 +2385,50 @@ When image data is not ready yet, return a textual fallback."
    (qq-media--cached-image (format "group-avatar:%s" group-id))
    "#"))
 
+(defun qq-media-session-avatar-cache-key (session)
+  "Return the exact avatar cache key used to present SESSION, or nil."
+  (let ((target-id (alist-get 'target-id session)))
+    (when target-id
+      (pcase (alist-get 'type session)
+        ('private (format "avatar:%s" target-id))
+        ('group (format "group-avatar:%s" target-id))
+        (_ nil)))))
+
 (defun qq-media-session-avatar-display-string (session)
-  "Return inline avatar display string for SESSION."
+  "Return one-line destination avatar or icon for SESSION.
+
+When the current UI account is not represented by a managed Gateway account,
+use only cached presentation and do not start a backend request."
+  (let ((target-id (alist-get 'target-id session))
+        (resolve-p
+         (qq-account-get (qq-runtime-current-account-id))))
+    (pcase (alist-get 'type session)
+      ('private
+       (if resolve-p
+           (qq-media-avatar-display-string target-id)
+         (qq-media-avatar-cached-display-string target-id)))
+      ('group
+       (if resolve-p
+           (qq-media-group-avatar-display-string target-id)
+         (qq-media-group-avatar-cached-display-string target-id)))
+      ('dataline "📱")
+      ('guild-channel "#")
+      ('service "◇")
+      (_ "?"))))
+
+(defun qq-media-session-avatar-cached-display-string (session)
+  "Return cached one-line destination avatar or icon for SESSION.
+
+Unlike `qq-media-session-avatar-display-string', this never starts resource
+resolution and is safe while the account has no managed backend runtime."
   (let ((target-id (alist-get 'target-id session)))
     (pcase (alist-get 'type session)
-      ('group (qq-media-group-avatar-display-string target-id))
+      ('private (qq-media-avatar-cached-display-string target-id))
+      ('group (qq-media-group-avatar-cached-display-string target-id))
       ('dataline "📱")
-      (_ (qq-media-avatar-display-string target-id)))))
+      ('guild-channel "#")
+      ('service "◇")
+      (_ "?"))))
 
 (defvar qq-media--face-names-table nil
   "Lazy hash table: face id string → QDes name (e.g. \"/斜眼笑\").")

@@ -120,6 +120,23 @@ partial-window paging."
                  (number :tag "Seconds"))
   :group 'qq)
 
+(defcustom qq-chat-buffer-name-prefix "QQ"
+  "Application prefix used for human-readable chat buffer names.
+
+The conversation kind is expressed by brackets around its title.  Account and
+protocol identities are appended only when another live buffer has the same
+human name."
+  :type 'string
+  :group 'qq)
+
+(defcustom qq-chat-show-prompt-avatar t
+  "Non-nil means show the destination avatar in the chat composer prompt.
+
+Private chats show the peer avatar and group chats show the group avatar.
+Non-avatar session kinds retain a compact textual destination icon."
+  :type 'boolean
+  :group 'qq)
+
 (defcustom qq-chat-messages-pop-ring-size 50
   "Size of the chatbuf messages pop ring.
 
