@@ -22,6 +22,7 @@
 (require 'qq-directory)
 (require 'qq-profile)
 (require 'qq-remote-media)
+(require 'qq-resource)
 (require 'qq-server)
 (require 'qq-request)
 (require 'qq-protocol)
@@ -883,6 +884,97 @@ accepts them.  Cancellation or failure releases everything still owned here."
          (abort-startup)
          (signal (car error-data) (cdr error-data)))))))
 
+(defun qq-core--file-send-plan (session-key segments)
+  "Return a standalone local-file plan, or nil when SEGMENTS has no file.
+
+QQ group files are feed publications, not ordinary message elements.  Mixed
+text, reply, media, and multiple-file drafts are therefore rejected instead
+of being split into several messages with ambiguous partial-success rules."
+  (let ((files
+         (seq-filter
+          (lambda (segment)
+            (equal (alist-get 'type segment) "file"))
+          segments)))
+    (when files
+      (unless (and (= (length files) 1)
+                   (= (length segments) 1))
+        (user-error
+         "qq: Send one group file at a time without text, reply, or other media"))
+      (unless (eq (qq-state-session-key-type session-key) 'group)
+        (user-error "qq: Native private file upload is not implemented yet"))
+      (let* ((data (alist-get 'data (car files)))
+             (file (and (listp data)
+                        (or (alist-get 'file data)
+                            (alist-get 'path data))))
+             (path (and (stringp file) (expand-file-name file)))
+             (name (and (listp data) (alist-get 'name data))))
+        (unless (and path (file-regular-p path) (file-readable-p path))
+          (user-error "qq: File source is not a readable regular file: %s"
+                      (or path file)))
+        (list :path path
+              :name (or name (file-name-nondirectory path)))))))
+
+(defun qq-core--send-file
+    (session-key plan callback errback)
+  "Stage and publish local file PLAN in group SESSION-KEY.
+
+Cancellation detaches the caller.  An already-started native upload is allowed
+to settle so its resource lease and staged resource can be released safely."
+  (let* ((owner (or (qq-runtime-current-account-id)
+                    (user-error "qq: Select a QQ account first")))
+         (observing t)
+         resource-id
+         request)
+    (cl-labels
+        ((release-resource
+           ()
+           (when resource-id
+             (let ((owned resource-id))
+               (setq resource-id nil)
+               (qq-core--release-send-resource owned))))
+         (finish
+           (success-p body value)
+           (release-resource)
+           (when (qq-request-active-p request)
+             (if success-p
+                 (qq-request-finish request)
+               (qq-request-fail request))
+             (if success-p
+                 (qq-request--invoke callback value)
+               (qq-request--invoke errback body value))))
+         (send-ready
+           (resource)
+           (setq resource-id (alist-get 'resource_id resource))
+           (if (not observing)
+               (release-resource)
+             (condition-case error-data
+                 (qq-message-send-file
+                  session-key resource-id
+                  (lambda (receipt) (finish t nil receipt))
+                  (lambda (body reason) (finish nil body reason)))
+               ((error quit)
+                (finish nil nil (error-message-string error-data))))))
+         (stage-failed
+           (body reason)
+           (finish nil body reason))
+         (cancel
+           ()
+           (setq observing nil)
+           (release-resource)))
+      (setq request (qq-request-create owner #'cancel))
+      (condition-case error-data
+          (qq-resource-stage-local
+           (plist-get plan :path)
+           (plist-get plan :name)
+           nil
+           #'send-ready
+           #'stage-failed)
+        ((error quit)
+         (qq-request-fail request)
+         (release-resource)
+         (signal (car error-data) (cdr error-data))))
+      request)))
+
 (defun qq-core-send-message
     (session-key segments &optional raw-message callback errback)
   "Send SEGMENTS to SESSION-KEY through the native service.
@@ -893,20 +985,26 @@ for the selected account and conversation, then replaced by opaque attachment
 IDs before the wire request is sent.  RAW-MESSAGE is an
 optional optimistic rendering override.  The pending row is promoted only by
 the later authoritative self event."
-  (let ((plans
+  (let ((file-plan (qq-core--file-send-plan session-key segments))
+        (plans
          (cl-loop for segment in segments
                   for index from 0
                   for plan = (qq-core--local-media-plan segment index)
                   when plan collect plan))
         (error-fn (or errback #'qq-core--default-error)))
-    (if plans
+    (cond
+     (file-plan
+      (qq-core--send-file
+       session-key file-plan callback error-fn))
+     (plans
         (qq-core--send-message-with-local-media
-         session-key segments plans raw-message callback error-fn)
-      (qq-core--start-request
-       (lambda (success failure)
-         (qq-message-send
-          session-key segments raw-message success failure))
-       callback error-fn))))
+         session-key segments plans raw-message callback error-fn))
+     (t
+       (qq-core--start-request
+        (lambda (success failure)
+          (qq-message-send
+           session-key segments raw-message success failure))
+        callback error-fn)))))
 
 (defun qq-core-send-poke
     (session-key target-id &optional callback errback)
@@ -1411,6 +1509,7 @@ It is used only when the target message is not already cached."
     (presence "account.set_presence")
     (send-text "message.send")
     (send-message "message.send")
+    (send-file "file.send" "resource.stage_local")
     (face "message.send")
     (reply "message.send")
     (mention "message.send")

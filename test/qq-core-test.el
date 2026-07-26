@@ -703,6 +703,68 @@
         (should (eq (nth 1 sent) segments))
         (should (equal (nth 2 sent) "optimistic"))))))
 
+(ert-deftest qq-core-group-file-stages-publishes-and-releases-resource ()
+  (qq-core-test-with-managed-account
+    (let ((path (make-temp-file "qq-core-file-" nil ".txt" "hello"))
+          staged sent released success)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'qq-resource-stage-local)
+                (lambda (source name _sha callback _errback)
+                  (setq staged (list source name))
+                  (funcall
+                   callback
+                   '((resource_id . "res-group-file")
+                     (phase . "ready")))
+                  "stage-request"))
+               ((symbol-function 'qq-message-send-file)
+                (lambda (session resource-id callback _errback)
+                  (setq sent (list session resource-id))
+                  (funcall
+                   callback
+                   '((account_id . "slot-a")
+                     (group_uin . "8209413637")
+                     (fast_path . t)
+                     (message_random . 7)))
+                  "file-request"))
+               ((symbol-function 'qq-core--release-send-resource)
+                (lambda (resource-id)
+                  (push resource-id released))))
+            (let ((request
+                   (qq-core-send-message
+                    "group:8209413637"
+                    `(((type . "file")
+                       (data . ((file . ,path)
+                                (name . "notes.txt")))))
+                    nil
+                    (lambda (receipt) (setq success receipt)))))
+              (should (eq (qq-request-state request) 'settled))
+              (should (equal staged (list path "notes.txt")))
+              (should
+               (equal sent
+                      '("group:8209413637" "res-group-file")))
+              (should
+               (equal (alist-get 'message_random success) 7))
+              (should (equal released '("res-group-file")))))
+        (delete-file path)))))
+
+(ert-deftest qq-core-file-send-rejects-private-and-mixed-drafts ()
+  (let ((path (make-temp-file "qq-core-file-" nil ".txt" "hello")))
+    (unwind-protect
+        (progn
+          (should-error
+           (qq-core-send-message
+            "private:10001"
+            `(((type . "file") (data . ((file . ,path))))))
+           :type 'user-error)
+          (should-error
+           (qq-core-send-message
+            "group:8209413637"
+            `(((type . "text") (data . ((text . "caption"))))
+              ((type . "file") (data . ((file . ,path))))))
+           :type 'user-error))
+      (delete-file path))))
+
 (ert-deftest qq-core-local-images-finish-concurrently-but-send-in-draft-order ()
   (qq-core-test-with-managed-account
   (let ((path-a (make-temp-file "qq-core-image-a-" nil ".png" "aaa"))
