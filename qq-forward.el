@@ -18,7 +18,10 @@
 (require 'subr-x)
 (require 'qq-api)
 (require 'qq-chat)
+(require 'qq-core)
 (require 'qq-media)
+(require 'qq-message)
+(require 'qq-request)
 (require 'qq-state)
 (require 'qq-runtime)
 (require 'appkit-core)
@@ -26,9 +29,8 @@
 (require 'appkit-chat-timeline)
 (require 'appkit-ui)
 
-(declare-function qq-api-get-forward
-                  "qq-api" (source callback &optional errback))
-(declare-function qq-api-cancel-request "qq-api" (request-token))
+(declare-function qq-core-get-forward
+                  "qq-core" (resource-id scene callback &optional errback))
 (declare-function qq-api--exact-object-keys-p
                   "qq-api" (object required &optional optional))
 (declare-function qq-api--signal-schema-error
@@ -53,6 +55,8 @@
                   "qq-chat" (message properties layout &rest keys))
 (declare-function qq-chat--compute-fill-column
                   "qq-chat" (&optional window))
+(declare-function qq-message--segment-to-internal
+                  "qq-message" (segment))
 
 (defvar-local qq-forward--buffer-key nil
   "Explicit remote reference or local inline identity for this viewer.")
@@ -118,10 +122,26 @@ a remote reference that must be fetched.")
              (alist-get 'root_message_id source)
              (alist-get 'parent_message_id source)))))
 
+(defun qq-forward--validate-resource-source (source)
+  "Validate and copy one v2 long-message resource SOURCE."
+  (unless
+      (qq-api--exact-object-keys-p source '(kind resource_id scene))
+    (error "qq: v2 forward resource has invalid fields"))
+  (unless (equal (alist-get 'kind source) "resource")
+    (error "qq: v2 forward resource has invalid kind"))
+  (qq-api-validate-resource-id
+   (alist-get 'resource_id source) "v2 forward resource" t)
+  (unless (member (alist-get 'scene source)
+                  '("group" "private" "group_temp"))
+    (error "qq: v2 forward resource has invalid scene"))
+  (copy-tree source))
+
 (defun qq-forward--canonical-source (source)
   "Return validated SOURCE in one stable field order."
   (setq source
-        (qq-api-validate-forward-source source "forward viewer source"))
+        (if (equal (alist-get 'kind source) "resource")
+            (qq-forward--validate-resource-source source)
+          (qq-api-validate-forward-source source "forward viewer source")))
   (pcase (alist-get 'kind source)
     ("message"
      (let* ((chat (alist-get 'chat source))
@@ -133,7 +153,8 @@ a remote reference that must be fetched.")
              (cons 'chat canonical-chat))))
     ("resource"
      (list (cons 'kind "resource")
-           (cons 'resource_id (alist-get 'resource_id source))))
+           (cons 'resource_id (alist-get 'resource_id source))
+           (cons 'scene (alist-get 'scene source))))
     ("context"
      (let ((peer (alist-get 'peer source)))
        (list
@@ -203,11 +224,24 @@ a remote reference that must be fetched.")
                  (qq-api--exact-object-keys-p
                   data '(kind reference presentation))
                  (equal (alist-get 'kind data) "forward"))
-            (qq-api--validate-native-forward-segment
-             `((kind . "forward-card")
-               (payload . ((reference . ,(alist-get 'reference data))
-                           (presentation . ,(alist-get 'presentation data)))))
-             "canonical forward card" t)
+            (let ((reference
+                   (qq-forward--validate-resource-source
+                    (alist-get 'reference data)))
+                  (presentation (alist-get 'presentation data)))
+              (unless (equal (alist-get 'kind reference) "resource")
+                (error
+                 "qq: v2 forward card requires a resource reference"))
+              (unless
+                  (qq-api--exact-object-keys-p
+                   presentation nil '(source content summary prompt))
+                (error
+                 "qq: v2 forward card presentation has invalid fields"))
+              (dolist (key '(source content summary prompt))
+                (when (and (assq key presentation)
+                           (not (stringp (alist-get key presentation))))
+                  (error
+                   "qq: v2 forward card presentation.%s must be a string"
+                   key))))
             t))))
     (error nil)))
 
@@ -224,9 +258,8 @@ a remote reference that must be fetched.")
             (qq-api-validate-forward-source
              (alist-get 'reference content)
              "forward segment reference")))
-      (qq-api-validate-forward-source
-       (alist-get 'reference data)
-       "forward-card reference"))))
+      (qq-forward--validate-resource-source
+       (alist-get 'reference data)))))
 
 ;;;###autoload
 (defun qq-forward-reference-id (segment)
@@ -279,62 +312,117 @@ snapshot is remote-only."
       (string-to-number (match-string 1 summary)))
      (t nil))))
 (defun qq-forward--unsupported-segment (payload)
-  "Return safe internal placeholder for unsupported native PAYLOAD."
-  (let* ((summary (qq-forward--present-string
+  "Return safe internal placeholder for unsupported native PAYLOAD.
+
+Mirrors `qq-state--unsupported-preview': when the gateway retained the
+element's visible text, show it with a marker instead of replacing it with a
+diagnostic, so the forward view and the chat buffer agree."
+  (let* ((raw (and (listp payload) (alist-get 'raw payload)))
+         (fallback (qq-forward--present-string
+                    (and (listp raw) (alist-get 'fallback_text raw))))
+         (summary (qq-forward--present-string
                    (and (listp payload) (alist-get 'summary payload))))
          (summary (or summary "unknown element"))
          (summary (replace-regexp-in-string "[\n\r\t ]+" " " summary)))
     `((type . "text")
       (data
        . ((text
-           . ,(format "[unsupported QQ element: %s]"
-                      (truncate-string-to-width summary 80 nil nil t))))))))
+           . ,(if fallback
+                  (concat (replace-regexp-in-string "[\n\r\t ]+" " " fallback)
+                          " ⁇")
+                (format "[unsupported QQ element: %s]"
+                        (truncate-string-to-width summary 80 nil nil t)))))))))
 
-(defun qq-forward--native-video-data (payload)
-  "Map validated native video PAYLOAD into the internal media shape."
-  (let* ((remote (alist-get 'remote payload))
-         (state (alist-get 'state remote)))
-    `((file . ,(alist-get 'file payload))
-      ,@(when (assq 'local_path payload)
-          `((path . ,(alist-get 'local_path payload))))
-      ,@(when (assq 'size payload)
-          `((file_size . ,(alist-get 'size payload))))
-      ,@(when (assq 'name payload)
-          `((name . ,(alist-get 'name payload))))
-      ,@(when (assq 'thumb payload)
-          `((thumb . ,(alist-get 'thumb payload))))
-      (remote_status . ,state)
-      ,@(when (equal state "available")
-          `((url . ,(alist-get 'url remote))))
-      ,@(when (equal state "resolvable")
-          `((resolver . ,(copy-tree (alist-get 'resolver remote))))))))
+(defconst qq-forward--gateway-segment-kinds
+  '("text" "face" "at" "reply" "record" "video" "image"
+    "market_face" "forward_card" "light_app" "group_file" "unsupported")
+  "Closed segment union returned by `message.get_forward'.")
 
-(defun qq-forward-native-segment-to-internal (segment)
-  "Validate native SEGMENT and map it to one internal timeline segment."
-  (qq-api--validate-native-forward-segment
-   segment "native forward segment" t)
+(defun qq-forward--validate-gateway-segment (segment context)
+  "Validate one v2 Gateway SEGMENT at CONTEXT."
+  (unless (qq-api--exact-object-keys-p segment '(kind payload))
+    (error "qq: %s must contain only kind and payload" context))
   (let ((kind (alist-get 'kind segment))
         (payload (alist-get 'payload segment)))
-    (pcase kind
-      ("video"
-       `((type . "video")
-         (data . ,(qq-forward--native-video-data payload))))
-      ("forward"
-       `((type . "forward")
-         (data . ((content . ,(copy-tree (alist-get 'content payload)))))))
-      ("forward-card"
-       `((type . "card")
-         (data . ((kind . "forward")
-                  (reference . ,(copy-tree
-                                 (alist-get 'reference payload)))
-                  (presentation . ,(copy-tree
-                                    (alist-get 'presentation payload)))))))
-      ("reply"
-       `((type . "reply") (data . ,(copy-tree payload))))
-      ("unsupported"
-       (qq-forward--unsupported-segment payload))
-      (_
-       `((type . ,kind) (data . ,(copy-tree payload)))))))
+    (unless (member kind qq-forward--gateway-segment-kinds)
+      (error "qq: %s has unsupported Gateway kind %S" context kind))
+    (unless (qq-api--single-alist-p payload)
+      (error "qq: %s payload must be an object" context)))
+  segment)
+
+(defun qq-forward-native-segment-to-internal (segment)
+  "Validate Gateway SEGMENT and map it through the shared v2 message model."
+  (qq-forward--validate-gateway-segment
+   segment "Gateway forward segment")
+  (qq-message--segment-to-internal segment))
+
+(defun qq-forward--validate-gateway-message (message context)
+  "Validate one v2 Gateway forward MESSAGE at CONTEXT."
+  (unless
+      (qq-api--exact-object-keys-p
+       message '(entry_id sequence state sent_at sender origin segments)
+       '(message_id))
+    (error "qq: %s has invalid fields" context))
+  (unless (qq-api-entry-id-p (alist-get 'entry_id message))
+    (error "qq: %s entry_id must be a dotted decimal path" context))
+  (when (assq 'message_id message)
+    (qq-api-validate-message-id
+     (alist-get 'message_id message) context t))
+  (unless (qq-account--uint64-decimal-p (alist-get 'sequence message))
+    (error "qq: %s sequence must be canonical uint64 text" context))
+  (unless (and (integerp (alist-get 'sent_at message))
+               (>= (alist-get 'sent_at message) 0))
+    (error "qq: %s sent_at must be a non-negative integer" context))
+  (unless (equal (alist-get 'state message) "live")
+    (error "qq: %s state must be live" context))
+  (let ((sender (alist-get 'sender message)))
+    (pcase (and (qq-api--single-alist-p sender)
+                (alist-get 'kind sender))
+      ("user"
+       (unless
+           (and
+            (qq-api--exact-object-keys-p
+             sender '(kind user_id name avatar_url))
+            (qq-api-user-id-p (alist-get 'user_id sender))
+            (stringp (alist-get 'name sender))
+            (qq-api-non-empty-string-p (alist-get 'avatar_url sender)))
+         (error "qq: %s user sender is invalid" context)))
+      ("anonymous"
+       (unless
+           (and (qq-api--exact-object-keys-p sender '(kind name))
+                (stringp (alist-get 'name sender)))
+         (error "qq: %s anonymous sender is invalid" context)))
+      (_ (error "qq: %s sender has invalid kind" context))))
+  (let ((origin (alist-get 'origin message)))
+    (pcase (and (qq-api--single-alist-p origin)
+                (alist-get 'kind origin))
+      ("private"
+       (unless
+           (and (qq-api--exact-object-keys-p origin '(kind peer_uin))
+                (qq-account--uint64-decimal-p
+                 (alist-get 'peer_uin origin)))
+         (error "qq: %s private origin is invalid" context)))
+      ("group"
+       (unless
+           (and (qq-api--exact-object-keys-p origin '(kind group_uin))
+                (qq-account--uint64-decimal-p
+                 (alist-get 'group_uin origin)))
+         (error "qq: %s group origin is invalid" context)))
+      ("unknown"
+       (unless (qq-api--exact-object-keys-p origin '(kind))
+         (error "qq: %s unknown origin has invalid fields" context)))
+      (_ (error "qq: %s origin has invalid kind" context))))
+  (let ((segments (alist-get 'segments message)))
+    (unless (or (vectorp segments) (proper-list-p segments))
+      (error "qq: %s segments must be an array" context))
+    (unless (> (length segments) 0)
+      (error "qq: %s requires at least one segment" context))
+    (cl-loop
+     for segment across (vconcat segments)
+     for index from 0
+     do (qq-forward--validate-gateway-segment
+         segment (format "%s.segments[%d]" context index))))
+  message)
 
 (defun qq-forward--native-sender-fields (sender)
   "Return internal sender display tuple from native SENDER."
@@ -364,6 +452,7 @@ snapshot is remote-only."
                       (qq-state-message-preview-from-segments segments))))
       `((id . ,entry-id)
         (server-id . ,server-id)
+        (message-seq . ,(alist-get 'sequence source))
         (time . ,time)
         (sender-id . ,sender-id)
         (sender-name . ,sender-name)
@@ -382,9 +471,9 @@ snapshot is remote-only."
         (raw-event . ,(copy-tree source))))))
 
 (defun qq-forward-native-message-to-internal (message)
-  "Validate native MESSAGE and map it to viewer-local timeline shape."
-  (qq-api--validate-native-forward-message
-   message "native forward message" t)
+  "Validate a v2 Gateway MESSAGE and map it to viewer-local timeline shape."
+  (qq-forward--validate-gateway-message
+   message "Gateway forward message")
   (let ((segments
          (mapcar #'qq-forward-native-segment-to-internal
                  (let ((value (alist-get 'segments message)))
@@ -400,10 +489,11 @@ snapshot is remote-only."
      (alist-get 'origin message))))
 
 (defun qq-forward--normalize-messages (raw-messages)
-  "Validate and map native RAW-MESSAGES for the viewer."
+  "Validate and map v2 Gateway RAW-MESSAGES for the viewer."
+  (unless (or (vectorp raw-messages) (proper-list-p raw-messages))
+    (error "qq: Gateway forward messages must be an array"))
   (mapcar #'qq-forward-native-message-to-internal
-          (qq-api-validate-native-forward-messages
-           raw-messages "forward viewer messages" t)))
+          (append raw-messages nil)))
 
 (defun qq-forward--legacy-presentation (data)
   "Extract safe presentation fields from legacy Ark DATA."
@@ -499,15 +589,12 @@ the fork-native forward action using an explicit locator-qualified reference."
   (when-let* ((reply
                (seq-find (lambda (segment)
                            (equal (alist-get 'type segment) "reply"))
-                         (alist-get 'segments message)))
-              (target (alist-get 'target (alist-get 'data reply))))
-    (pcase (alist-get 'kind target)
-      ("entry"
-       (list :kind 'entry :id (alist-get 'entry_id target)))
-      ("native"
-       (list :kind 'native
-             :sequence (alist-get 'sequence target)
-             :sender-name (alist-get 'sender_name target))))))
+                         (alist-get 'segments message))))
+    (let ((data (alist-get 'data reply)))
+      (when-let* ((sequence (alist-get 'message_seq data)))
+        (list :kind 'native
+              :sequence sequence
+              :sender-name (alist-get 'sender_name data))))))
 
 (defun qq-forward--messages-by-entry (messages)
   "Return an equal-tested native entry id index for MESSAGES."
@@ -515,18 +602,40 @@ the fork-native forward action using an explicit locator-qualified reference."
     (dolist (message messages index)
       (puthash (alist-get 'id message) message index))))
 
-(defun qq-forward--reply-view-model (message messages-by-entry)
+(defun qq-forward--messages-by-sequence (messages)
+  "Return a unique native sequence index for MESSAGES.
+
+Conflicting sequence claims are removed instead of choosing one entry."
+  (let ((index (make-hash-table :test #'equal))
+        (conflicts (make-hash-table :test #'equal)))
+    (dolist (message messages)
+      (let ((sequence (alist-get 'message-seq message)))
+        (when sequence
+          (if (gethash sequence index)
+              (progn
+                (remhash sequence index)
+                (puthash sequence t conflicts))
+            (unless (gethash sequence conflicts)
+              (puthash sequence message index))))))
+    index))
+
+(defun qq-forward--reply-view-model
+    (message messages-by-entry messages-by-sequence)
   "Return a stable viewer-local reply model for MESSAGE.
 
 The model snapshots the target sender and preview into the projected row
 context.  A target-content change therefore changes the reply row context and
 causes appkit to redraw that row without a global message-state dependency.
-MESSAGES-BY-ENTRY is the projection-local native entry index."
+MESSAGES-BY-ENTRY and MESSAGES-BY-SEQUENCE are projection-local indexes."
   (when-let* ((target (qq-forward--message-reply-target message)))
     (let* ((target-kind (plist-get target :kind))
            (target-id (plist-get target :id))
-           (source (and (eq target-kind 'entry)
-                        (gethash target-id messages-by-entry)))
+           (source
+            (pcase target-kind
+              ('entry (gethash target-id messages-by-entry))
+              ('native
+               (gethash (plist-get target :sequence)
+                        messages-by-sequence))))
            (sender (and source
                         (qq-forward--present-string
                          (alist-get 'sender-name source))))
@@ -552,9 +661,7 @@ MESSAGES-BY-ENTRY is the projection-local native entry index."
                   (t "native reply"))))
       (list :target-kind target-kind
             :target-id target-id
-            :jump-entry-id (and source
-                                (eq target-kind 'entry)
-                                (alist-get 'id source))
+            :jump-entry-id (and source (alist-get 'id source))
             :body body))))
 
 (defun qq-forward--insert-reply-preview-line
@@ -630,7 +737,9 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
 (defun qq-forward--project-timeline ()
   "Project accepted messages and transient status into appkit rows."
   (let ((messages-by-entry
-         (qq-forward--messages-by-entry qq-forward--messages)))
+         (qq-forward--messages-by-entry qq-forward--messages))
+        (messages-by-sequence
+         (qq-forward--messages-by-sequence qq-forward--messages)))
     (let ((message-rows
            (appkit-chat-timeline-project
             qq-forward--messages
@@ -639,7 +748,8 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
             (lambda (_previous message)
               (when-let* ((reply-view-model
                            (qq-forward--reply-view-model
-                            message messages-by-entry)))
+                            message messages-by-entry
+                            messages-by-sequence)))
                 (list :reply-view-model (copy-tree reply-view-model))))
             :dependencies-function #'qq-forward--message-dependency-keys)))
       (cond
@@ -702,7 +812,7 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
           qq-forward--request-owner nil
           qq-forward--loading nil)
     (when request
-      (qq-api-cancel-request request))))
+      (qq-request-cancel request))))
 
 (defun qq-forward--clear-view-data ()
   "Clear account-scoped data projected by the current forward view."
@@ -889,8 +999,13 @@ sync; timeline mutation remains owned by `qq-forward--sync-invalidations'."
     (qq-forward--request-timeline-sync view)
     (condition-case error-data
         (let ((request
-                (qq-api-get-forward
-                 source
+                (qq-core-get-forward
+                 (pcase (alist-get 'kind source)
+                   ("resource" (alist-get 'resource_id source))
+                   (_
+                    (user-error
+                     "qq: v2 merged-forward loading requires a resource reference")))
+                 (alist-get 'scene source)
                  (lambda (raw-messages)
                    (when (qq-forward--request-current-p
                           view buffer source owner)

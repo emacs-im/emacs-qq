@@ -12,6 +12,7 @@
     "message.recall_poke" "message.recall" "message.set_reaction"
     "message.set_essence" "message.set_todo" "message.get_history"
     "message.get_group_history_window" "message.get_private_history"
+    "message.get_forward"
     "message.mark_read")
   "Native Gateway capabilities exercised by message tests.")
 
@@ -1879,6 +1880,48 @@ push carries sequence=40909 and client_sequence=30202."
         (should
          (equal (plist-get callback-meta :requested-start-sequence)
                 "18446744073709551516"))))))
+
+(ert-deftest qq-message-forward-request-keeps-resource-scene-and-transient-body ()
+  (qq-message-test-with-state
+    (let (sent-method sent-params projected)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method
+                         sent-params params)
+                   (funcall
+                    callback
+                    `((account_id . "slot-a")
+                      (messages
+                       . ,(list
+                           '((entry_id . "1")
+                             (state . "live")
+                             (sent_at . 1710000000)
+                             (sender . ((kind . "anonymous")
+                                        (name . "Alice")))
+                             (origin . ((kind . "unknown")))
+                             (segments . (((kind . "text")
+                                           (payload
+                                            . ((text . "inside")))))))))))
+                   "request-forward")))
+        (should
+         (equal
+          (qq-message-get-forward
+           "resid-private" "private"
+           (lambda (messages) (setq projected messages)))
+          "request-forward"))
+        (should (equal sent-method "message.get_forward"))
+        (should
+         (equal sent-params
+                '((account_id . "slot-a")
+                  (resource_id . "resid-private")
+                  (scene . "private"))))
+        (should (equal (alist-get 'entry_id (car projected)) "1"))
+        ;; The result is viewer-local data, not a timeline/history merge.
+        (should-not (qq-state-session-messages "private:10001"))))))
 
 (ert-deftest qq-message-group-history-window-anchors-at-server-frontier ()
   (qq-message-test-with-state

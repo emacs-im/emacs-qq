@@ -198,6 +198,38 @@ pushes left optimistic sends stuck without a snowflake."
   (let ((kind (alist-get 'kind segment))
         (payload (alist-get 'payload segment)))
     (pcase kind
+      ("forward_card"
+       `((type . "card")
+         (data . ((kind . "forward")
+                  (reference . ,(copy-tree
+                                 (alist-get 'reference payload)))
+                  (presentation . ,(copy-tree
+                                    (alist-get 'presentation payload)))))))
+      ("light_app"
+       (let* ((preview (alist-get 'preview payload))
+              (preview (cond
+                        ((vectorp preview) (append preview nil))
+                        ((listp preview) preview)))
+              (content (and preview (string-join preview "\n")))
+              (app (alist-get 'app payload))
+              (prompt (alist-get 'prompt payload))
+              (source (or (alist-get 'source payload) app)))
+         `((type . "card")
+           (data . ((kind . "app")
+                    (app . ,app)
+                    (title . ,prompt)
+                    (content . ,content)
+                    (source . ,source)
+                    (summary . ,(alist-get 'summary payload))
+                    (prompt . ,prompt))))))
+      ("market_face"
+       `((type . "mface")
+         (data . ((emoji_package_id . ,(alist-get 'package_id payload))
+                  (emoji_id . ,(alist-get 'emoji_id payload))
+                  (summary . ,(alist-get 'summary payload))
+                  (url . ,(alist-get 'url payload))
+                  (width . ,(alist-get 'width payload))
+                  (height . ,(alist-get 'height payload))))))
       ("reply"
        `((type . "reply")
          (data . ,(qq-state--native-reply-data
@@ -209,6 +241,36 @@ pushes left optimistic sends stuck without a snowflake."
                   ,@(when-let* ((raw (alist-get 'raw payload)))
                       `((fallback_text . ,(alist-get 'fallback_text raw))))))))
       (_ `((type . ,kind) (data . ,(copy-tree payload)))))))
+
+(defun qq-message-get-forward
+    (resource-id scene &optional callback errback)
+  "Fetch merged-forward entries behind opaque RESOURCE-ID in SCENE.
+
+The returned entries are transient viewer data.  They are not merged into the
+ordinary chat timeline or message store."
+  (unless (qq-account--non-empty-string-p resource-id)
+    (user-error "qq: Merged-forward resource id must be non-empty"))
+  (unless (member scene '("group" "private" "group_temp"))
+    (user-error "qq: Merged-forward scene is invalid"))
+  (let ((owner (qq-message--current-owner)))
+    (qq-message--sync-account owner)
+    (qq-message--call
+     "message.get_forward" owner
+     `((resource_id . ,resource-id)
+       (scene . ,scene))
+     :projector
+     (lambda (result)
+       (unless
+           (and (qq-account--exact-object-keys-p
+                 result '(account_id messages))
+                (equal (alist-get 'account_id result) owner)
+                (listp (alist-get 'messages result)))
+         (error "qq: Gateway returned invalid merged-forward messages"))
+       (qq-server-value-copy (alist-get 'messages result)))
+     :callback callback
+     :errback errback
+     :stale-message
+     "QQ account or Gateway connection changed during merged-forward fetch")))
 
 (defun qq-message--pending-send-key (owner client-sequence)
   "Return exact correlation key for OWNER and CLIENT-SEQUENCE."

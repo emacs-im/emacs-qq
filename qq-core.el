@@ -1485,6 +1485,14 @@ It is used only when the target message is not already cached."
          session-key start-sequence end-sequence callback errback
          (list :history-target-message-id message-id))))))
 
+(defun qq-core-get-forward
+    (resource-id scene callback &optional errback)
+  "Fetch merged-forward entries behind opaque RESOURCE-ID in SCENE."
+  (qq-core--start-request
+   (lambda (success failure)
+     (qq-message-get-forward resource-id scene success failure))
+   callback errback))
+
 (defun qq-core-history-exhausted-error-p (response reason)
   "Return non-nil when native RESPONSE and REASON mean history EOF."
   (ignore response reason)
