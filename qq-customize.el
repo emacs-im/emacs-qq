@@ -139,6 +139,24 @@ Nil means use `qq-history-fetch-count'.  NapCat `get_*_msg_history' with
                  (integer :tag "Count"))
   :group 'qq)
 
+(defcustom qq-chat-attach-commands
+  '(("image" qq-chat-attach-image)
+    ("video" qq-chat-attach-video)
+    ("file" qq-chat-attach-document)
+    ("media" qq-chat-attach-file)
+    ("clipboard" qq-chat-attach-clipboard)
+    ("qq-face" qq-chat-attach-face)
+    ("favorite-face" qq-chat-attach-custom-face))
+  "Attachment commands offered by `qq-chat-attach'.
+
+Each entry has the form (NAME COMMAND).  NAME is the stable completion
+candidate shown after `C-c C-a'; COMMAND must be an interactive function.
+As in telega's `telega-chat-attach-commands', users and extensions may append
+their own attachment kinds without replacing the dispatcher."
+  :type '(alist :key-type (string :tag "Attachment name")
+                :value-type (list function))
+  :group 'qq)
+
 (defcustom qq-auto-mark-read t
   "When non-nil, advance a chat's read position with its cursor.
 

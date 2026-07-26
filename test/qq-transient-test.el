@@ -50,7 +50,6 @@
   (should (commandp #'qq-chat-unpin-friend))
   (should (commandp #'qq-chat-friend-pin-transient))
   (should (commandp #'qq-chat-clear-message-selection))
-  (should (commandp #'qq-chat-attach-transient))
   (should (commandp #'qq-presence-transient))
   (should (commandp #'qq-root-transient)))
 
