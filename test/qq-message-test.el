@@ -8,7 +8,7 @@
 (require 'qq-message)
 
 (defconst qq-message-test-capabilities
-  '("message.send" "message.poke"
+  '("message.send" "file.send" "message.poke"
     "message.recall_poke" "message.recall" "message.set_reaction"
     "message.set_essence" "message.set_todo" "message.get_history"
     "message.get_group_history_window" "message.get_private_history"
@@ -264,6 +264,36 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
              ,@body))
        (qq-runtime-stop)
        (qq-state-reset))))
+
+(ert-deftest qq-message-send-file-publishes-staged-resource-to-group ()
+  (qq-message-test-with-state
+    (let (method params)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (sent-method sent-params _callback _errback
+                                      &optional _early)
+                   (setq method sent-method
+                         params sent-params)
+                   "file-send-request")))
+        (should
+         (equal
+          (qq-message-send-file
+           "group:8209413637" "res-group-file")
+          "file-send-request"))
+        (should (equal method "file.send"))
+        (should
+         (equal
+          params
+          '((account_id . "slot-a")
+            (conversation . ((kind . "group")
+                             (group_uin . "8209413637")))
+            (resource_id . "res-group-file"))))
+        (should-error
+         (qq-message-send-file
+          "private:10001" "res-group-file")
+         :type 'user-error)))))
 
 (ert-deftest qq-message-conversation-params-use-session-identity ()
   (should

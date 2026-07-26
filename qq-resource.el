@@ -32,7 +32,7 @@
 (defvar qq-resource--resync-request-id nil
   "Identity of the in-flight automatic resource registry resync.")
 
-(defun qq-resource--opaque-id-p (value)
+(defun qq-resource-id-p (value)
   "Return non-nil when VALUE is an opaque staged-resource identity."
   (and (stringp value)
        (string-prefix-p "res-" value)
@@ -237,7 +237,7 @@ The source must be a ready mono PCM WAV accepted by the native service.
 SUGGESTED-NAME, when non-nil, names the distinct derived resource.  CALLBACK
 receives its staging snapshot; source and result retain independent
 lifecycle and release operations."
-  (unless (qq-resource--opaque-id-p source-resource-id)
+  (unless (qq-resource-id-p source-resource-id)
     (user-error "qq: Record source ID must be an opaque res- identity"))
   (when (and suggested-name
              (not (qq-resource--safe-name-p suggested-name)))
@@ -263,7 +263,7 @@ The source must be a ready QQ/Tencent Silk resource accepted by the native
 service.  SUGGESTED-NAME, when non-nil, names the distinct derived resource.
 CALLBACK receives its staging snapshot; source and result retain
 independent lifecycle and release operations."
-  (unless (qq-resource--opaque-id-p source-resource-id)
+  (unless (qq-resource-id-p source-resource-id)
     (user-error "qq: Native record source ID must be an opaque res- identity"))
   (when (and suggested-name
              (not (qq-resource--safe-name-p suggested-name)))
@@ -302,7 +302,7 @@ CALLBACK receives an access grant containing `access_id', `resource_id',
 `path', and `expires_at'.  The path is deliberately absent from ordinary
 resource snapshots and must later be revoked with
 `qq-resource-close-local'."
-  (unless (qq-resource--opaque-id-p resource-id)
+  (unless (qq-resource-id-p resource-id)
     (user-error "qq: Resource ID must be an opaque res- identity"))
   (qq-rpc-call
    "resource.open_local" `((resource_id . ,resource-id))
@@ -328,7 +328,7 @@ resource snapshots and must later be revoked with
 
 Return a `qq-account-watch' that detaches this local observer without changing
 service state.  CALLBACK receives the ready snapshot."
-  (unless (qq-resource--opaque-id-p resource-id)
+  (unless (qq-resource-id-p resource-id)
     (user-error "qq: Resource ID must be an opaque res- identity"))
   (let (observer watch)
     (setq watch
@@ -432,7 +432,7 @@ AFTER is an opaque cursor returned by the previous page.  LIMIT defaults to
 (defun qq-resource-status
     (resource-id &optional callback errback)
   "Fetch RESOURCE-ID and merge it into the local projection."
-  (unless (qq-resource--opaque-id-p resource-id)
+  (unless (qq-resource-id-p resource-id)
     (user-error "qq: Resource ID must be an opaque res- identity"))
   (qq-rpc-call
    "resource.status" `((resource_id . ,resource-id))
@@ -446,7 +446,7 @@ AFTER is an opaque cursor returned by the previous page.  LIMIT defaults to
 (defun qq-resource-release
     (resource-id &optional callback errback)
   "Idempotently release staged RESOURCE-ID."
-  (unless (qq-resource--opaque-id-p resource-id)
+  (unless (qq-resource-id-p resource-id)
     (user-error "qq: Resource ID must be an opaque res- identity"))
   (qq-rpc-call
    "resource.release" `((resource_id . ,resource-id))

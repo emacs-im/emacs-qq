@@ -20,6 +20,7 @@
 (require 'qq-account)
 (require 'qq-attachment)
 (require 'qq-remote-media)
+(require 'qq-resource)
 (require 'qq-server)
 (require 'qq-protocol)
 (require 'qq-runtime)
@@ -1542,6 +1543,29 @@ The original reply element remains part of this local rendering shape."
        ,@(when reply-to `((reply_to . ,reply-to)))
        (segments . ,native-segments))
      callback errback)))
+
+(defun qq-message-send-file
+    (session-key resource-id &optional callback errback)
+  "Publish staged RESOURCE-ID as a standalone group file.
+
+Group files use QQ's dedicated file feed rather than `message.send'.  The
+successful receipt acknowledges publication but does not invent a message ID;
+the authoritative file message is projected when QQ returns it through push
+or history."
+  (unless (eq (qq-state-session-key-type session-key) 'group)
+    (user-error "qq: Native private file upload is not implemented yet"))
+  (unless (qq-resource-id-p resource-id)
+    (user-error "qq: File send requires an opaque staged resource"))
+  (let* ((owner (qq-message--current-owner))
+         (_owner (qq-message--sync-account owner)))
+    (qq-message--call
+     "file.send" owner
+     `((conversation . ,(qq-message--conversation-params session-key))
+       (resource_id . ,resource-id))
+     :callback callback
+     :errback errback
+     :stale-message
+     "QQ account or Gateway connection changed during file send")))
 
 (defun qq-message-send-poke
     (session-key target-uin &optional callback errback)
