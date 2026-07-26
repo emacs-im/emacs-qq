@@ -904,12 +904,7 @@ pixel-valued alignment follows text scaling."
 
 (defun qq-root--session-avatar-media-key (session)
   "Return the exact avatar cache key used by SESSION, or nil."
-  (let ((target-id (alist-get 'target-id session)))
-    (when target-id
-      (pcase (alist-get 'type session)
-        ('dataline nil)
-        ('group (format "group-avatar:%s" target-id))
-        (_ (format "avatar:%s" target-id))))))
+  (qq-media-session-avatar-cache-key session))
 
 (defun qq-root--handle-media-cache-update (media-key)
   "Invalidate every account root row identified by MEDIA-KEY."

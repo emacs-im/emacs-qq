@@ -2873,7 +2873,76 @@
                   (lambda (&rest _)
                     (ert-fail "media callback projected rows"))))
          (qq-chat--rerender-open-chats)
-         (should (equal calls (list (list view :entries '("m1"))))))))))
+         (should
+          (equal calls
+                 (list
+                  (list view :part 'composer :entries '("m1"))))))))))
+
+(ert-deftest qq-chat-avatar-cache-update-refreshes-composer-precisely ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat-render)
+     (let ((view (appkit-current-view)) calls)
+       (cl-letf (((symbol-function 'appkit-request-sync)
+                  (lambda (candidate &rest options)
+                    (push (cons candidate options) calls))))
+         (qq-chat--rerender-open-chats "group-avatar:20001")
+         (should
+          (equal calls
+                 (list
+                  (list view
+                        :part 'composer
+                        :resource '(:media "group-avatar:20001"))))))))))
+
+(ert-deftest qq-chat-composer-invalidation-refreshes-only-prompt ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Group") (target-id . "20001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (qq-chat-render)
+     (let ((view (appkit-current-view))
+           prompt-refreshed-p
+           rendered-p)
+       (cl-letf (((symbol-function 'qq-chat--refresh-prompt)
+                  (lambda () (setq prompt-refreshed-p t)))
+                 ((symbol-function 'qq-chat-render)
+                  (lambda () (setq rendered-p t))))
+         (appkit-request-sync view :part 'composer)
+         (qq-chat-test-sync-invalidations)
+         (should prompt-refreshed-p)
+         (should-not rendered-p))))))
+
+(ert-deftest qq-chat-prompt-presents-destination-avatar ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Readable Group") (target-id . "20001"))
+    nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "group:20001")
+     (let ((avatar (copy-sequence "#")))
+       (put-text-property 0 1 'display 'group-avatar avatar)
+       (cl-letf (((symbol-function
+                   'qq-media-session-avatar-display-string)
+                  (lambda (_session) avatar)))
+         (let ((prompt (qq-chat--prompt-text)))
+           (should (equal "# >>> " (substring-no-properties prompt)))
+           (should (eq 'group-avatar
+                       (get-text-property 0 'display prompt)))
+           (should
+            (equal "Message destination: Readable Group"
+                   (get-text-property 0 'help-echo prompt)))))))))
 
 (ert-deftest qq-chat-compact-face-message-uses-image-display ()
   "Same-sender face continuations must not render plain [face:id] text."
@@ -7089,6 +7158,49 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
        (setq qq-chat--session-key "group:20001")
        (should-not (qq-chat--friend-pin-capable-p))
        (should-error (qq-chat-unpin-friend) :type 'user-error)))))
+
+(ert-deftest qq-chat-buffer-names-present-human-session-kind ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001"
+    '((type . private) (title . "Alice") (target-id . "10001"))
+    nil)
+   (qq-state-upsert-session
+    "group:20001"
+    '((type . group) (title . "Emacs CN") (target-id . "20001"))
+    nil)
+   (should (equal "QQ{Alice}" (qq-chat--buffer-name "private:10001")))
+   (should (equal "QQ[Emacs CN]" (qq-chat--buffer-name "group:20001")))))
+
+(ert-deftest qq-chat-buffer-name-disambiguates-account-only-on-collision ()
+  (let ((qq-runtime--accounts (make-hash-table :test #'equal))
+        (qq-state--partitions (make-hash-table :test #'equal))
+        (qq-state--active-account-id nil)
+        first-buffer)
+    (unwind-protect
+        (cl-letf (((symbol-function 'qq-runtime-account-display-name)
+                   (lambda (account-id) account-id)))
+          (qq-runtime-with-account "slot-a"
+            (qq-state-upsert-session
+             "private:10001"
+             '((type . private) (title . "Alice") (target-id . "10001"))
+             nil)
+            (setq first-buffer (get-buffer-create "QQ{Alice}"))
+            (with-current-buffer first-buffer
+              (setq-local qq-runtime--account-id "slot-a")
+              (setq-local qq-chat--session-key "private:10001")))
+          (qq-runtime-with-account "slot-b"
+            (qq-state-upsert-session
+             "private:10001"
+             '((type . private) (title . "Alice") (target-id . "10001"))
+             nil)
+            (should
+             (equal "QQ{Alice}<slot-b>"
+                    (qq-chat--buffer-name "private:10001")))))
+      (when (buffer-live-p first-buffer)
+        (kill-buffer first-buffer))
+      (qq-runtime-stop-account "slot-a" t)
+      (qq-runtime-stop-account "slot-b" t))))
 
 (ert-deftest qq-chat-same-session-key-stays-independent-in-two-accounts ()
   (let ((qq-runtime--accounts (make-hash-table :test #'equal))

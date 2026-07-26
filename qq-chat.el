@@ -475,22 +475,81 @@ They are inactive in the composer so typing is never stolen.")
               (if (qq-chat--msg-filter-has-more-p) "+" "")
               (if qq-chat--filter-owner " · searching…" "")))))
 
+(defun qq-chat--single-line-presentation (value)
+  "Return VALUE as trimmed single-line presentation text."
+  (string-trim
+   (replace-regexp-in-string "[\n\r\t ]+" " " (format "%s" value))))
+
+(defun qq-chat--buffer-name-available-p (name owner session-key)
+  "Return non-nil when NAME is free or already owns OWNER's SESSION-KEY."
+  (let ((buffer (get-buffer name)))
+    (or (not (buffer-live-p buffer))
+        (and
+         (equal (buffer-local-value 'qq-runtime--account-id buffer) owner)
+         (equal (buffer-local-value 'qq-chat--session-key buffer)
+                session-key)))))
+
 (defun qq-chat--buffer-name (session-key)
-  "Return canonical buffer name for SESSION-KEY."
+  "Return a readable, globally unique buffer name for SESSION-KEY.
+
+The stable Appkit view identity remains account-qualified and independent of
+this presentation name.  Account and protocol identities appear only when a
+human title collides with another live buffer."
   (let* ((owner (qq-runtime-current-account-id))
+         (session (qq-state-session session-key))
+         (type (qq-state-session-key-type session-key))
+         (target-id (qq-state-session-key-target-id session-key))
+         (session-title (alist-get 'title session))
+         (title
+          (qq-chat--single-line-presentation
+           (if (and (stringp session-title)
+                    (not (string-empty-p
+                          (string-trim session-title))))
+               session-title
+             (or target-id session-key))))
+         (prefix
+          (qq-chat--single-line-presentation qq-chat-buffer-name-prefix))
+         (brackets
+          (pcase type
+            ('private '("{" . "}"))
+            ((or 'group 'guild-channel) '("[" . "]"))
+            ('dataline '("<" . ">"))
+            ('service '("(" . ")"))
+            (_ '("[" . "]"))))
+         (base
+          (format "%s%s%s%s"
+                  prefix
+                  (car brackets) title (cdr brackets)))
          (account-name
-          (if owner
-              (qq-runtime-account-display-name owner)
-            "unbound")))
-    (format "*qq-chat:%s:%s*"
-            account-name
-            (or (alist-get 'title (qq-state-session session-key))
-                session-key))))
+          (and owner
+               (qq-chat--single-line-presentation
+                (qq-runtime-account-display-name owner))))
+         (candidates
+          (delete-dups
+           (delq nil
+                 (list
+                  base
+                  (and account-name
+                       (format "%s<%s>" base account-name))
+                  (and account-name target-id
+                       (format "%s<%s:%s>" base account-name target-id))
+                  (and owner
+                       (format "%s<%s:%s>" base owner session-key))))))
+         (available
+          (cl-find-if
+           (lambda (candidate)
+             (qq-chat--buffer-name-available-p
+              candidate owner session-key))
+           candidates)))
+    (or available
+        (generate-new-buffer-name (car (last candidates))))))
 
 (defun qq-chat--ensure-buffer-name ()
   "Rename current chat buffer to reflect latest session title."
   (when qq-chat--session-key
-    (rename-buffer (qq-chat--buffer-name qq-chat--session-key) t)))
+    (let ((name (qq-chat--buffer-name qq-chat--session-key)))
+      (unless (equal (buffer-name) name)
+        (rename-buffer name)))))
 
 (defun qq-chat--buffer-width ()
   "Return current chat rendering width in columns."
@@ -1845,8 +1904,36 @@ selection; success removes only the immutable selection snapshot in PLAN."
     (qq-chat--manage-read-position)))
 
 (defun qq-chat--prompt-text ()
-  "Return visible prompt text for the current chat buffer."
-  ">>> ")
+  "Return the destination-aware prompt for the current chat buffer."
+  (let* ((session (qq-chat--session))
+         (avatar
+          (and qq-chat-show-prompt-avatar
+               session
+               (qq-media-session-avatar-display-string session))))
+    (concat
+     (if (and (stringp avatar) (not (string-empty-p avatar)))
+         (concat
+          (propertize
+           avatar
+           'help-echo
+           (format "Message destination: %s"
+                   (or (alist-get 'title session)
+                       (alist-get 'target-id session)
+                       qq-chat--session-key)))
+          " ")
+       "")
+     ">>> ")))
+
+(defun qq-chat--prompt-avatar-cache-key ()
+  "Return the media cache key affecting the current composer prompt."
+  (and qq-chat-show-prompt-avatar
+       (qq-media-session-avatar-cache-key (qq-chat--session))))
+
+(defun qq-chat--refresh-prompt ()
+  "Refresh generated prompt presentation without rebinding composer input."
+  (when (and (qq-chat--composer-visible-p)
+             (appkit-chatbuf-prompt-button-live-p))
+    (appkit-chatbuf-prompt-update (qq-chat--prompt-text))))
 
 (defun qq-chat--composer-visible-p ()
   "Return non-nil when the current session has a writable composer."
@@ -2268,14 +2355,17 @@ projection.  A replacement or detached view is inert."
          (if (eq event-mutation 'read)
              (qq-chat--apply-read-state-change)
            (qq-chat--header-line-update)
-           (qq-chat--update-frame))))
+           (qq-chat--update-frame)
+           (qq-chat--refresh-prompt))))
       ('action
        (when (equal event-session-key qq-chat--session-key)
          (qq-chat--update-frame)))
       ('sessions-refreshed
-       (qq-chat--header-line-update))
+       (qq-chat--header-line-update)
+       (qq-chat--refresh-prompt))
       ((or 'friends-refreshed 'groups-refreshed)
        (qq-chat--header-line-update)
+       (qq-chat--refresh-prompt)
        (qq-chat--sync-timeline
         :force-keys (appkit-chat-timeline-keys))))))
 
@@ -2284,6 +2374,8 @@ projection.  A replacement or detached view is inert."
   (let* ((events (appkit-view-pending-events-snapshot view))
          (parts (appkit-invalidations-parts invalidations))
          (geometry-p (memq 'geometry parts))
+         (composer-p (memq 'composer parts))
+         (non-composer-parts (delq 'composer (copy-sequence parts)))
          (resources (appkit-invalidations-resource-keys invalidations))
          (entries (appkit-invalidations-entry-keys invalidations))
          (raw-forward-sync-request qq-chat--forward-sync-request)
@@ -2354,7 +2446,7 @@ projection.  A replacement or detached view is inert."
           (qq-chat--update-frame))
          ((and (null events)
                (or (appkit-invalidations-structure-p invalidations)
-                   (appkit-invalidations-parts invalidations)
+                   non-composer-parts
                    (appkit-invalidations-position-p invalidations)))
           (qq-chat-render)
           (setq rendered-p t))
@@ -2373,6 +2465,11 @@ projection.  A replacement or detached view is inert."
                 (append entries (appkit-chat-timeline-keys)))
              entries)
            :changed-resources resources))
+        ;; Prompt presentation is independent from the editable input tail.
+        ;; Refresh it explicitly so an asynchronously materialized avatar never
+        ;; causes a full render or canonical composer rebind.
+        (when composer-p
+          (qq-chat--refresh-prompt))
         ;; Stabilize EWOC/frame boundaries before inserting a restored tail.
         ;; Full renders above know to skip live-to-canonical synchronization
         ;; while this barrier exists; materializing afterward cannot let the
@@ -7148,15 +7245,27 @@ search-result jump cannot race a latest/read-position request."
     buffer))
 
 (defun qq-chat--rerender-open-chats (&optional media-key)
-  "Invalidate open chat rows affected by MEDIA-KEY."
+  "Invalidate open chat rows and composer destinations affected by MEDIA-KEY."
   (dolist (buffer (buffer-list))
     (with-current-buffer buffer
       (when-let* ((view (qq-chat--live-current-view)))
-        (if media-key
-            (appkit-request-sync view :resource (list :media media-key))
-          (when (appkit-chat-timeline-live-p)
-            (appkit-request-sync
-             view :entries (appkit-chat-timeline-keys))))))))
+        (let ((prompt-key
+               (and qq-runtime--account-id
+                    (qq-runtime-with-account qq-runtime--account-id
+                      (qq-chat--prompt-avatar-cache-key)))))
+          (if media-key
+              (appkit-request-sync
+               view
+               :part (and (equal media-key prompt-key) 'composer)
+               :resource (list :media media-key))
+            (when (or (appkit-chat-timeline-live-p)
+                      (appkit-chatbuf-prompt-button-live-p))
+              (appkit-request-sync
+               view
+               :part (and prompt-key 'composer)
+               :entries
+               (and (appkit-chat-timeline-live-p)
+                    (appkit-chat-timeline-keys))))))))))
 
 (defun qq-chat--message-event-rekeys (event)
   "Return the row rekey described by EVENT, when it is an identity promotion.
