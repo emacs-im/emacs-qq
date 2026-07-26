@@ -2714,8 +2714,10 @@ favorite face's local thumbnail alongside its sendable mface payload."
 
 When SEGMENT-TYPE is nil, infer the most useful QQ segment type from PATH."
   (interactive
-   (list (read-file-name "Attach file: " nil nil t)
+   (list (appkit-media-read-file-name "Attach file: ")
          nil))
+  (unless (file-regular-p path)
+    (user-error "qq: attachment is not a regular file: %s" path))
   (unless (file-readable-p path)
     (user-error "qq: file is not readable: %s" path))
   (let* ((type (or segment-type (qq-chat--guess-file-segment-type path)))
@@ -2730,17 +2732,17 @@ When SEGMENT-TYPE is nil, infer the most useful QQ segment type from PATH."
 
 (defun qq-chat-attach-image (path)
   "Prompt for PATH and attach it explicitly as a QQ image."
-  (interactive (list (read-file-name "Attach image: " nil nil t)))
+  (interactive (list (appkit-media-read-file-name "Attach image: ")))
   (qq-chat-attach-file path "image"))
 
 (defun qq-chat-attach-video (path)
   "Prompt for PATH and attach it explicitly as a QQ video."
-  (interactive (list (read-file-name "Attach video: " nil nil t)))
+  (interactive (list (appkit-media-read-file-name "Attach video: ")))
   (qq-chat-attach-file path "video"))
 
 (defun qq-chat-attach-document (path)
   "Prompt for PATH and attach it explicitly as a generic QQ file."
-  (interactive (list (read-file-name "Attach file: " nil nil t)))
+  (interactive (list (appkit-media-read-file-name "Attach file: ")))
   (qq-chat-attach-file path "file"))
 
 (defun qq-chat-attach (attach-type)
@@ -2881,10 +2883,10 @@ Keys: `C-c C-e' / `C-u C-c C-e'."
                  (raw (url-filename parsed))
                  (path (and raw (url-unhex-string raw))))
             ;; url-filename keeps leading "/" on file:///path.
-            (when (and (stringp path)
-                       (file-exists-p path))
+            (when (appkit-media-readable-file-p path)
               (push (expand-file-name path) paths))))
-         ((and (file-name-absolute-p uri) (file-exists-p uri))
+         ((and (file-name-absolute-p uri)
+               (appkit-media-readable-file-p uri))
           (push (expand-file-name uri) paths)))))
     (nreverse paths)))
 
