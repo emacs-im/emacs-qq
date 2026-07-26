@@ -3615,6 +3615,7 @@ with the timestamp."
   "Return a short display label for normalized card KIND."
   (pcase kind
     ("miniapp" "Mini App")
+    ("app" "App")
     ("share" "Share")
     ("forward" "Chat History")
     ("forum" "Channel Post")
