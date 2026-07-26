@@ -7,7 +7,6 @@
 ;; Transient command menus for the root, chat, and message contexts:
 ;; - chat-level menu (`qq-chat-transient')
 ;; - message-at-point menu (`qq-chat-message-transient')
-;; - attach menu (`qq-chat-attach-transient')
 ;; - root menu (`qq-root-transient')
 ;;
 ;; These replace discoverability that used to live in always-visible
@@ -224,19 +223,6 @@
       (_ t))))
 
 
-;;; Attach helpers (typed)
-
-(defun qq-chat-attach-as-image ()
-  "Prompt for a file and attach it as an image segment."
-  (interactive)
-  (qq-chat-attach-file (read-file-name "Attach image: " nil nil t) "image"))
-
-(defun qq-chat-attach-as-file ()
-  "Prompt for a file and attach it as a generic file segment."
-  (interactive)
-  (qq-chat-attach-file (read-file-name "Attach file: " nil nil t) "file"))
-
-
 ;;; Chat / message transients
 ;;
 ;; Magit-style autoloads: do NOT put bare `;;;###autoload' above
@@ -362,17 +348,6 @@ Prefer this over inline button rows."
   (qq-chat--forward-plan-messages plan)
   (transient-setup 'qq-chat-forward-transient nil nil :scope plan))
 
-;;;###autoload(autoload 'qq-chat-attach-transient "qq-transient" nil t)
-(transient-define-prefix qq-chat-attach-transient ()
-  "Attach local media / QQ faces into the QQ chat composer."
-  [["Attach"
-    ("e" "QQ face (C-c C-e)" qq-chat-attach-face)
-    ("E" "Favorite face (C-u C-c C-e)" qq-chat-attach-custom-face)
-    ("f" "File (auto type)" qq-chat-attach-file)
-    ("i" "As image" qq-chat-attach-as-image)
-    ("F" "As file" qq-chat-attach-as-file)
-    ("v" "Clipboard (C-c C-v)" qq-chat-attach-clipboard)]])
-
 ;;;###autoload(autoload 'qq-chat-transient "qq-transient" nil t)
 (transient-define-prefix qq-chat-transient ()
   "Chat command menu for emacs-qq."
@@ -397,7 +372,7 @@ Prefer this over inline button rows."
      :inapt-if qq-transient--no-message-at-point-p)]
    ["Composer"
     ("c" "Send" qq-chat-send-message)
-    ("a" "Attach…" qq-chat-attach-transient)
+    ("a" "Attach…" qq-chat-attach)
     ("E" "QQ face" qq-chat-attach-face)
     ("F" "Favorite face" qq-chat-attach-custom-face)
     ("k" "Cancel reply/draft" qq-chat-cancel-dwim

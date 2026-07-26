@@ -61,7 +61,6 @@
                   "qq-red-packet"
                   (session-key message-id segment outgoing-p))
 (declare-function qq-chat-message-transient "qq-transient" (&rest args))
-(declare-function qq-chat-attach-transient "qq-transient" (&rest args))
 (declare-function qq-chat-transient "qq-transient" (&rest args))
 (declare-function qq-chat-forward-transient "qq-transient" (&rest args))
 (declare-function qq-chat-message-todo-transient "qq-transient" (&rest args))
@@ -2728,6 +2727,38 @@ When SEGMENT-TYPE is nil, infer the most useful QQ segment type from PATH."
     (message "qq: attached %s as %s"
              (file-name-nondirectory path)
              type)))
+
+(defun qq-chat-attach-image (path)
+  "Prompt for PATH and attach it explicitly as a QQ image."
+  (interactive (list (read-file-name "Attach image: " nil nil t)))
+  (qq-chat-attach-file path "image"))
+
+(defun qq-chat-attach-video (path)
+  "Prompt for PATH and attach it explicitly as a QQ video."
+  (interactive (list (read-file-name "Attach video: " nil nil t)))
+  (qq-chat-attach-file path "video"))
+
+(defun qq-chat-attach-document (path)
+  "Prompt for PATH and attach it explicitly as a generic QQ file."
+  (interactive (list (read-file-name "Attach file: " nil nil t)))
+  (qq-chat-attach-file path "file"))
+
+(defun qq-chat-attach (attach-type)
+  "Choose ATTACH-TYPE with completion and invoke its attachment command.
+
+`\\[universal-argument]' remains visible to the selected command.  For
+example, the clipboard command uses it to force image data to be attached as
+a generic file.  See `qq-chat-attach-commands' for the extensible command
+table."
+  (interactive
+   (list
+    (completing-read
+     "Attachment type: "
+     (mapcar #'car qq-chat-attach-commands)
+     nil t)))
+  (let ((command (cadr (assoc attach-type qq-chat-attach-commands))))
+    (cl-assert (commandp command))
+    (call-interactively command)))
 
 (defun qq-chat--read-base-face-id (&optional prompt)
   "Prompt for and return one QQ base face id.
@@ -6347,7 +6378,7 @@ still validated by the strict API contract."
     (define-key map (kbd "C-c C-f") #'qq-chat-attach-file)
     (define-key map (kbd "C-c C-v") #'qq-chat-attach-clipboard)
     (define-key map (kbd "C-c C-e") #'qq-chat-attach-emoji)
-    (define-key map (kbd "C-c C-a") #'qq-chat-attach-transient)
+    (define-key map (kbd "C-c C-a") #'qq-chat-attach)
     (define-key map (kbd "M-g s") #'qq-chat-inplace-search)
     (define-key map (kbd "M-g n") #'qq-chat-search-next)
     (define-key map (kbd "M-g p") #'qq-chat-search-prev)
