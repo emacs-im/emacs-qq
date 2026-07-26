@@ -432,7 +432,7 @@
 
 (ert-deftest qq-chat-explicit-media-attachers-select-the-requested-segment-type ()
   (let (calls)
-    (cl-letf (((symbol-function 'read-file-name)
+    (cl-letf (((symbol-function 'appkit-media-read-file-name)
                (lambda (prompt &rest _)
                  (concat "/tmp/" (substring prompt 7 -2))))
               ((symbol-function 'qq-chat-attach-file)
@@ -3965,6 +3965,13 @@
              (should (equal (file-name-nondirectory path)
                             (alist-get 'name (alist-get 'data (nth 1 sent-segments))))))
          (ignore-errors (delete-file path)))))))
+
+(ert-deftest qq-chat-attach-file-rejects-directories ()
+  (let ((directory (make-temp-file "qq-chat-attach-directory-" t)))
+    (unwind-protect
+        (should-error (qq-chat-attach-file directory)
+                      :type 'user-error)
+      (delete-directory directory))))
 
 (ert-deftest qq-chat-send-failure-restores-rich-draft-and-reply ()
   (qq-chat-test-with-reset
