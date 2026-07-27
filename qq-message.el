@@ -56,6 +56,9 @@
   (make-hash-table :test #'equal)
   "Newest live identity keyed by stable account ID and session.")
 
+(defconst qq-message-max-merged-forward-messages 500
+  "Maximum source messages accepted by one native merged forward.")
+
 (defun qq-message--message-id-p (value)
   "Return non-nil when VALUE is one canonical, nonzero uint64 Message ID."
   (qq-account--uint64-decimal-p value))
@@ -271,6 +274,55 @@ ordinary chat timeline or message store."
      :errback errback
      :stale-message
      "QQ account or Gateway connection changed during merged-forward fetch")))
+
+(defun qq-message-send-merged-forward
+    (source-session-key destination-session-key message-ids
+                        &optional callback errback)
+  "Send MESSAGE-IDS from SOURCE-SESSION-KEY as one native merged forward.
+
+The Gateway resolves every stable message ID from its durable Message Store,
+preserves caller order (including intentional duplicates), uploads the native
+long-message bag, and publishes its card to DESTINATION-SESSION-KEY."
+  (unless (and (listp message-ids)
+               (<= 1 (length message-ids)
+                   qq-message-max-merged-forward-messages))
+    (user-error "qq: Merged forward requires between 1 and %d messages"
+                qq-message-max-merged-forward-messages))
+  (dolist (message-id message-ids)
+    (unless (qq-message--message-id-p message-id)
+      (user-error "qq: Merged forward message IDs must be canonical uint64 strings")))
+  (let ((owner (qq-message--current-owner)))
+    (qq-message--sync-account owner)
+    (qq-message--call
+     "message.send_merged_forward" owner
+     `((destination
+        . ,(qq-message--conversation-params destination-session-key))
+       (source . ,(qq-message--conversation-params source-session-key))
+       (message_ids . ,(copy-sequence message-ids)))
+     :projector
+     (lambda (receipt)
+       (unless
+           (and
+            (qq-account--exact-object-keys-p
+             receipt
+             '(account_id resource_id sent_at server_sequence
+               client_sequence random))
+            (equal (alist-get 'account_id receipt) owner)
+            (qq-account--non-empty-string-p
+             (alist-get 'resource_id receipt))
+            (integerp (alist-get 'sent_at receipt))
+            (qq-account--uint64-decimal-p
+             (alist-get 'server_sequence receipt) t)
+            (qq-account--uint64-decimal-p
+             (alist-get 'client_sequence receipt) t)
+            (integerp (alist-get 'random receipt))
+            (<= 0 (alist-get 'random receipt) #xffffffff))
+         (error "qq: Gateway returned an invalid merged-forward receipt"))
+       (qq-server-value-copy receipt))
+     :callback callback
+     :errback errback
+     :stale-message
+     "QQ account or Gateway connection changed during merged-forward send")))
 
 (defun qq-message--pending-send-key (owner client-sequence)
   "Return exact correlation key for OWNER and CLIENT-SEQUENCE."

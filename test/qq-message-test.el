@@ -9,6 +9,7 @@
 
 (defconst qq-message-test-capabilities
   '("message.send" "file.send" "message.poke"
+    "message.send_merged_forward"
     "message.recall_poke" "message.recall" "message.set_reaction"
     "message.set_essence" "message.set_todo" "message.get_history"
     "message.get_group_history_window" "message.get_private_history"
@@ -313,6 +314,72 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
          (qq-message-send-file
           "private:10001" "res-group-file")
          :type 'user-error)))))
+
+(ert-deftest qq-message-send-merged-forward-preserves-source-order ()
+  (qq-message-test-with-state
+    (let (sent-method sent-params callback-result)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method
+                         sent-params params)
+                   (funcall
+                    callback
+                    '((account_id . "slot-a")
+                      (resource_id . "native-long-message-resource")
+                      (sent_at . 1785100000)
+                      (server_sequence . "8765432109")
+                      (client_sequence . "42001")
+                      (random . 123)))
+                   "request-forward")))
+        (should
+         (equal
+          (qq-message-send-merged-forward
+           "private:10001" "group:8209413637"
+           '("9007199254742007001"
+             "9007199254742007001"
+             "9007199254742007002")
+           (lambda (receipt) (setq callback-result receipt)))
+          "request-forward"))
+        (should (equal sent-method "message.send_merged_forward"))
+        (should
+         (equal
+          sent-params
+          '((account_id . "slot-a")
+            (destination . ((kind . "group")
+                            (group_uin . "8209413637")))
+            (source . ((kind . "private")
+                       (peer_uin . "10001")))
+            (message_ids
+             . ("9007199254742007001"
+                "9007199254742007001"
+                "9007199254742007002")))))
+        (should
+         (equal (alist-get 'resource_id callback-result)
+                "native-long-message-resource"))))))
+
+(ert-deftest qq-message-send-merged-forward-rejects-invalid-input-locally ()
+  (qq-message-test-with-state
+    (let (transport-called)
+      (cl-letf (((symbol-function 'qq-server-send)
+                 (lambda (&rest _arguments)
+                   (setq transport-called t))))
+        (should-error
+         (qq-message-send-merged-forward
+          "private:10001" "group:8209413637" nil)
+         :type 'user-error)
+        (should-error
+         (qq-message-send-merged-forward
+          "private:10001" "group:8209413637" '("local-pending"))
+         :type 'user-error)
+        (should-error
+         (qq-message-send-merged-forward
+          "service:u:mail:x" "group:8209413637"
+          '("9007199254742007001"))
+         :type 'user-error))
+      (should-not transport-called))))
 
 (ert-deftest qq-message-conversation-params-use-session-identity ()
   (should
