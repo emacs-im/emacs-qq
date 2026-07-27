@@ -126,6 +126,7 @@
          (qq-account-registry-changed-hook nil)
          (qq-account-selection-changed-hook nil)
          (qq-account-desync-hook nil)
+         (qq-account-projection-resync-hook nil)
          (qq-message--peer-uin-by-uid
           (make-hash-table :test #'equal))
          (qq-message--pending-recalls

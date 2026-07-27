@@ -401,12 +401,11 @@ Use a raw vector for `kinds' unless DOMAIN-P requests projected form."
         (should (equal qq-resource--gateway-instance-id "gateway-a"))
         (should (equal (car qq-resource--resync-request-id)
                        'resource-resync))
-        (qq-resource--handle-protocol-error
-         '((code . "resource_event_stream_lagged")
-           (message . "missed 2")))
+        (qq-resource--handle-projection-resync
+         "resources"
+         '((projection . "resources") (skipped . "2")))
         (should (equal calls '(ready)))
-        (should (equal (alist-get 'code desync)
-                       "resource_event_stream_lagged"))))))
+        (should (equal (alist-get 'projection desync) "resources"))))))
 
 (ert-deftest qq-resource-newest-refresh-owns-full-replacement ()
   (qq-resource-test-with-state

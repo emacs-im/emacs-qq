@@ -37,7 +37,8 @@
          (qq-account-registry-changed-hook nil)
          (qq-account-selection-changed-hook nil)
          (qq-account-registry-ready-hook nil)
-         (qq-account-desync-hook nil))
+         (qq-account-desync-hook nil)
+         (qq-account-projection-resync-hook nil))
      ,@body))
 
 (ert-deftest qq-account-uint64-wire-predicate-is-exact-and-bounded ()
@@ -436,6 +437,73 @@
         (should (equal (car qq-account--resync-request-id)
                        'account-resync))
         (should (equal (alist-get 'code observed) "event_stream_lagged"))))))
+
+(ert-deftest qq-account-websocket-lag-resyncs-every-projection ()
+  (qq-account-test-with-state
+    (let ((calls 0) projections)
+      (add-hook 'qq-account-projection-resync-hook
+                (lambda (projection _body) (push projection projections)))
+      (cl-letf (((symbol-function 'qq-account-refresh-accounts)
+                 (lambda (&rest _)
+                   (cl-incf calls)
+                   "resync-1")))
+        (qq-account--handle-protocol-error
+         '((code . "event_stream_lagged") (message . "missed 3")))
+        (should (= calls 1))
+        (should (equal (nreverse projections)
+                       '("resources" "attachments" "remote_media")))))))
+
+(ert-deftest qq-account-resync-required-accounts-triggers-one-registry-resync ()
+  (qq-account-test-with-state
+    (let ((calls 0) observed projections)
+      (add-hook 'qq-account-desync-hook
+                (lambda (body) (setq observed body)))
+      (add-hook 'qq-account-projection-resync-hook
+                (lambda (projection _body) (push projection projections)))
+      (cl-letf (((symbol-function 'qq-account-refresh-accounts)
+                 (lambda (&rest _)
+                   (cl-incf calls)
+                   "resync-1")))
+        (qq-account--handle-resync-required
+         "runtime.resync_required"
+         '((projection . "accounts") (skipped . "3")))
+        (should (= calls 1))
+        (should (equal (car qq-account--resync-request-id)
+                       'account-resync))
+        (should-not projections)
+        (should (equal (alist-get 'projection observed) "accounts"))))))
+
+(ert-deftest qq-account-resync-required-dispatches-foreign-projections ()
+  (qq-account-test-with-state
+    (let ((calls 0) observed)
+      (add-hook 'qq-account-projection-resync-hook
+                (lambda (projection body)
+                  (push (cons projection (alist-get 'skipped body))
+                        observed)))
+      (cl-letf (((symbol-function 'qq-account-refresh-accounts)
+                 (lambda (&rest _)
+                   (cl-incf calls)
+                   "resync-1")))
+        (dolist (projection '("resources" "attachments" "remote_media"))
+          (qq-account--handle-resync-required
+           "runtime.resync_required"
+           `((projection . ,projection) (skipped . "1"))))
+        (should (= calls 0))
+        (should (equal (nreverse observed)
+                       '(("resources" . "1")
+                         ("attachments" . "1")
+                         ("remote_media" . "1"))))))))
+
+(ert-deftest qq-account-resync-required-rejects-malformed-events ()
+  (qq-account-test-with-state
+    (dolist (data '(((projection . "accounts"))
+                    ((projection . "unknown") (skipped . "1"))
+                    ((projection . "") (skipped . "1"))
+                    ((skipped . "1"))
+                    ((projection . "accounts") (skipped . "1") (extra . t))))
+      (should-error
+       (qq-account--handle-resync-required
+        "runtime.resync_required" data)))))
 
 (ert-deftest qq-account-synchronous-resync-settlement-does-not-publish-token ()
   (qq-account-test-with-state

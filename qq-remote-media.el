@@ -672,9 +672,9 @@ Return a cancellable `qq-remote-media-operation'."
      (qq-remote-media--remove (alist-get 'media_id data) 'removed))
     (_ (error "qq: Unowned Gateway media event %s" event))))
 
-(defun qq-remote-media--handle-protocol-error (body)
-  "Resynchronize after unsolicited remote-media stream error BODY."
-  (when (equal (alist-get 'code body) "media_event_stream_lagged")
+(defun qq-remote-media--handle-projection-resync (projection body)
+  "Resynchronize after runtime PROJECTION events were lost with BODY."
+  (when (equal projection "remote_media")
     (qq-account--run-hook 'qq-remote-media-desync-hook body)
     (qq-remote-media--request-resync 'resync)))
 
@@ -683,8 +683,8 @@ Return a cancellable `qq-remote-media-operation'."
 (add-hook 'qq-account-registry-ready-hook #'qq-remote-media--handle-ready)
 (dolist (event '("media.changed" "media.removed"))
   (qq-rpc-register-event event #'qq-remote-media--handle-event))
-(qq-rpc-register-error
- "media_event_stream_lagged" #'qq-remote-media--handle-protocol-error)
+(add-hook 'qq-account-projection-resync-hook
+          #'qq-remote-media--handle-projection-resync)
 
 (provide 'qq-remote-media)
 

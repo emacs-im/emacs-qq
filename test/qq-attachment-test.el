@@ -12,6 +12,9 @@
 (defconst qq-attachment-test-record-id
   "att-11111111-2222-4333-8444-555555555556")
 
+(defconst qq-attachment-test-video-id
+  "att-11111111-2222-4333-8444-555555555557")
+
 (cl-defun qq-attachment-test-snapshot
     (&key
      (attachment-id qq-attachment-test-id)
@@ -53,6 +56,15 @@
    :attachment-id qq-attachment-test-record-id
    :resource-id "res-record-a"
    :use '((kind . "record"))
+   :phase "ready" :fast-path t :updated-at 1784700001))
+
+(defun qq-attachment-test-ready-video ()
+  "Return one fast-path ready native-video fixture."
+  (qq-attachment-test-snapshot
+   :attachment-id qq-attachment-test-video-id
+   :resource-id "res-video-a"
+   :use '((kind . "video")
+          (thumbnail_resource_id . "res-video-thumbnail-a"))
    :phase "ready" :fast-path t :updated-at 1784700001))
 
 (defun qq-attachment-test-account (&optional phase)
@@ -318,6 +330,46 @@
         (should (equal (alist-get 'use params) '((kind . "record"))))
         (should (equal (alist-get 'use delivered) '((kind . "record"))))))))
 
+(ert-deftest qq-attachment-prepare-video-binds-two-distinct-ready-resources ()
+  (qq-attachment-test-with-state
+    (puthash "res-video-a"
+             '((resource_id . "res-video-a") (phase . "ready"))
+             qq-resource--resources)
+    (puthash "res-video-thumbnail-a"
+             '((resource_id . "res-video-thumbnail-a") (phase . "ready"))
+             qq-resource--resources)
+    (let (method params delivered)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () '("attachment.prepare")))
+                ((symbol-function 'qq-server-send)
+                 (lambda (wire-method wire-params success _failure
+                                      &optional _early)
+                   (setq method wire-method params wire-params)
+                   (funcall
+                    success
+                    `((attachment . ,(qq-attachment-test-ready-video))))
+                   "prepare-video-request")))
+        (should
+         (equal
+          (qq-attachment-prepare-video
+           "group:8209413637" "res-video-a" "res-video-thumbnail-a"
+           (lambda (snapshot) (setq delivered snapshot)))
+          "prepare-video-request"))
+        (should (equal method "attachment.prepare"))
+        (should
+         (equal (alist-get 'use params)
+                '((kind . "video")
+                  (thumbnail_resource_id . "res-video-thumbnail-a"))))
+        (should
+         (equal (alist-get 'use delivered)
+                '((kind . "video")
+                  (thumbnail_resource_id . "res-video-thumbnail-a"))))
+        (should-error
+         (qq-attachment-prepare-video
+          "group:8209413637" "res-video-a" "res-video-a")
+         :type 'user-error)))))
+
 (ert-deftest qq-attachment-sendable-checks-account-and-conversation ()
   (qq-attachment-test-with-state
     (qq-attachment--upsert
@@ -352,7 +404,15 @@
      (qq-attachment-assert-sendable
       qq-attachment-test-record-id
       "group:8209413637" "slot-a")
-     :type 'user-error)))
+     :type 'user-error)
+    (qq-attachment--upsert
+     (qq-attachment-test-ready-video) 'ready-video)
+    (should
+     (equal
+      (qq-attachment-assert-sendable
+       qq-attachment-test-video-id
+       "group:8209413637" "slot-a" "video")
+      qq-attachment-test-video-id))))
 
 (ert-deftest qq-attachment-sendable-accepts-numeric-or-reordered-conversation ()
   "Conversation identity is kind + target id, never raw alist ordering or JSON number/string kind."
@@ -556,6 +616,112 @@
       (should (equal canceled "request-a"))
       (should (equal released-resource "res-image-a"))
       (should (equal released-attachment qq-attachment-test-id)))))
+
+(ert-deftest qq-attachment-video-cancel-releases-body-thumbnail-and-temp-file ()
+  (let* ((thumbnail-file
+          (make-temp-file "qq-video-cancel-" nil ".jpg" "jpeg"))
+         (operation
+          (qq-attachment-operation-create
+           :active-p t
+           :resource-id "res-video-a"
+           :thumbnail-resource-id "res-video-thumbnail-a"
+           :thumbnail-file thumbnail-file))
+         released)
+    (cl-letf (((symbol-function 'qq-resource-release)
+               (lambda (resource-id &rest _)
+                 (push resource-id released))))
+      (should (qq-attachment-cancel-operation operation))
+      (should-not (file-exists-p thumbnail-file))
+      (should
+       (equal (sort released #'string<)
+              '("res-video-a" "res-video-thumbnail-a"))))))
+
+(ert-deftest qq-attachment-video-rejects-non-mp4-before-extraction ()
+  (qq-attachment-test-with-state
+    (let ((path (make-temp-file "qq-video-format-" nil ".mkv" "mkv"))
+          extracted)
+      (unwind-protect
+          (cl-letf (((symbol-function 'qq-attachment--extract-video-thumbnail)
+                     (lambda (&rest _) (setq extracted t))))
+            (should-error
+             (qq-attachment-stage-and-prepare-video
+              "group:8209413637" path)
+             :type 'user-error)
+            (should-not extracted))
+        (delete-file path)))))
+
+(ert-deftest qq-attachment-video-generates-stages-and-prepares-both-resources ()
+  (qq-attachment-test-with-state
+    (let ((video-path (make-temp-file "qq-video-send-" nil ".mp4" "mp4"))
+          staged-paths prepared delivered failure operation)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'qq-runtime-current-account-id)
+                (lambda () "slot-a"))
+               ((symbol-function 'qq-attachment--extract-video-thumbnail)
+                (lambda (_operation _video thumbnail success _failure)
+                  (with-temp-file thumbnail
+                    (insert "jpeg"))
+                  (funcall success)
+                  nil))
+               ((symbol-function 'qq-resource-stage-local)
+                (lambda (path _name _digest success _failure)
+                  (let ((resource-id
+                         (if (equal path video-path)
+                             "res-video-a"
+                           "res-video-thumbnail-a")))
+                    (setq staged-paths (append staged-paths (list path)))
+                    (puthash resource-id
+                             `((resource_id . ,resource-id) (phase . "ready"))
+                             qq-resource--resources)
+                    (funcall success
+                             `((resource_id . ,resource-id)
+                               (phase . "staging")))
+                    (concat "stage-" resource-id))))
+               ((symbol-function 'qq-attachment-prepare-video)
+                (lambda (_session resource-id thumbnail-id success _failure)
+                  (setq prepared (list resource-id thumbnail-id))
+                  (let ((queued
+                         (qq-attachment-test-snapshot
+                          :attachment-id qq-attachment-test-video-id
+                          :resource-id resource-id
+                          :use `((kind . "video")
+                                 (thumbnail_resource_id . ,thumbnail-id)))))
+                    (qq-attachment--upsert queued 'prepare)
+                    (funcall success queued)
+                    (qq-attachment--upsert
+                     (qq-attachment-test-snapshot
+                      :attachment-id qq-attachment-test-video-id
+                      :resource-id resource-id
+                      :use `((kind . "video")
+                             (thumbnail_resource_id . ,thumbnail-id))
+                      :phase "negotiating" :updated-at 1784700001)
+                     'negotiating)
+                    (qq-attachment--upsert
+                     (qq-attachment-test-snapshot
+                      :attachment-id qq-attachment-test-video-id
+                      :resource-id resource-id
+                      :use `((kind . "video")
+                             (thumbnail_resource_id . ,thumbnail-id))
+                      :phase "ready" :fast-path t :updated-at 1784700002)
+                     'ready))
+                  "prepare-video-request"))
+               ((symbol-function 'qq-server-cancel) (lambda (_token) t)))
+            (setq operation
+                  (qq-attachment-stage-and-prepare-video
+                   "group:8209413637" video-path
+                   (lambda (snapshot) (setq delivered snapshot))
+                   (lambda (body reason) (setq failure (list body reason)))))
+            (should-not (qq-attachment-operation-active-p operation))
+            (should-not failure)
+            (should (equal prepared
+                           '("res-video-a" "res-video-thumbnail-a")))
+            (should (equal (alist-get 'phase delivered) "ready"))
+            (should (= (length staged-paths) 2))
+            (should (equal (car staged-paths) video-path))
+            (should-not (file-exists-p (cadr staged-paths))))
+        (when (file-exists-p video-path)
+          (delete-file video-path))))))
 
 (provide 'qq-attachment-test)
 

@@ -79,6 +79,7 @@ TRUNCATED is its exact wire boolean."
          (qq-account-registry-changed-hook nil)
          (qq-account-selection-changed-hook nil)
          (qq-account-desync-hook nil)
+         (qq-account-projection-resync-hook nil)
          (qq-server--gateway-instance-id "gateway-a")
          (qq-server--capabilities '("conversation.list_recent"))
          (qq-server--state 'ready))

@@ -1033,6 +1033,29 @@ whitespace are presentation details rather than part of a root-row preview."
        (replace-regexp-in-string "[[:space:]\u00a0]+" " " value))
     ""))
 
+(defun qq-state--unsupported-preview (data)
+  "Return preview text for an unsupported segment DATA.
+
+The gateway deliberately models an element it cannot fully parse as
+`unsupported' so it never claims, for example, that a mention is plain text.
+That is a constraint on the *model*, not an instruction to hide readable text
+from the user: when the gateway kept the element's visible text in
+`fallback_text', show it and mark it, rather than replacing the whole element
+with a diagnostic.  The `summary' stays available as a tooltip for debugging."
+  (let* ((fallback (alist-get 'fallback_text data))
+         (fallback (and (stringp fallback)
+                        (let ((trimmed (qq-state-preview-one-line fallback)))
+                          (and (not (string-empty-p trimmed)) trimmed))))
+         (summary (alist-get 'summary data))
+         (summary (if (stringp summary)
+                      (replace-regexp-in-string "[\n\r\t ]+" " " summary)
+                    "unknown element")))
+    (if fallback
+        (propertize (concat fallback " ⁇")
+                    'help-echo (format "unsupported QQ element: %s" summary))
+      (format "[unsupported QQ element: %s]"
+              (truncate-string-to-width summary 80 nil nil t)))))
+
 (defun qq-state-message-preview-from-segments (segments)
   "Return a human-readable plain-text preview for message SEGMENTS.
 
@@ -1051,14 +1074,20 @@ reply chrome elsewhere).  Media becomes short placeholders like
                                 "mention")))
           ;; Reply chrome is rendered separately in chatbuf / composer.
           ("reply" "")
-          ("__unsupported"
-           (let* ((summary (alist-get 'summary data))
-                  (summary (if (stringp summary)
-                               (replace-regexp-in-string
-                                "[\n\r\t ]+" " " summary)
-                             "unknown element")))
-             (format "[unsupported QQ element: %s]"
-                     (truncate-string-to-width summary 80 nil nil t))))
+          ("__unsupported" (qq-state--unsupported-preview data))
+          ;; Native gateway app card.  Display only: never follow an Ark
+          ;; action or open a URL from this segment.
+          ("light_app"
+           (or (qq-state--present-string (alist-get 'prompt data))
+               (let ((app (qq-state--present-string (alist-get 'app data))))
+                 (if (equal app "com.tencent.multimsg")
+                     "[聊天记录]"
+                   (format "[card:%s]" (or app "app"))))))
+          ;; Native gateway group file.  `file_size' is a decimal string.
+          ("group_file"
+           (format "[file:%s]"
+                   (qq-state--short-media-label
+                    (alist-get 'file_name data) "file")))
           ("face"
            (let* ((raw (alist-get 'raw data))
                   (text (or (alist-get 'description data)

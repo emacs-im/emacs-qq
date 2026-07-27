@@ -72,6 +72,23 @@
     (updated_at . 1784700001)
     (error)))
 
+(defun qq-message-test-ready-video (&optional attachment-id)
+  "Return one ready group-video attachment fixture."
+  `((attachment_id
+     . ,(or attachment-id "att-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee0"))
+    (resource_id . "res-video-wire")
+    (account_id . "slot-a")
+    (conversation . ((kind . "group") (group_uin . "8209413637")))
+    (use . ((kind . "video")
+            (thumbnail_resource_id . "res-video-thumbnail-wire")))
+    (phase . "ready")
+    (bytes_done . "0")
+    (bytes_total . "6")
+    (fast_path . t)
+    (created_at . 1784700000)
+    (updated_at . 1784700001)
+    (error)))
+
 (cl-defun qq-message-test-event
     (&key
      (account-id "slot-a")
@@ -231,6 +248,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
          (qq-account-registry-changed-hook nil)
          (qq-account-selection-changed-hook nil)
          (qq-account-desync-hook nil)
+         (qq-account-projection-resync-hook nil)
          (qq-attachment--attachments
           (make-hash-table :test #'equal))
          (qq-attachment--order nil)
@@ -1110,6 +1128,31 @@ push carries sequence=40909 and client_sequence=30202."
         `(:reply-to nil
           :segments
           (((kind . "record")
+            (payload . ((attachment_id . ,attachment-id))))))))
+      (should-error
+       (qq-message--prepare-outbound
+        "group:8209413637"
+        `(((type . "image")
+           (data . ((attachment_id . ,attachment-id)))))
+        "slot-a")
+       :type 'user-error))))
+
+(ert-deftest qq-message-serializes-video-attachment-id-only ()
+  (qq-message-test-with-state
+    (let ((attachment-id "att-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee0"))
+      (qq-attachment--upsert
+       (qq-message-test-ready-video attachment-id) 'test)
+      (should
+       (equal
+        (qq-message--prepare-outbound
+         "group:8209413637"
+         `(((type . "video")
+            (data . ((attachment_id . ,attachment-id)
+                     (file . "/tmp/must-not-cross-wire.mp4")))))
+         "slot-a")
+        `(:reply-to nil
+          :segments
+          (((kind . "video")
             (payload . ((attachment_id . ,attachment-id))))))))
       (should-error
        (qq-message--prepare-outbound

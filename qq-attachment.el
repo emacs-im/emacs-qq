@@ -47,9 +47,13 @@ behalf of one caller."
   request-id
   source-resource-id
   resource-id
+  thumbnail-resource-id
   attachment-id
   resource-watch
-  attachment-watch)
+  attachment-watch
+  thumbnail-process
+  thumbnail-buffer
+  thumbnail-file)
 
 (defun qq-attachment--id-p (value)
   "Return non-nil when VALUE is a canonical opaque attachment identity."
@@ -270,6 +274,27 @@ CALLBACK receives the queued snapshot."
   (qq-attachment--prepare
    session-key resource-id '((kind . "record")) "Record" callback errback))
 
+(defun qq-attachment-prepare-video
+    (session-key resource-id thumbnail-resource-id
+                 &optional callback errback)
+  "Prepare staged RESOURCE-ID as video for SESSION-KEY.
+
+THUMBNAIL-RESOURCE-ID must name a distinct ready staged image.  CALLBACK
+receives the queued snapshot; progress and completion are projected through
+`qq-attachment-changed-hook'."
+  (when (equal resource-id thumbnail-resource-id)
+    (user-error "qq: Video body and thumbnail must be distinct resources"))
+  (let ((thumbnail (qq-resource thumbnail-resource-id)))
+    (unless (and thumbnail
+                 (equal (alist-get 'phase thumbnail) "ready"))
+      (user-error
+       "qq: Video preparation requires a ready staged thumbnail")))
+  (qq-attachment--prepare
+   session-key resource-id
+   `((kind . "video")
+     (thumbnail_resource_id . ,thumbnail-resource-id))
+   "Video" callback errback))
+
 (defun qq-attachment-status
     (attachment-id &optional callback errback)
   "Fetch ATTACHMENT-ID and merge it into the local projection."
@@ -350,7 +375,24 @@ service state."
   (when-let* ((watch
                (qq-attachment-operation-attachment-watch operation)))
     (qq-request-watch-cancel watch)
-    (setf (qq-attachment-operation-attachment-watch operation) nil)))
+    (setf (qq-attachment-operation-attachment-watch operation) nil))
+  (when-let* ((process
+               (qq-attachment-operation-thumbnail-process operation)))
+    (setf (qq-attachment-operation-thumbnail-process operation) nil)
+    (when (processp process)
+      (set-process-sentinel process #'ignore)
+      (when (process-live-p process)
+        (delete-process process))))
+  (when-let* ((buffer
+               (qq-attachment-operation-thumbnail-buffer operation)))
+    (setf (qq-attachment-operation-thumbnail-buffer operation) nil)
+    (when (buffer-live-p buffer)
+      (kill-buffer buffer)))
+  (when-let* ((file
+               (qq-attachment-operation-thumbnail-file operation)))
+    (setf (qq-attachment-operation-thumbnail-file operation) nil)
+    (when (file-exists-p file)
+      (delete-file file))))
 
 (defun qq-attachment--release-created (operation)
   "Best-effort release service objects created for OPERATION."
@@ -366,9 +408,12 @@ service state."
                 (list
                  (qq-attachment-operation-resource-id operation)
                  (qq-attachment-operation-source-resource-id
+                  operation)
+                 (qq-attachment-operation-thumbnail-resource-id
                   operation))))))
     (setf (qq-attachment-operation-resource-id operation) nil
-          (qq-attachment-operation-source-resource-id operation) nil)
+          (qq-attachment-operation-source-resource-id operation) nil
+          (qq-attachment-operation-thumbnail-resource-id operation) nil)
     (dolist (resource-id resource-ids)
       (condition-case nil
           (qq-resource-release resource-id)
@@ -594,6 +639,225 @@ cancellable operation with the same ownership semantics as the image helper."
       session-key resource-id success failure))
    callback errback))
 
+(defun qq-attachment--video-thumbnail-command (video-path thumbnail-path)
+  "Return the ffmpeg command extracting VIDEO-PATH to THUMBNAIL-PATH."
+  (let ((ffmpeg (executable-find "ffmpeg")))
+    (unless ffmpeg
+      (user-error
+       "qq: Sending video requires ffmpeg to generate a thumbnail"))
+    (list ffmpeg "-nostdin" "-y" "-loglevel" "error"
+          "-ss" "0" "-i" video-path "-frames:v" "1"
+          "-vf" "scale=640:640:force_original_aspect_ratio=decrease"
+          "-q:v" "3" thumbnail-path)))
+
+(defun qq-attachment--extract-video-thumbnail
+    (operation video-path thumbnail-path callback errback)
+  "Asynchronously extract VIDEO-PATH into THUMBNAIL-PATH for OPERATION.
+
+CALLBACK runs with no arguments after a nonempty image is written.  ERRBACK
+receives one human-readable reason.  OPERATION owns the process, diagnostic
+buffer, and temporary output, so cancellation remains leak-free."
+  (let ((buffer (generate-new-buffer " *qq-video-thumbnail*"))
+        process)
+    (setf (qq-attachment-operation-thumbnail-buffer operation) buffer)
+    (cl-labels
+        ((finished
+          (candidate _event)
+          (unless (process-live-p candidate)
+            (when (eq candidate
+                      (qq-attachment-operation-thumbnail-process operation))
+              (let* ((status (process-exit-status candidate))
+                     (diagnostic
+                      (and (buffer-live-p buffer)
+                           (with-current-buffer buffer
+                             (string-trim (buffer-string))))))
+                (setf (qq-attachment-operation-thumbnail-process operation) nil
+                      (qq-attachment-operation-thumbnail-buffer operation) nil)
+                (when (buffer-live-p buffer)
+                  (kill-buffer buffer))
+                (when (qq-attachment-operation-active-p operation)
+                  (if (and (= status 0)
+                           (file-regular-p thumbnail-path)
+                           (> (file-attribute-size
+                               (file-attributes thumbnail-path))
+                              0))
+                      (funcall callback)
+                    (funcall
+                     errback
+                     (if (string-empty-p (or diagnostic ""))
+                         "ffmpeg could not generate a video thumbnail"
+                       (format "ffmpeg thumbnail failed: %s"
+                               diagnostic))))))))))
+      (condition-case error-data
+          (progn
+            (setq process
+                  (make-process
+                   :name "qq-video-thumbnail"
+                   :buffer buffer
+                   :command
+                   (qq-attachment--video-thumbnail-command
+                    video-path thumbnail-path)
+                   :noquery t
+                   :sentinel #'ignore))
+            (setf (qq-attachment-operation-thumbnail-process operation)
+                  process)
+            (set-process-sentinel process #'finished)
+            ;; A short video may finish before the real sentinel is installed.
+            (unless (process-live-p process)
+              (finished process "finished\n"))
+            process)
+        ((error quit)
+         (setf (qq-attachment-operation-thumbnail-buffer operation) nil)
+         (when (buffer-live-p buffer)
+           (kill-buffer buffer))
+         (funcall errback (error-message-string error-data))
+         nil)))))
+
+(defun qq-attachment-stage-and-prepare-video
+    (session-key path &optional callback errback)
+  "Stage local video PATH and a generated thumbnail for SESSION-KEY.
+
+Thumbnail extraction uses ffmpeg without a shell.  The video and JPEG are
+published as distinct immutable resources and retained until the target-bound
+Prepared Attachment reaches `ready'.  CALLBACK receives that ready snapshot.
+Return a cancellable `qq-attachment-operation'."
+  (let* ((path (expand-file-name path))
+         (account-id (or (qq-runtime-current-account-id)
+                         (user-error "qq: select a QQ account first")))
+         (attributes (file-attributes path))
+         (_mp4
+          (unless (equal (downcase (or (file-name-extension path) ""))
+                         "mp4")
+            (user-error
+             "qq: Native video sending currently requires an MP4 file")))
+         (thumbnail-file (make-temp-file "qq-video-thumbnail-" nil ".jpg"))
+         (operation
+          (qq-attachment-operation-create
+           :active-p t :thumbnail-file thumbnail-file)))
+    (unless (and attributes (file-regular-p path) (file-readable-p path))
+      (qq-attachment--cancel-local-work operation)
+      (user-error "qq: Video source is not a readable regular file: %s" path))
+    (cl-labels
+        ((account-current-p
+          ()
+          (qq-account-get account-id))
+         (fail
+          (body reason)
+          (qq-attachment--fail-operation operation errback body reason))
+         (start-request
+          (thunk)
+          (when (and (qq-attachment-operation-active-p operation)
+                     (account-current-p))
+            (let ((marker (list 'video-request)) token)
+              (setf (qq-attachment-operation-request-id operation) marker)
+              (condition-case error-data
+                  (setq token (funcall thunk))
+                ((error quit)
+                 (when (eq marker
+                           (qq-attachment-operation-request-id operation))
+                   (setf (qq-attachment-operation-request-id operation) nil))
+                 (fail nil (error-message-string error-data))))
+              (if (eq marker
+                      (qq-attachment-operation-request-id operation))
+                  (setf (qq-attachment-operation-request-id operation) token)
+                ;; A synchronous completion advanced or settled the chain.
+                (when token
+                  (qq-server-cancel token)))
+              token)))
+         (await-resource
+          (resource-id ready-callback)
+          (let ((watch
+                 (qq-resource-await-ready
+                  resource-id ready-callback #'fail)))
+            (when (and (qq-request-watch-active-p watch)
+                       (qq-attachment-operation-active-p operation))
+              (setf (qq-attachment-operation-resource-watch operation)
+                    watch))))
+         (attachment-ready
+          (attachment)
+          (when (qq-attachment-operation-active-p operation)
+            (let ((attachment-id (alist-get 'attachment_id attachment)))
+              (setf (qq-attachment-operation-request-id operation) nil
+                    (qq-attachment-operation-attachment-id operation)
+                    attachment-id)
+              (let ((watch
+                     (qq-attachment--await
+                      attachment-id
+                      (lambda (ready)
+                        (when (qq-attachment-operation-active-p operation)
+                          (setf
+                           (qq-attachment-operation-active-p operation) nil
+                           (qq-attachment-operation-attachment-watch operation)
+                           nil)
+                          (qq-account--invoke callback ready)))
+                      #'fail)))
+                (when (qq-request-watch-active-p watch)
+                  (setf
+                   (qq-attachment-operation-attachment-watch operation)
+                   watch))))))
+         (thumbnail-ready
+          (resource)
+          (when (qq-attachment-operation-active-p operation)
+            (setf (qq-attachment-operation-resource-watch operation) nil
+                  (qq-attachment-operation-thumbnail-resource-id operation)
+                  (alist-get 'resource_id resource))
+            ;; Resource Store is now authoritative for the generated bytes.
+            (when-let* ((file
+                         (qq-attachment-operation-thumbnail-file operation)))
+              (setf (qq-attachment-operation-thumbnail-file operation) nil)
+              (when (file-exists-p file)
+                (delete-file file)))
+            (if (not (account-current-p))
+                (fail nil "QQ account was removed during video staging")
+              (start-request
+               (lambda ()
+                 (qq-attachment-prepare-video
+                  session-key
+                  (qq-attachment-operation-resource-id operation)
+                  (qq-attachment-operation-thumbnail-resource-id operation)
+                  #'attachment-ready #'fail))))))
+         (thumbnail-staged
+          (resource)
+          (when (qq-attachment-operation-active-p operation)
+            (setf (qq-attachment-operation-request-id operation) nil
+                  (qq-attachment-operation-thumbnail-resource-id operation)
+                  (alist-get 'resource_id resource))
+            (await-resource
+             (alist-get 'resource_id resource) #'thumbnail-ready)))
+         (video-ready
+          (resource)
+          (when (qq-attachment-operation-active-p operation)
+            (setf (qq-attachment-operation-resource-watch operation) nil
+                  (qq-attachment-operation-resource-id operation)
+                  (alist-get 'resource_id resource))
+            (if (not (account-current-p))
+                (fail nil "QQ account was removed during video staging")
+              (start-request
+               (lambda ()
+                 (qq-resource-stage-local
+                  thumbnail-file
+                  (file-name-nondirectory thumbnail-file) nil
+                  #'thumbnail-staged #'fail))))))
+         (video-staged
+          (resource)
+          (when (qq-attachment-operation-active-p operation)
+            (setf (qq-attachment-operation-request-id operation) nil
+                  (qq-attachment-operation-resource-id operation)
+                  (alist-get 'resource_id resource))
+            (await-resource (alist-get 'resource_id resource) #'video-ready))))
+      (qq-attachment--extract-video-thumbnail
+       operation path thumbnail-file
+       (lambda ()
+         (if (not (account-current-p))
+             (fail nil "QQ account was removed during thumbnail extraction")
+           (start-request
+            (lambda ()
+              (qq-resource-stage-local
+               path (file-name-nondirectory path) nil
+               #'video-staged #'fail)))))
+       (lambda (reason) (fail nil reason)))
+      operation)))
+
 (defun qq-attachment--conversation-equal-p (left right)
   "Return non-nil when LEFT and RIGHT name the same private/group target.
 
@@ -616,7 +880,7 @@ JSON projection cannot false-fail a sendable check."
   "Return ATTACHMENT-ID after strict SESSION-KEY and ACCOUNT-ID checks.
 
 ACCOUNT-ID is a stable account-slot identity.  EXPECTED-USE defaults to image
-and may be \"record\"."
+and may be \"record\" or \"video\"."
   (unless (qq-attachment--id-p attachment-id)
     (user-error "qq: Media segment lacks an opaque attachment ID"))
   (unless (qq-account--non-empty-string-p account-id)
@@ -625,7 +889,7 @@ and may be \"record\"."
         (snapshot (qq-attachment attachment-id))
         (conversation
          (qq-attachment--conversation-params session-key)))
-    (unless (member expected-use '("image" "record"))
+    (unless (member expected-use '("image" "record" "video"))
       (error "qq: Unknown prepared attachment use %S" expected-use))
     (unless snapshot
       (user-error "qq: Prepared attachment %s is not projected" attachment-id))
@@ -668,9 +932,9 @@ and may be \"record\"."
       (alist-get 'attachment data) 'changed))
     (_ (error "qq: Unowned Gateway attachment event %s" event))))
 
-(defun qq-attachment--handle-protocol-error (body)
-  "Resynchronize after unsolicited attachment stream error BODY."
-  (when (equal (alist-get 'code body) "attachment_event_stream_lagged")
+(defun qq-attachment--handle-projection-resync (projection body)
+  "Resynchronize after runtime PROJECTION events were lost with BODY."
+  (when (equal projection "attachments")
     (qq-account--run-hook
      'qq-attachment-desync-hook
      body)
@@ -679,9 +943,8 @@ and may be \"record\"."
 (add-hook 'qq-account-registry-ready-hook #'qq-attachment--handle-ready)
 (qq-rpc-register-event
  "attachment.changed" #'qq-attachment--handle-event)
-(qq-rpc-register-error
- "attachment_event_stream_lagged"
- #'qq-attachment--handle-protocol-error)
+(add-hook 'qq-account-projection-resync-hook
+          #'qq-attachment--handle-projection-resync)
 
 (provide 'qq-attachment)
 

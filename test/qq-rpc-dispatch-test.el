@@ -106,21 +106,22 @@
              ("message.recalled" . qq-message--handle-event)
              ("message.poked" . qq-message--handle-event)
              ("message.reaction_changed" . qq-message--handle-event)
-             ("message.essence_changed" . qq-message--handle-event)))
+             ("message.essence_changed" . qq-message--handle-event)
+             ("runtime.resync_required"
+              . qq-account--handle-resync-required)))
     (should
      (eq (gethash (car route) qq-rpc--event-handlers)
          (cdr route))))
   (dolist (route
-           '(("event_stream_lagged" . qq-account--handle-protocol-error)
-             ("resource_event_stream_lagged"
-              . qq-resource--handle-protocol-error)
-             ("media_event_stream_lagged"
-              . qq-remote-media--handle-protocol-error)
-             ("attachment_event_stream_lagged"
-              . qq-attachment--handle-protocol-error)))
+           '(("event_stream_lagged" . qq-account--handle-protocol-error)))
     (should
      (eq (gethash (car route) qq-rpc--error-handlers)
          (cdr route))))
+  (dolist (consumer
+           '(qq-resource--handle-projection-resync
+             qq-remote-media--handle-projection-resync
+             qq-attachment--handle-projection-resync))
+    (should (memq consumer qq-account-projection-resync-hook)))
   (should
    (memq #'qq-rpc--handle-transport-event
          qq-server-event-hook))
