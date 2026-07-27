@@ -361,7 +361,7 @@ suppresses automatic reselection so the same session can fall back to Password."
     (qq-login--uniquify-account-choices
      (append (nreverse managed-choices)
              (nreverse quick-choices)
-             '(("New account" . (new)))))))
+             '(("Add QQ account" . (new)))))))
 
 (defun qq-login--matching-managed-account (quick-account)
   "Return a managed slot already bound to QUICK-ACCOUNT, or nil."
@@ -856,7 +856,7 @@ the caller has already made the optional label choice, including choosing nil."
   "Log in or continue authorization for managed ACCOUNT-ID.
 
 When ACCOUNT-ID is nil, continue the selected active runtime or offer managed
-accounts, every Gateway EasyLogin identity, and `New account'.  An online
+accounts, every Gateway EasyLogin identity, and `Add QQ account'.  An online
 managed account is selected without logging in again.  An EasyLogin identity
 reuses a matching managed slot or creates one as needed.  The command then
 follows projected account phases until the account is online."
