@@ -698,50 +698,22 @@ line; nil keeps service rows such as poke strictly one-line."
        value))
 
 (defun qq-chat--message-sender-display-parts (message)
-  "Return sender display parts for MESSAGE as (PRIMARY . SECONDARY)."
-  (let* ((session-key (or (alist-get 'session-key message)
-                          qq-chat--session-key))
-         (session-type (or (and session-key
-                                (qq-state-session-key-type session-key))
-                           (pcase (alist-get 'message-type message)
-                             ("group" 'group)
-                             (_ 'private))))
-         (raw-event (alist-get 'raw-event message))
-         (raw-sender (and (listp raw-event) (alist-get 'sender raw-event)))
-         (sender-id (qq-chat--present-string (alist-get 'sender-id message)))
-         (card (or (qq-chat--present-string (alist-get 'sender-card message))
-                   (and (listp raw-sender)
-                        (qq-chat--present-string (alist-get 'card raw-sender)))))
-         (nickname (or (qq-chat--present-string (alist-get 'sender-nickname message))
-                       (and (listp raw-sender)
-                            (qq-chat--present-string (alist-get 'nickname raw-sender)))))
-         (friend (and (eq session-type 'private)
-                      sender-id
-                      (qq-state-friend sender-id)))
-         (remark (or (qq-chat--present-string (alist-get 'sender-remark message))
-                     (and (listp friend)
-                          (qq-chat--present-string (alist-get 'remark friend)))))
-         (primary (if (eq session-type 'group)
-                      (or card
-                          nickname
-                          (qq-chat--present-string (alist-get 'sender-name message))
-                          sender-id
-                          "unknown")
-                    (or remark
-                        nickname
-                        (qq-chat--present-string (alist-get 'sender-name message))
-                        sender-id
-                        "unknown")))
-         (secondary (or (if (eq session-type 'group)
-                            (and card nickname
-                                 (not (equal primary nickname))
-                                 nickname)
-                          (and remark nickname
-                               (not (equal primary nickname))
-                               nickname))
-                        (qq-chat--present-string
-                         (alist-get 'sender-secondary-name message)))))
-    (cons primary secondary)))
+  "Return normalized sender display parts for MESSAGE.
+
+The message boundary has already selected PRIMARY and the optional SECONDARY
+from LinuxQQ's authored sender presentation.  Rendering must not re-resolve
+those historical values through the current friend directory, conversation
+title, or numeric identity."
+  (let* ((primary
+          (or (qq-chat--present-string (alist-get 'sender-name message))
+              (error "qq: normalized message has no sender presentation")))
+         (secondary
+          (qq-chat--present-string
+           (alist-get 'sender-secondary-name message))))
+    (cons primary
+          (and secondary
+               (not (equal primary secondary))
+               secondary))))
 
 (defun qq-chat--message-sender-name (message)
   "Return primary sender display name for MESSAGE."
@@ -2365,9 +2337,7 @@ projection.  A replacement or detached view is inert."
        (qq-chat--refresh-prompt))
       ((or 'friends-refreshed 'groups-refreshed)
        (qq-chat--header-line-update)
-       (qq-chat--refresh-prompt)
-       (qq-chat--sync-timeline
-        :force-keys (appkit-chat-timeline-keys))))))
+       (qq-chat--refresh-prompt)))))
 
 (defun qq-chat--sync-invalidations (view invalidations)
   "Synchronize VIEW's current chat from coalesced appkit INVALIDATIONS."
@@ -7431,7 +7401,8 @@ redisplay has not processed the queued event yet."
                 (appkit-request-sync
                  view :part (if (memq event-type
                                       '(session action connection
-                                        sessions-refreshed))
+                                        sessions-refreshed friends-refreshed
+                                        groups-refreshed))
                                 'frame
                               'timeline))))))))))
 

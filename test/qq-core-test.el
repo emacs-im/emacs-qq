@@ -14,7 +14,9 @@
      (sent_at . 1784700000)
      (sender . ((uin . "10001") (uid . "u_peer")))
      (recipient . ((uin . "10002") (uid . "u_self")))
-     (conversation . ((kind . "private") (name . "Peer")))
+     (conversation . ((kind . "private")))
+     (sender_presentation
+      . ((nickname . "Alice Nick") (remark . "Alice Remark")))
      (sequence . "9007199254740999")
      (client_sequence . "9007199254741001")
      (random . 7)

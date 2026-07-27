@@ -97,7 +97,8 @@
      (sent-at 1784700000)
      (sender '((uin . "10001") (uid . "u_peer")))
      (recipient '((uin . "10002") (uid . "u_self")))
-     (conversation '((kind . "private") (name . "Peer")))
+     (conversation '((kind . "private")))
+     (sender-presentation '((nickname . "Peer")))
      (sequence "9007199254740999")
      (client-sequence "9007199254741001")
      (random 7) (message-type 166) (sub-type 0)
@@ -110,6 +111,7 @@
         (sender . ,(copy-tree sender))
         (recipient . ,(copy-tree recipient))
         (conversation . ,(copy-tree conversation))
+        (sender_presentation . ,(copy-tree sender-presentation))
         (sequence . ,sequence)
         (client_sequence . ,client-sequence)
         (random . ,random)
@@ -506,8 +508,9 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         :conversation
         '((kind . "group")
           (group_uin . "8209413637")
-          (group_name . "Protocol Lab")
-          (sender_card . "Alice"))
+          (group_name . "Protocol Lab"))
+        :sender-presentation
+        '((member_name . "Alice") (nickname . "Alice Nick"))
         :segments segments))
       (let* ((session-key "group:8209413637")
              (messages (qq-state-session-messages session-key))
@@ -524,6 +527,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (should-not (assq 'native-sent-at message))
         (should (equal (alist-get 'gateway-account-id message) "slot-a"))
         (should (equal (alist-get 'sender-name message) "Alice"))
+        (should (equal (alist-get 'sender-secondary-name message)
+                       "Alice Nick"))
         (should (equal (alist-get 'mention-kinds message) '(at-me)))
         (should (eq (alist-get 'status message) 'received))
         (should (equal (mapcar (lambda (it) (alist-get 'type it)) internal)
@@ -552,11 +557,17 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
 (ert-deftest qq-message-projects-private-peer-by-self-endpoint ()
   (qq-message-test-with-state
     (qq-message--handle-event
-     "message.received" (qq-message-test-event))
+     "message.received"
+     (qq-message-test-event
+      :sender-presentation
+      '((nickname . "Alice Nick") (remark . "Alice Remark"))))
     (let* ((session-key "private:10001")
            (message (car (qq-state-session-messages session-key)))
            (session (qq-state-session session-key)))
       (should-not (alist-get 'self-p message))
+      (should (equal (alist-get 'sender-name message) "Alice Remark"))
+      (should (equal (alist-get 'sender-secondary-name message)
+                     "Alice Nick"))
       (should (equal (alist-get 'peer-uin message) "10001"))
       (should (equal (alist-get 'peer-uid message) "u_peer"))
       (should (equal (alist-get 'peer-uid session) "u_peer"))
