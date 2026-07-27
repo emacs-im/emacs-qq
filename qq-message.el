@@ -250,7 +250,8 @@ pushes left optimistic sends stuck without a snowflake."
   "Fetch merged-forward entries behind opaque RESOURCE-ID in SCENE.
 
 The returned entries are transient viewer data.  They are not merged into the
-ordinary chat timeline or message store."
+ordinary chat timeline or message store.  CALLBACK receives a plist containing
+`:messages' and `:unsupported-message-count'."
   (unless (qq-account--non-empty-string-p resource-id)
     (user-error "qq: Merged-forward resource id must be non-empty"))
   (unless (member scene '("group" "private" "group_temp"))
@@ -265,11 +266,17 @@ ordinary chat timeline or message store."
      (lambda (result)
        (unless
            (and (qq-account--exact-object-keys-p
-                 result '(account_id messages))
+                 result '(account_id unsupported_message_count messages))
                 (equal (alist-get 'account_id result) owner)
+                (integerp (alist-get 'unsupported_message_count result))
+                (>= (alist-get 'unsupported_message_count result) 0)
                 (listp (alist-get 'messages result)))
          (error "qq: Gateway returned invalid merged-forward messages"))
-       (qq-server-value-copy (alist-get 'messages result)))
+       (list
+        :messages
+        (qq-server-value-copy (alist-get 'messages result))
+        :unsupported-message-count
+        (alist-get 'unsupported_message_count result)))
      :callback callback
      :errback errback
      :stale-message

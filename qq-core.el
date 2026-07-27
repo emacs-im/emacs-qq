@@ -1501,7 +1501,8 @@ It is used only when the target message is not already cached."
 
 (defun qq-core-get-forward
     (resource-id scene callback &optional errback)
-  "Fetch merged-forward entries behind opaque RESOURCE-ID in SCENE."
+  "Fetch merged-forward entries behind opaque RESOURCE-ID in SCENE.
+CALLBACK receives a page plist with messages and the unsupported-entry count."
   (qq-core--start-request
    (lambda (success failure)
      (qq-message-get-forward resource-id scene success failure))
