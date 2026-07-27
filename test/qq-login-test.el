@@ -91,7 +91,7 @@
        (equal (mapcar #'car choices)
               '("10002 — Quick login"
                 "10001 — Quick login"
-                "New account")))
+                "Add QQ account")))
       (should
        (equal (qq-login--session-account-id session) "slot-b"))
       (should
@@ -159,7 +159,7 @@
         (should (qq-login--resolve-account-choice session)))
       (should
        (equal (mapcar #'car choices)
-              '("10001 — Online" "New account")))
+              '("10001 — Online" "Add QQ account")))
       (should
        (equal (qq-login--session-account-id session) "slot-remote")))))
 
@@ -175,7 +175,7 @@
       (cl-letf (((symbol-function 'qq-rpc-method-available-p)
                  (lambda (_method) t))
                 ((symbol-function 'completing-read)
-                 (lambda (&rest _arguments) "New account")))
+                 (lambda (&rest _arguments) "Add QQ account")))
         (should (qq-login--resolve-account-choice session)))
       (should (qq-login--session-create-p session))
       (should-not (qq-login--session-account-id session))
@@ -205,7 +205,7 @@
        (equal (mapcar #'car choices)
               '("10001 — Online"
                 "Unbound account — Logging In"
-                "New account")))
+                "Add QQ account")))
       (should
        (qq-login--session-login-accounts-loaded-p session))
       (should-not (qq-login--session-login-accounts session))
@@ -222,9 +222,9 @@
                 ((symbol-function 'completing-read)
                  (lambda (_prompt collection &rest _arguments)
                    (setq choices collection)
-                   "New account")))
+                   "Add QQ account")))
         (should (qq-login--resolve-account-choice session)))
-      (should (equal (mapcar #'car choices) '("New account")))
+       (should (equal (mapcar #'car choices) '("Add QQ account")))
       (should (qq-login--session-create-p session))
       ;; The label belongs to the explicitly selected new-account branch.  It
       ;; must never replace the account selector itself.
@@ -249,7 +249,7 @@
        (equal (mapcar #'car choices)
               '("Unbound account — Stopped [slot-a]"
                 "Unbound account — Stopped [slot-b]"
-                "New account")))
+                "Add QQ account")))
       (should
        (equal (qq-login--session-account-id session) "slot-b")))))
 
@@ -360,7 +360,7 @@
         (should (qq-login--resolve-account-choice session)))
       (should
        (equal (mapcar #'car choices)
-              '("10001 — Logging In" "New account")))
+              '("10001 — Logging In" "Add QQ account")))
       (should
        (equal (qq-login--session-account-id session) "slot-a")))))
 
@@ -390,7 +390,7 @@
        (equal (mapcar #'car choices)
               '("10001 — Online"
                 "10002 — Quick login"
-                "New account")))
+                "Add QQ account")))
       (should
        (equal (qq-login--session-account-id session) "slot-online"))
       (should-not (qq-login--session-quick-login-uin session))
