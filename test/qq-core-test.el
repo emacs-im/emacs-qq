@@ -72,6 +72,14 @@
   `((attachment_id . ,attachment-id)
     (resource_id . ,resource-id)))
 
+(defun qq-core-test-prepared-video
+    (attachment-id resource-id thumbnail-resource-id)
+  "Return the identities reported for one prepared video."
+  `((attachment_id . ,attachment-id)
+    (resource_id . ,resource-id)
+    (use . ((kind . "video")
+            (thumbnail_resource_id . ,thumbnail-resource-id)))))
+
 (defconst qq-core-test-members
   '(((user_id . "9007199254740999")
      (uid . "u_alice")
@@ -1074,6 +1082,69 @@
               (should (eq (qq-request-state request) 'settled))
               (should-not released-attachments))))
       (delete-file path))) ))
+
+(ert-deftest qq-core-local-video-is-prepared-with-thumbnail-before-send ()
+  (qq-core-test-with-managed-account
+    (let ((path (make-temp-file "qq-core-video-" nil ".mp4" "mp4"))
+          (owner "slot-a")
+          operation prepared sent released-resources)
+      (unwind-protect
+          (let ((segments
+                 `(((type . "text") (data . ((text . "video:"))))
+                   ((type . "video")
+                    (data . ((file . ,path) (name . "clip.mp4")))))))
+            (cl-letf
+                (((symbol-function 'qq-account-current-id)
+                  (lambda () owner))
+                 ((symbol-function
+                   'qq-attachment-stage-and-prepare-video)
+                  (lambda (session video-path callback errback)
+                    (setq prepared
+                          (list session video-path callback errback)
+                          operation
+                          (qq-attachment-operation-create :active-p t))
+                    operation))
+                 ((symbol-function 'qq-core--release-send-resource)
+                  (lambda (resource-id) (push resource-id released-resources)))
+                 ((symbol-function 'qq-message-send)
+                  (lambda (session ready-segments
+                                   &optional raw callback errback optimistic)
+                    (setq sent (list session ready-segments raw callback
+                                     errback optimistic))
+                    "send-video-request")))
+              (let ((request
+                     (qq-core-send-message
+                      "group:8209413637" segments "optimistic")))
+                (should (qq-request-p request))
+                (should (equal (car prepared) "group:8209413637"))
+                (should (equal (cadr prepared) path))
+                (setf (qq-attachment-operation-active-p operation) nil)
+                (funcall
+                 (nth 2 prepared)
+                 (qq-core-test-prepared-video
+                  "att-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+                  "res-video-ready" "res-video-thumbnail-ready"))
+                (should (equal (qq-request-token request)
+                               "send-video-request"))
+                (should
+                 (equal
+                  (nth 1 sent)
+                  '(((type . "text") (data . ((text . "video:"))))
+                    ((type . "video")
+                     (data
+                      . ((attachment_id
+                          . "att-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")))))))
+                (should (equal (nth 5 sent) segments))
+                (should-not
+                 (string-match-p "qq-core-video-"
+                                 (prin1-to-string (nth 1 sent))))
+                (should
+                 (equal (sort released-resources #'string<)
+                        '("res-video-ready"
+                          "res-video-thumbnail-ready")))
+                (funcall (nth 3 sent) '((sent . t)))
+                (should (eq (qq-request-state request) 'settled)))))
+        (delete-file path)))))
 
 (ert-deftest qq-core-local-image-cancel-stops-before-message-dispatch ()
   (let ((path (make-temp-file "qq-core-image-cancel-" nil ".png" "abc"))

@@ -1444,6 +1444,12 @@ domain schema, observed source metadata, and segment limits."
                     attachment-id session-key owner "record")
                    `((kind . "record")
                      (payload . ((attachment_id . ,attachment-id))))))
+                ("video"
+                 (let ((attachment-id (alist-get 'attachment_id data)))
+                   (qq-attachment-assert-sendable
+                    attachment-id session-key owner "video")
+                   `((kind . "video")
+                     (payload . ((attachment_id . ,attachment-id))))))
                 ("reply"
                  (let ((target (alist-get 'target data)))
                    (pcase (alist-get 'kind target)

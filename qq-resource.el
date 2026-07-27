@@ -206,7 +206,9 @@ SUGGESTED-NAME is an optional safe display basename.  EXPECTED-SHA256, when
 non-nil, must be a lowercase hexadecimal digest.  CALLBACK receives the
 staging snapshot; ERRBACK follows the Gateway convention."
   (let* ((path (expand-file-name path))
-         (attributes (file-attributes path 'string)))
+         ;; Numeric uid/gid avoids potentially blocking NSS name lookups; this
+         ;; operation needs only the regular-file bit and byte size.
+         (attributes (file-attributes path)))
     (unless (and attributes (file-regular-p path))
       (user-error "qq: Resource source is not a regular file: %s" path))
     (when (and suggested-name
@@ -484,9 +486,9 @@ AFTER is an opaque cursor returned by the previous page.  LIMIT defaults to
       (alist-get 'resource_id data) 'removed))
     (_ (error "qq: Unowned Gateway resource event %s" event))))
 
-(defun qq-resource--handle-protocol-error (body)
-  "Resynchronize after unsolicited resource stream error BODY."
-  (when (equal (alist-get 'code body) "resource_event_stream_lagged")
+(defun qq-resource--handle-projection-resync (projection body)
+  "Resynchronize after runtime PROJECTION events were lost with BODY."
+  (when (equal projection "resources")
     (qq-account--run-hook
      'qq-resource-desync-hook
      body)
@@ -496,9 +498,8 @@ AFTER is an opaque cursor returned by the previous page.  LIMIT defaults to
 (dolist (event '("resource.changed" "resource.removed"))
   (qq-rpc-register-event
    event #'qq-resource--handle-event))
-(qq-rpc-register-error
- "resource_event_stream_lagged"
- #'qq-resource--handle-protocol-error)
+(add-hook 'qq-account-projection-resync-hook
+          #'qq-resource--handle-projection-resync)
 
 (provide 'qq-resource)
 

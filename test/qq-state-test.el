@@ -2346,6 +2346,48 @@
                    "[unsupported QQ element: mystery native element]"))
     (should-not (string-match-p "DO-NOT-RENDER" preview))))
 
+(ert-deftest qq-state-unsupported-segment-preview-shows-retained-visible-text ()
+  "The gateway models an unparsed element as unsupported so it never claims a
+mention is plain text.  That constrains the model, not the presentation: when
+it kept the element's visible text, the user should still see it."
+  (let ((preview
+         (qq-state-message-preview-from-segments
+          '(((type . "__unsupported")
+             (data . ((native_keys . ["text.pb_reserve"])
+                      (summary . "text.pb_reserve")
+                      (fallback_text . "@Alice 你好")
+                      (raw . ((secret . "DO-NOT-RENDER"))))))))))
+    (should (string-match-p "@Alice 你好" preview))
+    ;; Still marked as not fully understood, and still no raw dump.
+    (should-not (equal preview "@Alice 你好"))
+    (should-not (string-match-p "DO-NOT-RENDER" preview))
+    ;; The diagnostic moves to a tooltip rather than replacing the text.
+    (should (equal (get-text-property 0 'help-echo preview)
+                   "unsupported QQ element: text.pb_reserve"))))
+
+(ert-deftest qq-state-light-app-preview-is-display-only ()
+  (should (equal (qq-state-message-preview-from-segments
+                  '(((type . "light_app")
+                     (data . ((app . "com.tencent.multimsg")
+                              (prompt . "[聊天记录]")
+                              (resid . "long-msg-resource-id"))))))
+                 "[聊天记录]"))
+  ;; A card without a prompt still identifies itself, and the opaque forward
+  ;; handle is never shown to the user.
+  (let ((preview (qq-state-message-preview-from-segments
+                  '(((type . "light_app")
+                     (data . ((app . "com.tencent.multimsg")
+                              (resid . "long-msg-resource-id"))))))))
+    (should (equal preview "[聊天记录]"))
+    (should-not (string-match-p "long-msg-resource-id" preview))))
+
+(ert-deftest qq-state-group-file-preview-names-the-file ()
+  (should (equal (qq-state-message-preview-from-segments
+                  '(((type . "group_file")
+                     (data . ((file_name . "报告.pdf")
+                              (file_size . "1234567"))))))
+                 "[file:报告.pdf]")))
+
 (ert-deftest qq-state-face-preview-uses-native-description ()
   (should (equal
            (qq-state-message-preview-from-segments

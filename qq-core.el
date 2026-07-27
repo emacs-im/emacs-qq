@@ -668,11 +668,11 @@ locally selected managed account without changing its lifecycle phase."
 (defun qq-core--local-media-plan (segment index)
   "Return a preparation plan for local media SEGMENT at INDEX, or nil.
 
-Image and record segments carrying an opaque `attachment_id' are already
+Image, record, and video segments carrying an opaque `attachment_id' are already
 protocol-ready.  URL-only media deliberately fails: the native service accepts
 immutable staged bytes, not a URL that could change before upload."
   (let ((kind (alist-get 'type segment)))
-    (when (member kind '("image" "record"))
+    (when (member kind '("image" "record" "video"))
       (let* ((data (alist-get 'data segment))
              (attachment-id (and (listp data)
                                  (alist-get 'attachment_id data)))
@@ -824,17 +824,26 @@ accepts them.  Cancellation or failure releases everything still owned here."
                (error
                 (send-failed nil (error-message-string error-data))))))
          (media-ready
-           (plan attachment)
-           (let ((attachment-id (alist-get 'attachment_id attachment))
-                 (resource-id (alist-get 'resource_id attachment)))
-             (if (not active)
-                 (progn
+          (plan attachment)
+          (let ((attachment-id (alist-get 'attachment_id attachment))
+                (resource-id (alist-get 'resource_id attachment))
+                (thumbnail-resource-id
+                 (and (equal (plist-get plan :kind) "video")
+                      (alist-get
+                       'thumbnail_resource_id
+                       (alist-get 'use attachment)))))
+            (if (not active)
+                (progn
                    (qq-core--release-send-attachment attachment-id)
-                   (qq-core--release-send-resource resource-id))
+                   (qq-core--release-send-resource resource-id)
+                   (when thumbnail-resource-id
+                     (qq-core--release-send-resource thumbnail-resource-id)))
                (push attachment-id attachment-ids)
                ;; The prepared attachment keeps the bytes alive, so the
                ;; composite never needs to retain the extra resource lease.
                (qq-core--release-send-resource resource-id)
+               (when thumbnail-resource-id
+                 (qq-core--release-send-resource thumbnail-resource-id))
                (unless (qq-account-get owner)
                  (qq-request-cancel request))
                (when active
@@ -872,6 +881,10 @@ accepts them.  Cancellation or failure releases everything still owned here."
                             ready #'send-failed))
                           ("record"
                            (qq-attachment-stage-and-prepare-record
+                            session-key (plist-get plan :path)
+                            ready #'send-failed))
+                          ("video"
+                           (qq-attachment-stage-and-prepare-video
                             session-key (plist-get plan :path)
                             ready #'send-failed))
                           (_ (error "qq: Unknown local media plan")))))
@@ -979,10 +992,11 @@ to settle so its resource lease and staged resource can be released safely."
     (session-key segments &optional raw-message callback errback)
   "Send SEGMENTS to SESSION-KEY through the native service.
 
-Local image paths are copied into the service Resource Store and local PCM WAV
-records are first derived into message-ready Tencent Silk.  Both are prepared
-for the selected account and conversation, then replaced by opaque attachment
-IDs before the wire request is sent.  RAW-MESSAGE is an
+Local image and video paths are copied into the service Resource Store; videos
+also get a locally generated immutable JPEG thumbnail.  Local PCM WAV records
+are first derived into message-ready Tencent Silk.  Media is prepared for the
+selected account and conversation, then replaced by opaque attachment IDs
+before the wire request is sent.  RAW-MESSAGE is an
 optional optimistic rendering override.  The pending row is promoted only by
 the later authoritative self event."
   (let ((file-plan (qq-core--file-send-plan session-key segments))

@@ -35,6 +35,19 @@ Gateway-owned registries without inspecting raw transport events.")
 (defvar qq-account-desync-hook nil
   "Hook called with a protocol error body after transient events were lost.")
 
+(defvar qq-account-projection-resync-hook nil
+  "Hook called with PROJECTION and BODY after projection events were lost.
+
+PROJECTION is one of \"resources\", \"attachments\", or \"remote_media\".
+The account projection is resynchronized by this registry itself and is not
+dispatched through this hook.  BODY is the owned event or error body that
+reported the loss.  Consumers filter on PROJECTION and refresh their own
+Gateway-owned registry from an authoritative snapshot.")
+
+(defconst qq-account--foreign-projections
+  '("resources" "attachments" "remote_media")
+  "Runtime projections owned by registries other than the account registry.")
+
 (defvar qq-account--accounts (make-hash-table :test #'equal))
 (defvar qq-account--account-order nil)
 (defvar qq-account--current-account-id nil)
@@ -496,39 +509,6 @@ snapshot; ERRBACK receives a failure body and reason."
    ticket callback errback))
 
 ;;;###autoload
-(defun qq-account-login-unusual-device
-    (account-id challenge-id &optional device-sig-hex callback errback)
-  "Continue ACCOUNT-ID's unusual-device CHALLENGE-ID.
-
-DEVICE-SIG-HEX is ignored: Gateway owns checkSig and TransEmp polling.
-Kept as an optional argument for older callers.
-
-CALLBACK receives the account snapshot; ERRBACK receives a failure body and
-reason."
-  (interactive
-   (let* ((account-id (qq-account--read-account-id "Unusual-device account: "))
-          (challenge (alist-get 'challenge (qq-account-get account-id))))
-     (unless (equal (alist-get 'kind challenge) "unusual_device")
-       (user-error "qq: Selected account has no unusual-device challenge"))
-     (list account-id (alist-get 'challenge_id challenge)
-           nil
-           #'qq-account--interactive-success
-           #'qq-account--interactive-error)))
-  (unless (qq-account--non-empty-string-p account-id)
-    (user-error "qq: Account ID must be a non-empty opaque string"))
-  (unless (qq-account--non-empty-string-p challenge-id)
-    (user-error "qq: Challenge ID must be a non-empty string"))
-  (ignore device-sig-hex)
-  (qq-rpc-call
-   "account.login.unusual_device"
-   `((account_id . ,account-id) (challenge_id . ,challenge-id))
-   :projector
-   (lambda (snapshot)
-     (qq-account--upsert-account snapshot 'response))
-   :callback callback
-   :errback errback))
-
-;;;###autoload
 (defun qq-account-stop (account-id &optional callback errback)
   "Stop ACCOUNT-ID's Native Session without logging out of QQ.
 
@@ -596,18 +576,47 @@ reason."
       (alist-get 'account_id data) 'removed))
     (_ (error "qq: Unowned Gateway account event %s" event))))
 
+(defun qq-account--resync-accounts (body)
+  "Resynchronize the account registry after transient event loss BODY."
+  (qq-account--run-hook 'qq-account-desync-hook body)
+  (qq-rpc-request-single-flight
+   'qq-account--resync-request-id 'account-resync
+   (lambda (success failure)
+     (qq-account-refresh-accounts success failure 'resync))
+   "QQ account"))
+
 (defun qq-account--handle-protocol-error (body)
-  "Handle unsolicited Gateway protocol error BODY."
+  "Handle unsolicited Gateway protocol error BODY.
+
+A websocket-level event stream lag may have dropped events for every runtime
+projection, so all projection owners resynchronize."
   (when (equal (alist-get 'code body) "event_stream_lagged")
-    (qq-account--run-hook 'qq-account-desync-hook body)
-    (qq-rpc-request-single-flight
-     'qq-account--resync-request-id 'account-resync
-     (lambda (success failure)
-       (qq-account-refresh-accounts success failure 'resync))
-     "QQ account")))
+    (qq-account--resync-accounts body)
+    (dolist (projection qq-account--foreign-projections)
+      (qq-account--run-hook
+       'qq-account-projection-resync-hook projection body))))
+
+(defun qq-account--handle-resync-required (_event data)
+  "Resynchronize one runtime projection after lossy DATA."
+  (let ((projection (alist-get 'projection data)))
+    (unless (and (qq-account--exact-object-keys-p data '(projection skipped))
+                 (qq-account--non-empty-string-p projection)
+                 (qq-account--non-empty-string-p (alist-get 'skipped data)))
+      (error "qq: Malformed runtime.resync_required event"))
+    (cond
+     ((equal projection "accounts")
+      (qq-account--resync-accounts data))
+     ((member projection qq-account--foreign-projections)
+      (qq-account--run-hook
+       'qq-account-projection-resync-hook projection data))
+     (t
+      (error "qq: Unowned runtime projection %s requires resync"
+             projection)))))
 
 (dolist (event '("gateway.ready" "account.changed" "account.removed"))
   (qq-rpc-register-event event #'qq-account--handle-event))
+(qq-rpc-register-event
+ "runtime.resync_required" #'qq-account--handle-resync-required)
 (qq-rpc-register-error
  "event_stream_lagged" #'qq-account--handle-protocol-error)
 
