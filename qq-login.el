@@ -33,6 +33,7 @@
   login-accounts-loaded-p
   login-accounts
   quick-login-uin
+  quick-login-suppressed-p
   in-flight-p
   prompting-p
   retry-failed-p
@@ -224,6 +225,7 @@ SUCCESS defaults to `qq-login--request-success'.  FAILURE defaults to
           (qq-login--session-login-accounts-loaded-p session) t
           (qq-login--session-login-accounts session)
           (copy-tree accounts))
+    (qq-login--select-quick-login-for-bound-account session)
     (qq-login--present session "Choose a QQ account." nil)
     (qq-login--schedule session)))
 
@@ -291,6 +293,23 @@ user-facing label."
      (lambda (quick-account)
        (equal uin (alist-get 'uin quick-account)))
      quick-accounts)))
+
+(defun qq-login--select-quick-login-for-bound-account (session)
+  "Prefer SESSION's Device-Profile-bound Login Record when available.
+
+This handles callers which selected a stable Account ID directly and therefore
+did not pass through the unified account chooser.  A rejected EasyLogin round
+suppresses automatic reselection so the same session can fall back to Password."
+  (when (and (qq-login--session-account-id session)
+             (not (qq-login--session-quick-login-suppressed-p session))
+             (null (qq-login--session-quick-login-uin session)))
+    (when-let* ((account
+                 (qq-account-get (qq-login--session-account-id session)))
+                (quick-account
+                 (qq-login--quick-account-for-managed
+                  account (qq-login--session-login-accounts session))))
+      (setf (qq-login--session-quick-login-uin session)
+            (copy-sequence (alist-get 'uin quick-account))))))
 
 (defun qq-login--uniquify-account-choices (choices)
   "Return CHOICES with exact identities appended only to duplicate labels."
@@ -401,6 +420,7 @@ user-facing label."
                (and managed
                     (copy-sequence (alist-get 'account_id managed)))
                (qq-login--session-create-p session) (null managed)
+               (qq-login--session-quick-login-suppressed-p session) nil
                ;; A quick-login identity already provides the useful label.
                (qq-login--session-label session) nil
                (qq-login--session-label-read-p session) t)
@@ -422,6 +442,11 @@ user-facing label."
 Return non-nil once SESSION names a managed slot or requests creation.  A nil
 return means an asynchronous account-catalog request is still pending."
   (cond
+   ((and (qq-login--session-account-id session)
+         (not (qq-login--session-login-accounts-loaded-p session))
+         (qq-login--quick-login-available-p))
+    (qq-login--request-quick-accounts session)
+    nil)
    ((or (qq-login--session-account-id session)
         (qq-login--session-create-p session))
     t)
@@ -513,7 +538,8 @@ Return its current snapshot, or nil while account creation is in flight."
   (when (qq-login--session-p session)
     ;; Continuing the same session retries this stable managed slot through
     ;; password login instead of repeatedly using a rejected stored record.
-    (setf (qq-login--session-quick-login-uin session) nil))
+    (setf (qq-login--session-quick-login-uin session) nil
+          (qq-login--session-quick-login-suppressed-p session) t))
   (qq-login--request-error session body reason))
 
 (defun qq-login--quick (session account)
@@ -807,6 +833,7 @@ the caller has already made the optional label choice, including choosing nil."
                 :login-accounts-loaded-p nil
                 :login-accounts nil
                 :quick-login-uin nil
+                :quick-login-suppressed-p nil
                 :retry-failed-p t
                 :status "Preparing QQ login…")))
           (setq qq-login--current session)

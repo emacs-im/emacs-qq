@@ -47,6 +47,7 @@
          :login-accounts-loaded-p nil
          :login-accounts nil
          :quick-login-uin nil
+         :quick-login-suppressed-p nil
          :retry-failed-p t
          :status "Preparing QQ login…")))
 
@@ -97,6 +98,35 @@
        (equal (qq-login--session-quick-login-uin session) "10002"))
       (should-not (qq-login--session-create-p session))
       (should (equal (qq-account-current-id) "slot-b")))))
+
+(ert-deftest qq-login-direct-bound-account-prefers-its-login-record ()
+  (qq-login-test-with-state
+    (qq-account--upsert-account
+     (qq-login-test-account "slot-a" "stopped" "10001") 'test)
+    (let ((session (qq-login-test-session "slot-a"))
+          requested)
+      (cl-letf (((symbol-function 'qq-rpc-method-available-p)
+                 (lambda (method)
+                   (member method
+                           '("account.login.list"
+                             "account.login.quick"))))
+                ((symbol-function 'qq-account-login-list)
+                 (lambda (success _failure)
+                   (setq requested t)
+                   (funcall
+                    success
+                    (list
+                     (qq-login-test-quick-account
+                      "10001" "u_self" 1784700001)))
+                   "quick-list-request"))
+                ((symbol-function 'qq-login--schedule) #'ignore))
+        (should-not (qq-login--resolve-account-choice session))
+        (should requested)
+        (should (qq-login--resolve-account-choice session)))
+      (should
+       (equal (qq-login--session-quick-login-uin session) "10001"))
+      (should-not
+       (qq-login--session-quick-login-suppressed-p session)))))
 
 (ert-deftest qq-login-refreshes-managed-accounts-before-opening-chooser ()
   (qq-login-test-with-state
@@ -431,6 +461,7 @@
         (qq-login--quick
          session (qq-account-get "slot-a")))
       (should-not (qq-login--session-quick-login-uin session))
+      (should (qq-login--session-quick-login-suppressed-p session))
       (should
        (string-match-p
         "quick_login_record_not_found"

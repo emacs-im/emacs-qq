@@ -7,7 +7,8 @@
 (require 'qq-account)
 
 (defconst qq-account-test-capabilities
-  '("account.list" "account.create" "account.status" "account.set_presence"
+  '("device.reset"
+    "account.list" "account.create" "account.status" "account.set_presence"
     "account.start"
     "account.login.list" "account.login.password" "account.login.quick"
     "account.login.captcha"
@@ -40,6 +41,26 @@
          (qq-account-desync-hook nil)
          (qq-account-projection-resync-hook nil))
      ,@body))
+
+(ert-deftest qq-device-reset-is-empty-explicit-and-projects-no-material ()
+  (qq-account-test-with-state
+    (let (sent-method sent-params delivered)
+      (cl-letf (((symbol-function 'qq-server-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-account-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall callback nil)
+                   "device-reset-request")))
+        (should
+         (equal
+          (qq-device-reset (lambda (receipt) (setq delivered receipt)))
+          "device-reset-request")))
+      (should (equal sent-method "device.reset"))
+      (should-not sent-params)
+      (should (eq delivered t)))))
 
 (ert-deftest qq-account-uint64-wire-predicate-is-exact-and-bounded ()
   (should (qq-account--uint64-decimal-p "1"))

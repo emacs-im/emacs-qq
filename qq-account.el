@@ -11,6 +11,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'seq)
 (require 'subr-x)
 (require 'qq-rpc)
 (require 'qq-server)
@@ -290,6 +291,43 @@ When REMOVE-P is non-nil, remove the returned snapshot instead of merging it."
 (defun qq-account--interactive-error (_body reason)
   "Report interactive Gateway failure REASON."
   (message "qq: Gateway request failed: %s" reason))
+
+(defun qq-device--interactive-reset-success (_receipt)
+  "Report successful explicit Device Profile reset."
+  (message "qq: default QQ Device Profile was reset; saved EasyLogin records are invalid"))
+
+;;;###autoload
+(defun qq-device-reset (&optional callback errback)
+  "Explicitly reset the shared default QQ Device Profile.
+
+Every Managed Account must first have no Native Session.  Success rotates the
+MachineGuid and invalidates every Login Record bound to the previous device.
+CALLBACK receives t; ERRBACK receives a failure body and reason."
+  (interactive
+   (progn
+     (unless
+         (yes-or-no-p
+          "Reset the shared QQ device and invalidate all quick logins? ")
+       (user-error "qq: Device Profile reset cancelled"))
+     (list #'qq-device--interactive-reset-success
+           #'qq-account--interactive-error)))
+  (when-let* ((active
+               (seq-find
+                (lambda (account)
+                  (not (member (alist-get 'phase account)
+                               '("stopped" "logged_out" "failed"))))
+                (qq-account-list))))
+    (user-error "qq: Stop account %s before resetting the shared device"
+                (alist-get 'account_id active)))
+  (qq-rpc-call
+   "device.reset" nil
+   :projector
+   (lambda (result)
+     (unless (qq-account--exact-object-keys-p result nil)
+       (error "qq: Gateway returned an invalid Device Reset receipt"))
+     t)
+   :callback callback
+   :errback errback))
 
 ;;;###autoload
 (defun qq-account-create (label &optional callback errback)
