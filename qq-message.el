@@ -462,6 +462,12 @@ as a server message identity."
           owner session-key sequence
           (if (integerp random) random "none")))
 
+(defun qq-message--present-string (value)
+  "Return non-empty string VALUE, or nil."
+  (and (stringp value)
+       (not (string-empty-p value))
+       value))
+
 (defun qq-message-normalize-snapshot
     (message owner account &optional recalled-p history-p)
   "Purely normalize one Gateway MESSAGE for OWNER and ACCOUNT.
@@ -482,6 +488,16 @@ order."
   (let* ((conversation (alist-get 'conversation message))
          (kind (alist-get 'kind conversation))
          (sender (alist-get 'sender message))
+         (sender-presentation (alist-get 'sender_presentation message))
+         (sender-nickname
+          (qq-message--present-string
+           (alist-get 'nickname sender-presentation)))
+         (sender-remark
+          (qq-message--present-string
+           (alist-get 'remark sender-presentation)))
+         (sender-member-name
+          (qq-message--present-string
+           (alist-get 'member_name sender-presentation)))
          (sender-id (or (alist-get 'uin sender) (alist-get 'uid sender)))
          session-key peer peer-name outgoing group-id)
     (pcase kind
@@ -489,14 +505,29 @@ order."
        (let ((context (qq-message--private-context message account)))
          (setq outgoing (plist-get context :outgoing)
                peer (plist-get context :peer)
-               peer-name (alist-get 'name conversation)
                session-key (qq-state-session-key
-                            'private (alist-get 'uin peer)))))
+                            'private (alist-get 'uin peer)))
+         (let* ((friend (qq-state-friend (alist-get 'uin peer)))
+                (session (qq-state-session session-key)))
+           (setq peer-name
+                 (or (qq-message--present-string
+                      (alist-get 'remark friend))
+                     (qq-message--present-string
+                      (alist-get 'nickname friend))
+                     (qq-message--present-string
+                      (alist-get 'title session))
+                     (alist-get 'uin peer))))))
       ("group"
        (setq outgoing (and (qq-message--endpoint-self-p sender account) t)
              group-id (alist-get 'group_uin conversation)
-             peer-name (alist-get 'group_name conversation)
-             session-key (qq-state-session-key 'group group-id)))
+             session-key (qq-state-session-key 'group group-id))
+       (let ((group (qq-state-group group-id)))
+         (setq peer-name
+               (or (qq-message--present-string
+                    (alist-get 'group_name conversation))
+                   (qq-message--present-string
+                    (alist-get 'group_name group))
+                   group-id))))
       ("temp" (error "qq: Temp conversations are not projected yet")))
     (let* ((server-id
             (qq-protocol-optional-message-id
@@ -519,12 +550,17 @@ order."
            (preview (if recalled-p
                         "[message recalled]"
                       (qq-state-message-preview-from-segments segments)))
-           (sender-name
-            (if outgoing
-                (or (alist-get 'label account) (alist-get 'uin account) "me")
-              (or (and (equal kind "group")
-                       (alist-get 'sender_card conversation))
-                  peer-name sender-id "unknown"))))
+           (presentation-name
+            ;; LinuxQQ's display order over exact sender snapshot fields.
+            ;; Missing presentation is a Rust/Gateway contract violation; a
+            ;; QQ number or chat title must not be substituted here.
+            (or sender-member-name sender-remark sender-nickname
+                (error "qq: Native message omitted sender presentation")))
+           (sender-name presentation-name)
+           (sender-secondary-name
+            (and sender-nickname
+                 (not (equal sender-name sender-nickname))
+                 sender-nickname)))
       `((id . ,(or server-id history-anchor))
         (server-id . ,server-id)
         (session-key . ,session-key)
@@ -536,11 +572,10 @@ order."
         (sender-id . ,sender-id)
         (sender-native-id . ,(alist-get 'uid sender))
         (sender-name . ,sender-name)
-        (sender-secondary-name . nil)
-        (sender-card . ,(and (equal kind "group")
-                             (alist-get 'sender_card conversation)))
-        (sender-nickname . nil)
-        (sender-remark . nil)
+        (sender-secondary-name . ,sender-secondary-name)
+        (sender-card . ,sender-member-name)
+        (sender-nickname . ,sender-nickname)
+        (sender-remark . ,sender-remark)
         (self-p . ,outgoing)
         (status . ,(cond (recalled-p 'recalled)
                          (outgoing 'sent)

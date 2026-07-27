@@ -2064,7 +2064,7 @@
      (goto-char (point-min))
      (should-not (search-forward "Reply to Alice" nil t)))))
 
-(ert-deftest qq-chat-render-falls-back-to-sender-id-when-sender-name-empty ()
+(ert-deftest qq-chat-render-rejects-missing-sender-presentation ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "group:20001"
@@ -2084,9 +2084,7 @@
      (qq-chat-mode)
      (setq qq-chat--session-key "group:20001")
      (qq-chat--set-history-window "m1" nil)
-     (qq-chat-render)
-     (goto-char (point-min))
-     (should (search-forward "10001" nil t)))))
+     (should-error (qq-chat-render) :type 'error))))
 
 (ert-deftest qq-chat-message-title-face-colors-stable-sender-identity ()
   (let* ((original
@@ -2138,13 +2136,13 @@
      (goto-char (point-min))
      (should (search-forward "Alice Card • Alice Nick" nil t)))))
 
-(ert-deftest qq-chat-render-uses-friend-remark-with-nickname-trail ()
+(ert-deftest qq-chat-render-uses-message-remark-with-nickname-trail ()
   (qq-chat-test-with-reset
    (qq-state-apply-friend-categories
     '(((category_id . 0) (sort_id . 0) (name . "好友")
        (online_count . 0)
        (friends . (((user_id . "10001")
-                    (remark . "Alice Remark")
+                    (remark . "Current Directory Remark")
                     (nickname . "Alice Nick")))))))
    (qq-state-upsert-session
     "private:10001"
@@ -2157,9 +2155,10 @@
        (session-key . "private:10001")
        (message-type . "private")
        (sender-id . "10001")
-       (sender-name . "Alice Nick")
-       (sender-secondary-name . nil)
+       (sender-name . "Alice Remark")
+       (sender-secondary-name . "Alice Nick")
        (sender-nickname . "Alice Nick")
+       (sender-remark . "Alice Remark")
        (time . 100)
        (raw-message . "hello")
        (raw-event . ((sender . ((user_id . 10001)
@@ -2515,7 +2514,7 @@
                 "recalled"
                 (buffer-substring-no-properties (point-min) (point-max))))))))
 
-(ert-deftest qq-chat-handle-state-change-friends-refreshes-timeline-for-name-updates ()
+(ert-deftest qq-chat-friend-refresh-keeps-authored-timeline-names-stable ()
   (qq-chat-test-with-reset
    (with-temp-buffer
      (qq-chat-mode)
@@ -2531,10 +2530,7 @@
          (qq-chat--handle-state-change
           '(:type friends-refreshed :account-id "slot-a" :count 1))
          (qq-chat-test-sync-invalidations)
-         (should (equal (mapcar (lambda (event)
-                                  (if (consp event) (car event) event))
-                                events)
-                        '(timeline header))))))))
+         (should (equal events '(header))))))))
 
 (ert-deftest qq-chat-projected-sync-replaces-empty-timeline-placeholder ()
   (qq-chat-test-with-reset
@@ -2852,6 +2848,7 @@
     "private:10001" '((title . "Alice") (target-id . "10001")) nil)
    (puthash "private:10001"
             '(((server-id . "m1") (sender-id . "10001")
+               (sender-name . "Alice")
                (time . 1) (raw-message . "hello")))
             qq-state--messages-by-session)
    (with-temp-buffer
@@ -4009,6 +4006,7 @@
              (qq-chat--set-pending-reply
              '((server-id . "42")
                 (session-key . "private:10001")
+                (sender-name . "Alice")
                 (raw-message . "source")
                 (segments . (((type . "text")
                               (data . ((text . "source"))))))))
@@ -4054,6 +4052,7 @@
      (qq-chat-render)
      (let* ((reply '((server-id . "9007199254742007094")
                      (session-key . "private:10001")
+                     (sender-name . "Alice")
                      (raw-message . "source")))
             error-fn)
        (qq-chat--insert-input-segment-object
@@ -5530,14 +5529,17 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
       `(((server-id . ,first) (session-key . "group:20001")
          (message-seq . "1") (group-id . "20001")
          (gateway-account-id . "slot-a")
+         (sender-name . "Alice")
          (time . 1) (raw-message . "first"))
         ((server-id . ,second) (session-key . "group:20001")
          (message-seq . "2") (group-id . "20001")
          (gateway-account-id . "slot-a")
+         (sender-name . "Alice")
          (time . 2) (raw-message . "second"))
         ((server-id . ,third) (session-key . "group:20001")
          (message-seq . "3") (group-id . "20001")
          (gateway-account-id . "slot-a")
+         (sender-name . "Alice")
          (time . 3) (raw-message . "third")))
       qq-state--messages-by-session)
      (with-temp-buffer
@@ -6970,8 +6972,9 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
       '((type . "at")
         (data . ((qq . "10001") (name . "Alice Card")))))
      (qq-chat--set-reply-message
-      '((server-id . "9007199254742007094")
+     '((server-id . "9007199254742007094")
         (session-key . "private:10001")
+        (sender-name . "Alice")
         (raw-message . "source")))
      ;; Match the send boundary, which normalizes live editable properties into
      ;; the canonical snapshot before the destructive clear.
@@ -7025,8 +7028,9 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
       '((type . "at")
         (data . ((qq . "10001") (name . "Alice Card")))))
      (qq-chat--set-reply-message
-      '((server-id . "9007199254742007094")
+     '((server-id . "9007199254742007094")
         (session-key . "private:10001")
+        (sender-name . "Alice")
         (raw-message . "source")))
      (qq-chat--sync-draft-from-buffer)
      (let (failure old-view replacement-view draft-state aux-state segments
