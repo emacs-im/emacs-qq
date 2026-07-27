@@ -668,6 +668,14 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
             image))
       (error nil))))
 
+(defun qq-media--avatar-image-from-file (file pixel-size)
+  "Create a circular avatar from FILE at PIXEL-SIZE.
+
+Retain the ordinary image decoder as a capability fallback when the current
+Emacs display cannot render SVG clipping."
+  (or (appkit-media-circular-image-from-file file pixel-size)
+      (qq-media--image-from-file file pixel-size)))
+
 (defun qq-media--preview-image-from-file (file spec)
   "Create a preview image object from FILE using appkit media helpers.
 
@@ -2282,7 +2290,8 @@ retain their native member cache identity and its existing URL handling."
       (lambda (profile)
         (funcall done (qq-media--guild-member-avatar-resource profile)))
       error))
-   qq-media-avatar-image-height))
+   qq-media-avatar-image-height
+   #'qq-media--avatar-image-from-file))
 
 (defun qq-media-message-avatar-image (message)
   "Return the identity-correct inline sender avatar for MESSAGE."
@@ -2295,7 +2304,8 @@ retain their native member cache identity and its existing URL handling."
        (qq-media--message-snapshot-avatar-key message)
        (lambda (done _error)
          (funcall done `((url . ,snapshot-url))))
-       qq-media-avatar-image-height))
+       qq-media-avatar-image-height
+       #'qq-media--avatar-image-from-file))
      (t
       (pcase identity
         (`(:guild-member ,guild-id ,native-id)
@@ -2304,7 +2314,8 @@ retain their native member cache identity and its existing URL handling."
               (qq-media--guild-member-avatar-key guild-id native-id)
               (lambda (done _error)
                 (funcall done `((url . ,avatar-url))))
-              qq-media-avatar-image-height)
+              qq-media-avatar-image-height
+              #'qq-media--avatar-image-from-file)
            (qq-media-guild-member-avatar-image guild-id native-id)))
         (`(:user ,user-id)
          (qq-media-avatar-image user-id)))))))
@@ -2316,7 +2327,8 @@ retain their native member cache identity and its existing URL handling."
      key
      (lambda (done error)
        (qq-media--fetch-native-user-avatar user-id done error))
-     qq-media-avatar-image-height)))
+     qq-media-avatar-image-height
+     #'qq-media--avatar-image-from-file)))
 
 (defun qq-media-avatar-display-string (user-id)
   "Return inline display string for USER-ID avatar.
@@ -2369,7 +2381,8 @@ Use FALLBACK until the preview is available."
    (format "group-avatar:%s" group-id)
    (lambda (done error)
      (qq-media--fetch-native-group-avatar group-id done error))
-   qq-media-avatar-image-height))
+   qq-media-avatar-image-height
+   #'qq-media--avatar-image-from-file))
 
 (defun qq-media-group-avatar-display-string (group-id)
   "Return inline display string for GROUP-ID avatar.

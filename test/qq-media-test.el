@@ -50,6 +50,50 @@
       (should (equal "#"
                      (qq-media-session-avatar-display-string channel))))))
 
+(ert-deftest qq-media-avatar-builder-prefers-appkit-circular-image ()
+  (let (circle-arguments square-called-p)
+    (cl-letf (((symbol-function 'appkit-media-circular-image-from-file)
+               (lambda (&rest arguments)
+                 (setq circle-arguments arguments)
+                 'circular-avatar))
+              ((symbol-function 'qq-media--image-from-file)
+               (lambda (&rest _arguments)
+                 (setq square-called-p t)
+                 'square-avatar)))
+      (should
+       (eq 'circular-avatar
+           (qq-media--avatar-image-from-file "/tmp/avatar.jpg" 20)))
+      (should (equal circle-arguments '("/tmp/avatar.jpg" 20)))
+      (should-not square-called-p))))
+
+(ert-deftest qq-media-avatar-builder-keeps-square-capability-fallback ()
+  (cl-letf (((symbol-function 'appkit-media-circular-image-from-file)
+             (lambda (&rest _arguments) nil))
+            ((symbol-function 'qq-media--image-from-file)
+             (lambda (file pixel-size)
+               (list 'square-avatar file pixel-size))))
+    (should
+     (equal '(square-avatar "/tmp/avatar.jpg" 20)
+            (qq-media--avatar-image-from-file "/tmp/avatar.jpg" 20)))))
+
+(ert-deftest qq-media-avatar-resources-select-the-circular-builder ()
+  (let (calls)
+    (cl-letf
+        (((symbol-function 'qq-media--ensure-resource-image)
+          (lambda (key _fetcher spec &optional builder)
+            (push (list key spec builder) calls)
+            'avatar)))
+      (qq-media-avatar-image "10001")
+      (qq-media-group-avatar-image "20001")
+      (qq-media-guild-member-avatar-image "30001" "40001")
+      (qq-media-message-avatar-image
+       '((sender-id . "50001")
+         (sender-avatar-url . "https://example.invalid/avatar.jpg")))
+      (should (= 4 (length calls)))
+      (dolist (call calls)
+        (should (= qq-media-avatar-image-height (nth 1 call)))
+        (should (eq #'qq-media--avatar-image-from-file (nth 2 call)))))))
+
 (ert-deftest qq-media-ensure-resource-image-uses-existing-disk-cache ()
   (qq-media-test-with-reset
    (let* ((qq-media-cache-directory (make-temp-file "qq-media-cache" t))
