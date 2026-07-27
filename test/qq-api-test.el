@@ -3735,45 +3735,42 @@ The authoritative post-state reports UNREAD-COUNT."
     (should (equal result '((kind . "individual"))))))
 
 (ert-deftest qq-api-native-forward-merged-preserves-order-and-group-target ()
-  (let (params result)
-    (cl-letf (((symbol-function 'qq-state-session) (lambda (_) nil))
-              ((symbol-function 'qq-api-call)
-               (lambda (_action called-params callback &optional _errback)
-                 (setq params called-params)
+  (let (source target ids result)
+    (cl-letf (((symbol-function 'qq-message-send-merged-forward)
+               (lambda (called-source called-target called-ids
+                                      &optional callback _errback)
+                 (setq source called-source
+                       target called-target
+                       ids called-ids)
                  (funcall
                   callback
-                  '((data . ((kind . "merged")
-                             (message_id . "9007199254742007999")
-                             (resource_id . "resource-b"))))))))
+                  '((account_id . "slot-a")
+                    (resource_id . "resource-b")
+                    (sent_at . 1785100000)
+                    (server_sequence . "44")
+                    (client_sequence . "45")
+                    (random . 46))))))
       (qq-api-forward-messages-merged
        "private:10001" "group:20001"
        '("9007199254742007001"
          "9007199254742007001"
          "9007199254742007002")
        (lambda (value) (setq result value))))
+    (should (equal source "private:10001"))
+    (should (equal target "group:20001"))
     (should
-     (equal (alist-get 'destination params)
-            '((kind . "group") (group_id . "20001"))))
-    (let ((messages
-           (alist-get 'messages (alist-get 'request params))))
-      (should (equal (alist-get 'kind (alist-get 'request params)) "merged"))
-      (should
-       (equal (mapcar (lambda (message) (alist-get 'message_id message))
-                      messages)
-              '("9007199254742007001"
-                "9007199254742007001"
-                "9007199254742007002")))
-      (should
-       (cl-every
-        (lambda (message)
-          (equal (alist-get 'chat message)
-                 '((kind . "private") (user_id . "10001"))))
-        messages)))
+     (equal ids
+            '("9007199254742007001"
+              "9007199254742007001"
+              "9007199254742007002")))
     (should
      (equal result
-            '((kind . "merged")
-              (message_id . "9007199254742007999")
-              (resource_id . "resource-b"))))))
+            '((account_id . "slot-a")
+              (resource_id . "resource-b")
+              (sent_at . 1785100000)
+              (server_sequence . "44")
+              (client_sequence . "45")
+              (random . 46))))))
 
 (ert-deftest qq-api-native-forward-rejects-dataline-destination ()
   (let ((request

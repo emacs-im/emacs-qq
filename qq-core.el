@@ -1531,6 +1531,7 @@ It is used only when the target message is not already cached."
     (presence "account.set_presence")
     (send-text "message.send")
     (send-message "message.send")
+    (merged-forward "message.send_merged_forward")
     (send-file "file.send" "resource.stage_local")
     (face "message.send")
     (reply "message.send")

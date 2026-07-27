@@ -24,6 +24,10 @@
 (declare-function qq-state-merge-guild-forum-post "qq-state" (post))
 (declare-function qq-state-replace-guild-forum-posts
                   "qq-state" (session-key posts))
+(declare-function qq-message-send-merged-forward
+                  "qq-message"
+                  (source-session-key destination-session-key message-ids
+                                      &optional callback errback))
 
 (defvar qq-api--read-operations (make-hash-table :test #'equal)
   "In-flight mark-read operations keyed by session key.
@@ -2505,9 +2509,8 @@ parent message id, or a different interface."
     (source-session-key target-session-key message-ids callback
                         &optional errback)
   "Forward ordered MESSAGE-IDS as one native merged-forward card."
-  (qq-api--forward-messages
-   "merged" source-session-key target-session-key message-ids
-   callback errback))
+  (qq-message-send-merged-forward
+   source-session-key target-session-key message-ids callback errback))
 (defun qq-api--history-around-params (session-key message-id count)
   "Build `get_msg_history_around' params for SESSION-KEY centered on MESSAGE-ID."
   (setq message-id
