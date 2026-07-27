@@ -2005,6 +2005,7 @@ push carries sequence=40909 and client_sequence=30202."
                    (funcall
                     callback
                     `((account_id . "slot-a")
+                      (unsupported_message_count . 2)
                       (messages
                        . ,(list
                            '((entry_id . "1")
@@ -2021,7 +2022,7 @@ push carries sequence=40909 and client_sequence=30202."
          (equal
           (qq-message-get-forward
            "resid-private" "private"
-           (lambda (messages) (setq projected messages)))
+           (lambda (page) (setq projected page)))
           "request-forward"))
         (should (equal sent-method "message.get_forward"))
         (should
@@ -2029,7 +2030,11 @@ push carries sequence=40909 and client_sequence=30202."
                 '((account_id . "slot-a")
                   (resource_id . "resid-private")
                   (scene . "private"))))
-        (should (equal (alist-get 'entry_id (car projected)) "1"))
+        (should (= (plist-get projected :unsupported-message-count) 2))
+        (should
+         (equal
+          (alist-get 'entry_id (car (plist-get projected :messages)))
+          "1"))
         ;; The result is viewer-local data, not a timeline/history merge.
         (should-not (qq-state-session-messages "private:10001"))))))
 

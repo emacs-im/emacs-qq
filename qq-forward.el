@@ -82,6 +82,9 @@
 (defvar-local qq-forward--error nil
   "Last loading error string for this forward viewer, or nil.")
 
+(defvar-local qq-forward--unsupported-message-count 0
+  "Number of forward entries omitted because their envelope is unsupported.")
+
 (defvar-local qq-forward--request nil
   "Active native forward request token for this viewer.")
 
@@ -734,6 +737,14 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
    :context nil
    :dependencies nil))
 
+(defun qq-forward--omitted-status-row ()
+  "Return the status row describing unsupported omitted entries."
+  (qq-forward--status-row
+   'warning
+   (format "%d unsupported forwarded message%s omitted"
+           qq-forward--unsupported-message-count
+           (if (= qq-forward--unsupported-message-count 1) "" "s"))))
+
 (defun qq-forward--project-timeline ()
   "Project accepted messages and transient status into appkit rows."
   (let ((messages-by-entry
@@ -754,13 +765,18 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
             :dependencies-function #'qq-forward--message-dependency-keys)))
       (cond
        (message-rows
-        (if qq-forward--error
-            (append message-rows
-                    (list (qq-forward--status-row
-                           'error
-                           (format "Unable to refresh chat history: %s"
-                                   qq-forward--error))))
-          message-rows))
+        (cond
+         (qq-forward--error
+          (append message-rows
+                  (list (qq-forward--status-row
+                         'error
+                         (format "Unable to refresh chat history: %s"
+                                 qq-forward--error)))))
+         ((> qq-forward--unsupported-message-count 0)
+          (append
+           message-rows
+           (list (qq-forward--omitted-status-row))))
+         (t message-rows)))
        (qq-forward--loading
         (list (qq-forward--status-row 'loading "Loading chat history…")))
        (qq-forward--error
@@ -768,7 +784,10 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
                'error
                (format "Unable to load chat history: %s" qq-forward--error))))
        (qq-forward--loaded-p
-        (list (qq-forward--status-row 'empty "(empty chat history)")))
+        (list
+         (if (> qq-forward--unsupported-message-count 0)
+             (qq-forward--omitted-status-row)
+           (qq-forward--status-row 'empty "(empty chat history)"))))
        (t
         (list (qq-forward--status-row
                'loading "Loading chat history…")))))))
@@ -794,7 +813,10 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
     (if (eq key qq-forward--status-row-key)
         (let* ((start (point))
                (kind (plist-get payload :status))
-               (face (if (eq kind 'error) 'error 'shadow)))
+               (face (pcase kind
+                       ('error 'error)
+                       ('warning 'warning)
+                       (_ 'shadow))))
           (insert (propertize (concat (plist-get payload :text) "\n")
                               'face face))
           (add-text-properties
@@ -817,6 +839,7 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
 (defun qq-forward--clear-view-data ()
   "Clear account-scoped data projected by the current forward view."
   (setq qq-forward--messages nil
+        qq-forward--unsupported-message-count 0
         qq-forward--loaded-p nil
         qq-forward--error nil))
 
@@ -938,6 +961,8 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
            qq-forward--error nil))
     ('load-success
      (setq qq-forward--messages (plist-get event :messages)
+           qq-forward--unsupported-message-count
+           (or (plist-get event :unsupported-message-count) 0)
            qq-forward--loaded-p t
            qq-forward--loading nil
            qq-forward--error nil
@@ -1006,7 +1031,7 @@ sync; timeline mutation remains owned by `qq-forward--sync-invalidations'."
                     (user-error
                      "qq: v2 merged-forward loading requires a resource reference")))
                  (alist-get 'scene source)
-                 (lambda (raw-messages)
+                 (lambda (page)
                    (when (qq-forward--request-current-p
                           view buffer source owner)
                      (let ((event
@@ -1014,7 +1039,10 @@ sync; timeline mutation remains owned by `qq-forward--sync-invalidations'."
                                 (list
                                  :type 'load-success
                                  :messages
-                                 (qq-forward--normalize-messages raw-messages))
+                                 (qq-forward--normalize-messages
+                                  (plist-get page :messages))
+                                 :unsupported-message-count
+                                 (plist-get page :unsupported-message-count))
                               (error
                                (list
                                 :type 'load-error
@@ -1047,7 +1075,8 @@ sync; timeline mutation remains owned by `qq-forward--sync-invalidations'."
     (qq-forward--apply-load-event
      (list :type 'load-success
            :messages
-           (qq-forward--normalize-messages qq-forward--inline-content)))
+           (qq-forward--normalize-messages qq-forward--inline-content)
+           :unsupported-message-count 0))
     (qq-forward--request-timeline-sync view)))
 
 (defun qq-forward-refresh ()
@@ -1209,6 +1238,7 @@ width is unchanged so pixel-aligned media follows text scaling."
                 qq-forward--loading nil
                 qq-forward--loaded-p nil
                 qq-forward--error nil
+                qq-forward--unsupported-message-count 0
                 qq-forward--request nil
                 qq-forward--request-owner nil
                 qq-forward--inline-p inline-p

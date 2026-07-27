@@ -269,7 +269,9 @@
                            (alist-get 'sender (car raw)))
                 "user"))
               (should (= (length (qq-forward--normalize-messages raw)) 1))
-              (funcall success raw))
+              (funcall success
+                       (list :messages raw
+                             :unsupported-message-count 0)))
             (with-current-buffer buffer
               (appkit-sync-invalidations (appkit-current-view))
               (should-not qq-forward--error)
@@ -295,6 +297,30 @@
               (should (eq qq-forward--request 'request-2))
               (should (equal canceled '(request-1))))))))))
 
+(ert-deftest qq-forward-viewer-makes-omitted-entries-visible ()
+  (qq-forward-test--with-clean-viewers
+    (cl-letf (((symbol-function 'qq-core-get-forward)
+               (lambda (_resource _scene callback &optional _errback)
+                 (funcall
+                  callback
+                  (list
+                   :messages
+                   (list (qq-forward-test--message "1" "visible"))
+                   :unsupported-message-count 2))
+                 'settled-request)))
+      (save-window-excursion
+        (let ((buffer (qq-forward-open (qq-forward-test--source))))
+          (with-current-buffer buffer
+            (appkit-sync-invalidations (appkit-current-view))
+            (should (= qq-forward--unsupported-message-count 2))
+            (should
+             (equal (appkit-chat-timeline-keys)
+                    '("1" :qq-forward-status)))
+            (should
+             (string-match-p
+              "2 unsupported forwarded messages omitted"
+              (buffer-string)))))))))
+
 (ert-deftest qq-forward-card-is-one-whole-clickable-action ()
   (let ((segment (qq-forward-test--card))
         opened)
@@ -318,10 +344,13 @@
                    (funcall
                     callback
                     (list
-                     (qq-forward-test--message
-                      "1.2" "first" :message-id message-id)
-                     (qq-forward-test--message
-                      "9" "second" :message-id message-id))))))
+                     :messages
+                     (list
+                      (qq-forward-test--message
+                       "1.2" "first" :message-id message-id)
+                      (qq-forward-test--message
+                       "9" "second" :message-id message-id))
+                     :unsupported-message-count 0)))))
         (save-window-excursion
           (let ((buffer (qq-forward-open (qq-forward-test--source))))
             (with-current-buffer buffer
