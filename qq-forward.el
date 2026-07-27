@@ -1123,25 +1123,12 @@ records issue a fresh `emacs_get_forward' request."
         (qq-forward-next-message (- count))
       (qq-forward--move-message (- count)))))
 
-(defun qq-forward-activate ()
-  "Activate the nested clickable forward block at point."
-  (interactive)
-  (cond
-   ((button-at (point))
-    (push-button (point)))
-   ((get-text-property (point) 'qq-forward-segment)
-    (qq-forward-open-segment
-     (get-text-property (point) 'qq-forward-segment)))
-   (t
-    (user-error "qq: no nested chat history at point"))))
-
 (defvar qq-forward-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "q") #'quit-window)
     (define-key map (kbd "g") #'qq-forward-refresh)
     (define-key map (kbd "n") #'qq-forward-next-message)
     (define-key map (kbd "p") #'qq-forward-previous-message)
-    (define-key map (kbd "RET") #'qq-forward-activate)
     map)
   "Keymap for `qq-forward-mode'.")
 

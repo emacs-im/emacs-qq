@@ -128,8 +128,6 @@ When nil, leave Evil's initial-state selection untouched."
     (kbd "g b") #'qq-contacts-open-root)
 
   (appkit-evil-define-keys qq-evil--application-states 'qq-forward-mode-map
-    (kbd "RET") #'qq-forward-activate
-    (kbd "<return>") #'qq-forward-activate
     (kbd "g r") #'qq-forward-refresh
     (kbd "g j") #'qq-forward-next-message
     (kbd "g k") #'qq-forward-previous-message)
