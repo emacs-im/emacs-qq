@@ -333,6 +333,15 @@
         (should (button-at (point)))
         (push-button (point))
         (should (equal opened segment))
+        (setq opened nil)
+        (goto-char (point-min))
+        (let ((command
+               (lookup-key
+                (get-text-property (point) 'keymap)
+                (kbd "RET"))))
+          (should (commandp command))
+          (call-interactively command))
+        (should (equal opened segment))
         (goto-char (1- (point-max)))
         (should (get-text-property (point) 'qq-forward-segment))))))
 
