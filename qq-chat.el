@@ -180,7 +180,7 @@ into canonical state.")
 (defvar-local qq-chat--remote-latest-id nil
   "Newest exact server message id observed for this QQ session.
 
-This NapCat/read-state frontier remains client-owned.  Protocol-independent
+This loaded-history frontier remains client-owned.  Protocol-independent
 window edges, loading ownership, exhaustion, and stalls live in AppKit's
 buffer-local continuous history controller.")
 
@@ -565,7 +565,7 @@ of the default chrome."
   (let* ((session (qq-chat--session))
          (title (or (alist-get 'title session) qq-chat--session-key))
          (status (qq-state-connection-status))
-         (unread (or (alist-get 'unread-count session) 0))
+         (unread (or (alist-get 'unread-badge-count session) 0))
          (status-part (if (memq status '(connected ready))
                           ""
                         (format "  [%s]" status)))
@@ -901,37 +901,61 @@ bounds."
 (defun qq-chat--message-by-sequence (sequence)
   "Return the current conversation message carrying exact SEQUENCE.
 
-QQ reply locators use this conversation-scoped sequence; it is not a message
-identity and must never be compared with a snowflake `server-id'."
+This is the canonical Message Sequence used by native history.  It is not a
+message identity and must never be compared with a snowflake `server-id'."
   (when (and sequence qq-chat--session-key)
     (seq-find
      (lambda (message)
        (equal (alist-get 'message-seq message) sequence))
      (qq-state-session-messages qq-chat--session-key))))
 
+(defun qq-chat--message-by-reply-sequence (sequence)
+  "Resolve SourceMsg OrigSeq SEQUENCE in the current conversation.
+
+Group OrigSeq is the canonical Message Sequence.  Private OrigSeq is the
+target's Client Message Sequence and must never be used as an SsoGetC2cMsg
+range cursor."
+  (when (and sequence qq-chat--session-key)
+    (let ((field (if (eq (qq-state-session-key-type qq-chat--session-key)
+                         'private)
+                     'native-client-sequence
+                   'message-seq)))
+      (seq-find
+       (lambda (message)
+         (equal (alist-get field message) sequence))
+       (qq-state-session-messages qq-chat--session-key)))))
+
 (defun qq-chat--message-reply-id (message)
   "Return MESSAGE's resolved reply target snowflake, or nil.
 
-Native replies are located by conversation sequence.  Historical segment
-shapes without a sequence may still carry an exact `id'; a numeric-looking
-SourceMsg reserve value accompanying a sequence is deliberately not treated
-as a snowflake."
+SourceMsg OrigSeq is group Message Sequence or private Client Message
+Sequence.  Historical segment shapes without a sequence may still carry an
+exact `id'; a numeric-looking SourceMsg reserve value accompanying a sequence
+is deliberately not treated as a snowflake."
   (when-let* ((data (qq-chat--message-reply-data message)))
     (let ((sequence (or (alist-get 'message_seq data)
                         (alist-get 'sequence data))))
       (if sequence
           (alist-get 'server-id
-                     (qq-chat--message-by-sequence sequence))
+                     (qq-chat--message-by-reply-sequence sequence))
         (when-let* ((reply-id (or (alist-get 'id data)
                                   (alist-get 'message_id data))))
           (format "%s" reply-id))))))
 
 (defun qq-chat--message-reply-sequence (message)
-  "Return MESSAGE's conversation-scoped reply seek sequence, or nil."
+  "Return MESSAGE's canonical history seek sequence, or nil.
+
+Never return a private SourceMsg OrigSeq directly: that value is a Client
+Message Sequence, not an SsoGetC2cMsg cursor."
   (when-let* ((data (qq-chat--message-reply-data message))
-              (sequence (or (alist-get 'message_seq data)
-                            (alist-get 'sequence data))))
-    (format "%s" sequence)))
+              (reply-sequence (or (alist-get 'message_seq data)
+                                  (alist-get 'sequence data))))
+    (let ((source (qq-chat--message-by-reply-sequence
+                   (format "%s" reply-sequence))))
+      (or (alist-get 'message-seq source)
+          (and (not (eq (qq-state-session-key-type qq-chat--session-key)
+                        'private))
+               (format "%s" reply-sequence))))))
 
 (defun qq-chat--message-line-properties (message anchor)
   "Return shared line properties for MESSAGE using ANCHOR."
@@ -1013,7 +1037,7 @@ canonical session timeline are compared."
   "Return non-nil when MESSAGE-ID can advance the known read position."
   (let* ((messages (qq-state-session-messages qq-chat--session-key))
          (session (qq-state-session qq-chat--session-key))
-         (unread-count (alist-get 'unread-count session))
+         (unread-count (alist-get 'unread-message-count session))
          (first-unread (alist-get 'first-unread-message-id session))
          (read-latest (alist-get 'read-latest-message-id session)))
     (and
@@ -2032,7 +2056,7 @@ Order (telega-inspired):
   "Return the exact first-unread anchor present in MESSAGES."
   (when qq-chat-show-unread-divider
     (let* ((session (qq-chat--session))
-           (count (and session (alist-get 'unread-count session)))
+            (count (and session (alist-get 'unread-message-count session)))
            (exact (and (integerp count)
                        (> count 0)
                        (alist-get 'first-unread-message-id session))))
@@ -3238,9 +3262,8 @@ Return non-nil on success.  When HIGHLIGHT is non-nil, pulse the block."
 
 Return non-nil on success."
   (let* ((source
-          (if sequence
-              (qq-chat--message-by-sequence sequence)
-            (qq-chat--message-by-server-id target)))
+          (or (and target (qq-chat--message-by-server-id target))
+              (and sequence (qq-chat--message-by-sequence sequence))))
          (resolved-anchor (qq-state-message-anchor source)))
     (when (and resolved-anchor
                (qq-chat--goto-loaded-message resolved-anchor t))
@@ -3375,11 +3398,16 @@ reply header.  Here the line is a button (RET / mouse-1) that jumps by exact
 message identity plus its conversation-scoped native sequence hint."
   (let* ((reply-id (or (alist-get 'message_id reply-data)
                        (alist-get 'id reply-data)))
-         (sequence (or (alist-get 'message_seq reply-data)
-                       (alist-get 'sequence reply-data)))
-         (source (if sequence
-                     (qq-chat--message-by-sequence sequence)
+         (reply-sequence (or (alist-get 'message_seq reply-data)
+                             (alist-get 'sequence reply-data)))
+         (source (if reply-sequence
+                     (qq-chat--message-by-reply-sequence reply-sequence)
                    (qq-chat--message-by-server-id reply-id)))
+         (sequence (or (alist-get 'message-seq source)
+                       (and (not (eq (qq-state-session-key-type
+                                     qq-chat--session-key)
+                                    'private))
+                            reply-sequence)))
          (sender (or (and source
                           (car (qq-chat--message-sender-display-parts source)))
                      (alist-get 'sender_name reply-data)))
@@ -3393,7 +3421,7 @@ message identity plus its conversation-scoped native sequence hint."
                 (sender (format "%s's message" sender))
                 ((and reply-id (not sequence))
                  (format "id %s" reply-id))
-                (sequence (format "message #%s" sequence))
+                (reply-sequence (format "message #%s" reply-sequence))
                 (t "replied message")))
          (reply-start (point))
          (target (or (qq-state-message-anchor source)
@@ -6623,7 +6651,7 @@ first unread message."
   (when (qq-chat--initial-history-request-current-p
          buffer session-key owner)
     (let* ((session (qq-state-session session-key))
-           (unread (or (alist-get 'unread-count session) 0))
+            (unread (or (alist-get 'unread-message-count session) 0))
            (first-id (alist-get 'first-unread-message-id session))
            (session-latest (alist-get 'read-latest-message-id session))
            (frontier-at-start (plist-get owner :frontier-at-start))
@@ -6834,57 +6862,6 @@ accepted Appkit projection."
                 buffer session-key owner response reason))
              (min 100 (max 1 qq-history-fetch-count))))
       (when (and pending
-                 (qq-chat--initial-history-request-current-p
-                  buffer session-key owner))
-        (with-current-buffer buffer
-          (setq qq-chat--initial-history-request request)))
-      request)))
-
-(defun qq-chat--load-initial-ordinary-history (buffer session-key)
-  "Load SESSION-KEY around its official QQ read position when available."
-  (let ((owner (list :kind 'initial-history
-                     :session-key session-key
-                     :view (with-current-buffer buffer
-                             (qq-chat--ensure-view))
-                     :remote-latest-id nil
-                     :frontier-at-start nil
-                     :read-observation-token
-                     (qq-api-read-observation-start))))
-    (with-current-buffer buffer
-      (when qq-chat--initial-history-request
-        (qq-api-cancel-request qq-chat--initial-history-request))
-      (appkit-chat-history-window-clear)
-      (setf (plist-get owner :frontier-at-start)
-            qq-chat--remote-latest-id)
-      (setq qq-chat--initial-history-owner owner
-            qq-chat--initial-history-request nil)
-      (appkit-chat-history-request-begin 'initial owner)
-      (qq-chat--sync-timeline :messages nil)
-      (qq-chat--update-frame))
-    (let ((read-pending t)
-          request)
-      (setq request
-            (qq-api-fetch-session-read-state
-             session-key
-             (lambda (read-state)
-               (setq read-pending nil)
-               (when (qq-chat--initial-history-request-current-p
-                      buffer session-key owner)
-                 (when (qq-api-read-observation-accept-p
-                        session-key
-                        (plist-get owner :read-observation-token))
-                   (qq-state-apply-session-read-state session-key read-state))
-                 ;; When the HTTP token lost, a newer notice/recent-contact
-                 ;; observation has already populated the canonical session.
-                 (qq-chat--continue-initial-history-from-session
-                  buffer session-key owner)))
-             (lambda (response reason)
-               (setq read-pending nil)
-               (qq-chat--fail-initial-history-load
-                buffer session-key owner response reason))))
-      ;; Only the still-pending read-state call owns this token.  A
-      ;; synchronous callback may already have installed its child token.
-      (when (and read-pending
                  (qq-chat--initial-history-request-current-p
                   buffer session-key owner))
         (with-current-buffer buffer

@@ -1007,6 +1007,15 @@ the later authoritative self event."
                   when plan collect plan))
         (error-fn (or errback #'qq-core--default-error)))
     (cond
+     ((eq (qq-state-session-key-type session-key) 'dataline)
+      ;; DataLine owns a separate text-only protocol. Never stage resources or
+      ;; prepare ordinary private/group attachments before that closed
+      ;; operation has validated the message.
+      (qq-core--start-request
+       (lambda (success failure)
+         (qq-message-send
+          session-key segments raw-message success failure))
+       callback error-fn))
      (file-plan
       (qq-core--send-file
        session-key file-plan callback error-fn))
@@ -1531,6 +1540,7 @@ CALLBACK receives a page plist with messages and the unsupported-entry count."
     (group-lifecycle "group.leave")
     (presence "account.set_presence")
     (send-text "message.send")
+    (dataline-text "dataline.send_text")
     (send-message "message.send")
     (merged-forward "message.send_merged_forward")
     (send-file "file.send" "resource.stage_local")

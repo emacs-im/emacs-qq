@@ -17,6 +17,14 @@
 (require 'qq-server)
 (require 'qq-protocol)
 
+(declare-function qq-runtime-call-with-account
+                  "qq-runtime" (account-id function))
+(declare-function qq-state-session-key
+                  "qq-state" (type target-id &optional variant))
+(declare-function qq-state-upsert-session
+                  "qq-state" (session-key fields &optional message))
+(declare-function qq-chat-open "qq-chat" (session-key))
+
 (defvar qq-account-registry-changed-hook nil
   "Hook called with REASON and ACCOUNT-ID after the local registry changes.
 
@@ -39,14 +47,15 @@ Gateway-owned registries without inspecting raw transport events.")
 (defvar qq-account-projection-resync-hook nil
   "Hook called with PROJECTION and BODY after projection events were lost.
 
-PROJECTION is one of \"resources\", \"attachments\", or \"remote_media\".
+PROJECTION is one of \"conversation_read_states\", \"resources\",
+\"attachments\", or \"remote_media\".
 The account projection is resynchronized by this registry itself and is not
 dispatched through this hook.  BODY is the owned event or error body that
 reported the loss.  Consumers filter on PROJECTION and refresh their own
 Gateway-owned registry from an authoritative snapshot.")
 
 (defconst qq-account--foreign-projections
-  '("resources" "attachments" "remote_media")
+  '("conversation_read_states" "resources" "attachments" "remote_media")
   "Runtime projections owned by registries other than the account registry.")
 
 (defvar qq-account--accounts (make-hash-table :test #'equal))
@@ -120,6 +129,10 @@ canonical string `0' additionally qualifies."
   (and (qq-account--canonical-decimal-p value allow-zero)
        (not (qq-account--decimal-less-p
              qq-account--max-uint64-decimal value))))
+
+(defun qq-account--uint32-p (value)
+  "Return non-nil when VALUE is an exact unsigned 32-bit integer."
+  (and (integerp value) (<= 0 value #xffffffff)))
 
 (defun qq-account-get (account-id)
   "Return a copy of managed ACCOUNT-ID's snapshot, or nil."
@@ -386,6 +399,276 @@ or store presence in the local account snapshot."
   (qq-rpc-call
    "account.set_presence"
    `((account_id . ,account-id) (presence . ,presence))
+   :callback callback
+   :errback errback))
+
+(defun qq-account--device-common-fields-p (device)
+  "Return non-nil when DEVICE has valid common roster fields."
+  (and (qq-account--uint32-p (alist-get 'instance_id device))
+       (> (alist-get 'instance_id device) 0)
+       (let ((client-type (alist-get 'client_type device)))
+         (or (null client-type) (qq-account--uint32-p client-type)))
+       (member (alist-get 'kind device)
+               '("computer" "phone" "pad" "unknown"))
+       (let ((platform-id (alist-get 'platform_id device)))
+         (or (null platform-id) (qq-account--uint32-p platform-id)))
+       (let ((name (alist-get 'device_name device)))
+         (or (null name) (stringp name)))))
+
+(defun qq-account--online-client-p (device)
+  "Return non-nil when DEVICE is a closed PushParams client row."
+  (and
+   (qq-account--exact-object-keys-p
+    device '(instance_id client_type kind state platform_id platform_type
+             new_client_type device_name))
+   (qq-account--device-common-fields-p device)
+   (let ((state (alist-get 'state device)))
+     (or (null state) (qq-account--uint32-p state)))
+   (let ((platform-type (alist-get 'platform_type device)))
+     (or (null platform-type) (stringp platform-type)))
+   (let ((client-type (alist-get 'new_client_type device)))
+     (or (null client-type) (qq-account--uint32-p client-type)))))
+
+(defun qq-account--dataline-candidate-p (device)
+  "Return non-nil when DEVICE is a closed 528/349 candidate row."
+  (and
+   (qq-account--exact-object-keys-p
+    device '(app_id instance_id client_type kind platform_id device_name
+             field_11))
+   (qq-account--device-common-fields-p device)
+   (let ((app-id (alist-get 'app_id device)))
+     (or (null app-id) (qq-account--uint32-p app-id)))
+   (let ((field-11 (alist-get 'field_11 device)))
+     (or (null field-11) (qq-account--uint32-p field-11)))))
+
+(defun qq-account--dataline-peer-p (peer)
+  "Return non-nil when PEER is a pinned DataLine class route."
+  (and
+   (qq-account--exact-object-keys-p
+    peer '(class peer_uid route_profile candidate_instance_ids))
+   (let ((class (alist-get 'class peer))
+         (uid (alist-get 'peer_uid peer)))
+     (or (and (equal class "phone")
+              (equal uid "u_Wcc5rknRRqRO8y5gxMD6sA"))
+         (and (equal class "pad")
+              (equal uid "u_l7jpPIZxQo0mzJwoEt-SKw"))))
+   (equal (alist-get 'route_profile peer) "linuxqq_3_2_31_51102")
+   (let ((instances (alist-get 'candidate_instance_ids peer))
+         (seen (make-hash-table :test #'eql))
+         valid)
+     (setq valid (and (listp instances) instances))
+     (dolist (instance instances)
+       (unless (and (qq-account--uint32-p instance)
+                    (> instance 0)
+                    (not (gethash instance seen)))
+         (setq valid nil))
+       (puthash instance t seen))
+     valid)))
+
+(defun qq-account--project-device-roster (roster predicate context)
+  "Validate source ROSTER rows with PREDICATE for CONTEXT."
+  (let ((state (alist-get 'state roster)))
+    (cond
+     ((equal state "unknown")
+      (unless (qq-account--exact-object-keys-p roster '(state))
+        (error "qq: Gateway returned an open %s roster" context))
+      '((state . "unknown")))
+     ((equal state "observed")
+      (unless (and (qq-account--exact-object-keys-p roster '(state devices))
+                   (listp (alist-get 'devices roster)))
+        (error "qq: Gateway returned an invalid %s roster" context))
+      (let ((seen-instances (make-hash-table :test #'eql))
+            devices)
+        (dolist (device (alist-get 'devices roster))
+          (unless (funcall predicate device)
+            (error "qq: Gateway returned invalid %s metadata" context))
+          (let ((instance-id (alist-get 'instance_id device)))
+            (when (gethash instance-id seen-instances)
+              (error "qq: Gateway returned duplicate %s instance %s"
+                     context instance-id))
+            (puthash instance-id t seen-instances))
+          (push (qq-server-value-copy device) devices))
+        `((state . "observed") (devices . ,(nreverse devices)))))
+     (t (error "qq: Gateway returned an invalid %s roster state" context)))))
+
+(defun qq-account--project-dataline-peer-roster (roster)
+  "Validate build-profile DataLine class ROSTER."
+  (let ((state (alist-get 'state roster)))
+    (cond
+     ((equal state "unknown")
+      (unless (qq-account--exact-object-keys-p roster '(state))
+        (error "qq: Gateway returned an open DataLine-peer roster"))
+      '((state . "unknown")))
+     ((equal state "observed")
+      (unless (and (qq-account--exact-object-keys-p roster '(state devices))
+                   (listp (alist-get 'devices roster)))
+        (error "qq: Gateway returned an invalid DataLine-peer roster"))
+      (let ((seen-classes (make-hash-table :test #'equal))
+            peers)
+        (dolist (peer (alist-get 'devices roster))
+          (unless (qq-account--dataline-peer-p peer)
+            (error
+             "qq: Gateway returned invalid DataLine class-route metadata"))
+          (let ((class (alist-get 'class peer)))
+            (when (gethash class seen-classes)
+              (error "qq: Gateway returned duplicate DataLine class route %s"
+                     class))
+            (puthash class t seen-classes))
+          (push (qq-server-value-copy peer) peers))
+        `((state . "observed") (devices . ,(nreverse peers)))))
+     (t (error "qq: Gateway returned an invalid DataLine-peer roster state")))))
+
+(defun qq-account--project-online-devices (result expected-account-id)
+  "Validate independent device RESULT rosters for EXPECTED-ACCOUNT-ID."
+  (unless (and
+           (qq-account--exact-object-keys-p
+            result '(account_id online_clients data_line_candidates
+                     data_line_peers))
+           (equal (alist-get 'account_id result) expected-account-id))
+    (error "qq: Gateway returned an invalid account-device snapshot"))
+  `((account_id . ,(copy-sequence expected-account-id))
+    (online_clients
+     . ,(qq-account--project-device-roster
+         (alist-get 'online_clients result) #'qq-account--online-client-p
+         "online-client"))
+    (data_line_candidates
+     . ,(qq-account--project-device-roster
+         (alist-get 'data_line_candidates result)
+         #'qq-account--dataline-candidate-p "DataLine-candidate"))
+    (data_line_peers
+     . ,(qq-account--project-dataline-peer-roster
+         (alist-get 'data_line_peers result)))))
+
+(defun qq-account--open-dataline-peer (account-id peer)
+  "Open ACCOUNT-ID's build-profile DataLine class PEER chat."
+  (qq-account-select account-id)
+  (require 'qq-state)
+  (require 'qq-chat)
+  (let* ((uid (alist-get 'peer_uid peer))
+         (class (alist-get 'class peer))
+         (title (if (equal class "pad") "My pad" "My phone"))
+         (session-key (qq-state-session-key 'dataline uid 'desktop)))
+    (require 'qq-runtime)
+    (qq-runtime-call-with-account
+     account-id
+     (lambda ()
+       (qq-state-upsert-session
+        session-key
+        `((type . dataline)
+          (title . ,title)
+          (target-id . ,uid)
+          (peer-uid . ,uid)
+          (variant . "desktop")
+          (chat-type . "8"))
+        nil)))
+    (qq-chat-open session-key)))
+
+(defun qq-account--display-online-devices (snapshot)
+  "Display the online-device SNAPSHOT in a read-only buffer."
+  (let* ((account-id (alist-get 'account_id snapshot))
+         (online (alist-get 'online_clients snapshot))
+         (dataline (alist-get 'data_line_candidates snapshot))
+         (peers (alist-get 'data_line_peers snapshot))
+         (buffer (get-buffer-create
+                  (format "*QQ My Devices: %s*" account-id))))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "My Devices — account %s\n\n" account-id))
+        (insert "Online clients (PushParams)\n")
+        (cond
+         ((equal (alist-get 'state online) "unknown")
+          (insert "  Snapshot not observed yet.\n"))
+         ((null (alist-get 'devices online))
+          (insert "  QQ reports no online client rows.\n"))
+         (t
+          (dolist (device (alist-get 'devices online))
+            (insert
+             (format "  %s — kind: %s; client type: %s; instance: %s\n"
+                     (let ((name (alist-get 'device_name device)))
+                       (if (qq-account--non-empty-string-p name)
+                           name
+                         (capitalize (alist-get 'kind device))))
+                     (alist-get 'kind device)
+                     (or (alist-get 'client_type device) "unknown")
+                     (alist-get 'instance_id device))))))
+        (insert "\nDataLine candidates (528/349)\n")
+        (cond
+         ((equal (alist-get 'state dataline) "unknown")
+          (insert "  Snapshot not observed yet.\n"))
+         ((null (alist-get 'devices dataline))
+          (insert "  QQ reports no DataLine candidate rows.\n"))
+         (t
+          (dolist (device (alist-get 'devices dataline))
+            (insert
+             (format "  %s — kind: %s; client type: %s; instance: %s\n"
+                     (let ((name (alist-get 'device_name device)))
+                       (if (qq-account--non-empty-string-p name)
+                           name
+                         (capitalize (alist-get 'kind device))))
+                     (alist-get 'kind device)
+                     (or (alist-get 'client_type device) "unknown")
+                     (alist-get 'instance_id device))))))
+        (insert "\nDataLine class routes (LinuxQQ 3.2.31 profile)\n")
+        (cond
+         ((equal (alist-get 'state peers) "unknown")
+          (insert "  Candidate snapshot not observed yet.\n"))
+         ((null (alist-get 'devices peers))
+          (insert "  No currently reachable phone/pad class route.\n"))
+         (t
+          (dolist (peer (alist-get 'devices peers))
+            (let ((route (copy-tree peer))
+                  (owner (copy-sequence account-id)))
+              (insert "  ")
+              (insert-text-button
+               (format "Open %s class chat" (alist-get 'class route))
+               'follow-link t
+               'help-echo
+               (concat "Open the shared DataLine class conversation "
+                       "(not one physical device)")
+               'action
+               (lambda (_button)
+                 (qq-account--open-dataline-peer owner route)))
+              (insert
+               (format " — UID: %s; candidate instances: %s\n"
+                       (alist-get 'peer_uid route)
+                       (mapconcat #'number-to-string
+                                  (alist-get 'candidate_instance_ids route)
+                                  ", ")))))))
+        (insert
+         "\nA class route does not select one physical same-class device.\n")
+        (goto-char (point-min))
+        (special-mode)))
+    (display-buffer buffer)
+    snapshot))
+
+;;;###autoload
+(defun qq-account-list-online-devices
+    (account-id &optional callback errback)
+  "List QQ clients currently online for managed ACCOUNT-ID.
+
+The result keeps the PushParams online-client roster and the 528/349 DataLine
+candidate roster independent.  Each source is explicitly `unknown' or
+`observed', so an observed empty list does not collapse into not-yet-observed.
+It also carries a third, explicitly derived computer/phone/pad class-route
+projection for the pinned LinuxQQ profile.  This projection never claims that
+a class UID selects one physical same-class Device Instance.
+
+CALLBACK receives the closed source and class-route rosters.  ERRBACK follows
+the Gateway transport convention."
+  (interactive
+   (list (qq-account--read-account-id "List devices for account: ")
+         #'qq-account--display-online-devices
+         #'qq-account--interactive-error))
+  (unless (qq-account--non-empty-string-p account-id)
+    (user-error "qq: Account ID must be a non-empty opaque string"))
+  (unless (qq-account-get account-id)
+    (user-error "qq: QQ account does not exist: %s" account-id))
+  (qq-rpc-call
+   "account.list_online_devices" `((account_id . ,account-id))
+   :projector
+   (lambda (result)
+     (qq-account--project-online-devices result account-id))
    :callback callback
    :errback errback))
 

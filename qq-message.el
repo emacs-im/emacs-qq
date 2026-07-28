@@ -795,6 +795,101 @@ acknowledgement never impersonates a state update."
                qq-message--live-frontiers))
     merged))
 
+(defun qq-message--project-dataline-message (data)
+  "Project one account-scoped DataLine text event DATA."
+  (let* ((owner (qq-message--event-owner data))
+         (_owner (qq-message--sync-account owner))
+         (message (alist-get 'message data))
+         (chat (alist-get 'chat message))
+         (peer-uid (alist-get 'peer_uid chat))
+         (variant (alist-get 'variant chat))
+         (direction (alist-get 'direction message))
+         (message-id (alist-get 'message_id message))
+         (sent-at (alist-get 'sent_at message))
+         (client-sequence (alist-get 'client_sequence message))
+         (message-sequence (alist-get 'message_sequence message))
+         (random (alist-get 'random message))
+         (batch-id (alist-get 'batch_id message))
+         (text (alist-get 'text message))
+         (message-keys (mapcar #'car message))
+         (allowed-message-keys
+          '(message_id chat direction sent_at client_sequence
+                       message_sequence random batch_id text)))
+    (unless (and
+             (qq-account--exact-object-keys-p data '(account_id message))
+             (cl-every (lambda (key) (memq key allowed-message-keys))
+                       message-keys)
+             (= (length message-keys)
+                (length (delete-dups (copy-sequence message-keys))))
+             (cl-every (lambda (key) (assq key message))
+                       '(message_id chat direction sent_at batch_id text))
+             (qq-account--exact-object-keys-p chat '(peer_uid variant))
+             (equal variant "desktop")
+             (member peer-uid '("u_Wcc5rknRRqRO8y5gxMD6sA"
+                                "u_l7jpPIZxQo0mzJwoEt-SKw"))
+             (member direction '("sent" "received"))
+             (qq-message--message-id-p message-id)
+             (qq-account--uint32-p sent-at)
+             (> sent-at 0)
+             (or (null client-sequence)
+                 (qq-account--uint64-decimal-p client-sequence t))
+             (or (null message-sequence)
+                 (qq-account--uint64-decimal-p message-sequence t))
+             (or (null random) (qq-account--uint32-p random))
+             (qq-account--uint64-decimal-p batch-id)
+             (qq-account--non-empty-string-p text)
+             (<= (string-bytes text) 160))
+      (error "qq: Gateway returned an invalid DataLine text event"))
+    (let* ((session-key
+            (qq-state-session-key 'dataline peer-uid variant))
+           (outgoing (equal direction "sent"))
+           (wire-message
+            `((client_sequence . ,client-sequence)
+              (sequence . ,message-sequence)
+              (random . ,random)))
+           (normalized
+            `((id . ,message-id)
+              (server-id . ,message-id)
+              (session-key . ,session-key)
+              (time . ,sent-at)
+              (message-seq
+               . ,(and message-sequence
+                       (not (equal message-sequence "0"))
+                       message-sequence))
+              (native-client-sequence . ,client-sequence)
+              (native-random . ,random)
+              (gateway-account-id . ,owner)
+              (sender-id . nil)
+              (sender-native-id . nil)
+              (sender-name . ,(if outgoing "Me" "My device"))
+              (self-p . ,outgoing)
+              (status . ,(if outgoing 'sent 'received))
+              (segments . (((type . "text")
+                            (data . ((text . ,text))))))
+              (raw-message . ,text)
+              (preview . ,text)
+              (message-type . "dataline")
+              (chat-type . "8")
+              (peer-uid . ,peer-uid)
+              (peer-uin . nil)
+              (peer-name . ,(if (equal peer-uid
+                                       "u_l7jpPIZxQo0mzJwoEt-SKw")
+                                "My pad"
+                              "My phone"))
+              (group-id . nil)
+              (user-id . nil)
+              (target-id . ,peer-uid)
+              (dataline-batch-id . ,batch-id)
+              (order . ,(qq-state--next-message-order))
+              (raw-event . ,(copy-tree data)))))
+      (setq normalized
+            (qq-message--attach-pending-local-id
+             normalized owner wire-message session-key))
+      (let ((merged (qq-message--merge-normalized normalized 'event)))
+        (qq-message--finalize-message-context
+         owner wire-message normalized)
+        merged))))
+
 (defun qq-message--plan-live-frontier (owner normalized)
   "Return OWNER's new live frontier for NORMALIZED, or nil if unchanged.
 
@@ -994,6 +1089,8 @@ responses never advance this observation; only `message.received' events do."
           (pcase event
             ("message.received"
              (qq-message--project-message data))
+            ("dataline.message_received"
+             (qq-message--project-dataline-message data))
             ("message.recalled"
              (qq-message--project-recall data))
             ("message.poked"
@@ -1680,7 +1777,7 @@ self-echo push already consumed the pending receipt."
 (defun qq-message-send
     (session-key segments &optional raw-message callback errback
                  optimistic-segments)
-  "Send SEGMENTS to native private/group SESSION-KEY.
+  "Send SEGMENTS to a native sendable SESSION-KEY.
 
 Supported elements are text, base face (ID 0 through 259), group mention,
 reply, and already prepared image/record/video attachments.  One optional
@@ -1691,20 +1788,43 @@ most 128 non-reply content elements are required.  RAW-MESSAGE is an optional
 optimistic rendering override.
 OPTIMISTIC-SEGMENTS, when non-nil, are stored in the pending row instead of
 protocol-ready SEGMENTS so local media previews never enter the wire request.
-The original reply element remains part of this local rendering shape."
+The original reply element remains part of this local rendering shape.
+DataLine desktop currently accepts exactly one nonempty text segment of at
+most 160 UTF-8 bytes and uses its dedicated `dataline.send_text' operation."
   (let* ((owner (qq-message--current-owner))
-         (_owner (qq-message--sync-account owner))
-         (outbound
-          (qq-message--prepare-outbound session-key segments owner))
-         (reply-to (plist-get outbound :reply-to))
-         (native-segments (plist-get outbound :segments))
-         (conversation (qq-message--conversation-params session-key)))
-    (qq-message--send-request
-     session-key (or optimistic-segments segments) raw-message "message.send"
-     `((conversation . ,conversation)
-       ,@(when reply-to `((reply_to . ,reply-to)))
-       (segments . ,native-segments))
-     callback errback)))
+         (_owner (qq-message--sync-account owner)))
+    (if (eq (qq-state-session-key-type session-key) 'dataline)
+        (let* ((identity (qq-state-session-key-identity session-key))
+               (peer-uid (alist-get 'peer-uid identity))
+               (variant (alist-get 'variant identity))
+               (segment (and (= (length segments) 1) (car segments)))
+               (data (and segment (alist-get 'data segment)))
+               (text (and (equal (alist-get 'type segment) "text")
+                          (alist-get 'text data))))
+          (unless (and (equal variant "desktop")
+                       (member peer-uid '("u_Wcc5rknRRqRO8y5gxMD6sA"
+                                          "u_l7jpPIZxQo0mzJwoEt-SKw"))
+                       (qq-account--non-empty-string-p text)
+                       (<= (string-bytes text) 160))
+            (user-error
+             "qq: DataLine desktop requires one 1–160 byte text segment for a pinned phone/pad class"))
+          (qq-message--send-request
+           session-key (or optimistic-segments segments) raw-message
+           "dataline.send_text"
+           `((chat . ((peer_uid . ,peer-uid) (variant . ,variant)))
+             (text . ,text))
+           callback errback))
+      (let* ((outbound
+              (qq-message--prepare-outbound session-key segments owner))
+             (reply-to (plist-get outbound :reply-to))
+             (native-segments (plist-get outbound :segments))
+             (conversation (qq-message--conversation-params session-key)))
+        (qq-message--send-request
+         session-key (or optimistic-segments segments) raw-message "message.send"
+         `((conversation . ,conversation)
+           ,@(when reply-to `((reply_to . ,reply-to)))
+           (segments . ,native-segments))
+         callback errback)))))
 
 (defun qq-message-send-file
     (session-key resource-id &optional callback errback)
@@ -2158,7 +2278,8 @@ service body and reason.  LIMIT defaults to `qq-recent-contact-count'."
    :callback callback
    :errback errback))
 
-(dolist (event '("message.received" "message.recalled" "message.poked"
+(dolist (event '("message.received" "dataline.message_received"
+                  "message.recalled" "message.poked"
                  "message.reaction_changed" "message.essence_changed"))
   (qq-rpc-register-event
    event #'qq-message--handle-event))

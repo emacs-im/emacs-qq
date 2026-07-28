@@ -6,6 +6,7 @@
 (require 'cl-lib)
 (require 'qq-rpc)
 (require 'qq-message)
+(require 'qq-read)
 
 (defvar qq-rpc-dispatch-test--calls nil)
 
@@ -102,11 +103,13 @@
              ("media.changed" . qq-remote-media--handle-event)
              ("media.removed" . qq-remote-media--handle-event)
              ("attachment.changed" . qq-attachment--handle-event)
-             ("message.received" . qq-message--handle-event)
+              ("message.received" . qq-message--handle-event)
+              ("dataline.message_received" . qq-message--handle-event)
              ("message.recalled" . qq-message--handle-event)
              ("message.poked" . qq-message--handle-event)
              ("message.reaction_changed" . qq-message--handle-event)
              ("message.essence_changed" . qq-message--handle-event)
+             ("conversation.read_state_changed" . qq-read--handle-event)
              ("runtime.resync_required"
               . qq-account--handle-resync-required)))
     (should

@@ -29,16 +29,6 @@
                   (source-session-key destination-session-key message-ids
                                       &optional callback errback))
 
-(defvar qq-api--read-operations (make-hash-table :test #'equal)
-  "In-flight mark-read operations keyed by session key.
-
-Each operation owns the exact NT message id currently in flight and at most
-one newer cursor intent.  It never reconstructs unread counts; those come
-from authoritative Linux QQ observations.")
-
-(defvar qq-api--read-operation-counter 0
-  "Monotonic token used to reject stale read callbacks.")
-
 (defvar qq-api--read-observation-clock 0
   "Monotonic clock for read-state writers and observations.")
 
@@ -92,17 +82,6 @@ earlier, without introducing a generic application-wide generation counter."
            token)
     (puthash session-key token qq-api--session-read-observation-tokens)
     t))
-
-(defun qq-api-read-observation-start ()
-  "Return a freshness token for a caller-owned read-state request."
-  (qq-api--next-read-observation-token))
-
-(defun qq-api-read-observation-accept-p (session-key token)
-  "Accept caller-owned read observation TOKEN for SESSION-KEY if current.
-
-Callers which fetch read state without asking `qq-api' to apply it use this
-barrier before mutating state or choosing a timeline position."
-  (qq-api--accept-read-observation-p session-key token))
 
 (defun qq-api--response-data (response)
   "Extract `data' payload from RESPONSE alist."
@@ -2219,40 +2198,6 @@ peer UIDs stay strings and are never interpreted as QQ numbers."
     ;; future locator kind cannot silently map to the wrong session namespace.
     (_ (error "qq: unsupported Emacs session locator %S" locator))))
 
-(defun qq-api-fetch-session-read-state (session-key &optional callback errback)
-  "Fetch the official Linux QQ read position for SESSION-KEY.
-
-NapCat resolves the kernel first-unread sequence to the hard-cut NT snowflake
-in `first_unread.message_id'.  CALLBACK receives the validated raw read-state
-payload.  Fetching alone does not mutate local unread state: callers that own a
-freshness barrier decide whether the response may be applied."
-  (when (eq (qq-state-session-key-type session-key) 'guild-channel)
-    (user-error "qq: use Guild navigation for channel read state"))
-  (let ((handle-error (or errback #'qq-api--default-error)))
-    (qq-api-call
-     "emacs_get_read_state"
-     (qq-api--session-emacs-params session-key)
-     (lambda (response)
-       (condition-case err
-           (let ((read-state
-                  (qq-protocol-validate-emacs-read-state
-                   (qq-api--response-data response)
-                   "emacs_get_read_state response")))
-             (when callback
-               (funcall callback read-state)))
-         (error
-          (funcall handle-error response (error-message-string err)))))
-     errback)))
-
-(defun qq-api--refresh-session-read-state-after-failure (session-key)
-  "Refresh SESSION-KEY after a failed mark-read without guessing counts."
-  (let ((token (qq-api--next-read-observation-token)))
-    (qq-api-fetch-session-read-state
-     session-key
-     (lambda (read-state)
-       (when (qq-api--accept-read-observation-p session-key token)
-         (qq-state-apply-session-read-state session-key read-state))))))
-
 (defun qq-api-fetch-history-page (session-key cursor direction
                                               &optional callback errback count)
   "Fetch one history page for SESSION-KEY at CURSOR in DIRECTION.
@@ -2561,120 +2506,6 @@ CALLBACK receives the merge-history plist.  ERRBACK receives
          (when callback
            (funcall callback meta))))
      errback)))
-
-(defun qq-api--read-operation-current-p (session-key token)
-  "Return non-nil when TOKEN still owns SESSION-KEY's read operation."
-  (equal token
-         (plist-get (gethash session-key qq-api--read-operations) :token)))
-
-(defun qq-api--finish-read-operation (session-key token)
-  "Settle TOKEN and start SESSION-KEY's newest coalesced read intent.
-
-The operation remains registered while response state and synchronous hooks
-run.  A reentrant `qq-api-mark-message-read' therefore coalesces into the
-current owner instead of starting an overlapping request."
-  (when (qq-api--read-operation-current-p session-key token)
-    (let ((next-message-id
-           (plist-get (gethash session-key qq-api--read-operations)
-                      :next-message-id)))
-      (remhash session-key qq-api--read-operations)
-      (when next-message-id
-        (qq-api--start-mark-message-read session-key next-message-id)))))
-
-(defun qq-api--validate-mark-read-result
-    (session-key message-id response)
-  "Return RESPONSE's closed mark-read result for SESSION-KEY and MESSAGE-ID.
-
-Service and DataLine sessions expose only a session-scoped native read
-capability.  Private and group sessions must report an exact message-scoped
-advance.  The tagged result must echo the requested NT message identity in
-the field belonging to that scope."
-  (let* ((result
-          (qq-protocol-validate-emacs-mark-read-result
-           (qq-api--response-data response)
-           "emacs_mark_read response"))
-         (type (qq-state-session-key-type session-key))
-         (scope (alist-get 'scope result))
-         (expected-scope
-          (if (memq type '(service dataline)) "session" "message"))
-         (reported-id
-          (alist-get (if (equal scope "session")
-                         'requested_message_id
-                       'read_through_message_id)
-                     result)))
-    (unless (equal scope expected-scope)
-      (error "qq: emacs_mark_read returned %s scope for %s session"
-             scope type))
-    (unless (equal reported-id message-id)
-      (error "qq: emacs_mark_read response belongs to %s, requested %s"
-             reported-id message-id))
-    result))
-
-(defun qq-api--start-mark-message-read (session-key message-id)
-  "Start one read-through request for MESSAGE-ID in SESSION-KEY."
-  (let* ((token (cl-incf qq-api--read-operation-counter))
-         (observation-token (qq-api--next-read-observation-token))
-         (operation (list :token token
-                          :message-id message-id
-                          :next-message-id nil)))
-    (puthash session-key operation qq-api--read-operations)
-    (qq-api-call
-     "emacs_mark_read"
-     (append (qq-api--session-emacs-params session-key)
-             `((message_id . ,message-id)))
-     (lambda (response)
-       (when (qq-api--read-operation-current-p session-key token)
-         (unwind-protect
-             (condition-case err
-                 (let* ((result
-                         (qq-api--validate-mark-read-result
-                          session-key message-id response))
-                        (read-state (alist-get 'read_state result)))
-                   (when (qq-api--accept-read-observation-p
-                          session-key observation-token)
-                     (qq-state-apply-session-read-state
-                      session-key read-state)))
-               (error
-                ;; A malformed or contradictory success response is not proof
-                ;; of read state.  Fail closed and request a fresh native state.
-                (qq-api--default-error response (error-message-string err))
-                (qq-api--refresh-session-read-state-after-failure session-key)))
-           (qq-api--finish-read-operation session-key token))))
-     (lambda (response reason)
-       (when (qq-api--read-operation-current-p session-key token)
-         (unwind-protect
-             (progn
-               (qq-api--default-error response reason)
-               (qq-api--refresh-session-read-state-after-failure session-key))
-           ;; Failure does not consume a later cursor intent.  The later target
-           ;; starts clean, so persistent errors cannot self-loop.
-           (qq-api--finish-read-operation session-key token)))))
-    token))
-
-(defun qq-api-mark-message-read (session-key message-id)
-  "Advance SESSION-KEY's native read state using MESSAGE-ID as ownership.
-
-MESSAGE-ID remains the original decimal NT snowflake string.  Private and
-group sessions advance through that exact message.  Linux QQ exposes service
-and DataLine reads only at session scope, so their tagged response explicitly
-reports that wider operation and returns an authoritative post-state instead
-of pretending to own a precise cursor.  Concurrent intents coalesce behind
-one request and retain only the newest target.  Failure starts one
-authoritative read-state refresh."
-  (interactive)
-  (setq message-id
-        (qq-api-validate-message-id message-id "mark read target"))
-  (let ((operation (gethash session-key qq-api--read-operations)))
-    (cond
-     ((null operation)
-      (qq-api--start-mark-message-read session-key message-id))
-     ((equal message-id (plist-get operation :message-id))
-      (plist-get operation :token))
-     (t
-      (setq operation
-            (plist-put operation :next-message-id message-id))
-      (puthash session-key operation qq-api--read-operations)
-      (plist-get operation :token)))))
 
 (defun qq-api--send-text-segments (text &optional reply-to-message-id)
   "Return send_msg segment list for TEXT and optional REPLY-TO-MESSAGE-ID."
@@ -4650,16 +4481,6 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
 (defun qq-api--handle-notice (notice)
   "Handle websocket NOTICE event."
   (pcase (alist-get 'notice_type notice)
-    ("emacs_read_state"
-     (let* ((event
-             (qq-protocol-validate-emacs-read-state-notice
-              notice "websocket event"))
-            (chat (alist-get 'chat event))
-            (read-state (alist-get 'read_state event))
-            (session-key (qq-api-session-key-from-locator chat)))
-       (when (qq-api--accept-read-observation-p
-              session-key (qq-api--next-read-observation-token))
-         (qq-state-apply-session-read-state session-key read-state))))
     ("friend_recall"
      (qq-state-apply-recall
       (qq-state-session-key 'private (alist-get 'user_id notice))

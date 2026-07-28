@@ -30,7 +30,7 @@
 (require 'qq-resource)
 (require 'qq-remote-media)
 (require 'qq-message)
-(require 'qq-message)
+(require 'qq-read)
 (require 'qq-directory)
 (require 'qq-profile)
 (require 'qq-core)

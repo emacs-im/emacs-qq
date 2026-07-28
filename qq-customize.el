@@ -227,9 +227,9 @@ Requires NapCat fork to mark messages with `recalled' / `recall_time'."
 (defcustom qq-chat-show-unread-divider t
   "When non-nil, render an unread divider before the first unread message.
 
-NapCat uses Linux QQ's `getABatchOfContactMsgBoxInfo' and resolves its first
-unread msgSeq to an exact NT snowflake.  The divider is omitted when that
-authoritative position is unavailable."
+The divider requires an exact first-unread NT snowflake from the Gateway's
+authoritative unread materialization.  It is omitted while only read/latest
+cursors are known."
   :type 'boolean
   :group 'qq)
 

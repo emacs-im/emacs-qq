@@ -9,6 +9,7 @@
 (defconst qq-account-test-capabilities
   '("device.reset"
     "account.list" "account.create" "account.status" "account.set_presence"
+    "account.list_online_devices"
     "account.start"
     "account.login.list" "account.login.password" "account.login.quick"
     "account.login.captcha"
@@ -72,6 +73,147 @@
     (should-not (qq-account--uint64-decimal-p value)))
   (dolist (value '("00" "01" "18446744073709551616"))
     (should-not (qq-account--uint64-decimal-p value t))))
+
+(ert-deftest qq-account-online-devices-preserve-independent-source-rosters ()
+  (qq-account-test-with-state
+    (qq-account--upsert-account
+     (qq-account-test-account "slot-a" "online" "10001") 'changed)
+    (let (sent-method sent-params delivered)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-account-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (method params callback _errback &optional _early)
+                   (setq sent-method method sent-params params)
+                   (funcall
+                    callback
+                    '((account_id . "slot-a")
+                      (online_clients
+                       (state . "observed")
+                       (devices
+                        ((instance_id . 537376497)
+                         (client_type . 7)
+                         (kind . "phone")
+                         (state . 1)
+                         (platform_id . 2)
+                         (platform_type . "Android")
+                         (new_client_type . 7)
+                         (device_name . "Phone"))))
+                      (data_line_candidates
+                       (state . "observed")
+                       (devices
+                        ((app_id . 537246243)
+                         (instance_id . 537376497)
+                         (client_type . 7)
+                         (kind . "phone")
+                         (platform_id . 2)
+                         (device_name . "Phone")
+                         (field_11 . 0))))
+                      (data_line_peers
+                       (state . "observed")
+                       (devices
+                        ((class . "phone")
+                         (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+                         (route_profile . "linuxqq_3_2_31_51102")
+                         (candidate_instance_ids . (537376497)))))))
+                   "device-list-request")))
+        (should
+         (equal
+          (qq-account-list-online-devices
+           "slot-a" (lambda (snapshot) (setq delivered snapshot)))
+          "device-list-request")))
+      (should (equal sent-method "account.list_online_devices"))
+      (should (equal sent-params '((account_id . "slot-a"))))
+      (let* ((online (alist-get 'online_clients delivered))
+             (candidates (alist-get 'data_line_candidates delivered))
+             (peers (alist-get 'data_line_peers delivered))
+             (online-device (car (alist-get 'devices online)))
+             (candidate (car (alist-get 'devices candidates)))
+             (peer (car (alist-get 'devices peers))))
+        (should (= (alist-get 'instance_id online-device) 537376497))
+        (should (= (alist-get 'instance_id candidate) 537376497))
+        (should-not (assq 'data_line_peer_uid candidate))
+        (should (equal (alist-get 'class peer) "phone"))
+        (should (equal (alist-get 'peer_uid peer)
+                       "u_Wcc5rknRRqRO8y5gxMD6sA"))))))
+
+(ert-deftest qq-account-online-devices-reject-open-or-duplicate-snapshots ()
+  (let ((client
+         '((instance_id . 11)
+           (client_type . 7)
+           (kind . "phone")
+           (state)
+           (platform_id . 2)
+           (platform_type)
+           (new_client_type)
+           (device_name)))
+        (candidate
+         '((app_id . 1001)
+           (instance_id . 11)
+           (client_type . 7)
+           (kind . "phone")
+           (platform_id . 2)
+           (device_name . "Phone")
+           (field_11))))
+    (should-error
+     (qq-account--project-online-devices
+      `((account_id . "slot-a")
+        (online_clients
+         (state . "observed") (devices ,client ,client))
+        (data_line_candidates (state . "unknown"))
+        (data_line_peers (state . "unknown")))
+      "slot-a"))
+    (should-error
+     (qq-account--project-online-devices
+      `((account_id . "slot-a")
+        (online_clients (state . "unknown"))
+        (data_line_candidates
+         (state . "observed")
+         (devices ,(append candidate '((dev_uid . "u_not_on_wire")))))
+        (data_line_peers (state . "unknown")))
+      "slot-a"))
+    (let* ((sparse (copy-tree client))
+           (client-cell (assq 'client_type sparse))
+           (platform-cell (assq 'platform_type sparse))
+           (name-cell (assq 'device_name sparse)))
+      (setcdr client-cell nil)
+      (setcdr platform-cell "")
+      (setcdr name-cell "")
+      (should
+       (equal
+        (alist-get 'devices
+                   (alist-get
+                    'online_clients
+                    (qq-account--project-online-devices
+                     `((account_id . "slot-a")
+                       (online_clients
+                        (state . "observed") (devices ,sparse))
+                       (data_line_candidates (state . "unknown"))
+                       (data_line_peers (state . "unknown")))
+                     "slot-a")))
+        (list sparse))))))
+
+(ert-deftest qq-account-online-devices-reject-substituted-dataline-class-route ()
+  (dolist (peer
+           '(((class . "phone")
+              (peer_uid . "u_account_uid")
+              (route_profile . "linuxqq_3_2_31_51102")
+              (candidate_instance_ids . (11)))
+             ((class . "phone")
+              (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+              (route_profile . "future_unverified_build")
+              (candidate_instance_ids . (11)))
+             ((class . "pad")
+              (peer_uid . "u_l7jpPIZxQo0mzJwoEt-SKw")
+              (route_profile . "linuxqq_3_2_31_51102")
+              (candidate_instance_ids . (11 11)))))
+    (should-error
+     (qq-account--project-online-devices
+      `((account_id . "slot-a")
+        (online_clients (state . "unknown"))
+        (data_line_candidates (state . "unknown"))
+        (data_line_peers (state . "observed") (devices ,peer)))
+      "slot-a"))))
 
 (ert-deftest qq-account-registry-preserves-domain-and-owns-accessors ()
   (qq-account-test-with-state
@@ -472,7 +614,8 @@
          '((code . "event_stream_lagged") (message . "missed 3")))
         (should (= calls 1))
         (should (equal (nreverse projections)
-                       '("resources" "attachments" "remote_media")))))))
+                       '("conversation_read_states" "resources"
+                         "attachments" "remote_media")))))))
 
 (ert-deftest qq-account-resync-required-accounts-triggers-one-registry-resync ()
   (qq-account-test-with-state
@@ -505,13 +648,15 @@
                  (lambda (&rest _)
                    (cl-incf calls)
                    "resync-1")))
-        (dolist (projection '("resources" "attachments" "remote_media"))
+        (dolist (projection '("conversation_read_states" "resources"
+                              "attachments" "remote_media"))
           (qq-account--handle-resync-required
            "runtime.resync_required"
            `((projection . ,projection) (skipped . "1"))))
         (should (= calls 0))
         (should (equal (nreverse observed)
-                       '(("resources" . "1")
+                       '(("conversation_read_states" . "1")
+                         ("resources" . "1")
                          ("attachments" . "1")
                          ("remote_media" . "1"))))))))
 
