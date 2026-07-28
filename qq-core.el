@@ -1007,10 +1007,12 @@ the later authoritative self event."
                   when plan collect plan))
         (error-fn (or errback #'qq-core--default-error)))
     (cond
-     ((eq (qq-state-session-key-type session-key) 'dataline)
-      ;; DataLine owns a separate text-only protocol. Never stage resources or
-      ;; prepare ordinary private/group attachments before that closed
-      ;; operation has validated the message.
+      ((eq (qq-state-session-key-type session-key) 'dataline)
+       ;; The selected Gateway currently exposes only the dedicated DataLine
+       ;; short-text operation.  Do not stage resources for an ordinary
+       ;; private/group send route.  Stock DataLine has separate file/forward
+       ;; operations; this branch is an implementation boundary, not a claim
+       ;; that the product protocol is text-only.
       (qq-core--start-request
        (lambda (success failure)
          (qq-message-send
@@ -1371,122 +1373,29 @@ the QQ C2C history method provides a latest cursor.  `:empty-p' or
           (t
            (list :unavailable-reason 'group-directory))))))))
 
-(defun qq-core-history-range-before (start-sequence count)
-  "Return a native range of COUNT messages before START-SEQUENCE, or nil at zero."
-  (qq-message--validate-sequence
-   start-sequence "Current history start sequence")
-  (qq-message--validate-history-count count)
-  (unless (equal start-sequence "0")
-    (qq-message-history-range-ending-at
-     (qq-message--decimal-subtract-small start-sequence 1)
-     count)))
+(defconst qq-core-history-port-version qq-message-history-port-version
+  "Version of the conversation-neutral Gateway history contract.")
 
-(defun qq-core-history-range-after
-    (end-sequence count &optional maximum-sequence)
-  "Return COUNT native messages after END-SEQUENCE, capped at MAXIMUM-SEQUENCE.
+(defun qq-core-fetch-history-page
+    (session-key cursor direction callback &optional errback count)
+  "Fetch one conversation-neutral history page.
 
-All sequence values stay canonical decimal strings.  Return nil when MAXIMUM
-is already covered."
-  (qq-message--validate-sequence
-   end-sequence "Current history end sequence")
-  (qq-message--validate-history-count count)
-  (when maximum-sequence
-    (qq-message--validate-sequence
-     maximum-sequence "Known latest history sequence"))
-  (unless (and maximum-sequence
-               (not (qq-account--decimal-less-p
-                     end-sequence maximum-sequence)))
-    (let* ((start-sequence
-            (qq-message--decimal-add-small end-sequence 1))
-           (candidate-end
-            (qq-message--decimal-add-small
-             start-sequence (1- count)))
-           (range-end
-            (if (and maximum-sequence
-                     (qq-account--decimal-less-p
-                      maximum-sequence candidate-end))
-                maximum-sequence
-              candidate-end)))
-      (qq-message--validate-history-range
-       start-sequence range-end))))
-
-(defun qq-core--history-meta (meta &rest properties)
-  "Return native history META prefixed with PROPERTIES."
-  (append properties (copy-sequence meta)))
-
-(defun qq-core-fetch-history-range
-    (session-key start-sequence end-sequence callback &optional errback properties)
-  "Fetch one native history range for SESSION-KEY.
-
-START-SEQUENCE and END-SEQUENCE are inclusive exact strings.  CALLBACK receives
-merge metadata prefixed by optional plist PROPERTIES.  ERRBACK handles a
-transport or protocol failure."
+CURSOR is nil for the authoritative latest page or an opaque cursor returned
+in earlier metadata.  DIRECTION is `older' or `newer'.  CALLBACK always
+receives versioned metadata with opaque older/newer cursors and explicit edge
+flags; callers must not inspect the selected storage/native driver."
+  (unless (memq direction '(older newer))
+    (user-error "qq: History direction must be older or newer"))
+  (setq count (min 100 (max 1 (or count qq-history-fetch-count))))
   (qq-core--start-request
    (lambda (success failure)
-     (qq-message-get-history
-      session-key start-sequence end-sequence
-      (lambda (meta)
-        (funcall success
-                 (apply #'qq-core--history-meta meta properties)))
-      failure))
+     (qq-message--request-history-page
+      session-key cursor direction success failure count))
    callback errback))
 
-(defun qq-core-fetch-private-history-page
-    (session-key cursor callback &optional errback count properties)
-  "Fetch one private roaming-history page for SESSION-KEY.
-
-CURSOR is nil for the initial server-clock request or the exact continuation
-cursor returned by the previous page.  CALLBACK receives merge metadata
-prefixed by optional PROPERTIES."
-  (qq-core--start-request
-   (lambda (success failure)
-     (qq-message-get-private-history
-      session-key cursor
-      (lambda (meta)
-        (funcall success
-                 (apply #'qq-core--history-meta meta properties)))
-       failure
-       (min 100 (max 1 (or count qq-history-fetch-count)))))
-   callback errback))
-
-(defun qq-core-fetch-group-history-window
-    (session-key after-sequence callback &optional errback count)
-  "Fetch a server-frontier group window for SESSION-KEY.
-
-Nil AFTER-SEQUENCE requests the latest page.  A non-nil exact sequence is an
-exclusive forward cursor returned by an earlier window."
-  (qq-core--start-request
-   (lambda (success failure)
-     (qq-message-get-group-history-window
-      session-key after-sequence success failure
-      (min 100 (max 1 (or count qq-history-fetch-count)))))
-   callback errback))
-
-(defun qq-core-fetch-latest-history
-    (session-key callback &optional errback count)
-  "Fetch the native service's latest known history for SESSION-KEY.
-
-Group history asks the service for an authoritative frontier and page in one
-operation; it never trusts a possibly stale contact-directory sequence.
-Private history starts from the service clock through `SsoGetRoamMsg'.
-ERRBACK handles failure and COUNT limits the requested page size."
-  (pcase (qq-state-session-key-type session-key)
-    ('group
-     (qq-core-fetch-group-history-window
-      session-key nil callback errback count))
-    ('private
-     (qq-core-fetch-private-history-page
-      session-key nil callback errback count
-      (list :history-at-latest-p t)))
-    (_
-     (user-error "qq: Native history supports private and group chats"))))
-
-(defun qq-core-fetch-history-around
-    (session-key message-id callback &optional errback count sequence-hint)
-  "Fetch native history around exact MESSAGE-ID in SESSION-KEY.
-
-SEQUENCE-HINT is conversation-scoped metadata carried by a native reply.
-It is used only when the target message is not already cached."
+(defun qq-core--history-around-sequence-hints
+    (session-key message-id sequence-hint)
+  "Return native center/latest sequence hints for one around request."
   (let* ((message
           (and message-id
                (seq-find
@@ -1494,19 +1403,43 @@ It is used only when the target message is not already cached."
                   (equal (alist-get 'server-id candidate) message-id))
                 (qq-state-session-messages session-key))))
          (sequence (or (alist-get 'message-seq message)
-                       sequence-hint)))
-    (if (not sequence)
-        (qq-account--client-error
-         (or errback #'qq-core--default-error)
-         "history_sequence_unavailable"
-         "Native history can seek only a cached message carrying sequence metadata")
-      (pcase-let ((`(,start-sequence . ,end-sequence)
-                   (qq-message-history-range-around
-                    sequence
-                    (min 100 (max 1 (or count qq-history-fetch-count))))))
-        (qq-core-fetch-history-range
-         session-key start-sequence end-sequence callback errback
-         (list :history-target-message-id message-id))))))
+                       sequence-hint))
+         (frontier (qq-core-history-frontier session-key)))
+    (and sequence
+         (list sequence (plist-get frontier :sequence)))))
+
+(defun qq-core-fetch-history-around
+    (session-key message-id callback &optional errback count sequence-hint)
+  "Fetch a conversation-neutral history window around MESSAGE-ID.
+
+SEQUENCE-HINT is accepted only by native private/group adapters.  DataLine
+history resolves the durable Message ID directly.  CALLBACK receives the same
+versioned cursor/edge metadata as `qq-core-fetch-history-page'."
+  (setq count (min 100 (max 1 (or count qq-history-fetch-count))))
+  (pcase (qq-state-session-key-type session-key)
+    ('dataline
+     (qq-core--start-request
+      (lambda (success failure)
+        (qq-message--request-history-around
+         session-key message-id nil nil success failure count))
+      callback errback))
+    ((or 'private 'group)
+     (if-let* ((hints
+                (qq-core--history-around-sequence-hints
+                 session-key message-id sequence-hint)))
+         (qq-core--start-request
+          (lambda (success failure)
+            (qq-message--request-history-around
+             session-key message-id (car hints) (cadr hints)
+             success failure count))
+          callback errback)
+       (qq-account--client-error
+        (or errback #'qq-core--default-error)
+        "history_sequence_unavailable"
+        "Native history can seek only a cached message carrying sequence metadata")))
+    (_
+     (user-error
+      "qq: Unified history supports private, group, and DataLine chats"))))
 
 (defun qq-core-get-forward
     (resource-id scene callback &optional errback)
@@ -1549,9 +1482,8 @@ CALLBACK receives a page plist with messages and the unsupported-entry count."
     (mention "message.send")
     (poke "message.poke")
     (recall "message.recall")
-    (explicit-history "message.get_history"
-                      "message.get_group_history_window"
-                      "message.get_private_history")
+    (history "message.get_history_page"
+             "message.get_history_around")
     (read-receipt "message.mark_read"))
   "Product capabilities and every required negotiated Gateway method.")
 
