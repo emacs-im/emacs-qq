@@ -1382,7 +1382,7 @@
      (should (eq (alist-get 'last-message-self-p session) t)))
    (should-not (qq-state-session "private:90001"))))
 
-(ert-deftest qq-state-apply-recent-contacts-uses-kernel-unread-count ()
+(ert-deftest qq-state-apply-recent-contacts-uses-kernel-stock-badge-count ()
   (qq-test-with-reset
    (qq-state-apply-recent-contacts
     '(((chatType . 2)
@@ -1393,7 +1393,7 @@
        (msgId . "9007199254743009336")
        (msgSeq . "10001")
        (unreadCount . 17))))
-   (should (= 17 (alist-get 'unread-count
+   (should (= 17 (alist-get 'unread-badge-count
                             (qq-state-session "group:20001"))))))
 
 (ert-deftest qq-state-apply-recent-contacts-null-unread-preserves-read-state ()
@@ -1401,7 +1401,7 @@
    (qq-state-upsert-session
     "group:20001"
     '((type . group) (target-id . "20001")
-      (title . "Old") (unread-count . 6))
+      (title . "Old") (unread-badge-count . 6))
     nil)
    (qq-state-apply-recent-contacts
     '(((chatType . 2)
@@ -1414,7 +1414,7 @@
        (lastMessagePreview . "latest")
        (unreadCount))))
    (let ((session (qq-state-session "group:20001")))
-     (should (= 6 (alist-get 'unread-count session)))
+     (should (= 6 (alist-get 'unread-badge-count session)))
      (should (equal "Fresh title" (alist-get 'title session))))))
 
 (ert-deftest qq-state-apply-recent-unread-invalidates-older-exact-position ()
@@ -1422,7 +1422,8 @@
    (qq-state-upsert-session
     "group:20001"
     '((type . group) (target-id . "20001")
-      (unread-count . 6)
+      (unread-message-count . 6)
+      (unread-badge-count . 6)
       (first-unread-message-id . "9007199254742007089")
       (first-unread-message-seq . "30001")
       (read-latest-message-id . "9007199254742007094")
@@ -1436,7 +1437,8 @@
        (lastMessagePreview . "latest")
        (unreadCount . 4))))
    (let ((session (qq-state-session "group:20001")))
-     (should (= 4 (alist-get 'unread-count session)))
+     (should-not (alist-get 'unread-message-count session))
+     (should (= 4 (alist-get 'unread-badge-count session)))
      (should-not (alist-get 'first-unread-message-id session))
      (should-not (alist-get 'first-unread-message-seq session))
      (should-not (alist-get 'read-latest-message-id session))
@@ -1447,7 +1449,7 @@
    (qq-state-upsert-session
     "group:20001"
     '((type . group) (target-id . "20001")
-      (title . "Old") (unread-count . 6))
+      (title . "Old") (unread-badge-count . 6))
     nil)
    (let (checked-key)
      (qq-state-apply-recent-contacts
@@ -1465,10 +1467,10 @@
         nil))
      (let ((session (qq-state-session "group:20001")))
        (should (equal checked-key "group:20001"))
-       (should (= 6 (alist-get 'unread-count session)))
+       (should (= 6 (alist-get 'unread-badge-count session)))
        (should (equal "Fresh title" (alist-get 'title session)))))))
 
-(ert-deftest qq-state-apply-recent-contacts-calibrates-native-mentions ()
+(ert-deftest qq-state-recent-badge-does-not-relabel-native-mentions-as-message-proof ()
   (qq-test-with-reset
    (qq-state-apply-recent-contacts
     '(((chatType . 2)
@@ -1482,10 +1484,10 @@
        (firstUnreadAtMeSeq . "30003")
        (firstUnreadAtAllSeq . "30004"))))
    (let ((session (qq-state-session "group:20001")))
-     (should (equal "30003"
-                    (alist-get 'unread-at-me-message-seq session)))
-     (should (equal "30004"
-                    (alist-get 'unread-at-all-message-seq session))))))
+     (should (= 5 (alist-get 'unread-badge-count session)))
+     (should-not (alist-get 'unread-message-count session))
+     (should-not (alist-get 'unread-at-me-message-seq session))
+     (should-not (alist-get 'unread-at-all-message-seq session)))))
 
 (ert-deftest qq-state-apply-recent-contacts-preserves-message-disturb-state ()
   (qq-test-with-reset
@@ -1516,25 +1518,24 @@
    (should-not (alist-get 'muted-p
                           (qq-state-session "group:20001")))))
 
-(ert-deftest qq-state-apply-session-read-state-keeps-snowflake-string ()
+(ert-deftest qq-state-apply-session-read-projection-keeps-snowflake-string ()
   (qq-test-with-reset
    (qq-state-upsert-session "group:20001" nil nil)
-   (qq-state-apply-session-read-state
+   (qq-state-apply-session-read-projection
     "group:20001"
-    '((unread_count . 5)
-      (first_unread
-       . ((sequence . "30001")
-          (message_id . "9007199254742007089")))
-      (latest
-       . ((sequence . "30005")
-          (message_id . "9007199254742007094")))
-      (mentions
-       (at_me . ((sequence . "30003")
-                 (message_id . "9007199254742007091")))
-       (at_all . ((sequence . "30004")
-                  (message_id . "9007199254742007092"))))))
+    '((unread-message-count . 5)
+      (unread-badge-count . 7)
+      (first-unread-message-id . "9007199254742007089")
+      (first-unread-message-seq . "30001")
+      (unread-at-me-message-id . "9007199254742007091")
+      (unread-at-me-message-seq . "30003")
+      (unread-at-all-message-id . "9007199254742007092")
+      (unread-at-all-message-seq . "30004")
+      (read-position-available . t)
+      (read-latest-message-id . "9007199254742007094")))
    (let ((session (qq-state-session "group:20001")))
-     (should (= 5 (alist-get 'unread-count session)))
+     (should (= 5 (alist-get 'unread-message-count session)))
+     (should (= 7 (alist-get 'unread-badge-count session)))
      (should (equal "30001" (alist-get 'first-unread-message-seq session)))
      (should (equal "9007199254742007089"
                     (alist-get 'first-unread-message-id session)))
@@ -1549,36 +1550,65 @@
 (ert-deftest qq-state-read-position-preserves-sequence-without-exact-anchor ()
   (qq-test-with-reset
    (qq-state-upsert-session "group:20001" nil nil)
-   (qq-state-apply-session-read-state
+   (qq-state-apply-session-read-projection
     "group:20001"
-    '((unread_count . 5)
-      (first_unread
-       . ((sequence . "30001")
-          (message_id)))))
+    '((unread-message-count . 5)
+      (unread-badge-count . nil)
+      (first-unread-message-id . nil)
+      (first-unread-message-seq . "30001")
+      (unread-at-me-message-id . nil)
+      (unread-at-me-message-seq . nil)
+      (unread-at-all-message-id . nil)
+      (unread-at-all-message-seq . nil)
+      (read-position-available . nil)
+      (read-latest-message-id . nil)))
    (let ((session (qq-state-session "group:20001")))
      (should-not (alist-get 'first-unread-message-id session))
      (should (equal "30001"
                     (alist-get 'first-unread-message-seq session)))
      (should-not (alist-get 'read-position-available session)))))
 
+(ert-deftest qq-state-read-projection-rejects-positions-without-exact-unread ()
+  (qq-test-with-reset
+   (qq-state-upsert-session "group:20001" nil nil)
+   (let ((before (qq-state-session "group:20001")))
+     (should-error
+      (qq-state-apply-session-read-projection
+       "group:20001"
+       '((unread-message-count . nil)
+         (unread-badge-count . nil)
+         (first-unread-message-id . nil)
+         (first-unread-message-seq . "30001")
+         (unread-at-me-message-id . nil)
+         (unread-at-me-message-seq . nil)
+         (unread-at-all-message-id . nil)
+         (unread-at-all-message-seq . nil)
+         (read-position-available . nil)
+         (read-latest-message-id . nil))))
+     (should (equal (qq-state-session "group:20001") before)))))
+
 (ert-deftest qq-state-identical-authoritative-read-state-is-a-no-op ()
   (qq-test-with-reset
    (qq-state-upsert-session "group:20001" nil nil)
    (let ((read-state
-          '((unread_count . 5)
-            (first_unread
-             . ((sequence . "30001")
-                (message_id . "9007199254742007089")))
-            (mentions . ((at_me . nil) (at_all . nil)))
-            (latest . nil)))
+          '((unread-message-count . 5)
+            (unread-badge-count . 5)
+            (first-unread-message-id . "9007199254742007089")
+            (first-unread-message-seq . "30001")
+            (unread-at-me-message-id . nil)
+            (unread-at-me-message-seq . nil)
+            (unread-at-all-message-id . nil)
+            (unread-at-all-message-seq . nil)
+            (read-position-available . t)
+            (read-latest-message-id . nil)))
          events)
      (add-hook 'qq-state-change-hook
                (lambda (event)
                  (when (and (eq (plist-get event :type) 'session)
                             (eq (plist-get event :mutation) 'read))
                    (push event events))))
-     (qq-state-apply-session-read-state "group:20001" read-state)
-     (qq-state-apply-session-read-state "group:20001" read-state)
+     (qq-state-apply-session-read-projection "group:20001" read-state)
+     (qq-state-apply-session-read-projection "group:20001" read-state)
      (should (= 1 (length events))))))
 
 (ert-deftest qq-state-rejects-numeric-message-id-from-wire ()
@@ -1916,7 +1946,7 @@
       (message . (((type . "text")
                    (data . ((text . "hello"))))))))
    (let ((session (qq-state-session "private:10001")))
-     (should (= (alist-get 'unread-count session) 0)))
+     (should-not (alist-get 'unread-count session)))
    (qq-state-apply-recall "private:10001" "9007199254741004123")
    (let ((message (car (qq-state-session-messages "private:10001"))))
      (should (qq-state-message-recalled-p message))
@@ -1948,7 +1978,7 @@
      ;; anchors come only from the authoritative kernel read-state event.
      (should-not (alist-get 'unread-at-me-message-id session))
      (should-not (alist-get 'unread-at-all-message-id session))
-     (should (= 0 (alist-get 'unread-count session))))))
+     (should-not (alist-get 'unread-count session)))))
 
 (ert-deftest qq-state-live-message-does-not-change-authoritative-unread-count ()
   (qq-test-with-reset
@@ -2074,7 +2104,7 @@
      (should (equal (alist-get 'variant session) "mobile"))
      (should (equal (alist-get 'sender-name message) "我的手机"))
      (should-not (alist-get 'self-p message))
-     (should (= (alist-get 'unread-count session) 0)))))
+     (should-not (alist-get 'unread-count session)))))
 
 (ert-deftest qq-state-live-missing-or-unknown-chat-type-is-not-routed ()
   (qq-test-with-reset
@@ -2201,7 +2231,7 @@
      (should (equal (alist-get 'title session) "QQ邮箱提醒"))
      (should (equal (alist-get 'preview message)
                     "Henrik Lissner: Re: Doom Emacs"))
-     (should (= (alist-get 'unread-count session) 0)))))
+     (should-not (alist-get 'unread-count session)))))
 
 (ert-deftest qq-state-mail-segment-preview-prefers-protocol-prompt ()
   (should
@@ -2631,7 +2661,7 @@ it kept the element's visible text, the user should still see it."
        ;; Metadata and the independently accepted unread projection still
        ;; refresh even though the message-summary owner lost.
        (should (equal (alist-get 'title session) "stale metadata"))
-       (should (= (alist-get 'unread-count session) 9))))))
+       (should (= (alist-get 'unread-badge-count session) 9))))))
 
 (ert-deftest qq-state-summary-newer-recent-response-supersedes-older-request ()
   (qq-test-with-reset
@@ -2841,15 +2871,15 @@ it kept the element's visible text, the user should still see it."
          (should (equal (plist-get history-event :batch-newest-message-id)
                         "9007199254741004001")))
        (setq events nil)
-       (qq-state-clear-session-unread "private:10001")
+       (qq-state-clear-session-message-unread "private:10001")
        (let ((read-event (car events)))
          (should (eq (plist-get read-event :type) 'session))
          (should (eq (plist-get read-event :mutation) 'read)))
        (setq events nil)
-       (qq-state-set-session-unread "private:10001" 4)
+       (qq-state-set-session-message-unread "private:10001" 4)
        (let ((restore-event (car events)))
          (should (eq (plist-get restore-event :mutation) 'read))
-         (should (= 4 (alist-get 'unread-count
+         (should (= 4 (alist-get 'unread-message-count
                                  (qq-state-session "private:10001")))))))))
 
 (ert-deftest qq-state-filter-only-recall-emits-exact-message-patch ()

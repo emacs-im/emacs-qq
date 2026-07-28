@@ -101,11 +101,11 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
   (qq-root-test-with-reset
    (qq-state-upsert-session
     "group:10001"
-    '((unread-count . 3) (muted-p . nil))
+     '((unread-badge-count . 3) (muted-p . nil))
     nil)
    (qq-state-upsert-session
     "group:10002"
-    '((unread-count . 9) (muted-p . t))
+     '((unread-badge-count . 9) (muted-p . t))
     nil)
    (let ((metrics (qq-root--activity-metrics)))
      (should (= 2 (plist-get metrics :unread)))
@@ -140,7 +140,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
 (ert-deftest qq-root-renders-muted-unread-in-title-trail ()
   (let* ((session '((key . "group:muted")
                     (type . group)
-                    (unread-count . 9)
+                     (unread-badge-count . 9)
                     (muted-p . t)
                     (last-message-preview . "quiet message")))
          (row (qq-root--session-one-line-row session))
@@ -152,7 +152,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
     (should-not (appkit-view-one-line-row-time-tail-face row))))
 
 (ert-deftest qq-root-muted-session-without-unread-has-no-activity-trail ()
-  (let ((session '((muted-p . t) (unread-count . 0))))
+  (let ((session '((muted-p . t) (unread-badge-count . 0))))
     (should (equal "" (qq-root--session-unread-trail session)))
     (should (equal "" (qq-root--session-preview-text session)))))
 
@@ -208,7 +208,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
 
 (ert-deftest qq-root-mentions-stay-important-through-muted-groups ()
   (let ((session '((muted-p . t)
-                   (unread-count . 9)
+                    (unread-badge-count . 9)
                    (unread-at-me-message-seq . "10001")
                    (unread-at-all-message-seq . "10002"))))
     (should (qq-root--session-important-unread-p session))
@@ -221,7 +221,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
       (should (eq 'qq-root-mention-count
                   (get-text-property 4 'face trail))))))
 
-(ert-deftest qq-root-inserts-unread-count-inside-title-brackets ()
+(ert-deftest qq-root-inserts-badge-count-inside-title-brackets ()
   (with-temp-buffer
     (cl-letf (((symbol-function 'qq-media-session-avatar-display-string)
                (lambda (_session) "#"))
@@ -230,7 +230,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
        '((key . "group:1")
          (type . group)
          (title . "Example Group")
-         (unread-count . 3)
+          (unread-badge-count . 3)
          (muted-p . t)
          (last-message-preview . "[image]"))))
     (should (string-match-p

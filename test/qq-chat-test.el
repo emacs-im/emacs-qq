@@ -3711,7 +3711,7 @@
     "private:10001"
     '((title . "Alice")
       (target-id . "10001")
-      (unread-count . 2))
+       (unread-message-count . 2))
     nil)
    (let ((messages
           '(((server-id . "m1") (self-p . nil) (time . 1))
@@ -3730,7 +3730,7 @@
     "private:10001"
     '((title . "Alice")
       (target-id . "10001")
-      (unread-count . 2)
+       (unread-message-count . 2)
       (first-unread-message-id . "m3"))
     nil)
    (with-temp-buffer
@@ -3749,7 +3749,7 @@
     "private:10001"
     '((title . "Alice")
       (target-id . "10001")
-      (unread-count . 1)
+       (unread-message-count . 1)
       (first-unread-message-id . "m2"))
     nil)
    (puthash
@@ -3777,7 +3777,7 @@
        (should (search-forward "Unread Messages" nil t))
        (let ((ctx (appkit-chat-timeline-context "m2")))
          (should (plist-get ctx :insert-unread)))
-       (qq-state-clear-session-unread "private:10001")
+        (qq-state-clear-session-message-unread "private:10001")
        (qq-chat--apply-read-state-change)
        (should-not (plist-get (appkit-chat-timeline-context "m2")
                               :insert-unread))
@@ -4295,6 +4295,60 @@
        (qq-chat-goto-pop-message)
        (should (equal "200"
                       (get-text-property (point) (quote qq-chat-message-anchor))))))))
+
+(ert-deftest qq-chat-private-reply-resolves-origseq-as-client-sequence ()
+  "Private SourceMsg OrigSeq must not be used as a history Message Sequence."
+  (qq-chat-test-with-reset
+   (let* ((session-key "private:10001")
+          (source
+           `((id . "100")
+             (server-id . "100")
+             (session-key . ,session-key)
+             (message-seq . "42108")
+             (native-client-sequence . "47705")
+             (message-type . "private")
+             (sender-id . "10001")
+             (sender-name . "Alice")
+             (time . 1710000100)
+             (raw-message . "quoted text")
+             (preview . "quoted text")
+             (segments . (((type . "text")
+                           (data . ((text . "quoted text"))))))))
+          (reply
+           `((id . "200")
+             (server-id . "200")
+             (session-key . ,session-key)
+             (message-seq . "42112")
+             (native-client-sequence . "60924")
+             (message-type . "private")
+             (sender-id . "10002")
+             (sender-name . "Bob")
+             (time . 1710000200)
+             (raw-message . "reply body")
+             (preview . "reply body")
+             (segments . (((type . "reply")
+                           (data . ((message_seq . "47705"))))
+                          ((type . "text")
+                           (data . ((text . "reply body")))))))))
+     (qq-state-upsert-session
+      session-key
+      '((type . private) (title . "Alice") (target-id . "10001"))
+      nil)
+     (puthash session-key (list source reply) qq-state--messages-by-session)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key session-key)
+       (qq-chat--set-history-window "100" nil)
+       (should (equal "100" (qq-chat--message-reply-id reply)))
+       (should (equal "42108" (qq-chat--message-reply-sequence reply)))
+       (qq-chat-render)
+       (goto-char (point-min))
+       (should (search-forward "Alice: quoted text" nil t))
+       (goto-char (qq-chat--message-position "200"))
+       (qq-chat-goto-reply)
+       (should
+        (equal "100"
+               (get-text-property (point) 'qq-chat-message-anchor)))))))
 
 (ert-deftest qq-chat-goto-reply-jumps-to-sequence-only-history-anchor ()
   (qq-chat-test-with-reset
@@ -5520,7 +5574,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
       `((title . "Group")
         (target-id . "20001")
         (type . group)
-        (unread-count . 2)
+         (unread-message-count . 2)
         (first-unread-message-id . ,second)
         (read-latest-message-id . ,third))
       nil)

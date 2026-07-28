@@ -8,7 +8,7 @@
 (require 'qq-message)
 
 (defconst qq-message-test-capabilities
-  '("message.send" "file.send" "message.poke"
+  '("message.send" "dataline.send_text" "file.send" "message.poke"
     "message.send_merged_forward"
     "message.recall_poke" "message.recall" "message.set_reaction"
     "message.set_essence" "message.set_todo" "message.get_history"
@@ -316,6 +316,106 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
          (qq-message-send-file
           "private:10001" "res-group-file")
          :type 'user-error)))))
+
+(ert-deftest qq-message-dataline-text-uses-the-pinned-class-operation ()
+  (qq-message-test-with-state
+    (let (method params receipt)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (sent-method sent-params callback _errback
+                                      &optional _early)
+                   (setq method sent-method params sent-params)
+                   (funcall callback
+                            '((account_id . "slot-a")
+                              (chat
+                               (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+                               (variant . "desktop"))
+                              (sent_at . 1784700000)
+                              (server_sequence . "0")
+                              (client_sequence . "42001")
+                              (random . 0)
+                              (batch_id . "99")))
+                   "dataline-send")))
+        (should
+         (equal
+          (qq-message-send
+           "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA"
+           '(((type . "text") (data . ((text . "hello phone")))))
+           nil (lambda (value) (setq receipt value)))
+          "dataline-send")))
+      (should (equal method "dataline.send_text"))
+      (should
+       (equal params
+              '((account_id . "slot-a")
+                (chat (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+                      (variant . "desktop"))
+                (text . "hello phone"))))
+      (should (equal (alist-get 'batch_id receipt) "99"))
+      (should (= (hash-table-count qq-message--pending-sends) 1)))))
+
+(ert-deftest qq-message-dataline-self-echo-rekeys-the-optimistic-row ()
+  (qq-message-test-with-state
+    (let ((session-key "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA"))
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (funcall callback
+                            '((account_id . "slot-a")
+                              (chat
+                               (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+                               (variant . "desktop"))
+                              (sent_at . 1784700000)
+                              (server_sequence . "0")
+                              (client_sequence . "42001")
+                              (random . 0)
+                              (batch_id . "99")))
+                   "dataline-send")))
+        (qq-message-send
+         session-key
+         '(((type . "text") (data . ((text . "hello phone")))))))
+      (qq-message--handle-event
+       "dataline.message_received"
+       '((account_id . "slot-a")
+         (message
+          (message_id . "7348923749823749823")
+          (chat
+           (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+           (variant . "desktop"))
+          (direction . "sent")
+          (sent_at . 1784700000)
+          (client_sequence . "42001")
+          (message_sequence . "0")
+          (random . 0)
+          (batch_id . "99")
+          (text . "hello phone"))))
+      (let ((messages (qq-state-session-messages session-key)))
+        (should (= (length messages) 1))
+        (should (equal (alist-get 'server-id (car messages))
+                       "7348923749823749823"))
+        (should-not (alist-get 'message-seq (car messages)))
+        (should (eq (alist-get 'status (car messages)) 'sent)))
+      (should (= (hash-table-count qq-message--pending-sends) 0)))))
+
+(ert-deftest qq-message-dataline-send-rejects-endpoint-substitution-and-rich-content ()
+  (qq-message-test-with-state
+    (let (transport-called)
+      (cl-letf (((symbol-function 'qq-server-send)
+                 (lambda (&rest _args) (setq transport-called t))))
+        (should-error
+         (qq-message-send
+          "dataline:desktop:u_account_uid"
+          '(((type . "text") (data . ((text . "hello"))))))
+         :type 'user-error)
+        (should-error
+         (qq-message-send
+          "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA"
+          '(((type . "face") (data . ((id . "1"))))))
+         :type 'user-error)
+        (should-not transport-called)))))
 
 (ert-deftest qq-message-send-merged-forward-preserves-source-order ()
   (qq-message-test-with-state

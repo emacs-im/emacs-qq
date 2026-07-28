@@ -175,12 +175,12 @@ used only when its QQ number agrees with ACCOUNT."
   "Return root activity metrics for SESSIONS or current state."
   (let* ((sessions (or sessions (qq-state-sessions)))
          (unread (cl-count-if (lambda (session)
-                                (> (or (alist-get 'unread-count session) 0) 0))
+                                 (> (or (alist-get 'unread-badge-count session) 0) 0))
                               sessions))
          (important (cl-count-if #'qq-root--session-important-unread-p sessions))
          (muted (cl-count-if (lambda (session)
                                (and (qq-root--session-muted-p session)
-                                    (> (or (alist-get 'unread-count session) 0) 0)))
+                                    (> (or (alist-get 'unread-badge-count session) 0) 0)))
                              sessions))
          (dms (cl-count-if (lambda (session)
                              (not (eq (alist-get 'type session) 'group)))
@@ -243,17 +243,17 @@ used only when its QQ number agrees with ACCOUNT."
 
 (defun qq-root--session-important-unread-p (session)
   "Return non-nil when SESSION has unmuted unread or an unread mention."
-  (and (> (or (alist-get 'unread-count session) 0) 0)
-       (or (not (qq-root--session-muted-p session))
-           (qq-root--session-mention-kinds session))))
+  (or (and (> (or (alist-get 'unread-badge-count session) 0) 0)
+           (not (qq-root--session-muted-p session)))
+      (qq-root--session-mention-kinds session)))
 
 (defun qq-root--session-unread-trail (session)
   "Return SESSION's propertized unread trail for the title brackets.
 
-Like telega's chat unread trail, ordinary unread count follows the title and
-uses a muted or unmuted face.  Native mention kinds remain independently
-prominent even when the session is muted."
-  (let* ((unread (or (alist-get 'unread-count session) 0))
+Like telega's chat unread trail, the complete stock badge count follows the
+title and uses a muted or unmuted face. Ordinary-message mention kinds remain
+independently prominent even when the badge is unknown or the session muted."
+  (let* ((unread (or (alist-get 'unread-badge-count session) 0))
          (mentions (qq-root--session-mention-kinds session))
          (count-face (if (qq-root--session-muted-p session)
                          'qq-root-muted-count
@@ -331,7 +331,7 @@ message title rather than like dimmed preview content."
 (defun qq-root--session-one-line-row (session)
   "Return one-line row model for SESSION."
   (let* ((session-key (alist-get 'key session))
-         (unread (or (alist-get 'unread-count session) 0))
+         (unread (or (alist-get 'unread-badge-count session) 0))
          (muted (qq-root--session-muted-p session))
          (important (qq-root--session-important-unread-p session))
          (preview-model (qq-root--session-preview-model session)))
@@ -351,7 +351,7 @@ message title rather than like dimmed preview content."
      :line-properties
      (list 'qq-root-row-type 'session
            'qq-root-session-key session-key
-           'qq-root-unread-count unread
+            'qq-root-badge-count unread
            'qq-root-has-unread (and (> unread 0) t)
            'qq-root-muted-p muted
            'qq-root-has-important-unread (and important t))
@@ -670,7 +670,7 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
   (unless (qq-root--move-linewise
            1
            (lambda ()
-             (> (or (get-text-property (point) 'qq-root-unread-count) 0) 0))
+              (> (or (get-text-property (point) 'qq-root-badge-count) 0) 0))
            t)
     (message "qq: no unread sessions")))
 

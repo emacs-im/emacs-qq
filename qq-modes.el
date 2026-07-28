@@ -32,7 +32,8 @@ sessions because native QQ mentions are priority activity."
         (mentions 0))
     (dolist (session (qq-state-sessions))
       (unless (qq-root--session-muted-p session)
-        (cl-incf unread (max 0 (or (alist-get 'unread-count session) 0))))
+        (cl-incf unread
+                 (max 0 (or (alist-get 'unread-badge-count session) 0))))
       (when (qq-root--session-mention-kinds session)
         (cl-incf mentions)))
     (cons unread mentions)))

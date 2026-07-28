@@ -745,7 +745,13 @@ they are never split, normalized, escaped, or reconstructed from metadata."
     `((key . ,session-key)
       ,@identity
       (title . ,target-id)
-      (unread-count . 0)
+      ;; Nil is the first-class "unknown" state. Ordinary message and complete
+      ;; stock badge counts have independent completeness.
+      (unread-message-count . nil)
+      (unread-badge-count . nil)
+      ;; Retained only for protocol-specific projections not yet migrated to
+      ;; the ordinary-message/stock-badge split (currently guild navigation).
+      (unread-count . nil)
       (unread-at-me-message-id . nil)
       (unread-at-me-message-seq . nil)
       (unread-at-all-message-id . nil)
@@ -2558,9 +2564,9 @@ delta from being applied twice."
     (session-key message &optional summary-observation-token source)
   "Merge normalized MESSAGE into SESSION-KEY.
 
-Unread state is deliberately not inferred from message delivery.  The Linux QQ
-kernel's authoritative read-state snapshot is the only source of unread count
-and position, including updates caused by another logged-in client.
+Unread state is deliberately not inferred from message delivery.  Only an
+exact authoritative unread materialization may write the unread count and
+positions, including updates caused by another logged-in client.
 
 SOURCE may be `history'.  A history row transport-correlated with an existing
 live row then enriches that row without replacing its authoritative live
@@ -3123,8 +3129,8 @@ transport timeout."
                         :source 'response)
         updated))))
 
-(defun qq-state-set-session-unread (session-key count)
-  "Set SESSION-KEY unread-count to COUNT and emit `:mutation' `read'.
+(defun qq-state-set-session-message-unread (session-key count)
+  "Set SESSION-KEY ordinary Message Count and emit `:mutation' `read'.
 
 COUNT is clamped to a non-negative integer.  Views treat this mutation as a
 read-state change (header-line + optional unread divider), not a full
@@ -3132,7 +3138,7 @@ timeline rebuild."
   (let ((n (max 0 (if (integerp count) count (truncate (or count 0))))))
     (qq-state-upsert-session
      session-key
-     `((unread-count . ,n)
+     `((unread-message-count . ,n)
        ,@(when (zerop n)
            '((unread-at-me-message-id . nil)
              (unread-at-me-message-seq . nil)
@@ -3145,69 +3151,89 @@ timeline rebuild."
                     :mutation 'read)
     n))
 
-(defun qq-state-clear-session-unread (session-key)
-  "Reset unread count for SESSION-KEY."
-  (qq-state-set-session-unread session-key 0))
+(defun qq-state-clear-session-message-unread (session-key)
+  "Reset SESSION-KEY's ordinary Message Count."
+  (qq-state-set-session-message-unread session-key 0))
 
 (defconst qq-state--session-read-projection-keys
-  '(unread-count
+  '(unread-message-count unread-badge-count
     first-unread-message-id first-unread-message-seq
     unread-at-me-message-id unread-at-me-message-seq
     unread-at-all-message-id unread-at-all-message-seq
     read-position-available read-latest-message-id)
-  "Session fields written by an authoritative kernel read state.")
+  "Session fields written by an authoritative unread materialization.")
 
 (defun qq-state--session-read-projection (session)
   "Return the authoritative read projection of SESSION."
   (mapcar (lambda (key) (cons key (alist-get key session)))
           qq-state--session-read-projection-keys))
 
-(defun qq-state-apply-session-read-state (session-key read-state)
-  "Apply kernel READ-STATE to SESSION-KEY and emit a read mutation.
+(defun qq-state--validate-session-read-projection (projection)
+  "Return an isolated normalized read PROJECTION, or signal an error."
+  (let ((keys (mapcar #'car projection))
+        (message-count (alist-get 'unread-message-count projection))
+        (badge-count (alist-get 'unread-badge-count projection)))
+    (unless (and (proper-list-p projection)
+                 (= (length projection)
+                    (length qq-state--session-read-projection-keys))
+                 (null (seq-difference
+                        keys qq-state--session-read-projection-keys))
+                 (= (length keys) (length (delete-dups (copy-sequence keys)))))
+      (error "qq: invalid internal session read projection"))
+    (dolist (count (list message-count badge-count))
+      (unless (or (null count) (and (integerp count) (>= count 0)))
+        (error "qq: internal unread count must be nil or non-negative")))
+    (when (and message-count badge-count (< badge-count message-count))
+      (error "qq: exact badge count cannot be below exact message count"))
+    (dolist (key '(first-unread-message-id
+                   unread-at-me-message-id unread-at-all-message-id
+                   read-latest-message-id))
+      (qq-protocol-optional-message-id
+       (alist-get key projection) "internal read projection"))
+    (dolist (key '(first-unread-message-seq
+                   unread-at-me-message-seq unread-at-all-message-seq))
+      (let ((sequence (alist-get key projection)))
+        (unless (or (null sequence)
+                    (qq-protocol-message-sequence-p sequence))
+          (error "qq: internal read projection has invalid sequence"))))
+    (unless (memq (alist-get 'read-position-available projection) '(nil t))
+      (error "qq: internal read-position availability must be boolean"))
+    (let* ((first-id (alist-get 'first-unread-message-id projection))
+           (first-seq (alist-get 'first-unread-message-seq projection))
+           (at-me-id (alist-get 'unread-at-me-message-id projection))
+           (at-me-seq (alist-get 'unread-at-me-message-seq projection))
+           (at-all-id (alist-get 'unread-at-all-message-id projection))
+           (at-all-seq (alist-get 'unread-at-all-message-seq projection))
+           (available (alist-get 'read-position-available projection))
+           (unread-position-values
+            (list first-id first-seq at-me-id at-me-seq at-all-id at-all-seq)))
+      (unless (and (or (null at-me-id) at-me-seq)
+                   (or (null at-all-id) at-all-seq)
+                   (cond
+                    ((null message-count)
+                     (and (not available)
+                          (seq-every-p #'null unread-position-values)))
+                    ((zerop message-count)
+                     (and (not available)
+                          (seq-every-p #'null unread-position-values)))
+                    (t
+                     (and (or (null first-id) first-seq)
+                          (eq available (and first-id t))))))
+        (error "qq: inconsistent internal session read projection"))))
+  (copy-tree projection))
 
-READ-STATE is the payload from NapCat `emacs_get_read_state'.  Message ids and
-sequences remain strings; in particular, the NT snowflake message id is never
-coerced to an Emacs number."
-  (let* ((raw-count (alist-get 'unread_count read-state))
-         (count (max 0 (if (numberp raw-count)
-                           (truncate raw-count)
-                         (string-to-number (format "%s" (or raw-count 0))))))
-         (first (alist-get 'first_unread read-state))
-         (latest (alist-get 'latest read-state))
-         (first-id
-          (qq-protocol-optional-message-id
-           (and (listp first) (alist-get 'message_id first))
-           "read state"))
-         (first-seq (qq-state--normalize-id
-                     (and (listp first) (alist-get 'sequence first))))
-         (latest-id
-          (qq-protocol-optional-message-id
-           (and (listp latest) (alist-get 'message_id latest))
-           "read state"))
-         (mentions (alist-get 'mentions read-state))
-         (at-me (and (listp mentions) (alist-get 'at_me mentions)))
-         (at-all (and (listp mentions) (alist-get 'at_all mentions)))
-         (has-unread (> count 0))
-         (available (and has-unread first-id))
-         (projection
-          `((unread-count . ,count)
-            (first-unread-message-id . ,(and has-unread first-id))
-            (first-unread-message-seq . ,(and has-unread first-seq))
-            (unread-at-me-message-id
-             . ,(and has-unread (alist-get 'message_id at-me)))
-            (unread-at-me-message-seq
-             . ,(and has-unread (alist-get 'sequence at-me)))
-            (unread-at-all-message-id
-             . ,(and has-unread (alist-get 'message_id at-all)))
-            (unread-at-all-message-seq
-             . ,(and has-unread (alist-get 'sequence at-all)))
-            (read-position-available . ,(and available t))
-            (read-latest-message-id . ,latest-id)))
-         (existing (qq-state-session session-key)))
+(defun qq-state-apply-session-read-projection (session-key projection)
+  "Apply normalized authoritative read PROJECTION to SESSION-KEY.
+
+PROJECTION is an internal state value, not a Gateway or NapCat wire object.
+Its keys are exactly `qq-state--session-read-projection-keys'. Nil message or
+badge counts independently mean that component has not been materialized."
+  (setq projection (qq-state--validate-session-read-projection projection))
+  (let ((existing (qq-state-session session-key)))
     (unless (and existing
                  (equal (qq-state--session-read-projection existing)
                         projection))
-      (qq-state-upsert-session session-key projection nil)
+      (qq-state-upsert-session session-key (copy-tree projection) nil)
       (qq-state--emit 'session
                       :session-key session-key
                       :session (qq-state-session session-key)
@@ -3756,6 +3782,24 @@ its session metadata can be committed."
        :at-all-seq
        (qq-state--normalize-id (alist-get 'firstUnreadAtAllSeq contact))))))
 
+(defun qq-state--recent-contact-read-projection (entry)
+  "Return legacy recent-contact ENTRY's exact stock-badge projection.
+
+Return nil when the transport omitted its unread count."
+  (let ((unread-count (plist-get entry :unread-count)))
+    (when (and (plist-get entry :unread-entry-p)
+               (qq-protocol--nonnegative-safe-integer-p unread-count))
+      `((unread-message-count . nil)
+        (unread-badge-count . ,unread-count)
+        (first-unread-message-id . nil)
+        (first-unread-message-seq . nil)
+        (unread-at-me-message-id . nil)
+        (unread-at-me-message-seq . nil)
+        (unread-at-all-message-id . nil)
+        (unread-at-all-message-seq . nil)
+        (read-position-available . nil)
+        (read-latest-message-id . nil)))))
+
 (defun qq-state-apply-recent-contacts
     (contacts &optional read-state-writable-p summary-observation-token)
   "Apply recent CONTACTS snapshot to local session store.
@@ -3775,6 +3819,20 @@ write, so malformed payloads cannot leave a half-committed session snapshot."
          ;; Prepare the complete response before the first store mutation.
          (prepared (delq nil (mapcar #'qq-state--prepare-recent-contact
                                      (or contacts '())))))
+    ;; The legacy NapCat recent-contact adapter may know the native stock badge
+    ;; without proving an ordinary Message Count. Normalize and validate every
+    ;; such projection before the first session mutation, then feed the same
+    ;; internal reducer used by nt-gateway below.
+    (setq prepared
+          (mapcar
+           (lambda (entry)
+             (if-let* ((projection
+                        (qq-state--recent-contact-read-projection entry)))
+                 (plist-put
+                  entry :read-projection
+                  (qq-state--validate-session-read-projection projection))
+               entry))
+           prepared))
     (setq qq-state--recent-session-keys
           (delete-dups
            (mapcar (lambda (entry) (plist-get entry :session-key)) prepared)))
@@ -3783,32 +3841,18 @@ write, so malformed payloads cannot leave a half-committed session snapshot."
       (puthash session-key t qq-state--recent-session-key-set))
     (dolist (entry prepared)
       (let* ((session-key (plist-get entry :session-key))
-             (unread-count (plist-get entry :unread-count))
-             (valid-unread-count-p
-              (and (plist-get entry :unread-entry-p)
-                   (qq-protocol--nonnegative-safe-integer-p unread-count)))
+             (read-projection (plist-get entry :read-projection))
              (write-read-state
-              (and valid-unread-count-p
+              (and read-projection
                    (or (null read-state-writable-p)
-                       (funcall read-state-writable-p session-key))))
-             (at-me-seq (plist-get entry :at-me-seq))
-             (at-all-seq (plist-get entry :at-all-seq)))
+                       (funcall read-state-writable-p session-key)))))
         (qq-state-upsert-session
          session-key
-         (append
-          (plist-get entry :metadata-fields)
-          (when write-read-state
-            `((unread-count . ,unread-count)
-              (first-unread-message-id . nil)
-              (first-unread-message-seq . nil)
-              (read-position-available . nil)
-              (read-latest-message-id . nil)
-              (unread-at-me-message-id . nil)
-              (unread-at-me-message-seq . ,(and (> unread-count 0) at-me-seq))
-              (unread-at-all-message-id . nil)
-              (unread-at-all-message-seq . ,(and (> unread-count 0)
-                                                 at-all-seq)))))
+         (plist-get entry :metadata-fields)
          nil)
+        (when write-read-state
+          (qq-state-apply-session-read-projection
+           session-key read-projection))
         (if-let* ((message (plist-get entry :normalized-message)))
             (qq-state--merge-normalized-message session-key message token)
           (qq-state--apply-session-summary
