@@ -1749,82 +1749,193 @@
                        "7348923749823749823"))
         (should (eq (plist-get frontier :source) 'live-event))))))
 
-(ert-deftest qq-core-history-ranges-stay-exact-and-bounded ()
-  (should
-   (equal (qq-core-history-range-before
-           "9007199254741000" 20)
-          '("9007199254740980" . "9007199254740999")))
-  (should
-   (equal (qq-core-history-range-after
-           "9007199254740999" 20 "9007199254741005")
-          '("9007199254741000" . "9007199254741005")))
-  (should-not (qq-core-history-range-before "0" 20))
-  (should-not
-   (qq-core-history-range-after "100" 20 "100")))
+(ert-deftest qq-core-latest-history-uses-one-conversation-neutral-port ()
+  (qq-core-test-with-managed-account
+    (let (call callback-meta)
+      (cl-letf (((symbol-function 'qq-message--request-history-page)
+                 (lambda (session cursor direction callback _errback count)
+                   (setq call (list session cursor direction count))
+                   (funcall
+                    callback
+                    (list :history-port-version qq-core-history-port-version
+                          :history-account-id "slot-a"
+                          :history-session-key session
+                          :message-count 0))
+                   "history-page")))
+        (let ((request
+               (qq-core-fetch-history-page
+                "group:8209413637" nil 'older
+                (lambda (meta) (setq callback-meta meta)) nil 20)))
+          (should (qq-request-p request))
+          (should
+           (equal call '("group:8209413637" nil older 20)))
+          (should (= (plist-get callback-meta :message-count) 0)))))))
 
-(ert-deftest qq-core-latest-group-history-uses-server-frontier-window ()
-  (let (call callback-meta)
-    (cl-letf (((symbol-function 'qq-core-fetch-group-history-window)
-               (lambda (session after callback _errback count)
-                 (setq call (list session after count))
-                 (funcall callback '(:message-count 0 :batch-message-ids nil))
-                 (let ((request (qq-request-create)))
-                   (qq-request-finish request)
-                   request))))
-      (let ((request
-             (qq-core-fetch-latest-history
-              "group:8209413637"
-              (lambda (meta) (setq callback-meta meta)) nil 20)))
-        (should (qq-request-p request))
+(ert-deftest qq-core-history-response-retains-the-request-account ()
+  (qq-core-test-with-managed-account
+    (let (driver-callback callback-meta)
+      (cl-letf (((symbol-function 'qq-message--request-history-page)
+                 (lambda (_session _cursor _direction callback _errback _count)
+                   (setq driver-callback callback)
+                   "history-page")))
+        (qq-core-fetch-history-page
+         "group:8209413637" nil 'older
+         (lambda (meta) (setq callback-meta meta)))
+        ;; Response ownership must not be reconstructed from whichever
+        ;; account happens to be selected when an asynchronous driver ends.
+        (setq qq-account--current-account-id nil)
+        (funcall
+         driver-callback
+         (list :history-port-version qq-core-history-port-version
+               :history-account-id "slot-a"
+               :history-session-key "group:8209413637"
+               :history-older-cursor '((opaque . "older"))
+               :history-newer-cursor '((opaque . "newer"))))
+        (should (equal (plist-get callback-meta :history-account-id)
+                       "slot-a"))
         (should
-         (equal call '("group:8209413637" nil 20)))
-        (should (= (plist-get callback-meta :message-count) 0))))))
+         (equal
+          (plist-get callback-meta :history-older-cursor)
+          '((opaque . "older"))))
+        (should
+         (equal
+          (plist-get callback-meta :history-newer-cursor)
+          '((opaque . "newer"))))))))
 
-(ert-deftest qq-core-private-latest-uses-server-clock-roaming-cursor ()
-  (let (callback-meta call)
-    (cl-letf (((symbol-function 'qq-core-history-frontier)
-               (lambda (_session-key)
-                 '(:unavailable-reason private-latest-sequence)))
-              ((symbol-function 'qq-core-fetch-private-history-page)
-               (lambda (session cursor callback _errback count properties)
-                 (setq call (list session cursor count properties))
-                 (funcall callback
-                          '(:message-count 0 :batch-message-ids nil))
-                 (let ((request (qq-request-create)))
-                   (qq-request-finish request)
-                   request))))
-      (let ((request
-             (qq-core-fetch-latest-history
-              "private:10001"
-              (lambda (meta) (setq callback-meta meta))
-              nil 20)))
-        (should (qq-request-p request)))
+(ert-deftest qq-core-private-latest-does-not-select-a-driver ()
+  (qq-core-test-with-managed-account
+    (let (callback-meta call)
+      (cl-letf (((symbol-function 'qq-message--request-history-page)
+                 (lambda (session cursor direction callback _errback count)
+                   (setq call (list session cursor direction count))
+                   (funcall
+                    callback
+                    (list :history-port-version qq-core-history-port-version
+                          :history-account-id "slot-a"
+                          :history-session-key session
+                          :message-count 0))
+                   "history-page")))
+        (let ((request
+               (qq-core-fetch-history-page
+                "private:10001" nil 'older
+                (lambda (meta) (setq callback-meta meta))
+                nil 20)))
+          (should (qq-request-p request)))
+        (should
+         (equal call
+                '("private:10001" nil older 20)))
+        (should (= (plist-get callback-meta :message-count) 0))
+        (should
+         (= (plist-get callback-meta :history-port-version)
+            qq-core-history-port-version))))))
+
+(ert-deftest qq-core-unified-history-keeps-gateway-cursors-opaque ()
+  (qq-core-test-with-managed-account
+    (let* ((session-key
+            "dataline:mobile:u_Wcc5rknRRqRO8y5gxMD6sA")
+           (older-cursor '((opaque . "older")))
+           (newer-cursor '((opaque . "newer")))
+           calls latest-meta older-meta)
+      (cl-letf
+          (((symbol-function 'qq-message--request-history-page)
+            (lambda (session cursor direction callback _errback count)
+              (push (list session cursor direction count) calls)
+              (funcall
+               callback
+               (list :history-port-version qq-core-history-port-version
+                     :history-account-id "slot-a"
+                     :history-session-key session-key
+                     :history-older-cursor (and (null cursor) older-cursor)
+                     :history-newer-cursor newer-cursor
+                     :history-at-oldest-p (and cursor t)
+                     :history-at-latest-p (null cursor)
+                     :message-count 2
+                     :added-count 2
+                     :batch-message-ids nil))
+              "history-page")))
+        (should
+         (qq-request-p
+          (qq-core-fetch-history-page
+           session-key nil 'older
+           (lambda (meta) (setq latest-meta meta)) nil 20)))
+        (let ((returned-older
+               (plist-get latest-meta :history-older-cursor)))
+          (should (= (plist-get latest-meta :history-port-version)
+                     qq-core-history-port-version))
+          (should (equal returned-older older-cursor))
+          (should (equal (plist-get latest-meta :history-newer-cursor)
+                         newer-cursor))
+          (should
+           (qq-request-p
+            (qq-core-fetch-history-page
+             session-key returned-older 'older
+             (lambda (meta) (setq older-meta meta)) nil 1)))
+          (should (plist-get older-meta :history-at-oldest-p))
+          (should-not (plist-get older-meta :history-older-cursor))))
       (should
-       (equal call
-              '("private:10001" nil 20 (:history-at-latest-p t))))
-      (should (= (plist-get callback-meta :message-count) 0)))))
+       (equal
+        (nreverse calls)
+        (list (list session-key nil 'older 20)
+              (list session-key older-cursor 'older 1)))))))
+
+(ert-deftest qq-core-unified-history-around-routes-dataline-by-message-id ()
+  (qq-core-test-with-managed-account
+    (let* ((session-key
+            "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA")
+           (center "7348923749823749823")
+           call meta)
+      (cl-letf
+          (((symbol-function 'qq-message--request-history-around)
+            (lambda (session message-id sequence latest callback _errback count)
+              (setq call (list session message-id sequence latest count))
+              (funcall
+               callback
+               (list :history-port-version qq-core-history-port-version
+                     :history-account-id "slot-a"
+                     :history-session-key session-key
+                     :history-older-cursor nil
+                     :history-newer-cursor '((opaque . "tail"))
+                     :history-at-oldest-p t
+                     :history-at-latest-p t
+                     :batch-message-ids (list center)
+                     :message-count 1 :added-count 1))
+              "history-around")))
+        (qq-core-fetch-history-around
+         session-key center (lambda (value) (setq meta value)) nil 21))
+      (should (equal call (list session-key center nil nil 21)))
+      (should (plist-get meta :history-at-oldest-p))
+      (should (plist-get meta :history-at-latest-p))
+      (should-not (plist-get meta :history-older-cursor))
+      (should (equal (plist-get meta :history-newer-cursor)
+                     '((opaque . "tail")))))))
 
 (ert-deftest qq-core-around-requires-cached-exact-sequence ()
-  (let (range failure)
-    (cl-letf (((symbol-function 'qq-state-session-messages)
-               (lambda (_session-key)
-                 '(((server-id . "7348923749823749823")
-                    (message-seq . "9007199254740999")))))
-              ((symbol-function 'qq-core-fetch-history-range)
-               (lambda (_session start end _callback _errback _properties)
-                 (setq range (cons start end))
-                 (qq-request-create))))
-      (let ((request
-             (qq-core-fetch-history-around
-              "private:10001" "7348923749823749823" #'ignore nil 20)))
-        (should (qq-request-p request)))
-      (should
-       (equal range
-              '("9007199254740990" . "9007199254741009")))
-      (qq-core-fetch-history-around
-       "private:10001" "missing" #'ignore
-       (lambda (_body reason) (setq failure reason)) 20)
-      (should (string-match-p "cached message" failure)))))
+  (qq-core-test-with-managed-account
+    (let (call failure)
+      (cl-letf (((symbol-function 'qq-state-session-messages)
+                 (lambda (_session-key)
+                   '(((server-id . "7348923749823749823")
+                      (message-seq . "9007199254740999")))))
+                ((symbol-function 'qq-core-history-frontier)
+                 (lambda (_session-key)
+                   '(:sequence "9007199254741005")))
+                ((symbol-function 'qq-message--request-history-around)
+                 (lambda (session center sequence latest
+                                  _callback _errback count)
+                   (setq call (list session center sequence latest count))
+                   "history-around")))
+        (let ((request
+               (qq-core-fetch-history-around
+                "private:10001" "7348923749823749823" #'ignore nil 20)))
+          (should (qq-request-p request)))
+        (should
+         (equal call
+                '("private:10001" "7348923749823749823"
+                  "9007199254740999" "9007199254741005" 20)))
+        (qq-core-fetch-history-around
+         "private:10001" "missing" #'ignore
+         (lambda (_body reason) (setq failure reason)) 20)
+        (should (string-match-p "cached message" failure))))))
 
 (ert-deftest qq-core-bootstrap-completion-requires-opaque-attempt-token ()
   (let* ((old-token (list 'old-bootstrap))

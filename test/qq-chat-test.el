@@ -53,6 +53,42 @@
     (setf (qq-request-token request) token)
     request))
 
+(defun qq-chat-test--history-meta (session-key &rest properties)
+  "Return unified history metadata for SESSION-KEY and PROPERTIES."
+  (append properties
+          (list :history-port-version qq-core-history-port-version
+                :history-account-id "slot-a"
+                :history-session-key session-key
+                :history-older-cursor nil
+                :history-newer-cursor nil
+                :history-at-oldest-p nil
+                :history-at-latest-p nil)))
+
+(defun qq-chat-test--history-cursor (session-key driver &rest properties)
+  "Return one opaque wire-history cursor fixture for SESSION-KEY."
+  (let ((position
+         (pcase driver
+           ('native-sequence
+            `((kind . "native_sequence")
+              (sequence . ,(plist-get properties :sequence))
+              ,@(when-let* ((maximum (plist-get properties :maximum-sequence)))
+                  `((maximum_sequence . ,maximum)))))
+           ('group-window
+            `((kind . "group_window")
+              (sequence . ,(plist-get properties :sequence))))
+           ('private-roam
+            `((kind . "private_roam")
+              (cursor . ,(copy-tree (plist-get properties :cursor)))))
+           ('dataline
+            `((kind . "dataline")
+              (message_id . ,(plist-get properties :message-id))))
+           (_ (error "unknown history cursor fixture %S" driver)))))
+    `((version . ,qq-core-history-port-version)
+      (account_id . "slot-a")
+      (conversation
+       . ,(qq-message--history-conversation-params session-key))
+      (position . ,position))))
+
 (defun qq-chat-test--search-result (id sequence time &optional preview)
   "Return one strict group search result."
   `((chat . ((kind . "group") (group_id . "20001")))
@@ -4448,7 +4484,7 @@
                                   (list (cons (quote text) "hi"))))))))))
 
 (ert-deftest qq-chat-goto-message-uses-history-around ()
-  "Jump prefers fork get_msg_history_around, not load-older from oldest."
+  "Jump uses the unified around port, not repeated older-page loading."
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "private:10001"
@@ -4505,11 +4541,13 @@
                                                                 "old target")))))))))
                     (when callback
                       (funcall callback
-                               (list :added-count 1
-                                     :message-count 1
-                                     :batch-message-ids '("100")
-                                     :batch-oldest-message-id "100"
-                                     :batch-newest-message-id "100")))))
+                               (qq-chat-test--history-meta
+                                "private:10001"
+                                :added-count 1
+                                :message-count 1
+                                :batch-message-ids '("100")
+                                :batch-oldest-message-id "100"
+                                :batch-newest-message-id "100")))))
                  ((symbol-function 'qq-chat-load-older-messages)
                   (lambda ()
                     (setq load-older-called t)
@@ -4535,7 +4573,9 @@
                    (lambda (_session _target callback
                             &optional _errback _count)
                      (cl-incf requests)
-                     (funcall callback '(:message-count 0))))
+                     (funcall callback
+                              (qq-chat-test--history-meta
+                               "private:10001" :message-count 0))))
                   ((symbol-function 'qq-chat--note-history-window) #'ignore)
                   ((symbol-function 'qq-chat--finish-jump-if-loaded)
                    (lambda (_target &optional _sequence) nil))
@@ -5261,6 +5301,24 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
               '(:batch-message-ids nil))
              (cons nil nil))))))
 
+(ert-deftest qq-chat-unified-history-metadata-is-account-conversation-scoped ()
+  (qq-chat-test-with-reset
+    (with-temp-buffer
+      (qq-chat-mode)
+      (setq qq-chat--session-key "group:20001")
+      (should-error
+       (qq-chat--record-gateway-history-range
+        (list :history-port-version qq-core-history-port-version
+              :history-account-id "slot-b"
+              :history-session-key "group:20001"))
+       :type 'error)
+      (should-error
+       (qq-chat--record-gateway-history-range
+        (list :history-port-version qq-core-history-port-version
+              :history-account-id "slot-a"
+              :history-session-key "group:20002"))
+       :type 'error))))
+
 
 
 
@@ -5289,9 +5347,11 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                       ((server-id . "m20") (time . 20)))
                     qq-state--messages-by-session)
                    (funcall callback
-                            '(:added-count 2
-                              :message-count 2
-                              :batch-message-ids ("m19" "m20")))
+                            (qq-chat-test--history-meta
+                             "group:20001"
+                             :added-count 2
+                             :message-count 2
+                             :batch-message-ids '("m19" "m20")))
                    'around-request))
                 ((symbol-function 'qq-chat--finish-jump-if-loaded)
                  (lambda (_target) t))
@@ -5357,12 +5417,15 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
          ;; Wire order and fallback newest are deliberately misleading;
          ;; normalized session order makes NORMALIZED-NEWEST authoritative.
          (qq-chat--note-history-window
-          `(:added-count 3
-            :message-count 3
-            :batch-message-ids
-            (,normalized-newest ,captured-latest ,first)
-            :batch-oldest-message-id ,first
-            :batch-newest-message-id ,captured-latest))
+          (qq-chat-test--history-meta
+           "group:20001"
+           :history-at-latest-p t
+           :added-count 3
+           :message-count 3
+           :batch-message-ids
+           (list normalized-newest captured-latest first)
+           :batch-oldest-message-id first
+           :batch-newest-message-id captured-latest))
          (should (equal qq-chat--remote-latest-id normalized-newest))
          (should (equal (appkit-chat-history-window-first-key) first))
          (should-not (appkit-chat-history-window-last-key))
@@ -5390,11 +5453,13 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
        (cl-letf (((symbol-function 'qq-chat--update-frame) #'ignore)
                  ((symbol-function 'qq-chat--sync-timeline) #'ignore))
          (qq-chat--note-history-window
-          `(:added-count 2
-            :message-count 2
-            :batch-message-ids (,first ,newest)
-            :batch-oldest-message-id ,first
-            :batch-newest-message-id ,newest))
+          (qq-chat-test--history-meta
+           "group:20001"
+           :added-count 2
+           :message-count 2
+           :batch-message-ids (list first newest)
+           :batch-oldest-message-id first
+           :batch-newest-message-id newest))
          ;; Canonical order, rather than snowflake arithmetic, proves that
          ;; the disconnected frontier predates this around window.  Unknown
          ;; is safer and lets a no-progress newer page attach at real latest.
@@ -5436,12 +5501,14 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (qq-chat-test-sync-until-idle)
         (should-not calls))))))
 
-(ert-deftest qq-chat-auto-polls-attached-group-tail-with-a-rate-limit ()
+(ert-deftest qq-chat-auto-polls-attached-unified-history-tail-with-a-rate-limit ()
   (qq-chat-test-with-reset
    (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001"
-          qq-chat--gateway-history-end-sequence "105544")
+          qq-chat--gateway-history-newer-cursor
+          (qq-chat-test--history-cursor
+           "group:20001" 'group-window :sequence "105544"))
     (qq-chat--ensure-view)
     (qq-chat--set-history-window "m10" nil)
     (let ((qq-chat-history-auto-load-threshold 50)
@@ -5691,11 +5758,17 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
 
 
 
-(ert-deftest qq-chat-native-initial-group-history-records-exact-range ()
+(ert-deftest qq-chat-unified-initial-group-history-records-exact-range ()
   (qq-chat-test-with-reset
    (let* ((session-key "group:20001")
           (oldest "7348923749823749801")
-          (latest "7348923749823749820"))
+          (latest "7348923749823749820")
+          (older-cursor
+           (qq-chat-test--history-cursor
+            session-key 'native-sequence :sequence "81"))
+          (newer-cursor
+           (qq-chat-test--history-cursor
+            session-key 'group-window :sequence "100")))
      (qq-state-upsert-session
       session-key '((type . group) (target-id . "20001")) nil)
      (puthash
@@ -5708,104 +5781,163 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
      (with-temp-buffer
        (qq-chat-mode)
        (setq qq-chat--session-key session-key)
-       (cl-letf (((symbol-function 'qq-core-history-frontier)
-                  (lambda (_session-key)
-                    `(:sequence "100"
-                      :message-id ,latest :authoritative-p t)))
-                 ((symbol-function 'qq-core-fetch-latest-history)
-                  (lambda (_session-key callback &optional _errback _count)
+       (cl-letf (((symbol-function 'qq-core-fetch-history-page)
+                  (lambda (_session-key cursor direction callback
+                           &optional _errback _count)
+                    (should-not cursor)
+                    (should (eq direction 'older))
                     (funcall
                      callback
-                     `(:history-at-latest-p t
-                       :requested-start-sequence "81"
-                       :requested-end-sequence "100"
-                       :batch-message-ids (,oldest ,latest)
-                       :message-count 2 :added-count 2))
+                     (qq-chat-test--history-meta
+                      session-key
+                      :history-older-cursor older-cursor
+                      :history-newer-cursor newer-cursor
+                      :history-at-latest-p t
+                      :batch-message-ids (list oldest latest)
+                      :message-count 2 :added-count 2))
                     (qq-chat-test-native-request "latest-native")))
                  ((symbol-function 'qq-chat--ensure-view) #'ignore)
                  ((symbol-function 'qq-chat--sync-timeline) #'ignore)
                  ((symbol-function 'qq-chat--update-frame) #'ignore))
          (qq-chat--load-initial-history (current-buffer) session-key)
-         (should (equal qq-chat--gateway-history-start-sequence "81"))
-         (should (equal qq-chat--gateway-history-end-sequence "100"))
+         (should (equal qq-chat--gateway-history-older-cursor older-cursor))
+         (should (equal qq-chat--gateway-history-newer-cursor newer-cursor))
          (should (equal qq-chat--remote-latest-id latest))
          (should (equal (appkit-chat-history-window-first-key) oldest))
          (should-not (appkit-chat-history-window-last-key))
          (should-not (appkit-chat-history-loading-p)))))))
 
-(ert-deftest qq-chat-native-private-history-bootstraps-and-pages-by-time-cursor ()
+(ert-deftest qq-chat-dataline-initial-window-uses-unified-durable-history ()
   (qq-chat-test-with-reset
-   (let ((session-key "private:10001")
+   (dolist (variant '("desktop" "mobile"))
+     (let* ((peer "u_Wcc5rknRRqRO8y5gxMD6sA")
+            (session-key (format "dataline:%s:%s" variant peer))
+            (message-id "7348923749823749823")
+            history-call)
+       (qq-state-upsert-session
+        session-key '((type . dataline) (title . "My device")) nil)
+       (with-temp-buffer
+         (qq-chat-mode)
+         (setq qq-chat--session-key session-key)
+         (cl-letf (((symbol-function 'qq-core-fetch-history-page)
+                    (lambda (session cursor direction callback
+                             &optional _errback count)
+                      (setq history-call
+                            (list session cursor direction count))
+                      (puthash
+                       session-key
+                       `(((server-id . ,message-id)
+                          (session-key . ,session-key)
+                          (time . 1784700000)
+                          (raw-message . "durable DataLine text")))
+                       qq-state--messages-by-session)
+                      (funcall
+                       callback
+                       (qq-chat-test--history-meta
+                        session-key
+                        :history-at-oldest-p t
+                        :history-at-latest-p t
+                        :batch-message-ids (list message-id)
+                        :message-count 1 :added-count 1))
+                      (qq-chat-test-native-request "dataline-history")))
+                   ((symbol-function 'qq-chat--sync-timeline) #'ignore)
+                   ((symbol-function 'qq-chat--update-frame) #'ignore))
+           (qq-chat--load-initial-history (current-buffer) session-key)
+           (qq-chat-test-sync-until-idle)
+           (should
+            (equal history-call
+                   (list session-key nil 'older qq-history-fetch-count)))
+           (should (equal qq-chat--remote-latest-id message-id))
+           (should
+            (equal (appkit-chat-history-window-first-key) message-id))
+           (should-not (appkit-chat-history-window-last-key))
+           (should (appkit-chat-history-older-loaded-p))))))))
+
+(ert-deftest qq-chat-unified-private-history-pages-by-opaque-cursor ()
+  (qq-chat-test-with-reset
+   (let* ((session-key "private:10001")
          (older-id "7348923749823749822")
          (latest-id "7348923749823749823")
          (first-cursor '((timestamp . 1784700000) (random . 7)))
-         (second-cursor '((timestamp . 1784699900) (random . 9)))
+         (first-history-cursor
+          (qq-chat-test--history-cursor
+           session-key 'private-roam :cursor first-cursor))
          older-call)
      (qq-state-upsert-session
       session-key '((type . private) (target-id . "10001")) nil)
      (with-temp-buffer
        (qq-chat-mode)
        (setq qq-chat--session-key session-key)
-       (cl-letf (((symbol-function 'qq-core-history-frontier)
-                  (lambda (_session-key)
-                    '(:unavailable-reason private-latest-sequence)))
-                 ((symbol-function 'qq-core-fetch-latest-history)
-                  (lambda (_session-key callback &optional _errback _count)
-                    (puthash
-                     session-key
-                     (list (qq-chat-test--gateway-message
-                            session-key latest-id "500" 500 "latest"))
-                     qq-state--messages-by-session)
-                    (funcall
-                     callback
-                     `(:history-at-latest-p t
-                       :private-history-p t
-                       :response-private-cursor ,first-cursor
-                       :batch-message-ids (,latest-id)
-                       :message-count 1 :added-count 1))
-                    (qq-chat-test-native-request "latest-private")))
-                 ((symbol-function 'qq-core-fetch-private-history-page)
-                  (lambda (_session cursor callback
-                           &optional _errback count _properties)
-                    (setq older-call (list cursor count))
-                    (puthash
-                     session-key
-                     (list (qq-chat-test--gateway-message
-                            session-key older-id "499" 499 "older")
-                           (qq-chat-test--gateway-message
-                            session-key latest-id "500" 500 "latest"))
-                     qq-state--messages-by-session)
-                    (funcall
-                     callback
-                     `(:private-history-p t
-                       :response-private-cursor ,second-cursor
-                       :history-at-oldest-p t
-                       :batch-message-ids (,older-id)
-                       :message-count 1 :added-count 1))
-                    (qq-chat-test-native-request "older-private")))
+       (cl-letf (((symbol-function 'qq-core-fetch-history-page)
+                  (lambda (_session cursor direction callback
+                           &optional _errback count)
+                    (should (eq direction 'older))
+                    (if cursor
+                        (progn
+                          (setq older-call (list cursor count))
+                          (puthash
+                           session-key
+                           (list (qq-chat-test--gateway-message
+                                  session-key older-id "499" 499 "older")
+                                 (qq-chat-test--gateway-message
+                                  session-key latest-id "500" 500 "latest"))
+                           qq-state--messages-by-session)
+                          (funcall
+                           callback
+                           (qq-chat-test--history-meta
+                            session-key
+                            :history-at-oldest-p t
+                            :history-at-latest-p nil
+                            :batch-message-ids (list older-id)
+                            :message-count 1 :added-count 1)))
+                      (puthash
+                       session-key
+                       (list (qq-chat-test--gateway-message
+                              session-key latest-id "500" 500 "latest"))
+                       qq-state--messages-by-session)
+                      (funcall
+                       callback
+                       (qq-chat-test--history-meta
+                        session-key
+                        :history-older-cursor first-history-cursor
+                        :history-at-latest-p t
+                        :batch-message-ids (list latest-id)
+                        :message-count 1 :added-count 1)))
+                    (qq-chat-test-native-request
+                     (if cursor "older-private" "latest-private"))))
                  ((symbol-function 'qq-chat--ensure-view) #'ignore)
                  ((symbol-function 'qq-chat--sync-timeline) #'ignore)
                  ((symbol-function 'qq-chat--update-frame) #'ignore))
          (qq-chat--load-initial-history (current-buffer) session-key)
          (should
-          (equal qq-chat--gateway-private-history-cursor first-cursor))
-         (should-not qq-chat--gateway-history-awaiting-frontier-p)
+          (equal qq-chat--gateway-history-older-cursor
+                 first-history-cursor))
          (should-not (appkit-chat-history-older-loaded-p))
          (should
           (equal (appkit-chat-history-window-first-key) latest-id))
 
          (qq-chat-load-older-messages t)
-         (should (equal older-call (list first-cursor qq-history-fetch-count)))
          (should
-          (equal qq-chat--gateway-private-history-cursor second-cursor))
+          (equal older-call
+                 (list first-history-cursor qq-history-fetch-count)))
+         (should-not qq-chat--gateway-history-older-cursor)
          (should (appkit-chat-history-older-loaded-p))
          (should
           (equal (appkit-chat-history-window-first-key) older-id)))))))
 
-(ert-deftest qq-chat-native-older-history-advances-through-empty-sequence-gaps ()
+(ert-deftest qq-chat-unified-older-history-advances-through-empty-pages ()
   (qq-chat-test-with-reset
    (let* ((session-key "group:20001")
           (current-id "7348923749823749900")
+          (older-cursor
+           (qq-chat-test--history-cursor
+            session-key 'native-sequence :sequence "100"))
+          (next-older-cursor
+           (qq-chat-test--history-cursor
+            session-key 'native-sequence :sequence "80"))
+          (newer-cursor
+           (qq-chat-test--history-cursor
+            session-key 'group-window :sequence "119"))
           call)
      (qq-state-upsert-session
       session-key '((type . group) (target-id . "20001")) nil)
@@ -5817,37 +5949,49 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
      (with-temp-buffer
        (qq-chat-mode)
        (setq qq-chat--session-key session-key
-             qq-chat--gateway-history-start-sequence "100"
-             qq-chat--gateway-history-end-sequence "119")
+             qq-chat--gateway-history-older-cursor older-cursor
+             qq-chat--gateway-history-newer-cursor newer-cursor)
        (qq-chat--set-history-window current-id nil)
        (appkit-chat-history-older-loaded-set nil)
-       (cl-letf (((symbol-function 'qq-core-fetch-history-range)
-                  (lambda (_session start end callback &optional _errback _props)
-                    (setq call (cons start end))
+       (cl-letf (((symbol-function 'qq-core-fetch-history-page)
+                  (lambda (_session cursor direction callback
+                           &optional _errback _count)
+                    (setq call (list cursor direction))
                     ;; An all-unsupported page still advances exact coverage.
                     (funcall
                      callback
-                     `(:requested-start-sequence ,start
-                       :requested-end-sequence ,end
-                       :unsupported-message-count 20
-                       :batch-message-ids nil
-                       :message-count 0 :added-count 0))
+                     (qq-chat-test--history-meta
+                      session-key
+                      :history-older-cursor next-older-cursor
+                      :unsupported-message-count 20
+                      :batch-message-ids nil
+                      :message-count 0 :added-count 0))
                     nil))
                  ((symbol-function 'qq-chat--ensure-view) #'ignore))
          (qq-chat-load-older-messages t)
-         (should (equal call '("80" . "99")))
-         (should (equal qq-chat--gateway-history-start-sequence "80"))
+         (should (equal call (list older-cursor 'older)))
+         (should
+          (equal qq-chat--gateway-history-older-cursor next-older-cursor))
          ;; Extending the lower edge must retain the newer cursor.  Replacing
          ;; both edges here made a following forward page restart at 100.
-         (should (equal qq-chat--gateway-history-end-sequence "119"))
+         (should (equal qq-chat--gateway-history-newer-cursor newer-cursor))
          (should (equal (appkit-chat-history-window-first-key) current-id))
          (should-not (appkit-chat-history-older-loaded-p)))))))
 
-(ert-deftest qq-chat-native-newer-group-history-uses-server-frontier-window ()
+(ert-deftest qq-chat-unified-newer-history-uses-opaque-continuation ()
   (qq-chat-test-with-reset
    (let* ((session-key "group:20001")
           (current-id "7348923749823749900")
           (latest-id "7348923749823749905")
+          (older-cursor
+           (qq-chat-test--history-cursor
+            session-key 'native-sequence :sequence "81"))
+          (newer-cursor
+           (qq-chat-test--history-cursor
+            session-key 'group-window :sequence "100"))
+          (next-newer-cursor
+           (qq-chat-test--history-cursor
+            session-key 'group-window :sequence "105"))
           call)
      (qq-state-upsert-session
       session-key '((type . group) (target-id . "20001")) nil)
@@ -5859,14 +6003,15 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
      (with-temp-buffer
        (qq-chat-mode)
        (setq qq-chat--session-key session-key
-             qq-chat--gateway-history-start-sequence "81"
-             qq-chat--gateway-history-end-sequence "100")
+             qq-chat--gateway-history-older-cursor older-cursor
+             qq-chat--gateway-history-newer-cursor newer-cursor)
        ;; An attached window still polls after its exact native sequence;
        ;; `last-key=nil' means no known gap, not "never ask the server again".
        (qq-chat--set-history-window current-id nil)
-       (cl-letf (((symbol-function 'qq-core-fetch-group-history-window)
-                  (lambda (_session after callback &optional _errback count)
-                    (setq call (list after count))
+       (cl-letf (((symbol-function 'qq-core-fetch-history-page)
+                  (lambda (_session cursor direction callback
+                           &optional _errback count)
+                    (setq call (list cursor direction count))
                     (puthash
                      session-key
                      (list (qq-chat-test--gateway-message
@@ -5876,33 +6021,42 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                      qq-state--messages-by-session)
                     (funcall
                      callback
-                     `(:group-history-window-p t
-                       :requested-after-sequence ,after
-                       :history-frontier-sequence "105"
-                       :requested-start-sequence "101"
-                       :requested-end-sequence "105"
-                       :next-after-sequence "105"
-                       :history-at-latest-p t
-                       :batch-message-ids (,latest-id)
-                       :message-count 1 :added-count 1))
+                     (qq-chat-test--history-meta
+                      session-key
+                      :history-newer-cursor next-newer-cursor
+                      :history-at-latest-p t
+                      :batch-message-ids (list latest-id)
+                      :message-count 1 :added-count 1))
                     nil))
                  ((symbol-function 'qq-chat--ensure-view) #'ignore))
          (qq-chat-load-newer-messages t)
-         (should (equal call (list "100" qq-history-fetch-count)))
+         (should
+          (equal call
+                 (list newer-cursor 'newer qq-history-fetch-count)))
          ;; Extending the upper edge must retain the older cursor.  Replacing
          ;; both edges here made a following backward page overlap 81..100.
-         (should (equal qq-chat--gateway-history-start-sequence "81"))
-         (should (equal qq-chat--gateway-history-end-sequence "105"))
+         (should (equal qq-chat--gateway-history-older-cursor older-cursor))
+         (should
+          (equal qq-chat--gateway-history-newer-cursor next-newer-cursor))
          (should-not (appkit-chat-history-window-last-key))
          (should (equal qq-chat--remote-latest-id latest-id)))))))
 
-(ert-deftest qq-chat-private-sequence-window-pages-newer-via-c2c-range ()
-  "Private forward paging uses SsoGetC2cMsg sequence ranges, not roam cursors."
+(ert-deftest qq-chat-private-window-pages-newer-with-opaque-history-cursor ()
+  "Chat forwards the newer cursor without choosing a native driver."
   (qq-chat-test-with-reset
    (let* ((session-key "private:10001")
           (current-id "7348923749823749900")
           (latest-id "7348923749823749905")
           (roam-cursor '((timestamp . 1784700000) (random . 7)))
+          (older-cursor
+           (qq-chat-test--history-cursor
+            session-key 'private-roam :cursor roam-cursor))
+          (newer-cursor
+           (qq-chat-test--history-cursor
+            session-key 'native-sequence :sequence "100"))
+          (next-newer-cursor
+           (qq-chat-test--history-cursor
+            session-key 'native-sequence :sequence "105"))
           call)
      (qq-state-upsert-session
       session-key '((type . private) (target-id . "10001")) nil)
@@ -5914,17 +6068,13 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
      (with-temp-buffer
        (qq-chat-mode)
        (setq qq-chat--session-key session-key
-             qq-chat--gateway-history-start-sequence "81"
-             qq-chat--gateway-history-end-sequence "100"
-             qq-chat--gateway-private-history-cursor (copy-tree roam-cursor))
+             qq-chat--gateway-history-older-cursor older-cursor
+             qq-chat--gateway-history-newer-cursor newer-cursor)
        (qq-chat--set-history-window current-id current-id)
-       (cl-letf (((symbol-function 'qq-core-history-frontier)
-                  (lambda (_session-key)
-                    `(:sequence "105"
-                      :message-id ,latest-id :source live-event)))
-                 ((symbol-function 'qq-core-fetch-history-range)
-                  (lambda (_session start end callback &optional _errback _props)
-                    (setq call (cons start end))
+       (cl-letf (((symbol-function 'qq-core-fetch-history-page)
+                  (lambda (_session cursor direction callback
+                           &optional _errback _count)
+                    (setq call (list cursor direction))
                     (puthash
                      session-key
                      (list (qq-chat-test--gateway-message
@@ -5934,20 +6084,19 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                      qq-state--messages-by-session)
                     (funcall
                      callback
-                     `(:requested-start-sequence ,start
-                       :requested-end-sequence ,end
-                       :batch-message-ids (,latest-id)
-                       :message-count 1 :added-count 1))
+                     (qq-chat-test--history-meta
+                      session-key
+                      :history-newer-cursor next-newer-cursor
+                      :history-at-latest-p t
+                      :batch-message-ids (list latest-id)
+                      :message-count 1 :added-count 1))
                     nil))
-                 ((symbol-function 'qq-core-fetch-private-history-page)
-                  (lambda (&rest _args)
-                    (ert-fail "forward paging must not use SsoGetRoamMsg")))
                  ((symbol-function 'qq-chat--ensure-view) #'ignore))
          (qq-chat-load-newer-messages t)
-         (should (equal call '("101" . "105")))
-         (should (equal qq-chat--gateway-history-start-sequence "81"))
-         (should (equal qq-chat--gateway-history-end-sequence "105"))
-         (should (equal qq-chat--gateway-private-history-cursor roam-cursor))
+         (should (equal call (list newer-cursor 'newer)))
+         (should (equal qq-chat--gateway-history-older-cursor older-cursor))
+         (should
+          (equal qq-chat--gateway-history-newer-cursor next-newer-cursor))
          (should-not (appkit-chat-history-window-last-key)))))))
 
 
@@ -6830,13 +6979,16 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
    (with-temp-buffer
      (qq-chat-mode)
      (setq qq-chat--session-key "private:10001"
-           qq-chat--gateway-private-history-cursor
-           '((timestamp . 200) (random . 3)))
+           qq-chat--gateway-history-older-cursor
+           (qq-chat-test--history-cursor
+            "private:10001" 'private-roam
+            :cursor '((timestamp . 200) (random . 3))))
      (qq-chat--set-history-window "200" "300")
      (let (callback old-view replacement-view projection-calls)
-       (cl-letf (((symbol-function 'qq-core-fetch-private-history-page)
-                  (lambda (_session _cursor success
-                           &optional _failure _count _properties)
+       (cl-letf (((symbol-function 'qq-core-fetch-history-page)
+                  (lambda (_session _cursor direction success
+                           &optional _failure _count)
+                    (should (eq direction 'older))
                     (setq callback success)
                     (qq-chat-test-native-request "older-private"))))
          (qq-chat-load-older-messages t))
@@ -6857,12 +7009,15 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                   (lambda (&rest arguments)
                     (push arguments projection-calls))))
          (funcall callback
-                  '(:private-history-p t
-                    :response-private-cursor
-                    ((timestamp . 150) (random . 4))
-                    :added-count 1
-                    :message-count 2
-                    :batch-message-ids ("150" "200"))))
+                  (qq-chat-test--history-meta
+                   "private:10001"
+                   :history-older-cursor
+                   (qq-chat-test--history-cursor
+                    "private:10001" 'private-roam
+                    :cursor '((timestamp . 150) (random . 4)))
+                   :added-count 1
+                   :message-count 2
+                   :batch-message-ids '("150" "200"))))
        (should-not projection-calls)
        (should-not (appkit-chat-history-loading-p))
        (should-not (appkit-chat-history-request-owner))
@@ -6943,12 +7098,11 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
      (qq-chat-mode)
      (setq qq-chat--session-key "group:20001")
      (let (latest-callback old-view replacement-view projection-calls)
-       (cl-letf (((symbol-function 'qq-core-history-frontier)
-                  (lambda (_session)
-                    '(:sequence "300" :message-id "300"
-                      :authoritative-p t)))
-                 ((symbol-function 'qq-core-fetch-latest-history)
-                  (lambda (_session success &optional _failure _count)
+       (cl-letf (((symbol-function 'qq-core-fetch-history-page)
+                  (lambda (_session cursor direction success
+                           &optional _failure _count)
+                    (should-not cursor)
+                    (should (eq direction 'older))
                     (setq latest-callback success)
                     (qq-chat-test-native-request "latest-token"))))
          (qq-chat--load-initial-history (current-buffer) "group:20001")
@@ -6964,13 +7118,14 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
            (puthash
             "group:20001"
             '(((server-id . "300") (message-seq . "300") (time . 300)))
-            qq-state--messages-by-session)
+           qq-state--messages-by-session)
            (funcall latest-callback
-                    '(:added-count 1
-                      :message-count 1
-                      :requested-start-sequence "281"
-                      :requested-end-sequence "300"
-                      :batch-message-ids ("300")))))
+                    (qq-chat-test--history-meta
+                     "group:20001"
+                     :history-at-latest-p t
+                     :added-count 1
+                     :message-count 1
+                     :batch-message-ids '("300")))))
        (should-not projection-calls)
        (should-not qq-chat--initial-history-request)
        (should-not qq-chat--initial-history-owner)

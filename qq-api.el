@@ -389,9 +389,11 @@ and must not be retained as an `unsupported.raw' diagnostic payload."
     (kind locator &optional context protocol-p)
   "Validate LOCATOR as a send-forward source for exact request KIND.
 
-DataLine remains part of the general session locator union.  Native probes
-support only `individual' from the desktop variant; mobile individual and all
-merged DataLine sends are rejected without fallback."
+DataLine remains part of the general session locator union.  The current
+`emacs_send_forward' adapter exposes only `individual' from the desktop
+variant.  Mobile still needs operation-specific normalization to the type-8
+DataLine path and self-echo reconciliation; this validator must not be read as
+evidence for a second or unsupported 134 wire route."
   (unless (member kind '("individual" "merged"))
     (qq-api--signal-schema-error
      protocol-p "qq: %s has invalid forwarding kind %S"
@@ -413,8 +415,8 @@ merged DataLine sends are rejected without fallback."
   "Validate a sendable forwarding destination LOCATOR.
 
 Only private and group sessions are destinations.  Service sessions remain
-valid send-forward sources; DataLine desktop is valid only as an individual
-source and neither DataLine variant is accepted as a destination."
+valid send-forward sources; the current adapter accepts DataLine desktop only
+as an individual source and neither DataLine variant as a destination."
   (let ((validated
          (qq-api-validate-forward-session-locator
           locator (or context "forward destination") protocol-p)))
@@ -2198,56 +2200,6 @@ peer UIDs stay strings and are never interpreted as QQ numbers."
     ;; future locator kind cannot silently map to the wrong session namespace.
     (_ (error "qq: unsupported Emacs session locator %S" locator))))
 
-(defun qq-api-fetch-history-page (session-key cursor direction
-                                              &optional callback errback count)
-  "Fetch one history page for SESSION-KEY at CURSOR in DIRECTION.
-
-DIRECTION is `older' or `newer'.  A nil CURSOR pulls the latest page.  On the
-current Linux QQ kernel `reverse_order' true walks older and false walks newer.
-
-COUNT overrides `qq-history-fetch-count' when non-nil (used by jump seek).
-
-CALLBACK receives the merge-history plist
-\(`:added-count', `:message-count', `:oldest-message-id', …).
-ERRBACK receives (RESPONSE REASON)."
-  (when (eq (qq-state-session-key-type session-key) 'guild-channel)
-    (user-error "qq: channel history requires an explicit native sequence range"))
-  (let* ((type (alist-get 'type
-                          (qq-state-session-key-identity session-key)))
-         (action (pcase type
-                   ('group "get_group_msg_history")
-                   ('dataline "get_peer_msg_history")
-                   ('service "get_peer_msg_history")
-                   (_ "get_friend_msg_history")))
-         (n (max 1 (or count qq-history-fetch-count)))
-         (params (append
-                  (qq-api--session-request-params session-key)
-                  `((count . ,n))
-                  (when cursor
-                    `((message_seq . ,(format "%s" cursor))
-                      (reverse_order . ,(if (eq direction 'older) t :false)))))))
-    (qq-api--call-with-materialization-owner
-     session-key
-     action
-     params
-     (lambda (response request-owner)
-       (let* ((data (qq-api--response-data response))
-              (messages (alist-get 'messages data nil nil #'eq))
-              (meta (qq-state-merge-history
-                     session-key messages request-owner)))
-         (qq-api--apply-pending-essences session-key)
-         (when callback
-           (funcall callback meta))))
-     errback)))
-
-(defun qq-api-fetch-older-history (session-key &optional before-message-id callback errback count)
-  "Fetch latest or older history for SESSION-KEY.
-
-BEFORE-MESSAGE-ID is the optional older-page cursor."
-  (interactive)
-  (qq-api-fetch-history-page session-key before-message-id 'older
-                             callback errback count))
-
 (defun qq-api-chat-locator (session-key)
   "Return strict fork-native ChatLocator for SESSION-KEY."
   (let* ((identity (qq-state-session-key-identity session-key))
@@ -2456,57 +2408,6 @@ parent message id, or a different interface."
   "Forward ordered MESSAGE-IDS as one native merged-forward card."
   (qq-message-send-merged-forward
    source-session-key target-session-key message-ids callback errback))
-(defun qq-api--history-around-params (session-key message-id count)
-  "Build `get_msg_history_around' params for SESSION-KEY centered on MESSAGE-ID."
-  (setq message-id
-        (qq-api-validate-message-id message-id "get_msg_history_around"))
-  (let* ((identity (qq-state-session-key-identity session-key))
-         (type (alist-get 'type identity))
-         (target-id (alist-get 'target-id identity))
-         (params `((message_id . ,message-id)
-                   (count . ,(max 1 count)))))
-    (pcase type
-      ('group
-       (append params `((group_id . ,(format "%s" target-id)))))
-      ('dataline
-       (append params
-               `((chat_type . ,(alist-get 'chat-type identity))
-                 (peer_uid . ,(alist-get 'peer-uid identity)))))
-      ('service
-       (append params
-               `((chat_type . ,(alist-get 'chat-type identity))
-                 (peer_uid . ,(alist-get 'peer-uid identity)))))
-      (_
-       (append params
-               `((user_id . ,target-id)))))))
-
-(defun qq-api-fetch-history-around (session-key message-id callback &optional errback count)
-  "Fetch a history window around MESSAGE-ID (NapCat `get_msg_history_around').
-
-Fork action: older+newer pages around the NT snowflake center (telega around).
-CALLBACK receives the merge-history plist.  ERRBACK receives
-`(RESPONSE REASON)' when the exact around request fails."
-  (when (eq (qq-state-session-key-type session-key) 'guild-channel)
-    (user-error "qq: channel history requires an explicit native sequence range"))
-  (let ((n (max 1 (or count
-                      (and (boundp 'qq-chat-jump-history-count)
-                           qq-chat-jump-history-count)
-                      qq-history-fetch-count))))
-    (qq-api--call-with-materialization-owner
-     session-key
-     "get_msg_history_around"
-     (qq-api--history-around-params session-key message-id n)
-     (lambda (response request-owner)
-       (let* ((data (qq-api--response-data response))
-              (messages (or (alist-get 'messages data nil nil #'eq)
-                            (and (listp data) data)))
-              (meta (qq-state-merge-history
-                     session-key messages request-owner)))
-         (qq-api--apply-pending-essences session-key)
-         (when callback
-           (funcall callback meta))))
-     errback)))
-
 (defun qq-api--send-text-segments (text &optional reply-to-message-id)
   "Return send_msg segment list for TEXT and optional REPLY-TO-MESSAGE-ID."
   (append

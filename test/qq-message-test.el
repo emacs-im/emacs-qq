@@ -12,7 +12,7 @@
     "message.send_merged_forward"
     "message.recall_poke" "message.recall" "message.set_reaction"
     "message.set_essence" "message.set_todo" "message.get_history"
-    "message.get_group_history_window" "message.get_private_history"
+    "message.get_history_page" "message.get_history_around"
     "message.get_forward"
     "message.mark_read")
   "Native Gateway capabilities exercised by message tests.")
@@ -214,31 +214,57 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (unsupported_message_count . ,unsupported-count)
     (messages . ,(vconcat (mapcar #'copy-tree (append messages nil))))))
 
-(cl-defun qq-message-test-private-history-result
-    (messages requested response &key complete (unsupported-count 0))
-  "Return a closed private history result containing MESSAGES."
-  `((account_id . "slot-a")
-    (requested_cursor . ,(copy-tree requested))
-    (response_cursor . ,(copy-tree response))
-    (complete . ,(if complete t :false))
-    (unsupported_message_count . ,unsupported-count)
-    (messages . ,(vconcat (mapcar #'copy-tree (append messages nil))))))
+(cl-defun qq-message-test-dataline-message
+    (&key (variant "desktop")
+     (peer-uid "u_Wcc5rknRRqRO8y5gxMD6sA")
+     (message-id "7348923749823749823")
+     (direction "received") (sent-at 1784700000)
+     (client-sequence "0") (message-sequence "0")
+     (random 0) (batch-id "99") (text "durable DataLine text"))
+  "Return one closed DataLine timeline message fixture."
+  `((message_id . ,message-id)
+    (chat . ((peer_uid . ,peer-uid) (variant . ,variant)))
+    (direction . ,direction)
+    (sent_at . ,sent-at)
+    (client_sequence . ,client-sequence)
+    (message_sequence . ,message-sequence)
+    (random . ,random)
+    (batch_id . ,batch-id)
+    (text . ,text)))
 
-(cl-defun qq-message-test-group-history-window-result
-    (messages after frontier start end next
-              &key caught-up (unsupported-count 0))
-  "Return a closed authoritative group history window result."
-  `((account_id . "slot-a")
-    (requested_after_sequence . ,after)
-    (frontier_sequence . ,frontier)
-    (requested_start_sequence . ,start)
-    (requested_end_sequence . ,end)
-    (response_start_sequence . ,start)
-    (response_end_sequence . ,end)
-    (next_after_sequence . ,next)
-    (caught_up . ,(if caught-up t :false))
-    (unsupported_message_count . ,unsupported-count)
-    (messages . ,(vconcat (mapcar #'copy-tree (append messages nil))))))
+(cl-defun qq-message-test-dataline-page
+    (messages &key (variant "desktop") requested-cursor
+              older-cursor newer-cursor (direction "older")
+              at-oldest at-latest)
+  "Return a closed unified DataLine page containing MESSAGES."
+  `((history_version . ,qq-message-history-port-version)
+    (account_id . "slot-a")
+    (conversation
+     . ((kind . "dataline")
+        (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+        (variant . ,variant)))
+    (direction . ,direction)
+    (requested_cursor . ,(copy-tree requested-cursor))
+    (messages
+     . ,(vconcat
+         (mapcar (lambda (message)
+                   `((kind . "dataline")
+                     (message . ,(copy-tree message))))
+                 (append messages nil))))
+    (unsupported_message_count . 0)
+    (older_cursor . ,(copy-tree older-cursor))
+    (newer_cursor . ,(copy-tree newer-cursor))
+    (at_oldest . ,(if at-oldest t :false))
+    (at_latest . ,(if at-latest t :false))))
+
+(defun qq-message-test-history-cursor
+    (session-key position &optional account-id)
+  "Return a scoped unified history cursor fixture."
+  `((version . ,qq-message-history-port-version)
+    (account_id . ,(or account-id "slot-a"))
+    (conversation
+     . ,(qq-message--history-conversation-params session-key))
+    (position . ,(copy-tree position))))
 
 (defmacro qq-message-test-with-state (&rest body)
   "Run BODY with one selected account and isolated message projection state."
@@ -399,6 +425,233 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (should-not (alist-get 'message-seq (car messages)))
         (should (eq (alist-get 'status (car messages)) 'sent)))
       (should (= (hash-table-count qq-message--pending-sends) 0)))))
+
+(ert-deftest qq-message-unified-history-projects-mobile-dataline-page ()
+  (qq-message-test-with-state
+    (let* ((session-key
+            "dataline:mobile:u_Wcc5rknRRqRO8y5gxMD6sA")
+           (text (make-string 200 ?x))
+           (message
+            (qq-message-test-dataline-message
+             :variant "mobile" :text text))
+           (tail-cursor
+            (qq-message-test-history-cursor
+             session-key
+             '((kind . "dataline")
+               (message_id . "7348923749823749823"))))
+           method params meta)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (candidate candidate-params callback _errback
+                          &optional _early)
+                   (setq method candidate params candidate-params)
+                   (funcall
+                    callback
+                    (qq-message-test-dataline-page
+                     (list message) :variant "mobile"
+                     :newer-cursor tail-cursor
+                     :at-oldest t :at-latest t))
+                   "history-page")))
+        (should
+         (equal
+          (qq-message--request-history-page
+           session-key nil 'older
+           (lambda (value) (setq meta value)) nil 20)
+          "history-page")))
+      (should (equal method "message.get_history_page"))
+      (should
+       (equal
+        params
+        '((account_id . "slot-a")
+          (conversation
+           (kind . "dataline")
+           (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+           (variant . "mobile"))
+          (direction . "older")
+          (count . 20))))
+      (should (= (plist-get meta :history-port-version)
+                 qq-message-history-port-version))
+      (should (plist-get meta :history-at-oldest-p))
+      (should (plist-get meta :history-at-latest-p))
+      (should (equal (plist-get meta :history-newer-cursor)
+                     tail-cursor))
+      (let ((projected (car (qq-state-session-messages session-key))))
+        (should (equal (alist-get 'server-id projected)
+                       "7348923749823749823"))
+        (should (equal (alist-get 'chat-type projected) "134"))
+        (should-not (alist-get 'message-seq projected))
+        (should (equal (alist-get 'raw-message projected) text))))))
+
+(ert-deftest qq-message-unified-around-keeps-dataline-message-id-locator ()
+  (qq-message-test-with-state
+    (let* ((session-key
+            "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA")
+           (center "7348923749823749823")
+           (tail-cursor
+            (qq-message-test-history-cursor
+             session-key
+             `((kind . "dataline") (message_id . ,center))))
+           method params meta)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (candidate candidate-params callback _errback
+                          &optional _early)
+                   (setq method candidate params candidate-params)
+                   (funcall
+                   callback
+                    `((history_version . ,qq-message-history-port-version)
+                      (account_id . "slot-a")
+                      (conversation
+                       . ((kind . "dataline")
+                          (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+                          (variant . "desktop")))
+                      (center_message_id . ,center)
+                      (messages
+                       . [((kind . "dataline")
+                           (message
+                            . ,(qq-message-test-dataline-message
+                                :message-id center)))])
+                      (unsupported_message_count . 0)
+                      (older_cursor)
+                      (newer_cursor . ,tail-cursor)
+                      (at_oldest . t)
+                      (at_latest . t)))
+                   "history-around")))
+        (qq-message--request-history-around
+         session-key center nil nil
+         (lambda (value) (setq meta value)) nil 21))
+      (should (equal method "message.get_history_around"))
+      (should
+       (equal
+        params
+        `((account_id . "slot-a")
+          (conversation
+           (kind . "dataline")
+           (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+           (variant . "desktop"))
+          (center_message_id . ,center)
+          (count . 21))))
+      (should (plist-get meta :history-at-oldest-p))
+      (should (plist-get meta :history-at-latest-p))
+      (should (equal (plist-get meta :history-newer-cursor)
+                     tail-cursor)))))
+
+(ert-deftest qq-message-unified-history-projects-native-private-page ()
+  (qq-message-test-with-state
+    (let* ((session-key "private:10001")
+           (message (alist-get 'message (qq-message-test-event)))
+           (older-cursor
+            (qq-message-test-history-cursor
+             session-key
+             '((kind . "private_roam")
+               (cursor . ((timestamp . 1784690000) (random . 7))))))
+           method params meta)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (candidate candidate-params callback _errback
+                          &optional _early)
+                   (setq method candidate params candidate-params)
+                   (funcall
+                    callback
+                    `((history_version . ,qq-message-history-port-version)
+                      (account_id . "slot-a")
+                      (conversation
+                       . ((kind . "private") (peer_uin . "10001")))
+                      (direction . "older")
+                      (requested_cursor)
+                      (messages
+                       . [((kind . "native")
+                           (message . ,message))])
+                      (unsupported_message_count . 0)
+                      (older_cursor . ,older-cursor)
+                      (newer_cursor)
+                      (at_oldest . :false)
+                      (at_latest . t)))
+                   "history-page")))
+        (qq-message--request-history-page
+         session-key nil 'older
+         (lambda (value) (setq meta value)) nil 20))
+      (should (equal method "message.get_history_page"))
+      (should
+       (equal params
+              '((account_id . "slot-a")
+                (conversation (kind . "private") (peer_uin . "10001"))
+                (direction . "older")
+                (count . 20))))
+      (should (equal (plist-get meta :history-older-cursor)
+                     older-cursor))
+      (should (= (length (qq-state-session-messages session-key)) 1)))))
+
+(ert-deftest qq-message-unified-history-rejects-cross-scope-cursors-locally ()
+  (qq-message-test-with-state
+    (let* ((group-cursor
+            (qq-message-test-history-cursor
+             "group:20001"
+             '((kind . "native_sequence") (sequence . "100"))))
+           (other-account-cursor
+            (qq-message-test-history-cursor
+             "private:10001"
+             '((kind . "private_roam")
+               (cursor . ((timestamp . 100) (random . 1))))
+             "slot-b"))
+           transport-called)
+      (cl-letf (((symbol-function 'qq-server-send)
+                 (lambda (&rest _args) (setq transport-called t))))
+        (should-error
+         (qq-message--request-history-page
+          "private:10001" group-cursor 'older)
+         :type 'error)
+        (should-error
+         (qq-message--request-history-page
+          "private:10001" other-account-cursor 'older)
+         :type 'error)
+        (should-not transport-called)))))
+
+(ert-deftest qq-message-unified-native-around-sends-only-adapter-hints ()
+  (qq-message-test-with-state
+    (let ((center "7348923749823749823") method params meta)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (candidate candidate-params callback _errback
+                          &optional _early)
+                   (setq method candidate params candidate-params)
+                   (funcall
+                    callback
+                    `((history_version . ,qq-message-history-port-version)
+                      (account_id . "slot-a")
+                      (conversation
+                       . ((kind . "private") (peer_uin . "10001")))
+                      (center_message_id . ,center)
+                      (messages . [])
+                      (unsupported_message_count . 1)
+                      (older_cursor)
+                      (newer_cursor)
+                      (at_oldest . :false)
+                      (at_latest . t)))
+                   "history-around")))
+        (qq-message--request-history-around
+         "private:10001" center "9007199254740999"
+         "9007199254741005" (lambda (value) (setq meta value)) nil 21))
+      (should (equal method "message.get_history_around"))
+      (should
+       (equal
+        params
+        `((account_id . "slot-a")
+          (conversation (kind . "private") (peer_uin . "10001"))
+          (center_message_id . ,center)
+          (sequence_hint . "9007199254740999")
+          (latest_sequence_hint . "9007199254741005")
+          (count . 21))))
+      (should (= (plist-get meta :message-count) 0))
+      (should (plist-get meta :history-at-latest-p)))))
 
 (ert-deftest qq-message-dataline-send-rejects-endpoint-substitution-and-rich-content ()
   (qq-message-test-with-state
@@ -2018,26 +2271,6 @@ push carries sequence=40909 and client_sequence=30202."
      (qq-message--validate-history-range (car range) (cadr range))
      :type 'user-error)))
 
-(ert-deftest qq-message-history-page-arithmetic-never-coerces-sequence ()
-  (should
-   (equal
-    (qq-message-history-range-ending-at
-     "18446744073709551615" 100)
-    '("18446744073709551516" . "18446744073709551615")))
-  (should
-   (equal (qq-message-history-range-ending-at "12" 20)
-          '("0" . "12")))
-  (should
-   (equal (qq-message-history-range-around "2" 20)
-          '("0" . "19")))
-  (should
-   (equal
-    (qq-message-history-range-around "9007199254740999" 20)
-    '("9007199254740990" . "9007199254741009")))
-  (should-error
-   (qq-message-history-range-ending-at "99" 101)
-   :type 'user-error))
-
 (ert-deftest qq-message-live-frontier-uses-events-not-history ()
   (qq-message-test-with-state
     (qq-message--handle-event
@@ -2083,7 +2316,7 @@ push carries sequence=40909 and client_sequence=30202."
                    "request-history")))
         (should
          (equal
-          (qq-message-get-history
+          (qq-message--request-native-history-range
            "group:8209413637"
            "18446744073709551516" "18446744073709551615"
            (lambda (meta) (setq callback-meta meta)))
@@ -2149,133 +2382,6 @@ push carries sequence=40909 and client_sequence=30202."
         ;; The result is viewer-local data, not a timeline/history merge.
         (should-not (qq-state-session-messages "private:10001"))))))
 
-(ert-deftest qq-message-group-history-window-anchors-at-server-frontier ()
-  (qq-message-test-with-state
-    (let (sent-method sent-params callback-meta)
-      (cl-letf (((symbol-function 'qq-server-ready-p)
-                 (lambda () t))
-                ((symbol-function 'qq-server-capabilities)
-                 (lambda () qq-message-test-capabilities))
-                ((symbol-function 'qq-server-send)
-                 (lambda (method params callback _errback &optional _early)
-                   (setq sent-method method sent-params params)
-                   (funcall
-                    callback
-                    (qq-message-test-group-history-window-result
-                     nil nil "100" "81" "100" "100" :caught-up t))
-                   "request-group-window")))
-        (should
-         (equal
-          (qq-message-get-group-history-window
-           "group:8209413637" nil
-           (lambda (meta) (setq callback-meta meta))
-           nil 20)
-          "request-group-window"))
-        (should (equal sent-method "message.get_group_history_window"))
-        (should
-         (equal
-          sent-params
-          '((account_id . "slot-a")
-            (conversation . ((kind . "group")
-                             (group_uin . "8209413637")))
-            (limit . 20))))
-        (should (plist-get callback-meta :group-history-window-p))
-        (should (plist-get callback-meta :history-at-latest-p))
-        (should
-         (equal (plist-get callback-meta :history-frontier-sequence)
-                "100"))
-        (should
-         (equal (plist-get callback-meta :next-after-sequence) "100"))))))
-
-(ert-deftest qq-message-group-history-window-advances-across-unsupported-slots ()
-  (qq-message-test-with-state
-    (let (sent-params callback-meta)
-      (cl-letf (((symbol-function 'qq-server-ready-p)
-                 (lambda () t))
-                ((symbol-function 'qq-server-capabilities)
-                 (lambda () qq-message-test-capabilities))
-                ((symbol-function 'qq-server-send)
-                 (lambda (_method params callback _errback &optional _early)
-                   (setq sent-params params)
-                   (funcall
-                    callback
-                    (qq-message-test-group-history-window-result
-                     nil "100" "140" "101" "120" "120"
-                     :unsupported-count 20))
-                   "request-group-window")))
-        (qq-message-get-group-history-window
-         "group:8209413637" "100"
-         (lambda (meta) (setq callback-meta meta))
-         nil 20)
-        (should (equal (alist-get 'after_sequence sent-params) "100"))
-        (should-not (plist-get callback-meta :history-at-latest-p))
-        (should
-         (equal (plist-get callback-meta :next-after-sequence) "120"))
-        (should
-         (= (plist-get callback-meta :unsupported-message-count) 20))))))
-
-(ert-deftest qq-message-private-history-bootstraps-and-keeps-cursor ()
-  (qq-message-test-with-state
-    (let (sent-method sent-params callback-meta)
-      (cl-letf (((symbol-function 'qq-server-ready-p)
-                 (lambda () t))
-                ((symbol-function 'qq-server-capabilities)
-                 (lambda () qq-message-test-capabilities))
-                ((symbol-function 'qq-server-send)
-                 (lambda (method params callback _errback &optional _early)
-                   (setq sent-method method sent-params params)
-                   (funcall
-                    callback
-                    (qq-message-test-private-history-result
-                     nil
-                     '((timestamp . 1784700000) (random . 0))
-                     '((timestamp . 1784699900) (random . 7))))
-                   "request-private-history")))
-        (should
-         (equal
-          (qq-message-get-private-history
-           "private:10001" nil
-           (lambda (meta) (setq callback-meta meta))
-           nil 20)
-          "request-private-history"))
-        (should (equal sent-method "message.get_private_history"))
-        (should
-         (equal
-          sent-params
-          '((account_id . "slot-a")
-            (conversation . ((kind . "private") (peer_uin . "10001")))
-            (limit . 20))))
-        (should (plist-get callback-meta :private-history-p))
-        (should-not (plist-get callback-meta :history-at-oldest-p))
-        (should
-         (equal
-          (plist-get callback-meta :response-private-cursor)
-          '((timestamp . 1784699900) (random . 7))))))))
-
-(ert-deftest qq-message-private-history-rejects-stalled-empty-page ()
-  (qq-message-test-with-state
-    (let ((cursor '((timestamp . 1784699900) (random . 7)))
-          failure)
-      (cl-letf (((symbol-function 'qq-server-ready-p)
-                 (lambda () t))
-                ((symbol-function 'qq-server-capabilities)
-                 (lambda () qq-message-test-capabilities))
-                ((symbol-function 'qq-server-send)
-                 (lambda (_method _params callback errback &optional _early)
-                   (condition-case error-data
-                       (funcall
-                        callback
-                        (qq-message-test-private-history-result
-                         nil cursor cursor))
-                     (error
-                      (funcall errback nil (error-message-string error-data))))
-                   "request-private-history")))
-        (qq-message-get-private-history
-         "private:10001" cursor nil
-         (lambda (_body reason) (setq failure reason))
-         20)
-        (should (string-match-p "did not advance" failure))))))
-
 (ert-deftest qq-message-history-merges-once-and-deduplicates-live-row ()
   (qq-message-test-with-state
     (let* ((conversation
@@ -2313,7 +2419,7 @@ push carries sequence=40909 and client_sequence=30202."
                      (list older newer) "100" "101"
                      :unsupported-count 2))
                    "request-history")))
-        (qq-message-get-history
+        (qq-message--request-native-history-range
          "group:8209413637" "100" "101"
          (lambda (meta) (setq callback-meta meta)))
         (should (= (length (qq-state-session-messages
@@ -2343,10 +2449,8 @@ push carries sequence=40909 and client_sequence=30202."
               :random nil
               :conversation conversation)))
            (result
-            (qq-message-test-group-history-window-result
-             (list history-message)
-             nil "105525" "105525" "105525" "105525"
-             :caught-up t))
+            (qq-message-test-history-result
+             (list history-message) "105525" "105525"))
            (meta
             (qq-message--merge-history
              "group:8209413637"
@@ -2410,7 +2514,7 @@ push carries sequence=40909 and client_sequence=30202."
                  (lambda (_method _params callback _errback &optional _early)
                    (funcall callback result)
                    "request-history")))
-        (qq-message-get-history
+        (qq-message--request-native-history-range
          "group:8209413637" "100" "100")
         (should
          (qq-state-message-recalled-p
@@ -2443,7 +2547,7 @@ push carries sequence=40909 and client_sequence=30202."
                  (lambda (_method _params callback _errback &optional _early)
                    (funcall callback result)
                    "request-history")))
-        (qq-message-get-history
+        (qq-message--request-native-history-range
          "group:8209413637" "100" "100")
         (let* ((projected
                 (car (qq-state-session-messages "group:8209413637")))
@@ -2479,7 +2583,7 @@ push carries sequence=40909 and client_sequence=30202."
                  (lambda (_method _params callback _errback &optional _early)
                    (funcall callback result)
                    "request-history")))
-        (qq-message-get-history
+        (qq-message--request-native-history-range
          "group:8209413637" "100" "100")
         (let ((projected
                (car (qq-state-session-messages "group:8209413637"))))
@@ -2520,7 +2624,7 @@ push carries sequence=40909 and client_sequence=30202."
                     (qq-message-test-history-result
                      (list valid invalid) "100" "101"))
                    "request-history")))
-        (qq-message-get-history
+        (qq-message--request-native-history-range
          "group:8209413637" "100" "101" nil
          (lambda (_body reason) (setq failure reason)))
         (should (string-match-p "message_id" failure))
@@ -2551,7 +2655,7 @@ push carries sequence=40909 and client_sequence=30202."
                     (qq-message-test-history-result
                      (list group-message) "100" "100"))
                    "request-history")))
-        (qq-message-get-history
+        (qq-message--request-native-history-range
          "private:10001" "100" "100" nil
          (lambda (_body reason) (setq failure reason)))
         (should (string-match-p "requested conversation" failure))
@@ -2569,7 +2673,7 @@ push carries sequence=40909 and client_sequence=30202."
                  (lambda (_method _params callback _errback &optional _early)
                    (setq response-callback callback)
                    "request-history")))
-        (qq-message-get-history
+        (qq-message--request-native-history-range
          "group:8209413637" "100" "100"
          (lambda (_metadata) (setq delivered t))
          (lambda (_body reason) (setq failure reason)))
@@ -2624,7 +2728,7 @@ push carries sequence=40909 and client_sequence=30202."
         (setq local-id
               (alist-get 'local-id
                          (car (qq-state-session-messages "private:10001"))))
-        (qq-message-get-history
+        (qq-message--request-native-history-range
          "private:10001" "8765432109" "8765432109")
         (let* ((messages (qq-state-session-messages "private:10001"))
                (message (car messages)))

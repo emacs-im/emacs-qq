@@ -59,6 +59,9 @@
 (defconst qq-message-max-merged-forward-messages 500
   "Maximum source messages accepted by one native merged forward.")
 
+(defconst qq-message-max-dataline-text-bytes (* 1024 1024)
+  "Maximum reassembled DataLine text accepted from the Gateway timeline.")
+
 (defun qq-message--message-id-p (value)
   "Return non-nil when VALUE is one canonical, nonzero uint64 Message ID."
   (qq-account--uint64-decimal-p value))
@@ -795,12 +798,11 @@ acknowledgement never impersonates a state update."
                qq-message--live-frontiers))
     merged))
 
-(defun qq-message--project-dataline-message (data)
-  "Project one account-scoped DataLine text event DATA."
-  (let* ((owner (qq-message--event-owner data))
-         (_owner (qq-message--sync-account owner))
-         (message (alist-get 'message data))
-         (chat (alist-get 'chat message))
+(defun qq-message--normalize-dataline-message (owner message &optional raw-data)
+  "Return normalized DataLine MESSAGE owned by OWNER.
+
+RAW-DATA, when non-nil, is retained only as the event diagnostic envelope."
+  (let* ((chat (alist-get 'chat message))
          (peer-uid (alist-get 'peer_uid chat))
          (variant (alist-get 'variant chat))
          (direction (alist-get 'direction message))
@@ -816,7 +818,6 @@ acknowledgement never impersonates a state update."
           '(message_id chat direction sent_at client_sequence
                        message_sequence random batch_id text)))
     (unless (and
-             (qq-account--exact-object-keys-p data '(account_id message))
              (cl-every (lambda (key) (memq key allowed-message-keys))
                        message-keys)
              (= (length message-keys)
@@ -824,7 +825,7 @@ acknowledgement never impersonates a state update."
              (cl-every (lambda (key) (assq key message))
                        '(message_id chat direction sent_at batch_id text))
              (qq-account--exact-object-keys-p chat '(peer_uid variant))
-             (equal variant "desktop")
+             (member variant '("desktop" "mobile"))
              (member peer-uid '("u_Wcc5rknRRqRO8y5gxMD6sA"
                                 "u_l7jpPIZxQo0mzJwoEt-SKw"))
              (member direction '("sent" "received"))
@@ -838,8 +839,9 @@ acknowledgement never impersonates a state update."
              (or (null random) (qq-account--uint32-p random))
              (qq-account--uint64-decimal-p batch-id)
              (qq-account--non-empty-string-p text)
-             (<= (string-bytes text) 160))
-      (error "qq: Gateway returned an invalid DataLine text event"))
+             (<= (string-bytes text)
+                 qq-message-max-dataline-text-bytes))
+      (error "qq: Gateway returned an invalid DataLine text message"))
     (let* ((session-key
             (qq-state-session-key 'dataline peer-uid variant))
            (outgoing (equal direction "sent"))
@@ -869,7 +871,7 @@ acknowledgement never impersonates a state update."
               (raw-message . ,text)
               (preview . ,text)
               (message-type . "dataline")
-              (chat-type . "8")
+              (chat-type . ,(if (equal variant "mobile") "134" "8"))
               (peer-uid . ,peer-uid)
               (peer-uin . nil)
               (peer-name . ,(if (equal peer-uid
@@ -881,14 +883,28 @@ acknowledgement never impersonates a state update."
               (target-id . ,peer-uid)
               (dataline-batch-id . ,batch-id)
               (order . ,(qq-state--next-message-order))
-              (raw-event . ,(copy-tree data)))))
+              ,@(when raw-data
+                  `((raw-event . ,(copy-tree raw-data)))))))
       (setq normalized
             (qq-message--attach-pending-local-id
              normalized owner wire-message session-key))
-      (let ((merged (qq-message--merge-normalized normalized 'event)))
-        (qq-message--finalize-message-context
-         owner wire-message normalized)
-        merged))))
+      (cons normalized wire-message))))
+
+(defun qq-message--project-dataline-message (data)
+  "Project one account-scoped DataLine text event DATA."
+  (let* ((owner (qq-message--event-owner data))
+         (_owner (qq-message--sync-account owner))
+         (message (alist-get 'message data)))
+    (unless (qq-account--exact-object-keys-p data '(account_id message))
+      (error "qq: Gateway returned an invalid DataLine event envelope"))
+    (pcase-let* ((`(,normalized . ,wire-message)
+                  (qq-message--normalize-dataline-message
+                   owner message data))
+                 (merged
+                  (qq-message--merge-normalized normalized 'event)))
+      (qq-message--finalize-message-context
+       owner wire-message normalized)
+      merged)))
 
 (defun qq-message--plan-live-frontier (owner normalized)
   "Return OWNER's new live frontier for NORMALIZED, or nil if unchanged.
@@ -1152,31 +1168,6 @@ are represented as Emacs integers."
       (setq carry (/ carry 10)))
     (apply #'string result)))
 
-(defun qq-message--decimal-subtract-small (value subtrahend)
-  "Return canonical decimal VALUE minus non-negative small SUBTRAHEND.
-
-The result saturates at zero.  VALUE is never coerced to an Emacs number."
-  (unless (and (qq-account--canonical-decimal-p value t)
-               (integerp subtrahend) (>= subtrahend 0))
-    (error "qq: Invalid decimal subtraction operands"))
-  (let ((small (number-to-string subtrahend)))
-    (if (or (qq-account--decimal-less-p value small)
-            (equal value small))
-        "0"
-      (let ((borrow subtrahend)
-            result)
-        (dolist (digit (nreverse (string-to-list value)))
-          (let* ((subdigit (% borrow 10))
-                 (next-borrow (/ borrow 10))
-                 (difference (- (- digit ?0) subdigit)))
-            (when (< difference 0)
-              (setq difference (+ difference 10)
-                    next-borrow (1+ next-borrow)))
-            (push (+ ?0 difference) result)
-            (setq borrow next-borrow)))
-        (setq result (string-trim-left (apply #'string result) "0+"))
-        (if (string-empty-p result) "0" result)))))
-
 (defun qq-message--validate-sequence (value context)
   "Return exact sequence VALUE after validation for CONTEXT."
   (unless (qq-account--uint64-decimal-p value t)
@@ -1201,34 +1192,6 @@ The result saturates at zero.  VALUE is never coerced to an Emacs number."
   (unless (and (integerp count) (<= 1 count 100))
     (user-error "qq: Native Gateway history count must be between 1 and 100"))
   count)
-
-(defun qq-message-history-range-ending-at (end-sequence count)
-  "Return COUNT messages in an inclusive range ending at exact END-SEQUENCE.
-
-The start saturates at zero, so a sequence near the beginning may yield a
-shorter range."
-  (qq-message--validate-sequence end-sequence "History page end")
-  (qq-message--validate-history-count count)
-  (let ((start-sequence
-         (qq-message--decimal-subtract-small
-          end-sequence (1- count))))
-    (qq-message--validate-history-range
-     start-sequence end-sequence)))
-
-(defun qq-message-history-range-around (sequence count)
-  "Return COUNT messages in an inclusive range containing exact SEQUENCE.
-
-The target is centered when possible.  Close to zero, the whole range shifts
-right instead of becoming shorter."
-  (qq-message--validate-sequence sequence "History center sequence")
-  (qq-message--validate-history-count count)
-  (let* ((start-sequence
-          (qq-message--decimal-subtract-small
-           sequence (/ (1- count) 2)))
-         (end-sequence
-          (qq-message--decimal-add-small start-sequence (1- count))))
-    (qq-message--validate-history-range
-     start-sequence end-sequence)))
 
 (defun qq-message--history-message-data (owner message)
   "Wrap one history MESSAGE with stable account OWNER context."
@@ -1363,7 +1326,7 @@ Gateway instance, never UI selection or Native Session identity."
             (qq-runtime-with-account owner
               (funcall errback body reason)))))))
 
-(defun qq-message-get-history
+(defun qq-message--request-native-history-range
     (session-key start-sequence end-sequence &optional callback errback)
   "Fetch an inclusive native history range for SESSION-KEY.
 
@@ -1385,120 +1348,6 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
      :callback callback
      :errback errback)))
 
-(defun qq-message--optional-history-sequence (value context)
-  "Validate optional history sequence VALUE for CONTEXT."
-  (when value
-    (qq-message--validate-sequence value context)))
-
-(defun qq-message--merge-group-history-window
-    (session-key result owner after-sequence)
-  "Validate and merge one forward-capable group history RESULT.
-
-AFTER-SEQUENCE is nil for the authoritative latest-window request and is the
-exclusive sequence cursor for a forward continuation."
-  (unless
-      (and
-       (qq-account--exact-object-keys-p
-        result
-        '(account_id requested_after_sequence frontier_sequence
-          requested_start_sequence requested_end_sequence
-          response_start_sequence response_end_sequence next_after_sequence
-          caught_up unsupported_message_count messages))
-       (equal (alist-get 'account_id result) owner)
-       (memq (alist-get 'caught_up result) '(t :false))
-       (integerp (alist-get 'unsupported_message_count result))
-       (>= (alist-get 'unsupported_message_count result) 0)
-       (listp (alist-get 'messages result)))
-    (error "qq: Gateway returned an invalid group history window"))
-  (let* ((requested-after
-          (qq-message--optional-history-sequence
-           (alist-get 'requested_after_sequence result)
-           "Gateway group history requested cursor"))
-         (frontier
-          (qq-message--validate-sequence
-           (alist-get 'frontier_sequence result)
-           "Gateway group history frontier"))
-         (requested-start
-          (qq-message--optional-history-sequence
-           (alist-get 'requested_start_sequence result)
-           "Gateway group history requested start"))
-         (requested-end
-          (qq-message--optional-history-sequence
-           (alist-get 'requested_end_sequence result)
-           "Gateway group history requested end"))
-         (response-start
-          (qq-message--optional-history-sequence
-           (alist-get 'response_start_sequence result)
-           "Gateway group history response start"))
-         (response-end
-          (qq-message--optional-history-sequence
-           (alist-get 'response_end_sequence result)
-           "Gateway group history response end"))
-         (next
-          (qq-message--validate-sequence
-           (alist-get 'next_after_sequence result)
-           "Gateway group history next cursor"))
-         (caught-up (eq (alist-get 'caught_up result) t)))
-    (unless (equal requested-after after-sequence)
-      (error "qq: Gateway group history echoed another cursor"))
-    (unless (eq (null requested-start) (null requested-end))
-      (error "qq: Gateway group history returned a partial requested range"))
-    (unless (eq (null response-start) (null response-end))
-      (error "qq: Gateway group history returned a partial response range"))
-    (when (and requested-start requested-end)
-      (qq-message--validate-history-range requested-start requested-end)
-      (unless (equal requested-end next)
-        (error "qq: Gateway group history next cursor contradicts its range")))
-    (when (and after-sequence
-               (qq-account--decimal-less-p next after-sequence))
-      (error "qq: Gateway group history cursor moved backwards"))
-    (when (if caught-up
-              (not (equal next frontier))
-            (not (qq-account--decimal-less-p next frontier)))
-      (error "qq: Gateway group history caught-up state contradicts its frontier"))
-    (qq-message--merge-history
-     session-key result owner
-     (list :group-history-window-p t
-           :requested-after-sequence requested-after
-           :history-frontier-sequence frontier
-           :next-after-sequence next
-           :history-at-latest-p caught-up
-           :history-at-oldest-p
-           (and (null after-sequence)
-                (or (equal frontier "0")
-                    (equal requested-start "0")))))))
-
-(defun qq-message-get-group-history-window
-    (session-key after-sequence &optional callback errback limit)
-  "Fetch one authoritative group history window for SESSION-KEY.
-
-Nil AFTER-SEQUENCE anchors a page at the current server frontier.  Otherwise
-it is an exclusive exact cursor and the service advances toward that frontier.
-CALLBACK receives merge metadata including `:next-after-sequence' and
-`:history-at-latest-p'."
-  (unless (eq (qq-state-session-key-type session-key) 'group)
-    (user-error "qq: Group history windows require a group session"))
-  (setq limit (or limit qq-history-fetch-count))
-  (qq-message--validate-history-count limit)
-  (when after-sequence
-    (qq-message--validate-sequence
-     after-sequence "Group history continuation cursor"))
-  (let* ((conversation (qq-message--conversation-params session-key))
-         (owner (qq-message--current-owner)))
-    (qq-message--sync-account owner)
-    (qq-message--call
-     "message.get_group_history_window" owner
-     `((conversation . ,conversation)
-       ,@(when after-sequence
-           `((after_sequence . ,after-sequence)))
-       (limit . ,limit))
-     :projector
-     (lambda (result)
-       (qq-message--merge-group-history-window
-        session-key result owner after-sequence))
-     :callback callback
-     :errback errback)))
-
 (defun qq-message--private-history-cursor (cursor context)
   "Return a closed copy of private history CURSOR for CONTEXT."
   (unless
@@ -1513,75 +1362,366 @@ CALLBACK receives merge metadata including `:next-after-sequence' and
   `((timestamp . ,(alist-get 'timestamp cursor))
     (random . ,(alist-get 'random cursor))))
 
-(defun qq-message--merge-private-history
-    (session-key result owner requested-cursor)
-  "Validate and merge private roaming history RESULT.
+(defconst qq-message-history-port-version 1
+  "Gateway's conversation-neutral history façade version.")
 
-REQUESTED-CURSOR is nil for the server-clock bootstrap request."
+(defun qq-message--history-conversation-params (session-key)
+  "Return the closed unified-history locator for SESSION-KEY."
+  (let* ((identity (qq-state-session-key-identity session-key))
+         (kind (alist-get 'type identity)))
+    (pcase kind
+      ((or 'private 'group)
+       (qq-message--conversation-params session-key))
+      ('dataline
+       `((kind . "dataline")
+         (peer_uid . ,(alist-get 'peer-uid identity))
+         (variant . ,(alist-get 'variant identity))))
+      (_
+       (user-error
+        "qq: Unified history supports private, group, and DataLine chats")))))
+
+(defun qq-message--normalize-dataline-history
+    (messages owner session-key)
+  "Preflight DataLine MESSAGES for OWNER and SESSION-KEY."
+  (let ((initial-order qq-state--message-order-counter)
+        rows)
+    (condition-case error-data
+        (progn
+          (dolist (message messages)
+            (pcase-let ((`(,normalized . ,wire-message)
+                         (qq-message--normalize-dataline-message
+                          owner message)))
+              (unless (equal (alist-get 'session-key normalized)
+                             session-key)
+                (error
+                 "qq: Gateway DataLine history contradicts requested conversation"))
+              (qq-state-validate-message-session
+               session-key (alist-get 'server-id normalized))
+              (push (cons normalized wire-message) rows)))
+          (nreverse rows))
+      (error
+       (setq qq-state--message-order-counter initial-order)
+       (signal (car error-data) (cdr error-data))))))
+
+(defun qq-message--merge-dataline-history
+    (session-key messages owner properties)
+  "Merge DataLine MESSAGES into SESSION-KEY and return PROPERTIES metadata."
+  (let ((rows (qq-message--normalize-dataline-history
+               messages owner session-key))
+        (known-anchors (make-hash-table :test #'equal))
+        (added 0)
+        batch-ids)
+    (dolist (message (qq-state-session-messages session-key))
+      (when-let* ((anchor (qq-state-message-anchor message)))
+        (puthash anchor t known-anchors)))
+    (dolist (row rows)
+      (let* ((normalized (car row))
+             (wire-message (cdr row))
+             (anchor (qq-state-message-anchor normalized)))
+        (when-let* ((title (alist-get 'peer-name normalized)))
+          (qq-state-upsert-session session-key `((title . ,title)) nil))
+        (cl-multiple-value-bind (merged _mutation _previous-anchor)
+            (qq-state--merge-normalized-message
+             session-key normalized nil 'history)
+          (qq-message--finalize-message-context
+           owner wire-message normalized)
+          (setq anchor (qq-state-message-anchor merged)))
+        (unless (gethash anchor known-anchors)
+          (cl-incf added)
+          (puthash anchor t known-anchors))
+        (push anchor batch-ids)))
+    (setq batch-ids (delete-dups (nreverse batch-ids)))
+    (let ((meta
+           (append
+            properties
+            (list :session-key session-key
+                  :account-id owner
+                  :message-count (length rows)
+                  :added-count added
+                  :oldest-message-id
+                  (qq-state-session-oldest-message-id session-key)
+                  :batch-message-ids batch-ids
+                  :batch-oldest-message-id (car batch-ids)
+                  :batch-newest-message-id (car (last batch-ids))))))
+      (apply #'qq-state--emit 'history
+             :mutation 'history :source 'response meta)
+      meta)))
+
+(defun qq-message--exact-history-object-keys-p
+    (object required &optional optional)
+  "Return non-nil when history OBJECT has only REQUIRED/OPTIONAL keys."
+  (when (and (listp object)
+             (cl-every (lambda (entry)
+                         (and (consp entry) (symbolp (car entry))))
+                       object))
+    (let ((keys (mapcar #'car object))
+          (allowed (append required optional)))
+      (and (= (length keys)
+              (length (delete-dups (copy-sequence keys))))
+           (cl-every (lambda (key) (assq key object)) required)
+           (cl-every (lambda (key) (memq key allowed)) keys)))))
+
+(defun qq-message--history-cursor
+    (cursor owner conversation direction context)
+  "Validate and copy opaque history CURSOR for CONTEXT.
+
+OWNER and CONVERSATION bind the capability to one managed account locator;
+DIRECTION closes which operation may consume its private position."
   (unless
       (and
        (qq-account--exact-object-keys-p
-        result
-        '(account_id requested_cursor response_cursor complete
-          unsupported_message_count messages))
+        cursor '(version account_id conversation position))
+       (= (alist-get 'version cursor) qq-message-history-port-version)
+       (equal (alist-get 'account_id cursor) owner)
+       (equal (alist-get 'conversation cursor) conversation)
+       (listp (alist-get 'position cursor)))
+    (error "qq: %s is not scoped to this account conversation" context))
+  (let* ((position (alist-get 'position cursor))
+         (kind (alist-get 'kind position))
+         (conversation-kind (alist-get 'kind conversation)))
+    (pcase kind
+      ("native_sequence"
+       (unless
+           (and
+            (member conversation-kind '("private" "group"))
+            (qq-message--exact-history-object-keys-p
+             position '(kind sequence) '(maximum_sequence))
+            (qq-message--validate-sequence
+             (alist-get 'sequence position) context)
+            (let ((maximum (alist-get 'maximum_sequence position)))
+              (and
+               (or (null maximum)
+                   (progn
+                     (qq-message--validate-sequence maximum context)
+                     (not (qq-account--decimal-less-p
+                           maximum (alist-get 'sequence position)))))
+               (pcase direction
+                 ('older
+                  (not (equal (alist-get 'sequence position) "0")))
+                 ('newer
+                  (and (equal conversation-kind "private")
+                       maximum
+                       (qq-account--decimal-less-p
+                        (alist-get 'sequence position) maximum)))))))
+         (error "qq: %s has an invalid native sequence position" context)))
+      ("group_window"
+       (unless
+           (and
+            (equal conversation-kind "group")
+            (eq direction 'newer)
+            (qq-account--exact-object-keys-p position '(kind sequence))
+            (qq-message--validate-sequence
+             (alist-get 'sequence position) context))
+         (error "qq: %s has an invalid group continuation" context)))
+      ("private_roam"
+       (unless
+           (and
+            (equal conversation-kind "private")
+            (eq direction 'older)
+            (qq-account--exact-object-keys-p position '(kind cursor)))
+         (error "qq: %s has an invalid private continuation" context))
+       (qq-message--private-history-cursor
+        (alist-get 'cursor position) context))
+      ("dataline"
+       (unless
+           (and
+            (equal conversation-kind "dataline")
+            (qq-account--exact-object-keys-p position '(kind message_id))
+            (qq-message--message-id-p (alist-get 'message_id position)))
+         (error "qq: %s has an invalid DataLine continuation" context)))
+      (_ (error "qq: %s contains an unknown position" context))))
+  (copy-tree cursor))
+
+(defun qq-message--history-items (items expected-kind context)
+  "Return message payloads from closed history ITEMS of EXPECTED-KIND."
+  (unless (listp items)
+    (error "qq: %s messages must be a list" context))
+  (mapcar
+   (lambda (item)
+     (unless
+         (and (qq-account--exact-object-keys-p item '(kind message))
+              (equal (alist-get 'kind item) expected-kind)
+              (listp (alist-get 'message item)))
+       (error "qq: %s contains a mismatched history message" context))
+     (copy-tree (alist-get 'message item)))
+   items))
+
+(defun qq-message--history-common-meta
+    (result owner session-key conversation context)
+  "Validate RESULT's common unified-history envelope for CONTEXT."
+  (unless
+      (and
+       (= (alist-get 'history_version result -1)
+          qq-message-history-port-version)
        (equal (alist-get 'account_id result) owner)
-       (memq (alist-get 'complete result) '(t :false))
+       (equal (alist-get 'conversation result) conversation)
        (integerp (alist-get 'unsupported_message_count result))
        (>= (alist-get 'unsupported_message_count result) 0)
-       (listp (alist-get 'messages result)))
-    (error "qq: Gateway returned an invalid private history page"))
-  (let* ((requested
-          (qq-message--private-history-cursor
-           (alist-get 'requested_cursor result)
-           "Gateway private history requested cursor"))
-         (response
-          (qq-message--private-history-cursor
-           (alist-get 'response_cursor result)
-           "Gateway private history response cursor"))
-         (complete (eq (alist-get 'complete result) t))
-         (messages (alist-get 'messages result)))
-    (when (and requested-cursor
-               (not (equal requested requested-cursor)))
-      (error "qq: Gateway private history echoed another request cursor"))
-    (when (and (not complete)
-               (null messages)
-               (equal requested response))
-      (error "qq: Gateway private history cursor did not advance"))
-    (qq-message--merge-history
-     session-key result owner
-     (list :private-history-p t
-           :requested-private-cursor requested
-           :response-private-cursor response
-           :history-at-oldest-p complete))))
+       (memq (alist-get 'at_oldest result) '(t :false))
+       (memq (alist-get 'at_latest result) '(t :false)))
+    (error "qq: Gateway returned an invalid %s envelope" context))
+  (let ((older (and (alist-get 'older_cursor result)
+                    (qq-message--history-cursor
+                     (alist-get 'older_cursor result) owner conversation
+                     'older (format "%s older cursor" context))))
+        (newer (and (alist-get 'newer_cursor result)
+                    (qq-message--history-cursor
+                     (alist-get 'newer_cursor result) owner conversation
+                     'newer (format "%s newer cursor" context))))
+        (at-oldest (eq (alist-get 'at_oldest result) t))
+        (at-latest (eq (alist-get 'at_latest result) t)))
+    (when (and at-oldest older)
+      (error "qq: %s supplies an older cursor at the oldest edge" context))
+    (list :history-port-version qq-message-history-port-version
+          :history-account-id owner
+          :history-session-key session-key
+          :history-older-cursor older
+          :history-newer-cursor newer
+          :history-at-oldest-p at-oldest
+          :history-at-latest-p at-latest)))
 
-(defun qq-message-get-private-history
-    (session-key cursor &optional callback errback limit)
-  "Fetch one backwards private roaming page for SESSION-KEY.
+(defun qq-message--merge-unified-history
+    (session-key result owner conversation properties context
+                 &optional center-message-id)
+  "Merge one validated unified-history RESULT using PROPERTIES metadata."
+  (let* ((dataline-p (equal (alist-get 'kind conversation) "dataline"))
+         (messages
+          (qq-message--history-items
+           (alist-get 'messages result)
+           (if dataline-p "dataline" "native") context)))
+    (if dataline-p
+        (let ((message-ids
+               (mapcar (lambda (message)
+                         (alist-get 'message_id message))
+                       messages)))
+          (unless
+              (= (length message-ids)
+                 (length (delete-dups (copy-sequence message-ids))))
+            (error "qq: %s repeats a DataLine Message ID" context))
+          (when (and center-message-id
+                     (not (member center-message-id message-ids)))
+            (error "qq: %s omitted its DataLine center" context))
+          (qq-message--merge-dataline-history
+           session-key messages owner properties))
+      (qq-message--merge-history
+       session-key
+       `((messages . ,messages)
+         (unsupported_message_count
+          . ,(alist-get 'unsupported_message_count result)))
+       owner properties))))
 
-CURSOR is nil for the server-clock bootstrap request.  Otherwise it is the
-exact `response_cursor' returned by the previous page.  CALLBACK receives
-merge metadata containing `:response-private-cursor' and
-`:history-at-oldest-p'."
-  (unless (eq (qq-state-session-key-type session-key) 'private)
-    (user-error "qq: Private roaming history requires a private session"))
+(defun qq-message--merge-unified-history-page
+    (session-key result owner conversation cursor direction)
+  "Validate and merge one unified page RESULT for its exact request."
+  (unless
+      (qq-message--exact-history-object-keys-p
+       result
+       '(history_version account_id conversation direction messages
+                         unsupported_message_count requested_cursor
+                         older_cursor newer_cursor at_oldest at_latest))
+    (error "qq: Gateway returned a non-closed history page"))
+  (let ((wire-direction (symbol-name direction)))
+    (unless (and (equal (alist-get 'direction result) wire-direction)
+                 (equal (alist-get 'requested_cursor result) cursor))
+      (error "qq: Gateway history page contradicts its request")))
+  (let ((properties
+         (qq-message--history-common-meta
+          result owner session-key conversation "history page")))
+    (qq-message--merge-unified-history
+     session-key result owner conversation properties "history page")))
+
+(defun qq-message--request-history-page
+    (session-key cursor direction &optional callback errback limit)
+  "Request one page from the Gateway's unified history façade."
+  (unless (memq direction '(older newer))
+    (user-error "qq: History direction must be older or newer"))
+  (when (and (null cursor) (eq direction 'newer))
+    (user-error "qq: Nil history cursor identifies only the latest page"))
   (setq limit (or limit qq-history-fetch-count))
   (qq-message--validate-history-count limit)
-  (when cursor
-    (setq cursor
-          (qq-message--private-history-cursor
-           cursor "Private history cursor")))
-  (let* ((conversation (qq-message--conversation-params session-key))
-         (owner (qq-message--current-owner)))
+  (let* ((conversation
+          (qq-message--history-conversation-params session-key))
+         (owner (qq-message--current-owner))
+         (cursor
+          (and cursor
+               (qq-message--history-cursor
+                cursor owner conversation direction "History cursor"))))
     (qq-message--sync-account owner)
     (qq-message--call
-     "message.get_private_history" owner
+     "message.get_history_page" owner
      `((conversation . ,conversation)
        ,@(when cursor `((cursor . ,cursor)))
-       (limit . ,limit))
+       (direction . ,(symbol-name direction))
+       (count . ,limit))
      :projector
      (lambda (result)
-       (qq-message--merge-private-history
-        session-key result owner cursor))
+       (qq-message--merge-unified-history-page
+        session-key result owner conversation cursor direction))
+     :callback callback
+     :errback errback)))
+
+(defun qq-message--merge-unified-history-around
+    (session-key result owner conversation center-message-id)
+  "Validate and merge one unified around-history RESULT."
+  (unless
+      (and
+       (qq-message--exact-history-object-keys-p
+        result
+        '(history_version account_id conversation center_message_id messages
+                          unsupported_message_count older_cursor newer_cursor
+                          at_oldest at_latest))
+       (equal (alist-get 'center_message_id result) center-message-id))
+    (error "qq: Gateway returned a non-closed history around page"))
+  (let ((properties
+         (qq-message--history-common-meta
+          result owner session-key conversation "history around")))
+    (qq-message--merge-unified-history
+     session-key result owner conversation properties "history around"
+     center-message-id)))
+
+(defun qq-message--request-history-around
+    (session-key center-message-id sequence-hint latest-sequence-hint
+                 &optional callback errback limit)
+  "Request a unified history window around CENTER-MESSAGE-ID.
+
+SEQUENCE-HINT and LATEST-SEQUENCE-HINT are adapter-only native locators;
+DataLine resolves its durable Message ID directly."
+  (unless (qq-message--message-id-p center-message-id)
+    (user-error "qq: History center must be a Message ID"))
+  (setq limit (or limit qq-history-fetch-count))
+  (qq-message--validate-history-count limit)
+  (let* ((conversation
+          (qq-message--history-conversation-params session-key))
+         (dataline-p (equal (alist-get 'kind conversation) "dataline"))
+         (owner (qq-message--current-owner)))
+    (if dataline-p
+        (when (or sequence-hint latest-sequence-hint)
+          (error "qq: DataLine around-history must not carry sequence hints"))
+      (progn
+        (qq-message--validate-sequence
+         sequence-hint "History around sequence hint")
+        (when (equal sequence-hint "0")
+          (user-error "qq: History around sequence hint must be nonzero"))
+        (when latest-sequence-hint
+          (qq-message--validate-sequence
+           latest-sequence-hint "History latest sequence hint")
+          (when (qq-account--decimal-less-p
+                 latest-sequence-hint sequence-hint)
+            (user-error
+             "qq: History latest sequence hint precedes its center")))))
+    (qq-message--sync-account owner)
+    (qq-message--call
+     "message.get_history_around" owner
+     `((conversation . ,conversation)
+       (center_message_id . ,center-message-id)
+       ,@(when sequence-hint `((sequence_hint . ,sequence-hint)))
+       ,@(when latest-sequence-hint
+           `((latest_sequence_hint . ,latest-sequence-hint)))
+       (count . ,limit))
+     :projector
+     (lambda (result)
+       (qq-message--merge-unified-history-around
+        session-key result owner conversation center-message-id))
      :callback callback
      :errback errback)))
 
@@ -1708,7 +1848,7 @@ self-echo push already consumed the pending receipt."
                  (not (equal server-sequence "0")))
         (condition-case err
             (qq-runtime-with-account owner
-              (qq-message-get-history
+              (qq-message--request-native-history-range
                session-key server-sequence server-sequence
                nil
                (lambda (_body reason)
@@ -1789,8 +1929,10 @@ optimistic rendering override.
 OPTIMISTIC-SEGMENTS, when non-nil, are stored in the pending row instead of
 protocol-ready SEGMENTS so local media previews never enter the wire request.
 The original reply element remains part of this local rendering shape.
-DataLine desktop currently accepts exactly one nonempty text segment of at
-most 160 UTF-8 bytes and uses its dedicated `dataline.send_text' operation."
+The currently negotiated `dataline.send_text' operation accepts one nonempty
+desktop text segment of at most 160 UTF-8 bytes.  That method boundary does not
+describe stock DataLine file, forwarding, face projection, or multipart
+capabilities."
   (let* ((owner (qq-message--current-owner))
          (_owner (qq-message--sync-account owner)))
     (if (eq (qq-state-session-key-type session-key) 'dataline)
@@ -1806,8 +1948,8 @@ most 160 UTF-8 bytes and uses its dedicated `dataline.send_text' operation."
                                           "u_l7jpPIZxQo0mzJwoEt-SKw"))
                        (qq-account--non-empty-string-p text)
                        (<= (string-bytes text) 160))
-            (user-error
-             "qq: DataLine desktop requires one 1–160 byte text segment for a pinned phone/pad class"))
+             (user-error
+              "qq: current dataline.send_text requires one 1–160 byte desktop text segment for a pinned phone/pad class"))
           (qq-message--send-request
            session-key (or optimistic-segments segments) raw-message
            "dataline.send_text"
