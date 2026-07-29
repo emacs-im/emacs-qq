@@ -358,6 +358,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                               (chat
                                (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
                                (variant . "desktop"))
+                              (message_id . "7348923749823749823")
                               (sent_at . 1784700000)
                               (server_sequence . "0")
                               (client_sequence . "42001")
@@ -379,9 +380,17 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                       (variant . "desktop"))
                 (text . "hello phone"))))
       (should (equal (alist-get 'batch_id receipt) "99"))
-      (should (= (hash-table-count qq-message--pending-sends) 1)))))
+      (let ((message
+             (car
+              (qq-state-session-messages
+               "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA"))))
+        (should (equal (alist-get 'server-id message)
+                       "7348923749823749823"))
+        (should (equal (alist-get 'sender-name message) "Primary"))
+        (should (eq (alist-get 'status message) 'sent)))
+      (should (= (hash-table-count qq-message--pending-sends) 0)))))
 
-(ert-deftest qq-message-dataline-self-echo-rekeys-the-optimistic-row ()
+(ert-deftest qq-message-dataline-durable-event-deduplicates-the-receipt-row ()
   (qq-message-test-with-state
     (let ((session-key "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA"))
       (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
@@ -394,6 +403,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                               (chat
                                (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
                                (variant . "desktop"))
+                              (message_id . "7348923749823749823")
                               (sent_at . 1784700000)
                               (server_sequence . "0")
                               (client_sequence . "42001")
@@ -424,6 +434,42 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                        "7348923749823749823"))
         (should-not (alist-get 'message-seq (car messages)))
         (should (eq (alist-get 'status (car messages)) 'sent)))
+      (should (= (hash-table-count qq-message--pending-sends) 0)))))
+
+(ert-deftest qq-message-dataline-mobile-retains-its-local-send-locator ()
+  (qq-message-test-with-state
+    (let ((session-key "dataline:mobile:u_Wcc5rknRRqRO8y5gxMD6sA")
+          sent-params)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (_method params callback _errback &optional _early)
+                   (setq sent-params params)
+                   (funcall callback
+                            '((account_id . "slot-a")
+                              (chat
+                               (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+                               (variant . "mobile"))
+                              (message_id . "7348923749823749824")
+                              (sent_at . 1784700000)
+                              (server_sequence . "0")
+                              (client_sequence . "42002")
+                              (random . 1)
+                              (batch_id . "100")))
+                   "dataline-mobile-send")))
+        (qq-message-send
+         session-key
+         '(((type . "text") (data . ((text . "hello mobile")))))))
+      (should
+       (equal
+        (alist-get 'chat sent-params)
+        '((peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+          (variant . "mobile"))))
+      (let ((message (car (qq-state-session-messages session-key))))
+        (should (equal (alist-get 'server-id message)
+                       "7348923749823749824"))
+        (should (eq (alist-get 'status message) 'sent)))
       (should (= (hash-table-count qq-message--pending-sends) 0)))))
 
 (ert-deftest qq-message-unified-history-projects-mobile-dataline-page ()
@@ -481,6 +527,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (should (equal (alist-get 'server-id projected)
                        "7348923749823749823"))
         (should (equal (alist-get 'chat-type projected) "134"))
+        (should (equal (alist-get 'sender-name projected) "My phone"))
         (should-not (alist-get 'message-seq projected))
         (should (equal (alist-get 'raw-message projected) text))))))
 

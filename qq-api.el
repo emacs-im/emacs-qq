@@ -392,8 +392,8 @@ and must not be retained as an `unsupported.raw' diagnostic payload."
 DataLine remains part of the general session locator union.  The current
 `emacs_send_forward' adapter exposes only `individual' from the desktop
 variant.  Mobile still needs operation-specific normalization to the type-8
-DataLine path and self-echo reconciliation; this validator must not be read as
-evidence for a second or unsupported 134 wire route."
+DataLine path and sender-local result persistence; this validator must not be
+read as evidence for a second or unsupported 134 wire route."
   (unless (member kind '("individual" "merged"))
     (qq-api--signal-schema-error
      protocol-p "qq: %s has invalid forwarding kind %S"
