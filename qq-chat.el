@@ -4297,11 +4297,21 @@ buffer session with a detached message id after the fact."
 (defun qq-chat--insert-compact-message-body (message prefix-state properties short-time)
   "Insert a same-sender continuation body for MESSAGE.
 
-Uses structured segments (so faces render as images).  SHORT-TIME is appended
-on the first inline line when the body is pure inline content."
-  (let ((segments (alist-get 'segments message))
-        (inline-parts nil)
-        (saw-block nil))
+Uses structured segments (so faces render as images).  The row's own status and
+SHORT-TIME are appended on the first inline line when the body is pure inline
+content."
+  (let* ((segments (alist-get 'segments message))
+         (status-suffix (qq-chat--status-suffix message))
+         (status-time
+          (cond
+           ((and (not (string-empty-p status-suffix))
+                 (stringp short-time)
+                 (not (string-empty-p short-time)))
+            (concat status-suffix " " short-time))
+           ((not (string-empty-p status-suffix)) status-suffix)
+           (t short-time)))
+         (inline-parts nil)
+         (saw-block nil))
     (cl-labels
         ((flush-inline (&optional with-time)
            (when inline-parts
@@ -4311,10 +4321,10 @@ on the first inline line when the body is pure inline content."
                (insert (if (string-empty-p text) "(empty message)" text))
                (setq body-end (point))
                (when (and with-time
-                          (stringp short-time)
-                          (not (string-empty-p short-time)))
+                          (stringp status-time)
+                          (not (string-empty-p status-time)))
                  (qq-chat--insert-right-aligned-time
-                  short-time
+                  status-time
                   (string-width
                    (or (appkit-ui-prefix-state-current prefix-state) ""))
                   t))
@@ -4330,9 +4340,9 @@ on the first inline line when the body is pure inline content."
                body-end)
           (insert (if (string-empty-p text) "(empty message)" text))
           (setq body-end (point))
-          (when (and (stringp short-time) (not (string-empty-p short-time)))
+          (when (and (stringp status-time) (not (string-empty-p status-time)))
             (qq-chat--insert-right-aligned-time
-             short-time
+             status-time
              (string-width
               (or (appkit-ui-prefix-state-current prefix-state) ""))
              t))
@@ -4373,12 +4383,12 @@ on the first inline line when the body is pure inline content."
         ;; Time rides on the first (only) inline flush when there is no media card.
         (flush-inline (not saw-block))
         (when (and saw-block
-                   (stringp short-time)
-                   (not (string-empty-p short-time))
+                   (stringp status-time)
+                   (not (string-empty-p status-time))
                    (null inline-parts))
           (let ((start (point)))
             (qq-chat--insert-right-aligned-time
-             short-time
+             status-time
              (string-width
               (or (appkit-ui-prefix-state-current prefix-state) ""))
              t)

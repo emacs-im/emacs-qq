@@ -2977,6 +2977,24 @@
             (equal "Message destination: Readable Group"
                    (get-text-property 0 'help-echo prompt)))))))))
 
+(ert-deftest qq-chat-compact-message-shows-its-own-send-status ()
+  "A continuation row must not hide its pending or failed state."
+  (with-temp-buffer
+    (qq-chat--insert-compact-message-body
+     '((status . pending)
+       (segments . (((type . "text")
+                     (data . ((text . "continuation")))))))
+     (appkit-ui-make-prefix-state "  " "  ")
+     nil
+     "09:36")
+    (goto-char (point-min))
+    (should (search-forward "continuation" nil t))
+    (let ((line-end (line-end-position)))
+      (should (search-forward "…" line-end t))
+      (should (equal (get-text-property (1- (point)) 'help-echo)
+                     "pending"))
+      (should (search-forward "09:36" line-end t)))))
+
 (ert-deftest qq-chat-compact-face-message-uses-image-display ()
   "Same-sender face continuations must not render plain [face:id] text."
   (qq-chat-test-with-reset

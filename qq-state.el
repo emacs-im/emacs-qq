@@ -3066,8 +3066,9 @@ Return a plist:
     (session-key local-id message-id &optional request-owner)
   "Mark local pending message LOCAL-ID as sent with MESSAGE-ID in SESSION-KEY.
 
-MESSAGE-ID is the NapCat NT snowflake string (`message_id' in the protocol
-hard-cut).  It is stored as `server-id' and becomes the chat timeline anchor.
+MESSAGE-ID is the permanent decimal timeline identity (`message_id' in the
+protocol hard-cut): an NT snowflake for ordinary chats or a sender-local ID for
+DataLine. It is stored as `server-id' and becomes the chat timeline anchor.
 REQUEST-OWNER is the owner captured before dispatching the send request."
   (let* ((messages (copy-tree (or (gethash session-key qq-state--messages-by-session) '())))
          (existing (qq-state--find-message
