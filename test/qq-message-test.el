@@ -588,6 +588,57 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                      older-cursor))
       (should (= (length (qq-state-session-messages session-key)) 1)))))
 
+(ert-deftest qq-message-unified-group-history-ignores-json-object-key-order ()
+  (qq-message-test-with-state
+    (let* ((session-key "group:20001")
+           (request-cursor
+            (qq-message-test-history-cursor
+             session-key
+             '((kind . "native_sequence")
+               (sequence . "100")
+               (maximum_sequence . "120"))))
+           (response-cursor
+            `((position
+               (maximum_sequence . "120")
+               (sequence . "100")
+               (kind . "native_sequence"))
+              (conversation (group_uin . "20001") (kind . "group"))
+              (account_id . "slot-a")
+              (version . ,qq-message-history-port-version)))
+           (newer-cursor
+            `((position (sequence . "120") (kind . "group_window"))
+              (conversation (group_uin . "20001") (kind . "group"))
+              (account_id . "slot-a")
+              (version . ,qq-message-history-port-version)))
+           meta)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (funcall
+                    callback
+                    `((history_version . ,qq-message-history-port-version)
+                      (account_id . "slot-a")
+                      (conversation (group_uin . "20001") (kind . "group"))
+                      (direction . "older")
+                      (requested_cursor . ,response-cursor)
+                      (messages . [])
+                      (unsupported_message_count . 0)
+                      (older_cursor)
+                      (newer_cursor . ,newer-cursor)
+                      (at_oldest . t)
+                      (at_latest . :false)))
+                   "history-page")))
+        (qq-message--request-history-page
+         session-key request-cursor 'older
+         (lambda (value) (setq meta value)) nil 20))
+      (should (plist-get meta :history-at-oldest-p))
+      (should-not (plist-get meta :history-at-latest-p))
+      (should
+       (qq-message--history-cursor-equal-p
+        (plist-get meta :history-newer-cursor) newer-cursor)))))
+
 (ert-deftest qq-message-unified-history-rejects-cross-scope-cursors-locally ()
   (qq-message-test-with-state
     (let* ((group-cursor
