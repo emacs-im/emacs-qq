@@ -1380,6 +1380,89 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
        (user-error
         "qq: Unified history supports private, group, and DataLine chats")))))
 
+(defun qq-message--history-conversation-equal-p (left right)
+  "Return non-nil when closed history locators LEFT and RIGHT are equal.
+
+JSON object member order is not semantic.  Compare the closed discriminator
+and identity fields instead of raw alist order."
+  (let ((left-kind (alist-get 'kind left))
+        (right-kind (alist-get 'kind right)))
+    (and (equal left-kind right-kind)
+         (pcase left-kind
+           ("private"
+            (and (qq-account--exact-object-keys-p left '(kind peer_uin))
+                 (qq-account--exact-object-keys-p right '(kind peer_uin))
+                 (equal (alist-get 'peer_uin left)
+                        (alist-get 'peer_uin right))))
+           ("group"
+            (and (qq-account--exact-object-keys-p left '(kind group_uin))
+                 (qq-account--exact-object-keys-p right '(kind group_uin))
+                 (equal (alist-get 'group_uin left)
+                        (alist-get 'group_uin right))))
+           ("dataline"
+            (and (qq-account--exact-object-keys-p
+                  left '(kind peer_uid variant))
+                 (qq-account--exact-object-keys-p
+                  right '(kind peer_uid variant))
+                 (equal (alist-get 'peer_uid left)
+                        (alist-get 'peer_uid right))
+                 (equal (alist-get 'variant left)
+                        (alist-get 'variant right))))
+           (_ nil)))))
+
+(defun qq-message--history-position-equal-p (left right)
+  "Return non-nil when closed cursor positions LEFT and RIGHT are equal."
+  (let ((left-kind (alist-get 'kind left))
+        (right-kind (alist-get 'kind right)))
+    (and (equal left-kind right-kind)
+         (pcase left-kind
+           ("native_sequence"
+            (and (qq-message--exact-history-object-keys-p
+                  left '(kind sequence) '(maximum_sequence))
+                 (qq-message--exact-history-object-keys-p
+                  right '(kind sequence) '(maximum_sequence))
+                 (equal (alist-get 'sequence left)
+                        (alist-get 'sequence right))
+                 (equal (alist-get 'maximum_sequence left)
+                        (alist-get 'maximum_sequence right))))
+           ("group_window"
+            (and (qq-account--exact-object-keys-p left '(kind sequence))
+                 (qq-account--exact-object-keys-p right '(kind sequence))
+                 (equal (alist-get 'sequence left)
+                        (alist-get 'sequence right))))
+           ("private_roam"
+            (let ((left-cursor (alist-get 'cursor left))
+                  (right-cursor (alist-get 'cursor right)))
+              (and (qq-account--exact-object-keys-p left '(kind cursor))
+                   (qq-account--exact-object-keys-p right '(kind cursor))
+                   (qq-account--exact-object-keys-p
+                    left-cursor '(timestamp random))
+                   (qq-account--exact-object-keys-p
+                    right-cursor '(timestamp random))
+                   (equal (alist-get 'timestamp left-cursor)
+                          (alist-get 'timestamp right-cursor))
+                   (equal (alist-get 'random left-cursor)
+                          (alist-get 'random right-cursor)))))
+           ("dataline"
+            (and (qq-account--exact-object-keys-p left '(kind message_id))
+                 (qq-account--exact-object-keys-p right '(kind message_id))
+                 (equal (alist-get 'message_id left)
+                        (alist-get 'message_id right))))
+           (_ nil)))))
+
+(defun qq-message--history-cursor-equal-p (left right)
+  "Return non-nil when scoped history cursors LEFT and RIGHT are equal."
+  (and (qq-account--exact-object-keys-p
+        left '(version account_id conversation position))
+       (qq-account--exact-object-keys-p
+        right '(version account_id conversation position))
+       (eql (alist-get 'version left) (alist-get 'version right))
+       (equal (alist-get 'account_id left) (alist-get 'account_id right))
+       (qq-message--history-conversation-equal-p
+        (alist-get 'conversation left) (alist-get 'conversation right))
+       (qq-message--history-position-equal-p
+        (alist-get 'position left) (alist-get 'position right))))
+
 (defun qq-message--normalize-dataline-history
     (messages owner session-key)
   "Preflight DataLine MESSAGES for OWNER and SESSION-KEY."
@@ -1473,7 +1556,8 @@ DIRECTION closes which operation may consume its private position."
         cursor '(version account_id conversation position))
        (= (alist-get 'version cursor) qq-message-history-port-version)
        (equal (alist-get 'account_id cursor) owner)
-       (equal (alist-get 'conversation cursor) conversation)
+       (qq-message--history-conversation-equal-p
+        (alist-get 'conversation cursor) conversation)
        (listp (alist-get 'position cursor)))
     (error "qq: %s is not scoped to this account conversation" context))
   (let* ((position (alist-get 'position cursor))
@@ -1554,7 +1638,8 @@ DIRECTION closes which operation may consume its private position."
        (= (alist-get 'history_version result -1)
           qq-message-history-port-version)
        (equal (alist-get 'account_id result) owner)
-       (equal (alist-get 'conversation result) conversation)
+       (qq-message--history-conversation-equal-p
+        (alist-get 'conversation result) conversation)
        (integerp (alist-get 'unsupported_message_count result))
        (>= (alist-get 'unsupported_message_count result) 0)
        (memq (alist-get 'at_oldest result) '(t :false))
@@ -1620,9 +1705,18 @@ DIRECTION closes which operation may consume its private position."
                          unsupported_message_count requested_cursor
                          older_cursor newer_cursor at_oldest at_latest))
     (error "qq: Gateway returned a non-closed history page"))
-  (let ((wire-direction (symbol-name direction)))
+  (let ((wire-direction (symbol-name direction))
+        (response-cursor (alist-get 'requested_cursor result)))
+    (when response-cursor
+      (qq-message--history-cursor
+       response-cursor owner conversation direction
+       "History page requested cursor"))
     (unless (and (equal (alist-get 'direction result) wire-direction)
-                 (equal (alist-get 'requested_cursor result) cursor))
+                 (if cursor
+                     (and response-cursor
+                          (qq-message--history-cursor-equal-p
+                           response-cursor cursor))
+                   (null response-cursor)))
       (error "qq: Gateway history page contradicts its request")))
   (let ((properties
          (qq-message--history-common-meta
