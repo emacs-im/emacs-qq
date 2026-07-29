@@ -831,13 +831,13 @@ snapshot; ERRBACK receives a failure body and reason."
 
 ;;;###autoload
 (defun qq-account-stop (account-id &optional callback errback)
-  "Stop ACCOUNT-ID's Native Session without logging out of QQ.
+  "Take ACCOUNT-ID's Native Session offline while retaining quick login.
 
 CALLBACK receives the snapshot; ERRBACK receives a failure body and reason."
   (interactive
    (let ((account-id (qq-account--read-account-id "Stop Native Session: ")))
-     (unless (yes-or-no-p
-              (format "Stop Native Session %s without QQ logout? " account-id))
+      (unless (yes-or-no-p
+               (format "Stop Native Session %s and retain quick login? " account-id))
        (user-error "qq: Account stop cancelled"))
      (list account-id #'qq-account--interactive-success
            #'qq-account--interactive-error)))
@@ -846,12 +846,13 @@ CALLBACK receives the snapshot; ERRBACK receives a failure body and reason."
 
 ;;;###autoload
 (defun qq-account-logout (account-id &optional callback errback)
-  "Explicitly log ACCOUNT-ID out of QQ while retaining its managed slot.
+  "Take ACCOUNT-ID offline and delete quick login, retaining its managed slot.
 
 CALLBACK receives the snapshot; ERRBACK receives a failure body and reason."
   (interactive
    (let ((account-id (qq-account--read-account-id "Log out account: ")))
-     (unless (yes-or-no-p (format "Log QQ account %s out of QQ? " account-id))
+     (unless (yes-or-no-p
+              (format "Log QQ account %s out and delete quick login? " account-id))
        (user-error "qq: Account logout cancelled"))
      (list account-id #'qq-account--interactive-success
            #'qq-account--interactive-error)))
