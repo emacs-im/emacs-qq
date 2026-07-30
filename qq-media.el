@@ -235,6 +235,14 @@ transfer callbacks can run outside a safe redisplay context; immediate
   "Return validated native video media ID from SEGMENT, or nil."
   (qq-media--native-media-id segment "video"))
 
+(defun qq-media--remote-file-id (segment)
+  "Return SEGMENT's opaque native file resolver, or nil.
+
+The display filename remains in `file' or `name', while `file_id' alone
+carries download authority."
+  (let ((file-id (alist-get 'file_id (alist-get 'data segment))))
+    (and (qq-remote-media--id-p file-id) file-id)))
+
 (defun qq-media--native-record-key (media-id)
   "Return logical media cache key for native record MEDIA-ID."
   (format "record:%s" media-id))
@@ -651,6 +659,8 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
           (qq-media--native-video-key media-id))
          (qq-media--note-cache-updated
           (qq-media--native-video-thumbnail-key media-id)))
+        ;; Generic file segments key their cache by the opaque file_id.
+        ("file" (qq-media--note-cache-updated (format "file:%s" media-id)))
         (_ (qq-media--note-cache-updated nil)))
     (qq-media--note-cache-updated nil)))
 
@@ -962,57 +972,82 @@ Call CALLBACK with the persistent resource; call ERRBACK on failure."
    segment (qq-media--native-video-media-id segment) 'thumbnail
    key callback errback))
 
+(defun qq-media--materialize-native-content-to-cache
+    (media-id key target callback errback &optional mime-type)
+  "Materialize native MEDIA-ID content into client-owned TARGET under KEY."
+  (let ((error-fn (or errback #'qq-api--default-error)))
+    (condition-case error-data
+        (let ((operation
+               (qq-remote-media-prepare-part-local-access
+                media-id 'content
+                (lambda (result)
+                  (let* ((access (alist-get 'access result))
+                         (access-id (alist-get 'access_id access))
+                         (path (alist-get 'path access))
+                         (closed nil))
+                    (cl-labels
+                        ((close-access
+                          ()
+                          (unless closed
+                            (setq closed t)
+                            (qq-media--close-local-access access-id)))
+                         (finish
+                          (file)
+                          (close-access)
+                          (funcall
+                           callback
+                           `((file . ,file)
+                             (name . ,(file-name-nondirectory file))
+                             ,@(when mime-type
+                                 `((mime-type . ,mime-type))))))
+                         (fail-copy
+                          (reason)
+                          (close-access)
+                          (funcall error-fn nil reason)))
+                      (condition-case copy-error
+                          (appkit-media-copy-or-download-resource-async
+                           `((file . ,path)) target #'finish #'fail-copy)
+                        ((error quit)
+                         (close-access)
+                         (funcall error-fn nil
+                                  (error-message-string copy-error)))))))
+                error-fn)))
+          (when (and (qq-remote-media-operation-active-p operation)
+                     (gethash key qq-media--fetching-cache))
+            (puthash key operation qq-media--fetching-cache))
+          operation)
+      ((error quit)
+       (funcall error-fn nil (error-message-string error-data))
+       nil))))
+
 (defun qq-media--fetch-native-video-resource
   (segment key callback errback)
-  "Materialize native video SEGMENT content into KEY.
+  "Materialize native video SEGMENT content into KEY."
+  (if-let* ((media-id (qq-media--native-video-media-id segment)))
+      (qq-media--materialize-native-content-to-cache
+       media-id key
+       (expand-file-name
+        (format "native-video-%s.mp4" (secure-hash 'sha256 key))
+        qq-media-cache-directory)
+       callback errback "video/mp4")
+    (funcall (or errback #'qq-api--default-error)
+             nil "video segment has no native media handle")))
 
-Call CALLBACK with the persistent resource; call ERRBACK on failure."
-  (let ((media-id (qq-media--native-video-media-id segment))
-        (error-fn (or errback #'qq-api--default-error))
-        (target
+(defun qq-media--fetch-native-file-resource
+    (segment key callback errback)
+  "Resolve SEGMENT's opaque file_id into a persistent client cache entry."
+  (if-let* ((file-id (qq-media--remote-file-id segment)))
+      (let ((safe-name (qq-media-segment-default-save-name segment)))
+        (qq-media--materialize-native-content-to-cache
+         file-id key
          (expand-file-name
-          (format "native-video-%s.mp4" (secure-hash 'sha256 key))
-          qq-media-cache-directory)))
-    (if (not media-id)
-        (funcall error-fn nil "video segment has no native media handle")
-      (condition-case error-data
-          (qq-remote-media-prepare-part-local-access
-           media-id 'content
-           (lambda (result)
-             (let* ((access (alist-get 'access result))
-                    (access-id (alist-get 'access_id access))
-                    (path (alist-get 'path access))
-                    (closed nil))
-               (cl-labels
-                   ((close-access
-                     ()
-                     (unless closed
-                       (setq closed t)
-                       (qq-media--close-local-access access-id)))
-                    (finish
-                     (file)
-                     (close-access)
-                     (funcall
-                      callback
-                      `((file . ,file)
-                        (name . ,(file-name-nondirectory file))
-                        (mime-type . "video/mp4"))))
-                    (fail-copy
-                     (reason)
-                     (close-access)
-                     (funcall error-fn nil reason)))
-                 (condition-case copy-error
-                     (appkit-media-copy-or-download-resource-async
-                      `((file . ,path)) target #'finish #'fail-copy)
-                   ((error quit)
-                    (close-access)
-                    (funcall
-                     error-fn nil
-                     (error-message-string copy-error)))))))
-           error-fn)
-        ((error quit)
-         (funcall error-fn nil (error-message-string error-data))
-         nil)))))
+          (format "native-file-%s-%s"
+                  (substring (secure-hash 'sha256 key) 0 16)
+                  safe-name)
+          qq-media-cache-directory)
+         callback errback))
+    (funcall (or errback #'qq-api--default-error)
+             nil "file segment has no native file_id")))
 
 (defun qq-media--resource-fetching-p (key)
   "Return non-nil when KEY is currently being fetched."
@@ -1132,27 +1167,37 @@ Only these keys are safe to pass to NapCat `get_image'/`get_file'."
    (when (appkit-media-url-present-p url)
      `((url . ,url)))))
 
-(defun qq-media--resolve-fileish-segment (segment action callback errback &optional final-error)
+(defun qq-media--resolve-fileish-segment
+    (segment action callback errback &optional final-error cache-key)
   "Resolve file-like SEGMENT with Telega-style priority.
 
 Order:
 1. Existing local path on the segment (outbound attach / pending)
-2. NapCat ACTION (`get_image'/`get_file') with remote file keys only
-3. Direct `url' from the segment
-4. ERRBACK
+2. Native opaque `file_id' materialization
+3. Dormant v1 ACTION resolver for any remaining legacy keys
+4. Direct `url' from the segment
+5. ERRBACK
 
-NapCat/NT still owns remote materialization and QQ disk cache; the client
-never treats a local absolute path as a NapCat file id."
+The native service owns FTN identity and signed URL negotiation; the client
+never treats a local absolute path or display filename as a download token."
   (let* ((capabilities (qq-media-segment-capabilities segment))
          (url (plist-get capabilities :remote-url))
          (local (qq-media--segment-existing-path segment))
-         (remote-keys (qq-media--segment-remote-file-keys segment))
+         (file-id (qq-media--remote-file-id segment))
+         (remote-keys (remove file-id
+                              (qq-media--segment-remote-file-keys segment)))
          (error-fn (or errback #'qq-api--default-error))
          (fail-msg (or final-error
                        "media segment has neither local file, file id, nor URL")))
     (cond
      (local
       (funcall callback (qq-media--resource-from-local+url local url)))
+     (file-id
+      (qq-media--fetch-native-file-resource
+       segment (or cache-key
+                   (qq-media--segment-resource-key segment)
+                   (format "file:%s" file-id))
+       callback error-fn))
      (remote-keys
       (qq-media--call-fileish-action
        action remote-keys
@@ -1418,122 +1463,80 @@ states never probe a second interface such as get_file."
           :remote-error remote-error
           :download-state nil)))
 
-(defconst qq-media--native-image-required-methods
+(defconst qq-media--native-content-required-methods
   '("media.materialize"
     "media.cancel"
     "resource.status"
     "resource.open_local"
     "resource.close_local")
-  "Native protocol methods required for image materialization.")
+  "Native protocol methods required for content materialization.")
 
-(defun qq-media--native-image-methods-ready-p ()
-  "Return non-nil when native image materialization can start."
+(defun qq-media--native-content-methods-ready-p ()
+  "Return non-nil when native content materialization can start."
   (and (qq-runtime-current-account-id)
        (qq-server-ready-p)
        (cl-every #'qq-rpc-method-available-p
-                 qq-media--native-image-required-methods)))
+                 qq-media--native-content-required-methods)))
+
+(defun qq-media--native-content-capabilities (segment media-id noun)
+  "Return native content actions for SEGMENT and MEDIA-ID named NOUN."
+  (let* ((local-file (qq-media-segment-local-file segment))
+         (remote (qq-remote-media media-id))
+         (content (qq-remote-media-part remote 'content))
+         (phase (alist-get 'phase content))
+         (problem (alist-get 'error content))
+         (problem-message (alist-get 'message problem))
+         (methods-ready (qq-media--native-content-methods-ready-p))
+         (download-state (qq-media-segment-download-state segment))
+         (download-status (plist-get download-state :status))
+         (resolve-remote (and methods-ready (not local-file)))
+         (remote-error
+          (cond
+           ((not (qq-runtime-current-account-id))
+            (format "select an account before loading this %s" noun))
+           ((not methods-ready)
+            (format "native %s materialization methods are unavailable" noun))
+           ((equal phase "failed")
+            (or problem-message
+                (format "remote %s materialization failed" noun)))))
+         (status
+          (or (qq-media--transfer-status-text download-state)
+              (pcase phase
+                ("materializing"
+                 (let ((done (alist-get 'bytes_done content))
+                       (total (or (alist-get 'bytes_total content)
+                                  (alist-get 'expected_size content))))
+                   (if total
+                       (format "Loading %s/%s bytes" done total)
+                     (format "Loading %s bytes" done))))
+                ("materialized" "Ready")
+                ("failed"
+                 (format "Retry: %s"
+                         (truncate-string-to-width
+                          (or problem-message "materialization failed")
+                          68 nil nil t)))
+                (_ (unless local-file (format "Remote %s" noun)))))))
+    (list :open (and (or local-file methods-ready) t)
+          :download (and resolve-remote
+                         (not (memq download-status
+                                    '(downloading downloaded))))
+          :save (and (or local-file methods-ready) t)
+          :copy-url nil
+          :status status
+          :local-file local-file
+          :remote-status (or phase 'unprojected)
+          :resolve-remote resolve-remote
+          :remote-url nil
+          :remote-error remote-error
+          :download-state download-state)))
 
 (defun qq-media--native-image-capabilities (segment media-id)
   "Return the action/status model for native image SEGMENT and MEDIA-ID."
-  (let* ((local-file (qq-media-segment-local-file segment))
-         (remote (qq-remote-media media-id))
-         (content (qq-remote-media-part remote 'content))
-         (phase (alist-get 'phase content))
-         (problem (alist-get 'error content))
-         (problem-message (alist-get 'message problem))
-         (methods-ready (qq-media--native-image-methods-ready-p))
-         (download-state (qq-media-segment-download-state segment))
-         (download-status (plist-get download-state :status))
-         (resolve-remote (and methods-ready (not local-file)))
-         (remote-error
-          (cond
-           ((not (qq-runtime-current-account-id))
-            "select an account before loading this image")
-           ((not methods-ready)
-            "native image materialization methods are unavailable")
-           ((equal phase "failed")
-            (or problem-message "remote image materialization failed"))))
-         (status
-          (or (qq-media--transfer-status-text download-state)
-              (pcase phase
-                ("materializing"
-                 (let ((done (alist-get 'bytes_done content))
-                       (total (or (alist-get 'bytes_total content)
-                                  (alist-get 'expected_size content))))
-                   (if total
-                       (format "Loading %s/%s bytes" done total)
-                     (format "Loading %s bytes" done))))
-                ("materialized" "Ready")
-                ("failed"
-                 (format "Retry: %s"
-                         (truncate-string-to-width
-                          (or problem-message "materialization failed")
-                          68 nil nil t)))
-                (_ (unless local-file "Remote image"))))))
-    (list :open (and (or local-file methods-ready) t)
-          :download (and resolve-remote
-                         (not (memq download-status
-                                    '(downloading downloaded))))
-          :save (and (or local-file methods-ready) t)
-          :copy-url nil
-          :status status
-          :local-file local-file
-          :remote-status (or phase 'unprojected)
-          :resolve-remote resolve-remote
-          :remote-url nil
-          :remote-error remote-error
-          :download-state download-state)))
+  (qq-media--native-content-capabilities segment media-id "image"))
 
 (defun qq-media--native-video-capabilities (segment media-id)
   "Return the action/status model for native video SEGMENT and MEDIA-ID."
-  (let* ((local-file (qq-media-segment-local-file segment))
-         (remote (qq-remote-media media-id))
-         (content (qq-remote-media-part remote 'content))
-         (phase (alist-get 'phase content))
-         (problem (alist-get 'error content))
-         (problem-message (alist-get 'message problem))
-         (methods-ready (qq-media--native-image-methods-ready-p))
-         (download-state (qq-media-segment-download-state segment))
-         (download-status (plist-get download-state :status))
-         (resolve-remote (and methods-ready (not local-file)))
-         (remote-error
-          (cond
-           ((not (qq-runtime-current-account-id))
-            "select an account before loading this video")
-           ((not methods-ready)
-            "native video materialization methods are unavailable")
-           ((equal phase "failed")
-            (or problem-message "remote video materialization failed"))))
-         (status
-          (or (qq-media--transfer-status-text download-state)
-              (pcase phase
-                ("materializing"
-                 (let ((done (alist-get 'bytes_done content))
-                       (total (or (alist-get 'bytes_total content)
-                                  (alist-get 'expected_size content))))
-                   (if total
-                       (format "Loading %s/%s bytes" done total)
-                     (format "Loading %s bytes" done))))
-                ("materialized" "Ready")
-                ("failed"
-                 (format "Retry: %s"
-                         (truncate-string-to-width
-                          (or problem-message "materialization failed")
-                          68 nil nil t)))
-                (_ (unless local-file "Remote video"))))))
-    (list :open (and (or local-file methods-ready) t)
-          :download (and resolve-remote
-                         (not (memq download-status
-                                    '(downloading downloaded))))
-          :save (and (or local-file methods-ready) t)
-          :copy-url nil
-          :status status
-          :local-file local-file
-          :remote-status (or phase 'unprojected)
-          :resolve-remote resolve-remote
-          :remote-url nil
-          :remote-error remote-error
-          :download-state download-state)))
+  (qq-media--native-content-capabilities segment media-id "video"))
 
 (defun qq-media-segment-capabilities (segment)
   "Return the centralized action/status model for media SEGMENT.
@@ -1551,6 +1554,9 @@ retired."
    ((qq-media--native-video-media-id segment)
     (qq-media--native-video-capabilities
      segment (qq-media--native-video-media-id segment)))
+   ((qq-media--remote-file-id segment)
+    (qq-media--native-content-capabilities
+     segment (qq-media--remote-file-id segment) "file"))
    (t
     (qq-media--legacy-segment-capabilities segment))))
 
@@ -3249,7 +3255,7 @@ Preview failures are soft (no NapCat error spam)."
                 ;; Soft-fail: clear fetching without user-error / NapCat spam.
                 (lambda (_response _reason)
                   (funcall error nil "preview image not found"))
-                "preview image not found"))
+                "preview image not found" key))
             (t
              (funcall done nil))))
          nil

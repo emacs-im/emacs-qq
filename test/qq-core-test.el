@@ -758,6 +758,97 @@
               (should (equal released '("res-group-file")))))
         (delete-file path)))))
 
+(ert-deftest qq-core-dataline-image-stages-as-one-file-transfer ()
+  (qq-core-test-with-managed-account
+    (let ((path (make-temp-file "qq-core-dataline-" nil ".png" "image"))
+          staged sent released success)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'qq-resource-stage-local)
+                (lambda (source name _sha callback _errback)
+                  (setq staged (list source name))
+                  (funcall callback
+                           '((resource_id . "res-dataline-image")
+                             (phase . "ready")))
+                  "stage-request"))
+               ((symbol-function 'qq-message-send-file)
+                (lambda (session resource-id callback _errback segment)
+                  (setq sent (list session resource-id segment))
+                  (funcall
+                   callback
+                   '((account_id . "slot-a")
+                     (message_id . "7348923749823749825")
+                     (transfer_session_id . "305419896")))
+                  "dataline-file-request"))
+               ((symbol-function 'qq-core--release-send-resource)
+                (lambda (resource-id) (push resource-id released))))
+            (let* ((segment
+                    `((type . "image")
+                      (data . ((file . ,path) (name . "photo.png")))))
+                   (request
+                    (qq-core-send-message
+                     "dataline:mobile:u_Wcc5rknRRqRO8y5gxMD6sA"
+                     (list segment) nil
+                     (lambda (receipt) (setq success receipt)))))
+              (should (eq (qq-request-state request) 'settled))
+              (should (equal staged (list path "photo.png")))
+              (should (equal (nth 0 sent)
+                             "dataline:mobile:u_Wcc5rknRRqRO8y5gxMD6sA"))
+              (should (equal (nth 1 sent) "res-dataline-image"))
+              (should (equal (nth 2 sent) segment))
+              (should (equal (alist-get 'transfer_session_id success)
+                             "305419896"))
+              (should (equal released '("res-dataline-image")))))
+        (delete-file path)))))
+
+(ert-deftest qq-core-dataline-file-waits-for-staged-resource-readiness ()
+  (qq-core-test-with-managed-account
+    (let ((path (make-temp-file "qq-core-dataline-wait-" nil ".png" "image"))
+          ready-callback sent released success)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'qq-resource-stage-local)
+                (lambda (_source _name _sha callback _errback)
+                  (funcall callback
+                           '((resource_id . "res-dataline-wait")
+                             (phase . "staging")))
+                  "stage-request"))
+               ((symbol-function 'qq-resource-await-ready)
+                (lambda (resource-id callback _errback)
+                  (should (equal resource-id "res-dataline-wait"))
+                  (setq ready-callback callback)
+                  (qq-request-watch-create :active-p t)))
+               ((symbol-function 'qq-message-send-file)
+                (lambda (_session resource-id callback _errback _segment)
+                  (setq sent resource-id)
+                  (funcall callback
+                           '((account_id . "slot-a")
+                             (message_id . "7348923749823749825")
+                             (transfer_session_id . "305419896")))
+                  "dataline-file-request"))
+               ((symbol-function 'qq-core--release-send-resource)
+                (lambda (resource-id) (push resource-id released))))
+            (let* ((segment
+                    `((type . "image")
+                      (data . ((file . ,path) (name . "photo.png")))))
+                   (request
+                    (qq-core-send-message
+                     "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA"
+                     (list segment) nil
+                     (lambda (receipt) (setq success receipt)))))
+              (should (eq (qq-request-state request) 'active))
+              (should ready-callback)
+              (should-not sent)
+              (funcall ready-callback
+                       '((resource_id . "res-dataline-wait")
+                         (phase . "ready")))
+              (should (eq (qq-request-state request) 'settled))
+              (should (equal sent "res-dataline-wait"))
+              (should (equal (alist-get 'transfer_session_id success)
+                             "305419896"))
+              (should (equal released '("res-dataline-wait")))))
+        (delete-file path)))))
+
 (ert-deftest qq-core-file-send-rejects-private-and-mixed-drafts ()
   (let ((path (make-temp-file "qq-core-file-" nil ".txt" "hello")))
     (unwind-protect
@@ -1649,8 +1740,12 @@
     (should-not (qq-core-supports-p 'presence))
     (should (qq-core-supports-p 'send-message))
     (should (qq-core-supports-p 'read-receipt))
+    (should-not (qq-core-supports-p 'dataline-file))
     (should-not (qq-core-implemented-p 'chat-action))
-    (should-not (qq-core-supports-p 'chat-action))))
+    (should-not (qq-core-supports-p 'chat-action)))
+  (cl-letf (((symbol-function 'qq-server-capabilities)
+             (lambda () '("dataline.send_file" "resource.stage_local"))))
+    (should (qq-core-supports-p 'dataline-file))))
 
 (ert-deftest qq-core-essence-routes-whole-message ()
   (let ((qq-account--current-account-id "slot-a") call)

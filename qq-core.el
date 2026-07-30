@@ -925,11 +925,42 @@ of being split into several messages with ambiguous partial-success rules."
           (user-error "qq: File source is not a readable regular file: %s"
                       (or path file)))
         (list :path path
-              :name (or name (file-name-nondirectory path)))))))
+              :name (or name (file-name-nondirectory path))
+              :segment (car files))))))
+
+(defun qq-core--dataline-file-send-plan (session-key segments)
+  "Return one DataLine File Transfer plan for local SEGMENTS, or nil.
+
+Pictures remain FILE/FTN payloads on the wire; their `image' segment type is
+retained only for the sender's optimistic local presentation."
+  (when (eq (qq-state-session-key-type session-key) 'dataline)
+    (let ((files
+           (seq-filter
+            (lambda (segment)
+              (member (alist-get 'type segment) '("file" "image")))
+            segments)))
+      (when files
+        (unless (and (= (length files) 1)
+                     (= (length segments) 1))
+          (user-error
+           "qq: Send one DataLine file or image at a time without text or other media"))
+        (let* ((segment (car files))
+               (data (alist-get 'data segment))
+               (file (and (listp data)
+                          (or (alist-get 'file data)
+                              (alist-get 'path data))))
+               (path (and (stringp file) (expand-file-name file)))
+               (name (and (listp data) (alist-get 'name data))))
+          (unless (and path (file-regular-p path) (file-readable-p path))
+            (user-error "qq: File source is not a readable regular file: %s"
+                        (or path file)))
+          (list :path path
+                :name (or name (file-name-nondirectory path))
+                :segment segment))))))
 
 (defun qq-core--send-file
     (session-key plan callback errback)
-  "Stage and publish local file PLAN in group SESSION-KEY.
+  "Stage and publish local file PLAN through SESSION-KEY.
 
 Cancellation detaches the caller.  An already-started native upload is allowed
 to settle so its resource lease and staged resource can be released safely."
@@ -937,9 +968,15 @@ to settle so its resource lease and staged resource can be released safely."
                     (user-error "qq: Select a QQ account first")))
          (observing t)
          resource-id
+         ready-watch
          request)
     (cl-labels
-        ((release-resource
+        ((detach-ready-watch
+           ()
+           (when ready-watch
+             (qq-request-watch-cancel ready-watch)
+             (setq ready-watch nil)))
+         (release-resource
            ()
            (when resource-id
              (let ((owned resource-id))
@@ -947,6 +984,7 @@ to settle so its resource lease and staged resource can be released safely."
                (qq-core--release-send-resource owned))))
          (finish
            (success-p body value)
+           (detach-ready-watch)
            (release-resource)
            (when (qq-request-active-p request)
              (if success-p
@@ -956,23 +994,50 @@ to settle so its resource lease and staged resource can be released safely."
                  (qq-request--invoke callback value)
                (qq-request--invoke errback body value))))
          (send-ready
+           (_resource)
+           (detach-ready-watch)
+           (if (not observing)
+               (release-resource)
+             (condition-case error-data
+                 (if (eq (qq-state-session-key-type session-key) 'dataline)
+                     (qq-message-send-file
+                      session-key resource-id
+                      (lambda (receipt) (finish t nil receipt))
+                      (lambda (body reason) (finish nil body reason))
+                      (plist-get plan :segment))
+                   (qq-message-send-file
+                    session-key resource-id
+                    (lambda (receipt) (finish t nil receipt))
+                    (lambda (body reason) (finish nil body reason))))
+               ((error quit)
+                (finish nil nil (error-message-string error-data))))))
+         (stage-observed
            (resource)
            (setq resource-id (alist-get 'resource_id resource))
            (if (not observing)
                (release-resource)
-             (condition-case error-data
-                 (qq-message-send-file
-                  session-key resource-id
-                  (lambda (receipt) (finish t nil receipt))
-                  (lambda (body reason) (finish nil body reason)))
-               ((error quit)
-                (finish nil nil (error-message-string error-data))))))
+             (pcase (alist-get 'phase resource)
+               ("ready" (send-ready resource))
+               ("staging"
+                (setq ready-watch
+                      (qq-resource-await-ready
+                       resource-id #'send-ready #'stage-failed)))
+               ((or "failed" "released")
+                (let ((problem (alist-get 'error resource)))
+                  (stage-failed
+                   problem
+                   (or (alist-get 'message problem)
+                       "Staged resource did not become ready"))))
+               (_
+                (stage-failed
+                 nil "Gateway returned an invalid staged-resource phase")))))
          (stage-failed
            (body reason)
            (finish nil body reason))
          (cancel
            ()
            (setq observing nil)
+           (detach-ready-watch)
            (release-resource)))
       (setq request (qq-request-create owner #'cancel))
       (condition-case error-data
@@ -980,10 +1045,11 @@ to settle so its resource lease and staged resource can be released safely."
            (plist-get plan :path)
            (plist-get plan :name)
            nil
-           #'send-ready
+           #'stage-observed
            #'stage-failed)
         ((error quit)
          (qq-request-fail request)
+         (detach-ready-watch)
          (release-resource)
          (signal (car error-data) (cdr error-data))))
       request)))
@@ -999,20 +1065,24 @@ selected account and conversation, then replaced by opaque attachment IDs
 before the wire request is sent.  RAW-MESSAGE is an
 optional optimistic rendering override.  The pending row is promoted only by
 the later authoritative self event."
-  (let ((file-plan (qq-core--file-send-plan session-key segments))
-        (plans
-         (cl-loop for segment in segments
-                  for index from 0
-                  for plan = (qq-core--local-media-plan segment index)
-                  when plan collect plan))
-        (error-fn (or errback #'qq-core--default-error)))
+  (let* ((dataline-p (eq (qq-state-session-key-type session-key) 'dataline))
+         (dataline-file-plan
+          (and dataline-p
+               (qq-core--dataline-file-send-plan session-key segments)))
+         (file-plan (and (not dataline-p)
+                         (qq-core--file-send-plan session-key segments)))
+         (plans
+          (and (not dataline-file-plan)
+               (cl-loop for segment in segments
+                        for index from 0
+                        for plan = (qq-core--local-media-plan segment index)
+                        when plan collect plan)))
+         (error-fn (or errback #'qq-core--default-error)))
     (cond
-      ((eq (qq-state-session-key-type session-key) 'dataline)
-       ;; The selected Gateway currently exposes only the dedicated DataLine
-       ;; short-text operation.  Do not stage resources for an ordinary
-       ;; private/group send route.  Stock DataLine has separate file/forward
-       ;; operations; this branch is an implementation boundary, not a claim
-       ;; that the product protocol is text-only.
+     (dataline-file-plan
+      (qq-core--send-file
+       session-key dataline-file-plan callback error-fn))
+     (dataline-p
       (qq-core--start-request
        (lambda (success failure)
          (qq-message-send
@@ -1474,6 +1544,7 @@ CALLBACK receives a page plist with messages and the unsupported-entry count."
     (presence "account.set_presence")
     (send-text "message.send")
     (dataline-text "dataline.send_text")
+    (dataline-file "dataline.send_file" "resource.stage_local")
     (send-message "message.send")
     (merged-forward "message.send_merged_forward")
     (send-file "file.send" "resource.stage_local")

@@ -1970,6 +1970,43 @@
         thumbnail-call
         (list segment (qq-media--native-video-thumbnail-key media-id)))))))
 
+(ert-deftest qq-media-native-file-id-reuses-generic-file-resolution ()
+  (let* ((file-id "media-22334455-6677-4889-9aab-ccddeeff0011")
+         (segment `((type . "file")
+                    (data . ((file_id . ,file-id)
+                             (name . "photo.png")
+                             (file_size . 12345)))))
+         (qq-remote-media--media (make-hash-table :test #'equal))
+         fetch-call resolved)
+    (puthash file-id
+             `((media_id . ,file-id)
+               (kind . "file")
+               (content . ((phase . "available")
+                           (bytes_done . "0")
+                           (expected_size . "12345"))))
+             qq-remote-media--media)
+    (cl-letf (((symbol-function 'qq-runtime-current-account-id)
+               (lambda () "slot-a"))
+              ((symbol-function 'qq-server-ready-p) (lambda () t))
+              ((symbol-function 'qq-rpc-method-available-p) (lambda (_method) t))
+              ((symbol-function 'qq-media--fetch-native-file-resource)
+               (lambda (called-segment key callback _errback)
+                 (setq fetch-call (list called-segment key))
+                 (funcall callback '((file . "/tmp/photo.png")))))
+              ((symbol-function 'qq-api-call)
+               (lambda (&rest _arguments)
+                 (ert-fail "native file_id must not enter the v1 OneBot resolver"))))
+      (let ((capabilities (qq-media-segment-capabilities segment)))
+        (should (plist-get capabilities :open))
+        (should (plist-get capabilities :download))
+        (should (equal (plist-get capabilities :status) "Remote file")))
+      (qq-media--fetch-segment-resource
+       segment (lambda (resource) (setq resolved resource)) #'ignore)
+      (should (equal resolved '((file . "/tmp/photo.png"))))
+      (should
+       (equal fetch-call
+              (list segment (format "file:%s" file-id)))))))
+
 (ert-deftest qq-media-native-record-second-click-cancels-preparation ()
   (let* ((media-id "media-10213243-5465-7687-98a9-bacbdcedfe0f")
          (segment `((type . "record")

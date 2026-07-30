@@ -103,7 +103,7 @@ explicitly internal, already-normalized registry boundary."
                      :false-object :false
                      :null-object qq-server-wire-null))
 
-(defconst qq-server-protocol-version 8
+(defconst qq-server-protocol-version 9
   "Native Gateway protocol version implemented by this client.")
 
 (defvar qq-server-event-hook nil
