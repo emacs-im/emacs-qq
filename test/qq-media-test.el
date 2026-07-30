@@ -2007,6 +2007,68 @@
        (equal fetch-call
               (list segment (format "file:%s" file-id)))))))
 
+(ert-deftest qq-media-terminal-native-file-preview-never-restarts-from-redisplay ()
+  (qq-media-test-with-reset
+   (let* ((file-id "media-33445566-7788-499a-8bbc-ddeeff001122")
+          (segment `((type . "file")
+                     (data . ((file_id . ,file-id)
+                              (name . "received.png")))))
+          (qq-remote-media--media (make-hash-table :test #'equal))
+          (calls 0))
+     (puthash file-id
+              `((media_id . ,file-id)
+                (kind . "file")
+                (content
+                 . ((phase . "failed")
+                    (error . ((code . "media_download_rejected")
+                              (message . "terminal download failure"))))))
+              qq-remote-media--media)
+     (cl-letf (((symbol-function 'qq-media--resolve-fileish-segment)
+                (lambda (&rest _arguments)
+                  (cl-incf calls)))
+               ((symbol-function 'qq-media--preview-image-from-file)
+                (lambda (&rest _arguments) 'unexpected-image)))
+       (should-not (qq-media-segment-preview-image segment))
+       (should-not (qq-media-segment-preview-image segment))
+       (should (= calls 0))))))
+
+(ert-deftest qq-media-failed-automatic-preview-attempt-is-single-shot ()
+  (qq-media-test-with-reset
+   (let* ((file-id "media-44556677-8899-4aab-9ccd-eeff00112233")
+          (segment `((type . "file")
+                     (data . ((file_id . ,file-id)
+                              (name . "received.png")))))
+          (qq-remote-media--media (make-hash-table :test #'equal))
+          (calls 0))
+     (puthash file-id
+              `((media_id . ,file-id)
+                (kind . "file")
+                (content . ((phase . "available"))))
+              qq-remote-media--media)
+     (cl-letf (((symbol-function 'qq-media--resolve-fileish-segment)
+                (lambda (_segment _action _done error &rest _arguments)
+                  (cl-incf calls)
+                  (funcall error nil "scripted terminal failure"))))
+       (should-not (qq-media-segment-preview-image segment))
+       (should-not (qq-media-segment-preview-image segment))
+       (should (= calls 1)))
+
+     ;; An explicit open/download operation may still succeed and populate the
+     ;; persistent cache.  Rendering that cached result does not schedule a
+     ;; second native request.
+     (let* ((key (qq-media-segment-preview-key segment))
+            (file (make-temp-file "qq-native-preview" nil ".png")))
+       (unwind-protect
+           (progn
+             (qq-media--cache-resource key `((file . ,file)))
+             (cl-letf (((symbol-function 'qq-media--preview-image-from-file)
+                        (lambda (path _spec) (list 'preview path))))
+               (should (equal (qq-media-segment-preview-image segment)
+                              (list 'preview file)))
+               (should (= calls 1))))
+         (when (file-exists-p file)
+           (delete-file file)))))))
+
 (ert-deftest qq-media-native-record-second-click-cancels-preparation ()
   (let* ((media-id "media-10213243-5465-7687-98a9-bacbdcedfe0f")
          (segment `((type . "record")
