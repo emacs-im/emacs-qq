@@ -8,7 +8,8 @@
 (require 'qq-message)
 
 (defconst qq-message-test-capabilities
-  '("message.send" "dataline.send_text" "file.send" "message.poke"
+  '("message.send" "dataline.send_text" "dataline.send_file"
+    "file.send" "message.poke"
     "message.send_merged_forward"
     "message.recall_poke" "message.recall" "message.set_reaction"
     "message.set_essence" "message.set_todo" "message.get_history"
@@ -229,8 +230,9 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (client_sequence . ,client-sequence)
     (message_sequence . ,message-sequence)
     (random . ,random)
-    (batch_id . ,batch-id)
-    (text . ,text)))
+    (content . ((kind . "text")
+                (batch_id . ,batch-id)
+                (text . ,text)))))
 
 (cl-defun qq-message-test-dataline-page
     (messages &key (variant "desktop") requested-cursor
@@ -390,6 +392,183 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (should (eq (alist-get 'status message) 'sent)))
       (should (= (hash-table-count qq-message--pending-sends) 0)))))
 
+(ert-deftest qq-message-dataline-file-promotes-from-durable-receipt ()
+  (qq-message-test-with-state
+    (let ((session-key "dataline:mobile:u_Wcc5rknRRqRO8y5gxMD6sA")
+          method params receipt)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (sent-method sent-params callback _errback
+                                      &optional _early)
+                   (setq method sent-method params sent-params)
+                   (funcall
+                    callback
+                    '((account_id . "slot-a")
+                      (chat
+                       (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+                       (variant . "mobile"))
+                      (message_id . "7348923749823749825")
+                      (sent_at . 1784700001)
+                      (server_sequence . "0")
+                      (client_sequence . "42003")
+                      (random . 2)
+                      (transfer_session_id . "305419896")
+                      (file_name . "photo.png")
+                      (file_size . 12345)
+                      (file_kind . "image")
+                      (resource_id . "res-dataline-file")
+                      (fast_path . :false)))
+                   "dataline-file-send")))
+        (should
+         (equal
+          (qq-message-send-file
+           session-key "res-dataline-file"
+           (lambda (value) (setq receipt value)) nil
+           '((type . "image")
+             (data . ((file . "/tmp/photo.png") (name . "photo.png")))))
+          "dataline-file-send")))
+      (should (equal method "dataline.send_file"))
+      (should
+       (equal params
+              '((account_id . "slot-a")
+                (chat (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+                      (variant . "mobile"))
+                (resource_id . "res-dataline-file"))))
+      (should (equal (alist-get 'transfer_session_id receipt) "305419896"))
+      ;; The durable FILE observation replaces wire metadata but must retain
+      ;; the correlated optimistic row's client-local presentation path.
+      (qq-message--handle-event
+       "dataline.message_received"
+       '((account_id . "slot-a")
+         (message
+          (message_id . "7348923749823749825")
+          (chat
+           (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+           (variant . "mobile"))
+          (direction . "sent")
+          (sent_at . 1784700001)
+          (client_sequence . "42003")
+          (message_sequence . "0")
+          (random . 2)
+          (content
+           (kind . "file")
+           (transfer_session_id . "305419896")
+           (file_name . "photo.png")
+           (file_size . 12345)
+           (file_kind . "image")))))
+      (let* ((message (car (qq-state-session-messages session-key)))
+             (segment (car (alist-get 'segments message)))
+             (data (alist-get 'data segment)))
+        (should (equal (alist-get 'server-id message)
+                       "7348923749823749825"))
+        (should (eq (alist-get 'status message) 'sent))
+        (should (equal (alist-get 'type segment) "file"))
+        (should (equal (alist-get 'file data) "/tmp/photo.png"))
+        (should (equal (alist-get 'name data) "photo.png"))
+        (should (equal (alist-get 'dataline_file_kind data) "image")))
+      (should (= (hash-table-count qq-message--pending-sends) 0)))))
+
+(ert-deftest qq-message-dataline-file-event-before-receipt-keeps-local-presentation ()
+  (qq-message-test-with-state
+    (let ((session-key "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA")
+          response-callback)
+      (cl-letf (((symbol-function 'float-time) (lambda (&optional _time) 1784700002.0))
+                ((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (_method _params callback _errback &optional _early)
+                   (setq response-callback callback)
+                   "dataline-file-send")))
+        (qq-message-send-file
+         session-key "res-dataline-file" nil nil
+         '((type . "image")
+           (data . ((file . "/tmp/before.png") (name . "before.png")))))
+        (qq-message--handle-event
+         "dataline.message_received"
+         '((account_id . "slot-a")
+           (message
+            (message_id . "7348923749823749827")
+            (chat
+             (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+             (variant . "desktop"))
+            (direction . "sent")
+            (sent_at . 1784700002)
+            (client_sequence . "42005")
+            (message_sequence . "0")
+            (random . 4)
+            (content
+             (kind . "file")
+             (transfer_session_id . "305419898")
+             (file_name . "before.png")
+             (file_size . 12345)
+             (file_kind . "image")))))
+        (funcall
+         response-callback
+         '((account_id . "slot-a")
+           (chat
+            (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+            (variant . "desktop"))
+           (message_id . "7348923749823749827")
+           (sent_at . 1784700002)
+           (server_sequence . "0")
+           (client_sequence . "42005")
+           (random . 4)
+           (transfer_session_id . "305419898")
+           (file_name . "before.png")
+           (file_size . 12345)
+           (file_kind . "image")
+           (resource_id . "res-dataline-file")
+           (fast_path . :false))))
+      (let* ((messages (qq-state-session-messages session-key))
+             (message (car messages))
+             (data (alist-get 'data (car (alist-get 'segments message)))))
+        (should (= (length messages) 1))
+        (should (equal (alist-get 'server-id message)
+                       "7348923749823749827"))
+        (should (equal (alist-get 'file data) "/tmp/before.png"))
+        (should (eq (alist-get 'status message) 'sent))))))
+
+(ert-deftest qq-message-dataline-file-event-is-closed-and-projects-metadata ()
+  (qq-message-test-with-state
+    (qq-message--handle-event
+     "dataline.message_received"
+     '((account_id . "slot-a")
+       (message
+        (message_id . "7348923749823749826")
+        (chat
+         (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+         (variant . "desktop"))
+        (direction . "sent")
+        (sent_at . 1784700002)
+        (client_sequence . "42004")
+        (message_sequence . "0")
+        (random . 3)
+        (content
+         (kind . "file")
+         (transfer_session_id . "305419897")
+         (file_name . "photo.png")
+         (file_size . 12345)
+         (file_kind . "image")
+         (media_id . "media-00000000-0000-4000-8000-000000000001")))))
+    (let* ((message
+            (car
+             (qq-state-session-messages
+              "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA")))
+           (segment (car (alist-get 'segments message))))
+      (should (equal (alist-get 'server-id message)
+                     "7348923749823749826"))
+      (should (equal (alist-get 'preview message) "[Image] photo.png"))
+      (should (equal (alist-get 'type segment) "file"))
+      (should (equal (alist-get 'name (alist-get 'data segment))
+                     "photo.png"))
+      (should (equal (alist-get 'file_id (alist-get 'data segment))
+                     "media-00000000-0000-4000-8000-000000000001"))
+      (should (equal (alist-get 'dataline-transfer-session-id message)
+                     "305419897")))))
+
 (ert-deftest qq-message-dataline-durable-event-deduplicates-the-receipt-row ()
   (qq-message-test-with-state
     (let ((session-key "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA"))
@@ -426,8 +605,10 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (client_sequence . "42001")
           (message_sequence . "0")
           (random . 0)
-          (batch_id . "99")
-          (text . "hello phone"))))
+          (content
+           (kind . "text")
+           (batch_id . "99")
+           (text . "hello phone")))))
       (let ((messages (qq-state-session-messages session-key)))
         (should (= (length messages) 1))
         (should (equal (alist-get 'server-id (car messages))

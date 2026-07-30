@@ -811,22 +811,22 @@ RAW-DATA, when non-nil, is retained only as the event diagnostic envelope."
          (client-sequence (alist-get 'client_sequence message))
          (message-sequence (alist-get 'message_sequence message))
          (random (alist-get 'random message))
-         (batch-id (alist-get 'batch_id message))
-         (text (alist-get 'text message))
+         (content (alist-get 'content message))
+         (content-kind (alist-get 'kind content))
          (peer-name (if (equal peer-uid "u_l7jpPIZxQo0mzJwoEt-SKw")
                         "My pad"
                       "My phone"))
          (message-keys (mapcar #'car message))
          (allowed-message-keys
           '(message_id chat direction sent_at client_sequence
-                       message_sequence random batch_id text)))
+                       message_sequence random content)))
     (unless (and
              (cl-every (lambda (key) (memq key allowed-message-keys))
                        message-keys)
              (= (length message-keys)
                 (length (delete-dups (copy-sequence message-keys))))
              (cl-every (lambda (key) (assq key message))
-                       '(message_id chat direction sent_at batch_id text))
+                       '(message_id chat direction sent_at content))
              (qq-account--exact-object-keys-p chat '(peer_uid variant))
              (member variant '("desktop" "mobile"))
              (member peer-uid '("u_Wcc5rknRRqRO8y5gxMD6sA"
@@ -840,63 +840,127 @@ RAW-DATA, when non-nil, is retained only as the event diagnostic envelope."
              (or (null message-sequence)
                  (qq-account--uint64-decimal-p message-sequence t))
              (or (null random) (qq-account--uint32-p random))
-             (qq-account--uint64-decimal-p batch-id)
-             (qq-account--non-empty-string-p text)
-             (<= (string-bytes text)
-                 qq-message-max-dataline-text-bytes))
-      (error "qq: Gateway returned an invalid DataLine text message"))
-    (let* ((session-key
-            (qq-state-session-key 'dataline peer-uid variant))
-           (outgoing (equal direction "sent"))
-           (wire-message
-            `((client_sequence . ,client-sequence)
-              (sequence . ,message-sequence)
-              (random . ,random)))
-           (normalized
-            `((id . ,message-id)
-              (server-id . ,message-id)
-              (session-key . ,session-key)
-              (time . ,sent-at)
-              (message-seq
-               . ,(and message-sequence
-                       (not (equal message-sequence "0"))
-                       message-sequence))
-              (native-client-sequence . ,client-sequence)
-              (native-random . ,random)
-              (gateway-account-id . ,owner)
-              (sender-id . nil)
-              (sender-native-id . nil)
-              (sender-name
-               . ,(if outgoing
-                      (or (alist-get 'nickname (qq-state-self-info))
-                          (qq-state-self-user-id)
-                          "Me")
-                    peer-name))
-              (self-p . ,outgoing)
-              (status . ,(if outgoing 'sent 'received))
-              (segments . (((type . "text")
-                            (data . ((text . ,text))))))
-              (raw-message . ,text)
-              (preview . ,text)
-              (message-type . "dataline")
-              (chat-type . ,(if (equal variant "mobile") "134" "8"))
-              (peer-uid . ,peer-uid)
-              (peer-uin . nil)
-              (peer-name . ,peer-name)
-              (group-id . nil)
-              (user-id . nil)
-              (target-id . ,peer-uid)
-              (dataline-batch-id . ,batch-id)
-              (order . ,(qq-state--next-message-order))
-              ,@(when raw-data
-                  `((raw-event . ,(copy-tree raw-data)))))))
-      (setq normalized
-            (qq-message--attach-pending-local-id
-             normalized owner wire-message session-key))
-      (cons normalized wire-message))))
+             (listp content))
+      (error "qq: Gateway returned an invalid DataLine message"))
+    (let* ((text-p (equal content-kind "text"))
+           (file-p (equal content-kind "file"))
+           (batch-id (and text-p (alist-get 'batch_id content)))
+           (text (and text-p (alist-get 'text content)))
+           (transfer-session-id
+            (and file-p (alist-get 'transfer_session_id content)))
+           (file-name (and file-p (alist-get 'file_name content)))
+           (file-size (and file-p (alist-get 'file_size content)))
+           (file-kind (and file-p (alist-get 'file_kind content)))
+           (local-resource-id
+            (and file-p (alist-get 'local_resource_id content)))
+           (media-id (and file-p (alist-get 'media_id content)))
+           (content-valid
+            (cond
+             (text-p
+              (and (qq-account--exact-object-keys-p
+                    content '(kind batch_id text))
+                   (qq-account--uint64-decimal-p batch-id)
+                   (not (equal batch-id "0"))
+                   (qq-account--non-empty-string-p text)
+                   (<= (string-bytes text)
+                       qq-message-max-dataline-text-bytes)))
+             (file-p
+              (let* ((keys (mapcar #'car content))
+                     (allowed '(kind transfer_session_id file_name file_size
+                                     file_kind local_resource_id media_id)))
+                (and (cl-every (lambda (key) (memq key allowed)) keys)
+                     (= (length keys)
+                        (length (delete-dups (copy-sequence keys))))
+                     (cl-every (lambda (key) (assq key content))
+                               '(kind transfer_session_id file_name file_size
+                                      file_kind))
+                     (qq-account--uint64-decimal-p transfer-session-id)
+                     (not (equal transfer-session-id "0"))
+                     (qq-account--non-empty-string-p file-name)
+                     (<= (string-bytes file-name) 4096)
+                     (qq-account--uint32-p file-size)
+                     (> file-size 0)
+                     (member file-kind '("other" "image" "video"))
+                     (or (null local-resource-id)
+                         (qq-resource-id-p local-resource-id))
+                     (or (null media-id)
+                         (qq-remote-media--id-p media-id)))))
+             (t nil))))
+      (unless content-valid
+        (error "qq: Gateway returned an invalid DataLine message content"))
+      (let* ((session-key
+              (qq-state-session-key 'dataline peer-uid variant))
+             (outgoing (equal direction "sent"))
+             (file-preview
+              (and file-p
+                   (format "[%s] %s"
+                           (if (equal file-kind "image") "Image" "File")
+                           file-name)))
+             (segments
+              (if text-p
+                  `(((type . "text") (data . ((text . ,text)))))
+                `(((type . "file")
+                   (data . ((name . ,file-name)
+                            (size . ,file-size)
+                            (dataline_file_kind . ,file-kind)
+                            ,@(when local-resource-id
+                                `((resource_id . ,local-resource-id)))
+                            ;; Reuse the generic opaque file resolver shape.
+                            ;; FTN identity and signed URLs remain behind the
+                            ;; native service's remote-media capability.
+                            ,@(when media-id
+                                `((file_id . ,media-id)))))))))
+             (raw-message (if text-p text file-preview))
+             (wire-message
+              `((client_sequence . ,client-sequence)
+                (sequence . ,message-sequence)
+                (random . ,random)))
+             (normalized
+              `((id . ,message-id)
+                (server-id . ,message-id)
+                (session-key . ,session-key)
+                (time . ,sent-at)
+                (message-seq
+                 . ,(and message-sequence
+                         (not (equal message-sequence "0"))
+                         message-sequence))
+                (native-client-sequence . ,client-sequence)
+                (native-random . ,random)
+                (gateway-account-id . ,owner)
+                (sender-id . nil)
+                (sender-native-id . nil)
+                (sender-name
+                 . ,(if outgoing
+                        (or (alist-get 'nickname (qq-state-self-info))
+                            (qq-state-self-user-id)
+                            "Me")
+                      peer-name))
+                (self-p . ,outgoing)
+                (status . ,(if outgoing 'sent 'received))
+                (segments . ,segments)
+                (raw-message . ,raw-message)
+                (preview . ,raw-message)
+                (message-type . "dataline")
+                (chat-type . ,(if (equal variant "mobile") "134" "8"))
+                (peer-uid . ,peer-uid)
+                (peer-uin . nil)
+                (peer-name . ,peer-name)
+                (group-id . nil)
+                (user-id . nil)
+                (target-id . ,peer-uid)
+                ,@(when text-p `((dataline-batch-id . ,batch-id)))
+                ,@(when file-p
+                    `((dataline-transfer-session-id . ,transfer-session-id)))
+                (order . ,(qq-state--next-message-order))
+                ,@(when raw-data
+                    `((raw-event . ,(copy-tree raw-data)))))))
+        (setq normalized
+              (qq-message--attach-pending-local-id
+               normalized owner wire-message session-key))
+        (cons normalized wire-message)))))
 
 (defun qq-message--project-dataline-message (data)
-  "Project one account-scoped DataLine text event DATA."
+  "Project one account-scoped DataLine event DATA."
   (let* ((owner (qq-message--event-owner data))
          (_owner (qq-message--sync-account owner))
          (message (alist-get 'message data)))
@@ -1967,25 +2031,52 @@ device's independently assigned inbound DataLine Message ID."
     (let* ((identity (qq-state-session-key-identity session-key))
            (chat (alist-get 'chat receipt))
            (message-id (alist-get 'message_id receipt)))
-      (unless
-          (and
-           (qq-account--exact-object-keys-p
-            receipt '(account_id chat message_id sent_at server_sequence
-                                 client_sequence random batch_id))
-           (equal (alist-get 'account_id receipt) owner)
-           (qq-account--exact-object-keys-p chat '(peer_uid variant))
-           (equal (alist-get 'peer_uid chat) (alist-get 'peer-uid identity))
-           (equal (alist-get 'variant chat) (alist-get 'variant identity))
-           (qq-message--message-id-p message-id)
-           (qq-account--uint32-p (alist-get 'sent_at receipt))
-           (> (alist-get 'sent_at receipt) 0)
-           (qq-account--uint64-decimal-p
-            (alist-get 'server_sequence receipt) t)
-           (qq-account--uint64-decimal-p
-            (alist-get 'client_sequence receipt))
-           (qq-account--uint32-p (alist-get 'random receipt))
-           (qq-account--uint64-decimal-p (alist-get 'batch_id receipt)))
-        (error "qq: Gateway returned an invalid DataLine send receipt"))
+      (let* ((text-receipt-p (assq 'batch_id receipt))
+             (file-receipt-p (assq 'transfer_session_id receipt))
+             (shape-valid
+              (cond
+               ((and text-receipt-p (not file-receipt-p))
+                (and
+                 (qq-account--exact-object-keys-p
+                  receipt '(account_id chat message_id sent_at server_sequence
+                                       client_sequence random batch_id))
+                 (qq-account--uint64-decimal-p
+                  (alist-get 'batch_id receipt))))
+               ((and file-receipt-p (not text-receipt-p))
+                (and
+                 (qq-account--exact-object-keys-p
+                  receipt '(account_id chat message_id sent_at server_sequence
+                                       client_sequence random transfer_session_id
+                                       file_name file_size file_kind resource_id
+                                       fast_path))
+                 (qq-account--uint64-decimal-p
+                  (alist-get 'transfer_session_id receipt))
+                 (not (equal (alist-get 'transfer_session_id receipt) "0"))
+                 (qq-account--non-empty-string-p
+                  (alist-get 'file_name receipt))
+                 (qq-account--uint32-p (alist-get 'file_size receipt))
+                 (> (alist-get 'file_size receipt) 0)
+                 (member (alist-get 'file_kind receipt)
+                         '("other" "image" "video"))
+                 (qq-resource-id-p (alist-get 'resource_id receipt))
+                 (memq (alist-get 'fast_path receipt) '(t :false))))
+               (t nil))))
+        (unless
+            (and
+             shape-valid
+             (equal (alist-get 'account_id receipt) owner)
+             (qq-account--exact-object-keys-p chat '(peer_uid variant))
+             (equal (alist-get 'peer_uid chat) (alist-get 'peer-uid identity))
+             (equal (alist-get 'variant chat) (alist-get 'variant identity))
+             (qq-message--message-id-p message-id)
+             (qq-account--uint32-p (alist-get 'sent_at receipt))
+             (> (alist-get 'sent_at receipt) 0)
+             (qq-account--uint64-decimal-p
+              (alist-get 'server_sequence receipt) t)
+             (qq-account--uint64-decimal-p
+              (alist-get 'client_sequence receipt))
+             (qq-account--uint32-p (alist-get 'random receipt)))
+          (error "qq: Gateway returned an invalid DataLine send receipt")))
       message-id)))
 
 (defun qq-message--promote-dataline-send-receipt
@@ -2127,27 +2218,52 @@ forwarding, face projection, or multipart capabilities."
          callback errback)))))
 
 (defun qq-message-send-file
-    (session-key resource-id &optional callback errback)
-  "Publish staged RESOURCE-ID as a standalone group file.
+    (session-key resource-id &optional callback errback optimistic-segment)
+  "Publish staged RESOURCE-ID through SESSION-KEY's file operation.
 
-Group files use QQ's dedicated file feed rather than `message.send'.  The
-successful receipt acknowledges publication but does not invent a message ID;
-the authoritative file message is projected when QQ returns it through push
-or history."
-  (unless (eq (qq-state-session-key-type session-key) 'group)
-    (user-error "qq: Native private file upload is not implemented yet"))
+Groups use their dedicated file feed and wait for authoritative push/history.
+DataLine uses command-7 FTN publication, inserts OPTIMISTIC-SEGMENT locally,
+and promotes it from the sender-local Message ID in the durable receipt."
   (unless (qq-resource-id-p resource-id)
     (user-error "qq: File send requires an opaque staged resource"))
   (let* ((owner (qq-message--current-owner))
          (_owner (qq-message--sync-account owner)))
-    (qq-message--call
-     "file.send" owner
-     `((conversation . ,(qq-message--conversation-params session-key))
-       (resource_id . ,resource-id))
-     :callback callback
-     :errback errback
-     :stale-message
-     "QQ account or Gateway connection changed during file send")))
+    (pcase (qq-state-session-key-type session-key)
+      ('group
+       (qq-message--call
+        "file.send" owner
+        `((conversation . ,(qq-message--conversation-params session-key))
+          (resource_id . ,resource-id))
+        :callback callback
+        :errback errback
+        :stale-message
+        "QQ account or Gateway connection changed during group-file send"))
+      ('dataline
+       (unless (and (listp optimistic-segment)
+                    (member (alist-get 'type optimistic-segment)
+                            '("file" "image")))
+         (user-error "qq: DataLine file transfer requires one local file or image"))
+       (let* ((identity (qq-state-session-key-identity session-key))
+              (peer-uid (alist-get 'peer-uid identity))
+              (variant (alist-get 'variant identity))
+              (presentation (copy-tree optimistic-segment))
+              (name (alist-get 'name (alist-get 'data presentation))))
+         ;; DataLine pictures are FILE operations.  Keep the optimistic row in
+         ;; that canonical segment shape too; the generic media layer derives
+         ;; image presentation from its filename.
+         (setf (alist-get 'type presentation nil nil #'eq) "file")
+         (unless (and (member variant '("desktop" "mobile"))
+                      (member peer-uid '("u_Wcc5rknRRqRO8y5gxMD6sA"
+                                         "u_l7jpPIZxQo0mzJwoEt-SKw")))
+           (user-error "qq: DataLine file target is not a pinned phone/pad class"))
+         (qq-message--send-request
+          session-key (list presentation) name
+          "dataline.send_file"
+          `((chat . ((peer_uid . ,peer-uid) (variant . ,variant)))
+            (resource_id . ,resource-id))
+          callback errback)))
+      (_
+       (user-error "qq: Native private file upload is not implemented yet")))))
 
 (defun qq-message-send-poke
     (session-key target-uin &optional callback errback)

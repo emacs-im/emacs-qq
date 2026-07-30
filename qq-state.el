@@ -2560,6 +2560,43 @@ delta from being applied twice."
           (setq updated (qq-state--as-recalled-message updated)))
         updated))))
 
+(defun qq-state--merge-local-segment-presentation
+    (existing incoming merged)
+  "Overlay safe client-local media fields from EXISTING onto MERGED.
+
+INCOMING remains authoritative for segment kind and remote identities.  This
+only preserves absolute source paths from a correlated optimistic row, keeping
+local presentation independent of the authoritative opaque `file_id'."
+  (let ((existing-segments (and existing (alist-get 'segments existing)))
+        (incoming-segments (alist-get 'segments incoming)))
+    (if (not (and (alist-get 'local-id existing)
+                  (alist-get 'server-id incoming)
+                  (= (length existing-segments) (length incoming-segments))
+                  (cl-every
+                   (lambda (pair)
+                     (let ((old (car pair))
+                           (new (cdr pair)))
+                       (and (equal (alist-get 'type old)
+                                   (alist-get 'type new))
+                            (member (alist-get 'type new)
+                                    '("image" "file" "video" "record")))))
+                   (cl-mapcar #'cons existing-segments incoming-segments))))
+        merged
+      (let ((preserved (copy-tree merged)))
+        (cl-mapc
+         (lambda (old new)
+           (let ((old-data (alist-get 'data old))
+                 (new-data (alist-get 'data new)))
+             (dolist (key '(file path))
+               (let ((value (alist-get key old-data)))
+                 (when (and (stringp value)
+                            (file-name-absolute-p value)
+                            (null (assq key new-data)))
+                   (setf (alist-get key new-data nil nil #'eq) value))))
+             (setf (alist-get 'data new nil nil #'eq) new-data)))
+         existing-segments (alist-get 'segments preserved))
+        preserved))))
+
 (defun qq-state--merge-normalized-message
     (session-key message &optional summary-observation-token source)
   "Merge normalized MESSAGE into SESSION-KEY.
@@ -2629,6 +2666,9 @@ Return three values via `cl-values':
                           (alist-get key existing))))
                 preserved)
             merged))
+         (merged
+          (qq-state--merge-local-segment-presentation
+           existing message merged))
          (old-order (and existing (alist-get 'order existing)))
          (previous-anchor
           (or (and redundant (qq-state-message-anchor redundant))
