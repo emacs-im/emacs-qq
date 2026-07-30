@@ -37,6 +37,13 @@
 (defvar qq-media--preview-missing-cache (make-hash-table :test #'equal)
   "Preview keys whose current media source could not produce an image.")
 
+(defvar qq-media--native-preview-attempts (make-hash-table :test #'equal)
+  "Renderer-owned native preview attempts keyed by (MEDIA-ID . PART).
+
+A failed automatic attempt remains here until an explicit operation succeeds
+and populates the stable cache, or account/Gateway lifecycle clears it.
+Redisplay therefore observes operation state but never schedules a retry.")
+
 (defvar qq-media--fetching-cache (make-hash-table :test #'equal)
   "Set of logical resource identities currently being fetched.")
 
@@ -157,6 +164,7 @@ the adopted transport `:token'.")
   (clrhash qq-media--resource-cache)
   (clrhash qq-media--image-cache)
   (clrhash qq-media--preview-missing-cache)
+  (clrhash qq-media--native-preview-attempts)
   (clrhash qq-media--fetching-cache)
   (clrhash qq-media--download-state-table)
   (when (file-directory-p qq-media-cache-directory)
@@ -648,6 +656,11 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
 
 (defun qq-media--native-remote-media-changed (_reason media-id)
   "Redisplay cards affected by remote MEDIA-ID state changes."
+  (if media-id
+      (unless (qq-remote-media media-id)
+        (remhash (cons media-id 'content) qq-media--native-preview-attempts)
+        (remhash (cons media-id 'thumbnail) qq-media--native-preview-attempts))
+    (clrhash qq-media--native-preview-attempts))
   (if-let* ((media (and media-id (qq-remote-media media-id))))
       (pcase (alist-get 'kind media)
         ("record" (qq-media--notify-native-record-state media-id))
@@ -888,6 +901,45 @@ resource alist.  SPEC is forwarded to IMAGE-BUILDER, which defaults to
     (or (qq-media--json-truthy-p (alist-get 'animated data))
         (and (stringp summary)
              (string-match-p "动画" summary)))))
+
+(defun qq-media--native-preview-part-failed-p (media-id part)
+  "Return non-nil when MEDIA-ID PART has terminal materialization failure."
+  (when-let* ((media (qq-remote-media media-id))
+              (snapshot (qq-remote-media-part media part)))
+    (equal (alist-get 'phase snapshot) "failed")))
+
+(defun qq-media--ensure-native-preview-image
+    (key media-id part fetcher &optional image-builder)
+  "Return KEY's image or begin one renderer-owned MEDIA-ID PART attempt.
+
+FETCHER accepts success and error callbacks.  IMAGE-BUILDER converts the
+persistent file into an Emacs image.  A terminal or locally failed automatic
+attempt is not reissued by later redisplay.  User actions continue to call the
+ordinary segment operations directly and can therefore retry."
+  (when-let* ((file (qq-media--remote-image-cache-existing-file key)))
+    (qq-media--cache-resource key `((file . ,file))))
+  (let ((attempt-key (cons media-id part)))
+    (cond
+     ((or (qq-media--cached-image key)
+          (qq-media--cached-resource key))
+      (qq-media--ensure-resource-image key fetcher nil image-builder))
+     ((qq-media--native-preview-part-failed-p media-id part) nil)
+     ((gethash attempt-key qq-media--native-preview-attempts) nil)
+     (t
+      (puthash attempt-key t qq-media--native-preview-attempts)
+      (qq-media--ensure-resource-image
+       key
+       (lambda (done error)
+         (funcall
+          fetcher
+          (lambda (resource)
+            (remhash attempt-key qq-media--native-preview-attempts)
+            (funcall done resource))
+          (lambda (response reason)
+            ;; Keep ATTEMPT-KEY terminal.  Only an explicit operation or a
+            ;; lifecycle replacement may create another native request.
+            (funcall error response reason))))
+       nil image-builder)))))
 
 (defun qq-media--fetch-native-image-part-resource
     (segment media-id part key callback errback)
@@ -3222,12 +3274,11 @@ Preview failures are soft (no NapCat error spam)."
       (cond
        (native-video-id
         (when-let* ((image
-                     (qq-media--ensure-resource-image
-                      key
+                     (qq-media--ensure-native-preview-image
+                      key native-video-id 'thumbnail
                       (lambda (done error)
                         (qq-media--fetch-native-video-thumbnail-resource
                          segment key done error))
-                      nil
                       #'qq-media--preview-image-from-file)))
           (or (appkit-media-video-preview-display-image image 'qq)
               image)))
@@ -3240,26 +3291,33 @@ Preview failures are soft (no NapCat error spam)."
           (qq-media--cache-resource
            key
            (qq-media--resource-from-local+url local url)))
-        (qq-media--ensure-resource-image
-         key
-         (lambda (done error)
-           (cond
-            (native-image-id
-             (qq-media--fetch-native-image-resource
-              segment key done error))
-            ((qq-media-segment-preview-capable-p segment)
-               (qq-media--resolve-fileish-segment
-                segment
-                "get_image"
-                done
-                ;; Soft-fail: clear fetching without user-error / NapCat spam.
-                (lambda (_response _reason)
-                  (funcall error nil "preview image not found"))
-                "preview image not found" key))
-            (t
-             (funcall done nil))))
-         nil
-         #'qq-media--preview-image-from-file))))))
+        (let ((file-id (qq-media--remote-file-id segment)))
+          (if-let* ((media-id (or native-image-id file-id)))
+              (qq-media--ensure-native-preview-image
+               key media-id 'content
+               (lambda (done error)
+                 (if native-image-id
+                     (qq-media--fetch-native-image-resource
+                      segment key done error)
+                   (qq-media--resolve-fileish-segment
+                    segment "get_image" done error
+                    "preview image not found" key)))
+               #'qq-media--preview-image-from-file)
+            (qq-media--ensure-resource-image
+             key
+             (lambda (done error)
+               (if (qq-media-segment-preview-capable-p segment)
+                   (qq-media--resolve-fileish-segment
+                    segment
+                    "get_image"
+                    done
+                    ;; Soft-fail: clear fetching without user-error / NapCat spam.
+                    (lambda (_response _reason)
+                      (funcall error nil "preview image not found"))
+                    "preview image not found" key)
+                 (funcall done nil)))
+             nil
+             #'qq-media--preview-image-from-file))))))))
 
 (defun qq-media-segment-preview-fetching-p (segment)
   "Return non-nil when preview fetch for SEGMENT is currently active."
