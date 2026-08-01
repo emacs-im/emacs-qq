@@ -243,13 +243,9 @@ transfer callbacks can run outside a safe redisplay context; immediate
   "Return validated native video media ID from SEGMENT, or nil."
   (qq-media--native-media-id segment "video"))
 
-(defun qq-media--remote-file-id (segment)
-  "Return SEGMENT's opaque native file resolver, or nil.
-
-The display filename remains in `file' or `name', while `file_id' alone
-carries download authority."
-  (let ((file-id (alist-get 'file_id (alist-get 'data segment))))
-    (and (qq-remote-media--id-p file-id) file-id)))
+(defun qq-media--native-file-media-id (segment)
+  "Return validated native file media ID from SEGMENT, or nil."
+  (qq-media--native-media-id segment "file"))
 
 (defun qq-media--native-record-key (media-id)
   "Return logical media cache key for native record MEDIA-ID."
@@ -262,6 +258,10 @@ carries download authority."
 (defun qq-media--native-video-key (media-id)
   "Return logical content cache key for native video MEDIA-ID."
   (format "video:%s" media-id))
+
+(defun qq-media--native-file-key (media-id)
+  "Return logical content cache key for native file MEDIA-ID."
+  (format "file:%s" media-id))
 
 (defun qq-media--native-video-thumbnail-key (media-id)
   "Return logical thumbnail cache key for native video MEDIA-ID."
@@ -672,8 +672,8 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
           (qq-media--native-video-key media-id))
          (qq-media--note-cache-updated
           (qq-media--native-video-thumbnail-key media-id)))
-        ;; Generic file segments key their cache by the opaque file_id.
-        ("file" (qq-media--note-cache-updated (format "file:%s" media-id)))
+        ;; Native file segments key their cache by the opaque media handle.
+        ("file" (qq-media--note-cache-updated (qq-media--native-file-key media-id)))
         (_ (qq-media--note-cache-updated nil)))
     (qq-media--note-cache-updated nil)))
 
@@ -1087,11 +1087,11 @@ Call CALLBACK with the persistent resource; call ERRBACK on failure."
 
 (defun qq-media--fetch-native-file-resource
     (segment key callback errback)
-  "Resolve SEGMENT's opaque file_id into a persistent client cache entry."
-  (if-let* ((file-id (qq-media--remote-file-id segment)))
+  "Materialize SEGMENT's opaque native media handle into the client cache."
+  (if-let* ((media-id (qq-media--native-file-media-id segment)))
       (let ((safe-name (qq-media-segment-default-save-name segment)))
         (qq-media--materialize-native-content-to-cache
-         file-id key
+         media-id key
          (expand-file-name
           (format "native-file-%s-%s"
                   (substring (secure-hash 'sha256 key) 0 16)
@@ -1099,7 +1099,7 @@ Call CALLBACK with the persistent resource; call ERRBACK on failure."
           qq-media-cache-directory)
          callback errback))
     (funcall (or errback #'qq-api--default-error)
-             nil "file segment has no native file_id")))
+             nil "file segment has no native media handle")))
 
 (defun qq-media--resource-fetching-p (key)
   "Return non-nil when KEY is currently being fetched."
@@ -1220,36 +1220,27 @@ Only these keys are safe to pass to NapCat `get_image'/`get_file'."
      `((url . ,url)))))
 
 (defun qq-media--resolve-fileish-segment
-    (segment action callback errback &optional final-error cache-key)
+    (segment action callback errback &optional final-error)
   "Resolve file-like SEGMENT with Telega-style priority.
 
 Order:
 1. Existing local path on the segment (outbound attach / pending)
-2. Native opaque `file_id' materialization
-3. Dormant v1 ACTION resolver for any remaining legacy keys
-4. Direct `url' from the segment
-5. ERRBACK
+2. Dormant v1 ACTION resolver for any remaining legacy keys
+3. Direct `url' from the segment
+4. ERRBACK
 
 The native service owns FTN identity and signed URL negotiation; the client
 never treats a local absolute path or display filename as a download token."
   (let* ((capabilities (qq-media-segment-capabilities segment))
          (url (plist-get capabilities :remote-url))
          (local (qq-media--segment-existing-path segment))
-         (file-id (qq-media--remote-file-id segment))
-         (remote-keys (remove file-id
-                              (qq-media--segment-remote-file-keys segment)))
+         (remote-keys (qq-media--segment-remote-file-keys segment))
          (error-fn (or errback #'qq-api--default-error))
          (fail-msg (or final-error
                        "media segment has neither local file, file id, nor URL")))
     (cond
      (local
       (funcall callback (qq-media--resource-from-local+url local url)))
-     (file-id
-      (qq-media--fetch-native-file-resource
-       segment (or cache-key
-                   (qq-media--segment-resource-key segment)
-                   (format "file:%s" file-id))
-       callback error-fn))
      (remote-keys
       (qq-media--call-fileish-action
        action remote-keys
@@ -1264,24 +1255,40 @@ never treats a local absolute path or display filename as a download token."
      (t
       (funcall error-fn nil fail-msg)))))
 
+(defun qq-media-segment-display-name (segment)
+  "Return SEGMENT's display filename, or nil when none was projected."
+  (let ((data (alist-get 'data segment)))
+    (or (alist-get 'file_name data)
+        (alist-get 'name data)
+        (alist-get 'file data)
+        (appkit-media-url-filename (alist-get 'url data)))))
+
+(defun qq-media--file-segment-kind (segment)
+  "Return semantic kind of file SEGMENT, or nil for another segment type.
+
+An authoritative `file_kind' presentation fact wins.  Filename inference is
+only the fallback for older/general file producers that do not provide one."
+  (when (equal (alist-get 'type segment) "file")
+    (let* ((data (alist-get 'data segment))
+           (file-kind (alist-get 'file_kind data))
+           (name (qq-media-segment-display-name segment)))
+      (pcase file-kind
+        ("image" 'image)
+        ("video" 'video)
+        ("other" 'file)
+        (_ (cond
+            ((appkit-media-image-file-name-p name) 'image)
+            ((appkit-media-video-file-name-p name) 'video)
+            (t 'file)))))))
+
 (defun qq-media-imageish-file-segment-p (segment)
-  "Return non-nil when SEGMENT is a file that should preview like an image."
-  (and (equal (alist-get 'type segment) "file")
-       (let* ((data (alist-get 'data segment))
-              (name (or (alist-get 'name data)
-                        (alist-get 'file data))))
-         (appkit-media-image-file-name-p name))))
+  "Return non-nil when SEGMENT is a file presented as an image."
+  (eq (qq-media--file-segment-kind segment) 'image))
 
 (defun qq-media-videoish-segment-p (segment)
   "Return non-nil when SEGMENT carries a video preview source."
-  (let* ((type (alist-get 'type segment))
-         (data (alist-get 'data segment))
-         (name (or (alist-get 'name data)
-                   (alist-get 'file data)
-                   (alist-get 'url data))))
-    (or (equal type "video")
-        (and (equal type "file")
-             (appkit-media-video-file-name-p name)))))
+  (or (equal (alist-get 'type segment) "video")
+      (eq (qq-media--file-segment-kind segment) 'video)))
 
 (defun qq-media-segment-preview-capable-p (segment)
   "Return non-nil when SEGMENT supports inline preview rendering."
@@ -1606,9 +1613,10 @@ retired."
    ((qq-media--native-video-media-id segment)
     (qq-media--native-video-capabilities
      segment (qq-media--native-video-media-id segment)))
-   ((qq-media--remote-file-id segment)
+   ((qq-media--native-file-media-id segment)
     (qq-media--native-content-capabilities
-     segment (qq-media--remote-file-id segment) "file"))
+     segment (qq-media--native-file-media-id segment)
+     (symbol-name (or (qq-media--file-segment-kind segment) 'file))))
    (t
     (qq-media--legacy-segment-capabilities segment))))
 
@@ -1624,6 +1632,7 @@ retired."
          (record-media-id (qq-media--native-record-media-id segment))
          (image-media-id (qq-media--native-image-media-id segment))
          (video-media-id (qq-media--native-video-media-id segment))
+         (file-media-id (qq-media--native-file-media-id segment))
          (emoji-id (alist-get 'id data)))
     (pcase type
       ("image" (or (and image-media-id
@@ -1639,7 +1648,8 @@ retired."
            (and (appkit-media-url-present-p url)
                 (format "video-url:%s" url))))
       ("file"
-       (or (and file-key (format "%s:%s" type file-key))
+       (or (and file-media-id (qq-media--native-file-key file-media-id))
+           (and file-key (format "%s:%s" type file-key))
            (and (appkit-media-url-present-p url) (format "%s-url:%s" type url))))
       ("record" (or (and record-media-id
                           (qq-media--native-record-key record-media-id))
@@ -1652,7 +1662,9 @@ retired."
 (defun qq-media--fetch-segment-resource (segment callback &optional errback)
   "Fetch media resource for SEGMENT and pass it to CALLBACK.
 
-Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment')."
+Native segments materialize their opaque `media_id'.  Remaining transitional
+segments use local path → dormant action resolver → URL; see
+`qq-media--resolve-fileish-segment'."
   (let* ((type (alist-get 'type segment))
          (data (alist-get 'data segment))
          (emoji-id (alist-get 'id data))
@@ -1675,13 +1687,17 @@ Uses local path → NapCat get_* → URL (see `qq-media--resolve-fileish-segment
           segment "get_file" callback error-fn
           "video segment has neither local file, file id, nor URL")))
       ("file"
-       (qq-media--resolve-fileish-segment
-        segment
-        (if (qq-media-imageish-file-segment-p segment)
-            "get_image"
-          "get_file")
-        callback error-fn
-        (format "%s segment has neither local file, file id, nor URL" type)))
+       (if-let* ((media-id (qq-media--native-file-media-id segment)))
+           (qq-media--fetch-native-file-resource
+            segment (qq-media--native-file-key media-id)
+            callback error-fn)
+         (qq-media--resolve-fileish-segment
+          segment
+          (if (qq-media-imageish-file-segment-p segment)
+              "get_image"
+            "get_file")
+          callback error-fn
+          (format "%s segment has neither local file, file id, nor URL" type))))
       ("record"
        (let ((remote-keys (qq-media--segment-remote-file-keys segment))
              (local (qq-media--segment-existing-path segment)))
@@ -1817,17 +1833,12 @@ OWNER is the exact Appkit app generation that owns any external media player."
        (plist-get (qq-media-segment-capabilities segment) :open)))
 
 (defun qq-media-segment-kind (segment)
-  "Return semantic open kind for OneBot SEGMENT."
-  (let* ((type (alist-get 'type segment))
-         (data (alist-get 'data segment))
-         (name (or (alist-get 'name data)
-                   (alist-get 'file data)
-                   (appkit-media-url-filename (alist-get 'url data)))))
+  "Return semantic open kind for timeline SEGMENT."
+  (let ((type (alist-get 'type segment)))
     (cond
      ((equal type "video") 'video)
      ((member type '("image" "face" "mface")) 'image)
-     ((and (equal type "file") (appkit-media-image-file-name-p name)) 'image)
-     ((and (equal type "file") (appkit-media-video-file-name-p name)) 'video)
+     ((equal type "file") (qq-media--file-segment-kind segment))
      (t 'file))))
 
 (cl-defun qq-media-open-resource
@@ -1858,8 +1869,7 @@ OWNER is forwarded exactly to lifecycle-own an external video player."
                    (alist-get 'id data)
                    (alist-get 'emoji_id data)
                    (substring (md5 (prin1-to-string segment)) 0 8)))
-         (name (or (alist-get 'name data)
-                   (alist-get 'file data)
+         (name (or (qq-media-segment-display-name segment)
                    (and cached-resource
                         (let ((file (alist-get 'file cached-resource)))
                           (and (stringp file) (file-name-nondirectory file))))
@@ -3146,6 +3156,7 @@ not ready yet, show DESCRIPTION or the known human face name
   (when (qq-media-segment-preview-capable-p segment)
     (let* ((native-image-id (qq-media--native-image-media-id segment))
            (native-video-id (qq-media--native-video-media-id segment))
+           (native-file-id (qq-media--native-file-media-id segment))
            (type (alist-get 'type segment))
            (resolver-identity
             (and (equal type "video")
@@ -3163,6 +3174,8 @@ not ready yet, show DESCRIPTION or the known human face name
         (qq-media--native-image-key native-image-id))
        (native-video-id
         (qq-media--native-video-thumbnail-key native-video-id))
+       (native-file-id
+        (qq-media--native-file-key native-file-id))
        (resolver-identity
         (format "preview:%s:%s" preview-type resolver-identity))
        (file-key
@@ -3268,6 +3281,7 @@ Preview failures are soft (no NapCat error spam)."
   (let ((key (qq-media-segment-preview-key segment))
         (native-image-id (qq-media--native-image-media-id segment))
         (native-video-id (qq-media--native-video-media-id segment))
+        (native-file-id (qq-media--native-file-media-id segment))
         (local (qq-media--segment-existing-path segment))
         (url (qq-media--segment-url segment)))
     (when key
@@ -3291,19 +3305,17 @@ Preview failures are soft (no NapCat error spam)."
           (qq-media--cache-resource
            key
            (qq-media--resource-from-local+url local url)))
-        (let ((file-id (qq-media--remote-file-id segment)))
-          (if-let* ((media-id (or native-image-id file-id)))
-              (qq-media--ensure-native-preview-image
-               key media-id 'content
-               (lambda (done error)
-                 (if native-image-id
-                     (qq-media--fetch-native-image-resource
-                      segment key done error)
-                   (qq-media--resolve-fileish-segment
-                    segment "get_image" done error
-                    "preview image not found" key)))
-               #'qq-media--preview-image-from-file)
-            (qq-media--ensure-resource-image
+        (if-let* ((media-id (or native-image-id native-file-id)))
+            (qq-media--ensure-native-preview-image
+             key media-id 'content
+             (lambda (done error)
+               (if native-image-id
+                   (qq-media--fetch-native-image-resource
+                    segment key done error)
+                 (qq-media--fetch-native-file-resource
+                  segment key done error)))
+             #'qq-media--preview-image-from-file)
+          (qq-media--ensure-resource-image
              key
              (lambda (done error)
                (if (qq-media-segment-preview-capable-p segment)
@@ -3314,10 +3326,10 @@ Preview failures are soft (no NapCat error spam)."
                     ;; Soft-fail: clear fetching without user-error / NapCat spam.
                     (lambda (_response _reason)
                       (funcall error nil "preview image not found"))
-                    "preview image not found" key)
+                    "preview image not found")
                  (funcall done nil)))
              nil
-             #'qq-media--preview-image-from-file))))))))
+             #'qq-media--preview-image-from-file)))))))
 
 (defun qq-media-segment-preview-fetching-p (segment)
   "Return non-nil when preview fetch for SEGMENT is currently active."

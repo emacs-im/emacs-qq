@@ -1113,8 +1113,8 @@
        (when (file-exists-p local-file)
          (delete-file local-file))))))
 
-(ert-deftest qq-media-segment-file-keys-ignore-empty-file-id ()
-  "DataLine FILE images with an empty file_id must not share one cache key."
+(ert-deftest qq-media-segment-file-keys-ignore-empty-legacy-file-id ()
+  "Legacy file segments with an empty file_id must not share one cache key."
   (let* ((first '((type . "file")
                   (data . ((file_id . "")
                            (file . "qq-clip-first.png")
@@ -1970,16 +1970,17 @@
         thumbnail-call
         (list segment (qq-media--native-video-thumbnail-key media-id)))))))
 
-(ert-deftest qq-media-native-file-id-reuses-generic-file-resolution ()
-  (let* ((file-id "media-22334455-6677-4889-9aab-ccddeeff0011")
+(ert-deftest qq-media-native-file-media-id-reuses-content-materialization ()
+  (let* ((media-id "media-22334455-6677-4889-9aab-ccddeeff0011")
          (segment `((type . "file")
-                    (data . ((file_id . ,file-id)
-                             (name . "photo.png")
-                             (file_size . 12345)))))
+                    (data . ((media_id . ,media-id)
+                             (file_name . "photo.png")
+                             (file_size . "12345")
+                             (file_kind . "image")))))
          (qq-remote-media--media (make-hash-table :test #'equal))
          fetch-call resolved)
-    (puthash file-id
-             `((media_id . ,file-id)
+    (puthash media-id
+             `((media_id . ,media-id)
                (kind . "file")
                (content . ((phase . "available")
                            (bytes_done . "0")
@@ -1995,35 +1996,36 @@
                  (funcall callback '((file . "/tmp/photo.png")))))
               ((symbol-function 'qq-api-call)
                (lambda (&rest _arguments)
-                 (ert-fail "native file_id must not enter the v1 OneBot resolver"))))
+                 (ert-fail "native media_id must not enter the v1 OneBot resolver"))))
       (let ((capabilities (qq-media-segment-capabilities segment)))
         (should (plist-get capabilities :open))
         (should (plist-get capabilities :download))
-        (should (equal (plist-get capabilities :status) "Remote file")))
+        (should (equal (plist-get capabilities :status) "Remote image")))
       (qq-media--fetch-segment-resource
        segment (lambda (resource) (setq resolved resource)) #'ignore)
       (should (equal resolved '((file . "/tmp/photo.png"))))
       (should
        (equal fetch-call
-              (list segment (format "file:%s" file-id)))))))
+              (list segment (qq-media--native-file-key media-id)))))))
 
 (ert-deftest qq-media-terminal-native-file-preview-never-restarts-from-redisplay ()
   (qq-media-test-with-reset
-   (let* ((file-id "media-33445566-7788-499a-8bbc-ddeeff001122")
+   (let* ((media-id "media-33445566-7788-499a-8bbc-ddeeff001122")
           (segment `((type . "file")
-                     (data . ((file_id . ,file-id)
-                              (name . "received.png")))))
+                     (data . ((media_id . ,media-id)
+                              (file_name . "received.png")
+                              (file_kind . "image")))))
           (qq-remote-media--media (make-hash-table :test #'equal))
           (calls 0))
-     (puthash file-id
-              `((media_id . ,file-id)
+     (puthash media-id
+              `((media_id . ,media-id)
                 (kind . "file")
                 (content
                  . ((phase . "failed")
                     (error . ((code . "media_download_rejected")
                               (message . "terminal download failure"))))))
               qq-remote-media--media)
-     (cl-letf (((symbol-function 'qq-media--resolve-fileish-segment)
+     (cl-letf (((symbol-function 'qq-media--fetch-native-file-resource)
                 (lambda (&rest _arguments)
                   (cl-incf calls)))
                ((symbol-function 'qq-media--preview-image-from-file)
@@ -2034,19 +2036,20 @@
 
 (ert-deftest qq-media-failed-automatic-preview-attempt-is-single-shot ()
   (qq-media-test-with-reset
-   (let* ((file-id "media-44556677-8899-4aab-9ccd-eeff00112233")
+   (let* ((media-id "media-44556677-8899-4aab-9ccd-eeff00112233")
           (segment `((type . "file")
-                     (data . ((file_id . ,file-id)
-                              (name . "received.png")))))
+                     (data . ((media_id . ,media-id)
+                              (file_name . "received.png")
+                              (file_kind . "image")))))
           (qq-remote-media--media (make-hash-table :test #'equal))
           (calls 0))
-     (puthash file-id
-              `((media_id . ,file-id)
+     (puthash media-id
+              `((media_id . ,media-id)
                 (kind . "file")
                 (content . ((phase . "available"))))
               qq-remote-media--media)
-     (cl-letf (((symbol-function 'qq-media--resolve-fileish-segment)
-                (lambda (_segment _action _done error &rest _arguments)
+     (cl-letf (((symbol-function 'qq-media--fetch-native-file-resource)
+                (lambda (_segment _key _done error)
                   (cl-incf calls)
                   (funcall error nil "scripted terminal failure"))))
        (should-not (qq-media-segment-preview-image segment))

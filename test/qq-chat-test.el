@@ -3342,6 +3342,28 @@
            (setf (alist-get 'gateway-account-id message) "slot-b")
            (should-not (qq-chat--message-todo-capable-p message))))))))
 
+(ert-deftest qq-chat-poke-row-hides-ordinary-message-actions ()
+  (qq-chat-test-with-reset
+   (progn
+     (qq-state-upsert-session
+      "group:20001"
+      '((type . group) (title . "Group") (target-id . "20001"))
+      nil)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "group:20001")
+       (cl-letf (((symbol-function 'qq-account-current-id)
+                  (lambda () "slot-a")))
+         (let ((message
+                '((server-id . "9007199254741004001")
+                  (session-key . "group:20001")
+                  (gateway-account-id . "slot-a")
+                  (segments . (((type . "poke") (data)))))))
+           (should-not (qq-chat--message-forwardable-p message))
+           (should-not (qq-chat--message-reactable-p message))
+           (should-not (qq-chat--message-essence-capable-p message))
+           (should-not (qq-chat--message-todo-capable-p message))))))))
+
 (ert-deftest qq-chat-cached-message-remains-actionable-after-same-slot-restart ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session

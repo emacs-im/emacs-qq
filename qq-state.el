@@ -789,7 +789,7 @@ Values from NEW replace values in OLD."
   (eq (alist-get 'status message) 'recalled))
 
 (defun qq-state-poke-message-p (message)
-  "Return non-nil when MESSAGE is a NapCat poke notice row."
+  "Return non-nil when MESSAGE is a structured poke timeline row."
   (or (qq-state--poke-notice-p message)
       (let ((raw-event (alist-get 'raw-event message)))
         (and (listp raw-event)
@@ -1118,7 +1118,8 @@ reply chrome elsewhere).  Media becomes short placeholders like
           ("file"
            (format "[file:%s]"
                    (qq-state--short-media-label
-                    (or (alist-get 'name data)
+                    (or (alist-get 'file_name data)
+                        (alist-get 'name data)
                         (alist-get 'file data))
                     "file")))
           ("record" "[voice]")
@@ -2566,7 +2567,7 @@ delta from being applied twice."
 
 INCOMING remains authoritative for segment kind and remote identities.  This
 only preserves absolute source paths from a correlated optimistic row, keeping
-local presentation independent of the authoritative opaque `file_id'."
+local presentation independent of the authoritative opaque `media_id'."
   (let ((existing-segments (and existing (alist-get 'segments existing)))
         (incoming-segments (alist-get 'segments incoming)))
     (if (not (and (alist-get 'local-id existing)
