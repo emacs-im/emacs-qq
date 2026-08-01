@@ -145,20 +145,29 @@
      (sequence "9007199254740999") (group-uin "8209413637")
      (actor-uin "10002") (target-uin "9007199254741001")
      (tips-sequence "9007199254741007") (valid-before 1784700120))
-  "Return one authoritative native Gateway group poke event payload."
-  `((account_id . ,account-id)
-    (poke
-     . ((message_id . ,message-id)
-        (sent_at . ,sent-at)
-        (sequence . ,sequence)
-        (conversation . ((kind . "group") (group_uin . ,group-uin)))
-        (actor_uin . ,actor-uin)
-        (target_uin . ,target-uin)
-        (action . "戳了戳")
-        (action_image_url . "https://example.invalid/poke.png")
-        (suffix . "的肩膀")
-        (recall . ((tips_sequence . ,tips-sequence)
-                   (valid_before . ,valid-before)))))))
+  "Return one authoritative group poke as an ordinary message payload."
+  (qq-message-test-event
+   :account-id account-id
+   :message-id message-id
+   :sent-at sent-at
+   :sender `((uin . ,actor-uin))
+   :recipient nil
+   :conversation `((kind . "group") (group_uin . ,group-uin))
+   :sender-presentation nil
+   :sequence sequence
+   :client-sequence "0"
+   :random nil
+   :message-type 732
+   :sub-type 20
+   :segments
+   `(((kind . "poke")
+      (payload . ((actor_uin . ,actor-uin)
+                  (target_uin . ,target-uin)
+                  (action . "戳了戳")
+                  (action_image_url . "https://example.invalid/poke.png")
+                  (suffix . "的肩膀")
+                  (recall . ((tips_sequence . ,tips-sequence)
+                             (valid_before . ,valid-before)))))))))
 
 (cl-defun qq-message-test-reaction
     (&key
@@ -221,7 +230,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
      (message-id "7348923749823749823")
      (direction "received") (sent-at 1784700000)
      (client-sequence "0") (message-sequence "0")
-     (random 0) (batch-id "99") (text "durable DataLine text"))
+     (random 0) (text "durable DataLine text"))
   "Return one closed DataLine timeline message fixture."
   `((message_id . ,message-id)
     (chat . ((peer_uid . ,peer-uid) (variant . ,variant)))
@@ -230,9 +239,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (client_sequence . ,client-sequence)
     (message_sequence . ,message-sequence)
     (random . ,random)
-    (content . ((kind . "text")
-                (batch_id . ,batch-id)
-                (text . ,text)))))
+    (segments . (((kind . "text")
+                  (payload . ((text . ,text))))))))
 
 (cl-defun qq-message-test-dataline-page
     (messages &key (variant "desktop") requested-cursor
@@ -414,11 +422,9 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                       (server_sequence . "0")
                       (client_sequence . "42003")
                       (random . 2)
-                      (transfer_session_id . "305419896")
                       (file_name . "photo.png")
-                      (file_size . 12345)
+                      (file_size . "12345")
                       (file_kind . "image")
-                      (resource_id . "res-dataline-file")
                       (fast_path . :false)))
                    "dataline-file-send")))
         (should
@@ -436,7 +442,10 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                 (chat (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
                       (variant . "mobile"))
                 (resource_id . "res-dataline-file"))))
-      (should (equal (alist-get 'transfer_session_id receipt) "305419896"))
+      (should (equal (alist-get 'message_id receipt)
+                     "7348923749823749825"))
+      (should-not (assq 'transfer_session_id receipt))
+      (should-not (assq 'resource_id receipt))
       ;; The durable FILE observation replaces wire metadata but must retain
       ;; the correlated optimistic row's client-local presentation path.
       (qq-message--handle-event
@@ -452,12 +461,11 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (client_sequence . "42003")
           (message_sequence . "0")
           (random . 2)
-          (content
-           (kind . "file")
-           (transfer_session_id . "305419896")
-           (file_name . "photo.png")
-           (file_size . 12345)
-           (file_kind . "image")))))
+          (segments
+           . (((kind . "file")
+               (payload . ((file_name . "photo.png")
+                           (file_size . "12345")
+                           (file_kind . "image")))))))))
       (let* ((message (car (qq-state-session-messages session-key)))
              (segment (car (alist-get 'segments message)))
              (data (alist-get 'data segment)))
@@ -466,8 +474,10 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (should (eq (alist-get 'status message) 'sent))
         (should (equal (alist-get 'type segment) "file"))
         (should (equal (alist-get 'file data) "/tmp/photo.png"))
-        (should (equal (alist-get 'name data) "photo.png"))
-        (should (equal (alist-get 'dataline_file_kind data) "image")))
+        (should (equal (alist-get 'file_name data) "photo.png"))
+        (should (equal (alist-get 'file_size data) "12345"))
+        (should (equal (alist-get 'file_kind data) "image"))
+        (should-not (assq 'transfer_session_id data)))
       (should (= (hash-table-count qq-message--pending-sends) 0)))))
 
 (ert-deftest qq-message-dataline-file-event-before-receipt-keeps-local-presentation ()
@@ -499,12 +509,11 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
             (client_sequence . "42005")
             (message_sequence . "0")
             (random . 4)
-            (content
-             (kind . "file")
-             (transfer_session_id . "305419898")
-             (file_name . "before.png")
-             (file_size . 12345)
-             (file_kind . "image")))))
+            (segments
+             . (((kind . "file")
+                 (payload . ((file_name . "before.png")
+                             (file_size . "12345")
+                             (file_kind . "image")))))))))
         (funcall
          response-callback
          '((account_id . "slot-a")
@@ -516,11 +525,9 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
            (server_sequence . "0")
            (client_sequence . "42005")
            (random . 4)
-           (transfer_session_id . "305419898")
            (file_name . "before.png")
-           (file_size . 12345)
+           (file_size . "12345")
            (file_kind . "image")
-           (resource_id . "res-dataline-file")
            (fast_path . :false))))
       (let* ((messages (qq-state-session-messages session-key))
              (message (car messages))
@@ -546,13 +553,14 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (client_sequence . "42004")
         (message_sequence . "0")
         (random . 3)
-        (content
-         (kind . "file")
-         (transfer_session_id . "305419897")
-         (file_name . "photo.png")
-         (file_size . 12345)
-         (file_kind . "image")
-         (media_id . "media-00000000-0000-4000-8000-000000000001")))))
+        (segments
+         . (((kind . "file")
+             (payload
+              . ((file_name . "photo.png")
+                 (file_size . "12345")
+                 (file_kind . "image")
+                 (media_id
+                  . "media-00000000-0000-4000-8000-000000000001")))))))))
     (let* ((message
             (car
              (qq-state-session-messages
@@ -560,14 +568,71 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
            (segment (car (alist-get 'segments message))))
       (should (equal (alist-get 'server-id message)
                      "7348923749823749826"))
-      (should (equal (alist-get 'preview message) "[Image] photo.png"))
+      (should (equal (alist-get 'preview message) "[file:photo.png]"))
       (should (equal (alist-get 'type segment) "file"))
-      (should (equal (alist-get 'name (alist-get 'data segment))
+      (should (equal (alist-get 'file_name (alist-get 'data segment))
                      "photo.png"))
-      (should (equal (alist-get 'file_id (alist-get 'data segment))
+      (should (equal (alist-get 'media_id (alist-get 'data segment))
                      "media-00000000-0000-4000-8000-000000000001"))
-      (should (equal (alist-get 'dataline-transfer-session-id message)
-                     "305419897")))))
+      (should (equal (alist-get 'file_kind (alist-get 'data segment))
+                     "image"))
+      (should-not (assq 'transfer_session_id (alist-get 'data segment)))
+      (should-not (assq 'dataline-transfer-session-id message)))))
+
+(ert-deftest qq-message-dataline-ordered-file-segments-stay-one-timeline-row ()
+  (qq-message-test-with-state
+    (let ((session-key "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA"))
+      (qq-message--handle-event
+       "dataline.message_received"
+       '((account_id . "slot-a")
+         (message
+          (message_id . "7348923749823749828")
+          (chat
+           (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
+           (variant . "desktop"))
+          (direction . "received")
+          (sent_at . 1784700003)
+          (message_sequence . "84")
+          (random . 5)
+          (segments
+           . (((kind . "file")
+               (payload
+                . ((file_name . "first.png")
+                   (file_size . "4294967418")
+                   (file_kind . "image")
+                   (media_id
+                    . "media-11111111-1111-4111-8111-111111111111"))))
+              ((kind . "file")
+               (payload
+                . ((file_name . "second.mp4")
+                   (file_size . "98765")
+                   (file_kind . "video")
+                   (media_id
+                    . "media-22222222-2222-4222-8222-222222222222")))))))))
+      (let* ((messages (qq-state-session-messages session-key))
+             (message (car messages))
+             (segments (alist-get 'segments message)))
+        (should (= (length messages) 1))
+        (should (equal (alist-get 'server-id message)
+                       "7348923749823749828"))
+        (should (equal (mapcar (lambda (segment)
+                                (alist-get 'file_name
+                                           (alist-get 'data segment)))
+                              segments)
+                       '("first.png" "second.mp4")))
+        (should (equal (mapcar (lambda (segment)
+                                (alist-get 'file_size
+                                           (alist-get 'data segment)))
+                              segments)
+                       '("4294967418" "98765")))
+        (should (equal (mapcar (lambda (segment)
+                                (alist-get 'media_id
+                                           (alist-get 'data segment)))
+                              segments)
+                       '("media-11111111-1111-4111-8111-111111111111"
+                         "media-22222222-2222-4222-8222-222222222222")))
+        (should (equal (alist-get 'preview message)
+                       "[file:first.png] [file:second.mp4]"))))))
 
 (ert-deftest qq-message-dataline-durable-event-deduplicates-the-receipt-row ()
   (qq-message-test-with-state
@@ -605,10 +670,9 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (client_sequence . "42001")
           (message_sequence . "0")
           (random . 0)
-          (content
-           (kind . "text")
-           (batch_id . "99")
-           (text . "hello phone")))))
+          (segments
+           . (((kind . "text")
+               (payload . ((text . "hello phone")))))))))
       (let ((messages (qq-state-session-messages session-key)))
         (should (= (length messages) 1))
         (should (equal (alist-get 'server-id (car messages))
@@ -2037,23 +2101,37 @@ push carries sequence=40909 and client_sequence=30202."
       (qq-message-send-poke
        "group:8209413637" "9007199254741001")
       (qq-message--handle-event
-       "message.poked" (qq-message-test-poke))
+       "message.received" (qq-message-test-poke))
       (let* ((messages
               (qq-state-session-messages "group:8209413637"))
              (message (car messages))
-             (raw-event (alist-get 'raw-event message)))
+             (recall (alist-get 'poke-gateway-recall message)))
         (should (= (length messages) 1))
         (should (equal (alist-get 'server-id message)
                        "7348923749823749823"))
-        (should (equal (alist-get 'message_id
-                                  (alist-get 'gateway_recall raw-event))
+        (should (equal (alist-get 'message_id recall)
                        "7348923749823749823"))
-        (should (equal (alist-get 'tips_sequence
-                                  (alist-get 'gateway_recall raw-event))
+        (should (equal (alist-get 'tips_sequence recall)
                        "9007199254741007"))
         (should (equal (alist-get 'image-url
                                   (qq-state-poke-message-data message))
                        "https://example.invalid/poke.png"))))))
+
+(ert-deftest qq-message-poke-has-only-read-and-dedicated-recall-capabilities ()
+  (qq-message-test-with-state
+    (qq-message--handle-event
+     "message.received" (qq-message-test-poke))
+    (let* ((session-key "group:8209413637")
+           (message (car (qq-state-session-messages session-key))))
+      (should (qq-message-read-capable-p message))
+      (should-not (qq-message-reply-target session-key message))
+      (should-not (qq-message-recall-target session-key message))
+      (should-error (qq-message-set-reaction message "14" t)
+                    :type 'user-error)
+      (should-error (qq-message-set-essence message t)
+                    :type 'user-error)
+      (should-error (qq-message-set-todo message 'set)
+                    :type 'user-error))))
 
 (ert-deftest qq-message-reaction-sends-only-the-message-reference ()
   (qq-message-test-with-state
@@ -2272,7 +2350,7 @@ push carries sequence=40909 and client_sequence=30202."
 (ert-deftest qq-message-recall-poke-sends-original-gray-tip-metadata ()
   (qq-message-test-with-state
     (qq-message--handle-event
-     "message.poked" (qq-message-test-poke))
+     "message.received" (qq-message-test-poke))
     (let* ((session-key "group:8209413637")
            (message (car (qq-state-session-messages session-key)))
            sent-method sent-params)

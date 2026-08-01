@@ -1085,6 +1085,7 @@ prompt behavior.  Point on the timeline represents that exact message."
   "Return non-nil when MESSAGE can be forwarded by its server ID."
   (and (listp message)
        (qq-api-message-id-p (alist-get 'server-id message))
+       (not (qq-state-poke-message-p message))
        (not (qq-state-message-recalled-p message))))
 
 (defun qq-chat--forward-source-supported-p
@@ -3819,7 +3820,11 @@ with the timestamp."
         (data (alist-get 'data segment)))
     (pcase type
       ("image" (if (alist-get 'emoji_id data) "Sticker" "Image"))
-      ("file" (if (qq-media-imageish-file-segment-p segment) "Image" "File"))
+      ("file"
+       (pcase (qq-media-segment-kind segment)
+         ('image "Image")
+         ('video "Video")
+         (_ "File")))
       ("record" "Voice")
       ("video" "Video")
       ("mface" "Sticker")
@@ -3839,8 +3844,7 @@ Prefer a short name; never dump full URLs or CQ blobs into the timeline."
                      ("file" "file")
                      (_ "media")))
          (summary (or (alist-get 'summary data)
-                      (alist-get 'name data)
-                      (alist-get 'file data))))
+                      (qq-media-segment-display-name segment))))
     (qq-state--short-media-label summary fallback)))
 
 (defun qq-chat--format-byte-size (value)
@@ -3873,14 +3877,14 @@ Keep this short — size is useful; internal sub_type / emoji ids are not."
     (string-join (delq nil (list duration-text size)) " · ")))
 
 (defun qq-chat--segment-media-card-kind (segment)
-  "Return shared media card kind for OneBot SEGMENT."
+  "Return shared media card kind for timeline SEGMENT."
   (pcase (alist-get 'type segment)
     ("record" 'audio)
     ("mface" 'sticker)
     (_ (qq-media-segment-kind segment))))
 
 (defun qq-chat--segment-media-card-context (segment &optional capabilities)
-  "Adapt OneBot media SEGMENT to the shared card action protocol.
+  "Adapt media SEGMENT to the shared card action protocol.
 
 CAPABILITIES defaults to the centralized `qq-media' action/status model.
 The exact account app is captured while rendering; later actions never resolve
@@ -4101,6 +4105,7 @@ a replacement app instance."
 (defun qq-chat--message-reactable-p (message)
   "Return non-nil when MESSAGE can receive a group reaction."
   (and (listp message)
+       (not (qq-state-poke-message-p message))
        (eq (alist-get 'type (qq-chat--session)) 'group)
        (qq-protocol-message-id-p (alist-get 'server-id message))
        (not (qq-state-message-recalled-p message))
@@ -4117,6 +4122,7 @@ a replacement app instance."
 (defun qq-chat--message-essence-capable-p (message)
   "Return non-nil when MESSAGE supports an essence mutation."
   (and (listp message)
+       (not (qq-state-poke-message-p message))
        (eq (alist-get 'type (qq-chat--session)) 'group)
        (qq-protocol-message-id-p (alist-get 'server-id message))
        (not (qq-state-message-recalled-p message))
@@ -4164,6 +4170,7 @@ a replacement app instance."
 (defun qq-chat--message-todo-capable-p (message)
   "Return non-nil when MESSAGE supports a group todo mutation."
   (and (listp message)
+       (not (qq-state-poke-message-p message))
        (eq (alist-get 'type (qq-chat--session)) 'group)
        (qq-protocol-message-id-p (alist-get 'server-id message))
        (not (qq-state-message-recalled-p message))

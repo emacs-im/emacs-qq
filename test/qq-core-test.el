@@ -777,8 +777,7 @@
                   (funcall
                    callback
                    '((account_id . "slot-a")
-                     (message_id . "7348923749823749825")
-                     (transfer_session_id . "305419896")))
+                     (message_id . "7348923749823749825")))
                   "dataline-file-request"))
                ((symbol-function 'qq-core--release-send-resource)
                 (lambda (resource-id) (push resource-id released))))
@@ -796,8 +795,8 @@
                              "dataline:mobile:u_Wcc5rknRRqRO8y5gxMD6sA"))
               (should (equal (nth 1 sent) "res-dataline-image"))
               (should (equal (nth 2 sent) segment))
-              (should (equal (alist-get 'transfer_session_id success)
-                             "305419896"))
+              (should (equal (alist-get 'message_id success)
+                             "7348923749823749825"))
               (should (equal released '("res-dataline-image")))))
         (delete-file path)))))
 
@@ -823,8 +822,7 @@
                   (setq sent resource-id)
                   (funcall callback
                            '((account_id . "slot-a")
-                             (message_id . "7348923749823749825")
-                             (transfer_session_id . "305419896")))
+                             (message_id . "7348923749823749825")))
                   "dataline-file-request"))
                ((symbol-function 'qq-core--release-send-resource)
                 (lambda (resource-id) (push resource-id released))))
@@ -844,8 +842,8 @@
                          (phase . "ready")))
               (should (eq (qq-request-state request) 'settled))
               (should (equal sent "res-dataline-wait"))
-              (should (equal (alist-get 'transfer_session_id success)
-                             "305419896"))
+              (should (equal (alist-get 'message_id success)
+                             "7348923749823749825"))
               (should (equal released '("res-dataline-wait")))))
         (delete-file path)))))
 

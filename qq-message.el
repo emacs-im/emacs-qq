@@ -19,7 +19,6 @@
 (require 'qq-rpc)
 (require 'qq-account)
 (require 'qq-attachment)
-(require 'qq-remote-media)
 (require 'qq-resource)
 (require 'qq-server)
 (require 'qq-protocol)
@@ -58,9 +57,6 @@
 
 (defconst qq-message-max-merged-forward-messages 500
   "Maximum source messages accepted by one native merged forward.")
-
-(defconst qq-message-max-dataline-text-bytes (* 1024 1024)
-  "Maximum reassembled DataLine text accepted from the Gateway timeline.")
 
 (defun qq-message--message-id-p (value)
   "Return non-nil when VALUE is one canonical, nonzero uint64 Message ID."
@@ -240,6 +236,28 @@ pushes left optimistic sends stuck without a snowflake."
        `((type . "reply")
          (data . ,(qq-state--native-reply-data
                    (alist-get 'target payload)))))
+      ("poke"
+       (let* ((actor-id (alist-get 'actor_uin payload))
+              (target-id (alist-get 'target_uin payload))
+              (action (qq-message--present-string
+                       (alist-get 'action payload)))
+              (detail (qq-message--present-string
+                       (alist-get 'suffix payload)))
+              (actor-name
+               (qq-state--poke-user-name
+                actor-id (alist-get 'actor_name payload)))
+              (target-name
+               (qq-state--poke-user-name
+                target-id (alist-get 'target_name payload))))
+         `((type . "poke")
+           (data . ((actor-id . ,actor-id)
+                    (target-id . ,target-id)
+                    (actor-name . ,actor-name)
+                    (target-name . ,target-name)
+                    (image-url . ,(alist-get 'action_image_url payload))
+                    (action . ,action)
+                    (detail . ,detail)
+                    (texts . ,(delq nil (list action detail))))))))
       ("unsupported"
        `((type . "__unsupported")
          (data . ((native_keys . ,(copy-tree (alist-get 'native_keys payload)))
@@ -471,6 +489,51 @@ as a server message identity."
        (not (string-empty-p value))
        value))
 
+(defun qq-message--poke-payload (message)
+  "Return MESSAGE's sole typed poke payload, or nil.
+
+A poke is a private 528/290 or group 732/20 gray-tip timeline row, not an
+out-of-band event.  The Gateway protocol owns scalar decoding; this check
+enforces the relationships which the local timeline and recall UI rely on."
+  (let* ((segments (alist-get 'segments message))
+         (poke-segments
+          (seq-filter
+           (lambda (segment)
+             (equal (alist-get 'kind segment) "poke"))
+           segments)))
+    (when poke-segments
+      (unless (and (= (length segments) 1)
+                   (= (length poke-segments) 1)
+                   (let ((conversation-kind
+                          (alist-get 'kind
+                                     (alist-get 'conversation message)))
+                         (message-type (alist-get 'message_type message))
+                         (sub-type (alist-get 'sub_type message)))
+                     (or (and (equal conversation-kind "group")
+                              (= message-type 732)
+                              (= sub-type 20))
+                         (and (equal conversation-kind "private")
+                              (= message-type 528)
+                              (= sub-type 290)))))
+        (error "qq: Gateway returned an invalid poke timeline envelope"))
+      (let* ((payload (alist-get 'payload (car poke-segments)))
+             (actor-uin (alist-get 'actor_uin payload))
+             (target-uin (alist-get 'target_uin payload))
+             (recall (alist-get 'recall payload))
+             (sent-at (alist-get 'sent_at message)))
+        (unless (and (qq-account--uint64-decimal-p actor-uin)
+                     (qq-account--uint64-decimal-p target-uin)
+                     (qq-account--exact-object-keys-p
+                      recall '(tips_sequence valid_before))
+                     (qq-account--uint64-decimal-p
+                      (alist-get 'tips_sequence recall))
+                     (integerp sent-at)
+                     (> sent-at 0)
+                     (integerp (alist-get 'valid_before recall))
+                     (= (alist-get 'valid_before recall) (+ sent-at 120)))
+          (error "qq: Gateway returned invalid poke timeline metadata"))
+        payload))))
+
 (defun qq-message-normalize-snapshot
     (message owner account &optional recalled-p history-p)
   "Purely normalize one Gateway MESSAGE for OWNER and ACCOUNT.
@@ -501,12 +564,22 @@ order."
          (sender-member-name
           (qq-message--present-string
            (alist-get 'member_name sender-presentation)))
-         (sender-id (or (alist-get 'uin sender) (alist-get 'uid sender)))
+         (poke-payload (qq-message--poke-payload message))
+         (sender-id (or (and poke-payload
+                             (alist-get 'actor_uin poke-payload))
+                        (alist-get 'uin sender)
+                        (alist-get 'uid sender)))
          session-key peer peer-name outgoing group-id)
     (pcase kind
       ("private"
        (let ((context (qq-message--private-context message account)))
-         (setq outgoing (plist-get context :outgoing)
+         (setq outgoing
+               (if poke-payload
+                   (and (qq-message--endpoint-self-p
+                         `((uin . ,(alist-get 'actor_uin poke-payload)))
+                         account)
+                        t)
+                 (plist-get context :outgoing))
                peer (plist-get context :peer)
                session-key (qq-state-session-key
                             'private (alist-get 'uin peer)))
@@ -549,6 +622,27 @@ order."
             (unless recalled-p
               (mapcar #'qq-message--segment-to-internal
                       (alist-get 'segments message))))
+           (poke-recall
+            (and poke-payload server-id (equal kind "group")
+                 (let ((recall (alist-get 'recall poke-payload)))
+                   (qq-protocol-validate-poke-recall-reference
+                    `((message_id . ,server-id)
+                      (peer . ((chat_type . 2)
+                               (peer_uid . ,group-id)
+                               (guild_id . "")))
+                      (valid_before . ,(alist-get 'valid_before recall)))
+                    "poke timeline message"))))
+           (poke-gateway-recall
+            (and poke-recall
+                 `((account_id . ,owner)
+                   (conversation . ((kind . "group")
+                                    (group_uin . ,group-id)))
+                   (message_id . ,server-id)
+                   (sequence . ,(alist-get 'sequence message))
+                   (sent_at . ,(alist-get 'sent_at message))
+                   (tips_sequence
+                    . ,(alist-get 'tips_sequence
+                                  (alist-get 'recall poke-payload))))))
            (mention-kinds (qq-state--mention-kinds-from-segments segments))
            (preview (if recalled-p
                         "[message recalled]"
@@ -558,6 +652,9 @@ order."
             ;; Missing presentation is a Rust/Gateway contract violation; a
             ;; QQ number or chat title must not be substituted here.
             (or sender-member-name sender-remark sender-nickname
+                (and poke-payload
+                     (qq-state--poke-user-name
+                      sender-id (alist-get 'actor_name poke-payload)))
                 (error "qq: Native message omitted sender presentation")))
            (sender-name presentation-name)
            (sender-secondary-name
@@ -583,6 +680,10 @@ order."
         (status . ,(cond (recalled-p 'recalled)
                          (outgoing 'sent)
                          (t 'received)))
+        ,@(when poke-payload
+            `((local-poke-p . nil)
+              (poke-recall-reference . ,poke-recall)
+              (poke-gateway-recall . ,poke-gateway-recall)))
         (segments . ,segments)
         (mention-kinds . ,mention-kinds)
         (contains-mention-p . ,(and mention-kinds t))
@@ -594,8 +695,13 @@ order."
         (peer-uin . ,(and peer (alist-get 'uin peer)))
         (peer-name . ,peer-name)
         (group-id . ,group-id)
-        (user-id . ,(alist-get 'uin sender))
-        (target-id . ,(if group-id group-id (alist-get 'uin peer)))))))
+        (user-id . ,(or (and poke-payload
+                             (alist-get 'actor_uin poke-payload))
+                        (alist-get 'uin sender)))
+        (target-id . ,(or (and poke-payload
+                               (alist-get 'target_uin poke-payload))
+                          group-id
+                          (alist-get 'uin peer)))))))
 
 (defun qq-message--normalize-message (data &optional history-p)
   "Normalize native message event DATA for projection.
@@ -801,7 +907,10 @@ acknowledgement never impersonates a state update."
 (defun qq-message--normalize-dataline-message (owner message &optional raw-data)
   "Return normalized DataLine MESSAGE owned by OWNER.
 
-RAW-DATA, when non-nil, is retained only as the event diagnostic envelope."
+RAW-DATA, when non-nil, is retained only as the event diagnostic envelope.
+The exact Gateway protocol version owns scalar schema validation; this adapter
+checks only the local DataLine locator, direction, and nonempty presentation
+needed to avoid corrupting an Emacs timeline projection."
   (let* ((chat (alist-get 'chat message))
          (peer-uid (alist-get 'peer_uid chat))
          (variant (alist-get 'variant chat))
@@ -811,153 +920,68 @@ RAW-DATA, when non-nil, is retained only as the event diagnostic envelope."
          (client-sequence (alist-get 'client_sequence message))
          (message-sequence (alist-get 'message_sequence message))
          (random (alist-get 'random message))
-         (content (alist-get 'content message))
-         (content-kind (alist-get 'kind content))
+         (wire-segments (alist-get 'segments message))
          (peer-name (if (equal peer-uid "u_l7jpPIZxQo0mzJwoEt-SKw")
                         "My pad"
-                      "My phone"))
-         (message-keys (mapcar #'car message))
-         (allowed-message-keys
-          '(message_id chat direction sent_at client_sequence
-                       message_sequence random content)))
-    (unless (and
-             (cl-every (lambda (key) (memq key allowed-message-keys))
-                       message-keys)
-             (= (length message-keys)
-                (length (delete-dups (copy-sequence message-keys))))
-             (cl-every (lambda (key) (assq key message))
-                       '(message_id chat direction sent_at content))
-             (qq-account--exact-object-keys-p chat '(peer_uid variant))
-             (member variant '("desktop" "mobile"))
-             (member peer-uid '("u_Wcc5rknRRqRO8y5gxMD6sA"
-                                "u_l7jpPIZxQo0mzJwoEt-SKw"))
-             (member direction '("sent" "received"))
-             (qq-message--message-id-p message-id)
-             (qq-account--uint32-p sent-at)
-             (> sent-at 0)
-             (or (null client-sequence)
-                 (qq-account--uint64-decimal-p client-sequence t))
-             (or (null message-sequence)
-                 (qq-account--uint64-decimal-p message-sequence t))
-             (or (null random) (qq-account--uint32-p random))
-             (listp content))
-      (error "qq: Gateway returned an invalid DataLine message"))
-    (let* ((text-p (equal content-kind "text"))
-           (file-p (equal content-kind "file"))
-           (batch-id (and text-p (alist-get 'batch_id content)))
-           (text (and text-p (alist-get 'text content)))
-           (transfer-session-id
-            (and file-p (alist-get 'transfer_session_id content)))
-           (file-name (and file-p (alist-get 'file_name content)))
-           (file-size (and file-p (alist-get 'file_size content)))
-           (file-kind (and file-p (alist-get 'file_kind content)))
-           (local-resource-id
-            (and file-p (alist-get 'local_resource_id content)))
-           (media-id (and file-p (alist-get 'media_id content)))
-           (content-valid
-            (cond
-             (text-p
-              (and (qq-account--exact-object-keys-p
-                    content '(kind batch_id text))
-                   (qq-account--uint64-decimal-p batch-id)
-                   (not (equal batch-id "0"))
-                   (qq-account--non-empty-string-p text)
-                   (<= (string-bytes text)
-                       qq-message-max-dataline-text-bytes)))
-             (file-p
-              (let* ((keys (mapcar #'car content))
-                     (allowed '(kind transfer_session_id file_name file_size
-                                     file_kind local_resource_id media_id)))
-                (and (cl-every (lambda (key) (memq key allowed)) keys)
-                     (= (length keys)
-                        (length (delete-dups (copy-sequence keys))))
-                     (cl-every (lambda (key) (assq key content))
-                               '(kind transfer_session_id file_name file_size
-                                      file_kind))
-                     (qq-account--uint64-decimal-p transfer-session-id)
-                     (not (equal transfer-session-id "0"))
-                     (qq-account--non-empty-string-p file-name)
-                     (<= (string-bytes file-name) 4096)
-                     (qq-account--uint32-p file-size)
-                     (> file-size 0)
-                     (member file-kind '("other" "image" "video"))
-                     (or (null local-resource-id)
-                         (qq-resource-id-p local-resource-id))
-                     (or (null media-id)
-                         (qq-remote-media--id-p media-id)))))
-             (t nil))))
-      (unless content-valid
-        (error "qq: Gateway returned an invalid DataLine message content"))
-      (let* ((session-key
-              (qq-state-session-key 'dataline peer-uid variant))
-             (outgoing (equal direction "sent"))
-             (file-preview
-              (and file-p
-                   (format "[%s] %s"
-                           (if (equal file-kind "image") "Image" "File")
-                           file-name)))
-             (segments
-              (if text-p
-                  `(((type . "text") (data . ((text . ,text)))))
-                `(((type . "file")
-                   (data . ((name . ,file-name)
-                            (size . ,file-size)
-                            (dataline_file_kind . ,file-kind)
-                            ,@(when local-resource-id
-                                `((resource_id . ,local-resource-id)))
-                            ;; Reuse the generic opaque file resolver shape.
-                            ;; FTN identity and signed URLs remain behind the
-                            ;; native service's remote-media capability.
-                            ,@(when media-id
-                                `((file_id . ,media-id)))))))))
-             (raw-message (if text-p text file-preview))
-             (wire-message
-              `((client_sequence . ,client-sequence)
-                (sequence . ,message-sequence)
-                (random . ,random)))
-             (normalized
-              `((id . ,message-id)
-                (server-id . ,message-id)
-                (session-key . ,session-key)
-                (time . ,sent-at)
-                (message-seq
-                 . ,(and message-sequence
-                         (not (equal message-sequence "0"))
-                         message-sequence))
-                (native-client-sequence . ,client-sequence)
-                (native-random . ,random)
-                (gateway-account-id . ,owner)
-                (sender-id . nil)
-                (sender-native-id . nil)
-                (sender-name
-                 . ,(if outgoing
-                        (or (alist-get 'nickname (qq-state-self-info))
-                            (qq-state-self-user-id)
-                            "Me")
-                      peer-name))
-                (self-p . ,outgoing)
-                (status . ,(if outgoing 'sent 'received))
-                (segments . ,segments)
-                (raw-message . ,raw-message)
-                (preview . ,raw-message)
-                (message-type . "dataline")
-                (chat-type . ,(if (equal variant "mobile") "134" "8"))
-                (peer-uid . ,peer-uid)
-                (peer-uin . nil)
-                (peer-name . ,peer-name)
-                (group-id . nil)
-                (user-id . nil)
-                (target-id . ,peer-uid)
-                ,@(when text-p `((dataline-batch-id . ,batch-id)))
-                ,@(when file-p
-                    `((dataline-transfer-session-id . ,transfer-session-id)))
-                (order . ,(qq-state--next-message-order))
-                ,@(when raw-data
-                    `((raw-event . ,(copy-tree raw-data)))))))
-        (setq normalized
-              (qq-message--attach-pending-local-id
-               normalized owner wire-message session-key))
-        (cons normalized wire-message)))))
+                      "My phone")))
+    (unless (and (member variant '("desktop" "mobile"))
+                 (member peer-uid '("u_Wcc5rknRRqRO8y5gxMD6sA"
+                                    "u_l7jpPIZxQo0mzJwoEt-SKw")))
+      (error "qq: Gateway DataLine message has an unsupported chat locator"))
+    (unless (and (proper-list-p wire-segments) wire-segments)
+      (error "qq: Gateway DataLine message has no presentation segments"))
+    (let* ((outgoing
+            (pcase direction
+              ("sent" t)
+              ("received" nil)
+              (_ (error "qq: Gateway DataLine message has an invalid direction"))))
+           (segments (mapcar #'qq-message--segment-to-internal wire-segments))
+           (session-key (qq-state-session-key 'dataline peer-uid variant))
+           (raw-message (qq-state-message-preview-from-segments segments))
+           (wire-message
+            `((client_sequence . ,client-sequence)
+              (sequence . ,message-sequence)
+              (random . ,random)))
+           (normalized
+            `((id . ,message-id)
+              (server-id . ,message-id)
+              (session-key . ,session-key)
+              (time . ,sent-at)
+              (message-seq
+               . ,(and message-sequence
+                       (not (equal message-sequence "0"))
+                       message-sequence))
+              (native-client-sequence . ,client-sequence)
+              (native-random . ,random)
+              (gateway-account-id . ,owner)
+              (sender-id . nil)
+              (sender-native-id . nil)
+              (sender-name
+               . ,(if outgoing
+                      (or (alist-get 'nickname (qq-state-self-info))
+                          (qq-state-self-user-id)
+                          "Me")
+                    peer-name))
+              (self-p . ,outgoing)
+              (status . ,(if outgoing 'sent 'received))
+              (segments . ,segments)
+              (raw-message . ,raw-message)
+              (preview . ,raw-message)
+              (message-type . "dataline")
+              (chat-type . ,(if (equal variant "mobile") "134" "8"))
+              (peer-uid . ,peer-uid)
+              (peer-uin . nil)
+              (peer-name . ,peer-name)
+              (group-id . nil)
+              (user-id . nil)
+              (target-id . ,peer-uid)
+              (order . ,(qq-state--next-message-order))
+              ,@(when raw-data
+                  `((raw-event . ,(copy-tree raw-data)))))))
+      (setq normalized
+            (qq-message--attach-pending-local-id
+             normalized owner wire-message session-key))
+      (cons normalized wire-message))))
 
 (defun qq-message--project-dataline-message (data)
   "Project one account-scoped DataLine event DATA."
@@ -1071,51 +1095,6 @@ responses never advance this observation; only `message.received' events do."
        (copy-tree recall)
        qq-message--pending-recalls))))
 
-(defun qq-message--poke-raw-info (poke)
-  "Return shared renderer decoration items for POKE."
-  (delq
-   nil
-   (list
-    (when-let* ((action (alist-get 'action poke)))
-      `((type . "text") (txt . ,action)))
-    (when-let* ((image-url (alist-get 'action_image_url poke)))
-      `((type . "img") (src . ,image-url)))
-    (when-let* ((suffix (alist-get 'suffix poke)))
-      `((type . "text") (txt . ,suffix))))))
-
-(defun qq-message--project-poke (data)
-  "Project selected-account authoritative group poke event DATA."
-  (let* ((owner (qq-message--event-owner data))
-         (_owner (qq-message--sync-account owner))
-         (poke (alist-get 'poke data))
-         (conversation (alist-get 'conversation poke))
-         (group-uin (alist-get 'group_uin conversation))
-         (recall (alist-get 'recall poke))
-         (message-id (alist-get 'message_id poke))
-         (notice
-          `((time . ,(alist-get 'sent_at poke))
-            (post_type . "notice")
-            (notice_type . "notify")
-            (sub_type . "poke")
-            (group_id . ,group-uin)
-            (user_id . ,(alist-get 'actor_uin poke))
-            (target_id . ,(alist-get 'target_uin poke))
-            (recall_reference
-             . ((message_id . ,message-id)
-                (peer . ((chat_type . 2)
-                         (peer_uid . ,group-uin)
-                         (guild_id . "")))
-                (valid_before . ,(alist-get 'valid_before recall))))
-            (gateway_recall
-             . ((account_id . ,owner)
-                (conversation . ,(copy-tree conversation))
-                (message_id . ,message-id)
-                (sequence . ,(alist-get 'sequence poke))
-                (sent_at . ,(alist-get 'sent_at poke))
-                (tips_sequence . ,(alist-get 'tips_sequence recall))))
-            (raw_info . ,(qq-message--poke-raw-info poke)))))
-    (qq-state-apply-poke-notice notice)))
-
 (defun qq-message--project-reaction (data)
   "Project selected-account authoritative group reaction event DATA."
   (let* ((owner (qq-message--event-owner data))
@@ -1178,8 +1157,6 @@ responses never advance this observation; only `message.received' events do."
              (qq-message--project-dataline-message data))
             ("message.recalled"
              (qq-message--project-recall data))
-            ("message.poked"
-             (qq-message--project-poke data))
             ("message.reaction_changed"
              (qq-message--project-reaction data))
             ("message.essence_changed"
@@ -2031,52 +2008,17 @@ device's independently assigned inbound DataLine Message ID."
     (let* ((identity (qq-state-session-key-identity session-key))
            (chat (alist-get 'chat receipt))
            (message-id (alist-get 'message_id receipt)))
-      (let* ((text-receipt-p (assq 'batch_id receipt))
-             (file-receipt-p (assq 'transfer_session_id receipt))
-             (shape-valid
-              (cond
-               ((and text-receipt-p (not file-receipt-p))
-                (and
-                 (qq-account--exact-object-keys-p
-                  receipt '(account_id chat message_id sent_at server_sequence
-                                       client_sequence random batch_id))
-                 (qq-account--uint64-decimal-p
-                  (alist-get 'batch_id receipt))))
-               ((and file-receipt-p (not text-receipt-p))
-                (and
-                 (qq-account--exact-object-keys-p
-                  receipt '(account_id chat message_id sent_at server_sequence
-                                       client_sequence random transfer_session_id
-                                       file_name file_size file_kind resource_id
-                                       fast_path))
-                 (qq-account--uint64-decimal-p
-                  (alist-get 'transfer_session_id receipt))
-                 (not (equal (alist-get 'transfer_session_id receipt) "0"))
-                 (qq-account--non-empty-string-p
-                  (alist-get 'file_name receipt))
-                 (qq-account--uint32-p (alist-get 'file_size receipt))
-                 (> (alist-get 'file_size receipt) 0)
-                 (member (alist-get 'file_kind receipt)
-                         '("other" "image" "video"))
-                 (qq-resource-id-p (alist-get 'resource_id receipt))
-                 (memq (alist-get 'fast_path receipt) '(t :false))))
-               (t nil))))
-        (unless
-            (and
-             shape-valid
-             (equal (alist-get 'account_id receipt) owner)
-             (qq-account--exact-object-keys-p chat '(peer_uid variant))
-             (equal (alist-get 'peer_uid chat) (alist-get 'peer-uid identity))
-             (equal (alist-get 'variant chat) (alist-get 'variant identity))
-             (qq-message--message-id-p message-id)
-             (qq-account--uint32-p (alist-get 'sent_at receipt))
-             (> (alist-get 'sent_at receipt) 0)
-             (qq-account--uint64-decimal-p
-              (alist-get 'server_sequence receipt) t)
-             (qq-account--uint64-decimal-p
-              (alist-get 'client_sequence receipt))
-             (qq-account--uint32-p (alist-get 'random receipt)))
-          (error "qq: Gateway returned an invalid DataLine send receipt")))
+      ;; The exact hello version binds this adapter to the Gateway's typed
+      ;; receipt schema.  Only verify ownership and projection identity here;
+      ;; duplicating every Serde field and integer bound caused the previous
+      ;; file-size contract drift.
+      (unless (and (equal (alist-get 'account_id receipt) owner)
+                   (equal (alist-get 'peer_uid chat)
+                          (alist-get 'peer-uid identity))
+                   (equal (alist-get 'variant chat)
+                          (alist-get 'variant identity))
+                   (qq-message--message-id-p message-id))
+        (error "qq: Gateway returned a contradictory DataLine send receipt"))
       message-id)))
 
 (defun qq-message--promote-dataline-send-receipt
@@ -2317,6 +2259,8 @@ replace it."
 
 SET non-nil adds the reaction.  CALLBACK receives the receipt.  Only the
 authoritative `message.reaction_changed' update changes local reaction state."
+  (when (qq-state-poke-message-p message)
+    (user-error "qq: Poke timeline rows do not support reactions"))
   (let* ((owner (qq-message--current-owner))
          (_owner (qq-message--sync-account owner))
          (session-key (alist-get 'session-key message))
@@ -2350,6 +2294,8 @@ authoritative `message.reaction_changed' update changes local reaction state."
 
 SET non-nil sets the essence flag.  CALLBACK receives the receipt.  Only the
 authoritative `message.essence_changed' update changes local essence state."
+  (when (qq-state-poke-message-p message)
+    (user-error "qq: Poke timeline rows cannot become essence messages"))
   (let* ((owner (qq-message--current-owner))
          (_owner (qq-message--sync-account owner))
          (session-key (alist-get 'session-key message))
@@ -2383,6 +2329,8 @@ receipt.  No local todo state is invented because native query/event semantics
 are not yet part of the Gateway protocol."
   (unless (memq operation '(set complete cancel))
     (user-error "qq: Unknown native todo operation %S" operation))
+  (when (qq-state-poke-message-p message)
+    (user-error "qq: Poke timeline rows do not support todo mutations"))
   (let* ((owner (qq-message--current-owner))
          (_owner (qq-message--sync-account owner))
          (session-key (alist-get 'session-key message))
@@ -2482,24 +2430,28 @@ It is not a substitute for an exact NT message ID."
         `((kind . "sequence") (sequence . ,sequence))))))
 
 (defun qq-message-recall-target (session-key message)
-  "Return MESSAGE's closed native recall target in SESSION-KEY, or nil.
+  "Return MESSAGE's ordinary native recall target in SESSION-KEY, or nil.
 
 An exact NT snowflake works in private and group chats.  A group message may
 instead use its conversation-local native sequence; private sequence values
-alone are not a complete native recall capability."
+alone are not a complete native recall capability.  Poke timeline rows use
+their dedicated expiring recall capability."
   (when (and (listp message)
+             (not (qq-state-poke-message-p message))
              (equal (alist-get 'session-key message) session-key))
     (if-let* ((message-id (qq-message-exact-id message)))
         `((kind . "message") (message_id . ,message-id))
       (qq-message-group-sequence-target session-key message))))
 
 (defun qq-message-reply-target (session-key message)
-  "Return MESSAGE's closed native reply target in SESSION-KEY, or nil.
+  "Return MESSAGE's ordinary native reply target in SESSION-KEY, or nil.
 
 An exact NT snowflake works in private and group chats.  Group history may
 instead use its authoritative conversation-local sequence; Gateway retains
-the corresponding sender identity and timestamp inside the account actor."
+the corresponding sender identity and timestamp inside the account actor.
+Poke timeline rows are service records and cannot be reply targets."
   (when (and (listp message)
+             (not (qq-state-poke-message-p message))
              (equal (alist-get 'session-key message) session-key))
     (if-let* ((message-id (qq-message-exact-id message)))
         `((kind . "message") (message_id . ,message-id))
@@ -2535,9 +2487,7 @@ recalled; a later `message.recalled' event is an idempotent reconciliation."
 
 (defun qq-message--validate-poke-recall-metadata (message owner)
   "Return MESSAGE's native poke recall metadata for OWNER's account slot."
-  (let* ((raw-event (alist-get 'raw-event message))
-         (metadata (and (listp raw-event)
-                        (alist-get 'gateway_recall raw-event))))
+  (let ((metadata (alist-get 'poke-gateway-recall message)))
     (unless (and (qq-account--exact-object-keys-p
                   metadata
                   '(account_id conversation message_id sequence sent_at
@@ -2695,8 +2645,8 @@ service body and reason.  LIMIT defaults to `qq-recent-contact-count'."
    :errback errback))
 
 (dolist (event '("message.received" "dataline.message_received"
-                  "message.recalled" "message.poked"
-                 "message.reaction_changed" "message.essence_changed"))
+                 "message.recalled" "message.reaction_changed"
+                 "message.essence_changed"))
   (qq-rpc-register-event
    event #'qq-message--handle-event))
 (add-hook 'qq-account-registry-changed-hook
