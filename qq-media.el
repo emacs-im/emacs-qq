@@ -719,28 +719,37 @@ SPEC may be a numeric maximum height for compact decorative images."
     (appkit-media-one-line-preview-image-from-file
      file qq-media-preview-image-max-width)))
 
-(defun qq-media--remote-image-cache-file-base (key)
-  "Return disk cache file base for remote image KEY."
-  (expand-file-name (md5 key) qq-media-cache-directory))
-
-(defun qq-media--remote-image-cache-existing-file (key)
-  "Return existing disk cache file for remote image KEY, or nil."
-  (appkit-media-image-cache-existing-file
-   (qq-media--remote-image-cache-file-base key)))
-
 (defun qq-media--prefer-remote-image-resource-p (key resource)
-  "Return non-nil when RESOURCE at KEY should prefer remote image refresh.
+  "Return non-nil when RESOURCE at KEY should prefer its remote image.
 
-Currently this is enabled for user avatars so stale NapCat local avatar
-files do not permanently override fresher public avatar URLs."
+User-avatar local files may be stale NapCat fallbacks.  A remote avatar copy
+is reusable only when its disk identity includes the URL that supplied it."
   (and (stringp key)
        (string-prefix-p "avatar:" key)
        resource
        (appkit-media-url-present-p (alist-get 'url resource))))
 
+(defun qq-media--remote-image-cache-key (key &optional resource)
+  "Return the disk identity for logical image KEY and optional RESOURCE."
+  (if (qq-media--prefer-remote-image-resource-p key resource)
+      (format "%s:url:%s" key (alist-get 'url resource))
+    key))
+
+(defun qq-media--remote-image-cache-file-base (key &optional resource)
+  "Return disk cache file base for logical image KEY and optional RESOURCE."
+  (expand-file-name
+   (md5 (qq-media--remote-image-cache-key key resource))
+   qq-media-cache-directory))
+
+(defun qq-media--remote-image-cache-existing-file (key &optional resource)
+  "Return an existing disk cache file for KEY and RESOURCE, or nil."
+  (appkit-media-image-cache-existing-file
+   (qq-media--remote-image-cache-file-base key resource)))
+
 (defun qq-media--resource-image-file (key resource)
   "Return local image file for RESOURCE at KEY, consulting disk cache when needed."
-  (let* ((cached-file (and key (qq-media--remote-image-cache-existing-file key)))
+  (let* ((cached-file
+          (and key (qq-media--remote-image-cache-existing-file key resource)))
          (prefer-remote (qq-media--prefer-remote-image-resource-p key resource))
          (file (alist-get 'file resource)))
     (cond
@@ -773,8 +782,9 @@ non-preview resource path."
 (defun qq-media--start-resource-image-download (key resource spec builder)
   "Download remote image RESOURCE for KEY, then build image with BUILDER."
   (let* ((url (alist-get 'url resource))
-         (cache-base (qq-media--remote-image-cache-file-base key))
-         (disk-cache-file (qq-media--remote-image-cache-existing-file key))
+         (cache-base (qq-media--remote-image-cache-file-base key resource))
+         (disk-cache-file
+          (qq-media--remote-image-cache-existing-file key resource))
          (cache-file (qq-media--resource-image-file key resource))
          (cached-image (and cache-file (funcall builder cache-file spec))))
     (cond
@@ -1845,19 +1855,24 @@ OWNER is the exact Appkit app generation that owns any external media player."
     (resource &optional kind cache-key &key owner)
   "Open QQ RESOURCE through the shared browser-free media backend.
 
-CACHE-KEY also records the resolved local resource in QQ's logical cache.
-OWNER is forwarded exactly to lifecycle-own an external video player."
-  (appkit-media-open-resource
-   (qq-media--appkit-resource resource)
-   :kind kind
-   :cache-key cache-key
-   :cache-directory qq-media-cache-directory
-   :cache-update-function
-   (and cache-key
-        (lambda (updated-resource)
-          (qq-media--cache-resource cache-key updated-resource)))
-   :client-label "qq"
-   :owner owner))
+KIND selects the shared media operation.  CACHE-KEY also records the resolved
+local resource in QQ's logical cache.  OWNER is forwarded exactly to
+lifecycle-own an external video player."
+  (let ((open-resource (copy-tree resource)))
+    (when (qq-media--prefer-remote-image-resource-p cache-key open-resource)
+      (setf (alist-get 'file open-resource nil nil #'eq) nil))
+    (appkit-media-open-resource
+     (qq-media--appkit-resource open-resource)
+     :kind kind
+     :cache-key (and cache-key
+                     (qq-media--remote-image-cache-key cache-key resource))
+     :cache-directory qq-media-cache-directory
+     :cache-update-function
+     (and cache-key
+          (lambda (updated-resource)
+            (qq-media--cache-resource cache-key updated-resource)))
+     :client-label "qq"
+     :owner owner)))
 
 (defun qq-media-segment-default-save-name (segment)
   "Return default filename for saving SEGMENT locally."

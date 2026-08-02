@@ -97,14 +97,16 @@
 (ert-deftest qq-media-ensure-resource-image-uses-existing-disk-cache ()
   (qq-media-test-with-reset
    (let* ((qq-media-cache-directory (make-temp-file "qq-media-cache" t))
-          (key "avatar:10001")
-          (cache-file (expand-file-name (format "%s.jpg" (md5 key)) qq-media-cache-directory))
+          (key "preview:test")
+          (cache-file
+           (format "%s.jpg" (qq-media--remote-image-cache-file-base key)))
           (fetch-called nil))
      (unwind-protect
          (progn
            (with-temp-file cache-file
-             (insert "cached avatar bytes"))
-           (qq-media--cache-resource key '((url . "https://example.com/avatar.jpg")))
+             (insert "cached preview bytes"))
+           (qq-media--cache-resource
+            key '((url . "https://example.com/preview.jpg")))
            (should
             (equal
              (qq-media--ensure-resource-image
@@ -118,6 +120,59 @@
            (should-not fetch-called)
            (should (equal (alist-get 'file (qq-media--cached-resource key))
                           cache-file)))
+       (when (file-directory-p qq-media-cache-directory)
+         (delete-directory qq-media-cache-directory t))))))
+
+(ert-deftest qq-media-avatar-ignores-legacy-identity-only-disk-cache ()
+  (qq-media-test-with-reset
+   (let* ((qq-media-cache-directory (make-temp-file "qq-media-cache" t))
+          (key "avatar:10001")
+          (resource '((url . "https://example.com/current-avatar.png")))
+          (legacy-file
+           (format "%s.jpg" (qq-media--remote-image-cache-file-base key)))
+          started-key)
+     (unwind-protect
+         (progn
+           (with-temp-file legacy-file
+             (insert "stale identity-only avatar bytes"))
+           (qq-media--cache-resource key resource)
+           (cl-letf (((symbol-function 'qq-media--start-resource-image-download)
+                      (lambda (download-key _resource _spec _builder)
+                        (setq started-key download-key))))
+             (should-not
+              (qq-media--ensure-resource-image
+               key
+               (lambda (_done _error)
+                 (ert-fail "fetcher should not run for cached avatar locator"))
+               20
+               (lambda (file spec) (list file spec))))
+             (should (equal started-key key))))
+       (when (file-directory-p qq-media-cache-directory)
+         (delete-directory qq-media-cache-directory t))))))
+
+(ert-deftest qq-media-avatar-reuses-disk-cache-from-the-same-url ()
+  (qq-media-test-with-reset
+   (let* ((qq-media-cache-directory (make-temp-file "qq-media-cache" t))
+          (key "avatar:10001")
+          (resource '((url . "https://example.com/current-avatar.png")))
+          (cache-file
+           (format "%s.png"
+                   (qq-media--remote-image-cache-file-base key resource)))
+          (fetch-called nil))
+     (unwind-protect
+         (progn
+           (with-temp-file cache-file
+             (insert "current avatar bytes"))
+           (qq-media--cache-resource key resource)
+           (should
+            (equal
+             (qq-media--ensure-resource-image
+              key
+              (lambda (_done _error) (setq fetch-called t))
+              20
+              (lambda (file spec) (list file spec)))
+             (list cache-file 20)))
+           (should-not fetch-called))
        (when (file-directory-p qq-media-cache-directory)
          (delete-directory qq-media-cache-directory t))))))
 
@@ -300,7 +355,7 @@
             (qq-media--start-resource-image-download
              key resource 20 (lambda (_file _spec) :image)))
           (should (equal resource captured-resource))
-          (should (equal (qq-media--remote-image-cache-file-base key)
+          (should (equal (qq-media--remote-image-cache-file-base key resource)
                          captured-base))
           (should (eq :image-transfer
                       (gethash key qq-media--fetching-cache))))
@@ -1257,6 +1312,22 @@
       (should (equal (alist-get 'file
                                 (qq-media--cached-resource "image:test"))
                      "/tmp/cat.png")))))
+
+(ert-deftest qq-media-open-avatar-scopes-disk-cache-to-url ()
+  (let* ((resource '((file . "/tmp/stale-avatar.png")
+                     (url . "https://example.com/current-avatar.png")))
+         captured)
+    (cl-letf (((symbol-function 'appkit-media-open-resource)
+               (lambda (&rest arguments) (setq captured arguments))))
+      (qq-media-open-resource resource 'image "avatar:10001")
+      (should
+       (equal (car captured)
+              '((url . "https://example.com/current-avatar.png"))))
+      (should
+       (equal
+        (plist-get (cdr captured) :cache-key)
+        (qq-media--remote-image-cache-key "avatar:10001" resource)))
+      (should (equal (alist-get 'file resource) "/tmp/stale-avatar.png")))))
 
 (ert-deftest qq-media-open-video-file-segment-delegates-to-player ()
   "An mp4 delivered as a file segment still takes the video-player path."
