@@ -22,6 +22,13 @@
          (progn ,@body)
        (qq-state-reset))))
 
+(defun qq-root-test-set-recent (&rest session-keys)
+  "Set ordered recent membership to SESSION-KEYS in the current partition."
+  (setq qq-state--recent-session-keys (copy-sequence session-keys))
+  (clrhash qq-state--recent-session-key-set)
+  (dolist (session-key session-keys)
+    (puthash session-key t qq-state--recent-session-key-set)))
+
 (defmacro qq-root-test-with-live-view (&rest body)
   "Run BODY in a uniquely named live Appkit root view.
 
@@ -97,6 +104,35 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
          (equal (qq-root--header-line)
                 " emacs-qq  [ready]  Work (10001) — online · 1/2 online"))))))
 
+(ert-deftest qq-root-projects-only-authoritative-recent-membership-in-page-order ()
+  (qq-root-test-with-reset
+   (qq-state-upsert-session
+    "group:3"
+    '((type . group) (title . "Directory only") (last-message-time . 30))
+    nil)
+   (qq-state-upsert-session
+    "private:2"
+    '((type . private) (title . "Second") (last-message-time . 20))
+    nil)
+   (qq-state-upsert-session
+    "group:1"
+    '((type . group) (title . "First") (last-message-time . 10))
+    nil)
+   (qq-root-test-set-recent "group:1" "private:2")
+   (should
+    (equal (mapcar (lambda (session) (alist-get 'key session))
+                   (qq-root--recent-sessions))
+           '("group:1" "private:2")))
+   (cl-letf (((symbol-function 'qq-root--buffer-width) (lambda () 80)))
+     (should
+      (equal
+       (seq-keep
+        (lambda (entry)
+          (and (eq (qq-root--entry-type entry) 'session)
+               (alist-get 'key (qq-root--entry-session entry))))
+        (qq-root--project-account-entries))
+       '("group:1" "private:2"))))))
+
 (ert-deftest qq-root-distinguishes-important-and-muted-unread-sessions ()
   (qq-root-test-with-reset
    (qq-state-upsert-session
@@ -107,6 +143,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
     "group:10002"
      '((unread-badge-count . 9) (muted-p . t))
     nil)
+   (qq-root-test-set-recent "group:10001" "group:10002")
    (let ((metrics (qq-root--activity-metrics)))
      (should (= 2 (plist-get metrics :unread)))
      (should (= 1 (plist-get metrics :important)))
@@ -341,6 +378,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
     '((type . group) (target-id . "2") (title . "Two")
       (last-message-time . 1) (last-message-preview . "quiet"))
     nil)
+   (qq-root-test-set-recent "private:1" "group:2")
    (qq-root-test-with-live-view
      (cl-letf (((symbol-function 'qq-media-session-avatar-display-string)
                 (lambda (_session) "#")))
@@ -539,6 +577,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
     '((type . private) (target-id . "1") (title . "One")
       (last-message-time . 1) (last-message-preview . "old"))
     nil)
+   (qq-root-test-set-recent "private:1")
    (qq-root-test-with-live-view
      (cl-letf (((symbol-function 'qq-media-session-avatar-display-string)
                 (lambda (_session) "#")))
@@ -594,6 +633,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
     '((type . group) (target-id . "2") (title . "Two")
       (last-message-time . 1) (last-message-preview . "second"))
     nil)
+   (qq-root-test-set-recent "private:1" "group:2")
    (qq-root-test-with-live-view
      (cl-letf (((symbol-function 'qq-media-session-avatar-display-string)
                 (lambda (_session) "#")))
@@ -605,6 +645,9 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
        (should (equal "group:2" (qq-root--session-key-at-point)))
        (qq-state-upsert-session
         "group:2" '((last-message-time . 3)) nil)
+       ;; Root order belongs to the recent projection, not to all-session
+       ;; timestamp sorting.  Simulate the newer authoritative page order.
+       (qq-root-test-set-recent "group:2" "private:1")
        (appkit-invalidate view :structure t)
        (appkit-sync-invalidations view)
        (should (equal "group:2" (qq-root--session-key-at-point)))
@@ -745,12 +788,14 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
             (qq-state-upsert-session
              "private:1"
              '((type . private) (target-id . "1") (title . "Alice A"))
-             nil))
+             nil)
+            (qq-root-test-set-recent "private:1"))
           (qq-runtime-with-account "slot-b"
             (qq-state-upsert-session
              "private:1"
              '((type . private) (target-id . "1") (title . "Alice B"))
-             nil))
+             nil)
+            (qq-root-test-set-recent "private:1"))
           (cl-letf
               (((symbol-function 'qq-login-view-model) #'ignore)
                ((symbol-function 'qq-server-state)
