@@ -61,33 +61,17 @@
                 :history-session-key session-key
                 :history-older-cursor nil
                 :history-newer-cursor nil
-                :history-at-oldest-p nil
-                :history-at-latest-p nil)))
+                :history-has-older-p nil
+                :history-has-newer-materialized-p nil)))
 
-(defun qq-chat-test--history-cursor (session-key driver &rest properties)
-  "Return one opaque wire-history cursor fixture for SESSION-KEY."
-  (let ((position
-         (pcase driver
-           ('native-sequence
-            `((kind . "native_sequence")
-              (sequence . ,(plist-get properties :sequence))
-              ,@(when-let* ((maximum (plist-get properties :maximum-sequence)))
-                  `((maximum_sequence . ,maximum)))))
-           ('group-window
-            `((kind . "group_window")
-              (sequence . ,(plist-get properties :sequence))))
-           ('private-roam
-            `((kind . "private_roam")
-              (cursor . ,(copy-tree (plist-get properties :cursor)))))
-           ('dataline
-            `((kind . "dataline")
-              (message_id . ,(plist-get properties :message-id))))
-           (_ (error "unknown history cursor fixture %S" driver)))))
-    `((version . ,qq-core-history-port-version)
-      (account_id . "slot-a")
-      (conversation
-       . ,(qq-message--history-conversation-params session-key))
-      (position . ,position))))
+(defun qq-chat-test--history-cursor (session-key direction position)
+  "Return one opaque direction-scoped history cursor fixture."
+  `((version . ,qq-core-history-port-version)
+    (account_id . "slot-a")
+    (conversation
+     . ,(qq-message--history-conversation-params session-key))
+    (direction . ,(symbol-name direction))
+    (position . ,(copy-tree position))))
 
 (defun qq-chat-test--search-result (id sequence time &optional preview)
   "Return one strict group search result."
@@ -134,6 +118,28 @@
     (preview . ,(or text "native"))
     (message-type . "group")
     (order . ,time)))
+
+(defun qq-chat-test--apply-gray-tip-message
+    (session-key message-id time data)
+  "Merge one normalized GrayTip DATA row into SESSION-KEY."
+  (cl-multiple-value-bind (message _mutation _previous-anchor)
+      (qq-state--merge-normalized-message
+       session-key
+       `((id . ,message-id)
+         (server-id . ,message-id)
+         (session-key . ,session-key)
+         (time . ,time)
+         (sender-name . "QQ")
+         (self-p . nil)
+         (status . received)
+         (timeline-class . service)
+         (segments . (((type . "gray-tip") (data . ,(copy-tree data)))))
+         (raw-message . ,(alist-get 'text data))
+         (preview . ,(alist-get 'text data))
+         (message-type . "group")
+         (group-id . ,(qq-state-session-key-target-id session-key))
+         (order . ,time)))
+    message))
 
 (defun qq-chat-test--filter-snapshot (id sequence time text &optional reactions)
   "Return one flat rendering snapshot wire result for chat filter tests."
@@ -1692,7 +1698,7 @@
                   (lambda (&rest _args) nil))
                  ((symbol-function 'qq-core-fetch-history-around)
                   (lambda (_session-key message-id _callback
-                           &optional _errback _count)
+                           &optional _errback _count _sequence)
                     (setq around-message-ids
                           (append around-message-ids (list message-id)))
                     (intern (format "around-%s" message-id)))))
@@ -1739,7 +1745,7 @@
                        ((symbol-function 'qq-chat--goto-loaded-message)
                         (lambda (&rest _) nil))
                        ((symbol-function 'qq-core-fetch-history-around)
-                        (lambda (session id _callback &optional _errback count)
+                        (lambda (session id _callback &optional _errback count _sequence)
                           (setq around-call (list session id count))
                           'around-token))
                        ((symbol-function 'qq-chat--load-initial-history)
@@ -1786,7 +1792,7 @@
                       t))
                    ((symbol-function 'qq-core-fetch-history-around)
                     (lambda (session-key message-id _callback
-                             &optional _errback _count)
+                             &optional _errback _count _sequence)
                       (setq around-call (list session-key message-id))
                       'around-token)))
            (qq-chat-open-message "group:20001" target "cached")
@@ -3358,7 +3364,10 @@
                 '((server-id . "9007199254741004001")
                   (session-key . "group:20001")
                   (gateway-account-id . "slot-a")
-                  (segments . (((type . "poke") (data)))))))
+                  (timeline-class . service)
+                  (segments
+                   . (((type . "gray-tip")
+                       (data . ((kind . "poke")))))))))
            (should-not (qq-chat--message-forwardable-p message))
            (should-not (qq-chat--message-reactable-p message))
            (should-not (qq-chat--message-essence-capable-p message))
@@ -3492,39 +3501,31 @@
          (qq-chat-poke-sender))
        (should (equal call '("private:10002" "90001")))))))
 
-(ert-deftest qq-chat-recalls-pokes-with-their-closed-native-reference ()
-  (dolist (reference
-           '(((message_id . "9007199254741004001")
-              (peer . ((chat_type . 2)
-                       (peer_uid . "20001")
-                       (guild_id . "")))
-              (valid_before . 4102444800))
-             ((message_id . "9007199254741004002")
-              (peer . ((chat_type . 1)
-                       (peer_uid . "u_private-native-peer")
-                       (guild_id . "")))
-              (valid_before . 4102444800))))
-    (let* ((chat-type (alist-get 'chat_type (alist-get 'peer reference)))
-           (qq-chat--session-key
-            (if (= chat-type 2) "group:20001" "private:10001"))
-           (message
-           `((server-id . ,(alist-get 'message_id reference))
-             (session-key . ,qq-chat--session-key)
-             (self-p . t)
-             (poke-recall-reference . ,reference)
-             (segments . (((type . "poke"))))))
-          recalled-message
-          ordinary-delete-called)
-      (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
-                ((symbol-function 'qq-core-recall-poke)
-                 (lambda (value &rest _)
-                   (setq recalled-message value)))
-                ((symbol-function 'qq-api-delete-message)
-                 (lambda (&rest _)
-                   (setq ordinary-delete-called t))))
-        (qq-chat--delete-message-internal message))
-      (should (eq recalled-message message))
-      (should-not ordinary-delete-called))))
+(ert-deftest qq-chat-routes-group-poke-recall-through-dedicated-operation ()
+  (let* ((qq-chat--session-key "group:20001")
+         (message
+          '((server-id . "9007199254741004001")
+            (session-key . "group:20001")
+            (gateway-account-id . "slot-a")
+            (timeline-class . service)
+            (self-p . t)
+            (segments
+             . (((type . "gray-tip")
+                 (data . ((kind . "poke"))))))))
+         recalled-message
+         ordinary-recall-called)
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+              ((symbol-function 'qq-message-poke-recall-capable-p)
+               (lambda (value) (eq value message)))
+              ((symbol-function 'qq-core-recall-poke)
+               (lambda (value &rest _)
+                 (setq recalled-message value)))
+              ((symbol-function 'qq-core-recall-message)
+               (lambda (&rest _)
+                 (setq ordinary-recall-called t))))
+      (qq-chat--delete-message-internal message))
+    (should (eq recalled-message message))
+    (should-not ordinary-recall-called)))
 
 (ert-deftest qq-chat-recalls-ordinary-message-with-closed-reference ()
   (let ((qq-chat--session-key "group:20001")
@@ -3555,7 +3556,10 @@
   (let ((message
          '((server-id . "9007199254741004001")
            (self-p . t)
-           (segments . (((type . "poke"))))))
+           (timeline-class . service)
+           (segments
+            . (((type . "gray-tip")
+                (data . ((kind . "poke"))))))))
         prompted
         api-called)
     (cl-letf (((symbol-function 'y-or-n-p)
@@ -3569,36 +3573,30 @@
     (should-not prompted)
     (should-not api-called)))
 
-(ert-deftest qq-chat-refuses-an-expired-poke-before-confirmation ()
+(ert-deftest qq-chat-poke-recall-does-not-invent-a-client-expiry ()
   (let ((message
          '((server-id . "9007199254741004001")
+           (session-key . "group:20001")
+           (gateway-account-id . "slot-a")
            (self-p . t)
-           (poke-recall-reference
-            . ((message_id . "9007199254741004001")
-               (peer . ((chat_type . 2)
-                        (peer_uid . "20001")
-                        (guild_id . "")))
-               (valid_before . 200)))
-           (segments . (((type . "poke"))))))
+           (timeline-class . service)
+           (segments
+            . (((type . "gray-tip")
+                (data . ((kind . "poke"))))))))
         prompted
-        api-called
-        failure)
-    (cl-letf (((symbol-function 'float-time)
-               (lambda (&optional _time) 200))
-              ((symbol-function 'y-or-n-p)
+        recalled)
+    (cl-letf (((symbol-function 'y-or-n-p)
                (lambda (&rest _)
-                 (setq prompted t)))
+                 (setq prompted t)
+                 t))
+              ((symbol-function 'qq-message-poke-recall-capable-p)
+               (lambda (value) (eq value message)))
               ((symbol-function 'qq-core-recall-poke)
-               (lambda (&rest _)
-                 (setq api-called t))))
-      (setq failure
-            (should-error (qq-chat--delete-message-internal message)
-                          :type 'user-error)))
-    (should (string-match-p
-             "qq: 戳一戳已超过 2 分钟撤回期限"
-             (error-message-string failure)))
-    (should-not prompted)
-    (should-not api-called)))
+               (lambda (value &rest _)
+                 (setq recalled value))))
+      (qq-chat--delete-message-internal message))
+    (should prompted)
+    (should (eq recalled message))))
 
 (ert-deftest qq-chat-send-poke-uses-explicit-member-chooser ()
   (qq-chat-test-with-reset
@@ -4557,7 +4555,7 @@
      (qq-chat-render)
      (let (around-called load-older-called)
        (cl-letf (((symbol-function 'qq-core-fetch-history-around)
-                  (lambda (session-key message-id callback &optional _errback _count)
+                  (lambda (session-key message-id callback &optional _errback _count _sequence)
                     (setq around-called message-id)
                     (should (equal session-key "private:10001"))
                     (qq-state-merge-history
@@ -4611,7 +4609,7 @@
             failure)
         (cl-letf (((symbol-function 'qq-core-fetch-history-around)
                    (lambda (_session _target callback
-                            &optional _errback _count)
+                            &optional _errback _count _sequence)
                      (cl-incf requests)
                      (funcall callback
                               (qq-chat-test--history-meta
@@ -4948,14 +4946,16 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
            (sender-id . "10001")
            (sender-name . "Alice")
            (target-id . "10002")
+           (timeline-class . service)
            (segments
-            . (((type . "poke")
+            . (((type . "gray-tip")
                 (data .
-                 ((actor-name . "Alice")
-                 (target-name . "Bob")
-                 (image-url . "https://example.com/poke.png")
-                 (action . "喷了喷")
-                 (detail . "的加分喷雾，分数++")))))))))
+                 ((kind . "poke")
+                  (actor-name . "Alice")
+                  (target-name . "Bob")
+                  (image-url . "https://example.com/poke.png")
+                  (action . "喷了喷")
+                  (detail . "的加分喷雾，分数++")))))))))
     (with-temp-buffer
       (let ((inhibit-read-only t)
             (fill-column 80))
@@ -4983,20 +4983,18 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
     "group:987654321"
     '((type . group) (title . "Test Group") (target-id . "987654321"))
     nil)
-   (qq-state-apply-gray-tip-notice
-    '((post_type . "notice")
-      (notice_type . "notify")
-      (sub_type . "gray_tip")
-      (group_id . 987654321)
-      (user_id . 0)
-      (message_id . "9007199254750003456")
-      (busi_id . "19366")
-      (content . "{\"items\":[{\"txt\":\"新进群账号疑似来自非大陆地区，请谨慎核实对方身份。\",\"type\":\"nor\"},{\"txt\":\"查看异常>\",\"type\":\"url\"}]}")))
+   (qq-chat-test--apply-gray-tip-message
+    "group:987654321" "9007199254750003456" 1710000000
+    '((kind . "general")
+      (text . "新进群账号疑似来自非大陆地区，请谨慎核实对方身份。查看异常>")
+      (business-type . "1")
+      (business-id . "19366")
+      (parts
+       . (((type . "text")
+           (text . "新进群账号疑似来自非大陆地区，请谨慎核实对方身份。查看异常>"))))))
    (with-temp-buffer
      (qq-chat-mode)
-     (setq qq-chat--session-key "group:987654321"
-           qq-chat--message-selection
-           (qq-chat-test--selection "9007199254750003456"))
+     (setq qq-chat--session-key "group:987654321")
      (qq-chat--set-history-window "9007199254750003456" nil)
      (qq-chat-render)
      (should (equal (appkit-chat-timeline-keys)
@@ -5004,29 +5002,23 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
      (should (string-match-p
               "新进群账号疑似来自非大陆地区，请谨慎核实对方身份。查看异常>"
               (buffer-substring-no-properties (point-min) (point-max))))
-     (goto-char (point-min))
-     (search-forward "新进群账号疑似来自非大陆地区")
-     (beginning-of-line)
-     (should
-      (string-prefix-p "▌ " (get-text-property (point) 'line-prefix))))))
+     (should-not qq-chat--message-selection)
+     (should-not
+      (string-match-p
+       "@ QQ"
+       (buffer-substring-no-properties (point-min) (point-max)))))))
 
 (ert-deftest qq-chat-renders-member-add-user-as-avatar-profile-button ()
   (qq-chat-test-with-reset
    (let* ((message
-           (qq-state-apply-gray-tip-notice
-            '((post_type . "notice")
-              (notice_type . "notify")
-              (sub_type . "gray_tip")
-              (group_id . "20001")
-              (user_id . 0)
-              (message_id . "9007199254750003460")
-              (busi_id . "group-member-add")
-              (gray_tip_kind . "member-add")
+           (qq-chat-test--apply-gray-tip-message
+            "group:20001" "9007199254750003460" 1710000001
+            '((kind . "group_members_joined")
               (text . "新同学加入群聊")
-              (gray_tip_parts
+              (parts
                . (((type . "user")
                    (role . "member")
-                   (user_id . "10002")
+                   (user-id . "10002")
                    (name . "新同学"))
                   ((type . "text") (text . "加入群聊")))))))
           opened-user)
@@ -5058,6 +5050,50 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                       "AV 新同学"))
              (push-button button)
              (should (equal opened-user "10002")))))))))
+
+(ert-deftest qq-chat-renders-uid-only-gray-tip-user-without-fake-profile ()
+  (qq-chat-test-with-reset
+   (let ((message
+          (qq-chat-test--apply-gray-tip-message
+           "group:20001" "9007199254750003461" 1710000002
+           '((kind . "group_member_removed")
+             (text . "u_operator 将 u_member 移出群聊")
+             (parts
+              . (((type . "user")
+                  (role . "operator")
+                  (identity . ((kind . "uid") (uid . "u_operator")))
+                  (user-uid . "u_operator")
+                  (name . "u_operator"))
+                 ((type . "text") (text . " 将 "))
+                 ((type . "user")
+                  (role . "member")
+                  (identity . ((kind . "uid") (uid . "u_member")))
+                  (user-uid . "u_member")
+                  (name . "u_member"))
+                 ((type . "text") (text . " 移出群聊"))))))))
+     (should-not
+      (seq-some
+       (lambda (key) (string-prefix-p "avatar:" key))
+       (qq-chat--message-media-cache-keys message)))
+     (with-temp-buffer
+       (let ((inhibit-read-only t)
+             (fill-column 80))
+         (cl-letf (((symbol-function 'qq-media-avatar-display-string)
+                    (lambda (&rest _)
+                      (ert-fail "UID-only identity requested a fake avatar")))
+                   ((symbol-function 'qq-user-open)
+                    (lambda (&rest _)
+                      (ert-fail "UID-only identity opened a fake profile"))))
+           (qq-chat--insert-gray-tip-message message nil)
+           (should (string-match-p
+                    "u_operator 将 u_member 移出群聊"
+                    (buffer-string)))
+           (goto-char (point-min))
+           (search-forward "u_member")
+           (backward-char)
+           (should-not (button-at (point)))
+           (should-not (get-text-property
+                        (point) 'qq-chat-gray-tip-user-id))))))))
 
 (ert-deftest qq-chat-projects-guild-avatar-as-native-media-dependency ()
   (let ((message
@@ -5373,7 +5409,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
     (let (loading-during-request)
       (cl-letf (((symbol-function 'qq-core-fetch-history-around)
                  (lambda (session-key target callback
-                          &optional _errback _count)
+                          &optional _errback _count _sequence)
                    (should (equal session-key "group:20001"))
                    (should (equal target "m20"))
                    (should (appkit-chat-history-request-owner))
@@ -5403,7 +5439,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
         (should-not (appkit-chat-history-loading-p))
         (should-not (appkit-chat-history-request-owner))
         (should (equal (appkit-chat-history-window-first-key) "m19"))
-        (should (equal (appkit-chat-history-window-last-key) "m20")))))))
+        (should-not (appkit-chat-history-window-last-key)))))))
 
 (ert-deftest qq-chat-around-failure-clears-loading-and-owner ()
   (qq-chat-test-with-reset
@@ -5413,7 +5449,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
     (let (loading-during-request failure)
       (cl-letf (((symbol-function 'qq-core-fetch-history-around)
                  (lambda (session-key target _callback
-                          &optional errback _count)
+                          &optional errback _count _sequence)
                    (should (equal session-key "group:20001"))
                    (should (equal target "m20"))
                    (should (appkit-chat-history-request-owner))
@@ -5459,7 +5495,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
          (qq-chat--note-history-window
           (qq-chat-test--history-meta
            "group:20001"
-           :history-at-latest-p t
+           :history-has-newer-materialized-p nil
            :added-count 3
            :message-count 3
            :batch-message-ids
@@ -5495,6 +5531,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
          (qq-chat--note-history-window
           (qq-chat-test--history-meta
            "group:20001"
+           :history-has-newer-materialized-p t
            :added-count 2
            :message-count 2
            :batch-message-ids (list first newest)
@@ -5548,7 +5585,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
     (setq qq-chat--session-key "group:20001"
           qq-chat--gateway-history-newer-cursor
           (qq-chat-test--history-cursor
-           "group:20001" 'group-window :sequence "105544"))
+           "group:20001" 'newer
+           '((kind . "timeline_row") (row_key . "105544"))))
     (qq-chat--ensure-view)
     (qq-chat--set-history-window "m10" nil)
     (let ((qq-chat-history-auto-load-threshold 50)
@@ -5805,10 +5843,12 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
           (latest "7348923749823749820")
           (older-cursor
            (qq-chat-test--history-cursor
-            session-key 'native-sequence :sequence "81"))
+            session-key 'older
+            '((kind . "timeline_row") (row_key . "81"))))
           (newer-cursor
            (qq-chat-test--history-cursor
-            session-key 'group-window :sequence "100")))
+            session-key 'newer
+            '((kind . "timeline_row") (row_key . "100")))))
      (qq-state-upsert-session
       session-key '((type . group) (target-id . "20001")) nil)
      (puthash
@@ -5832,7 +5872,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                       session-key
                       :history-older-cursor older-cursor
                       :history-newer-cursor newer-cursor
-                      :history-at-latest-p t
+                      :history-has-older-p t
+                      :history-has-newer-materialized-p nil
                       :batch-message-ids (list oldest latest)
                       :message-count 2 :added-count 2))
                     (qq-chat-test-native-request "latest-native")))
@@ -5875,8 +5916,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                        callback
                        (qq-chat-test--history-meta
                         session-key
-                        :history-at-oldest-p t
-                        :history-at-latest-p t
+                        :history-has-older-p nil
+                        :history-has-newer-materialized-p nil
                         :batch-message-ids (list message-id)
                         :message-count 1 :added-count 1))
                       (qq-chat-test-native-request "dataline-history")))
@@ -5898,10 +5939,10 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
    (let* ((session-key "private:10001")
          (older-id "7348923749823749822")
          (latest-id "7348923749823749823")
-         (first-cursor '((timestamp . 1784700000) (random . 7)))
          (first-history-cursor
           (qq-chat-test--history-cursor
-           session-key 'private-roam :cursor first-cursor))
+           session-key 'older
+           '((kind . "timeline_row") (row_key . "500"))))
          older-call)
      (qq-state-upsert-session
       session-key '((type . private) (target-id . "10001")) nil)
@@ -5926,8 +5967,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                            callback
                            (qq-chat-test--history-meta
                             session-key
-                            :history-at-oldest-p t
-                            :history-at-latest-p nil
+                            :history-has-older-p nil
+                            :history-has-newer-materialized-p t
                             :batch-message-ids (list older-id)
                             :message-count 1 :added-count 1)))
                       (puthash
@@ -5940,7 +5981,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                        (qq-chat-test--history-meta
                         session-key
                         :history-older-cursor first-history-cursor
-                        :history-at-latest-p t
+                        :history-has-older-p t
+                        :history-has-newer-materialized-p nil
                         :batch-message-ids (list latest-id)
                         :message-count 1 :added-count 1)))
                     (qq-chat-test-native-request
@@ -5965,19 +6007,23 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
          (should
           (equal (appkit-chat-history-window-first-key) older-id)))))))
 
-(ert-deftest qq-chat-unified-older-history-advances-through-empty-pages ()
+(ert-deftest qq-chat-unified-older-history-extends-one-materialized-page ()
   (qq-chat-test-with-reset
    (let* ((session-key "group:20001")
+          (older-id "7348923749823749880")
           (current-id "7348923749823749900")
           (older-cursor
            (qq-chat-test--history-cursor
-            session-key 'native-sequence :sequence "100"))
+            session-key 'older
+            '((kind . "timeline_row") (row_key . "100"))))
           (next-older-cursor
            (qq-chat-test--history-cursor
-            session-key 'native-sequence :sequence "80"))
+            session-key 'older
+            '((kind . "timeline_row") (row_key . "80"))))
           (newer-cursor
            (qq-chat-test--history-cursor
-            session-key 'group-window :sequence "119"))
+            session-key 'newer
+            '((kind . "timeline_row") (row_key . "119"))))
           call)
      (qq-state-upsert-session
       session-key '((type . group) (target-id . "20001")) nil)
@@ -5997,15 +6043,21 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                   (lambda (_session cursor direction callback
                            &optional _errback _count)
                     (setq call (list cursor direction))
-                    ;; An all-unsupported page still advances exact coverage.
+                    (puthash
+                     session-key
+                     (list (qq-chat-test--gateway-message
+                            session-key older-id "80" 80)
+                           (qq-chat-test--gateway-message
+                            session-key current-id "100" 100))
+                     qq-state--messages-by-session)
                     (funcall
                      callback
                      (qq-chat-test--history-meta
                       session-key
                       :history-older-cursor next-older-cursor
-                      :unsupported-message-count 20
-                      :batch-message-ids nil
-                      :message-count 0 :added-count 0))
+                      :history-has-older-p t
+                      :batch-message-ids (list older-id)
+                      :message-count 1 :added-count 1))
                     nil))
                  ((symbol-function 'qq-chat--ensure-view) #'ignore))
          (qq-chat-load-older-messages t)
@@ -6015,7 +6067,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
          ;; Extending the lower edge must retain the newer cursor.  Replacing
          ;; both edges here made a following forward page restart at 100.
          (should (equal qq-chat--gateway-history-newer-cursor newer-cursor))
-         (should (equal (appkit-chat-history-window-first-key) current-id))
+         (should (equal (appkit-chat-history-window-first-key) older-id))
          (should-not (appkit-chat-history-older-loaded-p)))))))
 
 (ert-deftest qq-chat-unified-newer-history-uses-opaque-continuation ()
@@ -6025,13 +6077,16 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
           (latest-id "7348923749823749905")
           (older-cursor
            (qq-chat-test--history-cursor
-            session-key 'native-sequence :sequence "81"))
+            session-key 'older
+            '((kind . "timeline_row") (row_key . "81"))))
           (newer-cursor
            (qq-chat-test--history-cursor
-            session-key 'group-window :sequence "100"))
+            session-key 'newer
+            '((kind . "timeline_row") (row_key . "100"))))
           (next-newer-cursor
            (qq-chat-test--history-cursor
-            session-key 'group-window :sequence "105"))
+            session-key 'newer
+            '((kind . "timeline_row") (row_key . "105"))))
           call)
      (qq-state-upsert-session
       session-key '((type . group) (target-id . "20001")) nil)
@@ -6064,7 +6119,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                      (qq-chat-test--history-meta
                       session-key
                       :history-newer-cursor next-newer-cursor
-                      :history-at-latest-p t
+                      :history-has-newer-materialized-p nil
                       :batch-message-ids (list latest-id)
                       :message-count 1 :added-count 1))
                     nil))
@@ -6087,16 +6142,18 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
    (let* ((session-key "private:10001")
           (current-id "7348923749823749900")
           (latest-id "7348923749823749905")
-          (roam-cursor '((timestamp . 1784700000) (random . 7)))
           (older-cursor
            (qq-chat-test--history-cursor
-            session-key 'private-roam :cursor roam-cursor))
+            session-key 'older
+            '((kind . "timeline_row") (row_key . "81"))))
           (newer-cursor
            (qq-chat-test--history-cursor
-            session-key 'native-sequence :sequence "100"))
+            session-key 'newer
+            '((kind . "timeline_row") (row_key . "100"))))
           (next-newer-cursor
            (qq-chat-test--history-cursor
-            session-key 'native-sequence :sequence "105"))
+            session-key 'newer
+            '((kind . "timeline_row") (row_key . "105"))))
           call)
      (qq-state-upsert-session
       session-key '((type . private) (target-id . "10001")) nil)
@@ -6127,7 +6184,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                      (qq-chat-test--history-meta
                       session-key
                       :history-newer-cursor next-newer-cursor
-                      :history-at-latest-p t
+                      :history-has-newer-materialized-p nil
                       :batch-message-ids (list latest-id)
                       :message-count 1 :added-count 1))
                     nil))
@@ -7021,8 +7078,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
      (setq qq-chat--session-key "private:10001"
            qq-chat--gateway-history-older-cursor
            (qq-chat-test--history-cursor
-            "private:10001" 'private-roam
-            :cursor '((timestamp . 200) (random . 3))))
+            "private:10001" 'older
+            '((kind . "timeline_row") (row_key . "200"))))
      (qq-chat--set-history-window "200" "300")
      (let (callback old-view replacement-view projection-calls)
        (cl-letf (((symbol-function 'qq-core-fetch-history-page)
@@ -7053,8 +7110,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                    "private:10001"
                    :history-older-cursor
                    (qq-chat-test--history-cursor
-                    "private:10001" 'private-roam
-                    :cursor '((timestamp . 150) (random . 4)))
+                    "private:10001" 'older
+                    '((kind . "timeline_row") (row_key . "150")))
                    :added-count 1
                    :message-count 2
                    :batch-message-ids '("150" "200"))))
@@ -7162,7 +7219,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
            (funcall latest-callback
                     (qq-chat-test--history-meta
                      "group:20001"
-                     :history-at-latest-p t
+                     :history-has-newer-materialized-p nil
                      :added-count 1
                      :message-count 1
                      :batch-message-ids '("300")))))

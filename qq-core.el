@@ -189,7 +189,7 @@ contact cache."
 
 (defun qq-core--recent-private-row-projectable-p (row account)
   "Return non-nil when private recent ROW can derive a UIN using ACCOUNT."
-  (let* ((message (alist-get 'latest_message row))
+  (let* ((message (alist-get 'message (alist-get 'latest_message row)))
          (sender (alist-get 'sender message))
          (recipient (alist-get 'recipient message))
          (sender-self (qq-message--endpoint-self-p sender account))
@@ -219,9 +219,15 @@ contact cache."
   "Return one state-domain entry for PAGE ROW and ACCOUNT."
   (let* ((account-id (alist-get 'account_id page))
          (identity (alist-get 'conversation row))
+         (head (alist-get 'latest_message row))
+         (message (copy-tree (alist-get 'message head)))
+         (row-key (alist-get 'row_key head))
+         (_canonical-row
+          (setf (alist-get 'canonical-row-key message nil nil #'eq)
+                row-key))
          (normalized
           (qq-message-normalize-snapshot
-           (alist-get 'latest_message row)
+           message
            account-id
            account
            (eq (alist-get 'latest_message_recalled row) t)))
@@ -1172,17 +1178,12 @@ the successful receipt; ERRBACK receives failure details."
   "Recall normalized poke MESSAGE through its native capability.
 
 CALLBACK receives the successful response; ERRBACK receives failure details."
-  (unless (qq-state-poke-message-p message)
-    (user-error "qq: Poke recall requires a normalized poke message"))
-  (let ((session-key (alist-get 'session-key message))
-        (reference (qq-state-poke-recall-reference message)))
-    (unless (and session-key reference)
-      (user-error "qq: Poke has no native recall capability"))
-    (ignore session-key reference)
-    (qq-core--start-request
-     (lambda (success failure)
-       (qq-message-recall-poke message success failure))
-     callback errback)))
+  (unless (qq-message-poke-recall-capable-p message)
+    (user-error "qq: Poke recall requires an authored group Poke GrayTip"))
+  (qq-core--start-request
+   (lambda (success failure)
+     (qq-message-recall-poke message success failure))
+   callback errback))
 
 (defun qq-core-recall-message (message &optional callback errback)
   "Recall normalized MESSAGE through the native service.
@@ -1381,23 +1382,25 @@ receives failure details."
                 (qq-core--read-operation-next-errback operation) errback))
         (qq-core--read-operation-request operation))))))
 
-(defun qq-core--message-at-sequence (session-key sequence)
-  "Return SESSION-KEY message carrying exact SEQUENCE, or nil."
+(defun qq-core--authored-message-at-sequence (session-key sequence)
+  "Return SESSION-KEY's authored row carrying SEQUENCE, or nil."
   (seq-find
    (lambda (message)
-     (equal (alist-get 'message-seq message) sequence))
+     (and (not (qq-state-service-message-p message))
+          (equal (alist-get 'message-seq message) sequence)))
    (qq-state-session-messages session-key)))
 
 (defun qq-core-history-frontier (session-key)
   "Return the native service's exact known history frontier.
 
-SESSION-KEY identifies the private or group conversation.  The result is a
-plist containing `:sequence' and,
-when known, `:message-id'.  Group `latest_sequence' is authoritative and is
+SESSION-KEY identifies the private or group conversation.  The result carries
+`:sequence' and may name one cached authored row at that cursor.  A sequence is
+not a message identity: Service Timeline Messages can share it and therefore
+do not supply `:message-id'.  Group `latest_sequence' is authoritative and is
 advanced by a newer live event.  Private history deliberately exposes only a
-live sequence observed by this client projection because neither Lagrange nor
-the QQ C2C history method provides a latest cursor.  `:empty-p' or
-`:unavailable-reason' explains a result without a sequence."
+live sequence observed by this client projection because the C2C body-history
+methods provide no latest cursor.  `:empty-p' or `:unavailable-reason'
+explains a result without a sequence."
   (let* ((identity (qq-state-session-key-identity session-key))
          (kind (alist-get 'type identity))
          (target-id (alist-get 'target-id identity))
@@ -1408,9 +1411,12 @@ the QQ C2C history method provides a latest cursor.  `:empty-p' or
     (pcase kind
       ('private
        (if live-sequence
-           (list :sequence live-sequence
-                 :message-id (alist-get 'message_id live)
-                 :source 'live-event)
+           (let ((message
+                  (qq-core--authored-message-at-sequence
+                   session-key live-sequence)))
+             (list :sequence live-sequence
+                   :message-id (alist-get 'server-id message)
+                   :source 'live-event))
          (list :unavailable-reason 'private-latest-sequence)))
       ('group
        (let* ((group (qq-state-group target-id))
@@ -1431,11 +1437,10 @@ the QQ C2C history method provides a latest cursor.  `:empty-p' or
          (cond
           (sequence
            (let ((message
-                  (or (and (equal sequence live-sequence) live)
-                      (qq-core--message-at-sequence session-key sequence))))
+                  (qq-core--authored-message-at-sequence
+                   session-key sequence)))
              (list :sequence sequence
-                   :message-id (or (alist-get 'message_id message)
-                                   (alist-get 'server-id message))
+                   :message-id (alist-get 'server-id message)
                    :source source
                    :authoritative-p t)))
           (group
@@ -1463,53 +1468,30 @@ flags; callers must not inspect the selected storage/native driver."
       session-key cursor direction success failure count))
    callback errback))
 
-(defun qq-core--history-around-sequence-hints
-    (session-key message-id sequence-hint)
-  "Return native center/latest sequence hints for one around request."
-  (let* ((message
-          (and message-id
-               (seq-find
-                (lambda (candidate)
-                  (equal (alist-get 'server-id candidate) message-id))
-                (qq-state-session-messages session-key))))
-         (sequence (or (alist-get 'message-seq message)
-                       sequence-hint))
-         (frontier (qq-core-history-frontier session-key)))
-    (and sequence
-         (list sequence (plist-get frontier :sequence)))))
-
 (defun qq-core-fetch-history-around
-    (session-key message-id callback &optional errback count sequence-hint)
-  "Fetch a conversation-neutral history window around MESSAGE-ID.
+    (session-key message-id callback &optional errback count sequence)
+  "Fetch a conversation-neutral history window around one exact locator.
 
-SEQUENCE-HINT is accepted only by native private/group adapters.  DataLine
-history resolves the durable Message ID directly.  CALLBACK receives the same
-versioned cursor/edge metadata as `qq-core-fetch-history-page'."
+MESSAGE-ID takes precedence.  When it is absent, SEQUENCE names an authored
+native row; ambiguous sequence resolution fails in the Message Store.  DataLine
+requires MESSAGE-ID.  No cached frontier or adapter hint participates in the
+request."
   (setq count (min 100 (max 1 (or count qq-history-fetch-count))))
-  (pcase (qq-state-session-key-type session-key)
-    ('dataline
-     (qq-core--start-request
-      (lambda (success failure)
-        (qq-message--request-history-around
-         session-key message-id nil nil success failure count))
-      callback errback))
-    ((or 'private 'group)
-     (if-let* ((hints
-                (qq-core--history-around-sequence-hints
-                 session-key message-id sequence-hint)))
-         (qq-core--start-request
-          (lambda (success failure)
-            (qq-message--request-history-around
-             session-key message-id (car hints) (cadr hints)
-             success failure count))
-          callback errback)
-       (qq-account--client-error
-        (or errback #'qq-core--default-error)
-        "history_sequence_unavailable"
-        "Native history can seek only a cached message carrying sequence metadata")))
-    (_
-     (user-error
-      "qq: Unified history supports private, group, and DataLine chats"))))
+  (let ((center
+         (cond
+          (message-id
+           `((kind . "message") (message_id . ,message-id)))
+          ((and sequence
+                (memq (qq-state-session-key-type session-key)
+                      '(private group)))
+           `((kind . "sequence") (sequence . ,sequence)))
+          (t
+           (user-error "qq: History around requires an exact message locator")))))
+    (qq-core--start-request
+     (lambda (success failure)
+       (qq-message--request-history-around
+        session-key center success failure count))
+     callback errback)))
 
 (defun qq-core-get-forward
     (resource-id scene callback &optional errback)

@@ -12,6 +12,8 @@
 (require 'qq-state)
 (require 'qq-root)
 
+(defvar qq-mode-line-mode)
+
 (defvar qq-mode-line-string ""
   "Cached emacs-qq mode-line string.")
 

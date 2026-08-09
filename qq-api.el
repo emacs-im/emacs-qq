@@ -15,11 +15,12 @@
 (require 'qq-customize)
 (require 'qq-protocol)
 
+(declare-function qq-account--uint64-decimal-p
+                  "qq-account" (value &optional allow-zero))
 (declare-function qq-state-apply-guild-directory "qq-state" (directory))
 (declare-function qq-state-apply-guild-navigation "qq-state" (navigation))
 (require 'qq-state)
 
-(declare-function qq-state-apply-poke-notice "qq-state" (notice))
 (declare-function qq-state-merge-guild-message "qq-state" (event))
 (declare-function qq-state-merge-guild-forum-post "qq-state" (post))
 (declare-function qq-state-replace-guild-forum-posts
@@ -2406,6 +2407,9 @@ parent message id, or a different interface."
     (source-session-key target-session-key message-ids callback
                         &optional errback)
   "Forward ordered MESSAGE-IDS as one native merged-forward card."
+  (qq-api-validate-send-forward-source-locator
+   "merged" (qq-api--session-emacs-locator source-session-key)
+   "merged-forward source session")
   (qq-message-send-merged-forward
    source-session-key target-session-key message-ids callback errback))
 (defun qq-api--send-text-segments (text &optional reply-to-message-id)
@@ -2499,69 +2503,6 @@ When REPLY-TO-MESSAGE-ID is non-nil, send the text as a reply."
    session-key
    (qq-api--send-text-segments text reply-to-message-id)
    text))
-
-(defun qq-api--poke-id-p (value)
-  "Return non-nil when VALUE is a nonzero decimal poke identity."
-  (and (qq-api-user-id-p value)
-       (string-match-p "[1-9]" value)))
-
-(defun qq-api-send-poke (session-key target-id &optional callback errback)
-  "Send a poke in SESSION-KEY to TARGET-ID.
-
-SESSION-KEY must name an existing private or group session.  Its stored peer
-identity always determines the conversation; TARGET-ID only determines who is
-poked.  A successful action is reflected locally as a poke notice; a matching
-websocket notice is deduplicated by its local second-level anchor."
-  (let ((session (qq-state-session session-key)))
-    (unless session
-      (user-error "qq: poke requires an existing session"))
-    (unless (qq-api--poke-id-p target-id)
-      (user-error "qq: poke target must be a nonzero decimal QQ string"))
-    (let* ((identity (qq-state-session-key-identity session-key))
-           (type (alist-get 'type identity))
-           (peer-id (alist-get 'target-id identity))
-           (params
-            (pcase type
-              ('group
-               (unless (and (qq-api-group-id-p peer-id)
-                            (qq-api--poke-id-p peer-id))
-                 (user-error
-                  "qq: group poke requires a nonzero decimal session peer"))
-               `((group_id . ,peer-id)
-                 (user_id . ,target-id)
-                 (target_id . ,target-id)))
-              ('private
-               (unless (qq-api--poke-id-p peer-id)
-                 (user-error
-                  "qq: private poke requires a nonzero decimal session peer"))
-               `((user_id . ,peer-id)
-                 (target_id . ,target-id)))
-              (_
-               (user-error
-                "qq: poke is unsupported for %s sessions" type)))))
-      (qq-api-call
-       "send_poke"
-       params
-       (lambda (response)
-         (when-let* ((self-id (qq-state-self-user-id)))
-           (qq-state-apply-poke-notice
-            `((time . ,(truncate (float-time)))
-              (emacs_local_p . t)
-              (post_type . "notice")
-              (notice_type . "notify")
-              (sub_type . "poke")
-              ,@(if (eq type 'group)
-                    `((group_id . ,peer-id)
-                      (user_id . ,self-id)
-                      (target_id . ,target-id))
-                  `((user_id . ,peer-id)
-                    (sender_id . ,self-id)
-                    (target_id . ,target-id))))))
-         (when callback
-           (funcall callback response)))
-       (or errback
-           (lambda (response reason)
-             (qq-api--default-error response reason)))))))
 
 (defun qq-api--message-mutation-context (reference context)
   "Return validated mutation context for closed REFERENCE and CONTEXT.
@@ -2694,32 +2635,6 @@ ERRBACK follows ordinary `qq-api-call' conventions."
        (when callback
          (funcall callback response)))
      errback)))
-
-(defun qq-api-recall-poke
-    (session-key recall-reference &optional callback errback)
-  "Recall a poke in SESSION-KEY through native RECALL-REFERENCE.
-
-Pokes are gray-tip records, so they must not be sent through `delete_msg'.
-The closed reference carries the exact native Peer and msgId expected by
-`recallNudge'; no session or message-cache lookup is permitted here."
-  (let* ((reference
-          (qq-protocol-validate-poke-recall-reference
-           recall-reference "recall_poke" 'user-error))
-         (reference
-          (qq-state-validate-poke-recall-reference session-key reference))
-         (message-id (alist-get 'message_id reference)))
-    (when (qq-protocol-poke-recall-reference-expired-p reference)
-      (user-error "qq: 戳一戳已超过 2 分钟撤回期限"))
-    (qq-api-call
-     "recall_poke"
-     `((recall_reference . ,reference))
-     (lambda (response)
-       (qq-state-apply-recall session-key message-id)
-       (when callback
-         (funcall callback response)))
-     (or errback
-         (lambda (response reason)
-           (qq-api--default-error response reason))))))
 
 (defun qq-api-set-message-emoji-like
     (reference emoji-id set &optional callback errback)
@@ -4400,10 +4315,6 @@ CALLBACK / ERRBACK optional; default errors are silent (ephemeral signal)."
      (pcase (alist-get 'sub_type notice)
        ("input_status"
         (qq-state-apply-input-status notice))
-       ("poke"
-        (qq-state-apply-poke-notice notice))
-       ("gray_tip"
-        (qq-state-apply-gray-tip-notice notice))
        (_ (qq-api--refresh-for-notice notice))))
     (_ (qq-api--refresh-for-notice notice))))
 

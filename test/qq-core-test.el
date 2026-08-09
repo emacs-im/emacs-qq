@@ -161,14 +161,15 @@
              . (((conversation . ((kind . "private") (peer_uid . "u_peer")))
                  (pinned . t)
                  (activity_revision . "2")
-                 (latest_message . ,message)
+                 (latest_message . ((row_key . "2") (message . ,message)))
                  (latest_message_recalled . :false))
                 ((conversation
                   . ((kind . "temporary")
                      (peer_uid . "u_peer")
                      (from_tiny_id . "10")))
                  (activity_revision . "1")
-                 (latest_message . ,temporary-message)
+                 (latest_message
+                  . ((row_key . "1") (message . ,temporary-message)))
                  (latest_message_recalled . :false))))
             (truncated . :false))))
     (setf (alist-get 'conversation temporary-message nil nil #'eq)
@@ -192,6 +193,58 @@
                      (alist-get 'last-message-gateway-account-id session)
                      "slot-a"))
             (should-not (qq-state-session-messages "private:10001")))))))
+
+(ert-deftest qq-core-recent-accepts-idless-gray-tip-with-canonical-row-key ()
+  (qq-core-test-with-managed-account
+    (let* ((message
+            (qq-server-wire-domain-copy
+             (alist-get 'message (qq-core-test-message-event))))
+           (row-key "42")
+           row page entry)
+      (setf (alist-get 'message_id message nil nil #'eq) nil
+            (alist-get 'sender message nil nil #'eq)
+            '((uin . "10001") (uid . "u_peer"))
+            (alist-get 'recipient message nil nil #'eq)
+            '((uin . "10002") (uid . "u_self"))
+            (alist-get 'conversation message nil nil #'eq)
+            '((kind . "group") (group_uin . "8209413637")
+              (group_name . "Native Group"))
+            (alist-get 'sender_presentation message nil nil #'eq) nil
+            (alist-get 'message_type message nil nil #'eq) 732
+            (alist-get 'sub_type message nil nil #'eq) 20
+            (alist-get 'segments message nil nil #'eq)
+            '(((kind . "gray_tip")
+               (payload . ((kind . "poke")
+                           (actor_uin . "10001")
+                           (target_uin . "10002")
+                           (actor_name . "Actor")
+                           (target_name . "Target")
+                           (action . "戳了戳"))))))
+      (setq row
+            `((conversation . ((kind . "group")
+                               (group_uin . "8209413637")))
+              (activity_revision . "3")
+              (latest_message . ((row_key . ,row-key)
+                                 (message . ,message)))
+              (latest_message_recalled . :false))
+            page `((account_id . "slot-a")
+                   (conversations . (,row))
+                   (truncated . :false))
+            entry (qq-core--recent-row-state-entry
+                   page row (qq-core-test-account)))
+      (let ((normalized (plist-get entry :message)))
+        (should-not (alist-get 'server-id normalized))
+        (should (equal (alist-get 'canonical-row-key normalized) row-key))
+        (should (equal (alist-get 'id normalized)
+                       (format "timeline:slot-a:group:8209413637:%s" row-key))))
+      ;; Core normalization must not annotate the Gateway-owned page in place.
+      (should-not (alist-get 'canonical-row-key message))
+      (qq-state-apply-recent-conversations (list entry) 1)
+      (let ((session (qq-state-session "group:8209413637")))
+        (should (equal (alist-get 'last-message-id session)
+                       "timeline:slot-a:group:8209413637:42"))
+        (should (equal (alist-get 'last-message-preview session)
+                       "戳了戳 Target"))))))
 
 (ert-deftest qq-message-pure-normalizer-does-not-consume-projection-state ()
   (let* ((raw-message (alist-get 'message (qq-core-test-message-event)))
@@ -1791,9 +1844,8 @@
 
 (ert-deftest qq-core-poke-recall-routes-whole-message ()
   (let ((qq-account--current-account-id "slot-a") call)
-    (cl-letf (((symbol-function 'qq-state-poke-message-p) (lambda (_message) t))
-              ((symbol-function 'qq-state-poke-recall-reference)
-               (lambda (_message) '((message_id . "7348923749823749823"))))
+    (cl-letf (((symbol-function 'qq-message-poke-recall-capable-p)
+               (lambda (_message) t))
               ((symbol-function 'qq-message-recall-poke)
                (lambda (message &optional callback errback)
                  (setq call (list message callback errback))
@@ -1801,7 +1853,10 @@
       (let ((message
              '((session-key . "group:8209413637")
                (server-id . "7348923749823749823")
-               (segments . (((type . "poke")))))))
+               (timeline-class . service)
+               (segments
+                . (((type . "gray-tip")
+                    (data . ((kind . "poke")))))))))
         (let ((request (qq-core-recall-poke message)))
           (should (qq-request-p request))
           (should (equal (qq-request-token request)
@@ -1832,14 +1887,14 @@
                (lambda (_group-id) '((latest_sequence . "9007199254740999"))))
               ((symbol-function 'qq-message-live-frontier)
                (lambda (_session-key)
-                 '((message_id . "7348923749823749823")
-                   (sequence . "9007199254741001")))))
+                 '((sequence . "9007199254741001"))))
+              ((symbol-function 'qq-state-session-messages)
+               (lambda (_session-key) nil)))
       (let ((frontier
              (qq-core-history-frontier "group:8209413637")))
         (should (equal (plist-get frontier :sequence)
                        "9007199254741001"))
-        (should (equal (plist-get frontier :message-id)
-                       "7348923749823749823"))
+        (should-not (plist-get frontier :message-id))
         (should (eq (plist-get frontier :source) 'live-event))))))
 
 (ert-deftest qq-core-latest-history-uses-one-conversation-neutral-port ()
@@ -1940,8 +1995,8 @@
                      :history-session-key session-key
                      :history-older-cursor (and (null cursor) older-cursor)
                      :history-newer-cursor newer-cursor
-                     :history-at-oldest-p (and cursor t)
-                     :history-at-latest-p (null cursor)
+                     :history-has-older-p (null cursor)
+                     :history-has-newer-materialized-p (and cursor t)
                      :message-count 2
                      :added-count 2
                      :batch-message-ids nil))
@@ -1963,7 +2018,8 @@
             (qq-core-fetch-history-page
              session-key returned-older 'older
              (lambda (meta) (setq older-meta meta)) nil 1)))
-          (should (plist-get older-meta :history-at-oldest-p))
+          (should-not
+           (plist-get older-meta :history-has-older-p))
           (should-not (plist-get older-meta :history-older-cursor))))
       (should
        (equal
@@ -1979,8 +2035,8 @@
            call meta)
       (cl-letf
           (((symbol-function 'qq-message--request-history-around)
-            (lambda (session message-id sequence latest callback _errback count)
-              (setq call (list session message-id sequence latest count))
+            (lambda (session center callback _errback count)
+              (setq call (list session center count))
               (funcall
                callback
                (list :history-port-version qq-core-history-port-version
@@ -1988,34 +2044,36 @@
                      :history-session-key session-key
                      :history-older-cursor nil
                      :history-newer-cursor '((opaque . "tail"))
-                     :history-at-oldest-p t
-                     :history-at-latest-p t
+                     :history-has-older-p nil
+                     :history-has-newer-materialized-p nil
                      :batch-message-ids (list center)
                      :message-count 1 :added-count 1))
               "history-around")))
         (qq-core-fetch-history-around
          session-key center (lambda (value) (setq meta value)) nil 21))
-      (should (equal call (list session-key center nil nil 21)))
-      (should (plist-get meta :history-at-oldest-p))
-      (should (plist-get meta :history-at-latest-p))
+      (should
+       (equal call
+              (list session-key
+                    `((kind . "message") (message_id . ,center))
+                    21)))
+      (should-not (plist-get meta :history-has-older-p))
+      (should-not (plist-get meta :history-has-newer-materialized-p))
       (should-not (plist-get meta :history-older-cursor))
       (should (equal (plist-get meta :history-newer-cursor)
                      '((opaque . "tail")))))))
 
-(ert-deftest qq-core-around-requires-cached-exact-sequence ()
+(ert-deftest qq-core-around-uses-message-id-without-cache-derived-hints ()
   (qq-core-test-with-managed-account
-    (let (call failure)
+    (let (call)
       (cl-letf (((symbol-function 'qq-state-session-messages)
-                 (lambda (_session-key)
-                   '(((server-id . "7348923749823749823")
-                      (message-seq . "9007199254740999")))))
+                 (lambda (&rest _args)
+                   (ert-fail "around lookup consulted projected messages")))
                 ((symbol-function 'qq-core-history-frontier)
-                 (lambda (_session-key)
-                   '(:sequence "9007199254741005")))
+                 (lambda (&rest _args)
+                   (ert-fail "around lookup consulted a native frontier")))
                 ((symbol-function 'qq-message--request-history-around)
-                 (lambda (session center sequence latest
-                                  _callback _errback count)
-                   (setq call (list session center sequence latest count))
+                 (lambda (session center _callback _errback count)
+                   (setq call (list session center count))
                    "history-around")))
         (let ((request
                (qq-core-fetch-history-around
@@ -2023,12 +2081,29 @@
           (should (qq-request-p request)))
         (should
          (equal call
-                '("private:10001" "7348923749823749823"
-                  "9007199254740999" "9007199254741005" 20)))
-        (qq-core-fetch-history-around
-         "private:10001" "missing" #'ignore
-         (lambda (_body reason) (setq failure reason)) 20)
-        (should (string-match-p "cached message" failure))))))
+                '("private:10001"
+                  ((kind . "message")
+                   (message_id . "7348923749823749823"))
+                  20)))))))
+
+(ert-deftest qq-core-around-uses-authored-sequence-when-message-id-is-absent ()
+  (qq-core-test-with-managed-account
+    (let (call)
+      (cl-letf (((symbol-function 'qq-message--request-history-around)
+                 (lambda (session center _callback _errback count)
+                   (setq call (list session center count))
+                   "history-around")))
+        (let ((request
+               (qq-core-fetch-history-around
+                "group:8209413637" nil #'ignore nil 20
+                "9007199254740999")))
+          (should (qq-request-p request)))
+        (should
+         (equal call
+                '("group:8209413637"
+                  ((kind . "sequence")
+                   (sequence . "9007199254740999"))
+                  20)))))))
 
 (ert-deftest qq-core-bootstrap-completion-requires-opaque-attempt-token ()
   (let* ((old-token (list 'old-bootstrap))

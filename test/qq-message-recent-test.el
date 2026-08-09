@@ -43,17 +43,19 @@ SEQUENCE, SENDER, RECIPIENT, and CONVERSATION provide its native context."
      (identity '((kind . "private")
                  (peer_uin . "10001") (peer_uid . "u_peer")))
      (revision "12")
+     (row-key "17")
      (message (qq-message-recent-test-message))
      (recalled :false)
      (pinned 'absent))
   "Return a closed recent-conversation row for IDENTITY and REVISION.
 
-MESSAGE, RECALLED, and PINNED supply its latest projection metadata.  The
-symbol `absent' omits unknown pin state."
+ROW-KEY and MESSAGE form its canonical latest row.  RECALLED and PINNED supply
+projection metadata.  The symbol `absent' omits unknown pin state."
   `((conversation . ,(copy-tree identity))
     ,@(unless (eq pinned 'absent) `((pinned . ,pinned)))
     (activity_revision . ,revision)
-    (latest_message . ,(copy-tree message))
+    (latest_message . ((row_key . ,row-key)
+                       (message . ,(copy-tree message))))
     (latest_message_recalled . ,recalled)))
 
 (cl-defun qq-message-recent-test-page
@@ -112,9 +114,11 @@ TRUNCATED is its exact wire boolean."
         (funcall success (qq-message-recent-test-page)))
       (should (proper-list-p (alist-get 'conversations delivered)))
       (let* ((row (car (alist-get 'conversations delivered)))
-             (message (alist-get 'latest_message row)))
+             (head (alist-get 'latest_message row))
+             (message (alist-get 'message head)))
         (should-not (assq 'latest_message_generation row))
         (should-not (assq 'read_cursor row))
+        (should (equal (alist-get 'row_key head) "17"))
         (should (proper-list-p (alist-get 'segments message)))
         (should (equal (alist-get 'message_id message)
                        "7348923749823749823"))))))

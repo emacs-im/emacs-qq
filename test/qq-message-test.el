@@ -143,9 +143,8 @@
      (account-id "slot-a")
      (message-id "7348923749823749823") (sent-at 1784700000)
      (sequence "9007199254740999") (group-uin "8209413637")
-     (actor-uin "10002") (target-uin "9007199254741001")
-     (tips-sequence "9007199254741007") (valid-before 1784700120))
-  "Return one authoritative group poke as an ordinary message payload."
+     (actor-uin "10002") (target-uin "9007199254741001"))
+  "Return one authoritative group Poke GrayTip message payload."
   (qq-message-test-event
    :account-id account-id
    :message-id message-id
@@ -160,14 +159,46 @@
    :message-type 732
    :sub-type 20
    :segments
-   `(((kind . "poke")
-      (payload . ((actor_uin . ,actor-uin)
+   `(((kind . "gray_tip")
+      (payload . ((kind . "poke")
+                  (actor_uin . ,actor-uin)
                   (target_uin . ,target-uin)
+                  (actor_name . "Me")
+                  (target_name . "Peer")
                   (action . "戳了戳")
                   (action_image_url . "https://example.invalid/poke.png")
-                  (suffix . "的肩膀")
-                  (recall . ((tips_sequence . ,tips-sequence)
-                             (valid_before . ,valid-before)))))))))
+                  (suffix . "的肩膀")))))))
+
+(cl-defun qq-message-test-private-poke
+    (&key
+     (account-id "slot-a")
+     (message-id "144115189030781277") (sent-at 1784700000)
+     (sequence "30737") (random 954925405)
+     (actor-uin "10002") (target-uin "10001"))
+  "Return one authoritative private Poke sharing the private cursor space."
+  (qq-message-test-event
+   :account-id account-id
+   :message-id message-id
+   :sent-at sent-at
+   ;; Observed 528/290 records route from the semantic target to the actor;
+   ;; actor/target remain GrayTip semantics rather than route aliases.
+   :sender `((uin . ,target-uin) (uid . "u_peer"))
+   :recipient `((uin . ,actor-uin) (uid . "u_self"))
+   :conversation '((kind . "private"))
+   :sender-presentation nil
+   :sequence sequence
+   :client-sequence "3327"
+   :random random
+   :message-type 528
+   :sub-type 290
+   :segments
+   `(((kind . "gray_tip")
+      (payload . ((kind . "poke")
+                  (actor_uin . ,actor-uin)
+                  (target_uin . ,target-uin)
+                  (actor_name . "Me")
+                  (target_name . "Peer")
+                  (action . "戳了戳")))))))
 
 (cl-defun qq-message-test-reaction
     (&key
@@ -245,7 +276,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
 (cl-defun qq-message-test-dataline-page
     (messages &key (variant "desktop") requested-cursor
               older-cursor newer-cursor (direction "older")
-              at-oldest at-latest)
+              has-older has-newer)
   "Return a closed unified DataLine page containing MESSAGES."
   `((history_version . ,qq-message-history-port-version)
     (account_id . "slot-a")
@@ -264,16 +295,17 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (unsupported_message_count . 0)
     (older_cursor . ,(copy-tree older-cursor))
     (newer_cursor . ,(copy-tree newer-cursor))
-    (at_oldest . ,(if at-oldest t :false))
-    (at_latest . ,(if at-latest t :false))))
+    (has_older . ,(if has-older t :false))
+    (has_newer_materialized . ,(if has-newer t :false))))
 
 (defun qq-message-test-history-cursor
-    (session-key position &optional account-id)
-  "Return a scoped unified history cursor fixture."
+    (session-key position direction &optional account-id)
+  "Return a direction-scoped unified history cursor fixture."
   `((version . ,qq-message-history-port-version)
     (account_id . ,(or account-id "slot-a"))
     (conversation
      . ,(qq-message--history-conversation-params session-key))
+    (direction . ,(symbol-name direction))
     (position . ,(copy-tree position))))
 
 (defmacro qq-message-test-with-state (&rest body)
@@ -729,7 +761,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
             (qq-message-test-history-cursor
              session-key
              '((kind . "dataline")
-               (message_id . "7348923749823749823"))))
+               (message_id . "7348923749823749823"))
+             'newer))
            method params meta)
       (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
                 ((symbol-function 'qq-server-capabilities)
@@ -742,8 +775,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                     callback
                     (qq-message-test-dataline-page
                      (list message) :variant "mobile"
-                     :newer-cursor tail-cursor
-                     :at-oldest t :at-latest t))
+                     :newer-cursor tail-cursor))
                    "history-page")))
         (should
          (equal
@@ -764,8 +796,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (count . 20))))
       (should (= (plist-get meta :history-port-version)
                  qq-message-history-port-version))
-      (should (plist-get meta :history-at-oldest-p))
-      (should (plist-get meta :history-at-latest-p))
+      (should-not (plist-get meta :history-has-older-p))
+      (should-not (plist-get meta :history-has-newer-materialized-p))
       (should (equal (plist-get meta :history-newer-cursor)
                      tail-cursor))
       (let ((projected (car (qq-state-session-messages session-key))))
@@ -780,11 +812,13 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
   (qq-message-test-with-state
     (let* ((session-key
             "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA")
-           (center "7348923749823749823")
+           (message-id "7348923749823749823")
+           (center `((kind . "message") (message_id . ,message-id)))
            (tail-cursor
             (qq-message-test-history-cursor
              session-key
-             `((kind . "dataline") (message_id . ,center))))
+             `((kind . "dataline") (message_id . ,message-id))
+             'newer))
            method params meta)
       (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
                 ((symbol-function 'qq-server-capabilities)
@@ -801,21 +835,20 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                        . ((kind . "dataline")
                           (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
                           (variant . "desktop")))
-                      (center_message_id . ,center)
+                      (center . ,center)
                       (messages
                        . [((kind . "dataline")
                            (message
                             . ,(qq-message-test-dataline-message
-                                :message-id center)))])
+                                :message-id message-id)))])
                       (unsupported_message_count . 0)
                       (older_cursor)
                       (newer_cursor . ,tail-cursor)
-                      (at_oldest . t)
-                      (at_latest . t)))
+                      (has_older . :false)
+                      (has_newer_materialized . :false)))
                    "history-around")))
         (qq-message--request-history-around
-         session-key center nil nil
-         (lambda (value) (setq meta value)) nil 21))
+         session-key center (lambda (value) (setq meta value)) nil 21))
       (should (equal method "message.get_history_around"))
       (should
        (equal
@@ -825,10 +858,10 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
            (kind . "dataline")
            (peer_uid . "u_Wcc5rknRRqRO8y5gxMD6sA")
            (variant . "desktop"))
-          (center_message_id . ,center)
+          (center . ,center)
           (count . 21))))
-      (should (plist-get meta :history-at-oldest-p))
-      (should (plist-get meta :history-at-latest-p))
+      (should-not (plist-get meta :history-has-older-p))
+      (should-not (plist-get meta :history-has-newer-materialized-p))
       (should (equal (plist-get meta :history-newer-cursor)
                      tail-cursor)))))
 
@@ -839,8 +872,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
            (older-cursor
             (qq-message-test-history-cursor
              session-key
-             '((kind . "private_roam")
-               (cursor . ((timestamp . 1784690000) (random . 7))))))
+             '((kind . "timeline_row") (row_key . "7"))
+             'older))
            method params meta)
       (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
                 ((symbol-function 'qq-server-capabilities)
@@ -859,12 +892,13 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                       (requested_cursor)
                       (messages
                        . [((kind . "native")
+                           (row_key . "8")
                            (message . ,message))])
                       (unsupported_message_count . 0)
                       (older_cursor . ,older-cursor)
                       (newer_cursor)
-                      (at_oldest . :false)
-                      (at_latest . t)))
+                      (has_older . t)
+                      (has_newer_materialized . :false)))
                    "history-page")))
         (qq-message--request-history-page
          session-key nil 'older
@@ -886,19 +920,17 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
            (request-cursor
             (qq-message-test-history-cursor
              session-key
-             '((kind . "native_sequence")
-               (sequence . "100")
-               (maximum_sequence . "120"))))
+             '((kind . "timeline_row") (row_key . "100"))
+             'older))
            (response-cursor
-            `((position
-               (maximum_sequence . "120")
-               (sequence . "100")
-               (kind . "native_sequence"))
+            `((position (row_key . "100") (kind . "timeline_row"))
+              (direction . "older")
               (conversation (group_uin . "20001") (kind . "group"))
               (account_id . "slot-a")
               (version . ,qq-message-history-port-version)))
            (newer-cursor
-            `((position (sequence . "120") (kind . "group_window"))
+            `((position (row_key . "120") (kind . "timeline_row"))
+              (direction . "newer")
               (conversation (group_uin . "20001") (kind . "group"))
               (account_id . "slot-a")
               (version . ,qq-message-history-port-version)))
@@ -919,14 +951,14 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                       (unsupported_message_count . 0)
                       (older_cursor)
                       (newer_cursor . ,newer-cursor)
-                      (at_oldest . t)
-                      (at_latest . :false)))
+                      (has_older . :false)
+                      (has_newer_materialized . t)))
                    "history-page")))
         (qq-message--request-history-page
          session-key request-cursor 'older
          (lambda (value) (setq meta value)) nil 20))
-      (should (plist-get meta :history-at-oldest-p))
-      (should-not (plist-get meta :history-at-latest-p))
+      (should-not (plist-get meta :history-has-older-p))
+      (should (plist-get meta :history-has-newer-materialized-p))
       (should
        (qq-message--history-cursor-equal-p
         (plist-get meta :history-newer-cursor) newer-cursor)))))
@@ -936,13 +968,13 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
     (let* ((group-cursor
             (qq-message-test-history-cursor
              "group:20001"
-             '((kind . "native_sequence") (sequence . "100"))))
+             '((kind . "timeline_row") (row_key . "100"))
+             'older))
            (other-account-cursor
             (qq-message-test-history-cursor
              "private:10001"
-             '((kind . "private_roam")
-               (cursor . ((timestamp . 100) (random . 1))))
-             "slot-b"))
+             '((kind . "timeline_row") (row_key . "101"))
+             'older "slot-b"))
            transport-called)
       (cl-letf (((symbol-function 'qq-server-send)
                  (lambda (&rest _args) (setq transport-called t))))
@@ -956,9 +988,11 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
          :type 'error)
         (should-not transport-called)))))
 
-(ert-deftest qq-message-unified-native-around-sends-only-adapter-hints ()
+(ert-deftest qq-message-unified-native-around-sends-one-closed-center ()
   (qq-message-test-with-state
-    (let ((center "7348923749823749823") method params meta)
+    (let* ((message-id "7348923749823749823")
+           (center `((kind . "message") (message_id . ,message-id)))
+           method params meta)
       (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
                 ((symbol-function 'qq-server-capabilities)
                  (lambda () qq-message-test-capabilities))
@@ -972,29 +1006,27 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                       (account_id . "slot-a")
                       (conversation
                        . ((kind . "private") (peer_uin . "10001")))
-                      (center_message_id . ,center)
+                      (center . ,center)
                       (messages . [])
                       (unsupported_message_count . 1)
                       (older_cursor)
                       (newer_cursor)
-                      (at_oldest . :false)
-                      (at_latest . t)))
+                      (has_older . :false)
+                      (has_newer_materialized . :false)))
                    "history-around")))
         (qq-message--request-history-around
-         "private:10001" center "9007199254740999"
-         "9007199254741005" (lambda (value) (setq meta value)) nil 21))
+         "private:10001" center
+         (lambda (value) (setq meta value)) nil 21))
       (should (equal method "message.get_history_around"))
       (should
        (equal
         params
         `((account_id . "slot-a")
           (conversation (kind . "private") (peer_uin . "10001"))
-          (center_message_id . ,center)
-          (sequence_hint . "9007199254740999")
-          (latest_sequence_hint . "9007199254741005")
+          (center . ,center)
           (count . 21))))
       (should (= (plist-get meta :message-count) 0))
-      (should (plist-get meta :history-at-latest-p)))))
+      (should-not (plist-get meta :history-has-newer-materialized-p)))))
 
 (ert-deftest qq-message-dataline-send-rejects-endpoint-substitution-and-rich-content ()
   (qq-message-test-with-state
@@ -2047,7 +2079,7 @@ push carries sequence=40909 and client_sequence=30202."
     (qq-state-upsert-session
      "group:8209413637"
      '((type . group) (target-id . "8209413637") (title . "Protocol Lab")))
-    (let (sent-method sent-params applied callback-result)
+    (let (sent-method sent-params callback-result)
       (cl-letf (((symbol-function 'qq-server-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-server-capabilities)
@@ -2058,9 +2090,7 @@ push carries sequence=40909 and client_sequence=30202."
                    (funcall callback
                             '((account_id . "slot-a")
                               (target_uin . "9007199254741001")))
-                   "request-poke"))
-                ((symbol-function 'qq-state-apply-poke-notice)
-                 (lambda (notice) (setq applied notice))))
+                   "request-poke")))
         (should
          (equal
           (qq-message-send-poke
@@ -2074,10 +2104,17 @@ push carries sequence=40909 and client_sequence=30202."
                   (conversation
                    . ((kind . "group") (group_uin . "8209413637")))
                   (target_uin . "9007199254741001"))))
-        (should (equal (alist-get 'target_id applied)
-                       "9007199254741001"))
-        (should (equal (alist-get 'group_id applied) "8209413637"))
-        (should (equal (alist-get 'user_id applied) "10002"))
+        (let* ((message
+                (car (qq-state-session-messages "group:8209413637")))
+               (segment (car (alist-get 'segments message)))
+               (data (alist-get 'data segment)))
+          (should (eq (alist-get 'timeline-class message) 'service))
+          (should (alist-get 'local-poke-p message))
+          (should (equal (alist-get 'type segment) "gray-tip"))
+          (should (equal (alist-get 'kind data) "poke"))
+          (should (equal (alist-get 'actor-id data) "10002"))
+          (should (equal (alist-get 'target-id data)
+                         "9007199254741001")))
         (should (equal (alist-get 'target_uin callback-result)
                        "9007199254741001"))))))
 
@@ -2104,18 +2141,127 @@ push carries sequence=40909 and client_sequence=30202."
        "message.received" (qq-message-test-poke))
       (let* ((messages
               (qq-state-session-messages "group:8209413637"))
-             (message (car messages))
-             (recall (alist-get 'poke-gateway-recall message)))
+             (message (car messages)))
         (should (= (length messages) 1))
         (should (equal (alist-get 'server-id message)
                        "7348923749823749823"))
-        (should (equal (alist-get 'message_id recall)
-                       "7348923749823749823"))
-        (should (equal (alist-get 'tips_sequence recall)
-                       "9007199254741007"))
+        (should-not (assq 'poke-recall-reference message))
+        (should-not (assq 'poke-gateway-recall message))
         (should (equal (alist-get 'image-url
                                   (qq-state-poke-message-data message))
                        "https://example.invalid/poke.png"))))))
+
+(ert-deftest qq-message-private-poke-coexists-with-authored-row-at-shared-sequence ()
+  (qq-message-test-with-state
+    (let (projection-errors)
+      (add-hook
+       'qq-message-projection-error-hook
+       (lambda (&rest error) (push error projection-errors)))
+      (qq-message--handle-event
+       "message.received"
+       (qq-message-test-event
+        :message-id "72057595097851166"
+        :sequence "42413"
+        :random 1059923230
+        :sent-at 1785667319))
+      (qq-message--handle-event
+       "message.received"
+       (qq-message-test-private-poke
+        :message-id "144115189780958658"
+        :sequence "42413"
+        :random 1704086978
+        :sent-at 1785667494))
+      (should-not projection-errors)
+      (let ((messages (qq-state-session-messages "private:10001")))
+        (should (= (length messages) 2))
+        (should
+         (equal (mapcar (lambda (message)
+                          (alist-get 'server-id message))
+                        messages)
+                '("72057595097851166" "144115189780958658")))
+        (should (= (seq-count #'qq-state-service-message-p messages) 1)))
+      (should
+       (equal (qq-message-live-frontier "private:10001")
+              '((sequence . "42413")))))))
+
+(ert-deftest qq-message-service-siblings-share-group-sequence-with-distinct-identities ()
+  (qq-message-test-with-state
+    (let (projection-errors)
+      (add-hook
+       'qq-message-projection-error-hook
+       (lambda (&rest error) (push error projection-errors)))
+      (qq-message--handle-event
+       "message.received"
+       (qq-message-test-poke
+        :message-id "7348923749823749823"
+        :sequence "70001"
+        :target-uin "10001"))
+      (qq-message--handle-event
+       "message.received"
+       (qq-message-test-poke
+        :message-id "7348923749823749824"
+        :sequence "70001"
+        :target-uin "10003"))
+      (should-not projection-errors)
+      (let ((messages (qq-state-session-messages "group:8209413637")))
+        (should (= (length messages) 2))
+        (should (seq-every-p #'qq-state-service-message-p messages))
+        (should
+         (equal (mapcar (lambda (message)
+                          (alist-get 'server-id message))
+                        messages)
+                '("7348923749823749823" "7348923749823749824")))))))
+
+(ert-deftest qq-message-sequence-effects-wait-for-authored-row-not-service-sibling ()
+  (qq-message-test-with-state
+    (let ((conversation
+           '((kind . "group")
+             (group_uin . "8209413637")
+             (group_name . "Protocol Lab")
+             (sender_card . "Alice"))))
+      (qq-message--handle-event
+       "message.recalled"
+       (qq-message-test-recall
+        :target '((kind . "sequence") (sequence . "70001"))))
+      (qq-message--handle-event
+       "message.reaction_changed"
+       (qq-message-test-reaction :sequence "70001"))
+      (qq-message--handle-event
+       "message.received"
+       (qq-message-test-poke
+        :message-id "7348923749823749824"
+        :sequence "70001"))
+      (let ((service
+             (car (qq-state-session-messages "group:8209413637"))))
+        (should (qq-state-service-message-p service))
+        (should-not (qq-state-message-recalled-p service))
+        (should-not (qq-state-message-reactions service)))
+      (should (= (hash-table-count qq-message--pending-recalls) 1))
+      (should (= (hash-table-count qq-message--pending-reactions) 1))
+
+      (qq-message--handle-event
+       "message.received"
+       (qq-message-test-event
+        :message-id "7348923749823749823"
+        :sequence "70001"
+        :conversation conversation))
+      (let* ((messages (qq-state-session-messages "group:8209413637"))
+             (authored
+              (seq-find
+               (lambda (message)
+                 (not (qq-state-service-message-p message)))
+               messages))
+             (service
+              (seq-find #'qq-state-service-message-p messages)))
+        (should (= (length messages) 2))
+        (should (qq-state-message-recalled-p authored))
+        (should (= (alist-get 'count
+                              (car (qq-state-message-reactions authored)))
+                   3))
+        (should-not (qq-state-message-recalled-p service))
+        (should-not (qq-state-message-reactions service)))
+      (should (= (hash-table-count qq-message--pending-recalls) 0))
+      (should (= (hash-table-count qq-message--pending-reactions) 0)))))
 
 (ert-deftest qq-message-poke-has-only-read-and-dedicated-recall-capabilities ()
   (qq-message-test-with-state
@@ -2132,6 +2278,210 @@ push carries sequence=40909 and client_sequence=30202."
                     :type 'user-error)
       (should-error (qq-message-set-todo message 'set)
                     :type 'user-error))))
+
+(ert-deftest qq-message-projects-group-membership-as-typed-gray-tip ()
+  (qq-message-test-with-state
+    (qq-message--handle-event
+     "message.received"
+     (qq-message-test-event
+      :sender '((uin . "99999"))
+      :recipient nil
+      :conversation
+      '((kind . "group") (group_uin . "8209413637"))
+      :sender-presentation nil
+      :message-type 732
+      :sub-type 20
+      :segments
+      '(((kind . "gray_tip")
+         (payload
+          . ((kind . "group_members_joined")
+             (members
+              . (((kind . "uin") (uin . "9007199254740998"))
+                 ((kind . "uin") (uin . "10003"))))
+             (cause
+              . ((kind . "invited")
+                 (inviter
+                  . ((kind . "uin") (uin . "9007199254740997")))))
+             (attached_message_count . 3)))))))
+    (let* ((session-key "group:8209413637")
+           (message (car (qq-state-session-messages session-key)))
+           (data (qq-state-gray-tip-message-data message))
+           (parts (alist-get 'parts data)))
+      (should (qq-state-service-message-p message))
+      (should (qq-state-gray-tip-message-p message))
+      (should-not (qq-state-poke-message-p message))
+      (should (equal (alist-get 'sender-name message) "QQ"))
+      (should-not (alist-get 'sender-id message))
+      (should (equal (alist-get 'kind data) "group_members_joined"))
+      (should (equal (alist-get 'members data)
+                     '(((kind . "uin") (uin . "9007199254740998"))
+                       ((kind . "uin") (uin . "10003")))))
+      (should (equal (alist-get 'attached-message-count data) 3))
+      (should (equal (mapcar (lambda (part)
+                               (and (equal (alist-get 'type part) "user")
+                                    (alist-get 'user-id part)))
+                             parts)
+                     '("9007199254740997" nil
+                       "9007199254740998" nil "10003" nil nil)))
+      (should (string-match-p "3 条聊天记录"
+                              (qq-state-message-preview message)))
+      (should-not (qq-message-reply-target session-key message))
+      (should-not (qq-message-recall-target session-key message)))))
+
+(ert-deftest qq-message-projects-group-change-and-mute-gray-tips ()
+  (qq-message-test-with-state
+    (dolist (fixture
+             '(("7348923749823749823" "9007199254740999" 33 0
+                ((kind . "group_members_joined")
+                 (members . (((kind . "uid") (uid . "u_member"))))
+                 (cause
+                  . ((kind . "qr_code")
+                     (shared_by . ((kind . "uid") (uid . "u_sharer")))))))
+               ("7348923749823749824" "9007199254741000" 34 0
+                ((kind . "group_member_removed")
+                 (member . ((kind . "uid") (uid . "u_member")))
+                 (operator . ((kind . "uid") (uid . "u_operator")))))
+               ("7348923749823749825" "9007199254741001" 34 0
+                ((kind . "group_disbanded")))
+               ("7348923749823749826" "9007199254741002" 732 12
+                ((kind . "group_mute_changed")
+                 (target . ((kind . "whole_group")))
+                 (operator . ((kind . "uid") (uid . "u_operator")))
+                 (duration_seconds . 0)))))
+      (pcase-let ((`(,message-id ,sequence ,message-type ,sub-type ,payload)
+                   fixture))
+        (qq-message--handle-event
+         "message.received"
+         (qq-message-test-event
+          :message-id message-id
+          :sender '((uid . "u_system_envelope"))
+          :recipient nil
+          :conversation
+          '((kind . "group") (group_uin . "8209413637"))
+          :sender-presentation nil
+          :sequence sequence
+          :client-sequence "0"
+          :random nil
+          :message-type message-type
+          :sub-type sub-type
+          :segments `(((kind . "gray_tip") (payload . ,payload)))))))
+    (let ((messages (qq-state-session-messages "group:8209413637")))
+      (cl-labels
+          ((data (kind)
+             (qq-state-gray-tip-message-data
+              (seq-find
+               (lambda (message)
+                 (equal kind
+                        (alist-get
+                         'kind (qq-state-gray-tip-message-data message))))
+               messages))))
+        (let* ((joined (data "group_members_joined"))
+               (removed (data "group_member_removed"))
+               (removed-users
+                (seq-filter
+                 (lambda (part) (equal (alist-get 'type part) "user"))
+                 (alist-get 'parts removed)))
+               (disbanded (data "group_disbanded"))
+               (mute (data "group_mute_changed")))
+          (should (= (length messages) 4))
+          (should (equal (alist-get 'text joined)
+                         "u_sharer 分享二维码，u_member 加入群聊"))
+          (should (equal (alist-get 'text removed)
+                         "u_operator 将 u_member 移出群聊"))
+          (should (equal (mapcar (lambda (part)
+                                  (alist-get 'user-uid part))
+                                removed-users)
+                         '("u_operator" "u_member")))
+          (should-not (seq-some (lambda (part) (alist-get 'user-id part))
+                                removed-users))
+          (should (equal (alist-get 'text disbanded) "群聊已解散"))
+          (should (equal (alist-get 'text mute)
+                         "u_operator 解除了全员禁言"))
+          (should (equal (alist-get 'duration-seconds mute) 0)))))))
+
+(ert-deftest qq-message-projects-unknown-general-gray-tip-with-safe-summary ()
+  (qq-message-test-with-state
+    (qq-message--handle-event
+     "message.received"
+     (qq-message-test-event
+      :sender '((uin . "99999"))
+      :recipient nil
+      :conversation
+      '((kind . "group") (group_uin . "8209413637"))
+      :sender-presentation nil
+      :message-type 732
+      :sub-type 20
+      :segments
+      '(((kind . "gray_tip")
+         (payload
+          . ((kind . "general")
+             (summary . "未知服务消息")
+             (business_type . "9007199254740999")
+             (business_id . "9007199254740998")
+             (template_id . "9007199254740997")))))))
+    (let* ((message
+            (car (qq-state-session-messages "group:8209413637")))
+           (data (qq-state-gray-tip-message-data message)))
+      (should (qq-state-service-message-p message))
+      (should (equal (alist-get 'kind data) "general"))
+      (should (equal (alist-get 'text data) "未知服务消息"))
+      (should (equal (alist-get 'business-type data)
+                     "9007199254740999"))
+      (should (equal (qq-state-message-preview message)
+                     "未知服务消息"))
+      (should-not (assq 'tips-sequence data)))))
+
+(ert-deftest qq-message-projects-aio-group-name-change-gray-tip ()
+  (qq-message-test-with-state
+    (qq-message--handle-event
+     "message.received"
+     (qq-message-test-event
+      :sender '((uid . "u_system_envelope"))
+      :recipient nil
+      :conversation
+      '((kind . "group") (group_uin . "8209413637"))
+      :sender-presentation nil
+      :message-type 732
+      :sub-type 20
+      :segments
+      '(((kind . "gray_tip")
+         (payload
+          . ((kind . "group_name_changed")
+             (name . "新群名")))))))
+    (let* ((message
+            (car (qq-state-session-messages "group:8209413637")))
+           (data (qq-state-gray-tip-message-data message)))
+      (should (qq-state-service-message-p message))
+      (should (equal (alist-get 'kind data) "group_name_changed"))
+      (should (equal (alist-get 'name data) "新群名"))
+      (should (equal (qq-state-message-preview message)
+                     "群名称已修改为「新群名」"))
+      (should (equal (alist-get 'sender-name message) "QQ"))
+      (should-not (alist-get 'sender-id message)))))
+
+(ert-deftest qq-message-rejects-gray-tip-mixed-with-authored-content ()
+  (qq-message-test-with-state
+    (let ((message
+           (alist-get
+            'message
+            (qq-message-test-event
+             :sender '((uin . "10001") (uid . "u_peer"))
+             :recipient '((uin . "10002") (uid . "u_self"))
+             :conversation '((kind . "private"))
+             :sender-presentation nil
+             :message-type 528
+             :sub-type 290
+             :segments
+             '(((kind . "gray_tip")
+                (payload
+                 . ((kind . "general")
+                    (summary . "private service row")
+                    (business_type . "1")
+                    (business_id . "2"))))
+               ((kind . "text") (payload . ((text . "authored"))))))))))
+      (should-error
+       (qq-message-normalize-snapshot
+        message "slot-a" (qq-account-get "slot-a")))))
 
 (ert-deftest qq-message-reaction-sends-only-the-message-reference ()
   (qq-message-test-with-state
@@ -2347,7 +2697,7 @@ push carries sequence=40909 and client_sequence=30202."
                       (nreverse receipts))
               '("set" "complete" "cancel"))))))
 
-(ert-deftest qq-message-recall-poke-sends-original-gray-tip-metadata ()
+(ert-deftest qq-message-recall-poke-sends-only-public-message-reference ()
   (qq-message-test-with-state
     (qq-message--handle-event
      "message.received" (qq-message-test-poke))
@@ -2377,10 +2727,7 @@ push carries sequence=40909 and client_sequence=30202."
           '((account_id . "slot-a")
             (conversation . ((kind . "group")
                              (group_uin . "8209413637")))
-            (poke . ((message_id . "7348923749823749823")
-                     (sequence . "9007199254740999")
-                     (sent_at . 1784700000)
-                     (tips_sequence . "9007199254741007"))))))
+            (message . ((message_id . "7348923749823749823"))))))
         (should
          (qq-state-message-recalled-p
           (car (qq-state-session-messages session-key))))))))
@@ -2636,8 +2983,7 @@ push carries sequence=40909 and client_sequence=30202."
       :message-id "7348923749823749823" :sequence "100"))
     (should
      (equal (qq-message-live-frontier "private:10001")
-            '((message_id . "7348923749823749823")
-              (sequence . "100"))))
+            '((sequence . "100"))))
     (qq-message--handle-event
      "message.received"
      (qq-message-test-event
@@ -3140,8 +3486,7 @@ push carries sequence=40909 and client_sequence=30202."
              sent-params delivered)
         (puthash '(old-runtime) t qq-message--pending-recalls)
         (puthash (qq-message--frontier-key "slot-a" session-key)
-                 '((message_id . "7348923749823749823")
-                   (sequence . "9007199254740999"))
+                 '((sequence . "9007199254740999"))
                  qq-message--live-frontiers)
         (let ((stopped (qq-message-test-account)))
           (setf (alist-get 'phase stopped) "stopped")
