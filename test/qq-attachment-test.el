@@ -559,6 +559,57 @@
               (should (equal released '("res-record-source")))))
         (delete-file path)))))
 
+(ert-deftest qq-attachment-favorite-materializes-before-image-preparation ()
+  (qq-attachment-test-with-state
+    (let ((favorite-id
+           "10002_0_0_0_DEADBEEFDEADBEEFDEADBEEFDEADBEEF_0_0")
+          prepared delivered)
+      (cl-letf
+          (((symbol-function 'qq-favorite-emoji-materialize)
+            (lambda (requested-id callback _errback)
+              (should (equal requested-id favorite-id))
+              (funcall
+               callback
+               '((resource
+                  . ((resource_id . "res-favorite-a")
+                     (phase . "ready")))))
+              "materialize-request"))
+           ((symbol-function 'qq-resource-await-ready)
+            (lambda (resource-id callback _errback)
+              (funcall callback `((resource_id . ,resource-id)
+                                  (phase . "ready")))
+              (qq-request-watch-create :active-p nil)))
+           ((symbol-function 'qq-attachment-prepare-image)
+            (lambda (session resource-id summary sub-type callback _errback)
+              (setq prepared (list session resource-id summary sub-type))
+              (let ((queued
+                     (qq-attachment-test-snapshot
+                      :resource-id resource-id
+                      :use `((kind . "image")
+                             (summary . ,summary)
+                             (sub_type . ,sub-type)))))
+                (qq-attachment--upsert queued 'prepare)
+                (funcall callback queued))
+              "prepare-request")))
+        (let ((operation
+               (qq-attachment-materialize-and-prepare-favorite
+                "group:8209413637" favorite-id
+                (lambda (snapshot) (setq delivered snapshot)) #'ignore)))
+          (should (qq-attachment-operation-active-p operation))
+          (should
+           (equal prepared
+                  '("group:8209413637" "res-favorite-a" "[收藏表情]" 1)))
+          (qq-attachment--upsert
+           (qq-attachment-test-snapshot
+            :resource-id "res-favorite-a"
+            :use '((kind . "image")
+                   (summary . "[收藏表情]")
+                   (sub_type . 1))
+            :phase "ready" :fast-path t :updated-at 1784700001)
+           'ready)
+          (should (equal (alist-get 'phase delivered) "ready"))
+          (should-not (qq-attachment-operation-active-p operation)))))))
+
 (ert-deftest qq-attachment-preparation-survives-runtime-restart ()
   (qq-attachment-test-with-state
     (let ((path (make-temp-file "qq-image-owner-" nil ".png" "abc"))

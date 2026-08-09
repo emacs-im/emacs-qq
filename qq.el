@@ -28,6 +28,7 @@
 (require 'qq-rpc)
 (require 'qq-account)
 (require 'qq-resource)
+(require 'qq-favorite-emoji)
 (require 'qq-remote-media)
 (require 'qq-message)
 (require 'qq-read)

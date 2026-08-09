@@ -1163,6 +1163,58 @@
       (delete-file path-b)
       (delete-file path-c))) ))
 
+(ert-deftest qq-core-favorite-materializes-through-image-attachment-in-order ()
+  (qq-core-test-with-managed-account
+    (let* ((favorite-id
+            "10002_0_0_0_DEADBEEFDEADBEEFDEADBEEFDEADBEEF_0_0")
+           (segments
+            `(((type . "text") (data . ((text . "before"))))
+              ((type . "favorite_emoji")
+               (data . ((favorite_emoji_id . ,favorite-id))))
+              ((type . "face") (data . ((id . "178"))))))
+           operation prepared sent released-resources)
+      (cl-letf
+          (((symbol-function
+             'qq-attachment-materialize-and-prepare-favorite)
+            (lambda (session requested-id callback errback)
+              (setq prepared (list session requested-id callback errback)
+                    operation
+                    (qq-attachment-operation-create :active-p t))
+              operation))
+           ((symbol-function 'qq-core--release-send-resource)
+            (lambda (resource-id) (push resource-id released-resources)))
+           ((symbol-function 'qq-message-send)
+            (lambda (session ready-segments
+                             &optional raw callback errback optimistic)
+              (setq sent (list session ready-segments raw callback
+                               errback optimistic))
+              "send-favorite-request")))
+        (let ((request
+               (qq-core-send-message
+                "group:8209413637" segments "optimistic")))
+          (should (qq-request-p request))
+          (should (equal (seq-take prepared 2)
+                         (list "group:8209413637" favorite-id)))
+          (setf (qq-attachment-operation-active-p operation) nil)
+          (funcall
+           (nth 2 prepared)
+           (qq-core-test-prepared-image
+            "att-ffffffff-ffff-4fff-8fff-ffffffffffff"
+            "res-favorite-ready"))
+          (should
+           (equal
+            (nth 1 sent)
+            '(((type . "text") (data . ((text . "before"))))
+              ((type . "image")
+               (data
+                . ((attachment_id
+                    . "att-ffffffff-ffff-4fff-8fff-ffffffffffff"))))
+              ((type . "face") (data . ((id . "178")))))))
+          (should (equal (nth 5 sent) segments))
+          (should (equal released-resources '("res-favorite-ready")))
+          (funcall (nth 3 sent) '((sent . t)))
+          (should (eq (qq-request-state request) 'settled)))))))
+
 (ert-deftest qq-core-local-record-is-prepared-before-message-send ()
   (qq-core-test-with-managed-account
   (let ((path (make-temp-file "qq-core-record-" nil ".wav" "pcm"))

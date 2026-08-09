@@ -40,7 +40,13 @@
   "Query -> request metadata for in-flight native member searches.")
 
 (defvar-local qq-completion--custom-face-pending nil
-  "Current room-owned favorite-face cache request, or nil.")
+  "Current room-owned favorite-face catalog request, or nil.")
+
+(defvar-local qq-completion--custom-faces nil
+  "Native favorite entries for this exact chat buffer.
+
+The value `qq-completion--cache-miss' means no catalog has completed yet;
+nil means the authoritative catalog is empty.")
 
 (defvar qq-completion--face-history nil
   "History for shared QQ base-face completion readers.")
@@ -680,6 +686,10 @@ and send literal token text accidentally."
       (setq qq-completion--custom-face-pending nil))
     t))
 
+(defun qq-completion--custom-faces-loaded-p ()
+  "Return non-nil when this chat buffer has a favorite catalog result."
+  (not (eq qq-completion--custom-faces qq-completion--cache-miss)))
+
 (defun qq-completion--request-custom-faces (query &optional _reopen)
   "Load favorite faces for QUERY without presenting asynchronous results.
 
@@ -700,12 +710,14 @@ command owns presentation."
                         :status 'pending)))
       (setq qq-completion--custom-face-pending owner)
       (qq-media-ensure-custom-faces
-       (lambda (_faces)
+       (lambda (faces)
          (cond
           ((not (qq-completion--custom-face-request-owner-p buffer owner)))
           ((not (qq-completion--custom-face-request-current-p buffer owner))
            (qq-completion--clear-custom-face-owner buffer owner))
           (t
+           (with-current-buffer buffer
+             (setq qq-completion--custom-faces (copy-tree faces)))
            (setf (plist-get owner :status) 'ready)
            (qq-completion--clear-custom-face-owner buffer owner))))
        (lambda (_response reason)
@@ -720,11 +732,11 @@ command owns presentation."
            (query (plist-get token :query))
            (candidates
             (if custom-p
-                (when (qq-media-custom-faces-loaded-p)
+                (when (qq-completion--custom-faces-loaded-p)
                   (qq-completion--custom-face-candidates
-                   (qq-media-custom-faces)))
+                   qq-completion--custom-faces))
               (qq-completion--base-face-candidates))))
-      (when (and custom-p (not (qq-media-custom-faces-loaded-p)))
+      (when (and custom-p (not (qq-completion--custom-faces-loaded-p)))
         (qq-completion--request-custom-faces query))
       (when candidates
         (appkit-chat-completion-capf
@@ -748,23 +760,12 @@ command owns presentation."
              (appkit-chat-completion-candidate-create
               :label (qq-media-custom-face-label current index)
               :value `(:kind custom-face :face ,current)
-              :search-terms
-              (let* ((desc (alist-get 'desc current))
-                     (desc (and (stringp desc) (string-trim desc))))
-                (delq nil
-                      (append
-                       qq-completion--custom-face-query-prefixes
-                       (and (not (string-empty-p (or desc "")))
-                            (mapcar (lambda (prefix)
-                                      (concat prefix desc))
-                                    qq-completion--custom-face-query-prefixes))
-                       (list desc
-                             (alist-get 'md5 current)
-                             (and (alist-get 'emo_id current)
-                                  (format "%s"
-                                          (alist-get 'emo_id current)))))))
               :prefix (lambda (_candidate)
-                        (qq-media--custom-face-completion-prefix current))))))
+                        (qq-media--custom-face-completion-prefix current))
+              :search-terms
+              (append qq-completion--custom-face-query-prefixes
+                      (list (alist-get 'md5 current)
+                            (alist-get 'favorite_emoji_id current)))))))
 
 (defun qq-completion-read-base-face-id (&optional prompt)
   "Read a QQ base face and return its string id."
@@ -810,14 +811,14 @@ after the model is ready to present candidates."
   (when (appkit-chatbuf-point-in-input-p)
     (cond
      ((and (qq-completion--custom-face-token)
-           (not (qq-media-custom-faces-loaded-p)))
+           (not (qq-completion--custom-faces-loaded-p)))
       (qq-completion--request-custom-faces
        (plist-get (qq-completion--custom-face-token) :query))
       (message "qq: loading favorite faces…")
       t)
      ((and (qq-completion--custom-face-token)
-           (qq-media-custom-faces-loaded-p)
-           (null (qq-media-custom-faces)))
+           (qq-completion--custom-faces-loaded-p)
+           (null qq-completion--custom-faces))
       (message "qq: favorite faces are empty")
       t)
      ((if-let* ((token (qq-completion--member-token))
@@ -845,6 +846,7 @@ after the model is ready to present candidates."
   (setq-local qq-completion--member-cache (make-hash-table :test #'equal))
   (setq-local qq-completion--member-pending (make-hash-table :test #'equal))
   (setq-local qq-completion--custom-face-pending nil)
+  (setq-local qq-completion--custom-faces qq-completion--cache-miss)
   (setq-local qq-completion--poke-request nil)
   (add-hook 'kill-buffer-hook #'qq-completion--cancel-poke-request nil t)
   (add-hook 'change-major-mode-hook #'qq-completion--cancel-poke-request nil t)

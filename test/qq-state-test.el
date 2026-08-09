@@ -3140,6 +3140,15 @@ it kept the element's visible text, the user should still see it."
     (qq-state-message-reactions
      (car (qq-state-session-messages "group:20001"))))))
 
+(ert-deftest qq-state-favorite-pending-signature-matches-sticker-image ()
+  (should
+   (equal
+    (qq-state--pending-segment-signature
+     '((type . "favorite_emoji")
+       (data . ((favorite_emoji_id . "favorite-a")))))
+    (qq-state--pending-segment-signature
+     '((type . "image") (data . ((sub_type . 1))))))))
+
 (provide 'qq-state-test)
 
 ;;; qq-state-test.el ends here

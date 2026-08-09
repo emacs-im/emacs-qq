@@ -237,83 +237,6 @@
       (should (equal '(download-handle) canceled))
       (should (= 0 (hash-table-count qq-media--download-state-table))))))
 
-(ert-deftest qq-media-clear-cache-revokes-custom-face-account-generation ()
-  "Late favorite callbacks cannot repopulate a replacement account's cache."
-  (let* ((qq-media-cache-directory (make-temp-file "qq-faces-reset" t))
-         (qq-media--resource-cache (make-hash-table :test #'equal))
-         (qq-media--image-cache (make-hash-table :test #'equal))
-         (qq-media--preview-missing-cache (make-hash-table :test #'equal))
-         (qq-media--fetching-cache (make-hash-table :test #'equal))
-         (qq-media--download-state-table (make-hash-table :test #'equal))
-         (qq-media--account-generation 3)
-         (qq-media--custom-faces nil)
-         (qq-media--custom-faces-fetched-at nil)
-         (qq-media--custom-face-waiters nil)
-         (qq-media--custom-face-refresh-owner nil)
-         (qq-media--custom-face-completion-pairs
-          '(("OLD COMPLETION SECRET" . ((md5 . "old")))))
-         old-success old-error new-success
-         old-deliveries new-deliveries failures cancelled
-         (calls 0))
-    (unwind-protect
-        (cl-letf (((symbol-function 'qq-api-fetch-custom-face-info)
-                   (lambda (callback &optional errback _count)
-                     (cl-incf calls)
-                     (if (= calls 1)
-                         (setq old-success callback
-                               old-error errback)
-                       (setq new-success callback))
-                     (if (= calls 1) 'old-face-request 'new-face-request)))
-                  ((symbol-function 'qq-api-cancel-request)
-                   (lambda (token)
-                     (push token cancelled)
-                     ;; Cancellation may synchronously emit an errback.  The
-                     ;; old owner has already been revoked at this boundary.
-                     (when old-error
-                       (funcall old-error nil "cancelled")))))
-          (qq-media-ensure-custom-faces
-           (lambda (faces) (push faces old-deliveries))
-           (lambda (_response reason) (push reason failures)))
-          (should qq-media--custom-face-refresh-owner)
-          (qq-media-clear-cache)
-          (should (= qq-media--account-generation 4))
-          (should (equal cancelled '(old-face-request)))
-          (should-not failures)
-          (should-not qq-media--custom-faces)
-          (should-not qq-media--custom-faces-fetched-at)
-          (should-not qq-media--custom-face-refresh-owner)
-          (should-not qq-media--custom-face-waiters)
-          (should-not qq-media--custom-face-completion-pairs)
-
-          (qq-media-ensure-custom-faces
-           (lambda (faces) (push faces new-deliveries)))
-          (let ((replacement-owner qq-media--custom-face-refresh-owner))
-            (funcall old-success
-                     '(((md5 . "old-secret-md5")
-                        (desc . "OLD FAVORITE SECRET"))))
-            (should (eq replacement-owner
-                        qq-media--custom-face-refresh-owner))
-            (should-not qq-media--custom-faces)
-            (should-not old-deliveries)
-            (should-not
-             (string-match-p
-              "OLD \(?:COMPLETION\|FAVORITE\) SECRET"
-              (prin1-to-string
-               (list qq-media--custom-faces
-                     qq-media--custom-face-waiters
-                     qq-media--custom-face-completion-pairs)))))
-          (funcall new-success
-                   '(((md5 . "new-md5") (desc . "NEW FAVORITE"))))
-          (should-not old-deliveries)
-          (should (= 1 (length new-deliveries)))
-          (should (equal "new-md5"
-                         (alist-get 'md5
-                                    (car (car new-deliveries)))))
-          (should-not qq-media--custom-face-refresh-owner)
-          (should-not qq-media--custom-face-waiters))
-      (when (file-directory-p qq-media-cache-directory)
-        (delete-directory qq-media-cache-directory t)))))
-
 (ert-deftest qq-media-ensure-resource-image-starts-remote-download-for-url-only-resource ()
   (qq-media-test-with-reset
    (let (started-key started-resource started-spec)
@@ -716,326 +639,53 @@
     (should-not
      (qq-media-message-avatar-cache-key '((sender-id . "0"))))))
 
-(ert-deftest qq-media-normalize-custom-face-list-keeps-multiple-faces ()
-  "A list of face alists must not collapse into one bogus entry."
-  (let* ((faces '(((url . "https://a")
-                   (md5 . "AAAAAAAA")
-                   (desc . "")
-                   (file . "/tmp/a.jpg"))
-                  ((url . "https://b")
-                   (md5 . "BBBBBBBB")
-                   (desc . "")
-                   (file . "/tmp/b.jpg"))
-                  ((url . "https://c")
-                   (md5 . "CCCCCCCC")
-                   (desc . "named")
-                   (file . "/tmp/c.jpg"))))
-         (normalized (qq-media--normalize-custom-face-list faces))
-         (pairs (qq-media-custom-face-completion-candidates normalized)))
-    (should (= 3 (length normalized)))
-    (should (= 3 (length pairs)))
-    (should (string-match-p "AAAAAAAA" (car (nth 0 pairs))))
-    (should (string-match-p "BBBBBBBB" (car (nth 1 pairs))))
-    (should (string-match-p "named" (car (nth 2 pairs))))
-    ;; Labels carry the face for affixation / lookup.
-    (should (equal "AAAAAAAA"
-                   (alist-get 'md5 (get-text-property 0 'qq-custom-face
-                                                      (car (nth 0 pairs))))))))
+(ert-deftest qq-media-custom-face-preview-reuses-catalog-url-cache ()
+  (let* ((face '((favorite_emoji_id . "favorite-a")
+                 (md5 . "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                 (url . "https://example.invalid/a")))
+         captured)
+    (cl-letf (((symbol-function 'qq-media-url-preview-image)
+               (lambda (key url height)
+                 (setq captured (list key url height))
+                 'favorite-image)))
+      (should (eq (qq-media-custom-face-image face) 'favorite-image))
+      (should (equal captured
+                     (list "favorite-emoji:favorite-a"
+                           "https://example.invalid/a"
+                           (max qq-media-face-image-height 32))))
+      (let ((prefix (qq-media--custom-face-completion-prefix face)))
+        (should (eq (get-text-property 0 'display prefix)
+                    'favorite-image))))))
 
-(ert-deftest qq-media-custom-face-completion-table-metadata ()
-  "Favorite picker must keep NapCat order and declare affixation."
-  (let* ((faces '(((md5 . "AAAAAAAA") (desc . "") (url . "https://a"))
-                  ((md5 . "BBBBBBBB") (desc . "meme") (url . "https://b"))))
-         (table (qq-media-custom-face-completion-table faces))
-         (meta (funcall table "" nil 'metadata))
-         (labels (all-completions "" table)))
-    (should (eq (completion-metadata-get meta 'display-sort-function)
-                #'identity))
-    (should (eq (completion-metadata-get meta 'affixation-function)
-                #'qq-media-custom-face-affixation-function))
-    (should (= 2 (length labels)))
-    (should (string-match-p "AAAAAAAA" (nth 0 labels)))
-    (should (string-match-p "meme" (nth 1 labels)))
-    ;; Plain-string choice still resolves (completing-read may strip props).
-    (should (equal "AAAAAAAA"
-                   (alist-get 'md5
-                              (qq-media-custom-face-from-completion
-                               (substring-no-properties (nth 0 labels))))))))
+(ert-deftest qq-media-refresh-custom-faces-delegates-to-native-catalog ()
+  (let (requested-force received)
+    (cl-letf (((symbol-function 'qq-favorite-emoji-list)
+               (lambda (force callback _errback)
+                 (setq requested-force force)
+                 (funcall callback '((entries . (((favorite_emoji_id . "favorite-a"))))))
+                 "favorite-request")))
+      (should
+       (equal
+        (qq-media-refresh-custom-faces
+         (lambda (faces) (setq received faces)) nil t)
+        "favorite-request"))
+      (should requested-force)
+      (should (equal received '(((favorite_emoji_id . "favorite-a"))))))))
 
-(ert-deftest qq-media-ensure-custom-faces-coalesces-unloaded-callers ()
-  (let ((qq-media--custom-faces nil)
-        (qq-media--custom-faces-fetched-at nil)
-        (qq-media--custom-face-waiters nil)
-        (qq-media--custom-face-refresh-owner nil)
-        (requests 0)
-        callbacks
-        received)
-    (cl-letf (((symbol-function 'qq-media-refresh-custom-faces)
-               (lambda (callback &optional errback _count)
-                 (cl-incf requests)
-                 (setq callbacks (list callback errback))
-                 'request)))
-      (qq-media-ensure-custom-faces
-       (lambda (faces) (push (cons 'first faces) received)))
-      (qq-media-ensure-custom-faces
-       (lambda (faces) (push (cons 'second faces) received)))
-      (should (= 1 requests))
-      (let ((faces '(((md5 . "one")))))
-        (setq qq-media--custom-faces faces
-              qq-media--custom-faces-fetched-at (float-time))
-        (funcall (car callbacks) faces))
-      (should (equal '(first second)
-                     (sort (mapcar #'car received)
-                           (lambda (left right)
-                             (string-lessp (symbol-name left)
-                                           (symbol-name right))))))
-      (should-not qq-media--custom-face-refresh-owner)
-      (should-not qq-media--custom-face-waiters))))
-
-(ert-deftest qq-media-custom-face-waiters-stop-at-account-reset ()
-  "A reset from one waiter prevents later old-account waiters from running."
-  (let ((qq-media--account-generation 30)
-        (qq-media--custom-faces nil)
-        (qq-media--custom-faces-fetched-at nil)
-        (qq-media--custom-face-waiters nil)
-        (qq-media--custom-face-refresh-owner nil)
-        success
-        first-called
-        second-called)
-    (cl-letf (((symbol-function 'qq-media-refresh-custom-faces)
-               (lambda (callback &optional _errback _count)
-                 (setq success callback)
-                 'favorite-request)))
-      (qq-media-ensure-custom-faces
-       (lambda (_faces)
-         (setq first-called t)
-         (qq-media--revoke-custom-face-work)))
-      (qq-media-ensure-custom-faces
-       (lambda (_faces) (setq second-called t)))
-      (funcall success '(((md5 . "old-account-face"))))
-      (should first-called)
-      (should-not second-called)
-      (should (= qq-media--account-generation 31))
-      (should-not qq-media--custom-faces)
-      (should-not qq-media--custom-face-waiters)
-      (should-not qq-media--custom-face-refresh-owner))))
-
-(ert-deftest qq-media-ensure-custom-faces-cleans-up-synchronous-success ()
-  (let ((qq-media--custom-faces nil)
-        (qq-media--custom-faces-fetched-at nil)
-        (qq-media--custom-face-waiters nil)
-        (qq-media--custom-face-refresh-owner nil)
-        received)
-    (cl-letf (((symbol-function 'qq-media-refresh-custom-faces)
-               (lambda (callback &optional _errback _count)
-                 (funcall callback '(((md5 . "one"))))
-                 'request)))
-      (qq-media-ensure-custom-faces (lambda (faces) (setq received faces)))
-      (should (equal "one" (alist-get 'md5 (car received))))
-      (should-not qq-media--custom-face-refresh-owner)
-      (should-not qq-media--custom-face-waiters))))
-
-(ert-deftest qq-media-custom-faces-loaded-p-distinguishes-empty-cache ()
-  (let ((qq-media--custom-faces nil)
-        (qq-media--custom-faces-fetched-at nil))
-    (should-not (qq-media-custom-faces-loaded-p))
-    (setq qq-media--custom-faces-fetched-at (float-time))
-    (should (qq-media-custom-faces-loaded-p))
-    (let ((called :missing))
-      (qq-media-ensure-custom-faces
-       (lambda (faces) (setq called faces)))
-      (should (null called)))))
-
-(ert-deftest qq-media-ensure-custom-faces-error-clears-waiters-and-retries ()
-  (let ((qq-media--custom-faces nil)
-        (qq-media--custom-faces-fetched-at nil)
-        (qq-media--custom-face-waiters nil)
-        (qq-media--custom-face-refresh-owner nil)
-        (requests 0)
-        errbacks
-        failures)
-    (cl-letf (((symbol-function 'qq-media-refresh-custom-faces)
-               (lambda (_callback &optional errback _count)
-                 (cl-incf requests)
-                 (push errback errbacks)
-                 'request)))
-      (qq-media-ensure-custom-faces
-       nil (lambda (_response reason) (push (cons 'first reason) failures)))
-      (qq-media-ensure-custom-faces
-       nil (lambda (_response reason) (push (cons 'second reason) failures)))
-      (funcall (car errbacks) nil "offline")
-      (should (= 1 requests))
-      (should (equal '(first second)
-                     (sort (mapcar #'car failures)
-                           (lambda (left right)
-                             (string-lessp (symbol-name left)
-                                           (symbol-name right))))))
-      (should-not qq-media--custom-face-refresh-owner)
-      (should-not qq-media--custom-face-waiters)
-      (qq-media-ensure-custom-faces nil #'ignore)
-      (should (= 2 requests)))))
-
-(ert-deftest qq-media-custom-face-affixation-uses-local-thumb ()
-  "Favorite affix should show local thumb/file when present."
-  (let* ((file (make-temp-file "qq-fav-affix" nil ".png"))
-         (face `((md5 . "DEADBEEFDEADBEEF")
-                 (desc . "")
-                 (thumb_file . ,file)
-                 (file . ,file)
-                 (url . "https://example.com/x")))
-         (qq-media-face-image-height 18))
-    (unwind-protect
-        (progn
-          (with-temp-file file
-            (set-buffer-multibyte nil)
-            (insert (unibyte-string
-                     #x89 #x50 #x4e #x47 #x0d #x0a #x1a #x0a
-                     #x00 #x00 #x00 #x0d #x49 #x48 #x44 #x52
-                     #x00 #x00 #x00 #x01 #x00 #x00 #x00 #x01
-                     #x08 #x02 #x00 #x00 #x00 #x90 #x77 #x53
-                     #xde #x00 #x00 #x00 #x0c #x49 #x44 #x41
-                     #x54 #x08 #xd7 #x63 #xf8 #xcf #xc0 #x00
-                     #x00 #x00 #x03 #x00 #x01 #x00 #x05 #xfe
-                     #xd4 #xef #x00 #x00 #x00 #x00 #x49 #x45
-                     #x4e #x44 #xae #x42 #x60 #x82)))
-          (qq-media-custom-face-completion-table (list face))
-          (let* ((label (car (car qq-media--custom-face-completion-pairs)))
-                 (affixed (qq-media-custom-face-affixation-function
-                           (list label
-                                 "[fav] missing  (9)")))
-                 (prefix0 (nth 1 (nth 0 affixed)))
-                 (prefix1 (nth 1 (nth 1 affixed))))
-            (should (eq (car (get-text-property 0 'display prefix0)) 'image))
-            (should-not (get-text-property 0 'display prefix1))))
-      (when (file-exists-p file)
-        (delete-file file)))))
-
-(ert-deftest qq-media-normalize-custom-face-list-vector-and-single ()
-  (should (= 2 (length (qq-media--normalize-custom-face-list
-                        [((md5 . "A1A1A1A1") (url . "u1"))
-                         ((md5 . "B2B2B2B2") (url . "u2"))]))))
-  (let ((one (qq-media--normalize-custom-face-list
-              '((md5 . "C3C3C3C3") (url . "u3")))))
-    (should (= 1 (length one)))
-    (should (equal "C3C3C3C3" (alist-get 'md5 (car one))))))
-
-(ert-deftest qq-media-refresh-custom-faces-expands-when-full-page ()
-  "When NapCat returns exactly COUNT faces, retry with a larger count."
-  (let* ((qq-media-custom-face-count 2)
-         (qq-media-custom-face-count-max 8)
-         (qq-media--custom-faces nil)
-         (calls nil)
-         (final nil))
-    (cl-letf (((symbol-function 'qq-api-fetch-custom-face-info)
-               (lambda (callback &optional _errback count)
-                 (push count calls)
-                 (let* ((n (or count 2))
-                        ;; First full pages, then a short one.
-                        (take (if (>= n 8) 5 n))
-                        (data
-                         (cl-loop for i from 1 to take
-                                  collect
-                                  `((md5 . ,(format "MD5%06dXXXXXXXX" i))
-                                    (url . ,(format "https://e/%d" i))
-                                    (desc . "")))))
-                   (funcall callback data)))))
-      (qq-media-refresh-custom-faces
-       (lambda (faces) (setq final faces)))
-      (should (equal (nreverse calls) '(2 4 8)))
-      (should (= 5 (length final)))
-      (should (= 5 (length qq-media--custom-faces))))))
-
-(ert-deftest qq-media-custom-face-sync-page-adopts-async-next-page-token ()
-  "A synchronous full page must not overwrite its asynchronous successor."
-  (let ((qq-media-custom-face-count 2)
-        (qq-media-custom-face-count-max 4)
-        (qq-media--account-generation 12)
-        (qq-media--custom-faces nil)
-        (qq-media--custom-faces-fetched-at nil)
-        (qq-media--custom-face-waiters nil)
-        (qq-media--custom-face-refresh-owner nil)
-        counts
-        first-errback
-        second-success
-        second-errback
-        cancelled
-        delivered)
-    (cl-letf (((symbol-function 'qq-api-fetch-custom-face-info)
-               (lambda (callback &optional errback count)
-                 (push count counts)
-                 (if (= count 2)
-                     (progn
-                       (setq first-errback errback)
-                       (funcall callback
-                                '(((md5 . "first"))
-                                  ((md5 . "second"))))
-                       'first-page-request)
-                   (setq second-success callback
-                         second-errback errback)
-                   'second-page-request)))
-              ((symbol-function 'qq-api-cancel-request)
-               (lambda (token)
-                 (push token cancelled)
-                 ;; A completed first page may synchronously report
-                 ;; cancellation while the second page already owns the chain.
-                 (pcase token
-                   ('first-page-request
-                    (funcall first-errback nil "cancelled"))
-                   ('second-page-request
-                    (funcall second-errback nil "cancelled"))))))
-      (qq-media-ensure-custom-faces
-       (lambda (faces) (setq delivered faces)))
-      (should (equal '(2 4) (nreverse counts)))
-      (should (eq 'second-page-request
-                  (plist-get qq-media--custom-face-refresh-owner :token)))
-      (should (equal '(first-page-request) cancelled))
-
-      ;; Account reset must cancel the currently adopted second-page request,
-      ;; not the synchronously completed first page.
-      (qq-media--revoke-custom-face-work)
-      (should (equal '(second-page-request first-page-request) cancelled))
-      (should-not qq-media--custom-face-refresh-owner)
-      (should-not qq-media--custom-face-waiters)
-
-      ;; A late completion from the cancelled current page is also stale.
-      (funcall second-success '(((md5 . "late"))))
-      (should-not delivered)
-      (should-not qq-media--custom-faces)
-      (should-not qq-media--custom-faces-fetched-at))))
-
-(ert-deftest qq-media-custom-face-to-segment-personal-sticker ()
-  "Personal favorites become image segments with sub_type 1."
-  (let* ((file (make-temp-file "qq-fav" nil ".jpg"))
-         (face `((url . "https://example.com/x")
-                 (file . ,file)
-                 (thumb_file . ,file)
-                 (desc . "meme")
-                 (md5 . "ABCDEF12")
-                 (emo_id . 3)
-                 (is_mark_face . :false)
-                 (e_id . "")
-                 (ep_id . "0"))))
-    (unwind-protect
-        (progn
-          (with-temp-file file (insert "x"))
-          (let ((seg (qq-media-custom-face-to-segment face)))
-            (should (equal "image" (alist-get 'type seg)))
-            (should (equal 1 (alist-get 'sub_type (alist-get 'data seg))))
-            (should (equal file (alist-get 'file (alist-get 'data seg))))
-            (should (equal "meme" (alist-get 'summary (alist-get 'data seg))))))
-      (when (file-exists-p file)
-        (delete-file file)))))
-
-(ert-deftest qq-media-custom-face-to-segment-mark-face ()
-  (let* ((face '((is_mark_face . t)
-                 (e_id . "abc123")
-                 (ep_id . "5")
-                 (desc . "pack sticker")
-                 (key . "k1")))
-         (seg (qq-media-custom-face-to-segment face)))
-    (should (equal "mface" (alist-get 'type seg)))
-    (should (equal "abc123" (alist-get 'emoji_id (alist-get 'data seg))))
-    (should (equal 5 (alist-get 'emoji_package_id (alist-get 'data seg))))))
+(ert-deftest qq-media-custom-face-to-segment-keeps-only-durable-id ()
+  (let* ((favorite-id
+          "10001_0_0_1_01F97FC1C8118A7D09DE81124B346F67_195359_1d5176b6464998bd07f94c17d42012e5")
+         (face `((favorite_emoji_id . ,favorite-id)
+                 (md5 . "01f97fc1c8118a7d09de81124b346f67")
+                 (url . "https://example.invalid/favorite.png")))
+         (segment (qq-media-custom-face-to-segment face)))
+    (should
+     (equal segment
+            `((type . "favorite_emoji")
+              (data . ((favorite_emoji_id . ,favorite-id))))))
+    (should-not (string-match-p "https://" (prin1-to-string segment)))
+    (should-not (string-match-p "resource_id\|attachment_id\|file"
+                                (prin1-to-string segment)))))
 
 (ert-deftest qq-media-face-uses-local-default-emoji-png ()
   "Base faces should render from LinuxQQ default-emojis without API."

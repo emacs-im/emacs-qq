@@ -1013,7 +1013,7 @@ reply chrome elsewhere).  Media becomes short placeholders like
               (t "[face]"))))
           ;; Compact previews stay telega-short; chat body uses media cards.
           ("image" "[image]")
-          ("mface" "[sticker]")
+          ((or "mface" "favorite_emoji") "[sticker]")
           ("file"
            (format "[file:%s]"
                    (qq-state--short-media-label
@@ -1703,6 +1703,7 @@ surrounding message matcher."
          (list type face-id)))
       ("image"
        (list type (and (member (alist-get 'sub_type data) '(1 "1")) t)))
+      ("favorite_emoji" (list "image" t))
       ((or "mface" "video" "record" "file")
        (list type))
       (_ nil))))
