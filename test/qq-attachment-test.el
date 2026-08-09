@@ -169,6 +169,30 @@
                         (qq-attachment qq-attachment-test-id))
              "ready"))))
 
+(ert-deftest qq-attachment-coalesced-events-skip-intermediate-phases-monotonically ()
+  (qq-attachment-test-with-state
+    (qq-attachment--upsert
+     (qq-attachment-test-snapshot
+      :phase "ready" :fast-path t :updated-at 1784700001)
+     'ready)
+    ;; Gateway delivery is coalesced by attachment identity, so `sending' is
+    ;; not guaranteed to reach the client before the terminal snapshot.
+    (qq-attachment--upsert
+     (qq-attachment-test-snapshot
+      :phase "consumed" :fast-path t :updated-at 1784700002)
+     'consumed)
+    (should (equal
+             (alist-get 'phase
+                        (qq-attachment qq-attachment-test-id))
+             "consumed"))
+    (should-error
+     (qq-attachment--upsert
+      (qq-attachment-test-snapshot
+       :phase "failed" :fast-path t :updated-at 1784700003
+       :error '((code . "late_failure") (message . "late failure")))
+      'late-failure)
+     :type 'error)))
+
 (ert-deftest qq-attachment-identical-event-notifies-once ()
   (qq-attachment-test-with-state
     (let (changes)

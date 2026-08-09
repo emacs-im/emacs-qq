@@ -124,23 +124,17 @@ behalf of one caller."
     (_ -1)))
 
 (defun qq-attachment--transition-p (from to)
-  "Return non-nil when attachment phase FROM may transition to TO."
-  (or (equal from to)
-      (member (cons from to)
-              '(("queued" . "negotiating")
-                ("queued" . "failed")
-                ("queued" . "canceled")
-                ("negotiating" . "uploading")
-                ("negotiating" . "ready")
-                ("negotiating" . "failed")
-                ("negotiating" . "canceled")
-                ("uploading" . "ready")
-                ("uploading" . "failed")
-                ("uploading" . "canceled")
-                ("ready" . "sending")
-                ("ready" . "canceled")
-                ("sending" . "consumed")
-                ("sending" . "canceled")))))
+  "Return non-nil when attachment phase FROM may transition to TO.
+
+Gateway delivery coalesces snapshots by attachment identity, so a forward
+update may omit intermediate phases such as `sending'.  Terminal phases remain
+immutable."
+  (let ((from-rank (qq-attachment--phase-rank from))
+        (to-rank (qq-attachment--phase-rank to)))
+    (or (equal from to)
+        (and (>= from-rank 0)
+             (< from-rank 5)
+             (> to-rank from-rank)))))
 
 (defun qq-attachment--same-identity-p (left right)
   "Return non-nil when LEFT and RIGHT describe the same attachment."
@@ -170,7 +164,10 @@ behalf of one caller."
       (setq snapshot existing))
      ((not (qq-attachment--transition-p
             (alist-get 'phase existing) (alist-get 'phase snapshot)))
-      (error "qq: Gateway attachment lifecycle transition is invalid"))
+      (error "qq: Gateway attachment lifecycle transition is invalid for %s: %s -> %s"
+             attachment-id
+             (alist-get 'phase existing)
+             (alist-get 'phase snapshot)))
      ((< (alist-get 'updated_at snapshot) (alist-get 'updated_at existing))
       (setq snapshot existing))
      ((and (equal (alist-get 'phase existing) "uploading")
