@@ -172,9 +172,18 @@ used only when its QQ number agrees with ACCOUNT."
     (format " emacs-qq  [%s]  %s%s"
             status account-summary (or registry-summary ""))))
 
+(defun qq-root--recent-sessions ()
+  "Return the ordered sessions in the authoritative recent projection."
+  (mapcar
+   (lambda (session-key)
+     (or (qq-state-session session-key)
+         (error "qq: recent projection references missing session %s"
+                session-key)))
+   (qq-state-recent-session-keys)))
+
 (defun qq-root--activity-metrics (&optional sessions)
-  "Return root activity metrics for SESSIONS or current state."
-  (let* ((sessions (or sessions (qq-state-sessions)))
+  "Return root activity metrics for SESSIONS or current recent projection."
+  (let* ((sessions (or sessions (qq-root--recent-sessions)))
          (unread (cl-count-if (lambda (session)
                                  (> (or (alist-get 'unread-badge-count session) 0) 0))
                               sessions))
@@ -434,7 +443,7 @@ message title rather than like dimmed preview content."
 
 (defun qq-root--project-account-entries ()
   "Project the current account state into stable-keyed root entries."
-  (let* ((sessions (qq-state-sessions))
+  (let* ((sessions (qq-root--recent-sessions))
          (width (qq-root--buffer-width))
          (metadata
           (list
@@ -459,7 +468,7 @@ message title rather than like dimmed preview content."
      (unless sessions
        (list
         (qq-root--entry-create
-         :key 'empty :type 'note :text "No sessions available yet."))))))
+         :key 'empty :type 'note :text "No recent conversations available yet."))))))
 
 (defun qq-root--project-entries ()
   "Project this root buffer's explicit account or Gateway scope."
@@ -475,7 +484,7 @@ message title rather than like dimmed preview content."
   (unless (eq qq-root--scope 'gateway)
     (mapcar (lambda (session)
               (qq-root--session-entry-key (alist-get 'key session)))
-            (qq-state-sessions))))
+            (qq-root--recent-sessions))))
 
 (defun qq-root--sync-invalidations (view invalidations)
   "Synchronize VIEW from coalesced Appkit INVALIDATIONS.
