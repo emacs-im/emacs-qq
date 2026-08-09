@@ -1230,28 +1230,26 @@ response and reason."
 (defun qq-core--read-message-after-p (candidate reference)
   "Return non-nil when CANDIDATE follows REFERENCE in their session timeline.
 
-Read coalescing is a client projection concern.  It therefore compares stable
-message identities in the cached timeline instead of depending on native
-sequence metadata."
+Read coalescing is a client projection concern.  It compares canonical row
+identities in the cached timeline instead of depending on native sequence or
+Message ID metadata."
   (let ((candidate-session (alist-get 'session-key candidate))
         (reference-session (alist-get 'session-key reference))
-        (candidate-id (alist-get 'server-id candidate))
-        (reference-id (alist-get 'server-id reference)))
+        (candidate-row (alist-get 'canonical-row-key candidate))
+        (reference-row (alist-get 'canonical-row-key reference)))
     (when (and candidate-session
                (equal candidate-session reference-session)
-               (qq-protocol-message-id-p candidate-id)
-               (qq-protocol-message-id-p reference-id))
+               (qq-account--uint64-decimal-p candidate-row)
+               (qq-account--uint64-decimal-p reference-row))
       (let* ((messages (qq-state-session-messages candidate-session))
+             (row-key (lambda (message)
+                        (alist-get 'canonical-row-key message)))
              (candidate-position
-              (cl-position candidate-id messages
-                           :key (lambda (message)
-                                  (alist-get 'server-id message))
-                           :test #'equal))
+              (cl-position candidate-row messages
+                           :key row-key :test #'equal))
              (reference-position
-              (cl-position reference-id messages
-                           :key (lambda (message)
-                                  (alist-get 'server-id message))
-                           :test #'equal)))
+              (cl-position reference-row messages
+                           :key row-key :test #'equal)))
         (and candidate-position
              reference-position
              (> candidate-position reference-position))))))
@@ -1342,7 +1340,7 @@ and becomes terminal only after the actual queue is empty."
     request))
 
 (defun qq-core--start-mark-message-read (message callback errback)
-  "Start one native read report for exact MESSAGE."
+  "Start one native read report for canonical MESSAGE."
   (let* ((session-key (alist-get 'session-key message))
          (owner (qq-runtime-current-account-id))
          request
@@ -1379,7 +1377,7 @@ duplicate, older, and superseded intents do not accumulate waiters.  ERRBACK
 receives failure details."
   (unless (qq-core-message-read-capable-p message)
     (user-error
-     "qq: Native read report requires a current stable message reference"))
+     "qq: Native read report requires a current canonical timeline row"))
   (let* ((session-key (alist-get 'session-key message))
          (owner (qq-runtime-current-account-id))
          (operation

@@ -373,8 +373,8 @@ remove this membership only while the same OWNER still belongs to ANCHOR."
 Any later composer edit, reply change, or send revokes this ownership so a
 stale network failure can never overwrite newer user input.")
 
-(defvar-local qq-chat--last-read-target-id nil
-  "Newest server message id submitted from this buffer's cursor.")
+(defvar-local qq-chat--last-read-target-row-key nil
+  "Newest canonical row submitted from this buffer's cursor.")
 
 (defvar-local qq-chat--guild-read-request-p nil
   "Non-nil while this channel buffer is marking its native Guild peer read.")
@@ -959,12 +959,10 @@ Message Sequence, not an SsoGetC2cMsg cursor."
      (qq-api-message-id-p (alist-get 'server-id message)))
    (reverse (qq-state-session-messages qq-chat--session-key))))
 
-(defun qq-chat--latest-visible-server-message ()
-  "Return the newest server message in this buffer's contiguous window."
-  (seq-find
-   (lambda (message)
-     (qq-api-message-id-p (alist-get 'server-id message)))
-   (reverse (qq-chat--timeline-messages))))
+(defun qq-chat--latest-visible-read-target ()
+  "Return the newest read-capable row in this buffer's contiguous window."
+  (seq-find #'qq-core-message-read-capable-p
+            (reverse (qq-chat--timeline-messages))))
 
 (defun qq-chat--message-index (message-id messages)
   "Return MESSAGE-ID's zero-based position in ordered MESSAGES, or nil."
@@ -983,6 +981,13 @@ must not be guessed."
     (and candidate-index reference-index
          (> candidate-index reference-index))))
 
+(defun qq-chat--canonical-row-index (row-key messages)
+  "Return ROW-KEY's zero-based position in ordered MESSAGES, or nil."
+  (seq-position
+   messages row-key
+   (lambda (message candidate-row)
+     (equal (alist-get 'canonical-row-key message) candidate-row))))
+
 (defun qq-chat--history-frontier-behind-batch-p
     (frontier-id newest-id batch-ids)
   "Return non-nil when canonical order proves FRONTIER-ID predates a batch."
@@ -992,25 +997,32 @@ must not be guessed."
         newest-id frontier-id
         (qq-state-session-messages qq-chat--session-key))))
 
-(defun qq-chat--read-target-needed-p (message-id)
-  "Return non-nil when MESSAGE-ID can advance the known read position."
+(defun qq-chat--read-target-needed-p (message)
+  "Return non-nil when canonical MESSAGE can advance the known read position."
   (let* ((messages (qq-state-session-messages qq-chat--session-key))
+         (row-key (alist-get 'canonical-row-key message))
+         (target-index (qq-chat--canonical-row-index row-key messages))
+         (last-index
+          (and qq-chat--last-read-target-row-key
+               (qq-chat--canonical-row-index
+                qq-chat--last-read-target-row-key messages)))
          (session (qq-state-session qq-chat--session-key))
          (unread-count (alist-get 'unread-message-count session))
          (first-unread (alist-get 'first-unread-message-id session))
          (read-latest (alist-get 'read-latest-message-id session)))
-    (and
-     (or (null qq-chat--last-read-target-id)
-         (qq-chat--message-id-after-p
-          message-id qq-chat--last-read-target-id messages))
-     (cond
-      ((and (integerp unread-count) (= unread-count 0) read-latest)
-       (qq-chat--message-id-after-p message-id read-latest messages))
-      ((and (integerp unread-count) (> unread-count 0) first-unread)
-       (or (equal message-id first-unread)
-           (qq-chat--message-id-after-p
-            message-id first-unread messages)))
-      (t t)))))
+    (and target-index
+         (or (null qq-chat--last-read-target-row-key)
+             (and last-index (> target-index last-index)))
+         (cond
+          ((and (integerp unread-count) (= unread-count 0) read-latest)
+           (when-let* ((read-index
+                        (qq-chat--message-index read-latest messages)))
+             (> target-index read-index)))
+          ((and (integerp unread-count) (> unread-count 0) first-unread)
+           (when-let* ((first-index
+                        (qq-chat--message-index first-unread messages)))
+             (>= target-index first-index)))
+          (t t)))))
 
 (defun qq-chat--mark-message-viewed (message &optional force)
   "Advance native read position through MESSAGE.
@@ -1034,26 +1046,27 @@ With FORCE, submit even when this buffer already requested the same target."
                  (with-current-buffer buffer
                    (setq qq-chat--guild-read-request-p nil)))
                (qq-api--default-error response reason))))))
-    (when-let* ((message-id (alist-get 'server-id message))
-                ((qq-api-message-id-p message-id))
-                ((or force (qq-chat--read-target-needed-p message-id))))
-      (if (not (qq-core-message-read-capable-p message))
-          (when force
-            (user-error
-             "qq: this message lacks a current stable Message Reference"))
-        (let ((buffer (current-buffer))
-              (session-key qq-chat--session-key))
-          (qq-core-mark-message-read
-           message
-           (lambda (_receipt)
-             (when (buffer-live-p buffer)
-               (with-current-buffer buffer
-                 (when (equal qq-chat--session-key session-key)
-                   ;; The Gateway acknowledgement proves remote completion,
-                   ;; but is not authoritative read state.  This callback
-                   ;; belongs to this dispatched reference, so it may advance
-                   ;; the buffer-local submission fence.
-                   (setq qq-chat--last-read-target-id message-id)))))))))))
+    (when message
+      (let ((row-key (alist-get 'canonical-row-key message)))
+        (if (not (qq-core-message-read-capable-p message))
+            (when force
+              (user-error
+               "qq: this message lacks a current canonical timeline row"))
+          (when (or force (qq-chat--read-target-needed-p message))
+            (let ((buffer (current-buffer))
+                  (session-key qq-chat--session-key))
+              (qq-core-mark-message-read
+               message
+               (lambda (_receipt)
+                 (when (buffer-live-p buffer)
+                   (with-current-buffer buffer
+                     (when (equal qq-chat--session-key session-key)
+                       ;; The Gateway acknowledgement proves remote completion,
+                       ;; but is not authoritative read state.  This callback
+                       ;; belongs to this dispatched row, so it may advance the
+                       ;; buffer-local submission fence.
+                       (setq qq-chat--last-read-target-row-key
+                             row-key)))))))))))))
 
 (defun qq-chat--manage-read-position (&optional position)
   "Advance read state to the message represented by POSITION.
@@ -1064,7 +1077,7 @@ prompt behavior.  Point on the timeline represents that exact message."
     (let ((position (or position (point))))
       (qq-chat--mark-message-viewed
        (if (appkit-chatbuf-point-in-input-p position)
-           (qq-chat--latest-visible-server-message)
+           (qq-chat--latest-visible-read-target)
          (qq-chat--message-at-point position))))))
 
 (defun qq-chat--window-scroll (window _display-start)
@@ -5641,12 +5654,12 @@ flag describes rows already materialized after this slice."
       (goto-char (or (appkit-chatbuf-input-start-position) (point-max))))))
 
 (defun qq-chat--mark-latest-window-read (&optional message-id)
-  "Mark MESSAGE-ID, or the newest visible server message, as read."
+  "Mark MESSAGE-ID, or the newest visible canonical row, as read."
   (if-let* ((message (or (and message-id
                               (qq-chat--message-by-server-id message-id))
-                         (qq-chat--latest-visible-server-message))))
+                         (qq-chat--latest-visible-read-target))))
       (qq-chat--mark-message-viewed message t)
-    (user-error "qq: this chat has no server message to mark as read")))
+    (user-error "qq: this chat has no canonical message to mark as read")))
 
 (defun qq-chat--adopt-live-frontier-window
     (frontier-at-start observed-frontier)
@@ -6346,7 +6359,7 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (setq-local qq-chat--forward-request-owner nil)
   (setq-local qq-chat--forward-sync-request nil)
   (setq-local qq-chat--forward-plan-owner (list 'forward-plan-owner))
-  (setq-local qq-chat--last-read-target-id nil)
+  (setq-local qq-chat--last-read-target-row-key nil)
   (setq-local qq-chat--guild-read-request-p nil)
   (setq-local qq-chat--fill-column nil)
   (setq-local appkit-media-card-fallback-context-function

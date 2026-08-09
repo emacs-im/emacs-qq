@@ -94,6 +94,7 @@
 (cl-defun qq-message-test-event
     (&key
      (account-id "slot-a")
+     row-key
      (message-id "7348923749823749823")
      (sent-at 1784700000)
      (sender '((uin . "10001") (uid . "u_peer")))
@@ -106,6 +107,7 @@
      (segments '(((kind . "text") (payload . ((text . "hello")))))))
   "Return one closed native Gateway message event payload."
   `((account_id . ,account-id)
+    ,@(when row-key `((row_key . ,row-key)))
     (message
      . ((message_id . ,message-id)
         (sent_at . ,sent-at)
@@ -141,12 +143,14 @@
 (cl-defun qq-message-test-poke
     (&key
      (account-id "slot-a")
+     (row-key "42")
      (message-id "7348923749823749823") (sent-at 1784700000)
      (sequence "9007199254740999") (group-uin "8209413637")
      (actor-uin "10002") (target-uin "9007199254741001"))
   "Return one authoritative group Poke GrayTip message payload."
   (qq-message-test-event
    :account-id account-id
+   :row-key row-key
    :message-id message-id
    :sent-at sent-at
    :sender `((uin . ,actor-uin))
@@ -1170,15 +1174,16 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         (aset text 0 ?X)
         (should (equal source-text "mutable"))))))
 
-(ert-deftest qq-message-mark-read-sends-exact-message-references ()
+(ert-deftest qq-message-mark-read-sends-canonical-row-targets ()
   (qq-message-test-with-state
     (let* ((private
             '((session-key . "private:10001")
               (server-id . "7348923749823749823")
+              (canonical-row-key . "17")
               (gateway-account-id . "slot-a")))
-           (group
+           (idless-group
             '((session-key . "group:8209413637")
-              (server-id . "7348923749823749824")
+              (canonical-row-key . "18")
               (gateway-account-id . "slot-a")))
            calls receipts)
       (cl-letf (((symbol-function 'qq-server-ready-p)
@@ -1188,18 +1193,17 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                 ((symbol-function 'qq-server-send)
                  (lambda (method params callback _errback &optional _early)
                    (push (list method (copy-tree params)) calls)
-                   (let ((message (alist-get 'message params)))
-                     (funcall
-                      callback
-                      `((account_id . "slot-a")
-                        (message_id . ,(alist-get 'message_id message)))))
+                   (funcall
+                    callback
+                    `((account_id . "slot-a")
+                      (row_key . ,(alist-get 'row_key params))))
                    (format "read-%d" (length calls)))))
         (should (qq-message-read-capable-p private))
-        (should (qq-message-read-capable-p group))
+        (should (qq-message-read-capable-p idless-group))
         (qq-message-mark-read
          private (lambda (receipt) (push receipt receipts)))
         (qq-message-mark-read
-         group (lambda (receipt) (push receipt receipts))))
+         idless-group (lambda (receipt) (push receipt receipts))))
       (setq calls (nreverse calls)
             receipts (nreverse receipts))
       (should
@@ -1208,18 +1212,16 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
         '(("message.mark_read"
            ((account_id . "slot-a")
             (conversation . ((kind . "private") (peer_uin . "10001")))
-            (message . ((message_id . "7348923749823749823")))))
+            (row_key . "17")))
           ("message.mark_read"
            ((account_id . "slot-a")
             (conversation . ((kind . "group")
                              (group_uin . "8209413637")))
-            (message . ((message_id . "7348923749823749824"))))))))
+            (row_key . "18"))))))
       (should
        (equal receipts
-              '(((account_id . "slot-a")
-                 (message_id . "7348923749823749823"))
-                ((account_id . "slot-a")
-                 (message_id . "7348923749823749824"))))))))
+              '(((account_id . "slot-a") (row_key . "17"))
+                ((account_id . "slot-a") (row_key . "18"))))))))
 
 (ert-deftest qq-message-projects-group-segments-and-metadata ()
   (qq-message-test-with-state
