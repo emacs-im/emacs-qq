@@ -35,6 +35,7 @@
      (media-id qq-remote-media-test-id)
      (account-id "slot-a")
      (message-id "7348923749823749823")
+     (sequence "42")
      (segment-index 0)
      (duration-seconds 17)
      (phase "available")
@@ -48,6 +49,7 @@
   `((media_id . ,media-id)
     (account_id . ,account-id)
     (message_id . ,message-id)
+    ,@(when sequence `((sequence . ,sequence)))
     (segment_index . ,segment-index)
     (kind . "record")
     (duration_seconds . ,duration-seconds)
@@ -113,6 +115,45 @@
                (alist-get 'account_id
                           (qq-remote-media qq-remote-media-test-id))
                "slot-a")))))
+
+(ert-deftest qq-remote-media-message-id-promotes-without-changing-identity ()
+  (qq-remote-media-test-with-state
+    (qq-remote-media--upsert
+     (qq-remote-media-test-snapshot :message-id nil) 'history)
+    (qq-remote-media--upsert
+     (qq-remote-media-test-snapshot
+      :message-id "7348923749823749823"
+      :updated-at 1784700001)
+     'live)
+    (should
+     (equal (alist-get 'message_id
+                       (qq-remote-media qq-remote-media-test-id))
+            "7348923749823749823"))
+    ;; An older command response cannot erase exact evidence learned from the
+    ;; live observation, even when both updates share timestamp granularity.
+    (qq-remote-media--upsert
+     (qq-remote-media-test-snapshot
+      :message-id nil
+      :phase "materializing"
+      :updated-at 1784700001)
+     'response)
+    (let ((projected (qq-remote-media qq-remote-media-test-id)))
+      (should (equal (alist-get 'message_id projected)
+                     "7348923749823749823"))
+      (should (equal (alist-get 'phase
+                                (qq-remote-media-part projected 'content))
+                     "materializing")))))
+
+(ert-deftest qq-remote-media-rejects-stable-position-or-exact-id-conflicts ()
+  (qq-remote-media-test-with-state
+    (qq-remote-media--upsert (qq-remote-media-test-snapshot) 'first)
+    (should-error
+     (qq-remote-media--upsert
+      (qq-remote-media-test-snapshot :sequence "43") 'conflict))
+    (should-error
+     (qq-remote-media--upsert
+      (qq-remote-media-test-snapshot :message-id "7348923749823749824")
+      'conflict))))
 
 (ert-deftest qq-remote-media-materialize-starts-background-state-machine ()
   (qq-remote-media-test-with-state

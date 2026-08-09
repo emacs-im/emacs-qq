@@ -100,15 +100,28 @@ PART is one of the symbols `content' and `thumbnail'."
   "Return non-nil when LEFT and RIGHT identify the same remote media."
   (cl-every (lambda (key)
               (equal (alist-get key left) (alist-get key right)))
-            '(media_id account_id message_id segment_index kind created_at)))
+            '(media_id account_id sequence segment_index kind created_at)))
+
+(defun qq-remote-media--merge-message-id (existing snapshot)
+  "Merge monotone exact-message evidence from EXISTING into SNAPSHOT."
+  (let ((existing-id (alist-get 'message_id existing))
+        (incoming-id (alist-get 'message_id snapshot)))
+    (when (and existing-id incoming-id (not (equal existing-id incoming-id)))
+      (error "qq: Gateway remote-media exact message identity changed"))
+    (if (and existing-id (null incoming-id))
+        (let ((merged (copy-tree snapshot)))
+          (setf (alist-get 'message_id merged) existing-id)
+          merged)
+      snapshot)))
 
 (defun qq-remote-media--upsert (snapshot reason)
   "Merge SNAPSHOT into the remote-media projection for REASON."
   (let* ((media-id (alist-get 'media_id snapshot))
          (existing (gethash media-id qq-remote-media--media)))
-    (when (and existing
-               (not (qq-remote-media--same-identity-p existing snapshot)))
-      (error "qq: Gateway remote-media identity changed for %s" media-id))
+    (when existing
+      (unless (qq-remote-media--same-identity-p existing snapshot)
+        (error "qq: Gateway remote-media identity changed for %s" media-id))
+      (setq snapshot (qq-remote-media--merge-message-id existing snapshot)))
     (when (and existing
                (< (alist-get 'updated_at snapshot)
                   (alist-get 'updated_at existing)))
