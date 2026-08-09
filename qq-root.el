@@ -37,6 +37,7 @@
 (declare-function qq-search-open "qq-search" (session-key &optional query))
 (declare-function qq-contacts-open "qq-contacts" ())
 (declare-function qq-guilds-open "qq-guilds" ())
+(declare-function qq-root-transient "qq-transient" ())
 
 (defconst qq-root-buffer-name "*qq-root*"
   "Name of the emacs-qq root buffer.")

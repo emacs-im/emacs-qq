@@ -512,32 +512,23 @@
     (should-error (call-interactively #'qq-transient-forward-merged)
                   :type 'user-error)))
 
-(ert-deftest qq-transient-recall-requires-a-native-reference-for-pokes ()
-  (let ((message
-         '((server-id . "9007199254741004001")
-           (self-p . t)
-           (segments . (((type . "poke")))))))
-    (cl-letf (((symbol-function 'float-time)
-               (lambda (&optional _time) 200))
-              ((symbol-function 'qq-transient--message-at-point)
-               (lambda () message)))
-      (should (qq-transient--recall-inapt-p))
-      (setq message
-            '((server-id . "9007199254741004001")
-              (self-p . t)
-              (poke-recall-reference
-               . ((message_id . "9007199254741004001")
-                  (peer . ((chat_type . 1)
-                           (peer_uid . "u_private-native-peer")
-                           (guild_id . "")))
-                  (valid_before . 201)))
-              (segments . (((type . "poke"))))))
-      (should-not (qq-transient--recall-inapt-p))
-      (setf (alist-get
-             'valid_before
-             (alist-get 'poke-recall-reference message))
-            200)
-      (should (qq-transient--recall-inapt-p)))))
+(ert-deftest qq-transient-recall-requires-a-group-poke-message-reference ()
+  (qq-transient-test-with-reset
+   (let ((qq-chat--session-key "group:20001")
+         (message
+          '((server-id . "9007199254741004001")
+            (session-key . "group:20001")
+            (gateway-account-id . "slot-a")
+            (self-p . t)
+            (timeline-class . service)
+            (segments
+             . (((type . "gray-tip")
+                 (data . ((kind . "poke")))))))))
+     (cl-letf (((symbol-function 'qq-transient--message-at-point)
+                (lambda () message)))
+       (should-not (qq-transient--recall-inapt-p))
+       (setf (alist-get 'session-key message) "private:10001")
+       (should (qq-transient--recall-inapt-p))))))
 
 (ert-deftest qq-transient-poke-is-inapt-in-service-session ()
   (qq-transient-test-with-reset

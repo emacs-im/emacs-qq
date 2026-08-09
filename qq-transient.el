@@ -33,6 +33,8 @@
 (declare-function qq-reset-session-state "qq")
 (declare-function qq-chat--forward-source-supported-p "qq-chat"
                   (&optional style session-key))
+(declare-function qq-message-poke-recall-capable-p
+                  "qq-message" (message))
 
 (defvar qq-chat--forward-request-owner)
 (defvar qq-chat--message-selection)
@@ -90,20 +92,15 @@
   "Return non-nil when recall is unavailable for the message at point."
   (let* ((message (qq-transient--message-at-point))
          (poke-p (and message (qq-state-poke-message-p message)))
-         (recall-reference
-          (and poke-p (qq-state-poke-recall-reference message)))
          (recall-target
           (and message
                (not poke-p)
                (qq-message-recall-target qq-chat--session-key message))))
     (or (null message)
         (not (alist-get 'self-p message))
-        (and (not poke-p) (null recall-target))
-        (and poke-p
-             (or (null (qq-message-exact-id message))
-                 (null recall-reference)
-                 (qq-protocol-poke-recall-reference-expired-p
-                  recall-reference)))
+        (if poke-p
+            (not (qq-message-poke-recall-capable-p message))
+          (null recall-target))
         (qq-state-message-recalled-p message))))
 
 (defun qq-transient--forward-inapt-p ()

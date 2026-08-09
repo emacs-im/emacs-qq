@@ -9,12 +9,14 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 'json)
 (require 'seq)
 (require 'subr-x)
 (require 'qq-customize)
 (require 'qq-guild-channel-type)
 (require 'qq-protocol)
+
+(declare-function qq-account--uint64-decimal-p
+                  "qq-account" (value &optional allow-zero))
 
 (defvar qq-state-change-hook nil
   "Hook called with one event plist argument after state mutations.
@@ -788,139 +790,36 @@ Values from NEW replace values in OLD."
   "Return non-nil when local MESSAGE has status `recalled'."
   (eq (alist-get 'status message) 'recalled))
 
-(defun qq-state-poke-message-p (message)
-  "Return non-nil when MESSAGE is a structured poke timeline row."
-  (or (qq-state--poke-notice-p message)
-      (let ((raw-event (alist-get 'raw-event message)))
-        (and (listp raw-event)
-             (qq-state--poke-notice-p raw-event)))
-      (seq-some
-       (lambda (segment)
-         (equal (alist-get 'type segment) "poke"))
-       (alist-get 'segments message))))
-
-(defun qq-state-gray-tip-message-p (message)
-  "Return non-nil when MESSAGE is a QQ gray-tip notice row."
-  (or (and (listp message) (alist-get 'gray-tip-p message))
-      (let ((raw-event (and (listp message) (alist-get 'raw-event message))))
-        (and (listp raw-event)
-             (qq-state--gray-tip-notice-p raw-event)))
-      (seq-some
-       (lambda (segment)
-         (equal (alist-get 'type segment) "gray-tip"))
-       (and (listp message) (alist-get 'segments message)))))
+(defun qq-state-service-message-p (message)
+  "Return non-nil when MESSAGE is a service-owned timeline row."
+  (and (listp message)
+       (eq (alist-get 'timeline-class message) 'service)))
 
 (defun qq-state-gray-tip-message-data (message)
-  "Return normalized visual data for gray-tip MESSAGE."
-  (when (qq-state-gray-tip-message-p message)
-    (let* ((segment
-            (seq-find
-             (lambda (candidate)
-               (equal (alist-get 'type candidate) "gray-tip"))
-             (alist-get 'segments message)))
-           (segment-data (and segment (alist-get 'data segment))))
-      (or segment-data
-          (let ((notice (if (qq-state--gray-tip-notice-p message)
-                            message
-                          (alist-get 'raw-event message))))
-            (and notice (qq-state--gray-tip-data notice)))))))
+  "Return MESSAGE's normalized GrayTip semantic data, or nil."
+  (when (listp message)
+    (when-let* ((segment
+                 (seq-find
+                  (lambda (candidate)
+                    (equal (alist-get 'type candidate) "gray-tip"))
+                  (alist-get 'segments message))))
+      (alist-get 'data segment))))
+
+(defun qq-state-gray-tip-message-p (message)
+  "Return non-nil when MESSAGE contains one typed GrayTip segment."
+  (and (qq-state-service-message-p message)
+       (qq-state-gray-tip-message-data message)
+       t))
 
 (defun qq-state-poke-message-data (message)
-  "Return normalized visual data for poke MESSAGE.
+  "Return typed Poke GrayTip data from MESSAGE, or nil."
+  (when-let* ((data (qq-state-gray-tip-message-data message))
+              ((equal (alist-get 'kind data) "poke")))
+    data))
 
-Older rows may only have `raw-event', so derive the same data lazily when
-their cached segment predates the richer poke renderer."
-  (when (qq-state-poke-message-p message)
-    (let* ((segment
-            (seq-find
-             (lambda (candidate)
-               (equal (alist-get 'type candidate) "poke"))
-             (alist-get 'segments message)))
-           (segment-data (and segment (alist-get 'data segment))))
-      (or segment-data
-          (let* ((notice (if (qq-state--poke-notice-p message)
-                             message
-                           (alist-get 'raw-event message)))
-                 (actor-id (qq-state--normalize-id
-                            (or (alist-get 'sender-id message)
-                                (alist-get 'sender_id notice)
-                                (alist-get 'user_id notice))))
-                 (target-id (qq-state--normalize-id
-                             (or (alist-get 'target-id message)
-                                 (alist-get 'target_id notice))))
-                 (actor-name (or (qq-state--present-string
-                                  (alist-get 'sender-name message))
-                                 (qq-state--poke-user-name actor-id nil)))
-                 (target-name (or (qq-state--present-string
-                                   (alist-get 'target-name message))
-                                  (qq-state--poke-user-name target-id nil))))
-            (qq-state--normalize-poke-info
-             notice actor-id target-id actor-name target-name))))))
-
-(defun qq-state-poke-recall-reference (message)
-  "Return a copy of MESSAGE's native poke recall reference, or nil."
-  (when (qq-state-poke-message-p message)
-    (copy-tree (alist-get 'poke-recall-reference message))))
-
-(defun qq-state--validate-poke-recall-context
-    (reference session-key &optional authoritative-private-p
-               expected-private-peer-uid)
-  "Return REFERENCE when its native Peer belongs to SESSION-KEY.
-
-Group peers are their decimal group IDs.  Private peers are opaque NT UIDs;
-the session must already own that exact UID before a recall can be sent.
-
-AUTHORITATIVE-PRIVATE-P is reserved for an inbound fork-authored poke notice.
-Such a notice may supply the first private UID, but can never replace an
-existing one.  EXPECTED-PRIVATE-PEER-UID, when non-nil, is an independently
-authenticated recent-contact UID that the notice must match before either is
-committed."
-  (when reference
-    (unless session-key
-      (error "qq: poke recall reference has no conversation"))
-    (let* ((peer (alist-get 'peer reference))
-           (chat-type (alist-get 'chat_type peer))
-           (peer-uid (alist-get 'peer_uid peer))
-           (session-type (qq-state-session-key-type session-key))
-           (target-id (qq-state-session-key-target-id session-key))
-           (known-peer-uid
-            (alist-get 'peer-uid (gethash session-key qq-state--sessions))))
-      (pcase session-type
-        ('group
-         (unless (and (= chat-type 2)
-                      (equal peer-uid target-id))
-           (error "qq: group poke recall reference does not match %s"
-                  session-key)))
-        ('private
-         (unless (= chat-type 1)
-           (error "qq: private poke recall reference has non-private peer"))
-         (when expected-private-peer-uid
-           (setq expected-private-peer-uid
-                 (qq-state--canonical-peer-uid
-                  expected-private-peer-uid "private poke context"))
-           (unless (equal peer-uid expected-private-peer-uid)
-             (error "qq: private poke recall reference contradicts its contact UID")))
-         (if (and (stringp known-peer-uid)
-                  (not (string-empty-p known-peer-uid)))
-             (unless (equal peer-uid known-peer-uid)
-               (error "qq: private poke recall reference does not match %s"
-                      session-key))
-           (unless authoritative-private-p
-             (error
-              "qq: private poke recall requires the session's exact peer UID")))
-         (unless (and (stringp peer-uid)
-                      (not (string-empty-p peer-uid)))
-           (error "qq: private poke recall reference does not match %s"
-                  session-key)))
-        (_
-         (error "qq: poke recall reference has unsupported conversation %s"
-                session-key)))))
-  reference)
-
-(defun qq-state-validate-poke-recall-reference (session-key reference)
-  "Return a copy of REFERENCE after validating explicit SESSION-KEY."
-  (qq-state-session-key-identity session-key)
-  (copy-tree (qq-state--validate-poke-recall-context reference session-key)))
+(defun qq-state-poke-message-p (message)
+  "Return non-nil when MESSAGE is a typed Poke GrayTip service row."
+  (and (qq-state-poke-message-data message) t))
 
 (defun qq-state--raw-message-recalled-p (message)
   "Return non-nil when raw OneBot MESSAGE is explicitly recalled.
@@ -1153,17 +1052,21 @@ reply chrome elsewhere).  Media becomes short placeholders like
                "[card]"))
           ("json" "[card]")
           ("xml" "[xml]")
-          ("poke"
-           (let ((action (qq-state--present-string (alist-get 'action data)))
-                 (target (qq-state--present-string (alist-get 'target-name data)))
-                 (detail (qq-state--present-string (alist-get 'detail data))))
-             (or (and action target (concat action " " target detail))
-                 (and action (concat action detail))
-                 (and target (concat "戳了戳 " target))
-                 "[poke]")))
           ("gray-tip"
-           (or (qq-state--present-string (alist-get 'text data))
-               "QQ system notice"))
+           (if (equal (alist-get 'kind data) "poke")
+               (let ((action
+                      (qq-state--present-string (alist-get 'action data)))
+                     (target
+                      (qq-state--present-string
+                       (alist-get 'target-name data)))
+                     (detail
+                      (qq-state--present-string (alist-get 'detail data))))
+                 (or (and action target (concat action " " target detail))
+                     (and action (concat action detail))
+                     (and target (concat "戳了戳 " target))
+                     "[poke]"))
+             (or (qq-state--present-string (alist-get 'text data))
+                 "QQ system notice")))
           ("dice" "[dice]")
           ("rps" "[rps]")
           ("share" "[share]")
@@ -1383,88 +1286,8 @@ missing or contradictory wire identity."
                derived expected-session-key)))
     derived))
 
-(defun qq-state--poke-notice-p (message)
-  "Return non-nil when MESSAGE is a NapCat poke notice."
-  (and (equal (alist-get 'post_type message) "notice")
-       (equal (alist-get 'notice_type message) "notify")
-       (equal (alist-get 'sub_type message) "poke")))
-
-(defun qq-state--gray-tip-notice-p (message)
-  "Return non-nil when MESSAGE is a NapCat gray-tip notice."
-  (and (equal (alist-get 'post_type message) "notice")
-       (equal (alist-get 'notice_type message) "notify")
-       (equal (alist-get 'sub_type message) "gray_tip")))
-
-(defun qq-state--gray-tip-json (notice)
-  "Return decoded JSON payload from gray-tip NOTICE, or nil."
-  (or (let ((raw-info (alist-get 'raw_info notice)))
-        (and (listp raw-info) (alist-get 'json raw-info)))
-      (when-let* ((content (alist-get 'content notice))
-                  ((stringp content)))
-        (condition-case nil
-            (json-parse-string content
-                               :object-type 'alist
-                               :array-type 'list
-                               :null-object nil
-                               :false-object nil)
-          (json-parse-error nil)))))
-
-(defun qq-state--normalize-gray-tip-parts (notice)
-  "Return strict interactive presentation parts carried by NOTICE."
-  (mapcar
-   (lambda (part)
-     (unless (listp part)
-       (error "qq: gray-tip presentation part is not an object"))
-     (pcase (alist-get 'type part)
-       ("text"
-        (let ((text (qq-state--present-string (alist-get 'text part))))
-          (unless text
-            (error "qq: gray-tip text part is empty"))
-          `((type . "text") (text . ,text))))
-       ("user"
-        (let ((user-id (qq-state--normalize-id (alist-get 'user_id part)))
-              (name (qq-state--present-string (alist-get 'name part)))
-              (role (alist-get 'role part)))
-          (unless (qq-protocol--nonzero-decimal-string-p user-id)
-            (error "qq: gray-tip user part requires an exact QQ number"))
-          (unless name
-            (error "qq: gray-tip user part requires a display name"))
-          (unless (member role '("member" "inviter"))
-            (error "qq: gray-tip user part has invalid role %S" role))
-          `((type . "user")
-            (role . ,role)
-            (user-id . ,user-id)
-            (name . ,name))))
-       (_
-        (error "qq: unsupported gray-tip presentation part %S"
-               (alist-get 'type part)))))
-   (or (alist-get 'gray_tip_parts notice) '())))
-
-(defun qq-state--gray-tip-data (notice)
-  "Return stable visual data decoded from gray-tip NOTICE."
-  (let* ((direct-text
-          (qq-state--present-string (alist-get 'text notice)))
-         (json (qq-state--gray-tip-json notice))
-         (items (and (listp json) (alist-get 'items json)))
-         (texts
-          (delq nil
-                (mapcar
-                 (lambda (item)
-                   (and (listp item)
-                        (qq-state--present-string (alist-get 'txt item))))
-                 (if (listp items) items '()))))
-         (text (or direct-text
-                   (and texts (string-join texts ""))
-                   "QQ system notice")))
-    `((text . ,text)
-      (kind . ,(qq-state--present-string
-                (alist-get 'gray_tip_kind notice)))
-      (busi-id . ,(qq-state--normalize-id (alist-get 'busi_id notice)))
-      (parts . ,(qq-state--normalize-gray-tip-parts notice))
-      (items . ,(copy-tree items)))))
-
-(defun qq-state--poke-user-name (user-id explicit-name)
-  "Return a display name for POKE USER-ID, preferring EXPLICIT-NAME."
+(defun qq-state--gray-tip-user-name (user-id explicit-name)
+  "Return a GrayTip display name for USER-ID, preferring EXPLICIT-NAME."
   (let* ((user-id (qq-state--normalize-id user-id))
          (friend (and user-id (gethash user-id qq-state--friends-by-id)))
          (self-p (and user-id
@@ -1482,219 +1305,13 @@ missing or contradictory wire identity."
                    user-id)))
     (or name "某人")))
 
-(defun qq-state--normalize-poke-info
-    (notice actor-id target-id actor-name target-name)
-  "Return normalized visual metadata from POKE NOTICE.
-
-`raw_info' is NapCat's QQ-native gray-tip decoration list.  Keep only the
-small stable subset needed by the Emacs renderer: the action image URL and
-the natural-language fragments.  The complete original notice remains in
-`raw-event' for protocol/debugging purposes."
-  (let ((raw-info (alist-get 'raw_info notice))
-        image-url
-        texts)
-    (dolist (item (if (listp raw-info) raw-info '()))
-      (when (listp item)
-        (let ((text (qq-state--present-string (alist-get 'txt item)))
-              (type (qq-state--normalize-id (alist-get 'type item))))
-          (when (and (equal type "img") (null image-url))
-            (setq image-url
-                  (qq-state--present-string
-                   (or (alist-get 'src item)
-                       (alist-get 'url item)
-                       (alist-get 'jp item)))))
-          (when text
-            (push text texts)))))
-    (setq texts (nreverse texts))
-    `((actor-id . ,actor-id)
-      (target-id . ,target-id)
-      (actor-name . ,actor-name)
-      (target-name . ,target-name)
-      (image-url . ,image-url)
-      (action . ,(car texts))
-      (detail . ,(and (cdr texts) (string-join (cdr texts) "")))
-      (texts . ,texts))))
-
-(defun qq-state--normalize-poke-notice
-    (notice &optional expected-session-key expected-private-peer-uid)
-  "Normalize a live or historical POKE NOTICE into a timeline message.
-
-EXPECTED-PRIVATE-PEER-UID is trusted recent-contact context used to validate a
-structured latest poke before that contact has mutated the session store."
-  (let* ((group-id (qq-state--normalize-id (alist-get 'group_id notice)))
-         (local-marker-cell (assq 'emacs_local_p notice))
-         (recall-reference-cell (assq 'recall_reference notice))
-         (legacy-message-id-cell (assq 'message_id notice))
-         (local-poke-p
-          (and local-marker-cell
-               (eq (cdr local-marker-cell) t)))
-         (unscoped-recall-reference
-          (cond
-           (legacy-message-id-cell
-            (error "qq: poke notice must not carry top-level message_id"))
-           ((and local-poke-p (null recall-reference-cell)) nil)
-           ((and (null local-marker-cell) recall-reference-cell)
-            (qq-protocol-validate-poke-recall-reference
-             (cdr recall-reference-cell) "poke notice"))
-           (t
-            (error
-             "qq: poke notice must be either local or carry recall_reference"))))
-         ;; In a private poke, user_id is the peer and sender_id is the actor
-         ;; (the fork emits sender_id for this case).  Group pokes use user_id
-         ;; as the actor, matching the OneBot notice contract.
-         (peer-id (and (null group-id)
-                       (qq-state--normalize-id (alist-get 'user_id notice))))
-         (derived-session-key
-          (cond
-           (group-id (qq-state-session-key 'group group-id))
-           (peer-id (qq-state-session-key 'private peer-id))))
-         (session-key
-          (progn
-            (when expected-session-key
-              (qq-state-session-key-identity expected-session-key)
-              (unless derived-session-key
-                (error "qq: poke notice is missing its session identity"))
-              (unless (equal derived-session-key expected-session-key)
-                (error "qq: poke session %S contradicts expected session %S"
-                       derived-session-key expected-session-key)))
-            derived-session-key))
-         (recall-reference
-          (qq-state--validate-poke-recall-context
-           unscoped-recall-reference session-key t
-           expected-private-peer-uid))
-         (peer-uid
-          (and (null group-id)
-               recall-reference
-               (alist-get 'peer_uid (alist-get 'peer recall-reference))))
-         (actor-id (qq-state--normalize-id
-                    (or (alist-get 'sender_id notice)
-                        (alist-get 'user_id notice))))
-         (target-id (qq-state--normalize-id (alist-get 'target_id notice)))
-         (actor-name
-          (qq-state--poke-user-name actor-id (alist-get 'sender_name notice)))
-         (target-name
-          (qq-state--poke-user-name target-id (alist-get 'target_name notice)))
-         (poke-info
-          (qq-state--normalize-poke-info
-           notice actor-id target-id actor-name target-name))
-         (body (if target-id
-                   (format "戳了戳 %s" target-name)
-                 "戳了戳"))
-         (time (qq-state--normalize-time
-                (or (alist-get 'time notice) (float-time))))
-         ;; The authoritative fork exposes one closed native recall reference;
-         ;; its msgId is also the timeline identity.  Optimistic local notices
-         ;; remain local-only until the matching authoritative event arrives.
-         (server-id (alist-get 'message_id recall-reference))
-         (local-id
-          (and local-poke-p
-               (format "local-poke-%d"
-                       (cl-incf qq-state--local-message-counter))))
-         (anchor (or server-id local-id))
-         (self-p (and actor-id
-                      (equal actor-id (qq-state-self-user-id))))
-         (message
-          `((id . ,anchor)
-            (server-id . ,server-id)
-            (local-id . ,local-id)
-            (session-key . ,session-key)
-            (time . ,time)
-            (sender-id . ,actor-id)
-            (sender-name . ,actor-name)
-            (sender-secondary-name . nil)
-            (sender-card . nil)
-            (sender-nickname . ,actor-name)
-            (sender-remark . nil)
-            (self-p . ,self-p)
-            (local-poke-p . ,local-poke-p)
-            (poke-recall-reference . ,recall-reference)
-            (status . ,(if self-p 'sent 'received))
-            ;; Poke notices are gray-tip records, not ordinary text messages.
-            ;; Keep their visual metadata as a dedicated segment so chat can
-            ;; render the QQ-style action without using the normal message
-            ;; header/body layout.
-            (segments . ,(list `((type . "poke")
-                                 (data . ,poke-info))))
-            (raw-message . ,body)
-            (preview . ,body)
-            (message-type . ,(if group-id "group" "private"))
-            (peer-uid . ,peer-uid)
-            (group-id . ,group-id)
-            (user-id . ,actor-id)
-            (target-id . ,target-id)
-            (order . ,(qq-state--next-message-order))
-            (raw-event . ,(copy-tree notice)))))
-    message))
-
-(defun qq-state--normalize-gray-tip-notice
-    (notice &optional expected-session-key)
-  "Normalize fork-native gray-tip NOTICE into a timeline message.
-
-When EXPECTED-SESSION-KEY is non-nil, require NOTICE's native `group_id' to
-identify that exact group session."
-  (let* ((group-id (qq-state--normalize-id (alist-get 'group_id notice)))
-         (derived-session-key
-          (and group-id (qq-state-session-key 'group group-id)))
-         (session-key
-          (progn
-            (when expected-session-key
-              (qq-state-session-key-identity expected-session-key)
-              (unless derived-session-key
-                (error "qq: gray-tip notice is missing its group identity"))
-              (unless (equal derived-session-key expected-session-key)
-                (error "qq: gray-tip session %S contradicts expected session %S"
-                       derived-session-key expected-session-key)))
-            derived-session-key))
-         (server-id
-          (qq-protocol-optional-message-id
-           (alist-get 'message_id notice)
-           "gray-tip notice"))
-         (data (qq-state--gray-tip-data notice))
-         (text (alist-get 'text data))
-         (raw-info (alist-get 'raw_info notice))
-         (time
-          (qq-state--normalize-time
-           (or (alist-get 'time notice)
-               (and (listp raw-info) (alist-get 'msgTime raw-info)))))
-         (sender-id
-          (let ((id (qq-state--normalize-id (alist-get 'user_id notice))))
-            (and id (not (equal id "0")) id))))
-    (unless session-key
-      (error "qq: gray-tip notice requires group_id"))
-    (unless server-id
-      (error "qq: gray-tip notice requires NT message_id"))
-    `((id . ,server-id)
-      (server-id . ,server-id)
-      (session-key . ,session-key)
-      (time . ,time)
-      (sender-id . ,sender-id)
-      (sender-name . "QQ")
-      (self-p . nil)
-      (status . received)
-      (gray-tip-p . t)
-      (segments . (((type . "gray-tip") (data . ,data))))
-      (raw-message . ,text)
-      (preview . ,text)
-      (message-type . "group")
-      (group-id . ,group-id)
-      (user-id . ,sender-id)
-      (order . ,(qq-state--next-message-order))
-      (raw-event . ,(copy-tree notice)))))
-
 (defun qq-state--normalize-raw-message
     (message &optional expected-session-key expected-private-peer-uid)
   "Normalize raw OneBot MESSAGE into local store shape.
 
 EXPECTED-PRIVATE-PEER-UID constrains a private payload without supplying any
 missing wire identity."
-  (cond
-   ((qq-state--poke-notice-p message)
-    (qq-state--normalize-poke-notice
-     message expected-session-key expected-private-peer-uid))
-   ((qq-state--gray-tip-notice-p message)
-    (qq-state--normalize-gray-tip-notice message expected-session-key))
-   (t
-    (let* ((chat-type (qq-state--normalize-id (qq-state--message-chat-type message)))
+  (let* ((chat-type (qq-state--normalize-id (qq-state--message-chat-type message)))
            (peer-uid (qq-state--message-peer-uid message))
            (peer-uin (qq-state--message-peer-uin message))
            (session-key (qq-state--raw-message-session-key
@@ -1752,6 +1369,7 @@ missing wire identity."
         (sender-remark . ,(alist-get 'sender-remark sender-fields))
         (self-p . ,self-p)
         (status . ,status)
+        (timeline-class . authored)
         (segments . ,segments)
         (mention-kinds . ,mention-kinds)
         (contains-mention-p . ,(and mention-kinds t))
@@ -1771,7 +1389,7 @@ missing wire identity."
             `((reactions . ,(qq-state--normalize-reactions
                              (alist-get 'emoji_likes_list message)))))
         (order . ,(qq-state--next-message-order))
-        (raw-event . ,(copy-tree message)))))))
+        (raw-event . ,(copy-tree message)))))
 
 (defun qq-state--emacs-search-chat-session-key (chat)
   "Return canonical group/private session key represented by closed CHAT."
@@ -1916,6 +1534,13 @@ canonical history cache."
         (status . ,(cond (recalled-p 'recalled)
                          (self-p 'sent)
                          (t 'received)))
+        (timeline-class
+         . ,(if (seq-some
+                 (lambda (segment)
+                   (equal (alist-get 'type segment) "gray-tip"))
+                 segments)
+                'service
+              'authored))
         (segments . ,segments)
         (mention-kinds . ,mention-kinds)
         (contains-mention-p . ,(and mention-kinds t))
@@ -1945,22 +1570,27 @@ chat timeline and used by weak pending-message matching."
          (segments (copy-tree (or segments '())))
          (preview (qq-state-message-preview-from-segments segments))
          (raw-message (or raw-message preview "")))
-    `((id . ,local-id)
-      (local-id . ,local-id)
-      (session-key . ,session-key)
-      (time . ,time)
-      (sender-id . ,(qq-state-self-user-id))
-      (sender-name . ,self-name)
-      (sender-secondary-name . nil)
-      (sender-card . nil)
-      (sender-nickname . ,self-name)
-      (sender-remark . nil)
-      (self-p . t)
-      (status . pending)
-      (segments . ,segments)
-      (raw-message . ,raw-message)
-      (preview . ,preview)
-      (order . ,(qq-state--next-message-order)))))
+    ;; Backquote may share constant cons cells such as `(status . pending)'
+    ;; across calls.  Timeline messages are mutable projection objects, so
+    ;; return an entirely owned tree before any operation enriches one.
+    (copy-tree
+     `((id . ,local-id)
+       (local-id . ,local-id)
+       (session-key . ,session-key)
+       (time . ,time)
+       (sender-id . ,(qq-state-self-user-id))
+       (sender-name . ,self-name)
+       (sender-secondary-name . nil)
+       (sender-card . nil)
+       (sender-nickname . ,self-name)
+       (sender-remark . nil)
+       (self-p . t)
+       (status . pending)
+       (timeline-class . authored)
+       (segments . ,segments)
+       (raw-message . ,raw-message)
+       (preview . ,preview)
+       (order . ,(qq-state--next-message-order))))))
 
 (defun qq-state--pending-text-message (session-key text &optional reply-to-message-id)
   "Return a local pending text message for SESSION-KEY with TEXT.
@@ -2015,16 +1645,16 @@ pending message model."
                 (equal (alist-get 'id it) id)))))))
 
 (defun qq-state--native-message-correlation-key (message)
-  "Return MESSAGE's transport-stable correlation key, or nil.
+  "Return authored MESSAGE's transport correlation key, or nil.
 
-The key is scoped by the caller's session.  It is intentionally not a public
-message identity: group history in some QQ builds omits ContentHead `newId'
-while separately carrying a legacy UID.  Its conversation-scoped sequence
-still matches the live push and lets the client avoid rendering the same
-transport record twice."
+The key is scoped by the caller's session and is not a public identity.  It
+exists only to correlate an id-less authored history row with its live form.
+Service Timeline Messages are independently addressable rows and may share a
+sequence, so they must converge only by exact row identity."
   (let ((sequence (alist-get 'message-seq message))
         (random (alist-get 'native-random message)))
-    (when (qq-protocol--nonzero-decimal-string-p sequence)
+    (when (and (not (qq-state-service-message-p message))
+               (qq-protocol--nonzero-decimal-string-p sequence))
       (if (equal (alist-get 'message-type message) "group")
           ;; Group sequence is itself the conversation-scoped native locator
           ;; used by history, reply seek, and recall.  Some history builds omit
@@ -2265,8 +1895,7 @@ fallback describes the already accepted exact message."
 
 (defun qq-state--message-summary-fields (message)
   "Return root latest-message summary fields for normalized MESSAGE."
-  (let ((special-p (or (qq-state-poke-message-p message)
-                       (qq-state-gray-tip-message-p message))))
+  (let ((special-p (qq-state-service-message-p message)))
     `((last-message-time
        . ,(qq-state--normalize-time (alist-get 'time message)))
       (last-message-id . ,(or (alist-get 'server-id message)
@@ -2777,6 +2406,13 @@ Return three values via `cl-values':
       (status . ,(cond (recalled-p 'recalled)
                        (self-p 'sent)
                        (t 'received)))
+      (timeline-class
+       . ,(if (seq-some
+               (lambda (segment)
+                 (equal (alist-get 'type segment) "gray-tip"))
+               segments)
+              'service
+            'authored))
       (segments . ,segments)
       (mention-kinds . ,mention-kinds)
       (contains-mention-p . ,(and mention-kinds t))
@@ -2935,48 +2571,6 @@ activity notifications rather than posts."
                     :session (qq-state-session session-key)
                     :mutation 'read)
     session-key))
-
-(defun qq-state-apply-poke-notice (notice)
-  "Append a local timeline message for OneBot NOTIFY/POKE NOTICE.
-
-NapCat reports pokes as notices rather than ordinary messages.  The notice has
-no sender display object; use the fork's closed native recall reference for
-authoritative identity, and a local event anchor only for an optimistic local
-echo.  Numeric participant IDs remain display labels of last resort."
-  (let* ((message (qq-state--normalize-poke-notice notice))
-         (session-key (alist-get 'session-key message)))
-    (when session-key
-      (cl-multiple-value-bind (merged mutation previous-anchor)
-          (qq-state--merge-normalized-message session-key message)
-        (when merged
-          (apply #'qq-state--emit
-                 'message
-                 :session-key session-key
-                 :message (copy-tree merged)
-                 :message-anchor (qq-state-message-anchor merged)
-                 :mutation mutation
-                 :source 'notice
-                 (when previous-anchor
-                   (list :previous-anchor previous-anchor)))
-          merged)))))
-
-(defun qq-state-apply-gray-tip-notice (notice)
-  "Merge fork-native JSON gray-tip NOTICE into its group timeline."
-  (let* ((message (qq-state--normalize-gray-tip-notice notice))
-         (session-key (alist-get 'session-key message)))
-    (cl-multiple-value-bind (merged mutation previous-anchor)
-        (qq-state--merge-normalized-message session-key message)
-      (when merged
-        (apply #'qq-state--emit
-               'message
-               :session-key session-key
-               :message (copy-tree merged)
-               :message-anchor (qq-state-message-anchor merged)
-               :mutation mutation
-               :source 'notice
-               (when previous-anchor
-                 (list :previous-anchor previous-anchor)))
-        merged))))
 
 (defun qq-state-merge-history (session-key raw-messages &optional request-owner)
   "Merge RAW-MESSAGES history batch into SESSION-KEY.
@@ -3355,15 +2949,16 @@ Return the updated canonical message, if one was present."
       nil))))
 
 (defun qq-state-apply-group-sequence-recall (session-key sequence)
-  "Mark the unique group message at SEQUENCE in SESSION-KEY as recalled.
+  "Mark the unique authored group row at SEQUENCE as recalled.
 
-Group recall is closed on the native wire by `(group, sequence)' even when a
-history row has not yet acquired its global NT message snowflake.  Do not
-manufacture a message id from legacy `msgUid' metadata.  If the cached row
-already has an exact id, delegate to `qq-state-apply-recall' so the durable
-id-scoped patch journal remains available to filtered projections.
+Ordinary group recall is closed on `(group, sequence)'; Service Timeline
+Messages sharing that cursor use their dedicated operations and must not be
+selected accidentally.  Do not manufacture a message id from legacy `msgUid'
+metadata.  If the authored row has an exact id, delegate to
+`qq-state-apply-recall' so the durable id-scoped patch journal remains
+available to filtered projections.
 
-Return the updated canonical message, or nil when the sequence is not cached."
+Return the updated canonical message, or nil when the authored row is absent."
   (let ((identity (qq-state-session-key-identity session-key)))
     (unless (eq (alist-get 'type identity) 'group)
       (error "qq: sequence recall requires an explicit group session"))
@@ -3372,11 +2967,15 @@ Return the updated canonical message, or nil when the sequence is not cached."
   (let* ((messages
           (copy-tree
            (or (gethash session-key qq-state--messages-by-session) '())))
-         (existing
-          (seq-find
+         (matches
+          (seq-filter
            (lambda (message)
-             (equal (alist-get 'message-seq message) sequence))
-           messages)))
+             (and (not (qq-state-service-message-p message))
+                  (equal (alist-get 'message-seq message) sequence)))
+           messages))
+         (existing (car matches)))
+    (when (cdr matches)
+      (error "qq: Multiple authored group messages share one sequence"))
     (when existing
       (if-let* ((message-id (alist-get 'server-id existing)))
           (qq-state-apply-recall session-key message-id)
@@ -3591,6 +3190,9 @@ canonical history."
          (identity (qq-state-session-key-identity session-key))
          (session-type (alist-get 'type identity))
          (message (copy-tree (plist-get entry :message)))
+         (server-id (alist-get 'server-id message))
+         (canonical-row-key (alist-get 'canonical-row-key message))
+         (presentation-id (alist-get 'id message))
          (revision (plist-get entry :activity-revision))
          (pinned-known-p (plist-get entry :pinned-known-p))
          (pinned (plist-get entry :pinned)))
@@ -3599,7 +3201,12 @@ canonical history."
              session-key))
     (unless (and (listp message)
                  (equal (alist-get 'session-key message) session-key)
-                 (qq-protocol-message-id-p (alist-get 'server-id message))
+                 (or (qq-protocol-message-id-p server-id)
+                     (and (null server-id)
+                          (qq-protocol--nonzero-decimal-string-p
+                           canonical-row-key)
+                          (stringp presentation-id)
+                          (not (string-empty-p presentation-id))))
                  (integerp (alist-get 'time message))
                  (>= (alist-get 'time message) 0)
                  (qq-protocol--decimal-string-p
@@ -3755,19 +3362,10 @@ its session metadata can be committed."
                       (and (eq session-type 'dataline)
                            (equal embedded-seq "0")))
             (error "qq: recent contact msgSeq disagrees with latest message")))
-        (if (qq-state--poke-notice-p message-copy)
-            ;; Authoritative pokes deliberately carry their snowflake only in
-            ;; recall_reference.  Do not reintroduce the forbidden legacy
-            ;; top-level message_id while completing a recent-contact row.
-            (let ((reference-id
-                   (alist-get
-                    'message_id (alist-get 'recall_reference message-copy))))
-              (when (and msg-id reference-id (not (equal msg-id reference-id)))
-                (error "qq: recent contact msgId disagrees with latest poke")))
-          (when (and msg-id
-                     (not (alist-get 'message_id message-copy nil nil #'eq))
-                     (not (alist-get 'id message-copy nil nil #'eq)))
-            (push (cons 'message_id msg-id) message-copy)))
+        (when (and msg-id
+                   (not (alist-get 'message_id message-copy nil nil #'eq))
+                   (not (alist-get 'id message-copy nil nil #'eq)))
+          (push (cons 'message_id msg-id) message-copy))
         (when (and msg-seq
                    ;; Never disguise a recent-contact summary sequence as a
                    ;; DataLine RawMessage cursor.  DataLine timeline messages
