@@ -2650,7 +2650,7 @@ transaction can retry without losing structured input properties."
   "Return visible input label for structured SEGMENT.
 
 Face segments use the same inline image (or `/名称') as the timeline.
-Favorite stickers (`image' with sub_type 1, or mface) try local thumbs."
+Favorite drafts remain durable identity objects until send-time materialization."
   (let* ((type (or (alist-get 'type segment) "segment"))
          (data (alist-get 'data segment)))
     (pcase type
@@ -2664,6 +2664,7 @@ Favorite stickers (`image' with sub_type 1, or mface) try local thumbs."
       ("face"
        (let ((id (or (alist-get 'id data) "?")))
          (qq-media-face-display-string id)))
+      ("favorite_emoji" "[收藏表情]")
       ("mface"
        (let* ((summary (or (alist-get 'summary data) "[商城表情]"))
               (file (or (alist-get 'file data)
@@ -2732,8 +2733,8 @@ Favorite stickers (`image' with sub_type 1, or mface) try local thumbs."
 (defun qq-chat--insert-input-segment-object (segment &optional visible-label)
   "Insert outbound QQ SEGMENT into the composer as one object.
 
-VISIBLE-LABEL overrides the segment-derived label, for example to retain a
-favorite face's local thumbnail alongside its sendable mface payload."
+VISIBLE-LABEL overrides the segment-derived label, for example to retain the
+catalog label while a favorite draft stores only its durable identity."
   ;; Structured insertion inhibits ordinary modification hooks inside Appkit,
   ;; so revoke stale send restoration explicitly before changing the draft.
   (setq qq-chat--send-restore-owner nil
@@ -2847,7 +2848,7 @@ Bound via `qq-chat-attach-emoji' (`C-c C-e'); attach transient `e'."
              id)))
 
 (defun qq-chat--insert-custom-face (face)
-  "Insert favorite FACE alist into the composer as a sendable segment."
+  "Insert favorite FACE into the composer by durable native identity."
   (let ((segment (qq-media-custom-face-to-segment face)))
     (qq-chat--insert-input-segment-object
      segment (qq-media-custom-face-display-string face))
@@ -2857,8 +2858,7 @@ Bound via `qq-chat-attach-emoji' (`C-c C-e'); attach transient `e'."
 (defun qq-chat--pick-custom-face (faces)
   "Completing-read among FACES and insert the chosen favorite.
 
-Uses the shared Appkit candidate layer so favorites keep NapCat order and show
-local thumb previews with the same treatment as composer completion."
+Uses the shared Appkit candidate layer and preserves native catalog order."
   (unless faces
     (user-error "qq: no favorite custom faces (收藏表情为空)"))
   (qq-chat--insert-custom-face (qq-completion-read-custom-face faces)))
@@ -2866,17 +2866,17 @@ local thumb previews with the same treatment as composer completion."
 (defun qq-chat-attach-custom-face (&optional force-refresh)
   "Insert a favorite custom face (收藏表情) into the chat composer.
 
-Uses NapCat `fetch_custom_face_info'.  Personal favorites are sent as
-image segments with `sub_type' 1; market favorites as mface when possible.
+The native catalog contributes only a durable favorite identity to the draft.
+At send time Gateway materializes verified bytes and the existing image
+attachment pipeline prepares them with image subtype 1.
 
-  With prefix FORCE-REFRESH, re-fetch the list from NapCat.
+With prefix FORCE-REFRESH, bypass Gateway's catalog cache.
 Bound via `C-u C-c C-e' or attach transient `E'."
   (interactive "P")
   (let ((buffer (current-buffer))
         (session-key qq-chat--session-key)
         (view (qq-chat--ensure-view)))
-    (unless (and (not force-refresh) (qq-media-custom-faces-loaded-p))
-      (message "qq: loading favorite faces…"))
+    (message "qq: loading favorite faces…")
     (qq-media-ensure-custom-faces
      (lambda (faces)
        (when (and (buffer-live-p buffer) view)
@@ -3512,6 +3512,7 @@ base emoji), never as OneBot CQ text."
        (qq-media-face-display-string
         (or (qq-chat--face-segment-id segment) "?")
         (qq-chat--face-segment-description segment)))
+      ("favorite_emoji" "[收藏表情]")
       (_ nil))))
 
 (defun qq-chat--mail-segment-p (segment)

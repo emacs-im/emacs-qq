@@ -462,58 +462,58 @@
       (should (equal "face" (alist-get 'type segment)))
       (should (equal "178" (alist-get 'id (alist-get 'data segment)))))))
 
-(ert-deftest qq-completion-custom-face-prefixes-keep-per-candidate-face ()
-  (let ((faces '(((md5 . "one") (url . "https://example.invalid/one.png"))
-                 ((md5 . "two") (url . "https://example.invalid/two.png")))))
-    (cl-letf (((symbol-function 'qq-media-custom-face-to-segment)
+(ert-deftest qq-completion-custom-face-candidates-keep-identity-and-preview ()
+  (let* ((faces '(((favorite_emoji_id . "favorite-one")
+                   (md5 . "11111111111111111111111111111111")
+                   (url . "https://example.invalid/one.png"))
+                  ((favorite_emoji_id . "favorite-two")
+                   (md5 . "22222222222222222222222222222222")
+                   (url . "https://example.invalid/two.png"))))
+         (candidates (qq-completion--custom-face-candidates faces))
+         previewed)
+    (should
+     (equal '("favorite-one" "favorite-two")
+            (mapcar
+             (lambda (candidate)
+               (alist-get
+                'favorite_emoji_id
+                (plist-get
+                 (appkit-chat-completion-candidate-value candidate) :face)))
+             candidates)))
+    (cl-letf (((symbol-function 'qq-media--custom-face-completion-prefix)
                (lambda (face)
-                 `((type . "image") (data . ((name . ,(alist-get 'md5 face)))))))
-              ((symbol-function 'qq-media--custom-face-completion-prefix)
-               (lambda (face) (alist-get 'md5 face))))
-      (let ((candidates (qq-completion--custom-face-candidates faces)))
+                 (setq previewed face)
+                 "preview ")))
+      (let ((first (car candidates)))
         (should
-         (equal '("one" "two")
-                (mapcar
-                 (lambda (candidate)
-                   (funcall
-                    (appkit-chat-completion-candidate-prefix candidate)
-                    candidate))
-                 candidates)))))))
+         (equal "preview "
+                (funcall (appkit-chat-completion-candidate-prefix first)
+                         first)))
+        (should (equal previewed (car faces)))))))
 
-(ert-deftest qq-completion-fav-capf-inserts-thumbnail-backed-segment ()
+(ert-deftest qq-completion-fav-capf-inserts-durable-favorite-segment ()
   (qq-completion-test-with-group
-    (let ((old-faces qq-media--custom-faces)
-          (old-fetched-at qq-media--custom-faces-fetched-at)
-          (face '((md5 . "abcdef123456")
-                  (desc . "趴")
-                  (emo_id . 2)
-                  (is_mark_face . :false)
-                  (url . "https://example.invalid/favorite.png"))))
-      (unwind-protect
-          (cl-letf (((symbol-function 'qq-media-custom-face-display-string)
-                     (lambda (_face)
-                       (propertize "favorite" 'display 'favorite-image))))
-            (setq qq-media--custom-faces (list face)
-                  qq-media--custom-faces-fetched-at (float-time))
-            (insert "/fav趴")
-            (let* ((capf (qq-completion-face-capf))
-                   (table (nth 2 capf))
-                   (exit (plist-get (nthcdr 3 capf) :exit-function))
-                   (label (car (all-completions "/fav趴" table))))
-              (should (stringp label))
-              (delete-region (- (point) 5) (point))
-              (insert label)
-              (funcall exit label 'finished))
-            (goto-char (appkit-chatbuf-input-start-position))
-            (let* ((object (appkit-chatbuf-input-object-at-point))
-                   (segment (plist-get object :segment)))
-              (should (equal "image" (alist-get 'type segment)))
-              (should (= 1 (alist-get 'sub_type (alist-get 'data segment))))
-              (should (eq 'favorite-image
-                          (get-text-property 0 'display
-                                             (plist-get object :label))))))
-        (setq qq-media--custom-faces old-faces
-              qq-media--custom-faces-fetched-at old-fetched-at)))))
+    (let* ((favorite-id "10001_0_0_0_ABCDEF1234567890ABCDEF1234567890_0_0")
+           (face `((favorite_emoji_id . ,favorite-id)
+                   (md5 . "abcdef1234567890abcdef1234567890")
+                   (url . "https://example.invalid/favorite.png"))))
+      (setq qq-completion--custom-faces (list face))
+      (insert "/fav")
+      (let* ((capf (qq-completion-face-capf))
+             (table (nth 2 capf))
+             (exit (plist-get (nthcdr 3 capf) :exit-function))
+             (label (car (all-completions "/fav" table))))
+        (should (stringp label))
+        (delete-region (- (point) 4) (point))
+        (insert label)
+        (funcall exit label 'finished))
+      (goto-char (appkit-chatbuf-input-start-position))
+      (let* ((object (appkit-chatbuf-input-object-at-point))
+             (segment (plist-get object :segment)))
+        (should
+         (equal segment
+                `((type . "favorite_emoji")
+                  (data . ((favorite_emoji_id . ,favorite-id))))))))))
 
 (ert-deftest qq-completion-unicode-emoji-capf-inserts-plain-text ()
   (qq-completion-test-with-group
@@ -533,9 +533,7 @@
   (qq-completion-test-with-group
     (insert "/fav")
     (let (success owner)
-      (cl-letf (((symbol-function 'qq-media-custom-faces-loaded-p)
-                 (lambda () nil))
-                ((symbol-function 'qq-media-refresh-custom-faces)
+      (cl-letf (((symbol-function 'qq-media-refresh-custom-faces)
                  (lambda (callback &optional _errback _count)
                    (setq success callback)))
                 ((symbol-function 'completion-at-point)
@@ -547,8 +545,13 @@
         (should (qq-completion-complete))
         (setq owner qq-completion--custom-face-pending)
         (should (eq (plist-get owner :view) (appkit-current-view)))
-        (funcall success '(((md5 . "one"))))
-        (should-not qq-completion--custom-face-pending)))))
+        (funcall success '(((favorite_emoji_id . "favorite-one")
+                            (md5 . "11111111111111111111111111111111")
+                            (url . "https://example.invalid/one.png"))))
+        (should-not qq-completion--custom-face-pending)
+        (should (equal "favorite-one"
+                       (alist-get 'favorite_emoji_id
+                                  (car qq-completion--custom-faces))))))))
 
 (ert-deftest qq-completion-favorite-request-tracks-latest-query ()
   (qq-completion-test-with-group
@@ -572,28 +575,28 @@
           (funcall success nil)
           (should-not qq-completion--custom-face-pending))))))
 
-(ert-deftest qq-completion-favorite-aliases-filter-by-description ()
-  (let* ((face '((md5 . "one")
-                 (desc . "趴")
+(ert-deftest qq-completion-favorite-aliases-address-native-catalog ()
+  (let* ((face '((favorite_emoji_id . "favorite-one")
+                 (md5 . "11111111111111111111111111111111")
                  (url . "https://example.invalid/one.png")))
          (candidate (car (qq-completion--custom-face-candidates (list face)))))
     (dolist (alias qq-completion--custom-face-query-prefixes)
       (should
        (appkit-chat-completion--candidate-matches-p
-        candidate (concat "/" alias "趴"))))))
+        candidate (concat "/" alias))))))
 
 (ert-deftest qq-completion-favorite-candidates-exclude-unsendable-faces ()
   (let ((candidates
          (qq-completion--custom-face-candidates
           '("malformed"
-            ((md5 . "bad") (desc . "broken"))
-            ((md5 . "good")
-             (desc . "works")
+            ((md5 . "bad"))
+            ((favorite_emoji_id . "favorite-good")
+             (md5 . "33333333333333333333333333333333")
              (url . "https://example.invalid/good.png"))))))
     (should (= 1 (length candidates)))
-    (should (equal "good"
+    (should (equal "favorite-good"
                    (alist-get
-                    'md5
+                    'favorite_emoji_id
                     (plist-get
                      (appkit-chat-completion-candidate-value (car candidates))
                      :face))))))

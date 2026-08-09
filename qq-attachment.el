@@ -16,6 +16,7 @@
 (require 'subr-x)
 (require 'qq-rpc)
 (require 'qq-account)
+(require 'qq-favorite-emoji)
 (require 'qq-resource)
 (require 'qq-request)
 (require 'qq-server)
@@ -437,17 +438,17 @@ never stops an account or the long-lived service."
     (qq-attachment--release-created operation)
     (qq-account--invoke errback body reason)))
 
-(defun qq-attachment--stage-transform-and-prepare
-    (path media-name transform-phase transform prepare callback errback)
-  "Stage PATH, run TRANSFORM, then PREPARE it for one target.
+(defun qq-attachment--acquire-transform-and-prepare
+    (media-name transform-phase acquire transform prepare callback errback)
+  "Run ACQUIRE and TRANSFORM, then PREPARE media for one target.
 
+ACQUIRE receives success and failure callbacks and must return a request token.
 MEDIA-NAME and TRANSFORM-PHASE describe lifecycle errors.  TRANSFORM receives
 the ready source resource plus success and failure callbacks.  PREPARE receives
 the final ready resource ID plus success and failure callbacks.  CALLBACK runs
 only after the Prepared Attachment reaches `ready'.  Return a cancellable
 local operation that owns every service object created before that handoff."
-  (let* ((path (expand-file-name path))
-         (account-id (or (qq-runtime-current-account-id)
+  (let* ((account-id (or (qq-runtime-current-account-id)
                          (user-error "qq: select a QQ account first")))
          (operation
           (qq-attachment-operation-create :active-p t)))
@@ -588,10 +589,7 @@ local operation that owns every service object created before that handoff."
                 (error "qq: Resource stage changed identity within one operation"))
               (await-resource resource-id #'source-ready)))))
       (condition-case error-data
-          (let ((request-id
-                 (qq-resource-stage-local
-                  path (file-name-nondirectory path) nil
-                  #'stage-complete #'fail)))
+          (let ((request-id (funcall acquire #'stage-complete #'fail)))
             (when (and request-id
                        (qq-attachment-operation-active-p operation))
               (setf (qq-attachment-operation-request-id operation)
@@ -609,13 +607,39 @@ local operation that owns every service object created before that handoff."
 CALLBACK runs only after the Prepared Attachment reaches `ready'.  Return a
 cancellable local operation; canceling it also best-effort releases every
 resource or attachment already created for it."
-  (qq-attachment--stage-transform-and-prepare
-   path "image" "image staging"
+  (let ((path (expand-file-name path)))
+    (qq-attachment--acquire-transform-and-prepare
+     "image" "image staging"
+     (lambda (success failure)
+       (qq-resource-stage-local
+        path (file-name-nondirectory path) nil success failure))
+     (lambda (resource success _failure)
+     (funcall success resource))
+     (lambda (resource-id success failure)
+       (qq-attachment-prepare-image
+        session-key resource-id summary sub-type success failure))
+     callback errback)))
+
+(defun qq-attachment-materialize-and-prepare-favorite
+    (session-key favorite-emoji-id &optional callback errback)
+  "Materialize FAVORITE-EMOJI-ID and prepare it for SESSION-KEY.
+
+The native favorite service publishes verified bytes into the existing
+Resource Store.  They then follow the ordinary image preparation lifecycle
+with subtype 1.  Return a cancellable `qq-attachment-operation'."
+  (qq-attachment--acquire-transform-and-prepare
+   "favorite emoji" "favorite-emoji materialization"
+   (lambda (success failure)
+     (qq-favorite-emoji-materialize
+      favorite-emoji-id
+      (lambda (materialized)
+        (funcall success (alist-get 'resource materialized)))
+      failure))
    (lambda (resource success _failure)
      (funcall success resource))
    (lambda (resource-id success failure)
      (qq-attachment-prepare-image
-      session-key resource-id summary sub-type success failure))
+      session-key resource-id "[收藏表情]" 1 success failure))
    callback errback))
 
 (defun qq-attachment-stage-and-prepare-record
@@ -626,15 +650,19 @@ The account-neutral source is derived into a distinct Tencent Silk resource.
 Once derivation succeeds, the temporary WAV resource is released while the
 Silk resource proceeds through target-scoped attachment preparation.  Return a
 cancellable operation with the same ownership semantics as the image helper."
-  (qq-attachment--stage-transform-and-prepare
-   path "record" "record derivation"
-   (lambda (resource success failure)
+  (let ((path (expand-file-name path)))
+    (qq-attachment--acquire-transform-and-prepare
+     "record" "record derivation"
+     (lambda (success failure)
+       (qq-resource-stage-local
+        path (file-name-nondirectory path) nil success failure))
+     (lambda (resource success failure)
      (qq-resource-derive-record
       (alist-get 'resource_id resource) nil success failure))
-   (lambda (resource-id success failure)
-     (qq-attachment-prepare-record
-      session-key resource-id success failure))
-   callback errback))
+     (lambda (resource-id success failure)
+       (qq-attachment-prepare-record
+        session-key resource-id success failure))
+     callback errback)))
 
 (defun qq-attachment--video-thumbnail-command (video-path thumbnail-path)
   "Return the ffmpeg command extracting VIDEO-PATH to THUMBNAIL-PATH."

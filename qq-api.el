@@ -4255,15 +4255,6 @@ Lisp booleans and are encoded as JSON true or `:false'."
       #'qq-api--friend-add-callback "submitted" user-id callback errback)
      errback)))
 
-(defun qq-api-fetch-custom-face-info (callback &optional errback count)
-  "Fetch detailed favorite custom-face resources and pass them to CALLBACK."
-  (qq-api-call
-   "fetch_custom_face_info"
-   `((count . ,(max 1 (or count 48))))
-   (lambda (response)
-     (funcall callback (qq-api--response-data response)))
-   errback))
-
 (defun qq-api--refresh-for-notice (notice)
   "Run light refresh actions that correspond to NOTICE."
   (pcase (alist-get 'notice_type notice)

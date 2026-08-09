@@ -3963,48 +3963,37 @@
          (should (equal "178"
                         (alist-get 'id (alist-get 'data (car segments))))))))))
 
-(ert-deftest qq-chat-attach-custom-face-inserts-image-sticker-segment ()
+(ert-deftest qq-chat-attach-custom-face-inserts-durable-favorite-segment ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "private:10001"
     '((title . "Alice")
       (target-id . "10001"))
     nil)
-   (let* ((file (make-temp-file "qq-fav-chat" nil ".jpg"))
-          (face `((url . "https://example.com/x")
-                  (file . ,file)
-                  (thumb_file . ,file)
-                  (desc . "lol")
-                  (md5 . "DEADBEEF")
-                  (is_mark_face . :false)
-                  (e_id . "")
-                  (ep_id . "0")))
-          (qq-media--custom-faces (list face))
-          (qq-media--custom-faces-fetched-at (float-time)))
-     (unwind-protect
-         (progn
-           (with-temp-file file (insert "jpg"))
-           (with-temp-buffer
-             (qq-chat-mode)
-             (setq qq-chat--session-key "private:10001")
-             (qq-chat-render)
-             (cl-letf (((symbol-function 'completing-read)
-                        (lambda (&rest _)
-                          (qq-media-custom-face-label face 0))))
-               (qq-chat-attach-custom-face)
-               ;; Media completion queues insertion on the captured view.
-               (should-not (qq-chat--current-input-segments))
-               (qq-chat-test-sync-until-idle)
-               (let ((segments (qq-chat--current-input-segments)))
-                 (should (= 1 (length segments)))
-                 (should (equal "image" (alist-get 'type (car segments))))
-                 (should (equal 1 (alist-get 'sub_type
-                                             (alist-get 'data (car segments)))))
-                 (should (equal file
-                                (alist-get 'file
-                                           (alist-get 'data (car segments)))))))))
-       (when (file-exists-p file)
-         (delete-file file))))))
+   (let* ((favorite-id
+           "10001_0_0_0_DEADBEEFDEADBEEFDEADBEEFDEADBEEF_0_0")
+          (face `((favorite_emoji_id . ,favorite-id)
+                  (md5 . "deadbeefdeadbeefdeadbeefdeadbeef")
+                  (url . "https://example.invalid/favorite.png"))))
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "private:10001")
+       (qq-chat-render)
+       (cl-letf (((symbol-function 'qq-media-ensure-custom-faces)
+                  (lambda (callback &optional _errback _force)
+                    (funcall callback (list face))))
+                 ((symbol-function 'completing-read)
+                  (lambda (&rest _)
+                    (qq-media-custom-face-label face 0))))
+         (qq-chat-attach-custom-face)
+         ;; Media completion queues insertion on the captured view.
+         (should-not (qq-chat--current-input-segments))
+         (qq-chat-test-sync-until-idle)
+         (should
+          (equal
+           (qq-chat--current-input-segments)
+           `(((type . "favorite_emoji")
+              (data . ((favorite_emoji_id . ,favorite-id))))))))))))
 
 (ert-deftest qq-chat-attach-clipboard-uri-list-local-file ()
   (qq-chat-test-with-reset

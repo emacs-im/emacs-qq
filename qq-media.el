@@ -17,6 +17,7 @@
 (require 'qq-account)
 (require 'qq-api)
 (require 'qq-customize)
+(require 'qq-favorite-emoji)
 (require 'qq-remote-media)
 (require 'qq-rpc)
 (require 'qq-server)
@@ -59,72 +60,16 @@ Redisplay therefore observes operation state but never schedules a retry.")
 (defvar qq-media--native-record-progress-timer nil
   "Timer refreshing the one active native record progress row.")
 
-(defvar qq-media--account-generation 0
-  "Account generation owning asynchronous media cache callbacks.")
-
-(defvar qq-media--custom-faces nil
-  "Cached list of favorite custom-face alists from NapCat.")
-
-(defvar qq-media--custom-faces-fetched-at nil
-  "Float time when `qq-media--custom-faces' was last fetched.")
-
-(defvar qq-media--custom-face-waiters nil
-  "Callbacks waiting for the shared favorite-face refresh.")
-
-(defvar qq-media--custom-face-refresh-owner nil
-  "Owner plist for the current favorite-face refresh, or nil.
-
-The plist records the account `:generation', current page `:request', and
-the adopted transport `:token'.")
-
-(defvar qq-media--custom-face-completion-pairs nil
-  "Active `(LABEL . FACE)' pairs for favorite-face `completing-read'.")
-
-(defun qq-media--custom-face-owner-generation-current-p (owner)
-  "Return non-nil when OWNER belongs to the current account generation."
-  (= (or (plist-get owner :generation) -1)
-     qq-media--account-generation))
-
-(defun qq-media--custom-face-owner-current-p (owner)
-  "Return non-nil when OWNER owns the current favorite-face request."
-  (and (eq owner qq-media--custom-face-refresh-owner)
-       (qq-media--custom-face-owner-generation-current-p owner)))
-
-(defun qq-media--custom-face-request-current-p (owner request)
-  "Return non-nil when REQUEST is OWNER's current favorite-face page."
-  (and (qq-media--custom-face-owner-current-p owner)
-       (eq request (plist-get owner :request))))
-
-(defun qq-media--cancel-custom-face-request (token)
-  "Cancel favorite-face request TOKEN, isolating cancellation failures."
-  (when token
-    (condition-case err
-        (qq-api-cancel-request token)
-      (error
-       (message "qq: favorite-face request cancellation failed: %s"
-                (error-message-string err)))
-      (quit
-       (message "qq: favorite-face request cancellation was interrupted")))))
-
-(defun qq-media--revoke-custom-face-work ()
-  "Revoke favorite-face callbacks and cancel their transport request."
-  ;; Invalidate callback ownership before cancellation.  Some transports run
-  ;; an errback synchronously from their cancellation path.
-  (cl-incf qq-media--account-generation)
-  (let ((token (and qq-media--custom-face-refresh-owner
-                    (plist-get qq-media--custom-face-refresh-owner :token))))
-    (setq qq-media--custom-face-refresh-owner nil
-          qq-media--custom-face-waiters nil
-          qq-media--custom-faces nil
-          qq-media--custom-faces-fetched-at nil
-          qq-media--custom-face-completion-pairs nil)
-    (qq-media--cancel-custom-face-request token)))
+(defun qq-media--json-truthy-p (value)
+  "Return non-nil when JSON VALUE is a true-ish flag."
+  (and value
+       (not (memq value '(:false :null)))
+       (not (member value '(0 "0" "false")))))
 
 (defun qq-media-clear-cache ()
   "Clear all account-owned media caches and asynchronous work."
   (interactive)
   (qq-media--stop-all-native-record-playback)
-  (qq-media--revoke-custom-face-work)
   (condition-case nil
       (appkit-media-clear-video-decoration-cache 'qq)
     (error nil)
@@ -2667,394 +2612,82 @@ Metadata:
 
 ;;; Favorite / custom faces (收藏表情)
 
-(defun qq-media--json-truthy-p (value)
-  "Return non-nil when JSON VALUE is a true-ish flag (not :false/:null)."
-  (and value
-       (not (eq value :false))
-       (not (eq value :null))
-       (not (equal value 0))
-       (not (equal value "false"))
-       (not (equal value "0"))))
+(defun qq-media-refresh-custom-faces
+    (&optional callback errback force-refresh)
+  "Fetch the selected account's ordered native favorite entries.
 
-(defun qq-media--face-alist-p (value)
-  "Return non-nil when VALUE looks like one face resource alist."
-  (and (consp value)
-       (listp value)
-       (consp (car value))
-       ;; first element is (KEY . VAL), not another nested face list
-       (symbolp (car (car value)))))
-
-(defun qq-media--normalize-custom-face-list (data)
-  "Normalize DATA from fetch_custom_face_info into a list of face alists.
-
-NapCat returns a JSON array → vector or list of alists.  A single face
-alist must not be confused with a list of faces: for a list of faces the
-first element is itself an alist; for one face the first element is a
-pair `(url . …)'."
-  (cond
-   ((null data) nil)
-   ((vectorp data)
-    (qq-media--normalize-custom-face-list (append data nil)))
-   ((not (listp data)) nil)
-   ;; List of face alists: car is an alist (caar is a pair).
-   ((and (consp (car data))
-         (qq-media--face-alist-p (car data)))
-    data)
-   ;; Single face alist: car is (symbol . value).
-   ((qq-media--face-alist-p data)
-    (list data))
-   (t nil)))
-
-(defun qq-media-custom-faces (&optional force)
-  "Return cached favorite custom faces, or nil if not loaded.
-
-With FORCE non-nil, ignore the cache (caller should still refresh via
-`qq-media-refresh-custom-faces')."
-  (unless force
-    qq-media--custom-faces))
-
-(defun qq-media-custom-faces-loaded-p ()
-  "Return non-nil after the favorite-face cache has been fetched."
-  (numberp qq-media--custom-faces-fetched-at))
-
-(defun qq-media--refresh-custom-faces-page
-    (owner callback errback requested-count)
-  "Fetch one favorite-face page owned by OWNER.
-
-CALLBACK, ERRBACK, and REQUESTED-COUNT have the same meaning as in
-`qq-media-refresh-custom-faces'.  Full responses continue recursively under
-the exact same owner, so a reset invalidates every page in the chain."
-  (when (qq-media--custom-face-owner-current-p owner)
-    (let ((request-identity (list 'favorite-face-page requested-count))
-          request-token)
-      ;; Publish page ownership before dispatch.  A synchronous full-page
-      ;; response may recursively publish the next page before this dispatch
-      ;; returns its token.
-      (setf (plist-get owner :request) request-identity
-            (plist-get owner :token) nil)
-      (setq request-token
-            (qq-api-fetch-custom-face-info
-             (lambda (data)
-               (when (qq-media--custom-face-request-current-p
-                      owner request-identity)
-                 (let* ((faces (qq-media--normalize-custom-face-list data))
-                        (n (length faces))
-                        (max-count
-                         (max requested-count
-                              qq-media-custom-face-count-max)))
-                   (if (and (>= n requested-count)
-                            (< requested-count max-count))
-                       (qq-media--refresh-custom-faces-page
-                        owner callback errback
-                        (min max-count
-                             (max (* requested-count 2)
-                                  (1+ requested-count))))
-                     (setq qq-media--custom-faces faces
-                           qq-media--custom-faces-fetched-at (float-time))
-                     (when (and (>= n requested-count)
-                                (>= requested-count max-count))
-                       (message
-                        "qq: favorite faces may be truncated (%d returned, count max %d)"
-                        n max-count))
-                     (unwind-protect
-                         (when callback
-                           (funcall callback faces))
-                       ;; Shared waiter callbacks clear OWNER themselves.  A
-                       ;; direct refresh still needs a terminal page boundary.
-                       (when (qq-media--custom-face-request-current-p
-                              owner request-identity)
-                         (setq qq-media--custom-face-refresh-owner nil)))))))
-             (lambda (response reason)
-               (when (qq-media--custom-face-request-current-p
-                      owner request-identity)
-                 (unwind-protect
-                     (when errback
-                       (funcall errback response reason))
-                   (when (qq-media--custom-face-request-current-p
-                          owner request-identity)
-                     (setq qq-media--custom-face-refresh-owner nil)))))
-             requested-count))
-      (if (qq-media--custom-face-request-current-p owner request-identity)
-          (setf (plist-get owner :token) request-token)
-        ;; The dispatch synchronously settled, advanced, or was reset.  Its
-        ;; returned token must not replace the page that now owns the chain.
-        (qq-media--cancel-custom-face-request request-token))
-      (and (qq-media--custom-face-owner-current-p owner)
-           (plist-get owner :token)))))
-
-(defun qq-media-refresh-custom-faces (&optional callback errback count)
-  "Fetch favorite custom faces from NapCat and cache them.
-
-CALLBACK is called with the face list on success.  The request is owned by the
-current account generation, including all automatic larger-page retries.
-ERRBACK receives the transport response and failure reason.
-COUNT is the initial requested page size.
-
-`fetch_custom_face_info' is capped by its `count' argument (see
-`qq-media-custom-face-count').  When the response is full — length equals the
-requested count — this function retries with a larger count (doubling, capped
-by `qq-media-custom-face-count-max') so large favorites libraries are not
-silently truncated at 96/page-size."
-  (let ((owner (or qq-media--custom-face-refresh-owner
-                   (list :generation qq-media--account-generation
-                         :request nil
-                         :token nil))))
-    (unless qq-media--custom-face-refresh-owner
-      (setq qq-media--custom-face-refresh-owner owner))
-    (qq-media--refresh-custom-faces-page
-     owner callback errback
-     (max 1 (or count qq-media-custom-face-count)))))
-
-(defun qq-media--finish-custom-face-waiters (owner faces)
-  "Finish OWNER's shared favorite-face waiters successfully with FACES."
-  (when (qq-media--custom-face-owner-current-p owner)
-    (let ((waiters (prog1 (nreverse qq-media--custom-face-waiters)
-                     (setq qq-media--custom-face-waiters nil
-                           qq-media--custom-face-refresh-owner nil))))
-      (dolist (waiter waiters)
-        (when-let* ((current-generation-p
-                     (qq-media--custom-face-owner-generation-current-p owner))
-                    (callback (car waiter)))
-          (condition-case err
-              (funcall callback faces)
-            (error
-             (message "qq: favorite-face callback failed: %s"
-                      (error-message-string err)))
-            (quit
-             (message "qq: favorite-face callback was interrupted"))))))))
-
-(defun qq-media--fail-custom-face-waiters (owner response reason)
-  "Fail OWNER's shared favorite-face waiters with RESPONSE and REASON."
-  (when (qq-media--custom-face-owner-current-p owner)
-    (let ((waiters (prog1 (nreverse qq-media--custom-face-waiters)
-                     (setq qq-media--custom-face-waiters nil
-                           qq-media--custom-face-refresh-owner nil))))
-      (dolist (waiter waiters)
-        (when-let* ((current-generation-p
-                     (qq-media--custom-face-owner-generation-current-p owner))
-                    (errback (cdr waiter)))
-          (condition-case err
-              (funcall errback response reason)
-            (error
-             (message "qq: favorite-face errback failed: %s"
-                      (error-message-string err)))
-            (quit
-             (message "qq: favorite-face errback was interrupted"))))))))
+Gateway remains the sole catalog cache.  CALLBACK receives the entry list;
+ERRBACK receives the Gateway error body and reason.  With FORCE-REFRESH
+non-nil, bypass Gateway's replaceable cache."
+  (qq-favorite-emoji-list
+   force-refresh
+   (lambda (catalog)
+     (when callback
+       (funcall callback (copy-tree (alist-get 'entries catalog)))))
+   errback))
 
 (defun qq-media-ensure-custom-faces (&optional callback errback force)
-  "Call CALLBACK with the authoritative favorite-face cache.
+  "Call CALLBACK with the selected account's native favorite entries.
 
-Coalesce concurrent NapCat requests and notify every waiter.  ERRBACK receives
-the transport response and reason.  With FORCE non-nil, refresh even when the
-cache was already loaded."
-  (if (and (not force) (qq-media-custom-faces-loaded-p))
-      (progn
-        (when callback
-          (funcall callback (qq-media-custom-faces)))
-        t)
-    (push (cons callback errback) qq-media--custom-face-waiters)
-    (unless qq-media--custom-face-refresh-owner
-      (let ((owner (list :generation qq-media--account-generation
-                         :request nil
-                         :token nil)))
-        (setq qq-media--custom-face-refresh-owner owner)
-        (condition-case err
-            (qq-media-refresh-custom-faces
-             (apply-partially
-              #'qq-media--finish-custom-face-waiters owner)
-             (apply-partially
-              #'qq-media--fail-custom-face-waiters owner))
-          (error
-           (when (qq-media--custom-face-owner-current-p owner)
-             (qq-media--fail-custom-face-waiters
-              owner nil (error-message-string err)))))))
-    qq-media--custom-face-refresh-owner))
+FORCE bypasses Gateway's catalog cache.  Emacs deliberately keeps no second
+catalog cache, so account switching cannot expose another account's entries."
+  (qq-media-refresh-custom-faces callback errback force))
 
 (defun qq-media-custom-face-id (face)
-  "Return a stable string id for favorite FACE alist."
-  (or (let ((md5 (alist-get 'md5 face)))
-        (and (stringp md5) (not (string-empty-p md5)) md5))
-      (let ((res (alist-get 'res_id face)))
-        (and (stringp res) (not (string-empty-p res)) res))
-      (let ((emo (alist-get 'emo_id face)))
-        (and emo (format "emo:%s" emo)))
-      (format "fav:%s" (sxhash-equal face))))
+  "Return FACE's durable native favorite identity, or nil."
+  (let ((favorite-id (and (listp face)
+                          (alist-get 'favorite_emoji_id face))))
+    (and (qq-favorite-emoji-id-p favorite-id) favorite-id)))
 
 (defun qq-media-custom-face-label (face &optional index)
-  "Return a human completion label for favorite FACE.
+  "Return a stable human completion label for favorite FACE.
 
-INDEX, when non-nil, is included so completing-read candidates stay unique
-even when several favorites share an empty `desc'."
-  (let* ((desc (alist-get 'desc face))
-         (md5 (alist-get 'md5 face))
-         (emo (alist-get 'emo_id face))
-         (mark (qq-media--json-truthy-p (alist-get 'is_mark_face face)))
-         (short (cond
-                 ((and (stringp desc) (not (string-empty-p (string-trim desc))))
-                  (string-trim desc))
-                 ((and (stringp md5) (>= (length md5) 8))
-                  (concat (substring md5 0 8) "…"))
-                 ((and emo (not (equal emo 0)) (not (equal emo "0")))
-                  (format "#%s" emo))
-                 (t "favorite")))
-         (kind (if mark "mface" "fav"))
-         (base (format "[%s] %s" kind short)))
+INDEX keeps candidates distinct even if their short MD5 prefixes collide."
+  (let* ((md5 (alist-get 'md5 face))
+         (short (if (and (stringp md5) (>= (length md5) 8))
+                    (concat (substring md5 0 8) "…")
+                  "favorite"))
+         (base (format "[收藏] %s" short)))
     (if index
         (format "%s  (%d)" base (1+ index))
       base)))
 
-(defun qq-media-custom-face-file (face)
-  "Return best local image path for FACE, or nil."
-  (seq-find
-   #'appkit-media-file-present-p
-   (list (alist-get 'file face)
-         (alist-get 'original_file face)
-         (alist-get 'thumb_file face))))
-
-(defun qq-media-custom-face-thumb (face)
-  "Return best local thumb path for FACE, or nil."
-  (seq-find
-   #'appkit-media-file-present-p
-   (list (alist-get 'thumb_file face)
-         (alist-get 'file face)
-         (alist-get 'original_file face))))
-
-(defun qq-media-custom-face-display-string (face)
-  "Return composer/timeline display string for favorite FACE."
-  (let* ((thumb (qq-media-custom-face-thumb face))
-         (image (and thumb
-                     (qq-media--image-from-file
-                      thumb
-                      (max qq-media-face-image-height 32))))
-         (fallback (qq-media-custom-face-label face)))
-    (qq-media--image-display-string image fallback)))
-
-(defun qq-media-custom-face-sendable-p (face)
-  "Return non-nil when favorite FACE has a valid outbound resource."
-  (when (qq-media--face-alist-p face)
-    (let ((mark (qq-media--json-truthy-p (alist-get 'is_mark_face face)))
-          (e-id (alist-get 'e_id face))
-          (url (alist-get 'url face)))
-      (or (and mark
-               (stringp e-id)
-               (not (string-empty-p e-id)))
-          (qq-media-custom-face-file face)
-          (appkit-media-url-present-p url)))))
-
-(defun qq-media-custom-face-completion-candidates (&optional faces)
-  "Return completion candidates for favorite FACES (default: cache).
-
-Each entry is `(LABEL . FACE)'.  Labels are unique (md5 + index).
-Order follows the NapCat favorites list (not re-sorted by string)."
-  (let ((faces (seq-filter #'qq-media-custom-face-sendable-p
-                           (or faces qq-media--custom-faces)))
-        (candidates nil)
-        (i 0))
-    (dolist (face faces)
-      (when (qq-media--face-alist-p face)
-        (let* ((label (qq-media-custom-face-label face i))
-               ;; Attach FACE so affixation / lookup work even if the
-               ;; completion UI strips the pairs list context.
-               (labeled (propertize label 'qq-custom-face face)))
-          (push (cons labeled face) candidates)
-          (setq i (1+ i)))))
-    (nreverse candidates)))
-
-(defun qq-media-custom-face-from-completion (candidate &optional pairs)
-  "Return face alist matching completion CANDIDATE in PAIRS.
-
-PAIRS defaults to the active completion pairs, then the cache."
-  (or (and (stringp candidate)
-           (get-text-property 0 'qq-custom-face candidate))
-      (let* ((key (and (stringp candidate)
-                       (substring-no-properties candidate)))
-             (pairs (or pairs
-                        qq-media--custom-face-completion-pairs
-                        (qq-media-custom-face-completion-candidates))))
-        (when key
-          (or (cdr (assoc key pairs))
-              ;; assoc with text-propertized cars: match by plain string.
-              (cdr (seq-find (lambda (p)
-                               (equal key (substring-no-properties (car p))))
-                             pairs)))))))
+(defun qq-media-custom-face-image (face)
+  "Return FACE's cached preview, asynchronously fetching its catalog URL."
+  (when-let* ((favorite-id (qq-media-custom-face-id face))
+              (url (alist-get 'url face))
+              ((appkit-media-url-present-p url)))
+    (qq-media-url-preview-image
+     (format "favorite-emoji:%s" favorite-id)
+     url
+     (max qq-media-face-image-height 32))))
 
 (defun qq-media--custom-face-completion-prefix (face)
-  "Return minibuffer prefix with thumb image for FACE, or spaces."
-  (let* ((thumb (qq-media-custom-face-thumb face))
-         (image (and thumb
-                     (qq-media--image-from-file
-                      thumb
-                      (max qq-media-face-image-height 32)))))
-    (if image
-        (concat (propertize " " 'display image) " ")
-      "  ")))
+  "Return a visual completion prefix for favorite FACE."
+  (if-let* ((image (qq-media-custom-face-image face)))
+      (concat (propertize " " 'display image) " ")
+    "  "))
 
-(defun qq-media-custom-face-affixation-function (candidates)
-  "Affixation function: show favorite thumb before each CANDIDATE."
-  (mapcar
-   (lambda (cand)
-     (let ((face (qq-media-custom-face-from-completion cand)))
-       (list cand
-             (if face
-                 (qq-media--custom-face-completion-prefix face)
-               "  ")
-             "")))
-   candidates))
+(defun qq-media-custom-face-display-string (face)
+  "Return composer display text for native favorite FACE."
+  (qq-media--image-display-string
+   (qq-media-custom-face-image face)
+   (qq-media-custom-face-label face)))
 
-(defun qq-media-custom-face-completion-table (&optional faces)
-  "Completion table for favorite custom faces with images and stable order.
-
-Keeps NapCat favorites order (identity display/cycle sort) and prefixes
-each candidate with its local thumb when available."
-  (let* ((pairs (qq-media-custom-face-completion-candidates faces))
-         (labels (mapcar #'car pairs)))
-    (setq qq-media--custom-face-completion-pairs pairs)
-    (lambda (string pred action)
-      (if (eq action 'metadata)
-          '(metadata
-            (category . qq-custom-face)
-            (display-sort-function . identity)
-            (cycle-sort-function . identity)
-            (affixation-function . qq-media-custom-face-affixation-function))
-        (complete-with-action action labels string pred)))))
+(defun qq-media-custom-face-sendable-p (face)
+  "Return non-nil when FACE carries one durable native identity."
+  (and (qq-media-custom-face-id face) t))
 
 (defun qq-media-custom-face-to-segment (face)
-  "Convert favorite FACE alist into an outbound OneBot segment.
+  "Convert native favorite FACE into a durable composer segment.
 
-Personal favorites (most common) are sent as image with `sub_type' 1
-(KCUSTOM sticker).  Market favorites (`is_mark_face') become mface when
-e_id is present."
-  (let* ((mark (qq-media--json-truthy-p (alist-get 'is_mark_face face)))
-         (e-id (alist-get 'e_id face))
-         (ep-id (alist-get 'ep_id face))
-         (file (qq-media-custom-face-file face))
-         (url (alist-get 'url face))
-         (desc (alist-get 'desc face))
-         (md5 (alist-get 'md5 face))
-         (summary (if (and (stringp desc) (not (string-empty-p (string-trim desc))))
-                      (string-trim desc)
-                    "[收藏表情]")))
-    (cond
-     ((and mark
-           (stringp e-id)
-           (not (string-empty-p e-id)))
-      `((type . "mface")
-        (data . ((emoji_id . ,e-id)
-                 (emoji_package_id . ,(condition-case _
-                                          (string-to-number (format "%s" (or ep-id 0)))
-                                        (error 0)))
-                 (key . ,(or (alist-get 'key face) ""))
-                 (summary . ,summary)))))
-     ((or file (appkit-media-url-present-p url))
-      `((type . "image")
-        (data . (,@(when file `((file . ,file)))
-                 ,@(when (appkit-media-url-present-p url) `((url . ,url)))
-                 (name . ,(or md5 "custom-face"))
-                 (summary . ,summary)
-                 ;; PicSubType.KCUSTOM — QQ treats this as a sticker/emoji image.
-                 (sub_type . 1)))))
-     (t
-      (user-error "qq: favorite face has neither local file nor URL")))))
+No URL, local path, Resource ID, or Prepared Attachment ID enters the draft.
+Those shorter-lived capabilities are acquired only when the draft is sent."
+  (let ((favorite-id (qq-media-custom-face-id face)))
+    (unless favorite-id
+      (user-error "qq: favorite face has no durable identity"))
+    `((type . "favorite_emoji")
+      (data . ((favorite_emoji_id . ,favorite-id))))))
 
 (defun qq-media-face-text-fallback (emoji-id)
   "Return plain-text fallback for face EMOJI-ID (never a CQ blob)."

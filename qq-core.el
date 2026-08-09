@@ -20,6 +20,7 @@
 (require 'qq-attachment)
 (require 'qq-message)
 (require 'qq-directory)
+(require 'qq-favorite-emoji)
 (require 'qq-profile)
 (require 'qq-remote-media)
 (require 'qq-resource)
@@ -671,16 +672,25 @@ locally selected managed account without changing its lifecycle phase."
       group-id user-id reject-add-request success failure))
    callback errback))
 
-(defun qq-core--local-media-plan (segment index)
-  "Return a preparation plan for local media SEGMENT at INDEX, or nil.
+(defun qq-core--media-plan (segment index)
+  "Return a deferred preparation plan for SEGMENT at INDEX, or nil.
 
-Image, record, and video segments carrying an opaque `attachment_id' are already
-protocol-ready.  URL-only media deliberately fails: the native service accepts
-immutable staged bytes, not a URL that could change before upload."
-  (let ((kind (alist-get 'type segment)))
-    (when (member kind '("image" "record" "video"))
-      (let* ((data (alist-get 'data segment))
-             (attachment-id (and (listp data)
+Local image, record, and video bytes are staged when sending.  A favorite
+segment carries only its durable QQ identity and is materialized through the
+same Resource and Prepared Attachment pipeline at that point."
+  (let ((kind (alist-get 'type segment))
+        (data (alist-get 'data segment)))
+    (cond
+     ((equal kind "favorite_emoji")
+      (let ((favorite-id (and (listp data)
+                              (alist-get 'favorite_emoji_id data))))
+        (unless (and (qq-account--exact-object-keys-p
+                      data '(favorite_emoji_id))
+                     (qq-favorite-emoji-id-p favorite-id))
+          (user-error "qq: Favorite segment requires one durable identity"))
+        (list :index index :kind kind :favorite-emoji-id favorite-id)))
+     ((member kind '("image" "record" "video"))
+      (let* ((attachment-id (and (listp data)
                                  (alist-get 'attachment_id data)))
              (file (and (listp data)
                         (or (alist-get 'file data)
@@ -712,7 +722,7 @@ immutable staged bytes, not a URL that could change before upload."
          (t
           (user-error
            "qq: Native %s sending requires a local file or prepared attachment"
-           kind)))))))
+           kind))))))))
 
 (defun qq-core--release-send-resource (resource-id)
   "Best-effort release one send-pipeline RESOURCE-ID."
@@ -738,9 +748,9 @@ immutable staged bytes, not a URL that could change before upload."
        (message "qq: prepared media cleanup failed: %s"
                 (error-message-string error-data))))))
 
-(defun qq-core--send-message-with-local-media
+(defun qq-core--send-message-with-media
     (session-key segments plans raw-message callback errback)
-  "Resolve local media PLANS, then send SEGMENTS to SESSION-KEY.
+  "Resolve deferred media PLANS, then send SEGMENTS to SESSION-KEY.
 
 Staging and preparation may run concurrently, but the immutable segment order
 is retained.  This composite request owns preparation operations until they
@@ -762,7 +772,7 @@ accepts them.  Cancellation or failure releases everything still owned here."
            (condition-case error-data
                (qq-attachment-cancel-operation operation)
              ((error quit)
-              (message "qq: local media operation cleanup failed: %s"
+              (message "qq: media operation cleanup failed: %s"
                        (error-message-string error-data)))))
          (release-attachments
            ()
@@ -778,7 +788,7 @@ accepts them.  Cancellation or failure releases everything still owned here."
                (condition-case error-data
                    (qq-server-cancel token)
                  ((error quit)
-                  (message "qq: local media send cancellation failed: %s"
+                  (message "qq: media send cancellation failed: %s"
                            (error-message-string error-data)))))))
          (cleanup
            ()
@@ -854,7 +864,10 @@ accepts them.  Cancellation or failure releases everything still owned here."
                  (qq-request-cancel request))
                (when active
                  (aset resolved (plist-get plan :index)
-                       `((type . ,(plist-get plan :kind))
+                       `((type . ,(if (equal (plist-get plan :kind)
+                                            "favorite_emoji")
+                                      "image"
+                                    (plist-get plan :kind)))
                          (data . ((attachment_id . ,attachment-id)))))
                  (setq remaining (1- remaining))
                  (when (= remaining 0)
@@ -893,7 +906,12 @@ accepts them.  Cancellation or failure releases everything still owned here."
                            (qq-attachment-stage-and-prepare-video
                             session-key (plist-get plan :path)
                             ready #'send-failed))
-                          (_ (error "qq: Unknown local media plan")))))
+                          ("favorite_emoji"
+                           (qq-attachment-materialize-and-prepare-favorite
+                            session-key
+                            (plist-get plan :favorite-emoji-id)
+                            ready #'send-failed))
+                          (_ (error "qq: Unknown media plan")))))
                   (when (qq-attachment-operation-active-p operation)
                     (if active
                         (push operation operations)
@@ -1081,7 +1099,7 @@ the later authoritative self event."
           (and (not dataline-file-plan)
                (cl-loop for segment in segments
                         for index from 0
-                        for plan = (qq-core--local-media-plan segment index)
+                        for plan = (qq-core--media-plan segment index)
                         when plan collect plan)))
          (error-fn (or errback #'qq-core--default-error)))
     (cond
@@ -1098,7 +1116,7 @@ the later authoritative self event."
       (qq-core--send-file
        session-key file-plan callback error-fn))
      (plans
-        (qq-core--send-message-with-local-media
+        (qq-core--send-message-with-media
          session-key segments plans raw-message callback error-fn))
      (t
        (qq-core--start-request
