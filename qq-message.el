@@ -2325,31 +2325,32 @@ are not yet part of the Gateway protocol."
      "QQ account or Gateway connection changed during todo action")))
 
 (defun qq-message--read-request (message owner)
-  "Return an exact reference-only read request for MESSAGE and OWNER.
+  "Return a canonical-row read request for MESSAGE and OWNER.
 
-The result is a plist containing `:message-id' and `:params'.  This is the
-single capability check and request builder; it has no projection or transport
-side effects."
+The result is a plist containing `:row-key' and `:params'.  This is the single
+capability check and request builder; it has no projection or transport side
+effects."
   (let* ((session-key (and (listp message)
                            (alist-get 'session-key message)))
          (kind (and session-key (qq-state-session-key-type session-key)))
-         (message-id (and (listp message) (alist-get 'server-id message)))
+         (row-key (and (listp message)
+                       (alist-get 'canonical-row-key message)))
          conversation)
     (unless (and owner
                  (memq kind '(private group))
-                 (qq-message--message-id-p message-id))
-      (user-error "qq: Native read report requires an exact Message Reference"))
+                 (qq-account--uint64-decimal-p row-key))
+      (user-error "qq: Native read report requires a canonical timeline row"))
     (unless (equal (alist-get 'gateway-account-id message) owner)
       (user-error "qq: Read target belongs to another Gateway account"))
     (setq conversation
           (qq-message--conversation-params session-key))
-    (list :message-id message-id
+    (list :row-key row-key
           :params
           `((conversation . ,conversation)
-            (message . ((message_id . ,message-id)))))))
+            (row_key . ,row-key)))))
 
 (defun qq-message-read-capable-p (message)
-  "Return non-nil when MESSAGE is an exact reference for the current owner."
+  "Return non-nil when MESSAGE is a canonical row for the current owner."
   (when-let* ((owner (qq-runtime-current-account-id)))
     (condition-case nil
         (progn
@@ -2361,16 +2362,26 @@ side effects."
     (message &optional callback errback)
   "Mark the selected account's conversation read through MESSAGE.
 
-MESSAGE supplies only its stable public conversation locator and exact
-message ID.  Gateway resolves the corresponding Native read boundary.
-CALLBACK receives the acknowledgement; ERRBACK receives an error
-body and reason."
+MESSAGE supplies only its stable public conversation locator and canonical
+row key.  Gateway resolves that stored row to the Native read boundary.
+CALLBACK receives the acknowledgement; ERRBACK receives an error body and
+reason."
   (let* ((owner (qq-message--current-owner))
          (_owner (qq-message--sync-account owner))
-         (request (qq-message--read-request message owner)))
+         (request (qq-message--read-request message owner))
+         (row-key (plist-get request :row-key)))
     (qq-message--call
      "message.mark_read" owner
      (plist-get request :params)
+     :projector
+     (lambda (receipt)
+       (unless (and
+                (qq-account--exact-object-keys-p
+                 receipt '(account_id row_key))
+                (equal (alist-get 'account_id receipt) owner)
+                (equal (alist-get 'row_key receipt) row-key))
+         (error "qq: Gateway returned a contradictory read acknowledgement"))
+       (qq-server-value-copy receipt))
      :callback callback
      :errback errback
      :stale-message

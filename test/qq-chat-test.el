@@ -3382,6 +3382,7 @@
    ;; MESSAGE was cached before the native runtime restarted.  Its stable
    ;; account, conversation, and message identities remain authoritative.
    (let ((message '((server-id . "9007199254741004001")
+                    (canonical-row-key . "42")
                     (session-key . "group:20001")
                     (message-seq . "9007199254740999")
                     (native-random . 7)
@@ -3408,8 +3409,7 @@
                       (funcall
                        callback
                        '((account_id . "slot-a")
-                         (message_id
-                          . "9007199254741004001"))))))
+                         (row_key . "42"))))))
                  ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
                  ((symbol-function 'qq-core-recall-message)
                   (lambda (selected &rest _)
@@ -3440,6 +3440,35 @@
        (should (= (length calls) 6))
        (dolist (operation '(reply read recall reaction essence todo))
          (should (memq operation calls)))))))
+
+(ert-deftest qq-chat-latest-idless-canonical-row-is-a-read-target ()
+  (qq-chat-test-with-reset
+   (let* ((older '((server-id . "9007199254741004001")
+                   (canonical-row-key . "41")
+                   (session-key . "group:20001")
+                   (gateway-account-id . "slot-a")))
+          (newest '((canonical-row-key . "42")
+                    (session-key . "group:20001")
+                    (gateway-account-id . "slot-a")))
+          selected)
+     (with-temp-buffer
+       (qq-chat-mode)
+       (setq qq-chat--session-key "group:20001")
+       (cl-letf (((symbol-function 'qq-chat--timeline-messages)
+                  (lambda () (list older newest)))
+                 ((symbol-function 'qq-core-message-read-capable-p)
+                  (lambda (message)
+                    (and (alist-get 'canonical-row-key message) t)))
+                 ((symbol-function 'qq-core-mark-message-read)
+                  (lambda (message &optional callback _errback)
+                    (setq selected message)
+                    (when callback
+                      (funcall callback
+                               '((account_id . "slot-a")
+                                 (row_key . "42")))))))
+         (qq-chat--mark-latest-window-read))
+       (should (eq selected newest))
+       (should (equal qq-chat--last-read-target-row-key "42"))))))
 
 (ert-deftest qq-chat-filter-snapshot-builds-reference-without-caching-message ()
   (qq-chat-test-with-reset
@@ -5714,17 +5743,20 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
       nil)
      (puthash
       "group:20001"
-      `(((server-id . ,first) (session-key . "group:20001")
+      `(((server-id . ,first) (canonical-row-key . "41")
+         (session-key . "group:20001")
          (message-seq . "1") (group-id . "20001")
          (gateway-account-id . "slot-a")
          (sender-name . "Alice")
          (time . 1) (raw-message . "first"))
-        ((server-id . ,second) (session-key . "group:20001")
+        ((server-id . ,second) (canonical-row-key . "42")
+         (session-key . "group:20001")
          (message-seq . "2") (group-id . "20001")
          (gateway-account-id . "slot-a")
          (sender-name . "Alice")
          (time . 2) (raw-message . "second"))
-        ((server-id . ,third) (session-key . "group:20001")
+        ((server-id . ,third) (canonical-row-key . "43")
+         (session-key . "group:20001")
          (message-seq . "3") (group-id . "20001")
          (gateway-account-id . "slot-a")
          (sender-name . "Alice")
@@ -5748,7 +5780,8 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                       (funcall
                        callback
                        `((account_id . "slot-a")
-                         (message_id . ,(alist-get 'server-id message)))))
+                         (row_key
+                          . ,(alist-get 'canonical-row-key message)))))
                     "read-request")))
          ;; An already-read row does not move the native boundary backward.
          (goto-char (point-min))

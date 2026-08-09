@@ -1594,12 +1594,15 @@
       (let* ((base
               '((session-key . "group:8209413637")
                 (server-id . "7348923749823749823")
+                (canonical-row-key . "101")
                 (group-id . "8209413637")
                 (gateway-account-id . "slot-a")))
              (newest (copy-tree base))
              (middle (copy-tree base)))
-        (setf (alist-get 'server-id newest) "7348923749823749825"
-              (alist-get 'server-id middle) "7348923749823749824")
+        (setf (alist-get 'server-id newest) nil
+              (alist-get 'canonical-row-key newest) "103"
+              (alist-get 'server-id middle) "7348923749823749824"
+              (alist-get 'canonical-row-key middle) "102")
         (setq timeline (list base middle newest))
         (let ((request
                (qq-core-mark-message-read
@@ -1617,7 +1620,7 @@
              middle (lambda (_receipt) (push 'middle completed)))
             request)))
         (let ((other-account (copy-tree newest)))
-          (setf (alist-get 'server-id other-account) "7348923749823749826"
+          (setf (alist-get 'canonical-row-key other-account) "104"
                 (alist-get 'gateway-account-id other-account) "slot-b")
           (should-error
            (qq-core-mark-message-read other-account #'ignore)
@@ -1626,13 +1629,13 @@
         (funcall
          (nth 1 (car calls))
          '((account_id . "slot-a")
-           (message_id . "7348923749823749823")))
+           (row_key . "101")))
         (should (= (length calls) 2))
         (should (eq (car (cadr calls)) newest))
         (funcall
          (nth 1 (cadr calls))
          '((account_id . "slot-a")
-           (message_id . "7348923749823749825")))
+           (row_key . "103")))
         ;; MIDDLE never reached the wire and therefore owns no callback result.
         (should (equal (nreverse completed) '(base newest)))
         (should (= (hash-table-count qq-core--read-operations) 0))))) ))
@@ -1660,11 +1663,13 @@
       (let* ((base
               '((session-key . "group:8209413637")
                 (server-id . "7348923749823749823")
+                (canonical-row-key . "201")
                 (group-id . "8209413637")
                 (gateway-account-id . "slot-a")))
              (newest (copy-tree base))
              request)
-        (setf (alist-get 'server-id newest) "7348923749823749824")
+        (setf (alist-get 'server-id newest) nil
+              (alist-get 'canonical-row-key newest) "202")
         (setq timeline (list base newest))
         (setq request
               (qq-core-mark-message-read
@@ -1692,7 +1697,7 @@
              request))
         (funcall (nth 1 (car calls))
                  '((account_id . "slot-a")
-                   (message_id . "7348923749823749823")))
+                   (row_key . "201")))
         (should (= (length calls) 2))
         (should (eq reentered request))
         (should reentered-is-successor-p)
@@ -1705,7 +1710,7 @@
         ;; dispatch a hidden third request.
         (funcall (nth 1 (cadr calls))
                  '((account_id . "slot-a")
-                   (message_id . "7348923749823749824")))
+                   (row_key . "202")))
         (should (= (length calls) 2))))) ))
 
 (ert-deftest qq-core-account-selection-preserves-both-read-operations ()
@@ -1730,11 +1735,13 @@
         (let ((message-a
                '((session-key . "group:8209413637")
                  (server-id . "7348923749823749823")
+                 (canonical-row-key . "301")
                  (group-id . "8209413637")
                  (gateway-account-id . "slot-a")))
               (message-b
                '((session-key . "group:8209413637")
                  (server-id . "7348923749823749824")
+                 (canonical-row-key . "302")
                  (group-id . "8209413637")
                  (gateway-account-id . "slot-b"))))
           (qq-runtime-with-account "slot-a"
@@ -1748,12 +1755,12 @@
           (should (= (hash-table-count qq-core--read-operations) 2))
           (funcall (nth 1 (car calls))
                    '((account_id . "slot-a")
-                     (message_id . "7348923749823749823")))
+                     (row_key . "301")))
           (should (equal completed '(a)))
           (should (= (hash-table-count qq-core--read-operations) 1))
           (funcall (nth 1 (cadr calls))
                    '((account_id . "slot-b")
-                     (message_id . "7348923749823749824")))
+                     (row_key . "302")))
           (should (equal completed '(b a)))
           (should-not canceled)
           (should (= (hash-table-count qq-core--read-operations) 0)))))))
@@ -1782,6 +1789,7 @@
       (let* ((old
               '((session-key . "group:8209413637")
                 (server-id . "7348923749823749823")
+                (canonical-row-key . "401")
                 (group-id . "8209413637")
                 (gateway-account-id . "slot-a")))
              (new (copy-tree old))
@@ -1789,7 +1797,8 @@
               (qq-core-mark-message-read
                old #'ignore
                (lambda (_body reason) (push reason failures)))))
-        (setf (alist-get 'server-id new) "7348923749823749824")
+        (setf (alist-get 'server-id new) nil
+              (alist-get 'canonical-row-key new) "402")
         (setq timeline (list old new))
         ;; A registry update for the same stable slot must not revoke the
         ;; coalescer's outer request.
@@ -1808,7 +1817,7 @@
         (should (eq (car (cadr calls)) new))
         (funcall (nth 1 (cadr calls))
                  '((account_id . "slot-a")
-                   (message_id . "7348923749823749824")))
+                   (row_key . "402")))
         (should (equal completed '(new)))
         (should (= (hash-table-count qq-core--read-operations) 0))))) ))
 
@@ -1817,6 +1826,7 @@
   (let ((message
          '((session-key . "private:10001")
            (server-id . "7348923749823749823")
+           (canonical-row-key . "501")
            (gateway-account-id . "slot-a"))))
     (cl-letf (((symbol-function 'qq-core-ready-p) (lambda () t))
               ((symbol-function 'qq-server-capabilities)
@@ -1829,9 +1839,9 @@
       (let ((other-account (copy-tree message)))
         (setf (alist-get 'gateway-account-id other-account) "slot-b")
         (should-not (qq-core-message-read-capable-p other-account)))
-      (let ((missing-id (copy-tree message)))
-        (setf (alist-get 'server-id missing-id) nil)
-        (should-not (qq-core-message-read-capable-p missing-id)))
+      (let ((missing-row (copy-tree message)))
+        (setf (alist-get 'canonical-row-key missing-row) nil)
+        (should-not (qq-core-message-read-capable-p missing-row)))
       (let ((service (copy-tree message)))
         (setf (alist-get 'session-key service) "service:u_peer")
         (should-not (qq-core-message-read-capable-p service))))) ))
