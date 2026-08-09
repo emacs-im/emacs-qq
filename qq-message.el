@@ -679,13 +679,14 @@ canonical row identity, and pending-send correlation owned by the selected
 projection."
   (let* ((owner (qq-message--event-owner data))
          (message (qq-server-value-copy (alist-get 'message data)))
-         (row-key (alist-get 'row_key data)))
+         (row-key (alist-get 'row_key data))
+         (recalled-p (eq (alist-get 'canonical-recalled-p message) t)))
     (when row-key
       (setf (alist-get 'canonical-row-key message nil nil #'eq) row-key))
     (let* ((account (qq-account-get owner))
            (normalized
             (qq-message-normalize-snapshot
-             message owner account nil history-p)))
+             message owner account recalled-p history-p)))
       (setf (alist-get 'order normalized nil nil #'eq)
             (qq-state--next-message-order)
             (alist-get 'raw-event normalized nil nil #'eq)
@@ -1372,7 +1373,7 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
      :callback callback
      :errback errback)))
 
-(defconst qq-message-history-port-version 4
+(defconst qq-message-history-port-version 5
   "Gateway's conversation-neutral history façade version.")
 
 (defun qq-message--history-conversation-params (session-key)
@@ -1585,13 +1586,20 @@ DIRECTION closes which operation may consume its private position."
      (pcase expected-kind
        ("native"
         (unless (and (qq-account--exact-object-keys-p
-                      item '(kind row_key message))
+                      item '(kind row_key recalled message))
                      (qq-protocol--nonzero-decimal-string-p
-                      (alist-get 'row_key item)))
+                      (alist-get 'row_key item))
+                     (memq (alist-get 'recalled item) '(t :false)))
           (error "qq: %s contains an invalid canonical row" context))
-        (let ((message (copy-tree (alist-get 'message item))))
+        (let ((message (copy-tree (alist-get 'message item)))
+              (recalled-p (eq (alist-get 'recalled item) t)))
+          (when (and recalled-p (alist-get 'segments message))
+            (error "qq: %s recalled canonical row contains message content"
+                   context))
           (setf (alist-get 'canonical-row-key message nil nil #'eq)
-                (alist-get 'row_key item))
+                (alist-get 'row_key item)
+                (alist-get 'canonical-recalled-p message nil nil #'eq)
+                recalled-p)
           message))
        ("dataline"
         (unless (qq-account--exact-object-keys-p item '(kind message))

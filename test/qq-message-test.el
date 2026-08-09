@@ -868,7 +868,12 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
 (ert-deftest qq-message-unified-history-projects-native-private-page ()
   (qq-message-test-with-state
     (let* ((session-key "private:10001")
-           (message (alist-get 'message (qq-message-test-event)))
+           (message
+            (let ((message
+                   (copy-tree
+                    (alist-get 'message (qq-message-test-event)))))
+              (setf (alist-get 'segments message) nil)
+              message))
            (older-cursor
             (qq-message-test-history-cursor
              session-key
@@ -893,6 +898,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                       (messages
                        . [((kind . "native")
                            (row_key . "8")
+                           (recalled . t)
                            (message . ,message))])
                       (unsupported_message_count . 0)
                       (older_cursor . ,older-cursor)
@@ -912,7 +918,11 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                 (count . 20))))
       (should (equal (plist-get meta :history-older-cursor)
                      older-cursor))
-      (should (= (length (qq-state-session-messages session-key)) 1)))))
+      (let ((projected (car (qq-state-session-messages session-key))))
+        (should (qq-state-message-recalled-p projected))
+        (should-not (alist-get 'segments projected))
+        (should (equal (alist-get 'preview projected)
+                       "[message recalled]"))))))
 
 (ert-deftest qq-message-unified-group-history-ignores-json-object-key-order ()
   (qq-message-test-with-state
