@@ -178,6 +178,66 @@
      (list `((id . ,message-id) (server-id . ,message-id))) nil
      (buffer-local-value 'qq-chat--forward-plan-owner buffer))))
 
+(ert-deftest qq-chat-date-break-label-matches-telega-format ()
+  (let ((qq-chat-date-break-format "%d %B %Y %a")
+        (system-time-locale "C"))
+    (should (equal (qq-chat--message-day-label "2026-08-11")
+                   "11 August 2026 Tue"))))
+
+(ert-deftest qq-chat-date-break-projection-honors-toggle-and-day-boundary ()
+  (let* ((first-time (float-time (encode-time 0 0 12 11 8 2026)))
+         (second-time (float-time (encode-time 0 0 12 12 8 2026)))
+         (before-midnight
+          (float-time (encode-time 0 59 23 11 8 2026)))
+         (after-midnight
+          (float-time (encode-time 0 1 0 12 8 2026)))
+         (first (qq-chat-test--canonical-message "1" first-time "first"))
+         (same-day
+          (qq-chat-test--canonical-message "2" (+ first-time 60) "same"))
+         (next-day
+          (qq-chat-test--canonical-message "3" second-time "next"))
+         (before
+          (qq-chat-test--canonical-message "4" before-midnight "before"))
+         (after
+          (qq-chat-test--canonical-message "5" after-midnight "after"))
+         (undated (copy-tree first)))
+    (setf (alist-get 'time undated) nil)
+    (let ((qq-chat-use-date-breaks t))
+      (should-not
+       (plist-get (qq-chat--compute-message-render-context nil first nil)
+                  :insert-date))
+      (should-not
+       (plist-get (qq-chat--compute-message-render-context
+                   undated next-day nil)
+                  :insert-date))
+      (should-not
+       (plist-get (qq-chat--compute-message-render-context
+                   first same-day nil)
+                  :insert-date))
+      (should
+       (equal (plist-get (qq-chat--compute-message-render-context
+                          first next-day nil)
+                         :insert-date)
+              "2026-08-12"))
+      (let ((context
+             (qq-chat--compute-message-render-context before after nil)))
+        (should (equal (plist-get context :insert-date) "2026-08-12"))
+        (should-not (plist-get context :compact))))
+    (let ((qq-chat-use-date-breaks nil))
+      (should-not
+       (plist-get (qq-chat--compute-message-render-context
+                   first next-day nil)
+                  :insert-date)))))
+
+(ert-deftest qq-chat-date-break-row-uses-telega-style-chrome ()
+  (with-temp-buffer
+    (let ((qq-chat--fill-column 32))
+      (qq-chat--insert-date-separator-row "11 August 2026 Tue"))
+    (should (equal (buffer-string)
+                   "------(11 August 2026 Tue)------\n"))
+    (should (eq (get-text-property (point-min) 'face)
+                'qq-msg-date-separator))))
+
 (ert-deftest qq-chat-header-contains-state-not-a-key-cheat-sheet ()
   (with-temp-buffer
     (qq-chat-mode)
@@ -381,7 +441,9 @@
              (should qq-chat-timeline-mode)
              (should (eq (key-binding (kbd "q") t) 'quit-window))
              (should (eq (key-binding (kbd "r") t) 'qq-chat-reply-to-message))
-             (should (eq (key-binding (kbd "d") t) 'qq-chat-delete-message))
+             (should (eq (key-binding (kbd "d") t)
+                         'qq-chat-delete-transient))
+             (should-not (lookup-key qq-chat-timeline-mode-map (kbd "R")))
              (should (eq (key-binding (kbd "f") t)
                          'qq-chat-forward-transient))
              (should (eq (key-binding (kbd "m") t)
@@ -3386,7 +3448,9 @@
                     (session-key . "group:20001")
                     (message-seq . "9007199254740999")
                     (native-random . 7)
-                    (gateway-account-id . "slot-a")))
+                    (gateway-account-id . "slot-a")
+                    (self-p . t)
+                    (time . 100)))
          calls)
      (with-temp-buffer
        (qq-chat-mode)
@@ -3411,6 +3475,7 @@
                        '((account_id . "slot-a")
                          (row_key . "42"))))))
                  ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+                 ((symbol-function 'float-time) (lambda (&optional _) 200))
                  ((symbol-function 'qq-core-recall-message)
                   (lambda (selected &rest _)
                     (should (eq selected message))
@@ -3433,7 +3498,7 @@
                     (push 'todo calls))))
          (qq-chat-reply-to-message)
          (qq-chat--mark-message-viewed message t)
-         (qq-chat--delete-message-internal message)
+         (qq-chat--recall-message-internal message)
          (qq-chat-react-to-message "178" message)
          (qq-chat-toggle-message-essence message)
          (qq-chat-set-message-todo message))
@@ -3530,6 +3595,23 @@
          (qq-chat-poke-sender))
        (should (equal call '("private:10002" "90001")))))))
 
+(ert-deftest qq-chat-delete-is-local-and-never-routes-to-recall ()
+  (let ((message '((canonical-row-key . "42")
+                   (session-key . "group:20001")))
+        deleted recalled)
+    (cl-letf (((symbol-function 'qq-chat--message-at-point)
+               (lambda () message))
+              ((symbol-function 'qq-message-delete-local-capable-p)
+               (lambda (value) (eq value message)))
+              ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+              ((symbol-function 'qq-core-delete-message-local)
+               (lambda (value &rest _) (setq deleted value)))
+              ((symbol-function 'qq-core-recall-message)
+               (lambda (&rest _) (setq recalled t))))
+      (qq-chat-delete-message))
+    (should (eq deleted message))
+    (should-not recalled)))
+
 (ert-deftest qq-chat-routes-group-poke-recall-through-dedicated-operation ()
   (let* ((qq-chat--session-key "group:20001")
          (message
@@ -3552,7 +3634,7 @@
               ((symbol-function 'qq-core-recall-message)
                (lambda (&rest _)
                  (setq ordinary-recall-called t))))
-      (qq-chat--delete-message-internal message))
+      (qq-chat--recall-message-internal message))
     (should (eq recalled-message message))
     (should-not ordinary-recall-called)))
 
@@ -3560,26 +3642,39 @@
   (let ((qq-chat--session-key "group:20001")
         (message '((server-id . "9007199254741004001")
                    (session-key . "group:20001")
+                   (gateway-account-id . "slot-a")
+                   (self-p . t)
+                   (time . 100)
                    (segments . (((type . "text"))))))
         called)
     (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+              ((symbol-function 'float-time) (lambda (&optional _) 200))
+              ((symbol-function 'qq-runtime-current-account-id)
+               (lambda () "slot-a"))
               ((symbol-function 'qq-core-recall-message)
                (lambda (selected &rest _) (setq called selected))))
-      (qq-chat--delete-message-internal message))
+      (qq-chat--recall-message-internal message))
     (should (eq called message))))
 
-(ert-deftest qq-chat-recalls-sequence-only-group-message ()
+(ert-deftest qq-chat-refuses-sequence-only-group-recall ()
   (let ((qq-chat--session-key "group:20001")
         (message '((id . "history:slot-a:group:20001:105544:none")
                    (session-key . "group:20001")
+                   (gateway-account-id . "slot-a")
                    (message-seq . "105544")
                    (segments . (((type . "text"))))))
+        prompted
         called)
-    (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+    (cl-letf (((symbol-function 'y-or-n-p)
+               (lambda (&rest _) (setq prompted t)))
+              ((symbol-function 'qq-runtime-current-account-id)
+               (lambda () "slot-a"))
               ((symbol-function 'qq-core-recall-message)
-               (lambda (selected &rest _) (setq called selected))))
-      (qq-chat--delete-message-internal message))
-    (should (eq called message))))
+               (lambda (&rest _) (setq called t))))
+      (should-error (qq-chat--recall-message-internal message)
+                    :type 'user-error))
+    (should-not prompted)
+    (should-not called)))
 
 (ert-deftest qq-chat-refuses-an-unaddressable-poke-before-confirmation ()
   (let ((message
@@ -3597,7 +3692,7 @@
               ((symbol-function 'qq-core-recall-poke)
                (lambda (&rest _)
                  (setq api-called t))))
-      (should-error (qq-chat--delete-message-internal message)
+      (should-error (qq-chat--recall-message-internal message)
                     :type 'user-error))
     (should-not prompted)
     (should-not api-called)))
@@ -3623,7 +3718,7 @@
               ((symbol-function 'qq-core-recall-poke)
                (lambda (value &rest _)
                  (setq recalled value))))
-      (qq-chat--delete-message-internal message))
+      (qq-chat--recall-message-internal message))
     (should prompted)
     (should (eq recalled message))))
 
@@ -4871,6 +4966,24 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                      (insert "VIDEO-PREVIEW"))))
           (qq-chat--insert-segment-media-line segment nil nil)
           (should (equal fallback "[video]")))))))
+
+(ert-deftest qq-chat-renders-files-as-named-media-cards ()
+  (dolist (type '("file" "group_file"))
+    (let ((message
+           `((segments
+              . (((type . ,type)
+                  (data . ((file_name . "report.pdf")
+                           (file_size . "1572864")))))))))
+      (with-temp-buffer
+        (let ((inhibit-read-only t))
+          (cl-letf (((symbol-function 'qq-media-segment-capabilities)
+                     (lambda (_segment) nil)))
+            (qq-chat--insert-message-body message nil nil)
+            (should (string-match-p "report\\.pdf" (buffer-string)))
+            (should (string-match-p "1\\.5 MB" (buffer-string)))
+            (when (equal type "group_file")
+              (should-not (string-match-p "\\[group_file\\]"
+                                          (buffer-string))))))))))
 
 (ert-deftest qq-chat-media-card-context-targets-exact-segment-at-point ()
   "Shared card context keeps multi-segment QQ messages unambiguous."

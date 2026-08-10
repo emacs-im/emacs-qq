@@ -37,6 +37,7 @@
 (ert-deftest qq-transient-prefixes-are-commands ()
   (should (commandp #'qq-chat-transient))
   (should (commandp #'qq-chat-message-transient))
+  (should (commandp #'qq-chat-delete-transient))
   (should (commandp #'qq-chat-forward-transient))
   (should (commandp #'qq-transient-forward-individually))
   (should (commandp #'qq-transient-forward-merged))
@@ -117,6 +118,26 @@
       (should account-switch)
       (should
        (eq (oref account-switch command) 'qq-root-switch-account)))))
+
+(ert-deftest qq-transient-delete-prefix-separates-local-and-remote-mutations ()
+  (let* ((delete-objects (transient-suffixes 'qq-chat-delete-transient))
+         (local (seq-find (lambda (suffix) (equal (oref suffix key) "d"))
+                          delete-objects))
+         (recall (seq-find (lambda (suffix) (equal (oref suffix key) "r"))
+                           delete-objects))
+         (message-objects (transient-suffixes 'qq-chat-message-transient)))
+    (should (eq (oref local command) 'qq-chat-delete-message))
+    (should (eq (oref local inapt-if) 'qq-transient--delete-local-inapt-p))
+    (should (eq (oref recall command) 'qq-chat-recall-message))
+    (should (eq (oref recall inapt-if) 'qq-transient--recall-inapt-p))
+    (should
+     (eq (oref (seq-find (lambda (suffix) (equal (oref suffix key) "d"))
+                         message-objects)
+               command)
+         'qq-chat-delete-transient))
+    (should-not
+     (seq-find (lambda (suffix) (equal (oref suffix key) "R"))
+               message-objects))))
 
 (ert-deftest qq-transient-message-prefix-exposes-essence-toggle ()
   (let* ((objects (transient-suffixes 'qq-chat-message-transient))
@@ -236,6 +257,7 @@
     "private:10001"
     '(((server-id . "9007199254742007089")
        (session-key . "private:10001")
+       (gateway-account-id . "slot-a")
        (sender-id . "10001")
        (sender-name . "Alice")
        (time . 100)
@@ -256,8 +278,8 @@
      (should (qq-transient--no-message-selection-p))
      ;; With no explicit selection, the message at point is the plan.
      (should-not (qq-transient--forward-selection-inapt-p))
-     ;; Only self messages can be recalled.
-     (should (qq-transient--recall-inapt-p))
+     ;; Addressability is independent from local authorship policy; QQ decides.
+     (should-not (qq-transient--recall-inapt-p))
      (should-not (qq-transient--avatar-inapt-p))
      (setq qq-chat--message-selection
            (list
@@ -272,22 +294,25 @@
      (setq qq-chat--forward-request-owner '(request-owner))
      (should (qq-transient--forward-selection-inapt-p)))))
 
-(ert-deftest qq-transient-group-sequence-is-a-native-reply-and-recall-capability ()
+(ert-deftest qq-transient-group-sequence-is-reply-only-without-message-id ()
   (let ((qq-chat--session-key "group:8209413637")
         (message
          '((id . "history:slot-a:group:8209413637:105544:none")
            (server-id)
            (session-key . "group:8209413637")
+           (gateway-account-id . "slot-a")
            (message-seq . "105544")
-           (self-p)
            (status . received))))
-    (cl-letf (((symbol-function 'qq-transient--message-at-point)
+    (cl-letf (((symbol-function 'qq-runtime-current-account-id)
+               (lambda () "slot-a"))
+              ((symbol-function 'qq-transient--message-at-point)
                (lambda () message)))
       (should-not (qq-transient--reply-inapt-p))
       (should (qq-transient--recall-inapt-p))
-      (setf (alist-get 'self-p message) t)
+      (setf (alist-get 'server-id message) "7348923749823749823")
       (should-not (qq-transient--recall-inapt-p))
-      (setf (alist-get 'session-key message) "private:10001"
+      (setf (alist-get 'server-id message) nil
+            (alist-get 'session-key message) "private:10001"
             qq-chat--session-key "private:10001")
       (should (qq-transient--reply-inapt-p))
       (should (qq-transient--recall-inapt-p)))))

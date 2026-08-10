@@ -73,7 +73,8 @@
          (announcement . "Welcome")
          (remark . "Lab")
          (last_speak_time . 1784700000)
-         (latest_sequence . 123))]))))
+         (latest_sequence . 123)
+         (message_notify_mode . "receive"))]))))
 
 (defun qq-directory-test-members-result ()
   "Return one closed group-member result."
@@ -261,6 +262,7 @@
 (ert-deftest qq-directory-groups-project-native-metadata ()
   (qq-directory-test-with-state
     (let (sent-params callback-value)
+      (qq-state-upsert-session "group:8209413637" nil nil)
       (cl-letf (((symbol-function 'qq-server-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-server-capabilities)
@@ -282,7 +284,12 @@
           (should (equal (alist-get 'group_remark group) "Lab"))
           (should (equal (alist-get 'self_permission group) "owner"))
           (should (equal (alist-get 'latest_sequence group) "123"))
-          (should (= (alist-get 'max_member_count group) 500)))))))
+          (should (= (alist-get 'max_member_count group) 500))
+          (should (eq (alist-get 'message-notify-mode group) 'receive))
+          (should (eq (alist-get 'muted-p group) t)))
+        (let ((session (qq-state-session "group:8209413637")))
+          (should (eq (alist-get 'message-notify-mode session) 'receive))
+          (should (eq (alist-get 'muted-p session) t)))))))
 
 (ert-deftest qq-directory-group-settings-send-domain-requests ()
   (qq-directory-test-with-state

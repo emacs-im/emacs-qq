@@ -15,7 +15,7 @@
     "message.set_essence" "message.set_todo" "message.get_history"
     "message.get_history_page" "message.get_history_around"
     "message.get_forward"
-    "message.mark_read")
+    "message.mark_read" "message.delete_local")
   "Native Gateway capabilities exercised by message tests.")
 
 (defun qq-message-test-account (&optional account-id uin uid)
@@ -123,6 +123,14 @@
         (segments
          . ,(mapcar #'qq-message-test-wire-segment
                     (append segments nil)))))))
+
+(defun qq-message-test-native-row (event row-key)
+  "Return one canonical native history row for EVENT and ROW-KEY."
+  `((kind . "native")
+    (row_key . ,row-key)
+    (timeline_class . "authored")
+    (recalled . :false)
+    (message . ,(copy-tree (alist-get 'message event)))))
 
 (cl-defun qq-message-test-recall
     (&key
@@ -359,17 +367,18 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
        (qq-runtime-stop)
        (qq-state-reset))))
 
-(ert-deftest qq-message-send-file-publishes-staged-resource-to-group ()
+(ert-deftest qq-message-send-file-publishes-staged-resource-to-native-chats ()
   (qq-message-test-with-state
-    (let (method params)
+    (let (method params response-callback receipt)
       (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
                 ((symbol-function 'qq-server-capabilities)
                  (lambda () qq-message-test-capabilities))
                 ((symbol-function 'qq-server-send)
-                 (lambda (sent-method sent-params _callback _errback
+                 (lambda (sent-method sent-params callback _errback
                                       &optional _early)
                    (setq method sent-method
-                         params sent-params)
+                         params sent-params
+                         response-callback callback)
                    "file-send-request")))
         (should
          (equal
@@ -384,10 +393,67 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
             (conversation . ((kind . "group")
                              (group_uin . "8209413637")))
             (resource_id . "res-group-file"))))
-        (should-error
-         (qq-message-send-file
-          "private:10001" "res-group-file")
-         :type 'user-error)))))
+        (should
+         (equal
+          (qq-message-send-file
+           "private:10001" "res-private-file"
+           (lambda (value) (setq receipt value)))
+          "file-send-request"))
+        (should
+         (equal
+          params
+          '((account_id . "slot-a")
+            (conversation . ((kind . "private") (peer_uin . "10001")))
+            (resource_id . "res-private-file"))))
+        (funcall
+         response-callback
+         '((account_id . "slot-a")
+           (peer_uin . "10001")
+           (sent_at . 1784700000)
+           (server_sequence . "42")
+           (client_sequence . "42001")
+           (random . 7)
+           (resource_id . "res-private-file")
+           (file_name . "notes.txt")
+           (file_size . "4096")
+           (fast_path . :false)))
+        (should (equal (alist-get 'file_name receipt) "notes.txt"))))))
+
+(ert-deftest qq-message-private-file-receipt-correlates-peer-and-resource ()
+  (qq-message-test-with-state
+    (dolist (mismatch '((peer_uin . "10002")
+                        (resource_id . "res-other-file")))
+      (let (failure-body failure-reason)
+        (cl-letf
+            (((symbol-function 'qq-server-ready-p) (lambda () t))
+             ((symbol-function 'qq-server-capabilities)
+              (lambda () qq-message-test-capabilities))
+             ((symbol-function 'qq-server-send)
+              (lambda (_method _params callback _errback &optional _early)
+                (let ((receipt
+                       (copy-tree
+                        '((account_id . "slot-a")
+                          (peer_uin . "10001")
+                          (sent_at . 1784700000)
+                          (server_sequence . "42")
+                          (client_sequence . "42001")
+                          (random . 7)
+                          (resource_id . "res-private-file")
+                          (file_name . "notes.txt")
+                          (file_size . "4096")
+                          (fast_path . t)))))
+                  (setcdr (assq (car mismatch) receipt) (cdr mismatch))
+                  (funcall callback receipt))
+                "file-send-request")))
+          (qq-message-send-file
+           "private:10001" "res-private-file" nil
+           (lambda (body reason)
+             (setq failure-body body
+                   failure-reason reason))))
+        (should (equal (alist-get 'code failure-body)
+                       "invalid_gateway_result"))
+        (should (string-match-p "invalid private-file receipt"
+                                failure-reason))))))
 
 (ert-deftest qq-message-dataline-text-uses-the-pinned-class-operation ()
   (qq-message-test-with-state
@@ -902,6 +968,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                       (messages
                        . [((kind . "native")
                            (row_key . "8")
+                           (timeline_class . "authored")
                            (recalled . t)
                            (message . ,message))])
                       (unsupported_message_count . 0)
@@ -2807,11 +2874,140 @@ push carries sequence=40909 and client_sequence=30202."
           (should (eq (alist-get 'status message) 'failed))
           (should (equal (alist-get 'error message) "boom")))))))
 
+(ert-deftest qq-message-local-deletion-is-row-scoped-and-event-driven ()
+  (qq-message-test-with-state
+    (qq-message--handle-event
+     "message.received"
+     (qq-message-test-event :row-key "42"))
+    (let* ((session-key "private:10001")
+           (message (car (qq-state-session-messages session-key)))
+           method params response-callback)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () qq-message-test-capabilities))
+                ((symbol-function 'qq-server-send)
+                 (lambda (sent-method sent-params callback _errback
+                                      &optional _early)
+                   (setq method sent-method
+                         params sent-params
+                         response-callback callback)
+                   "local-delete-request")))
+        (should (equal (qq-message-delete-local message)
+                       "local-delete-request"))
+        (should (equal method "message.delete_local"))
+        (should
+         (equal params
+                '((account_id . "slot-a")
+                  (conversation . ((kind . "private")
+                                   (peer_uin . "10001")))
+                  (row_key . "42"))))
+        (funcall
+         response-callback
+         '((account_id . "slot-a")
+           (conversation . ((kind . "private") (peer_uin . "10001")))
+           (row_key . "42")
+           (newly_deleted . t)
+           (conversation_head . ((state . "cleared")))))
+        ;; The message-mutation fence delivers the durable event before the
+        ;; response; the response validator does not duplicate projection.
+        (should (= (length (qq-state-session-messages session-key)) 1))
+        (qq-message--handle-event
+         "message.locally_deleted"
+         '((account_id . "slot-a")
+           (conversation . ((kind . "private") (peer_uin . "10001")))
+           (row_key . "42")
+           (newly_deleted . t)
+           (conversation_head . ((state . "cleared")))))
+        (should-not (qq-state-session-messages session-key))
+        (should-not
+         (alist-get 'last-message-id (qq-state-session session-key)))))))
+
+(ert-deftest qq-message-local-deletion-accepts-same-group-replacement-dto ()
+  (qq-message-test-with-state
+    (let* ((conversation
+            '((kind . "group") (group_uin . "8209413637")))
+           (replacement-event
+            (qq-message-test-event
+             :conversation
+             '((kind . "group")
+               (group_uin . "8209413637")
+               (group_name . "Protocol Lab"))))
+           (deletion
+            `((account_id . "slot-a")
+              (conversation . ,conversation)
+              (row_key . "42")
+              (newly_deleted . t)
+              (conversation_head
+               . ((state . "replaced")
+                  (head . ,(qq-message-test-native-row
+                            replacement-event "41")))))))
+      (should
+       (equal
+        (plist-get
+         (qq-message--check-local-deletion
+          deletion "slot-a" "group replacement" conversation "42")
+         :session-key)
+        "group:8209413637"))
+      (setf (alist-get 'group_uin
+                       (alist-get 'conversation
+                                  (alist-get 'message
+                                             (alist-get 'head
+                                                        (alist-get 'conversation_head
+                                                                   deletion)))))
+            "8209413638")
+      (should-error
+       (qq-message--check-local-deletion
+        deletion "slot-a" "group replacement" conversation "42")
+       :type 'error))))
+
+(ert-deftest qq-message-local-deletion-derives-private-replacement-from-endpoints ()
+  (qq-message-test-with-state
+    (let* ((conversation '((kind . "private") (peer_uin . "10001")))
+           (replacement-event (qq-message-test-event))
+           (deletion
+            `((account_id . "slot-a")
+              (conversation . ,conversation)
+              (row_key . "42")
+              (newly_deleted . t)
+              (conversation_head
+               . ((state . "replaced")
+                  (head . ,(qq-message-test-native-row
+                            replacement-event "41")))))))
+      (should
+       (equal
+        (plist-get
+         (qq-message--check-local-deletion
+          deletion "slot-a" "private replacement" conversation "42")
+         :session-key)
+        "private:10001")))))
+
+(ert-deftest qq-message-ordinary-recall-aptitude-is-exact-reference-only ()
+  (let ((message '((server-id . "7348923749823749823")
+                   (session-key . "group:8209413637")
+                   (gateway-account-id . "slot-a")
+                   (self-p)
+                   (time . 1)
+                   (status . received)
+                   (segments . (((type . "text")))))))
+    (cl-letf (((symbol-function 'qq-runtime-current-account-id)
+               (lambda () "slot-a")))
+      (should (qq-message-recall-capable-p message))
+      (should
+       (qq-message-recall-capable-p (assq-delete-all 'time message)))
+      (should-not
+       (qq-message-recall-capable-p
+        (assq-delete-all 'server-id message))))
+    (cl-letf (((symbol-function 'qq-runtime-current-account-id)
+               (lambda () "slot-b")))
+      (should-not (qq-message-recall-capable-p message)))))
+
 (ert-deftest qq-message-group-recall-projects-typed-acknowledgement ()
   (qq-message-test-with-state
     (qq-message--handle-event
      "message.received"
      (qq-message-test-event
+      :sender '((uin . "10002") (uid . "u_self"))
+      :recipient '((uin . "10001") (uid . "u_peer"))
       :conversation
       '((kind . "group")
         (group_uin . "8209413637")
@@ -2830,9 +3026,7 @@ push carries sequence=40909 and client_sequence=30202."
                    (setq sent-params params)
                    (funcall callback
                             '((account_id . "slot-a")
-                              (target . ((kind . "message")
-                                         (message_id
-                                          . "7348923749823749823")))))
+                              (message_id . "7348923749823749823")))
                    "request-recall")))
         (should (equal (qq-message-recall session-key message)
                        "request-recall"))
@@ -2842,8 +3036,7 @@ push carries sequence=40909 and client_sequence=30202."
           '((account_id . "slot-a")
             (conversation . ((kind . "group")
                              (group_uin . "8209413637")))
-            (target . ((kind . "message")
-                       (message_id . "7348923749823749823"))))))
+            (message_id . "7348923749823749823"))))
         (should
          (qq-state-message-recalled-p
           (car (qq-state-session-messages session-key))))
@@ -2856,7 +3049,10 @@ push carries sequence=40909 and client_sequence=30202."
 (ert-deftest qq-message-private-recall-sends-only-the-message-reference ()
   (qq-message-test-with-state
     (qq-message--handle-event
-     "message.received" (qq-message-test-event))
+     "message.received"
+     (qq-message-test-event
+      :sender '((uin . "10002") (uid . "u_self"))
+      :recipient '((uin . "10001") (uid . "u_peer"))))
     (let* ((session-key "private:10001")
            (message (car (qq-state-session-messages session-key)))
            sent-params)
@@ -2871,16 +3067,12 @@ push carries sequence=40909 and client_sequence=30202."
                    (setq sent-params params)
                    (funcall callback
                             '((account_id . "slot-a")
-                              (target . ((kind . "message")
-                                         (message_id
-                                          . "7348923749823749823")))))
+                              (message_id . "7348923749823749823")))
                    "request-recall")))
         (qq-message-recall session-key message)
         (should
-         (equal
-          (alist-get 'target sent-params)
-          '((kind . "message")
-            (message_id . "7348923749823749823"))))
+         (equal (alist-get 'message_id sent-params)
+                "7348923749823749823"))
         (should
          (equal (alist-get 'conversation sent-params)
                 '((kind . "private") (peer_uin . "10001"))))
@@ -2888,7 +3080,7 @@ push carries sequence=40909 and client_sequence=30202."
          (qq-state-message-recalled-p
           (car (qq-state-session-messages session-key))))))))
 
-(ert-deftest qq-message-group-recall-uses-sequence-without-a-snowflake ()
+(ert-deftest qq-message-group-recall-without-message-id-remains-unavailable ()
   (qq-message-test-with-state
     (let* ((session-key "group:8209413637")
            (wire-message
@@ -2905,34 +3097,15 @@ push carries sequence=40909 and client_sequence=30202."
            (message
             (qq-message-normalize-snapshot
              wire-message "slot-a" (qq-account-get "slot-a") nil t))
-           sent-params)
+           called)
       (qq-message--merge-normalized message 'history)
-      (cl-letf (((symbol-function 'qq-server-ready-p)
-                 (lambda () t))
-                ((symbol-function 'qq-server-capabilities)
-                 (lambda () qq-message-test-capabilities))
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
                 ((symbol-function 'qq-server-send)
-                 (lambda (_method params callback _errback &optional _early)
-                   (setq sent-params params)
-                   (funcall
-                    callback
-                    '((account_id . "slot-a")
-                      (target . ((kind . "sequence")
-                                 (sequence . "105544")))))
-                   "request-sequence-recall")))
-        (should (equal (qq-message-recall session-key message)
-                       "request-sequence-recall"))
-        (should
-         (equal
-          sent-params
-          '((account_id . "slot-a")
-            (conversation . ((kind . "group")
-                             (group_uin . "8209413637")))
-            (target . ((kind . "sequence")
-                       (sequence . "105544"))))))
-        (should
-         (qq-state-message-recalled-p
-          (car (qq-state-session-messages session-key))))))))
+                 (lambda (&rest _args) (setq called t))))
+        (should-error (qq-message-recall session-key message)
+                      :type 'user-error)
+        (should-not called)
+        (should-not (qq-message-recall-target session-key message))))))
 
 (ert-deftest qq-message-group-reply-uses-sequence-without-a-snowflake ()
   (qq-message-test-with-state
@@ -3488,7 +3661,10 @@ push carries sequence=40909 and client_sequence=30202."
               (sender_card . "Alice"))))
       (qq-message--handle-event
        "message.received"
-       (qq-message-test-event :conversation conversation))
+       (qq-message-test-event
+        :sender '((uin . "10002") (uid . "u_self"))
+        :recipient '((uin . "10001") (uid . "u_peer"))
+        :conversation conversation))
       (let* ((old-message (car (qq-state-session-messages session-key)))
              (pending
               (qq-state-insert-pending-message
@@ -3523,7 +3699,9 @@ push carries sequence=40909 and client_sequence=30202."
           (should retained)
           (should (eq (alist-get 'status in-flight) 'pending))
           (should-not (alist-get 'error in-flight)))
-        (cl-letf (((symbol-function 'qq-server-ready-p)
+        (cl-letf (((symbol-function 'float-time)
+                   (lambda (&optional _) (+ (alist-get 'time old-message) 100)))
+                  ((symbol-function 'qq-server-ready-p)
                    (lambda () t))
                   ((symbol-function 'qq-server-capabilities)
                    (lambda () qq-message-test-capabilities))
@@ -3533,9 +3711,7 @@ push carries sequence=40909 and client_sequence=30202."
                      (funcall
                       callback
                       '((account_id . "slot-a")
-                        (target . ((kind . "message")
-                                   (message_id
-                                    . "7348923749823749823")))))
+                        (message_id . "7348923749823749823")))
                      "restart-recall")))
           (should
            (equal
@@ -3546,9 +3722,8 @@ push carries sequence=40909 and client_sequence=30202."
         (should delivered)
         (should (equal (alist-get 'account_id sent-params) "slot-a"))
         (should
-         (equal (alist-get 'target sent-params)
-                '((kind . "message")
-                  (message_id . "7348923749823749823"))))
+         (equal (alist-get 'message_id sent-params)
+                "7348923749823749823"))
         (should-not (assq 'generation sent-params))))))
 
 (ert-deftest qq-message-account-ready-synchronizes-every-owner ()

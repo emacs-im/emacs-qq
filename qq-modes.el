@@ -27,18 +27,22 @@
 (defun qq-mode-line--counts ()
   "Return (UNREAD . MENTIONS) counts for current QQ sessions.
 
-UNREAD is the number of messages in unmuted sessions.  MENTIONS is the
-number of sessions carrying an unread @self or @all marker, including muted
-sessions because native QQ mentions are priority activity."
+UNREAD is the exact number of messages in unmuted sessions, or nil when any
+applicable Badge Count is unavailable. MENTIONS independently counts sessions
+carrying an unread @self or @all marker, including muted sessions because native
+QQ mentions are priority activity."
   (let ((unread 0)
+        (unread-complete-p t)
         (mentions 0))
     (dolist (session (qq-state-sessions))
       (unless (qq-root--session-muted-p session)
-        (cl-incf unread
-                 (max 0 (or (alist-get 'unread-badge-count session) 0))))
+        (let ((badge (alist-get 'unread-badge-count session)))
+          (if (and (integerp badge) (>= badge 0))
+              (cl-incf unread badge)
+            (setq unread-complete-p nil))))
       (when (qq-root--session-mention-kinds session)
         (cl-incf mentions)))
-    (cons unread mentions)))
+    (cons (and unread-complete-p unread) mentions)))
 
 (defun qq-mode-line-open-root ()
   "Open the QQ root buffer from the mode line."
@@ -72,7 +76,7 @@ sessions because native QQ mentions are priority activity."
 (defun qq-mode-line-unread-unmuted ()
   "Return mode-line text for unmuted unread messages."
   (let ((count (car (qq-mode-line--counts))))
-    (unless (zerop count)
+    (when (and (integerp count) (> count 0))
       (appkit-mode-line-indicator
        (number-to-string count) :prefix " " :face 'qq-mode-line-unread
        :command #'qq-mode-line-open-unread

@@ -33,7 +33,11 @@
 (declare-function qq-reset-session-state "qq")
 (declare-function qq-chat--forward-source-supported-p "qq-chat"
                   (&optional style session-key))
+(declare-function qq-message-delete-local-capable-p
+                  "qq-message" (message))
 (declare-function qq-message-poke-recall-capable-p
+                  "qq-message" (message))
+(declare-function qq-message-recall-capable-p
                   "qq-message" (message))
 
 (defvar qq-chat--forward-request-owner)
@@ -88,20 +92,20 @@
       (not (ring-p qq-chat--messages-pop-ring))
       (ring-empty-p qq-chat--messages-pop-ring)))
 
+(defun qq-transient--delete-local-inapt-p ()
+  "Return non-nil when local deletion is unavailable at point."
+  (let ((message (qq-transient--message-at-point)))
+    (or (null message)
+        (not (qq-message-delete-local-capable-p message)))))
+
 (defun qq-transient--recall-inapt-p ()
   "Return non-nil when recall is unavailable for the message at point."
   (let* ((message (qq-transient--message-at-point))
-         (poke-p (and message (qq-state-poke-message-p message)))
-         (recall-target
-          (and message
-               (not poke-p)
-               (qq-message-recall-target qq-chat--session-key message))))
+         (poke-p (and message (qq-state-poke-message-p message))))
     (or (null message)
-        (not (alist-get 'self-p message))
         (if poke-p
             (not (qq-message-poke-recall-capable-p message))
-          (null recall-target))
-        (qq-state-message-recalled-p message))))
+          (not (qq-message-recall-capable-p message))))))
 
 (defun qq-transient--forward-inapt-p ()
   "Return non-nil when forwarding the message at point is unavailable."
@@ -248,6 +252,15 @@
     ("u" "Unpin" qq-chat-unpin-friend
      :inapt-if qq-transient--friend-pin-inapt-p)]])
 
+;;;###autoload(autoload 'qq-chat-delete-transient "qq-transient" nil t)
+(transient-define-prefix qq-chat-delete-transient ()
+  "Choose local deletion or QQ ordinary recall for the message at point."
+  [["Delete"
+    ("d" "Delete locally" qq-chat-delete-message
+     :inapt-if qq-transient--delete-local-inapt-p)
+    ("r" "Recall from QQ" qq-chat-recall-message
+     :inapt-if qq-transient--recall-inapt-p)]])
+
 ;;;###autoload(autoload 'qq-chat-message-transient "qq-transient" nil t)
 (transient-define-prefix qq-chat-message-transient ()
   "Message actions for the QQ chat message at point.
@@ -260,8 +273,7 @@ Prefer this over inline button rows."
      :inapt-if qq-transient--forward-inapt-p)
     ("m" "Select / unselect" qq-chat-toggle-message-selection
      :inapt-if qq-transient--forward-inapt-p)
-    ("d" "Recall" qq-chat-delete-message
-     :inapt-if qq-transient--recall-inapt-p)
+    ("d" "Delete…" qq-chat-delete-transient)
     ("!" "React…" qq-chat-react-to-message
      :inapt-if qq-transient--reaction-inapt-p)
     ("e" "Toggle essence" qq-chat-toggle-message-essence
@@ -377,8 +389,7 @@ Prefer this over inline button rows."
     ("e" "Focus draft" qq-chat-edit-draft)
     ("r" "Reply at point" qq-chat-reply-to-message
      :inapt-if qq-transient--reply-inapt-p)
-    ("d" "Recall at point" qq-chat-delete-message
-     :inapt-if qq-transient--recall-inapt-p)]
+    ("d" "Delete at point…" qq-chat-delete-transient)]
    ["Session"
     ("t" "Friend pin…" qq-chat-friend-pin-transient
      :inapt-if qq-transient--friend-pin-inapt-p)

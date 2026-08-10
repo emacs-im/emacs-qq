@@ -49,14 +49,38 @@ SEQUENCE, SENDER, RECIPIENT, and CONVERSATION provide its native context."
      (pinned 'absent))
   "Return a closed recent-conversation row for IDENTITY and REVISION.
 
-ROW-KEY and MESSAGE form its canonical latest row.  RECALLED and PINNED supply
-projection metadata.  The symbol `absent' omits unknown pin state."
+ROW-KEY and MESSAGE form its canonical latest row.  RECALLED and PINNED
+supply projection metadata.  The symbol `absent' omits an independently
+unknown field."
   `((conversation . ,(copy-tree identity))
     ,@(unless (eq pinned 'absent) `((pinned . ,pinned)))
     (activity_revision . ,revision)
-    (latest_message . ((row_key . ,row-key)
-                       (message . ,(copy-tree message))))
-    (latest_message_recalled . ,recalled)))
+    (latest_message . ((kind . "native")
+                       (row_key . ,row-key)
+                       (timeline_class . "authored")
+                       (recalled . ,recalled)
+                       (message . ,(copy-tree message))))))
+
+(cl-defun qq-message-recent-test-dataline-row
+    (&key
+     (variant "desktop")
+     (peer-uid "u_Wcc5rknRRqRO8y5gxMD6sA")
+     (revision "13")
+     (message-id "7348923749823749824"))
+  "Return one closed DataLine recent row for VARIANT and PEER-UID."
+  `((conversation . ((kind . "dataline")
+                     (peer_uid . ,peer-uid)
+                     (variant . ,variant)))
+    (activity_revision . ,revision)
+    (latest_message
+     . ((kind . "dataline")
+        (message
+         . ((message_id . ,message-id)
+            (chat . ((peer_uid . ,peer-uid) (variant . ,variant)))
+            (direction . "received")
+            (sent_at . 1784700001)
+            (segments . (((kind . "text")
+                          (payload . ((text . "DataLine recent"))))))))))))
 
 (cl-defun qq-message-recent-test-page
     (&key
@@ -195,6 +219,32 @@ TRUNCATED is its exact wire boolean."
         (should-error
          (qq-message--recent-check-page
           (qq-server-wire-domain-copy page)))))))
+
+(ert-deftest qq-message-recent-projection-keeps-dataline-variants-distinct ()
+  (qq-message-recent-test-with-state
+    (let* ((desktop (qq-message-recent-test-dataline-row))
+           (mobile (qq-message-recent-test-dataline-row
+                    :variant "mobile"
+                    :revision "14"
+                    :message-id "7348923749823749825"))
+           (page (qq-message-recent-test-page
+                  :rows (list desktop mobile))))
+      (should (qq-message--recent-check-page
+               (qq-server-wire-domain-copy page)))
+      (let* ((mismatch (copy-tree desktop))
+             (message (alist-get 'message
+                                 (alist-get 'latest_message mismatch))))
+        (setf (alist-get 'variant (alist-get 'chat message)) "mobile")
+        (ert-info ("mismatched DataLine locator")
+          (should-error
+           (qq-message--recent-check-page
+            (qq-server-wire-domain-copy
+             (qq-message-recent-test-page :rows (list mismatch)))))))
+      (ert-info ("duplicate DataLine locator")
+        (should-error
+         (qq-message--recent-check-page
+          (qq-server-wire-domain-copy
+           (qq-message-recent-test-page :rows (list desktop desktop)))))))))
 
 (ert-deftest qq-message-recent-limit-is-closed-before-send ()
   (qq-message-recent-test-with-state

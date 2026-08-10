@@ -1150,7 +1150,7 @@ FORCE-KEYS identifies existing rows whose presentation resources changed."
   (when qq-contacts--search-stranger-request
     (qq-api-cancel-request qq-contacts--search-stranger-request))
   (when qq-contacts--search-member-request
-    (qq-api-cancel-request qq-contacts--search-member-request))
+    (qq-request-cancel qq-contacts--search-member-request))
   (setq qq-contacts--search-friend-request nil
         qq-contacts--search-group-request nil
         qq-contacts--search-stranger-request nil
@@ -1166,6 +1166,10 @@ FORCE-KEYS identifies existing rows whose presentation resources changed."
 (defconst qq-contacts--contact-search-identities
   '((kind user_id) (kind uid))
   "Independent exact identities carried by each native contact result.")
+
+(defconst qq-contacts--group-member-identities
+  '((user_id) (uid))
+  "Independent identities carried by each v2 group-member projection.")
 
 (defun qq-contacts--append-search-items
     (old new identity-fields &optional nullable-identity-fields)
@@ -1256,7 +1260,7 @@ When APPEND-P is non-nil, merge PAGE after prior pages by exact identity."
                       ('members
                        (qq-contacts--append-search-items
                         (and append-p qq-contacts--search-members)
-                        items qq-contacts--contact-search-identities))
+                        items qq-contacts--group-member-identities))
                       (_ (error "qq: unknown native directory search kind %S"
                                 kind)))
                     prepared-p t))
@@ -1347,13 +1351,14 @@ APPEND-P controls whether the resulting page extends existing entries."
                     (qq-api-search-strangers-start
                      query success failure 50)))
                  ('members
-                  (if cursor
-                      (qq-api-search-contacts-next
-                       'group-members cursor query success failure
-                       qq-contacts--member-group-id 50)
-                    (qq-api-search-contacts-start
-                     'group-members query success failure
-                     qq-contacts--member-group-id 50)))
+                  (when cursor
+                    (error "qq: v2 group-member search has no continuation"))
+                  (qq-core-search-group-members
+                   qq-contacts--member-group-id query
+                   (lambda (members)
+                     (funcall success
+                              `((results . ,members) (next_cursor))))
+                   failure))
                  (_ (error "qq: unknown native directory search kind %S" kind)))))
           (when (qq-contacts--search-current-p view buffer owner kind)
             (pcase kind

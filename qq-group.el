@@ -369,11 +369,11 @@ GROUP-ID defaults to the identity selected in the current buffer."
    :face 'qq-group-action-button :help-echo "复制群号 (w)")
   (insert "\n  ")
   (appkit-ui-insert-action-button
-   " 修改群名 " #'qq-group-set-name
+   " 修改群名 " (lambda () (call-interactively #'qq-group-set-name))
    :face 'qq-group-action-button :help-echo "修改群名称 (N)")
   (insert "  ")
   (appkit-ui-insert-action-button
-   " 修改备注 " #'qq-group-set-remark
+   " 修改备注 " (lambda () (call-interactively #'qq-group-set-remark))
    :face 'qq-group-action-button :help-echo "修改群备注 (R)")
   (insert "  ")
   (appkit-ui-insert-action-button
@@ -384,7 +384,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
    :face 'qq-group-action-button :help-echo "切换群会话置顶状态 (P)")
   (insert "  ")
   (appkit-ui-insert-action-button
-   " 全员禁言 " #'qq-group-set-whole-mute
+   " 全员禁言 " (lambda () (call-interactively #'qq-group-set-whole-mute))
    :face 'qq-group-action-button :help-echo "开启或关闭全员禁言 (M)")
   (insert "  ")
   (appkit-ui-insert-action-button

@@ -384,7 +384,7 @@ stale network failure can never overwrite newer user input.")
     (define-key map (kbd "q") #'quit-window)
     ;; Message actions at point (telega-style single keys; never steal input).
     (define-key map (kbd "r") #'qq-chat-reply-to-message)
-    (define-key map (kbd "d") #'qq-chat-delete-message)
+    (define-key map (kbd "d") #'qq-chat-delete-transient)
     (define-key map (kbd "f") #'qq-chat-forward-transient)
     (define-key map (kbd "m") #'qq-chat-toggle-message-selection)
     (define-key map (kbd "U") #'qq-chat-clear-message-selection)
@@ -400,8 +400,8 @@ stale network failure can never overwrite newer user input.")
     map)
   "Timeline-only keymap active when point is outside the draft region.
 
-Single-key message actions (`r' reply, `d' recall, `!' react, `P' poke sender,
-`f' forward, `m' select/unselect, `U' clear selection,
+Single-key message actions (`r' reply, `d' delete menu, `f' forward,
+`!' react, `P' poke sender, `m' select/unselect, `U' clear selection,
 `o' open media, `a' avatar, `i' user,
 `g' goto replied-to, `x' pop jump) and the `?' menu apply on the timeline.
 They are inactive in the composer so typing is never stolen.")
@@ -650,11 +650,13 @@ line; nil keeps service rows such as poke strictly one-line."
       (format-time-string "%Y-%m-%d" (seconds-to-time timestamp)))))
 
 (defun qq-chat--message-day-label (day-key)
-  "Return pretty date label for DAY-KEY (YYYY-MM-DD)."
+  "Return the configured date-break label for DAY-KEY (YYYY-MM-DD)."
   (if (not (stringp day-key))
       "Unknown date"
     (condition-case _
-        (format-time-string "%A, %Y-%m-%d" (date-to-time (concat day-key "T00:00:00")))
+        (format-time-string
+         qq-chat-date-break-format
+         (date-to-time (concat day-key "T00:00:00")))
       (error day-key))))
 
 (defun qq-chat--present-string (value)
@@ -2045,13 +2047,19 @@ Order (telega-inspired):
   (let* ((day-key (qq-chat--message-day-key message))
          (previous-day-key
           (and previous-message (qq-chat--message-day-key previous-message)))
+         (insert-date
+          (and qq-chat-use-date-breaks
+               previous-day-key
+               day-key
+               (not (equal day-key previous-day-key))
+               day-key))
          (anchor (qq-chat--message-anchor message)))
     (list :compact
           (and previous-message
+               (not insert-date)
                (qq-chat--messages-compact-group-p previous-message message)
                t)
-          :insert-date
-          (and day-key (not (equal day-key previous-day-key)) day-key)
+          :insert-date insert-date
           :insert-unread
           (and first-unread-anchor
                anchor
@@ -3131,10 +3139,14 @@ Never dump OneBot CQ / raw_message here — previews come from
       "")))
 
 (defun qq-chat--insert-date-separator-row (day-label)
-  "Insert a date separator row for DAY-LABEL."
-  (appkit-view-insert-note-line
-   (format "-- %s --" day-label)
-   :face 'qq-msg-date-separator))
+  "Insert a telega-style centered date-break row for DAY-LABEL."
+  (let* ((body (format "--(%s)--" day-label))
+         (padding
+          (max 0 (/ (- (qq-chat--line-fill-column) (string-width body)) 2)))
+         (bars (make-string padding ?-)))
+    (appkit-view-insert-note-line
+     (concat bars body bars)
+     :face 'qq-msg-date-separator)))
 
 (defun qq-chat--insert-unread-divider-row ()
   "Insert the unread separator row above the first unread message.
@@ -3832,7 +3844,7 @@ with the timestamp."
 (defun qq-chat--media-segment-p (segment)
   "Return non-nil when SEGMENT should render as a media block."
   (member (alist-get 'type segment)
-          '("image" "file" "record" "video" "mface")))
+          '("image" "file" "group_file" "record" "video" "mface")))
 
 (defun qq-chat--segment-media-kind-label (segment)
   "Return short kind label for media SEGMENT."
@@ -3845,6 +3857,7 @@ with the timestamp."
          ('image "Image")
          ('video "Video")
          (_ "File")))
+      ("group_file" "Group File")
       ("record" "Voice")
       ("video" "Video")
       ("mface" "Sticker")
@@ -3861,7 +3874,7 @@ Prefer a short name; never dump full URLs or CQ blobs into the timeline."
                      ("mface" "sticker")
                      ("record" "voice")
                      ("video" "video")
-                     ("file" "file")
+                     ((or "file" "group_file") "file")
                      (_ "media")))
          (summary (or (alist-get 'summary data)
                       (qq-media-segment-display-name segment))))
@@ -4438,21 +4451,20 @@ content."
     (goto-char (or (appkit-chatbuf-input-logical-end-position) (point-max)))
     (message "qq: next message will reply to %s" label)))
 
-(defun qq-chat--delete-message-internal (message)
-  "Recall MESSAGE after confirmation."
+(defun qq-chat--recall-message-internal (message)
+  "Recall MESSAGE from QQ after confirmation."
   (let* ((message-id (alist-get 'server-id message))
          (poke-p (qq-state-poke-message-p message))
          (target
           (unless poke-p
             (qq-message-recall-target
              (alist-get 'session-key message) message)))
-         (target-label
-          (or message-id
-              (alist-get 'sequence target))))
+         (target-label (or message-id target)))
     (unless (if poke-p
                 (qq-message-poke-recall-capable-p message)
-              target)
-      (user-error "qq: selected message has no native recall target"))
+              (and target (qq-message-recall-capable-p message)))
+      (user-error
+       "qq: selected message is not currently eligible for recall"))
     (when (y-or-n-p (format "Recall message %s? " target-label))
       (if poke-p
           (qq-core-recall-poke message)
@@ -6058,9 +6070,20 @@ way to send literal token text."
        (user-error "qq: no message at point"))))
 
 (defun qq-chat-delete-message ()
-  "Recall the message currently under point."
+  "Persistently delete the message at point from local history only."
   (interactive)
-  (qq-chat--delete-message-internal
+  (let ((message (or (qq-chat--message-at-point)
+                     (user-error "qq: no message at point"))))
+    (unless (qq-message-delete-local-capable-p message)
+      (user-error "qq: local deletion requires a canonical timeline row"))
+    (when (y-or-n-p
+           "Delete this message locally? The QQ server copy is unaffected. ")
+      (qq-core-delete-message-local message))))
+
+(defun qq-chat-recall-message ()
+  "Recall the message currently under point from QQ."
+  (interactive)
+  (qq-chat--recall-message-internal
    (or (qq-chat--message-at-point)
        (user-error "qq: no message at point"))))
 
