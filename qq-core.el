@@ -212,6 +212,7 @@ contact cache."
       ;; The identity may legitimately be UID-only.  The latest message
       ;; can still provide the peer UIN needed by the product session key.
       ("private" (qq-core--recent-private-row-projectable-p row account))
+      ("dataline" t)
       ;; Temporary conversations are valid protocol rows but have no product
       ;; session-key/routing model yet.
       ("temporary" nil))))
@@ -220,21 +221,25 @@ contact cache."
   "Return one state-domain entry for PAGE ROW and ACCOUNT."
   (let* ((account-id (alist-get 'account_id page))
          (identity (alist-get 'conversation row))
+         (identity-kind (alist-get 'kind identity))
          (head (alist-get 'latest_message row))
-         (message (copy-tree (alist-get 'message head)))
-         (row-key (alist-get 'row_key head))
-         (_canonical-row
-          (setf (alist-get 'canonical-row-key message nil nil #'eq)
-                row-key))
+         (head-kind (if (equal identity-kind "dataline")
+                        "dataline"
+                      "native"))
+         (message
+          (qq-message--history-item head head-kind "recent conversation"))
          (normalized
-          (qq-message-normalize-snapshot
-           message
-           account-id
-           account
-           (eq (alist-get 'latest_message_recalled row) t)))
+          (if (equal identity-kind "dataline")
+              (car (qq-message--normalize-dataline-message
+                    account-id message))
+            (qq-message-normalize-snapshot
+             message
+             account-id
+             account
+             (alist-get 'canonical-recalled-p message))))
          (session-key (alist-get 'session-key normalized))
          (session-identity (qq-state-session-key-identity session-key)))
-    (pcase (alist-get 'kind identity)
+    (pcase identity-kind
       ("private"
        (unless (and (eq (alist-get 'type session-identity) 'private)
                     (or (not (assq 'peer_uin identity))
@@ -248,7 +253,14 @@ contact cache."
        (unless (and (eq (alist-get 'type session-identity) 'group)
                     (equal (alist-get 'group_uin identity)
                            (alist-get 'target-id session-identity)))
-         (error "qq: recent group identity contradicts latest message"))))
+         (error "qq: recent group identity contradicts latest message")))
+      ("dataline"
+       (unless (and (eq (alist-get 'type session-identity) 'dataline)
+                    (equal (alist-get 'peer_uid identity)
+                           (alist-get 'peer-uid session-identity))
+                    (equal (alist-get 'variant identity)
+                           (alist-get 'variant session-identity)))
+         (error "qq: recent DataLine identity contradicts latest message"))))
     (list
      :session-key session-key
      :message normalized
@@ -924,9 +936,10 @@ accepts them.  Cancellation or failure releases everything still owned here."
 (defun qq-core--file-send-plan (session-key segments)
   "Return a standalone local-file plan, or nil when SEGMENTS has no file.
 
-QQ group files are feed publications, not ordinary message elements.  Mixed
-text, reply, media, and multiple-file drafts are therefore rejected instead
-of being split into several messages with ambiguous partial-success rules."
+QQ private and group files are standalone publications, not ordinary rich-text
+segments.  Mixed text, reply, media, and multiple-file drafts are therefore
+rejected instead of being split into several messages with ambiguous
+partial-success rules."
   (let ((files
          (seq-filter
           (lambda (segment)
@@ -936,9 +949,9 @@ of being split into several messages with ambiguous partial-success rules."
       (unless (and (= (length files) 1)
                    (= (length segments) 1))
         (user-error
-         "qq: Send one group file at a time without text, reply, or other media"))
-      (unless (eq (qq-state-session-key-type session-key) 'group)
-        (user-error "qq: Native private file upload is not implemented yet"))
+         "qq: Send one file at a time without text, reply, or other media"))
+      (unless (memq (qq-state-session-key-type session-key) '(private group))
+        (user-error "qq: Native file upload requires a private or group chat"))
       (let* ((data (alist-get 'data (car files)))
              (file (and (listp data)
                         (or (alist-get 'file data)
@@ -991,6 +1004,7 @@ to settle so its resource lease and staged resource can be released safely."
   (let* ((owner (or (qq-runtime-current-account-id)
                     (user-error "qq: Select a QQ account first")))
          (observing t)
+         (publication-active-p nil)
          resource-id
          ready-watch
          request)
@@ -1008,6 +1022,7 @@ to settle so its resource lease and staged resource can be released safely."
                (qq-core--release-send-resource owned))))
          (finish
            (success-p body value)
+           (setq publication-active-p nil)
            (detach-ready-watch)
            (release-resource)
            (when (qq-request-active-p request)
@@ -1023,16 +1038,21 @@ to settle so its resource lease and staged resource can be released safely."
            (if (not observing)
                (release-resource)
              (condition-case error-data
-                 (if (eq (qq-state-session-key-type session-key) 'dataline)
+                 (progn
+                   ;; Caller cancellation detaches presentation, but native
+                   ;; publication must retain the staged bytes until its own
+                   ;; callback settles.
+                   (setq publication-active-p t)
+                   (if (eq (qq-state-session-key-type session-key) 'dataline)
+                       (qq-message-send-file
+                        session-key resource-id
+                        (lambda (receipt) (finish t nil receipt))
+                        (lambda (body reason) (finish nil body reason))
+                        (plist-get plan :segment))
                      (qq-message-send-file
                       session-key resource-id
                       (lambda (receipt) (finish t nil receipt))
-                      (lambda (body reason) (finish nil body reason))
-                      (plist-get plan :segment))
-                   (qq-message-send-file
-                    session-key resource-id
-                    (lambda (receipt) (finish t nil receipt))
-                    (lambda (body reason) (finish nil body reason))))
+                      (lambda (body reason) (finish nil body reason)))))
                ((error quit)
                 (finish nil nil (error-message-string error-data))))))
          (stage-observed
@@ -1062,7 +1082,8 @@ to settle so its resource lease and staged resource can be released safely."
            ()
            (setq observing nil)
            (detach-ready-watch)
-           (release-resource)))
+           (unless publication-active-p
+             (release-resource))))
       (setq request (qq-request-create owner #'cancel))
       (condition-case error-data
           (qq-resource-stage-local
@@ -1203,13 +1224,23 @@ CALLBACK receives the successful response; ERRBACK receives failure details."
      (qq-message-recall-poke message success failure))
    callback errback))
 
+(defun qq-core-delete-message-local (message &optional callback errback)
+  "Persistently hide normalized MESSAGE from local history only.
+
+This operation never asks QQ to recall the message.  CALLBACK receives the
+checked durable receipt; ERRBACK receives failure details."
+  (unless (qq-message-delete-local-capable-p message)
+    (user-error "qq: Local deletion requires a canonical timeline row"))
+  (qq-core--start-request
+   (lambda (success failure)
+     (qq-message-delete-local message success failure))
+   callback errback))
+
 (defun qq-core-recall-message (message &optional callback errback)
   "Recall normalized MESSAGE through the native service.
 
 CALLBACK receives the successful response; ERRBACK receives the failure
 response and reason."
-  (unless (listp message)
-    (user-error "qq: Recall requires a normalized message"))
   (let ((session-key (alist-get 'session-key message)))
     (unless session-key
       (user-error "qq: Recall requires a normalized message"))
@@ -1595,12 +1626,19 @@ CALLBACK receives a page plist with messages and the unsupported-entry count."
 
 (defun qq-core--bootstrap-success (owner token _value)
   "Record one successful OWNER bootstrap part identified by TOKEN."
-  (qq-core--bootstrap-complete owner token nil))
+  (when (qq-core--bootstrap-complete owner token nil)
+    (when-let* ((bootstrap (gethash owner qq-core--bootstraps)))
+      (when (zerop (qq-core--bootstrap-pending bootstrap))
+        (qq-core--bootstrap-managed-recents)))))
 
 (defun qq-core--bootstrap-failure (owner token _body reason)
   "Record failed OWNER bootstrap TOKEN and report REASON."
   (when (qq-core--bootstrap-complete owner token t)
-    (qq-core--default-error nil reason)))
+    (qq-core--default-error nil reason)
+    ;; Recent Conversation is independent of the directory which failed. The
+    ;; current token check above prevents a superseded Native Session from
+    ;; releasing this account's recent bootstrap.
+    (qq-core--bootstrap-managed-recents)))
 
 (defun qq-core--maybe-bootstrap-account (owner)
   "Load live friend and group directories for online account OWNER."
@@ -1657,12 +1695,12 @@ CALLBACK receives a page plist with messages and the unsupported-entry count."
   (clrhash qq-core--bootstraps)
   (clrhash qq-core--observed-account-phases)
   (clrhash qq-core--recent-resync-contexts)
+  (clrhash qq-core--recent-bootstrap-instances)
   (dolist (account (qq-account-list))
     (puthash (alist-get 'account_id account)
              (alist-get 'phase account)
              qq-core--observed-account-phases))
   (qq-core--maybe-bootstrap-all)
-  (clrhash qq-core--recent-bootstrap-instances)
   (qq-core--bootstrap-managed-recents))
 
 (defun qq-core--managed-recent-bootstrap-failed
@@ -1677,12 +1715,21 @@ CALLBACK receives a page plist with messages and the unsupported-entry count."
              (qq-core-supports-p 'recent-conversations))
     (let ((instance-id (qq-server-gateway-instance-id)))
       (dolist (account (qq-account-list))
-        (let ((account-id (alist-get 'account_id account)))
+        (let* ((account-id (alist-get 'account_id account))
+               (directory-bootstrap
+                (gethash account-id qq-core--bootstraps))
+               (directory-pending
+                (and directory-bootstrap
+                     (equal instance-id
+                            (qq-core--bootstrap-instance-id
+                             directory-bootstrap))
+                     (> (qq-core--bootstrap-pending directory-bootstrap) 0))))
           (if (equal (alist-get 'phase account) "online")
               (unless
-                  (equal instance-id
-                         (gethash account-id
-                                  qq-core--recent-bootstrap-instances))
+                  (or directory-pending
+                      (equal instance-id
+                             (gethash account-id
+                                      qq-core--recent-bootstrap-instances)))
                 ;; Publish before dispatch because preflight failure callbacks
                 ;; may run synchronously.
                 (puthash (copy-sequence account-id)

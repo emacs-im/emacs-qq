@@ -83,7 +83,11 @@ future request must accept its own authoritative reaction snapshot unchanged.")
 (defvar qq-state--guild-directory-loaded-p nil
   "Non-nil after an authoritative QQ Guild directory snapshot was applied.")
 (defvar qq-state--requests nil)
-(defvar qq-state--message-session-index (make-hash-table :test #'equal))
+(defvar qq-state--message-session-index (make-hash-table :test #'equal)
+  "Map exact authored message IDs to their known session.
+
+Service-row field 40006 is not a unique message identity and must never enter
+this index.  Service rows use their canonical row key for presentation.")
 (defvar qq-state--local-message-session-index (make-hash-table :test #'equal))
 (defvar qq-state--message-order-counter 0)
 (defvar qq-state--local-message-counter 0)
@@ -747,12 +751,12 @@ they are never split, normalized, escaped, or reconstructed from metadata."
     `((key . ,session-key)
       ,@identity
       (title . ,target-id)
-      ;; Nil is the first-class "unknown" state. Ordinary message and complete
-      ;; stock badge counts have independent completeness.
+      ;; Nil is the first-class "unknown" state. Ordinary Message Count and
+      ;; the active adapter's explicitly named Badge Count are independent.
       (unread-message-count . nil)
       (unread-badge-count . nil)
       ;; Retained only for protocol-specific projections not yet migrated to
-      ;; the ordinary-message/stock-badge split (currently guild navigation).
+      ;; the ordinary-message/named-badge split (currently guild navigation).
       (unread-count . nil)
       (unread-at-me-message-id . nil)
       (unread-at-me-message-seq . nil)
@@ -853,12 +857,20 @@ Empty bodies alone are not treated as recalled."
   "Return SESSION with title hydrated from contact caches when possible."
   (let* ((target-id (alist-get 'target-id session))
          (title (alist-get 'title session))
-         (default-title (qq-state--default-session-title session)))
+         (default-title (qq-state--default-session-title session))
+         (group (and (eq (alist-get 'type session) 'group)
+                     (gethash target-id qq-state--groups-by-id))))
     (when (and default-title
                (or (null title)
                    (equal title target-id)
                    (string-empty-p title)))
       (setf (alist-get 'title session nil nil #'eq) default-title))
+    (when-let* ((entry (and group
+                            (assq 'message-notify-mode group))))
+      (let ((mode (cdr entry)))
+        (setf (alist-get 'message-notify-mode session nil nil #'eq) mode
+              (alist-get 'muted-p session nil nil #'eq)
+              (and (not (eq mode 'notify)) t))))
     session))
 
 (defun qq-state-upsert-session (session-key fields &optional emit)
@@ -1783,10 +1795,26 @@ leaving repeated pokes as distinct timeline records."
   (let ((server-id (alist-get 'server-id message))
         (local-id (alist-get 'local-id message))
         (session-key (alist-get 'session-key message)))
-    (when (and server-id session-key)
+    (when (and server-id session-key
+               (not (qq-state-service-message-p message)))
       (puthash server-id session-key qq-state--message-session-index))
     (when (and local-id session-key)
       (puthash local-id session-key qq-state--local-message-session-index))))
+
+(defun qq-state--unindex-message (message)
+  "Remove lookup entries currently owned by MESSAGE."
+  (let ((server-id (alist-get 'server-id message))
+        (local-id (alist-get 'local-id message))
+        (session-key (alist-get 'session-key message)))
+    (when (and server-id session-key
+               (not (qq-state-service-message-p message))
+               (equal (gethash server-id qq-state--message-session-index)
+                      session-key))
+      (remhash server-id qq-state--message-session-index))
+    (when (and local-id session-key
+               (equal (gethash local-id qq-state--local-message-session-index)
+                      session-key))
+      (remhash local-id qq-state--local-message-session-index))))
 
 (defun qq-state--reindex-session-messages (session-key messages)
   "Rebuild indexes for SESSION-KEY using MESSAGES."
@@ -1965,6 +1993,71 @@ asynchronous materialization request; nil denotes a live/local observation."
       (qq-state--apply-session-summary
        session-key (qq-state--message-summary-fields latest)
        observation-token nil current-local-resolved-p))))
+
+(defun qq-state--set-session-summary (session-key latest)
+  "Authoritatively set SESSION-KEY's Conversation Head to LATEST or nil."
+  (let* ((messages (or (gethash session-key qq-state--messages-by-session) '()))
+         (oldest (seq-find (lambda (it) (alist-get 'server-id it)) messages))
+         (token (qq-state-session-summary-observation-start))
+         (cleared '((last-message-time . 0)
+                    (last-message-preview . "")
+                    (last-message-sender-name . nil)
+                    (last-message-self-p . nil)
+                    (last-message-local-id . nil)
+                    (last-message-order . nil)
+                    (last-message-seq . nil)
+                    (last-message-id . nil)
+                    (last-message-gateway-account-id . nil)
+                    (last-message-status . nil))))
+    (qq-state-upsert-session
+     session-key
+     (append
+      (if latest
+          (qq-state--message-summary-fields latest)
+        cleared)
+      `((last-message-summary-token . ,token)
+        (oldest-message-id . ,(alist-get 'server-id oldest))))
+     nil)))
+
+(defun qq-state--replace-session-summary (session-key)
+  "Replace SESSION-KEY bounds and summary from its current visible rows.
+
+Unlike ordinary observation sync, local deletion may move the selected head
+backward or clear it.  This function is reserved for that durable authoritative
+transition and therefore does not apply the monotonic observation comparator."
+  (qq-state--set-session-summary
+   session-key
+   (qq-state--latest-summary-message
+    (or (gethash session-key qq-state--messages-by-session) '()))))
+
+(defun qq-state-delete-local-message (session-key row-key)
+  "Remove durable ROW-KEY from SESSION-KEY's local visible projection.
+
+The Gateway owns persistence.  This reducer is idempotent and changes only
+cached presentation/index state; it never treats a QQ Message ID or Sequence as
+a canonical row key."
+  (let* ((messages (copy-tree
+                    (or (gethash session-key qq-state--messages-by-session) '())))
+         (deleted
+          (seq-find
+           (lambda (message)
+             (equal (alist-get 'canonical-row-key message) row-key))
+           messages)))
+    (when deleted
+      (setq messages
+            (seq-remove
+             (lambda (message)
+               (equal (alist-get 'canonical-row-key message) row-key))
+             messages))
+      (qq-state--unindex-message deleted)
+      (puthash session-key messages qq-state--messages-by-session)
+      (qq-state--emit 'message
+                      :session-key session-key
+                      :message (copy-tree deleted)
+                      :message-anchor (qq-state-message-anchor deleted)
+                      :mutation 'delete
+                      :source 'local-deletion)
+      deleted)))
 
 (defun qq-state-session-messages (session-key)
   "Return cached messages for SESSION-KEY."
@@ -2322,15 +2415,14 @@ Return three values via `cl-values':
       (setq merged (qq-state--as-recalled-message merged)))
     (setq merged (qq-state--materialize-message-patches session-key merged))
     (when redundant
-      (when-let* ((redundant-id (alist-get 'server-id redundant)))
-        (remhash redundant-id qq-state--message-session-index))
+      (qq-state--unindex-message redundant)
       (setq messages (delq redundant messages)))
     (if existing
         (setq messages (qq-state--replace-message messages existing merged))
       (push merged messages))
-    (when (and previous-anchor
-               (qq-protocol--nonzero-decimal-string-p previous-anchor))
-      (remhash previous-anchor qq-state--message-session-index))
+    (when (and existing previous-anchor
+               (equal previous-anchor (qq-state-message-anchor existing)))
+      (qq-state--unindex-message existing))
     (setq messages (qq-state--sort-messages messages))
     (puthash session-key messages qq-state--messages-by-session)
     (qq-state-upsert-session
@@ -2529,10 +2621,7 @@ activity notifications rather than posts."
         (normalized
          (mapcar #'qq-state--normalize-guild-forum-post posts)))
     (dolist (message old-messages)
-      (when-let* ((server-id (alist-get 'server-id message)))
-        (remhash server-id qq-state--message-session-index))
-      (when-let* ((local-id (alist-get 'local-id message)))
-        (remhash local-id qq-state--local-message-session-index)))
+      (qq-state--unindex-message message))
     (dolist (message normalized)
       (unless (equal (alist-get 'session-key message) session-key)
         (error "qq: forum first page contains a contradictory session")))
@@ -2847,10 +2936,7 @@ timeline rebuild."
       (unless (and (or (null at-me-id) at-me-seq)
                    (or (null at-all-id) at-all-seq)
                    (cond
-                    ((null message-count)
-                     (and (not available)
-                          (seq-every-p #'null unread-position-values)))
-                    ((zerop message-count)
+                    ((and message-count (zerop message-count))
                      (and (not available)
                           (seq-every-p #'null unread-position-values)))
                     (t
@@ -3183,8 +3269,7 @@ canonical history."
   "Validate and isolate one normalized native recent conversation ENTRY."
   (unless (qq-state--closed-plist-p
            entry
-           '(:session-key :message :activity-revision :pinned-known-p
-             :pinned)
+           '(:session-key :message :activity-revision :pinned-known-p :pinned)
            nil)
     (error "qq: native recent conversation has invalid domain fields"))
   (let* ((session-key (plist-get entry :session-key))
@@ -3197,31 +3282,36 @@ canonical history."
          (revision (plist-get entry :activity-revision))
          (pinned-known-p (plist-get entry :pinned-known-p))
          (pinned (plist-get entry :pinned)))
-    (unless (memq session-type '(private group))
+    (unless (memq session-type '(private group dataline))
       (error "qq: native recent conversation has unsupported session %S"
              session-key))
-    (unless (and (listp message)
-                 (equal (alist-get 'session-key message) session-key)
-                 (or (qq-protocol-message-id-p server-id)
-                     (and (null server-id)
-                          (qq-protocol--nonzero-decimal-string-p
-                           canonical-row-key)
-                          (stringp presentation-id)
-                          (not (string-empty-p presentation-id))))
-                 (integerp (alist-get 'time message))
-                 (>= (alist-get 'time message) 0)
-                 (qq-protocol--decimal-string-p
-                  (alist-get 'message-seq message))
-                 (stringp (alist-get 'gateway-account-id message))
-                 (not (string-empty-p
-                       (alist-get 'gateway-account-id message))))
-      (error "qq: native recent conversation has malformed normalized message"))
+    (let ((message-sequence (alist-get 'message-seq message)))
+      (unless (and (listp message)
+                   (equal (alist-get 'session-key message) session-key)
+                   (or (qq-protocol-message-id-p server-id)
+                       (and (null server-id)
+                            (qq-protocol--nonzero-decimal-string-p
+                             canonical-row-key)
+                            (stringp presentation-id)
+                            (not (string-empty-p presentation-id))))
+                   (integerp (alist-get 'time message))
+                   (>= (alist-get 'time message) 0)
+                   (if (eq session-type 'dataline)
+                       (or (null message-sequence)
+                           (qq-protocol--decimal-string-p message-sequence))
+                     (qq-protocol--decimal-string-p message-sequence))
+                   (stringp (alist-get 'gateway-account-id message))
+                   (not (string-empty-p
+                         (alist-get 'gateway-account-id message))))
+        (error "qq: native recent conversation has malformed normalized message")))
     (unless (qq-protocol--nonzero-decimal-string-p revision)
       (error "qq: native recent conversation revision is malformed"))
     (unless (memq pinned-known-p '(nil t))
       (error "qq: native recent conversation pin ownership is malformed"))
     (when (and pinned-known-p (not (memq pinned '(t :false))))
       (error "qq: native recent conversation pin state is malformed"))
+    (when (and (eq session-type 'dataline) pinned-known-p)
+      (error "qq: DataLine recent conversation cannot invent pin state"))
     (let ((peer-name (qq-state--present-string
                       (alist-get 'peer-name message))))
       (list
@@ -3539,14 +3629,35 @@ order are retained exactly as supplied by the native snapshot."
   (qq-state-friend-categories))
 
 (defun qq-state-apply-groups (groups)
-  "Replace cached group list with GROUPS."
+  "Replace cached group list with GROUPS.
+
+Known notification modes also update existing group sessions.  An omitted mode
+is independently unknown and preserves the last confirmed session value; the
+directory alone never creates a conversation session."
+  (dolist (group (or groups '()))
+    (when-let* ((entry (assq 'message-notify-mode group)))
+      (unless (memq (cdr entry) '(notify assistant shield receive))
+        (error "qq: group directory has an invalid notification mode"))))
   (setq qq-state--groups-loaded-p t)
   (setq qq-state--group-order nil)
   (clrhash qq-state--groups-by-id)
   (dolist (group (or groups '()))
-    (let ((group-id (qq-state--normalize-id (alist-get 'group_id group))))
+    (let* ((group-id (qq-state--normalize-id (alist-get 'group_id group)))
+           (notify-mode-entry (assq 'message-notify-mode group))
+           (session-key (qq-state-session-key 'group group-id)))
       (push group-id qq-state--group-order)
-      (puthash group-id (copy-tree group) qq-state--groups-by-id)))
+      (puthash group-id (copy-tree group) qq-state--groups-by-id)
+      (when-let* ((session (and notify-mode-entry
+                                (gethash session-key qq-state--sessions))))
+        (let* ((notify-mode (cdr notify-mode-entry))
+               (muted-p (and (not (eq notify-mode 'notify)) t)))
+          (unless (and (eq (alist-get 'message-notify-mode session) notify-mode)
+                       (eq (alist-get 'muted-p session) muted-p))
+            (qq-state-upsert-session
+             session-key
+             `((message-notify-mode . ,notify-mode)
+               (muted-p . ,muted-p))
+             t))))))
   (setq qq-state--group-order (nreverse qq-state--group-order))
   (qq-state--refresh-session-titles)
   (qq-state--emit 'groups-refreshed :count (length groups))

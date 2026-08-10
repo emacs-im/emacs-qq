@@ -19,7 +19,7 @@
 (require 'appkit-view)
 (require 'appkit-position)
 (require 'appkit-ewoc)
-(require 'qq-api)
+(require 'qq-core)
 (require 'qq-chat)
 (require 'qq-account)
 (require 'qq-media)
@@ -184,14 +184,25 @@ used only when its QQ number agrees with ACCOUNT."
 (defun qq-root--activity-metrics (&optional sessions)
   "Return root activity metrics for SESSIONS or current recent projection."
   (let* ((sessions (or sessions (qq-root--recent-sessions)))
-         (unread (cl-count-if (lambda (session)
-                                 (> (or (alist-get 'unread-badge-count session) 0) 0))
-                              sessions))
-         (important (cl-count-if #'qq-root--session-important-unread-p sessions))
-         (muted (cl-count-if (lambda (session)
-                               (and (qq-root--session-muted-p session)
-                                    (> (or (alist-get 'unread-badge-count session) 0) 0)))
-                             sessions))
+         (badges-complete-p
+          (cl-every (lambda (session)
+                      (let ((badge (alist-get 'unread-badge-count session)))
+                        (and (integerp badge) (>= badge 0))))
+                    sessions))
+         (unread (and badges-complete-p
+                      (cl-count-if
+                       (lambda (session)
+                         (> (alist-get 'unread-badge-count session) 0))
+                       sessions)))
+         (important (and badges-complete-p
+                         (cl-count-if #'qq-root--session-important-unread-p
+                                      sessions)))
+         (muted (and badges-complete-p
+                     (cl-count-if
+                      (lambda (session)
+                        (and (qq-root--session-muted-p session)
+                             (> (alist-get 'unread-badge-count session) 0)))
+                      sessions)))
          (dms (cl-count-if (lambda (session)
                              (not (eq (alist-get 'type session) 'group)))
                            sessions)))
@@ -202,20 +213,22 @@ used only when its QQ number agrees with ACCOUNT."
           :dms dms)))
 
 (defun qq-root--filter-chip (label count &optional active)
-  "Return one root filter chip for LABEL and COUNT."
-  (format "[%s%s:%d]"
+  "Return one root filter chip for LABEL and exact COUNT.
+
+Render `?' instead of a partial number when COUNT is nil."
+  (format "[%s%s:%s]"
           (if active "*" "")
           label
-          count))
+          (if (integerp count) (number-to-string count) "?")))
 
 (defun qq-root--filters-line (&optional sessions)
   "Return filter-chip line for SESSIONS or current state."
   (let ((metrics (qq-root--activity-metrics sessions)))
     (string-join
-     (list (qq-root--filter-chip "Main" (or (plist-get metrics :all) 0) t)
-           (qq-root--filter-chip "Important" (or (plist-get metrics :important) 0))
-           (qq-root--filter-chip "Muted" (or (plist-get metrics :muted) 0))
-           (qq-root--filter-chip "DMs" (or (plist-get metrics :dms) 0))
+     (list (qq-root--filter-chip "Main" (plist-get metrics :all) t)
+           (qq-root--filter-chip "Important" (plist-get metrics :important))
+           (qq-root--filter-chip "Muted" (plist-get metrics :muted))
+           (qq-root--filter-chip "DMs" (plist-get metrics :dms))
            "[activity sort:recent]")
      "  ")))
 
@@ -257,21 +270,26 @@ used only when its QQ number agrees with ACCOUNT."
            (not (qq-root--session-muted-p session)))
       (qq-root--session-mention-kinds session)))
 
+(defun qq-root--format-unread-count (count)
+  "Format positive badge COUNT using QQ's visible 99+ cap."
+  (if (> count 99) "99+" (number-to-string count)))
+
 (defun qq-root--session-unread-trail (session)
   "Return SESSION's propertized unread trail for the title brackets.
 
-Like telega's chat unread trail, the complete stock badge count follows the
-title and uses a muted or unmuted face. Ordinary-message mention kinds remain
-independently prominent even when the badge is unknown or the session muted."
-  (let* ((unread (or (alist-get 'unread-badge-count session) 0))
+Like telega's chat unread trail, the active adapter's complete named Badge
+Count follows the title and uses a muted or unmuted face. Mention kinds remain independently
+prominent even when the badge is unavailable or the session muted."
+  (let* ((badge (alist-get 'unread-badge-count session))
+         (unread (and (integerp badge) (> badge 0) badge))
          (mentions (qq-root--session-mention-kinds session))
          (count-face (if (qq-root--session-muted-p session)
                          'qq-root-muted-count
                        'qq-root-unmuted-count)))
     (string-join
      (delq nil
-           (list (and (> unread 0)
-                      (propertize (number-to-string unread)
+           (list (and unread
+                      (propertize (qq-root--format-unread-count unread)
                                   'face count-face))
                  (and (memq 'at-me mentions)
                       (propertize "@" 'face 'qq-root-mention-count))
@@ -584,7 +602,7 @@ When POS is nil, use point."
          (user-id (or (alist-get 'peer-uin session)
                       (alist-get 'target-id session))))
     (unless (and (eq (alist-get 'type session) 'private)
-                 (qq-api-user-id-p user-id))
+                 (qq-core-user-id-p user-id))
       (user-error "qq: session has no user profile"))
     (qq-user-open user-id)))
 
@@ -598,11 +616,11 @@ When POS is nil, use point."
                         (alist-get 'target-id session))))
     (pcase type
       ('private
-       (unless (qq-api-user-id-p target-id)
+       (unless (qq-core-user-id-p target-id)
          (user-error "qq: session has no user profile"))
        (qq-user-open target-id))
       ('group
-       (unless (qq-api-group-id-p target-id)
+       (unless (qq-core-group-id-p target-id)
          (user-error "qq: session has no group profile"))
        (qq-group-open target-id))
       (_ (user-error "qq: session has no profile page")))))
@@ -611,7 +629,7 @@ When POS is nil, use point."
   "Open the logged-in user's profile."
   (interactive)
   (let ((user-id (alist-get 'user_id (qq-state-self-info))))
-    (unless (qq-api-user-id-p user-id)
+    (unless (qq-core-user-id-p user-id)
       (user-error "qq: self user profile is unavailable"))
     (qq-user-open user-id)))
 
@@ -735,9 +753,9 @@ Views belonging to other accounts remain live and visible."
    query))
 
 (defun qq-root-refresh ()
-  "Request a fresh root snapshot from NapCat."
+  "Request fresh native recent and directory snapshots."
   (interactive)
-  (qq-api-refresh))
+  (qq-core-refresh))
 
 (defvar qq-root-mode-map
   (let ((map (make-sparse-keymap)))

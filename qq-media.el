@@ -189,8 +189,10 @@ transfer callbacks can run outside a safe redisplay context; immediate
   (qq-media--native-media-id segment "video"))
 
 (defun qq-media--native-file-media-id (segment)
-  "Return validated native file media ID from SEGMENT, or nil."
-  (qq-media--native-media-id segment "file"))
+  "Return validated native private/group file media ID from SEGMENT, or nil."
+  (when (member (alist-get 'type segment) '("file" "group_file"))
+    (let ((media-id (alist-get 'media_id (alist-get 'data segment))))
+      (and (qq-remote-media--id-p media-id) media-id))))
 
 (defun qq-media--native-record-key (media-id)
   "Return logical media cache key for native record MEDIA-ID."
@@ -1223,7 +1225,7 @@ never treats a local absolute path or display filename as a download token."
 
 An authoritative `file_kind' presentation fact wins.  Filename inference is
 only the fallback for older/general file producers that do not provide one."
-  (when (equal (alist-get 'type segment) "file")
+  (when (member (alist-get 'type segment) '("file" "group_file"))
     (let* ((data (alist-get 'data segment))
            (file-kind (alist-get 'file_kind data))
            (name (qq-media-segment-display-name segment)))
@@ -1602,7 +1604,7 @@ retired."
            (and file-key (format "video:%s" file-key))
            (and (appkit-media-url-present-p url)
                 (format "video-url:%s" url))))
-      ("file"
+      ((or "file" "group_file")
        (or (and file-media-id (qq-media--native-file-key file-media-id))
            (and file-key (format "%s:%s" type file-key))
            (and (appkit-media-url-present-p url) (format "%s-url:%s" type url))))
@@ -1641,7 +1643,7 @@ segments use local path → dormant action resolver → URL; see
          (qq-media--resolve-fileish-segment
           segment "get_file" callback error-fn
           "video segment has neither local file, file id, nor URL")))
-      ("file"
+      ((or "file" "group_file")
        (if-let* ((media-id (qq-media--native-file-media-id segment)))
            (qq-media--fetch-native-file-resource
             segment (qq-media--native-file-key media-id)
@@ -1793,7 +1795,8 @@ OWNER is the exact Appkit app generation that owns any external media player."
     (cond
      ((equal type "video") 'video)
      ((member type '("image" "face" "mface")) 'image)
-     ((equal type "file") (qq-media--file-segment-kind segment))
+     ((member type '("file" "group_file"))
+      (qq-media--file-segment-kind segment))
      (t 'file))))
 
 (cl-defun qq-media-open-resource

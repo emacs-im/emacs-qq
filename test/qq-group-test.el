@@ -158,6 +158,41 @@ BODY may refer to the lexical variables `buffer' and `view'."
         (push-button (button-at (1- (point))))
         (should (equal call '("20001" "synthetic member")))))))
 
+(ert-deftest qq-group-setting-buttons-call-their-commands-interactively ()
+  (with-temp-buffer
+    (qq-group-mode)
+    (setq qq-group--group-id "20001"
+          qq-group--profile (copy-tree qq-group-test--profile))
+    (let (calls)
+      (cl-letf
+          (((symbol-function 'qq-media-group-avatar-display-string)
+            (lambda (_group-id) "@"))
+           ((symbol-function 'read-string)
+            (lambda (prompt &rest _arguments)
+              (if (string-prefix-p "新群名称" prompt)
+                  "New Name"
+                "New Remark")))
+           ((symbol-function 'y-or-n-p) (lambda (_prompt) t))
+           ((symbol-function 'qq-core-set-group-name)
+            (lambda (group-id value &rest _arguments)
+              (push (list 'name group-id value) calls)))
+           ((symbol-function 'qq-core-set-group-remark)
+            (lambda (group-id value &rest _arguments)
+              (push (list 'remark group-id value) calls)))
+           ((symbol-function 'qq-core-set-group-whole-mute)
+            (lambda (group-id value &rest _arguments)
+              (push (list 'mute group-id value) calls))))
+        (qq-group-render)
+        (dolist (label '("修改群名" "修改备注" "全员禁言"))
+          (goto-char (point-min))
+          (search-forward label)
+          (push-button (button-at (1- (point))))))
+      (should
+       (equal (nreverse calls)
+              '((name "20001" "New Name")
+                (remark "20001" "New Remark")
+                (mute "20001" t)))))))
+
 (ert-deftest qq-group-setting-commands-update-current-profile-after-receipts ()
   (with-temp-buffer
     (qq-group-mode)

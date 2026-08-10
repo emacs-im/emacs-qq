@@ -4,10 +4,10 @@
 
 ;;; Commentary:
 
-;; Owns the nt-gateway read-state snapshot and event contract.  Native read
-;; cursors remain transport data; only an exact unread materialization is
-;; projected into `qq-state'.  In particular, latest_sequence-read_sequence is
-;; never treated as an unread count.
+;; Owns the nt-gateway read-state snapshot and event contract. Native read
+;; cursors remain transport data; the four unread completeness domains are
+;; projected independently into `qq-state'. In particular,
+;; latest_sequence-read_sequence is never treated as an unread count.
 
 ;;; Code:
 
@@ -81,24 +81,13 @@
     ("unknown"
      (qq-read--closed-object-p value '(status)))
     ("exact"
-     (and (qq-read--closed-object-p
-           value '(status count first mentions))
-          (let ((count (alist-get 'count value))
-                (first (alist-get 'first value))
-                (mentions (alist-get 'mentions value)))
-            (and (integerp count)
-                 (>= count 0)
-                 (qq-read--closed-object-p mentions '(at_me at_all))
-                 (let ((at-me (alist-get 'at_me mentions))
-                       (at-all (alist-get 'at_all mentions)))
-                   (and (or (null first) (qq-read--position-p first))
-                        (or (null at-me) (qq-read--position-p at-me))
-                        (or (null at-all) (qq-read--position-p at-all))
-                        (if (zerop count) (null first) (qq-read--position-p first))))))))
+     (and (qq-read--closed-object-p value '(status count))
+          (let ((count (alist-get 'count value)))
+            (and (integerp count) (>= count 0)))))
     (_ nil)))
 
 (defun qq-read--badge-count-p (value)
-  "Return non-nil when VALUE is a closed stock-badge count projection."
+  "Return non-nil when VALUE is a closed Managed Account badge projection."
   (pcase (and (listp value) (alist-get 'status value))
     ("unknown"
      (qq-read--closed-object-p value '(status)))
@@ -108,13 +97,40 @@
             (and (integerp count) (>= count 0)))))
     (_ nil)))
 
+(defun qq-read--first-unread-p (value)
+  "Return non-nil when VALUE is a closed first-unread projection."
+  (pcase (and (listp value) (alist-get 'status value))
+    ("unknown"
+     (qq-read--closed-object-p value '(status)))
+    ("exact"
+     (and (qq-read--closed-object-p value '(status position))
+          (let ((position (alist-get 'position value)))
+            (or (null position) (qq-read--position-p position)))))
+    (_ nil)))
+
+(defun qq-read--mentions-p (value)
+  "Return non-nil when VALUE is a closed unread-mention projection."
+  (pcase (and (listp value) (alist-get 'status value))
+    ("unknown"
+     (qq-read--closed-object-p value '(status)))
+    ("exact"
+     (and (qq-read--closed-object-p value '(status at_me at_all))
+          (let ((at-me (alist-get 'at_me value))
+                (at-all (alist-get 'at_all value)))
+            (and (or (null at-me) (qq-read--position-p at-me))
+                 (or (null at-all) (qq-read--position-p at-all))))))
+    (_ nil)))
+
 (defun qq-read--unread-p (value)
-  "Return non-nil when VALUE has independent message and badge counts."
-  (and (qq-read--closed-object-p value '(message_count badge_count))
+  "Return non-nil when VALUE has four independent unread projections."
+  (and (qq-read--closed-object-p
+        value '(message_count badge_count first_unread mentions))
        (let ((message-count (alist-get 'message_count value))
              (badge-count (alist-get 'badge_count value)))
          (and (qq-read--message-count-p message-count)
               (qq-read--badge-count-p badge-count)
+              (qq-read--first-unread-p (alist-get 'first_unread value))
+              (qq-read--mentions-p (alist-get 'mentions value))
               (or (not (and (equal (alist-get 'status message-count) "exact")
                             (equal (alist-get 'status badge-count) "exact")))
                   (>= (alist-get 'count badge-count)
@@ -136,29 +152,33 @@
           (latest (alist-get 'latest_sequence value))
           (unread (alist-get 'unread value))
           (message-count (alist-get 'message_count unread))
-          (exact (equal (alist-get 'status message-count) "exact"))
-          (count (and exact (alist-get 'count message-count)))
-          (first (and exact (alist-get 'first message-count)))
-          (mentions (and exact (alist-get 'mentions message-count)))
-          (positions
-           (delq nil
-                 (list first
-                       (and mentions (alist-get 'at_me mentions))
-                       (and mentions (alist-get 'at_all mentions)))))
+          (first-state (alist-get 'first_unread unread))
+          (mention-state (alist-get 'mentions unread))
+          (message-exact
+           (equal (alist-get 'status message-count) "exact"))
+          (first-exact (equal (alist-get 'status first-state) "exact"))
+          (mentions-exact
+           (equal (alist-get 'status mention-state) "exact"))
+          (count (and message-exact (alist-get 'count message-count)))
+          (first (and first-exact (alist-get 'position first-state)))
+          (at-me (and mentions-exact (alist-get 'at_me mention-state)))
+          (at-all (and mentions-exact (alist-get 'at_all mention-state)))
+          (positions (delq nil (list first at-me at-all)))
           (first-sequence (and first (alist-get 'sequence first))))
-     (or (not exact)
-         (if (zerop count)
-             (null positions)
-           (and first
-                (cl-every
-                 (lambda (position)
-                   (let ((sequence (alist-get 'sequence position)))
-                     (and (qq-account--decimal-less-p read sequence)
-                          (not (qq-account--decimal-less-p latest sequence))
-                          (or (equal sequence first-sequence)
-                              (qq-account--decimal-less-p
-                               first-sequence sequence)))))
-                 positions)))))))
+     (and (or (not first-exact) first (null positions))
+          (cond
+           ((and message-exact (zerop count)) (null positions))
+           ((and first-exact count (> count 0)) first)
+           (t t))
+          (cl-every
+           (lambda (position)
+             (let ((sequence (alist-get 'sequence position)))
+               (and (qq-account--decimal-less-p read sequence)
+                    (not (qq-account--decimal-less-p latest sequence))
+                    (or (null first-sequence)
+                        (equal sequence first-sequence)
+                        (qq-account--decimal-less-p first-sequence sequence)))))
+           positions)))))
 
 (defun qq-read--state-key (state)
   "Return a stable deduplication key for checked STATE."
@@ -206,30 +226,32 @@ When EXPECTED-ACCOUNT-ID is non-nil, reject a contradictory owner."
   (let* ((unread (alist-get 'unread state))
          (message-state (alist-get 'message_count unread))
          (badge-state (alist-get 'badge_count unread))
+         (first-state (alist-get 'first_unread unread))
+         (mention-state (alist-get 'mentions unread))
          (message-exact (equal (alist-get 'status message-state) "exact"))
          (badge-exact (equal (alist-get 'status badge-state) "exact"))
+         (first-exact (equal (alist-get 'status first-state) "exact"))
+         (mentions-exact
+          (equal (alist-get 'status mention-state) "exact"))
          (count (and message-exact (alist-get 'count message-state)))
          (badge-count (and badge-exact (alist-get 'count badge-state)))
-         (first (and message-exact (alist-get 'first message-state)))
-         (mentions (and message-exact (alist-get 'mentions message-state)))
-         (at-me (and mentions (alist-get 'at_me mentions)))
-         (at-all (and mentions (alist-get 'at_all mentions)))
-         (has-unread (and count (> count 0)))
-         (first-id (and has-unread
-                        (qq-read--position-field first 'message_id))))
+         (first (and first-exact (alist-get 'position first-state)))
+         (at-me (and mentions-exact (alist-get 'at_me mention-state)))
+         (at-all (and mentions-exact (alist-get 'at_all mention-state)))
+         (first-id (qq-read--position-field first 'message_id)))
     `((unread-message-count . ,count)
       (unread-badge-count . ,badge-count)
       (first-unread-message-id . ,first-id)
       (first-unread-message-seq
-       . ,(and has-unread (qq-read--position-field first 'sequence)))
+       . ,(qq-read--position-field first 'sequence))
       (unread-at-me-message-id
-       . ,(and has-unread (qq-read--position-field at-me 'message_id)))
+       . ,(qq-read--position-field at-me 'message_id))
       (unread-at-me-message-seq
-       . ,(and has-unread (qq-read--position-field at-me 'sequence)))
+       . ,(qq-read--position-field at-me 'sequence))
       (unread-at-all-message-id
-       . ,(and has-unread (qq-read--position-field at-all 'message_id)))
+       . ,(qq-read--position-field at-all 'message_id))
       (unread-at-all-message-seq
-       . ,(and has-unread (qq-read--position-field at-all 'sequence)))
+       . ,(qq-read--position-field at-all 'sequence))
       (read-position-available . ,(and first-id t))
       (read-latest-message-id . nil))))
 
@@ -258,21 +280,30 @@ When EXPECTED-ACCOUNT-ID is non-nil, reject a contradictory owner."
         (qq-state-apply-session-read-projection
          session-key (qq-read--state-projection state))))))
 
-(defun qq-read-list-states (account-id &optional callback errback)
-  "List ACCOUNT-ID's authoritative conversation read states."
+(defun qq-read--request-states (method account-id callback errback)
+  "Request ACCOUNT-ID's read states through METHOD."
   (unless (qq-account--non-empty-string-p account-id)
     (user-error "qq: conversation read states require an account slot"))
   (qq-rpc-call
-   "conversation.list_read_states"
-   `((account_id . ,account-id))
+   method `((account_id . ,account-id))
    :projector (lambda (value) (qq-read--check-page value account-id))
    :callback callback
    :errback errback))
 
+(defun qq-read-list-states (account-id &optional callback errback)
+  "List ACCOUNT-ID's retained authoritative conversation read states."
+  (qq-read--request-states
+   "conversation.list_read_states" account-id callback errback))
+
+(defun qq-read-refresh-states (account-id &optional callback errback)
+  "Acquire missing evidence and return ACCOUNT-ID's read states."
+  (qq-read--request-states
+   "conversation.refresh_read_states" account-id callback errback))
+
 (defun qq-read-refresh-account (account-id &optional callback errback)
   "Refresh and project ACCOUNT-ID's authoritative read-state snapshot."
   (let ((token (qq-read--next-observation-token)))
-    (qq-read-list-states
+    (qq-read-refresh-states
      account-id
      (lambda (page)
        (dolist (state (alist-get 'states page))
@@ -286,7 +317,7 @@ When EXPECTED-ACCOUNT-ID is non-nil, reject a contradictory owner."
 
 (defun qq-read--refresh-online-accounts ()
   "Refresh read-state snapshots for every online managed account."
-  (when (qq-rpc-method-available-p "conversation.list_read_states")
+  (when (qq-rpc-method-available-p "conversation.refresh_read_states")
     (dolist (account (qq-account-list))
       (when (equal (alist-get 'phase account) "online")
         (qq-read-refresh-account
@@ -316,7 +347,7 @@ When EXPECTED-ACCOUNT-ID is non-nil, reject a contradictory owner."
                    (equal new-phase "online")
                    (not (equal old-phase "online"))
                    (qq-rpc-method-available-p
-                    "conversation.list_read_states"))
+                    "conversation.refresh_read_states"))
           (qq-read-refresh-account account-id nil #'qq-read--default-error))))))
 
 (defun qq-read--handle-projection-resync (projection _body)

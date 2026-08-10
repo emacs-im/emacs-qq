@@ -532,12 +532,25 @@ order."
           (qq-message--present-string
            (alist-get 'member_name sender-presentation)))
          (gray-tip-data (qq-message--message-gray-tip-data message))
+         (canonical-timeline-class
+          (alist-get 'canonical-timeline-class message))
+         (timeline-class
+          (or canonical-timeline-class
+              (if gray-tip-data "service" "authored")))
+         (_timeline-class
+          (unless
+              (and (member timeline-class '("authored" "service"))
+                   (not (and (equal timeline-class "authored") gray-tip-data))
+                   (or (not (equal timeline-class "service"))
+                       gray-tip-data recalled-p))
+            (error "qq: Canonical timeline class contradicts message content")))
+         (service-p (equal timeline-class "service"))
          (poke-data
           (and (equal (alist-get 'kind gray-tip-data) "poke")
                gray-tip-data))
          (sender-id
           (cond (poke-data (alist-get 'actor-id poke-data))
-                (gray-tip-data nil)
+                (service-p nil)
                 (t (or (alist-get 'uin sender)
                        (alist-get 'uid sender)))))
          session-key peer peer-name outgoing group-id)
@@ -545,12 +558,14 @@ order."
       ("private"
        (let ((context (qq-message--private-context message account)))
          (setq outgoing
-               (if poke-data
-                   (and (qq-message--endpoint-self-p
-                         `((uin . ,(alist-get 'actor-id poke-data)))
-                         account)
-                        t)
-                 (plist-get context :outgoing))
+               (cond
+                (poke-data
+                 (and (qq-message--endpoint-self-p
+                       `((uin . ,(alist-get 'actor-id poke-data)))
+                       account)
+                      t))
+                (service-p nil)
+                (t (plist-get context :outgoing)))
                peer (plist-get context :peer)
                session-key (qq-state-session-key
                             'private (alist-get 'uin peer)))
@@ -572,7 +587,7 @@ order."
                      `((uin . ,(alist-get 'actor-id poke-data)))
                      account)
                     t))
-              (gray-tip-data nil)
+              (service-p nil)
               (t (and (qq-message--endpoint-self-p sender account) t)))
              group-id (alist-get 'group_uin conversation)
              session-key (qq-state-session-key 'group group-id))
@@ -615,7 +630,7 @@ order."
            (presentation-name
             (cond
              (poke-data (alist-get 'actor-name poke-data))
-             (gray-tip-data "QQ")
+             (service-p "QQ")
              (t
               ;; LinuxQQ's display order over exact sender snapshot fields.
               ;; Missing presentation is a Rust/Gateway contract violation; a
@@ -636,7 +651,7 @@ order."
         (native-client-sequence . ,(alist-get 'client_sequence message))
         (native-random . ,(alist-get 'random message))
         (gateway-account-id . ,owner)
-        (timeline-class . ,(if gray-tip-data 'service 'authored))
+        (timeline-class . ,(if service-p 'service 'authored))
         (sender-id . ,sender-id)
         (sender-native-id . ,(and (null gray-tip-data)
                                   (alist-get 'uid sender)))
@@ -1115,6 +1130,124 @@ History responses never advance it; only `message.received' events do."
        (copy-tree essence)
        qq-message--pending-essences))))
 
+(defun qq-message--check-local-deletion
+    (deletion owner context &optional expected-conversation expected-row-key)
+  "Validate local DELETION for OWNER in CONTEXT and return projection data."
+  (unless
+      (and
+       (qq-account--exact-object-keys-p
+        deletion
+        '(account_id conversation row_key newly_deleted conversation_head))
+       (equal (alist-get 'account_id deletion) owner)
+       (qq-account--uint64-decimal-p (alist-get 'row_key deletion))
+       (memq (alist-get 'newly_deleted deletion) '(t :false))
+       (listp (alist-get 'conversation deletion))
+       (listp (alist-get 'conversation_head deletion)))
+    (error "qq: Gateway returned an invalid %s" context))
+  (let* ((conversation (alist-get 'conversation deletion))
+         (conversation-kind (alist-get 'kind conversation))
+         (row-key (alist-get 'row_key deletion))
+         (session-key
+          (pcase conversation-kind
+            ("private"
+             (unless
+                 (and (qq-account--exact-object-keys-p
+                       conversation '(kind peer_uin))
+                      (qq-account--uint64-decimal-p
+                       (alist-get 'peer_uin conversation)))
+               (error "qq: %s has an invalid private conversation" context))
+             (qq-state-session-key
+              'private (alist-get 'peer_uin conversation)))
+            ("group"
+             (unless
+                 (and (qq-account--exact-object-keys-p
+                       conversation '(kind group_uin))
+                      (qq-account--uint64-decimal-p
+                       (alist-get 'group_uin conversation)))
+               (error "qq: %s has an invalid group conversation" context))
+             (qq-state-session-key
+              'group (alist-get 'group_uin conversation)))
+            (_ (error "qq: %s has an unknown conversation" context))))
+         (head-effect (alist-get 'conversation_head deletion))
+         (state (alist-get 'state head-effect))
+         head-message)
+    (when (and expected-conversation
+               (not (qq-message--history-conversation-equal-p
+                     conversation expected-conversation)))
+      (error "qq: %s contradicts the requested conversation" context))
+    (when (and expected-row-key (not (equal row-key expected-row-key)))
+      (error "qq: %s contradicts the requested row" context))
+    (pcase state
+      ((or "unchanged" "cleared")
+       (unless (qq-account--exact-object-keys-p head-effect '(state))
+         (error "qq: %s has an invalid head mutation" context)))
+      ("replaced"
+       (unless (qq-account--exact-object-keys-p head-effect '(state head))
+         (error "qq: %s has an invalid replacement head" context))
+       (let ((head (alist-get 'head head-effect)))
+         (when (equal (alist-get 'row_key head) row-key)
+           (error "qq: %s attempts to restore the deleted row" context))
+         (setq head-message
+               (qq-message--history-item head "native" context))
+         ;; `conversation' is a closed request locator, while the replacement
+         ;; carries the native message-conversation DTO.  Private identity is
+         ;; derived from endpoints and group messages may carry presentation
+         ;; fields, so comparing the two objects as closed locators rejects
+         ;; valid heads.  Reuse the normal message identity projection instead.
+         (unless
+             (equal
+              (alist-get
+               'session-key
+               (qq-message-normalize-snapshot
+                head-message owner (qq-account-get owner)
+                (eq (alist-get 'canonical-recalled-p head-message) t) t))
+              session-key)
+           (error "qq: %s replacement belongs to another conversation"
+                  context))))
+      (_ (error "qq: %s has an unknown head mutation" context)))
+    (list :deletion (copy-tree deletion)
+          :session-key session-key
+          :row-key row-key
+          :state state
+          :head-message head-message)))
+
+(defun qq-message--project-local-deletion (data)
+  "Project one durable local-deletion event DATA."
+  (let* ((owner (qq-message--event-owner data))
+         (_owner (qq-message--sync-account owner))
+         (checked (qq-message--check-local-deletion
+                   data owner "local deletion event"))
+         (session-key (plist-get checked :session-key))
+         (row-key (plist-get checked :row-key))
+         replacement)
+    ;; Validate and merge a replacement before removing the visible row.  A
+    ;; malformed authoritative head must not leave the local cache half-applied.
+    (when (equal (plist-get checked :state) "replaced")
+      (let* ((message (plist-get checked :head-message))
+             (replacement-row-key
+              (alist-get 'canonical-row-key message)))
+        (qq-message--merge-history
+         session-key
+         `((messages . (,message))
+           (unsupported_message_count . 0))
+         owner)
+        (setq replacement
+              (seq-find
+               (lambda (candidate)
+                 (equal (alist-get 'canonical-row-key candidate)
+                        replacement-row-key))
+               (qq-state-session-messages session-key)))
+        (unless replacement
+          (error "qq: local deletion replacement was not projected"))))
+    (qq-state-delete-local-message session-key row-key)
+    (pcase (plist-get checked :state)
+      ("unchanged" nil)
+      ("cleared"
+       (qq-state--set-session-summary session-key nil))
+      ("replaced"
+       (qq-state--set-session-summary session-key replacement)))
+    (plist-get checked :deletion)))
+
 (defun qq-message--projection-error (event data error-data)
   "Publish projection ERROR-DATA for Gateway EVENT and domain DATA."
   (let ((reason (error-message-string error-data)))
@@ -1136,6 +1269,8 @@ History responses never advance it; only `message.received' events do."
              (qq-message--project-dataline-message data))
             ("message.recalled"
              (qq-message--project-recall data))
+            ("message.locally_deleted"
+             (qq-message--project-local-deletion data))
             ("message.reaction_changed"
              (qq-message--project-reaction data))
             ("message.essence_changed"
@@ -1373,7 +1508,7 @@ merge metadata plist; ERRBACK receives a Gateway error body and reason."
      :callback callback
      :errback errback)))
 
-(defconst qq-message-history-port-version 5
+(defconst qq-message-history-port-version 6
   "Gateway's conversation-neutral history façade version.")
 
 (defun qq-message--history-conversation-params (session-key)
@@ -1574,38 +1709,46 @@ DIRECTION closes which operation may consume its private position."
       (_ (error "qq: %s contains an unknown position" context))))
   (copy-tree cursor))
 
+(defun qq-message--history-item (item expected-kind context)
+  "Return one closed history ITEM payload of EXPECTED-KIND in CONTEXT."
+  (unless (and (equal (alist-get 'kind item) expected-kind)
+               (listp (alist-get 'message item)))
+    (error "qq: %s contains a mismatched history message" context))
+  (pcase expected-kind
+    ("native"
+     (unless (and (qq-account--exact-object-keys-p
+                   item '(kind row_key timeline_class recalled message))
+                  (qq-protocol--nonzero-decimal-string-p
+                   (alist-get 'row_key item))
+                  (member (alist-get 'timeline_class item)
+                          '("authored" "service"))
+                  (memq (alist-get 'recalled item) '(t :false)))
+       (error "qq: %s contains an invalid canonical row" context))
+     (let ((message (copy-tree (alist-get 'message item)))
+           (recalled-p (eq (alist-get 'recalled item) t)))
+       (when (and recalled-p (alist-get 'segments message))
+         (error "qq: %s recalled canonical row contains message content"
+                context))
+       (setf (alist-get 'canonical-row-key message nil nil #'eq)
+             (alist-get 'row_key item)
+             (alist-get 'canonical-timeline-class message nil nil #'eq)
+             (alist-get 'timeline_class item)
+             (alist-get 'canonical-recalled-p message nil nil #'eq)
+             recalled-p)
+       message))
+    ("dataline"
+     (unless (qq-account--exact-object-keys-p item '(kind message))
+       (error "qq: %s contains an invalid DataLine row" context))
+     (copy-tree (alist-get 'message item)))
+    (_ (error "qq: %s requests an unknown history row kind" context))))
+
 (defun qq-message--history-items (items expected-kind context)
   "Return message payloads from closed history ITEMS of EXPECTED-KIND."
   (unless (listp items)
     (error "qq: %s messages must be a list" context))
   (mapcar
    (lambda (item)
-     (unless (and (equal (alist-get 'kind item) expected-kind)
-                  (listp (alist-get 'message item)))
-       (error "qq: %s contains a mismatched history message" context))
-     (pcase expected-kind
-       ("native"
-        (unless (and (qq-account--exact-object-keys-p
-                      item '(kind row_key recalled message))
-                     (qq-protocol--nonzero-decimal-string-p
-                      (alist-get 'row_key item))
-                     (memq (alist-get 'recalled item) '(t :false)))
-          (error "qq: %s contains an invalid canonical row" context))
-        (let ((message (copy-tree (alist-get 'message item)))
-              (recalled-p (eq (alist-get 'recalled item) t)))
-          (when (and recalled-p (alist-get 'segments message))
-            (error "qq: %s recalled canonical row contains message content"
-                   context))
-          (setf (alist-get 'canonical-row-key message nil nil #'eq)
-                (alist-get 'row_key item)
-                (alist-get 'canonical-recalled-p message nil nil #'eq)
-                recalled-p)
-          message))
-       ("dataline"
-        (unless (qq-account--exact-object-keys-p item '(kind message))
-          (error "qq: %s contains an invalid DataLine row" context))
-        (copy-tree (alist-get 'message item)))
-       (_ (error "qq: %s requests an unknown history row kind" context))))
+     (qq-message--history-item item expected-kind context))
    items))
 
 (defun qq-message--history-center (center conversation context)
@@ -2115,7 +2258,8 @@ forwarding, face projection, or multipart capabilities."
     (session-key resource-id &optional callback errback optimistic-segment)
   "Publish staged RESOURCE-ID through SESSION-KEY's file operation.
 
-Groups use their dedicated file feed and wait for authoritative push/history.
+Private files use the ordinary FTN plus `Trans0X211' publication path.  Groups
+use their dedicated file feed.  Both wait for authoritative push/history.
 DataLine uses command-7 FTN publication, inserts OPTIMISTIC-SEGMENT locally,
 and promotes it from the sender-local Message ID in the durable receipt."
   (unless (qq-resource-id-p resource-id)
@@ -2123,6 +2267,42 @@ and promotes it from the sender-local Message ID in the durable receipt."
   (let* ((owner (qq-message--current-owner))
          (_owner (qq-message--sync-account owner)))
     (pcase (qq-state-session-key-type session-key)
+      ('private
+       (let* ((conversation (qq-message--conversation-params session-key))
+              (peer-uin (alist-get 'peer_uin conversation)))
+         (qq-message--call
+          "file.send" owner
+          `((conversation . ,conversation)
+            (resource_id . ,resource-id))
+          :projector
+          (lambda (receipt)
+            (unless
+                (and
+                 (qq-account--exact-object-keys-p
+                  receipt
+                  '(account_id peer_uin sent_at server_sequence client_sequence
+                    random resource_id file_name file_size fast_path))
+                 (equal (alist-get 'account_id receipt) owner)
+                 (equal (alist-get 'peer_uin receipt) peer-uin)
+                 (integerp (alist-get 'sent_at receipt))
+                 (qq-account--uint64-decimal-p
+                  (alist-get 'server_sequence receipt) t)
+                 (qq-account--uint64-decimal-p
+                  (alist-get 'client_sequence receipt) t)
+                 (integerp (alist-get 'random receipt))
+                 (<= 0 (alist-get 'random receipt) #xffffffff)
+                 (equal (alist-get 'resource_id receipt) resource-id)
+                 (qq-account--non-empty-string-p
+                  (alist-get 'file_name receipt))
+                 (qq-account--uint64-decimal-p
+                  (alist-get 'file_size receipt) t)
+                 (memq (alist-get 'fast_path receipt) '(t :false)))
+              (error "qq: Gateway returned an invalid private-file receipt"))
+            (qq-server-value-copy receipt))
+          :callback callback
+          :errback errback
+          :stale-message
+          "QQ account or Gateway connection changed during private-file send")))
       ('group
        (qq-message--call
         "file.send" owner
@@ -2157,7 +2337,7 @@ and promotes it from the sender-local Message ID in the durable receipt."
             (resource_id . ,resource-id))
           callback errback)))
       (_
-       (user-error "qq: Native private file upload is not implemented yet")))))
+       (user-error "qq: Native file upload requires a private, group, or DataLine chat")))))
 
 (defun qq-message--project-local-poke (owner session-key target-uin)
   "Project one acknowledged local poke under OWNER and SESSION-KEY."
@@ -2324,12 +2504,12 @@ are not yet part of the Gateway protocol."
      :stale-message
      "QQ account or Gateway connection changed during todo action")))
 
-(defun qq-message--read-request (message owner)
-  "Return a canonical-row read request for MESSAGE and OWNER.
+(defun qq-message--canonical-row-request (message owner operation)
+  "Return a canonical-row request for MESSAGE, OWNER, and OPERATION.
 
 The result is a plist containing `:row-key' and `:params'.  This is the single
-capability check and request builder; it has no projection or transport side
-effects."
+local-row capability check and request builder; it has no projection or
+transport side effects."
   (let* ((session-key (and (listp message)
                            (alist-get 'session-key message)))
          (kind (and session-key (qq-state-session-key-type session-key)))
@@ -2339,7 +2519,7 @@ effects."
     (unless (and owner
                  (memq kind '(private group))
                  (qq-account--uint64-decimal-p row-key))
-      (user-error "qq: Native read report requires a canonical timeline row"))
+      (user-error "qq: %s requires a canonical timeline row" operation))
     (unless (equal (alist-get 'gateway-account-id message) owner)
       (user-error "qq: Read target belongs to another Gateway account"))
     (setq conversation
@@ -2354,7 +2534,7 @@ effects."
   (when-let* ((owner (qq-runtime-current-account-id)))
     (condition-case nil
         (progn
-          (qq-message--read-request message owner)
+          (qq-message--canonical-row-request message owner "Native read report")
           t)
       (error nil))))
 
@@ -2368,7 +2548,8 @@ CALLBACK receives the acknowledgement; ERRBACK receives an error body and
 reason."
   (let* ((owner (qq-message--current-owner))
          (_owner (qq-message--sync-account owner))
-         (request (qq-message--read-request message owner))
+         (request (qq-message--canonical-row-request
+                   message owner "Native read report"))
          (row-key (plist-get request :row-key)))
     (qq-message--call
      "message.mark_read" owner
@@ -2386,6 +2567,43 @@ reason."
      :errback errback
      :stale-message
      "QQ account or Gateway connection changed during read report")))
+
+(defun qq-message-delete-local-capable-p (message)
+  "Return non-nil when MESSAGE has a durable local timeline identity."
+  (when-let* ((owner (qq-runtime-current-account-id)))
+    (condition-case nil
+        (progn
+          (qq-message--canonical-row-request message owner "Local deletion")
+          t)
+      (error nil))))
+
+(defun qq-message-delete-local
+    (message &optional callback errback)
+  "Persistently hide MESSAGE from this client's local timeline.
+
+No QQ request is sent.  The canonical row remains available to unread and
+history-coverage accounting, while native re-observation cannot make it
+visible again.  CALLBACK receives the checked deletion receipt."
+  (let* ((owner (qq-message--current-owner))
+         (_owner (qq-message--sync-account owner))
+         (request (qq-message--canonical-row-request
+                   message owner "Local deletion"))
+         (row-key (plist-get request :row-key))
+         (conversation (alist-get 'conversation
+                                  (plist-get request :params))))
+    (qq-message--call
+     "message.delete_local" owner
+     (plist-get request :params)
+     :projector
+     (lambda (receipt)
+       (plist-get
+        (qq-message--check-local-deletion
+         receipt owner "local deletion receipt" conversation row-key)
+        :deletion))
+     :callback callback
+     :errback errback
+     :stale-message
+     "QQ account or Gateway connection changed during local deletion")))
 
 (defun qq-message-exact-id (message)
   "Return MESSAGE's observed exact NT message ID, or nil.
@@ -2410,18 +2628,15 @@ It is not a substitute for an exact NT message ID."
         `((kind . "sequence") (sequence . ,sequence))))))
 
 (defun qq-message-recall-target (session-key message)
-  "Return MESSAGE's ordinary native recall target in SESSION-KEY, or nil.
+  "Return MESSAGE's exact ordinary recall Message ID, or nil.
 
-An exact NT snowflake works in private and group chats.  A group message may
-instead use its conversation-local native sequence; private sequence values
-alone are not a complete native recall capability.  Service timeline rows use
-only their explicitly modeled service operations."
+Like LinuxQQ's kernel API, ordinary recall starts from the conversation and
+exact NT Message ID.  Sequence and other native facts never cross the Emacs
+protocol boundary."
   (when (and (listp message)
              (not (qq-state-service-message-p message))
              (equal (alist-get 'session-key message) session-key))
-    (if-let* ((message-id (qq-message-exact-id message)))
-        `((kind . "message") (message_id . ,message-id))
-      (qq-message-group-sequence-target session-key message))))
+    (qq-message-exact-id message)))
 
 (defun qq-message-reply-target (session-key message)
   "Return MESSAGE's ordinary native reply target in SESSION-KEY, or nil.
@@ -2437,6 +2652,31 @@ Service timeline rows cannot be reply targets."
         `((kind . "message") (message_id . ,message-id))
       (qq-message-group-sequence-target session-key message))))
 
+(defun qq-message-recall-capable-p (message)
+  "Return non-nil when ordinary MESSAGE has an exact recall reference.
+
+This is only UI addressability.  Runtime resolves native facts and QQ decides
+age, authorship, and role authorization."
+  (let ((session-key (and (listp message)
+                          (alist-get 'session-key message)))
+        (owner (qq-runtime-current-account-id)))
+    (and session-key
+         owner
+         (equal (alist-get 'gateway-account-id message) owner)
+         (not (qq-state-message-recalled-p message))
+         (not (qq-state-service-message-p message))
+         (qq-message-recall-target session-key message)
+         t)))
+
+(defun qq-message--check-recall-receipt (receipt owner message-id)
+  "Return checked ordinary recall RECEIPT for OWNER and MESSAGE-ID."
+  (unless (and (qq-account--exact-object-keys-p
+                receipt '(account_id message_id))
+               (equal (alist-get 'account_id receipt) owner)
+               (equal (alist-get 'message_id receipt) message-id))
+    (error "qq: Gateway returned a contradictory message recall receipt"))
+  receipt)
+
 (defun qq-message-recall
     (session-key message &optional callback errback)
   "Recall native MESSAGE in SESSION-KEY for the selected QQ account.
@@ -2447,18 +2687,21 @@ recalled; a later `message.recalled' event is an idempotent reconciliation."
   (let* ((owner (qq-message--current-owner))
          (_owner (qq-message--sync-account owner))
          (conversation (qq-message--conversation-params session-key))
-         (target (or (qq-message-recall-target session-key message)
-                     (user-error
-                      "qq: Message has no native recall target"))))
+         (message-id (or (qq-message-recall-target session-key message)
+                         (user-error
+                          "qq: Message has no exact recall reference"))))
     (unless (equal (alist-get 'gateway-account-id message) owner)
       (user-error "qq: Message is not owned by selected Gateway account"))
+    (unless (qq-message-recall-capable-p message)
+      (user-error "qq: Message has no exact ordinary recall capability"))
     (qq-message--call
      "message.recall" owner
      `((conversation . ,conversation)
-       (target . ,target))
+       (message_id . ,message-id))
      :projector
      (lambda (receipt)
-       (qq-message--apply-recall-target session-key target)
+       (qq-message--check-recall-receipt receipt owner message-id)
+       (qq-state-apply-recall session-key message-id)
        receipt)
      :callback callback
      :errback errback
@@ -2542,7 +2785,21 @@ observations resolve sequence, timestamp, and GrayTip tips-sequence evidence."
                     (not (equal (alist-get key identity)
                                 (alist-get key conversation))))
            (error "qq: recent %s temporary route contradicts latest message"
-                  context))))))
+                  context))))
+      ("dataline"
+       (let ((chat (alist-get 'chat message)))
+         (unless (and (qq-account--exact-object-keys-p
+                       identity '(kind peer_uid variant))
+                      (qq-account--exact-object-keys-p
+                       chat '(peer_uid variant))
+                      (equal (alist-get 'peer_uid identity)
+                             (alist-get 'peer_uid chat))
+                      (equal (alist-get 'variant identity)
+                             (alist-get 'variant chat)))
+           (error "qq: recent %s DataLine identity contradicts latest message"
+                  context))))
+      (_ (error "qq: recent %s has an unsupported conversation identity"
+                context))))
   message)
 
 (defun qq-message--recent-identity-key (identity message)
@@ -2558,7 +2815,11 @@ observations resolve sequence, timestamp, and GrayTip tips-sequence evidence."
            (alist-get 'peer_uin identity)
            (alist-get 'from_tiny_id identity)
            (alist-get 'to_tiny_id identity)
-           (alist-get 'sub_type message)))))
+           (alist-get 'sub_type message)))
+    ("dataline"
+     (list "dataline"
+           (alist-get 'variant identity)
+           (alist-get 'peer_uid identity)))))
 
 (defun qq-message--recent-check-row (row index seen-identities)
   "Check projection relationships for recent ROW at INDEX.
@@ -2566,18 +2827,19 @@ observations resolve sequence, timestamp, and GrayTip tips-sequence evidence."
 SEEN-IDENTITIES rejects two rows that would own the same local session."
   (let* ((context (format "conversations[%d]" index))
          (identity (alist-get 'conversation row))
-         (head (alist-get 'latest_message row)))
-    (unless (and (qq-account--exact-object-keys-p head '(row_key message))
-                 (qq-account--uint64-decimal-p (alist-get 'row_key head)))
-      (error "qq: recent %s has an invalid canonical head" context))
-    (let* ((message (alist-get 'message head))
-           (identity-key
-            (qq-message--recent-identity-key identity message)))
-      (qq-message--recent-assert-identity-message identity message context)
-      (when (gethash identity-key seen-identities)
-        (error "qq: recent page duplicates conversation identity"))
-      (puthash identity-key t seen-identities)
-      row)))
+         (identity-kind (alist-get 'kind identity))
+         (head (alist-get 'latest_message row))
+         (head-kind (if (equal identity-kind "dataline")
+                        "dataline"
+                      "native"))
+         (message (qq-message--history-item head head-kind context))
+         (identity-key
+          (qq-message--recent-identity-key identity message)))
+    (qq-message--recent-assert-identity-message identity message context)
+    (when (gethash identity-key seen-identities)
+      (error "qq: recent page duplicates conversation identity"))
+    (puthash identity-key t seen-identities)
+    row))
 
 (defun qq-message--recent-check-page (page)
   "Check client projection relationships in recent-conversation PAGE."
@@ -2614,7 +2876,8 @@ service body and reason.  LIMIT defaults to `qq-recent-contact-count'."
    :errback errback))
 
 (dolist (event '("message.received" "dataline.message_received"
-                 "message.recalled" "message.reaction_changed"
+                 "message.recalled" "message.locally_deleted"
+                 "message.reaction_changed"
                  "message.essence_changed"))
   (qq-rpc-register-event
    event #'qq-message--handle-event))

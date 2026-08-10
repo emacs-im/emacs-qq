@@ -23,6 +23,7 @@
 (declare-function evil-set-initial-state "evil-core" (mode state))
 (declare-function qq-chat-clear-message-selection "qq-chat" (&optional quiet))
 (declare-function qq-chat-delete-message "qq-chat" ())
+(declare-function qq-chat-recall-message "qq-chat" ())
 (declare-function qq-chat-forward-transient "qq-transient" (plan))
 (declare-function qq-chat-goto-pop-message "qq-chat" ())
 (declare-function qq-chat-goto-reply "qq-chat" (&optional message))
@@ -340,6 +341,7 @@ When nil, leave Evil's initial-state selection untouched."
     (kbd "q") #'quit-window
     (kbd "r") #'qq-chat-reply-to-message
     (kbd "d d") #'qq-chat-delete-message
+    (kbd "d r") #'qq-chat-recall-message
     (kbd "R") #'qq-chat-forward-transient
     (kbd "m") #'qq-chat-toggle-message-selection
     (kbd "U") #'qq-chat-clear-message-selection

@@ -17,6 +17,14 @@
     (should (equal " @2" (substring-no-properties
                            (qq-mode-line-mentions))))))
 
+(ert-deftest qq-mode-line-does-not-sum-an-unavailable-badge-as-zero ()
+  (cl-letf (((symbol-function 'qq-state-sessions)
+             (lambda ()
+               '(((unread-badge-count . 3) (muted-p . nil))
+                 ((unread-badge-count . nil) (muted-p . nil))))))
+    (should (equal '(nil . 0) (qq-mode-line--counts)))
+    (should-not (qq-mode-line-unread-unmuted))))
+
 (ert-deftest qq-mode-line-mode-installs-and-removes-state-hook ()
   (let ((mode-line-misc-info nil)
         (qq-state-change-hook nil))

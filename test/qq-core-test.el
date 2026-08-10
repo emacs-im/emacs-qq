@@ -161,16 +161,22 @@
              . (((conversation . ((kind . "private") (peer_uid . "u_peer")))
                  (pinned . t)
                  (activity_revision . "2")
-                 (latest_message . ((row_key . "2") (message . ,message)))
-                 (latest_message_recalled . :false))
+                 (latest_message . ((kind . "native")
+                                    (row_key . "2")
+                                    (timeline_class . "authored")
+                                    (recalled . :false)
+                                    (message . ,message))))
                 ((conversation
                   . ((kind . "temporary")
                      (peer_uid . "u_peer")
                      (from_tiny_id . "10")))
                  (activity_revision . "1")
                  (latest_message
-                  . ((row_key . "1") (message . ,temporary-message)))
-                 (latest_message_recalled . :false))))
+                  . ((kind . "native")
+                     (row_key . "1")
+                     (timeline_class . "authored")
+                     (recalled . :false)
+                     (message . ,temporary-message))))))
             (truncated . :false))))
     (setf (alist-get 'conversation temporary-message nil nil #'eq)
           '((kind . "temp") (name . "Temporary")
@@ -193,6 +199,46 @@
                      (alist-get 'last-message-gateway-account-id session)
                      "slot-a"))
             (should-not (qq-state-session-messages "private:10001")))))))
+
+(ert-deftest qq-core-recent-projects-dataline-through-unified-head ()
+  (qq-core-test-with-managed-account
+   (let* ((peer-uid "u_Wcc5rknRRqRO8y5gxMD6sA")
+          (message-id "7348923749823749824")
+          (page
+           `((account_id . "slot-a")
+             (conversations
+              . (((conversation . ((kind . "dataline")
+                                   (peer_uid . ,peer-uid)
+                                   (variant . "desktop")))
+                  (activity_revision . "5")
+                  (latest_message
+                   . ((kind . "dataline")
+                      (message
+                       . ((message_id . ,message-id)
+                          (chat . ((peer_uid . ,peer-uid)
+                                   (variant . "desktop")))
+                          (direction . "received")
+                          (sent_at . 1784700001)
+                          (segments
+                           . (((kind . "text")
+                               (payload
+                                . ((text . "hello from phone")))))))))))))
+             (truncated . :false))))
+     (qq-message--recent-check-page page)
+     (qq-core--apply-recent-page
+      page (qq-state-session-summary-observation-start))
+     (should (equal (qq-state-recent-session-keys)
+                    (list (format "dataline:desktop:%s" peer-uid))))
+     (let ((session
+            (qq-state-session
+             (format "dataline:desktop:%s" peer-uid))))
+       (should (equal (alist-get 'title session) "My phone"))
+       (should (equal (alist-get 'variant session) "desktop"))
+       (should (equal (alist-get 'last-message-id session) message-id))
+       (should (equal (alist-get 'last-message-preview session)
+                      "hello from phone"))
+       (should-not (assq 'pinned session))
+       (should-not (alist-get 'last-message-seq session))))))
 
 (ert-deftest qq-core-recent-accepts-idless-gray-tip-with-canonical-row-key ()
   (qq-core-test-with-managed-account
@@ -224,9 +270,11 @@
             `((conversation . ((kind . "group")
                                (group_uin . "8209413637")))
               (activity_revision . "3")
-              (latest_message . ((row_key . ,row-key)
-                                 (message . ,message)))
-              (latest_message_recalled . :false))
+              (latest_message . ((kind . "native")
+                                 (row_key . ,row-key)
+                                 (timeline_class . "service")
+                                 (recalled . :false)
+                                 (message . ,message))))
             page `((account_id . "slot-a")
                    (conversations . (,row))
                    (truncated . :false))
@@ -244,7 +292,34 @@
         (should (equal (alist-get 'last-message-id session)
                        "timeline:slot-a:group:8209413637:42"))
         (should (equal (alist-get 'last-message-preview session)
-                       "戳了戳 Target"))))))
+                       "戳了戳 Target")))
+      ;; Recall redacts the GrayTip body.  The canonical class must retain the
+      ;; service identity so an empty sender presentation cannot invalidate
+      ;; the whole atomic recent page.
+      (let* ((recalled-message (copy-tree message))
+             (recalled-row
+              `((conversation . ((kind . "group")
+                                 (group_uin . "8209413637")))
+                (activity_revision . "4")
+                (latest_message . ((kind . "native")
+                                   (row_key . "43")
+                                   (timeline_class . "service")
+                                   (recalled . t)
+                                   (message . ,recalled-message))))))
+        (setf (alist-get 'segments recalled-message nil nil #'eq) nil)
+        (qq-message--recent-check-page
+         `((account_id . "slot-a")
+           (conversations . (,recalled-row))
+           (truncated . :false)))
+        (let ((recalled
+               (plist-get
+                (qq-core--recent-row-state-entry
+                 page recalled-row (qq-core-test-account))
+                :message)))
+          (should (eq (alist-get 'timeline-class recalled) 'service))
+          (should (equal (alist-get 'sender-name recalled) "QQ"))
+          (should (equal (alist-get 'preview recalled)
+                         "[message recalled]")))))))
 
 (ert-deftest qq-message-pure-normalizer-does-not-consume-projection-state ()
   (let* ((raw-message (alist-get 'message (qq-core-test-message-event)))
@@ -900,22 +975,80 @@
               (should (equal released '("res-dataline-wait")))))
         (delete-file path)))))
 
-(ert-deftest qq-core-file-send-rejects-private-and-mixed-drafts ()
-  (let ((path (make-temp-file "qq-core-file-" nil ".txt" "hello")))
-    (unwind-protect
-        (progn
-          (should-error
-           (qq-core-send-message
-            "private:10001"
-            `(((type . "file") (data . ((file . ,path))))))
-           :type 'user-error)
-          (should-error
-           (qq-core-send-message
-            "group:8209413637"
-            `(((type . "text") (data . ((text . "caption"))))
-              ((type . "file") (data . ((file . ,path))))))
-           :type 'user-error))
-      (delete-file path))))
+(ert-deftest qq-core-private-file-stages-publishes-and-rejects-mixed-drafts ()
+  (qq-core-test-with-managed-account
+    (let ((path (make-temp-file "qq-core-file-" nil ".txt" "hello"))
+          staged sent released)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'qq-resource-stage-local)
+                (lambda (source name _sha callback _errback)
+                  (setq staged (list source name))
+                  (funcall callback
+                           '((resource_id . "res-private-file")
+                             (phase . "ready")))
+                  "stage-request"))
+               ((symbol-function 'qq-message-send-file)
+                (lambda (session resource-id callback _errback)
+                  (setq sent (list session resource-id))
+                  (funcall callback
+                           '((account_id . "slot-a")
+                             (peer_uin . "10001")
+                             (file_name . "notes.txt")))
+                  "file-request"))
+               ((symbol-function 'qq-core--release-send-resource)
+                (lambda (resource-id) (push resource-id released))))
+            (let ((request
+                   (qq-core-send-message
+                    "private:10001"
+                    `(((type . "file")
+                       (data . ((file . ,path) (name . "notes.txt"))))))))
+              (should (eq (qq-request-state request) 'settled))
+              (should (equal staged (list path "notes.txt")))
+              (should (equal sent '("private:10001" "res-private-file")))
+              (should (equal released '("res-private-file"))))
+            (should-error
+             (qq-core-send-message
+              "private:10001"
+              `(((type . "text") (data . ((text . "caption"))))
+                ((type . "file") (data . ((file . ,path))))))
+             :type 'user-error))
+        (delete-file path)))))
+
+(ert-deftest qq-core-file-cancel-retains-resource-until-publication-settles ()
+  (qq-core-test-with-managed-account
+    (let ((path (make-temp-file "qq-core-file-cancel-" nil ".txt" "hello"))
+          publication-success released delivered)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'qq-resource-stage-local)
+                (lambda (_source _name _sha callback _errback)
+                  (funcall callback
+                           '((resource_id . "res-private-file")
+                             (phase . "ready")))
+                  "stage-request"))
+               ((symbol-function 'qq-message-send-file)
+                (lambda (_session _resource-id callback _errback)
+                  (setq publication-success callback)
+                  "file-request"))
+               ((symbol-function 'qq-core--release-send-resource)
+                (lambda (resource-id) (push resource-id released))))
+            (let ((request
+                   (qq-core-send-message
+                    "private:10001"
+                    `(((type . "file")
+                       (data . ((file . ,path) (name . "notes.txt")))))
+                    nil (lambda (receipt) (setq delivered receipt)))))
+              (should (qq-request-active-p request))
+              (should publication-success)
+              (should-not released)
+              (should (qq-request-cancel request))
+              (should (eq (qq-request-state request) 'cancelled))
+              (should-not released)
+              (funcall publication-success '((account_id . "slot-a")))
+              (should (equal released '("res-private-file")))
+              (should-not delivered)))
+        (delete-file path)))))
 
 (ert-deftest qq-core-local-images-finish-concurrently-but-send-in-draft-order ()
   (qq-core-test-with-managed-account
@@ -1928,7 +2061,9 @@
 
 (ert-deftest qq-core-recall-dispatches-the-owned-native-message ()
   (let ((qq-account--current-account-id "slot-a") call)
-    (cl-letf (((symbol-function 'qq-message-recall)
+    (cl-letf (((symbol-function 'qq-message-recall-capable-p)
+               (lambda (_message) t))
+              ((symbol-function 'qq-message-recall)
                (lambda (session-key message &optional callback errback)
                  (setq call (list session-key message callback errback))
                  "recall-request")))
@@ -2189,6 +2324,36 @@
     (qq-core--bootstrap-success "slot-a" current-token nil)
     (should (= (qq-core--bootstrap-pending bootstrap) 1))))
 
+(ert-deftest qq-core-recent-bootstrap-waits-for-current-directory-bootstrap ()
+  (qq-core-test-with-managed-account
+   (let* ((token (list 'directory-bootstrap))
+          (qq-core--bootstraps (make-hash-table :test #'equal))
+          (qq-core--recent-bootstrap-instances
+           (make-hash-table :test #'equal))
+          (bootstrap
+           (qq-core--bootstrap-create
+            :owner "slot-a"
+            :instance-id "gateway-a"
+            :token token
+            :pending 1))
+          (recent-calls 0))
+     (puthash "slot-a" bootstrap qq-core--bootstraps)
+     (cl-letf
+         (((symbol-function 'qq-server-ready-p) (lambda () t))
+          ((symbol-function 'qq-server-gateway-instance-id)
+           (lambda () "gateway-a"))
+          ((symbol-function 'qq-core-supports-p)
+           (lambda (_capability) t))
+          ((symbol-function 'qq-core-refresh-recent-conversations)
+           (lambda (&rest _arguments) (cl-incf recent-calls))))
+       (qq-core--bootstrap-managed-recents)
+       (should (= recent-calls 0))
+       (qq-core--bootstrap-success "slot-a" token nil)
+       (should (= recent-calls 1))
+       (should (equal (gethash "slot-a"
+                               qq-core--recent-bootstrap-instances)
+                      "gateway-a"))))))
+
 (ert-deftest qq-core-bootstrap-coalesces-one-owner ()
   (qq-core-test-with-managed-account
     (let ((qq-core--bootstraps (make-hash-table :test #'equal))
@@ -2202,6 +2367,7 @@
            ((symbol-function 'qq-state-friend-categories-loaded-p)
             (lambda () nil))
            ((symbol-function 'qq-state-groups-loaded-p) (lambda () nil))
+           ((symbol-function 'qq-core--bootstrap-managed-recents) #'ignore)
            ((symbol-function 'qq-core-refresh-friend-categories)
             (lambda (callback _errback &optional _refresh)
               (push 'friends calls)

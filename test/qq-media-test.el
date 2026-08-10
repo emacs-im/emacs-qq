@@ -1729,6 +1729,36 @@
        (equal fetch-call
               (list segment (qq-media--native-file-key media-id)))))))
 
+(ert-deftest qq-media-group-file-reuses-the-opaque-file-materializer ()
+  (let* ((media-id "media-33445566-7788-499a-8bbc-ddeeff001122")
+         (segment `((type . "group_file")
+                    (data . ((media_id . ,media-id)
+                             (file_name . "archive.zip")
+                             (file_size . "4814589")))))
+         (qq-remote-media--media (make-hash-table :test #'equal))
+         fetched)
+    (puthash media-id
+             `((media_id . ,media-id)
+               (kind . "file")
+               (content . ((phase . "available")
+                           (bytes_done . "0")
+                           (expected_size . "4814589"))))
+             qq-remote-media--media)
+    (cl-letf (((symbol-function 'qq-runtime-current-account-id)
+               (lambda () "slot-a"))
+              ((symbol-function 'qq-server-ready-p) (lambda () t))
+              ((symbol-function 'qq-rpc-method-available-p) (lambda (_method) t))
+              ((symbol-function 'qq-media--fetch-native-file-resource)
+               (lambda (called-segment key callback _errback)
+                 (setq fetched (list called-segment key))
+                 (funcall callback '((file . "/tmp/archive.zip"))))))
+      (should (equal (qq-media--native-file-media-id segment) media-id))
+      (should (plist-get (qq-media-segment-capabilities segment) :open))
+      (qq-media--fetch-segment-resource segment #'ignore #'ignore)
+      (should
+       (equal fetched
+              (list segment (qq-media--native-file-key media-id)))))))
+
 (ert-deftest qq-media-terminal-native-file-preview-never-restarts-from-redisplay ()
   (qq-media-test-with-reset
    (let* ((media-id "media-33445566-7788-499a-8bbc-ddeeff001122")

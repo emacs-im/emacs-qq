@@ -120,6 +120,22 @@ partial-window paging."
                  (number :tag "Seconds"))
   :group 'qq)
 
+(defcustom qq-chat-use-date-breaks t
+  "Non-nil means render a date break at local calendar-day boundaries.
+
+Date breaks are derived presentation between adjacent canonical messages;
+they are not timeline rows or messages."
+  :type 'boolean
+  :group 'qq)
+
+(defcustom qq-chat-date-break-format "%d %B %Y %a"
+  "Format used for chat date-break labels.
+
+The value is accepted by `format-time-string'.  The default matches telega's
+`date-break-bar' format."
+  :type 'string
+  :group 'qq)
+
 (defcustom qq-chat-buffer-name-prefix "QQ"
   "Application prefix used for human-readable chat buffer names.
 
@@ -395,8 +411,8 @@ Same defaults as `telega-msg-deleted'."
   :group 'qq)
 
 (defface qq-msg-date-separator
-  '((t :inherit shadow))
-  "Face for day separator rows in the chat timeline."
+  '((t :inherit (shadow bold)))
+  "Face for telega-style day separator rows in the chat timeline."
   :group 'qq)
 
 (defface qq-msg-unread-divider

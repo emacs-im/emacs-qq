@@ -61,6 +61,13 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
        (when (buffer-live-p buffer)
          (kill-buffer buffer)))))
 
+(ert-deftest qq-root-refresh-uses-the-native-product-operation ()
+  (let ((calls 0))
+    (cl-letf (((symbol-function 'qq-core-refresh)
+               (lambda () (cl-incf calls) 'requests)))
+      (should (equal (qq-root-refresh) 'requests))
+      (should (= calls 1)))))
+
 (ert-deftest qq-root-header-shows-gateway-online-account-before-self-info ()
   (let ((account
          '((account_id . "slot-work")
@@ -148,6 +155,36 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
      (should (= 2 (plist-get metrics :unread)))
      (should (= 1 (plist-get metrics :important)))
      (should (= 1 (plist-get metrics :muted))))))
+
+(ert-deftest qq-root-aggregate-metrics-do-not-present-partial-badge-totals ()
+  (let* ((sessions '(((type . group) (unread-badge-count . 3) (muted-p . nil))
+                     ((type . private) (unread-badge-count . nil) (muted-p . nil))))
+         (metrics (qq-root--activity-metrics sessions)))
+    (should (= 2 (plist-get metrics :all)))
+    (should-not (plist-get metrics :unread))
+    (should-not (plist-get metrics :important))
+    (should-not (plist-get metrics :muted))
+    (should
+     (string-match-p "Important:?" (qq-root--filters-line sessions)))))
+
+(ert-deftest qq-root-badge-never-falls-back-to-message-count ()
+  (let ((unknown-badge '((unread-message-count . 7)
+                         (unread-badge-count . nil)
+                         (muted-p . nil)))
+        (exact-badge '((unread-message-count . 7)
+                       (unread-badge-count . 9)
+                       (muted-p . nil))))
+    (should (equal "" (qq-root--session-unread-trail unknown-badge)))
+    (should (string-match-p "9" (qq-root--session-unread-trail exact-badge)))
+    (should-not
+     (string-match-p "7" (qq-root--session-unread-trail exact-badge)))))
+
+(ert-deftest qq-root-renders-capped-badges ()
+  (should
+   (equal "99+"
+          (substring-no-properties
+           (qq-root--session-unread-trail
+            '((unread-badge-count . 218)))))))
 
 (ert-deftest qq-root-projects-the-scannable-login-view ()
   (let ((model '(:account-id "slot-a"

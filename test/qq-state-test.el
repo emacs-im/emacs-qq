@@ -323,6 +323,37 @@
                   '("20002" "20001")))
    (should (= (qq-state-group-count) 2))))
 
+(ert-deftest qq-state-group-directory-updates-only-existing-session-modes ()
+  (qq-test-with-reset
+   (qq-state-upsert-session
+    "group:20001"
+    '((message-notify-mode . shield) (muted-p . t))
+    nil)
+   (qq-state-apply-groups
+    '(((group_id . "20001") (message-notify-mode . notify))
+      ((group_id . "20002") (message-notify-mode . receive))))
+   (let ((session (qq-state-session "group:20001")))
+     (should (eq (alist-get 'message-notify-mode session) 'notify))
+     (should-not (alist-get 'muted-p session)))
+   (should-not (qq-state-session "group:20002"))
+   (should (eq (alist-get 'message-notify-mode
+                          (qq-state-group "20002"))
+               'receive))
+   ;; A session created after the directory snapshot hydrates the mode from
+   ;; the group cache instead of inventing an unmuted state.
+   (qq-state-upsert-session "group:20002" nil nil)
+   (let ((session (qq-state-session "group:20002")))
+     (should (eq (alist-get 'message-notify-mode session) 'receive))
+     (should (eq (alist-get 'muted-p session) t)))
+   ;; Unknown in a later directory page preserves the last confirmed fact.
+   (qq-state-apply-groups '(((group_id . "20001"))))
+   (should (eq (alist-get 'message-notify-mode
+                          (qq-state-session "group:20001"))
+               'notify))
+   (should-error
+    (qq-state-apply-groups
+     '(((group_id . "20001") (message-notify-mode . future-mode)))))))
+
 (ert-deftest qq-state-guild-directory-preserves-hierarchy-and-copy-boundaries ()
   (qq-test-with-reset
    (let* ((guild-id "9007199254740993")
@@ -1017,24 +1048,29 @@
                     (alist-get 'first-unread-message-seq session)))
      (should-not (alist-get 'read-position-available session)))))
 
-(ert-deftest qq-state-read-projection-rejects-positions-without-exact-unread ()
+(ert-deftest qq-state-read-projection-retains-independent-position-evidence ()
   (qq-test-with-reset
    (qq-state-upsert-session "group:20001" nil nil)
-   (let ((before (qq-state-session "group:20001")))
-     (should-error
-      (qq-state-apply-session-read-projection
-       "group:20001"
-       '((unread-message-count . nil)
-         (unread-badge-count . nil)
-         (first-unread-message-id . nil)
-         (first-unread-message-seq . "30001")
-         (unread-at-me-message-id . nil)
-         (unread-at-me-message-seq . nil)
-         (unread-at-all-message-id . nil)
-         (unread-at-all-message-seq . nil)
-         (read-position-available . nil)
-         (read-latest-message-id . nil))))
-     (should (equal (qq-state-session "group:20001") before)))))
+   (let ((projection
+          '((unread-message-count . nil)
+            (unread-badge-count . nil)
+            (first-unread-message-id . nil)
+            (first-unread-message-seq . "30001")
+            (unread-at-me-message-id . nil)
+            (unread-at-me-message-seq . "30003")
+            (unread-at-all-message-id . nil)
+            (unread-at-all-message-seq . nil)
+            (read-position-available . nil)
+            (read-latest-message-id . nil))))
+     (qq-state-apply-session-read-projection "group:20001" projection)
+     (let ((session (qq-state-session "group:20001")))
+       (should-not (alist-get 'unread-message-count session))
+       (should (equal "30001" (alist-get 'first-unread-message-seq session)))
+       (should (equal "30003" (alist-get 'unread-at-me-message-seq session))))
+     (let ((invalid (copy-tree projection)))
+       (setf (alist-get 'unread-message-count invalid) 0)
+       (should-error
+        (qq-state-apply-session-read-projection "group:20001" invalid))))))
 
 (ert-deftest qq-state-identical-authoritative-read-state-is-a-no-op ()
   (qq-test-with-reset
@@ -2822,6 +2858,41 @@ it kept the element's visible text, the user should still see it."
                 (likes . (((emoji_id . "178") (count . 1)))))))))
        (should (string-match-p "requires the explicit session group"
                                (error-message-string group-error)))))))
+
+(ert-deftest qq-state-service-message-ids-do-not-claim-authored-session-index ()
+  (qq-test-with-reset
+   (let* ((message-id "144115188083720924")
+          (first-service
+           `((server-id . ,message-id)
+             (session-key . "group:1027327596")
+             (timeline-class . service)))
+          (second-service
+           `((server-id . ,message-id)
+             (session-key . "group:364100168")
+             (timeline-class . service)))
+          (authored
+           `((server-id . ,message-id)
+             (session-key . "group:20001")
+             (timeline-class . authored))))
+     (qq-state--index-message first-service)
+     (qq-state--index-message second-service)
+     (should-not (gethash message-id qq-state--message-session-index))
+     (should
+      (equal (qq-state-validate-message-session
+              "group:1027327596" message-id)
+             message-id))
+     (qq-state--index-message authored)
+     (should
+      (equal (gethash message-id qq-state--message-session-index)
+             "group:20001"))
+     ;; Removing either colliding service row must not erase an authored owner.
+     (qq-state--unindex-message first-service)
+     (qq-state--unindex-message second-service)
+     (should
+      (equal (gethash message-id qq-state--message-session-index)
+             "group:20001"))
+     (qq-state--unindex-message authored)
+     (should-not (gethash message-id qq-state--message-session-index)))))
 
 (ert-deftest qq-state-normalize-message-snapshot-does-not-consume-global-order ()
   (qq-test-with-reset
