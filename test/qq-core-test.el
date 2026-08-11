@@ -292,7 +292,7 @@
         (should (equal (alist-get 'last-message-id session)
                        "timeline:slot-a:group:8209413637:42"))
         (should (equal (alist-get 'last-message-preview session)
-                       "戳了戳 Target")))
+                       "Actor 戳了戳 Target")))
       ;; Recall redacts the GrayTip body.  The canonical class must retain the
       ;; service identity so an empty sender presentation cannot invalidate
       ;; the whole atomic recent page.

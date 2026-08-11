@@ -1787,6 +1787,39 @@
                  (prompt . "[分享]Article"))))))
     "[分享]Article")))
 
+(ert-deftest qq-state-poke-segment-preview-names-the-actor ()
+  "Root previews must name the poke initiator; a bare action-plus-target
+sentence leaves the actor unreadable in the recent list."
+  (should
+   (equal
+    (qq-state-message-preview-from-segments
+     '(((type . "gray-tip")
+        (data . ((kind . "poke")
+                 (actor-name . "WD")
+                 (target-name . "WD")
+                 (action . "捏了捏")
+                 (detail))))))
+    "WD 捏了捏 WD")))
+
+(ert-deftest qq-state-poke-segment-preview-falls-back-without-actor ()
+  "A producer that omits the actor name must not crash; the sentence keeps
+its action and target, and a lone target still reads as a poke."
+  (should
+   (equal
+    (qq-state-message-preview-from-segments
+     '(((type . "gray-tip")
+        (data . ((kind . "poke")
+                 (target-name . "WD")
+                 (action . "捏了捏"))))))
+    "捏了捏 WD"))
+  (should
+   (equal
+    (qq-state-message-preview-from-segments
+     '(((type . "gray-tip")
+        (data . ((kind . "poke")
+                 (target-name . "WD"))))))
+    "戳了戳 WD")))
+
 (ert-deftest qq-state-live-message-ignores-empty-group-card-when-choosing-sender-name ()
   (qq-test-with-reset
    (qq-state-merge-live-message
