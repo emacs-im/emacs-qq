@@ -61,6 +61,11 @@ future request must accept its own authoritative reaction snapshot unchanged.")
   (make-hash-table :test #'eql)
   "Active materialization request owners keyed by their numeric identity.")
 (defvar qq-state--friends-by-id (make-hash-table :test #'equal))
+(defvar qq-state--known-user-names (make-hash-table :test #'equal)
+  "Most recently observed UIN to display-name map, learned from ordinary
+message senders.  QQ fills some GrayTip name parameters with the raw UIN,
+so non-friend senders resolve through this local map before falling back to
+the bare UIN.  Presentation only; never a peer identity source.")
 (defvar qq-state--friend-order nil
   "Friend UINs in the authoritative snapshot order.")
 (defvar qq-state--friend-categories nil
@@ -460,6 +465,7 @@ Prefer NapCat hard-cut NT snowflake `server-id', then `local-id', then `id'."
   (clrhash qq-state--message-patch-journal)
   (clrhash qq-state--materialization-request-owners)
   (clrhash qq-state--friends-by-id)
+  (clrhash qq-state--known-user-names)
   (clrhash qq-state--groups-by-id)
   (clrhash qq-state--guilds-by-id)
   (clrhash qq-state--guild-channels-by-key)
@@ -1066,14 +1072,19 @@ reply chrome elsewhere).  Media becomes short placeholders like
           ("xml" "[xml]")
           ("gray-tip"
            (if (equal (alist-get 'kind data) "poke")
-               (let ((action
+               (let ((actor
+                      (qq-state--present-string (alist-get 'actor-name data)))
+                     (action
                       (qq-state--present-string (alist-get 'action data)))
                      (target
                       (qq-state--present-string
                        (alist-get 'target-name data)))
                      (detail
                       (qq-state--present-string (alist-get 'detail data))))
-                 (or (and action target (concat action " " target detail))
+                 (or (and actor action target
+                          (concat actor " " action " " target detail))
+                     (and actor action (concat actor " " action detail))
+                     (and action target (concat action " " target detail))
                      (and action (concat action detail))
                      (and target (concat "戳了戳 " target))
                      "[poke]"))
@@ -1299,12 +1310,22 @@ missing or contradictory wire identity."
     derived))
 
 (defun qq-state--gray-tip-user-name (user-id explicit-name)
-  "Return a GrayTip display name for USER-ID, preferring EXPLICIT-NAME."
+  "Return a GrayTip display name for USER-ID, preferring EXPLICIT-NAME.
+
+QQ fills name parameters with the raw UIN when a poke action carries no
+name, so an explicit name identical to the UIN is a placeholder, not a
+display name.  The lookup then falls back to the local self/friend tables
+and the recently observed sender map before showing the bare UIN."
   (let* ((user-id (qq-state--normalize-id user-id))
          (friend (and user-id (gethash user-id qq-state--friends-by-id)))
          (self-p (and user-id
                       (equal user-id (qq-state-self-user-id))))
-         (name (or explicit-name
+         (explicit (and (stringp explicit-name)
+                        (not (string-empty-p explicit-name))
+                        (not (equal explicit-name user-id))
+                        explicit-name))
+         (known (and user-id (gethash user-id qq-state--known-user-names)))
+         (name (or explicit
                    (and self-p
                         (qq-state--present-string
                          (alist-get 'nickname qq-state--self-info)))
@@ -1314,6 +1335,9 @@ missing or contradictory wire identity."
                    (and friend
                         (qq-state--present-string
                          (alist-get 'nickname friend)))
+                   (and (stringp known)
+                        (not (string-empty-p known))
+                        known)
                    user-id)))
     (or name "某人")))
 
@@ -1339,6 +1363,16 @@ missing wire identity."
                           nil
                         sender-id))
            (sender-fields (qq-state--sender-display-fields session-key sender sender-id))
+           ;; Learn non-friend display names from ordinary senders: QQ fills
+           ;; some GrayTip name parameters with the raw UIN, and this local
+           ;; map is the only presentation fallback for those senders.
+           (observed-sender-name (alist-get 'sender-name sender-fields))
+           (sender-name (and sender-id
+                             (stringp observed-sender-name)
+                             (not (string-empty-p observed-sender-name))
+                             (not (equal observed-sender-name sender-id))
+                             (not (equal observed-sender-name "unknown"))
+                             observed-sender-name))
            (recalled-p (qq-state--raw-message-recalled-p message))
            (segments (if recalled-p '() (or (alist-get 'message message) '())))
            (mention-kinds (qq-state--mention-kinds-from-segments segments))
@@ -1366,6 +1400,8 @@ missing wire identity."
                  peer-uid
                  (not (equal peer-uid expected-private-peer-uid)))
         (error "qq: private latest message contradicts its contact UID"))
+      (when sender-name
+        (puthash sender-id sender-name qq-state--known-user-names))
       `((id . ,server-id)
         (server-id . ,server-id)
         (session-key . ,session-key)
