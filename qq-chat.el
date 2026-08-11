@@ -1787,21 +1787,6 @@ selection; success removes only the immutable selection snapshot in PLAN."
              :message-id (alist-get 'server-id message)))
     (appkit-chatbuf-aux-reset)))
 
-(defun qq-chat--after-change (beg end old-len)
-  "Keep draft state synced after editable-region changes from BEG to END."
-  (appkit-chatbuf-after-change
-   beg end
-   :old-length old-len
-   :rendering-p (appkit-chatbuf-rendering-p)
-   :sync-function #'qq-chat--sync-draft-from-buffer
-   :prune-broken-objects t))
-
-(defun qq-chat--update-context-mode ()
-  "Enable timeline bindings only when point is outside the draft input."
-  (let ((timeline-p (not (appkit-chatbuf-point-in-input-p))))
-    (unless (eq qq-chat-timeline-mode timeline-p)
-      (qq-chat-timeline-mode (if timeline-p 1 -1)))))
-
 (defun qq-chat--flush-deferred-node-redisplay ()
   "Flush any node redisplay deferred while a region was active."
   (when (appkit-chat-timeline-live-p)
@@ -1865,14 +1850,9 @@ selection; success removes only the immutable selection snapshot in PLAN."
          view (lambda () (qq-chat-load-newer-messages t)))))))
 
 (defun qq-chat--post-command ()
-  "Keep point inside the logical draft area when editing input."
+  "Maintain QQ-specific timeline behavior after each command."
   (unless (appkit-chatbuf-rendering-p)
-    (appkit-chatbuf-post-command-clamp-point)
-    (when (and (appkit-chatbuf-point-in-input-p)
-               (appkit-chatbuf-input-has-objects-p))
-      (appkit-chatbuf-input-prune-broken-objects))
     (qq-chat--flush-deferred-node-redisplay)
-    (qq-chat--update-context-mode)
     ;; A partial around-message window behaves like telega: approaching its
     ;; lower edge extends the continuous slice without inserting a gap row.
     (qq-chat--maybe-auto-load-newer)
@@ -2270,7 +2250,7 @@ same id or unrelated history islands and must not replace a search hit."
    :anchor-property 'qq-chat-message-anchor
    :header (qq-chat--header-text)
    :footer (qq-chat--footer-text)
-   :after-mutation-function #'qq-chat--update-context-mode))
+   :after-mutation-function #'appkit-chatbuf-update-context-mode))
 
 (defun qq-chat--view-id ()
   "Return the opaque appkit view id for the current QQ chat."
@@ -6319,10 +6299,6 @@ still validated by the strict API contract."
     ;; Keep M-</M-> as native Emacs beginning/end-of-buffer commands.
     ;; Telega reserves its authoritative latest/read-all action for M-g.
     (define-key map (kbd "RET") #'qq-chat-return-dwim)
-    (define-key map (kbd "DEL") #'appkit-chatbuf-input-backward-delete)
-    (define-key map (kbd "<backspace>") #'appkit-chatbuf-input-backward-delete)
-    (define-key map (kbd "C-d") #'appkit-chatbuf-input-forward-delete)
-    (define-key map (kbd "<delete>") #'appkit-chatbuf-input-forward-delete)
     (define-key map (kbd "TAB") #'qq-chat-complete)
     (define-key map (kbd "<tab>") #'qq-chat-complete)
     (define-key map (kbd "C-M-i") #'qq-chat-complete)
@@ -6348,17 +6324,18 @@ still validated by the strict API contract."
     map)
   "Keymap for `qq-chat-mode'.")
 
-(define-derived-mode qq-chat-mode nil "QQ-Chat"
+(define-derived-mode qq-chat-mode appkit-chatbuf-mode "QQ-Chat"
   "Major mode for emacs-qq chat buffers.
 
 Message actions use point + keys (`r'/`d'/`!'/`P'/`o'/`a' on the timeline) or
 `qq-chat-message-transient' (`C-c m' / timeline `m').  Chat-wide commands
 are in `qq-chat-transient' (`C-c ?' / timeline `?').
 Attach from clipboard with `C-c C-v' (telega-style)."
-  (appkit-chatbuf-mode-setup)
   ;; Keep vertically sliced two-line avatars visually contiguous.
   (setq-local line-spacing 0)
   (appkit-chatbuf-reset-state 32)
+  (setq-local appkit-chatbuf-input-sync-function
+              #'qq-chat--sync-draft-from-buffer)
   (qq-completion-setup)
   (setq-local qq-chat--last-search-query nil)
   (setq-local qq-chat--search-results nil)
@@ -6404,8 +6381,7 @@ Attach from clipboard with `C-c C-v' (telega-style)."
              '(image/png image/jpeg image/bmp)
              (lambda (mime-type data)
                (qq-chat--yank-media mime-type data nil))))
-  (add-hook 'after-change-functions #'qq-chat--after-change nil t)
-  (add-hook 'post-command-hook #'qq-chat--post-command nil t)
+  (add-hook 'post-command-hook #'qq-chat--post-command t t)
   (add-hook 'window-scroll-functions #'qq-chat--window-scroll nil t)
   (add-hook 'window-size-change-functions
             #'qq-chat--on-window-size-change nil t)
@@ -6417,7 +6393,7 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (add-hook 'kill-buffer-hook #'qq-chat--cancel-open-message-request nil t)
   (add-hook 'kill-buffer-hook #'qq-chat--cancel-initial-history-request nil t)
   (add-hook 'kill-buffer-hook #'qq-chat--cancel-forward-request nil t)
-  (qq-chat--update-context-mode))
+  (appkit-chatbuf-use-timeline-mode #'qq-chat-timeline-mode))
 
 (defun qq-chat--initial-history-request-current-p
     (buffer session-key owner)

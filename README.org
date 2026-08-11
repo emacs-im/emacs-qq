@@ -186,8 +186,8 @@ eask link add appkit ../appkit.el
 
 * 架构边界
 
-- QQ 运行时只依赖 Appkit 的 view、presentation、media、chat-buffer、completion
-  和 chat-timeline 基础设施，不依赖 ~disco.el~。
+- QQ 运行时依赖 Appkit 0.2.2 或更高版本的 view、presentation、media、
+  chat-buffer、completion 和 chat-timeline 基础设施，不依赖 ~disco.el~。
 - ~qq-server.el~ 独占 WebSocket、JSON wire value 和连接生命周期；~qq-rpc.el~
   在其上提供带所有权的请求与事件分派。
 - ~qq-account.el~、~qq-message.el~、~qq-directory.el~、~qq-resource.el~、
