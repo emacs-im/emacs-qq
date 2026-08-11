@@ -1000,7 +1000,11 @@ must not be guessed."
         (qq-state-session-messages qq-chat--session-key))))
 
 (defun qq-chat--read-target-needed-p (message)
-  "Return non-nil when canonical MESSAGE can advance the known read position."
+  "Return non-nil when canonical MESSAGE can advance the known read position.
+
+First-unread is compared by native sequence because the message owning that
+position may have been locally deleted and is therefore absent from the local
+timeline; a server-id lookup would then fail closed forever."
   (let* ((messages (qq-state-session-messages qq-chat--session-key))
          (row-key (alist-get 'canonical-row-key message))
          (target-index (qq-chat--canonical-row-index row-key messages))
@@ -1021,9 +1025,10 @@ must not be guessed."
                         (qq-chat--message-index read-latest messages)))
              (> target-index read-index)))
           ((and (integerp unread-count) (> unread-count 0) first-unread)
-           (when-let* ((first-index
-                        (qq-chat--message-index first-unread messages)))
-             (>= target-index first-index)))
+           (when-let* ((target-seq (alist-get 'message-seq message))
+                       (first-seq
+                        (alist-get 'first-unread-message-seq session)))
+             (not (qq-account--decimal-less-p target-seq first-seq))))
           (t t)))))
 
 (defun qq-chat--mark-message-viewed (message &optional force)
