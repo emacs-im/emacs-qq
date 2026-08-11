@@ -827,6 +827,28 @@ Values from NEW replace values in OLD."
               ((equal (alist-get 'kind data) "poke")))
     data))
 
+(defun qq-state--poke-display-names (data)
+  "Return (ACTOR . TARGET) display names for poke DATA.
+
+Mobile-style self wording is shared by every presentation surface: ACTOR is
+\"你\" when the initiating UIN is the current account; TARGET is \"自己\" for a
+self-initiated self-targeted poke and \"你\" when the target is the current
+account.  Falls back to the wire names, either of which may be nil."
+  (let* ((actor-id (qq-state--present-string (alist-get 'actor-id data)))
+         (target-id (qq-state--present-string (alist-get 'target-id data)))
+         (self-uin (qq-state-self-user-id))
+         (actor-self-p (and actor-id self-uin (equal actor-id self-uin)))
+         (target-self-p (and target-id self-uin (equal target-id self-uin)))
+         (actor (if actor-self-p
+                    "你"
+                  (qq-state--present-string (alist-get 'actor-name data))))
+         (target (cond
+                  ((and actor-self-p target-self-p) "自己")
+                  (target-self-p "你")
+                  (t (qq-state--present-string
+                      (alist-get 'target-name data))))))
+    (cons actor target)))
+
 (defun qq-state-poke-message-p (message)
   "Return non-nil when MESSAGE is a typed Poke GrayTip service row."
   (and (qq-state-poke-message-data message) t))
@@ -1072,15 +1094,13 @@ reply chrome elsewhere).  Media becomes short placeholders like
           ("xml" "[xml]")
           ("gray-tip"
            (if (equal (alist-get 'kind data) "poke")
-               (let ((actor
-                      (qq-state--present-string (alist-get 'actor-name data)))
-                     (action
-                      (qq-state--present-string (alist-get 'action data)))
-                     (target
-                      (qq-state--present-string
-                       (alist-get 'target-name data)))
-                     (detail
-                      (qq-state--present-string (alist-get 'detail data))))
+               (let* ((names (qq-state--poke-display-names data))
+                      (actor (car names))
+                      (action
+                       (qq-state--present-string (alist-get 'action data)))
+                      (target (cdr names))
+                      (detail
+                       (qq-state--present-string (alist-get 'detail data))))
                  (or (and actor action target
                           (concat actor " " action " " target detail))
                      (and actor action (concat actor " " action detail))

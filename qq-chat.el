@@ -3594,10 +3594,11 @@ horizontal bars and keep the time at the far right.  QQ's native descriptive
 tail stays on that same row; truncate the action before allowing it to collide
 with the timestamp."
   (let* ((data (or (qq-state-poke-message-data message) '()))
-         (actor (or (qq-chat--present-string (alist-get 'actor-name data))
+         (names (qq-state--poke-display-names data))
+         (actor (or (car names)
                     (qq-chat--present-string (alist-get 'sender-name message))
                     "某人"))
-         (target (qq-chat--present-string (alist-get 'target-name data)))
+         (target (cdr names))
          (action (or (qq-chat--present-string (alist-get 'action data))
                      "戳了戳"))
          (detail (qq-chat--present-string (alist-get 'detail data)))
@@ -3616,9 +3617,9 @@ with the timestamp."
           (max 1 (- (qq-chat--line-fill-column) time-width 12)))
          (content
           (truncate-string-to-width
-           (concat image " "
+           (concat actor " " image " "
                    (string-join
-                    (delq nil (list actor action target detail))
+                    (delq nil (list action target detail))
                     " "))
            max-content-width nil nil "…"))
          (core (concat "( " content " )"))
