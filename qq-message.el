@@ -1264,9 +1264,13 @@ History responses never advance it; only `message.received' events do."
         (qq-runtime-with-account owner
           (pcase event
             ("message.received"
-             (qq-message--project-message data))
+             (when-let* ((merged (qq-message--project-message data)))
+               (qq-state--bump-recent-session
+                (alist-get 'session-key merged))))
             ("dataline.message_received"
-             (qq-message--project-dataline-message data))
+             (when-let* ((merged (qq-message--project-dataline-message data)))
+               (qq-state--bump-recent-session
+                (alist-get 'session-key merged))))
             ("message.recalled"
              (qq-message--project-recall data))
             ("message.locally_deleted"

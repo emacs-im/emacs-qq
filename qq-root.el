@@ -246,9 +246,12 @@ Render `?' instead of a partial number when COUNT is nil."
 
 (defun qq-root--session-context-label (session)
   "Return one-line context label for SESSION."
-  (or (alist-get 'title session)
-      (alist-get 'key session)
-      "session"))
+  (let ((label (or (alist-get 'title session)
+                   (alist-get 'key session)
+                   "session")))
+    (if (eq (alist-get 'pinned session) t)
+        (concat "\N{PUSHPIN} " label)
+      label)))
 
 (defun qq-root--session-muted-p (session)
   "Return non-nil when SESSION has QQ message notifications muted."
@@ -972,7 +975,8 @@ pixel-valued alignment follows text scaling."
           :structure t
           :entry (and session-key
                       (qq-root--session-entry-key session-key))))
-        ((or 'reset 'sessions-refreshed 'friends-refreshed 'groups-refreshed)
+        ((or 'reset 'sessions-refreshed 'friends-refreshed 'groups-refreshed
+             'recent-order)
          (qq-root--queue-invalidation :account-id owner :structure t))))))
 
 (defun qq-root--handle-login-change ()
