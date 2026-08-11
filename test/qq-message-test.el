@@ -1519,6 +1519,20 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
       (should (equal (alist-get 'essence-operator-id message) "10002"))
       (should (= (hash-table-count qq-message--pending-essences) 0)))))
 
+(ert-deftest qq-message-received-event-bumps-active-session-in-recent ()
+  (qq-message-test-with-state
+   (let ((key-set (make-hash-table :test #'equal)))
+     (dolist (key '("group:20001" "private:10001"))
+       (puthash key t key-set))
+     (setq qq-state--recent-session-keys '("group:20001" "private:10001")
+           qq-state--recent-session-key-set key-set))
+   (qq-message--handle-event
+    "message.received"
+    (qq-message-test-event :message-id "7348923749823749825"))
+   ;; Live activity reorders the recent projection immediately.
+   (should (equal (qq-state-recent-session-keys)
+                  '("private:10001" "group:20001")))))
+
 (ert-deftest qq-message-direct-private-recall-marks-exact-message ()
   (qq-message-test-with-state
     (qq-message--handle-event

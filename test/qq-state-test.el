@@ -566,6 +566,55 @@
      (setcar copy "changed")
      (should (equal (qq-state-recent-session-keys) '("group:20001"))))))
 
+(ert-deftest qq-state-bump-recent-moves-active-session-above-non-pinned ()
+  (qq-test-with-reset
+   (qq-state-apply-recent-conversations
+    (list (qq-state-test--native-recent-entry
+           :message (qq-state-test--native-recent-message
+                     :session-key "group:20001" :peer-name "Pinned Group")
+           :pinned-known-p t :pinned t)
+          (qq-state-test--native-recent-entry
+           :message (qq-state-test--native-recent-message
+                     :session-key "group:20002" :peer-name "Group Two"))
+          (qq-state-test--native-recent-entry
+           :message (qq-state-test--native-recent-message
+                     :session-key "group:20003" :peer-name "Group Three")))
+    1)
+   (should (equal (qq-state-recent-session-keys)
+                  '("group:20001" "group:20002" "group:20003")))
+   ;; Activity on the last row moves it above the first non-pinned row.
+   (qq-state--bump-recent-session "group:20003")
+   (should (equal (qq-state-recent-session-keys)
+                  '("group:20001" "group:20003" "group:20002")))
+   ;; Pinned sessions never move on activity.
+   (qq-state--bump-recent-session "group:20001")
+   (should (equal (qq-state-recent-session-keys)
+                  '("group:20001" "group:20003" "group:20002")))
+   ;; An already-leading row publishes no reorder.
+   (let ((emitted 0))
+     (cl-letf (((symbol-function 'qq-state--emit)
+                (lambda (&rest _) (cl-incf emitted))))
+       (qq-state--bump-recent-session "group:20003")
+       (should (= emitted 0))))))
+
+(ert-deftest qq-state-bump-recent-inserts-unknown-session-and-skips-empty ()
+  (qq-test-with-reset
+   ;; An empty projection has no baseline until a native snapshot arrives.
+   (let ((emitted 0))
+     (cl-letf (((symbol-function 'qq-state--emit)
+                (lambda (&rest _) (cl-incf emitted))))
+       (qq-state--bump-recent-session "group:20002")
+       (should (= emitted 0))))
+   (qq-state-apply-recent-conversations
+    (list (qq-state-test--native-recent-entry
+           :message (qq-state-test--native-recent-message
+                     :session-key "group:20001")))
+    1)
+   ;; A session absent from the recent projection still enters at the head.
+   (qq-state--bump-recent-session "group:20002")
+   (should (equal (qq-state-recent-session-keys)
+                  '("group:20002" "group:20001")))))
+
 (ert-deftest qq-state-native-recent-page-is-atomic-before-first-commit ()
   (qq-test-with-reset
    (qq-state-upsert-session

@@ -3373,6 +3373,40 @@ message observed later keeps ownership of a newer root summary."
                     :source 'response)
     (qq-state-sessions)))
 
+(defun qq-state--bump-recent-session (session-key)
+  "Move SESSION-KEY to the head of the non-pinned recent region.
+
+Live message activity reorders the recent projection immediately so the root
+list follows active conversations without waiting for a native snapshot.
+Pinned sessions keep their leading region and never move on activity; the
+first non-pinned row is the insertion point.  A later native recent snapshot
+remains authoritative and may restore server order.  Publish one
+`recent-order' notification only when the order actually changed, and skip
+an empty projection until a native snapshot establishes the baseline."
+  (let* ((keys qq-state--recent-session-keys)
+         (session (qq-state-session session-key)))
+    (when (and keys (not (eq (alist-get 'pinned session) t)))
+      (let* ((without
+              (cl-remove session-key (copy-sequence keys) :test #'equal))
+             (insert-index
+              (or (cl-position-if
+                   (lambda (key)
+                     (not (eq (alist-get 'pinned (qq-state-session key)) t)))
+                   without)
+                  (length without)))
+             (ordered
+              (append (seq-take without insert-index)
+                      (list session-key)
+                      (seq-drop without insert-index))))
+        (unless (equal ordered keys)
+          (let ((key-set (make-hash-table :test #'equal)))
+            (dolist (key ordered)
+              (puthash key t key-set))
+            (setq qq-state--recent-session-keys ordered
+                  qq-state--recent-session-key-set key-set))
+          (qq-state--emit 'recent-order :count (length ordered)
+                          :source 'activity))))))
+
 (defun qq-state--recent-contact-title (contact session-key)
   "Return display title for recent CONTACT in SESSION-KEY."
   (let ((peer-name (alist-get 'peerName contact))
