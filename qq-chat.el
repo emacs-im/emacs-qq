@@ -3144,11 +3144,11 @@ Never dump OneBot CQ / raw_message here — previews come from
       "")))
 
 (defun qq-chat--insert-date-separator-row (day-label)
-  "Insert a telega-style centered date-break row for DAY-LABEL."
-  (let* ((body (format "--(%s)--" day-label))
+  "Insert a disco-style centered date-break row for DAY-LABEL."
+  (let* ((body (format "──(%s)──" day-label))
          (padding
           (max 0 (/ (- (qq-chat--line-fill-column) (string-width body)) 2)))
-         (bars (make-string padding ?-)))
+         (bars (make-string padding ?─)))
     (appkit-view-insert-note-line
      (concat bars body bars)
      :face 'qq-msg-date-separator)))
@@ -3647,7 +3647,7 @@ with the timestamp."
                        time-width
                        8))
          (bar-count (max 0 (floor (/ (max 0 available) 2))))
-         (bars (make-string bar-count ?-))
+         (bars (make-string bar-count ?─))
          (start (point))
          (poke-properties (append properties (list 'face 'qq-msg-poke))))
     (insert bars " " core " " bars)

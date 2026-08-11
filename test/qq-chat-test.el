@@ -234,7 +234,7 @@
     (let ((qq-chat--fill-column 32))
       (qq-chat--insert-date-separator-row "11 August 2026 Tue"))
     (should (equal (buffer-string)
-                   "------(11 August 2026 Tue)------\n"))
+                   "──────(11 August 2026 Tue)──────\n"))
     (should (eq (get-text-property (point-min) 'face)
                 'qq-msg-date-separator))))
 
