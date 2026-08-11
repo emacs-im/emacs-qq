@@ -5096,7 +5096,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
           (qq-chat--insert-poke-message message nil)
           (should (string-match-p
                    (regexp-quote
-                    "( ✦ Alice 喷了喷 Bob 的加分喷雾，分数++ )")
+                    "( Alice ✦ 喷了喷 Bob 的加分喷雾，分数++ )")
                    (buffer-string)))
           (should (string-match-p "00:00" (buffer-string)))
           (should (= (count-lines (point-min) (point-max)) 1))
@@ -5108,6 +5108,71 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
                                             'display)
                          '(space :align-to 75)))
           (should (eq (get-text-property 2 'face) 'qq-msg-poke)))))))
+
+(ert-deftest qq-chat-self-poke-renders-you-and-self ()
+  "A self-initiated self-targeted poke reads as `你 … 自己' like the mobile
+client, never as a doubled display name."
+  (let ((message
+         '((server-id . "poke-2")
+           (time . 1710000002)
+           (sender-id . "90001")
+           (sender-name . "Self")
+           (target-id . "90001")
+           (timeline-class . service)
+           (segments
+            . (((type . "gray-tip")
+                (data .
+                 ((kind . "poke")
+                  (actor-id . "90001")
+                  (target-id . "90001")
+                  (actor-name . "Self")
+                  (target-name . "Self")
+                  (image-url . "https://example.com/poke.png")
+                  (action . "捏了捏")
+                  (detail)))))))))
+    (with-temp-buffer
+      (let ((inhibit-read-only t)
+            (fill-column 80)
+            (qq-state--self-info
+             '((user_id . "90001") (nickname . "Self"))))
+        (cl-letf (((symbol-function 'qq-media-url-preview-display-string)
+                   (lambda (&rest _args) "✦")))
+          (qq-chat--insert-poke-message message nil)
+          (should (string-match-p
+                   (regexp-quote "( 你 ✦ 捏了捏 自己 )")
+                   (buffer-string))))))))
+
+(ert-deftest qq-chat-poke-targeting-self-renders-you ()
+  "A poke aimed at the current account names the target `你'."
+  (let ((message
+         '((server-id . "poke-3")
+           (time . 1710000003)
+           (sender-id . "10001")
+           (sender-name . "Alice")
+           (target-id . "90001")
+           (timeline-class . service)
+           (segments
+            . (((type . "gray-tip")
+                (data .
+                 ((kind . "poke")
+                  (actor-id . "10001")
+                  (target-id . "90001")
+                  (actor-name . "Alice")
+                  (target-name . "Self")
+                  (image-url . "https://example.com/poke.png")
+                  (action . "捏了捏")
+                  (detail)))))))))
+    (with-temp-buffer
+      (let ((inhibit-read-only t)
+            (fill-column 80)
+            (qq-state--self-info
+             '((user_id . "90001") (nickname . "Self"))))
+        (cl-letf (((symbol-function 'qq-media-url-preview-display-string)
+                   (lambda (&rest _args) "✦")))
+          (qq-chat--insert-poke-message message nil)
+          (should (string-match-p
+                   (regexp-quote "( Alice ✦ 捏了捏 你 )")
+                   (buffer-string))))))))
 
 (ert-deftest qq-chat-renders-json-gray-tip-as-system-divider ()
   (qq-chat-test-with-reset

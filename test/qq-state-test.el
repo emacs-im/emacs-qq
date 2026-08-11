@@ -1767,6 +1767,53 @@
                     "Henrik Lissner: Re: Doom Emacs"))
      (should-not (alist-get 'unread-count session)))))
 
+(ert-deftest qq-state-gray-tip-user-name-resolves-wire-and-local-names ()
+  "Treat a UIN-filled wire name as missing, but preserve a real wire name."
+  (qq-test-with-reset
+   (puthash "30001" '((remark . "阿飞") (nickname . "fei"))
+            qq-state--friends-by-id)
+   (puthash "30003" '((remark . "备注") (nickname . "nick"))
+            qq-state--friends-by-id)
+   (should (equal (qq-state--gray-tip-user-name "30001" "30001")
+                  "阿飞"))
+   (should (equal (qq-state--gray-tip-user-name "30003" "小伍")
+                  "小伍"))))
+
+(ert-deftest qq-state-gray-tip-user-name-falls-back-to-observed-sender ()
+  "A non-friend poke actor resolves through the observed sender map, then
+falls back to its UIN when no local name is known."
+  (qq-test-with-reset
+   (puthash "30002" "老白" qq-state--known-user-names)
+   (should (equal (qq-state--gray-tip-user-name "30002" "30002")
+                  "老白"))
+   (should (equal (qq-state--gray-tip-user-name "8888888888" nil)
+                  "8888888888"))))
+
+(ert-deftest qq-state-normalize-raw-message-learns-observed-sender-name ()
+  "Ordinary group messages teach the local UIN to display-name map used by
+GrayTip pokes whose wire name parameters are raw UINs."
+  (qq-test-with-reset
+   (qq-state-merge-live-message
+    '((post_type . "message")
+      (message_type . "group")
+      (chat_type . 2)
+      (peer_uin . "40001")
+      (message_id . "144115188100000001")
+      (group_id . 40001)
+      (user_id . 30001)
+      (time . 1786174322)
+      (sender . ((user_id . 30001)
+                 (card . "阿飞")
+                 (nickname . "fei")))
+      (raw_message . "hello")
+      (message . (((type . "text") (data . ((text . "hello"))))))))
+   (should
+    (equal (gethash "30001" qq-state--known-user-names)
+           "阿飞"))
+   (should
+    (equal (qq-state--gray-tip-user-name "30001" "30001")
+           "阿飞"))))
+
 (ert-deftest qq-state-mail-segment-preview-prefers-protocol-prompt ()
   (should
    (equal
@@ -1787,20 +1834,6 @@
                  (prompt . "[分享]Article"))))))
     "[分享]Article")))
 
-(ert-deftest qq-state-poke-segment-preview-names-the-actor ()
-  "Root previews must name the poke initiator; a bare action-plus-target
-sentence leaves the actor unreadable in the recent list."
-  (should
-   (equal
-    (qq-state-message-preview-from-segments
-     '(((type . "gray-tip")
-        (data . ((kind . "poke")
-                 (actor-name . "WD")
-                 (target-name . "WD")
-                 (action . "捏了捏")
-                 (detail))))))
-    "WD 捏了捏 WD")))
-
 (ert-deftest qq-state-poke-segment-preview-falls-back-without-actor ()
   "A producer that omits the actor name must not crash; the sentence keeps
 its action and target, and a lone target still reads as a poke."
@@ -1809,16 +1842,57 @@ its action and target, and a lone target still reads as a poke."
     (qq-state-message-preview-from-segments
      '(((type . "gray-tip")
         (data . ((kind . "poke")
-                 (target-name . "WD")
+                 (target-name . "Self")
                  (action . "捏了捏"))))))
-    "捏了捏 WD"))
+    "捏了捏 Self"))
   (should
    (equal
     (qq-state-message-preview-from-segments
      '(((type . "gray-tip")
         (data . ((kind . "poke")
-                 (target-name . "WD"))))))
-    "戳了戳 WD")))
+                 (target-name . "Self"))))))
+    "戳了戳 Self")))
+
+(ert-deftest qq-state-poke-preview-uses-mobile-self-wording ()
+  "Root previews share the mobile-style `你/自己' wording with the chat
+buffer instead of doubling the display name."
+  (let ((qq-state--self-info '((user_id . "90001") (nickname . "Me"))))
+    (should
+     (equal
+      (qq-state-message-preview-from-segments
+       '(((type . "gray-tip")
+          (data . ((kind . "poke")
+                   (actor-id . "90001")
+                   (target-id . "90001")
+                   (actor-name . "Me")
+                   (target-name . "Me")
+                   (action . "捏了捏")
+                   (detail))))))
+      "你 捏了捏 自己"))
+    (should
+     (equal
+      (qq-state-message-preview-from-segments
+       '(((type . "gray-tip")
+          (data . ((kind . "poke")
+                   (actor-id . "30001")
+                   (target-id . "90001")
+                   (actor-name . "阿飞")
+                   (target-name . "Me")
+                   (action . "捏了捏")
+                   (detail))))))
+      "阿飞 捏了捏 你"))
+    (should
+     (equal
+      (qq-state-message-preview-from-segments
+       '(((type . "gray-tip")
+          (data . ((kind . "poke")
+                   (actor-id . "90001")
+                   (target-id . "30002")
+                   (actor-name . "Me")
+                   (target-name . "老白")
+                   (action . "拍了拍")
+                   (detail))))))
+      "你 拍了拍 老白"))))
 
 (ert-deftest qq-state-live-message-ignores-empty-group-card-when-choosing-sender-name ()
   (qq-test-with-reset
