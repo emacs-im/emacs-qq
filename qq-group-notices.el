@@ -11,13 +11,9 @@
 
 (require 'button)
 (require 'cl-lib)
-(require 'ewoc)
-(require 'subr-x)
 (require 'appkit-core)
-(require 'appkit-ewoc)
 (require 'appkit-invalidation)
-(require 'appkit-position)
-(require 'appkit-transaction)
+(require 'appkit-projection)
 (require 'appkit-view)
 (require 'qq-api)
 (require 'qq-runtime)
@@ -30,8 +26,8 @@
   :group 'qq)
 
 (cl-defstruct (qq-group-notices--entry
+               (:include appkit-projection-row)
                (:constructor qq-group-notices--entry-create))
-  key
   type
   object
   index
@@ -40,11 +36,6 @@
 (defconst qq-group-notices--view-id 'group-notices
   "Appkit identity of the singleton group-notices view.")
 
-(defvar-local qq-group-notices--ewoc nil
-  "Persistent keyed EWOC used by the announcement view.")
-
-(defvar-local qq-group-notices--node-table nil
-  "Stable announcement key to EWOC node table.")
 
 (defvar-local qq-group-notices--group-id nil
   "Group whose announcements are displayed in this buffer.")
@@ -235,9 +226,8 @@ the stopped account."
                 qq-group-notices--loading nil
                 qq-group-notices--error nil
                 qq-group-notices--request nil
-                qq-group-notices--request-owner nil
-                qq-group-notices--ewoc nil
-                qq-group-notices--node-table nil)
+                qq-group-notices--request-owner nil)
+          (setf (appkit-view-engine view) nil)
           (let ((inhibit-read-only t))
             (widen)
             (erase-buffer)
@@ -300,25 +290,17 @@ the stopped account."
                  (appkit-invalidations-parts invalidations)
                  (appkit-invalidations-entry-keys invalidations)
                  (appkit-invalidations-position-p invalidations)))
-    (let ((snapshot
-           (with-current-buffer (appkit-view-buffer view)
-             (appkit-position-capture
-              :anchor-property 'qq-group-notice-key
-              :preserve-window-start t))))
-      (appkit-with-content-update view
-        (unless qq-group-notices--ewoc
-          (erase-buffer)
-          (setq qq-group-notices--ewoc
-                (ewoc-create #'qq-group-notices--ewoc-printer nil nil t)))
-        (setq qq-group-notices--node-table
-              (appkit-ewoc-reconcile
-               qq-group-notices--ewoc
-               (qq-group-notices--project-entries)
-               #'qq-group-notices--entry-key
-               :force-keys (appkit-invalidations-entry-keys invalidations)))
-        (force-mode-line-update)
-        (when snapshot
-          (appkit-position-restore snapshot))))))
+    (with-current-buffer (appkit-view-buffer view)
+      (appkit-projection-ensure
+       view
+       :printer #'qq-group-notices--ewoc-printer
+       :anchor-property 'qq-group-notice-key
+       :no-separator-p t)
+      (appkit-projection-sync
+       view
+       (qq-group-notices--project-entries)
+       :force-keys (appkit-invalidations-entry-keys invalidations))
+      (force-mode-line-update))))
 
 (defun qq-group-notices--request-current-p (view buffer group-id owner)
   "Return non-nil when VIEW and OWNER still load GROUP-ID in BUFFER."
@@ -420,8 +402,6 @@ the stopped account."
   (setq-local truncate-lines nil)
   (setq-local switch-to-buffer-preserve-window-point nil)
   (setq-local header-line-format '(:eval (qq-group-notices--header-line)))
-  (setq-local qq-group-notices--ewoc nil)
-  (setq-local qq-group-notices--node-table nil)
   (add-hook 'change-major-mode-hook #'qq-group-notices--cancel-request nil t)
   (add-hook 'kill-buffer-hook #'qq-group-notices--cancel-request nil t))
 
