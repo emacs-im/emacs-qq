@@ -88,6 +88,9 @@ BODY may refer to the lexical variable `view'."
           qq-group-notices--items (copy-tree qq-group-notices-test--items))
     (qq-group-notices-test--sync view)
     (let ((text (buffer-string)))
+      (should (equal '(note . instructions)
+                     (get-text-property (point-min)
+                                        'qq-group-notice-key)))
       (should (string-match-p "Maintenance" text))
       (should (string-match-p "read-only tonight" text))
       (should (string-match-p "10001" text))
@@ -115,7 +118,7 @@ BODY may refer to the lexical variable `view'."
     (setq qq-group-notices--items (copy-tree qq-group-notices-test--items))
     (qq-group-notices-test--sync view)
     (let* ((key '(notice "20001" "notice-one"))
-           (node (gethash key qq-group-notices--node-table))
+           (node (appkit-projection-node view key))
            success)
       (should node)
       (cl-letf (((symbol-function 'qq-api-get-group-notices)
@@ -141,7 +144,7 @@ BODY may refer to the lexical variable `view'."
                    (lambda ()
                      (ert-fail "incremental notice sync erased the buffer"))))
           (appkit-sync-invalidations view))
-        (should (eq node (gethash key qq-group-notices--node-table)))
+        (should (eq node (appkit-projection-node view key)))
         (should (string-match-p "Updated announcement text"
                                 (buffer-string)))))))
 
@@ -150,7 +153,7 @@ BODY may refer to the lexical variable `view'."
     (setq qq-group-notices--items (copy-tree qq-group-notices-test--items))
     (qq-group-notices-test--sync view)
     (let* ((first-key '(notice "20001" "notice-one"))
-           (first-node (gethash first-key qq-group-notices--node-table))
+           (first-node (appkit-projection-node view first-key))
            (second-items (copy-tree qq-group-notices-test--items)))
       (should first-node)
       (setf (alist-get 'title (car second-items)) "Other group notice")
@@ -158,11 +161,11 @@ BODY may refer to the lexical variable `view'."
             qq-group-notices--items second-items)
       (qq-group-notices-test--sync view)
       (let ((second-node
-             (gethash '(notice "20002" "notice-one")
-                      qq-group-notices--node-table)))
+             (appkit-projection-node
+              view '(notice "20002" "notice-one"))))
         (should second-node)
         (should-not (eq first-node second-node))
-        (should-not (gethash first-key qq-group-notices--node-table))
+        (should-not (appkit-projection-node view first-key))
         (should (string-match-p "Other group notice" (buffer-string)))))))
 
 (ert-deftest qq-group-notices-stale-errback-is-silent-and-inert ()
