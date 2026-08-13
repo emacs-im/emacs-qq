@@ -233,6 +233,13 @@ pushes left optimistic sends stuck without a snowflake."
                   (url . ,(alist-get 'url payload))
                   (width . ,(alist-get 'width payload))
                   (height . ,(alist-get 'height payload))))))
+      ("legacy_image"
+       `((type . "image")
+         (data . ((summary . ,(alist-get 'summary payload))
+                  (url . ,(alist-get 'url payload))
+                  (width . ,(alist-get 'width payload))
+                  (height . ,(alist-get 'height payload))
+                  (md5 . ,(alist-get 'md5 payload))))))
       ("reply"
        `((type . "reply")
          (data . ,(qq-state--native-reply-data

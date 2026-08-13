@@ -1361,6 +1361,24 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
          (internal (qq-message--segment-to-internal record)))
     (should (equal (alist-get 'media_id (alist-get 'data internal)) media-id))))
 
+(ert-deftest qq-message-projects-legacy-image-as-url-image ()
+  (let* ((record `((kind . "legacy_image")
+                   (payload . ((md5 . "0123456789abcdeffedcba9876543210")
+                               (url . "https://gchat.qpic.cn/gchatpic_new/group/0/abc/0")
+                               (width . 320)
+                               (height . 240)
+                               (summary . "[动画表情]")))))
+         (internal (qq-message--segment-to-internal record))
+         (data (alist-get 'data internal)))
+    (should (equal (alist-get 'type internal) "image"))
+    (should (equal (alist-get 'url data)
+                   "https://gchat.qpic.cn/gchatpic_new/group/0/abc/0"))
+    (should (equal (alist-get 'summary data) "[动画表情]"))
+    (should (equal (alist-get 'md5 data)
+                   "0123456789abcdeffedcba9876543210"))
+    (should (= (alist-get 'width data) 320))
+    (should (= (alist-get 'height data) 240))))
+
 (ert-deftest qq-message-projects-private-peer-by-self-endpoint ()
   (qq-message-test-with-state
     (qq-message--handle-event
