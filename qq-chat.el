@@ -173,9 +173,6 @@ into canonical state.")
 (defvar qq-chat-group-messages-timespan 300
   "Maximum time gap in seconds used for compact message grouping.")
 
-(defvar-local qq-chat--fill-column nil
-  "Cached telega-style timeline width for the active chat window.")
-
 (defconst qq-chat--empty-placeholder :qq-chat-empty-placeholder
   "Sentinel EWOC payload used for the empty timeline note.")
 
@@ -593,38 +590,9 @@ of the default chrome."
       (format-time-string "%H:%M" (seconds-to-time timestamp))
     ""))
 
-(defun qq-chat--render-window ()
-  "Return the best live window currently displaying this chat buffer."
-  (or (and (eq (window-buffer (selected-window)) (current-buffer))
-           (selected-window))
-      (let ((best nil)
-            (best-width -1))
-        (dolist (win (get-buffer-window-list (current-buffer) nil t) best)
-          (let ((width (if (window-live-p win)
-                           (window-width win 'remap)
-                         -1)))
-            (when (> width best-width)
-              (setq best win
-                    best-width width)))))))
-
-(defun qq-chat--compute-fill-column (&optional window)
-  "Compute telega-style timeline width for WINDOW."
-  (appkit-view-window-fill-column
-   (or window (qq-chat--render-window))
-   qq-chat-auto-fill-margin-columns))
-
-(defun qq-chat--update-fill-column (&optional window)
-  "Refresh and return the cached timeline width for WINDOW."
-  (when-let* ((width (qq-chat--compute-fill-column window)))
-    (setq-local qq-chat--fill-column width)
-    width))
-
 (defun qq-chat--line-fill-column ()
   "Return the usable timeline width for the current chat buffer."
-  (or (and (integerp qq-chat--fill-column)
-           (> qq-chat--fill-column 0)
-           qq-chat--fill-column)
-      (qq-chat--update-fill-column)
+  (or (appkit-view-responsive-width qq-chat-auto-fill-margin-columns)
       (and (integerp fill-column) (> fill-column 0) fill-column)
       80))
 
@@ -1931,7 +1899,7 @@ actions are shown on the footer delimiter line above the composer."
 
 (defun qq-chat--history-delimiter-line ()
   "Return a telega-style delimiter reflecting the current history edge."
-  (let ((width (max 8 (or qq-chat--fill-column 60))))
+  (let ((width (max 8 (qq-chat--line-fill-column))))
     (if-let* ((status (qq-chat--msg-filter-status)))
         (let* ((label
                 (truncate-string-to-width
@@ -2370,11 +2338,10 @@ projection.  A replacement or detached view is inert."
           (and filter-point-owner
                (qq-chat--filter-point-state-current-p filter-point-owner))))
     (when geometry-p
-      (when-let* ((window (qq-chat--render-window))
-                  (next (qq-chat--compute-fill-column window))
-                  (_ (and (integerp next) (> next 15))))
-        (setq-local qq-chat--fill-column next
-                    fill-column next)))
+      (when-let* ((next
+                   (appkit-view-responsive-width
+                    qq-chat-auto-fill-margin-columns)))
+        (setq-local fill-column next)))
     (dolist (event events)
       (when (appkit-view-live-p view)
         (qq-chat--apply-state-event event)))
@@ -2485,27 +2452,30 @@ projection.  A replacement or detached view is inert."
           (qq-runtime-account-sync-function
            owner #'qq-chat--sync-invalidations))
          (id (qq-chat--view-id))
-         (current (appkit-current-view)))
-    (cond
-     ((and (appkit-view-live-p current)
-           (eq app (appkit-view-app current))
-           (equal id (appkit-view-id current)))
-      (setf (appkit-view-state current) qq-chat--session-key
-            (appkit-view-sync-function current)
-            sync-function
-            (appkit-view-parts current)
-            '(frame timeline composer geometry))
-      current)
-     ((appkit-view-live-p current)
-      (error "qq: chat buffer belongs to a different appkit view"))
-     (t
-      (appkit-attach-view
-       :app app
-       :id id
-       :state qq-chat--session-key
-       :mode 'qq-chat-mode
-       :sync-function sync-function
-       :parts '(frame timeline composer geometry))))))
+         (current (appkit-current-view))
+         (view
+          (cond
+           ((and (appkit-view-live-p current)
+                 (eq app (appkit-view-app current))
+                 (equal id (appkit-view-id current)))
+            (setf (appkit-view-state current) qq-chat--session-key
+                  (appkit-view-sync-function current)
+                  sync-function
+                  (appkit-view-parts current)
+                  '(frame timeline composer geometry))
+            current)
+           ((appkit-view-live-p current)
+            (error "qq: chat buffer belongs to a different appkit view"))
+           (t
+            (appkit-attach-view
+             :app app
+             :id id
+             :state qq-chat--session-key
+             :mode 'qq-chat-mode
+             :sync-function sync-function
+             :parts '(frame timeline composer geometry))))))
+    (appkit-view-enable-responsive-geometry view)
+    view))
 
 (defun qq-chat--header-line-update ()
   "Update chat header line and buffer name."
@@ -2549,31 +2519,6 @@ projection.  A replacement or detached view is inert."
         (setq state (plist-put state :aux-msg message))
         (appkit-chatbuf-aux-set state)))
     (qq-chat--update-frame)))
-
-(cl-defun qq-chat-sync-timeline-geometry (&key reset force)
-  "Synchronize shared QQ timeline geometry in the current buffer.
-
-RESET forces an authoritative geometry sync even when the cached width still
-matches.  FORCE refreshes projected rows at the same character width, which is
-required after text scaling because pixel-aligned avatars can still change."
-  (when-let* ((view (qq-chat--live-current-view)))
-    (let* ((window (qq-chat--render-window))
-           (next (and window (qq-chat--compute-fill-column window)))
-           (valid (and (integerp next) (> next 15)))
-           (changed (and valid (not (equal next qq-chat--fill-column)))))
-      (when (or reset changed force)
-        (appkit-request-sync view :part 'geometry :position t))
-      (and valid next))))
-
-(defun qq-chat--on-window-size-change (&optional _frame)
-  "Recompute chat width and refresh rows after window resizing."
-  (when (eq major-mode 'qq-chat-mode)
-    (qq-chat-sync-timeline-geometry)))
-
-(defun qq-chat--on-text-scale-change ()
-  "Recompute pixel alignment after `text-scale-mode' changes."
-  (when (eq major-mode 'qq-chat-mode)
-    (qq-chat-sync-timeline-geometry :reset t :force t)))
 
 (defun qq-chat--request-row-redisplay (anchors)
   "Redisplay projected ANCHORS, deferring while a region is active."
@@ -6367,7 +6312,6 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (setq-local qq-chat--forward-plan-owner (list 'forward-plan-owner))
   (setq-local qq-chat--last-read-target-row-key nil)
   (setq-local qq-chat--guild-read-request-p nil)
-  (setq-local qq-chat--fill-column nil)
   (setq-local appkit-media-card-fallback-context-function
               #'qq-chat--media-card-fallback-context)
   (qq-chat--reset-history-state)
@@ -6384,11 +6328,6 @@ Attach from clipboard with `C-c C-v' (telega-style)."
                (qq-chat--yank-media mime-type data nil))))
   (add-hook 'post-command-hook #'qq-chat--post-command t t)
   (add-hook 'window-scroll-functions #'qq-chat--window-scroll nil t)
-  (add-hook 'window-size-change-functions
-            #'qq-chat--on-window-size-change nil t)
-  (add-hook 'display-line-numbers-mode-hook
-            #'qq-chat--on-window-size-change nil t)
-  (add-hook 'text-scale-mode-hook #'qq-chat--on-text-scale-change nil t)
   (add-hook 'kill-buffer-hook #'qq-chat--cancel-search-request nil t)
   (add-hook 'kill-buffer-hook #'qq-chat--cancel-filter-request nil t)
   (add-hook 'kill-buffer-hook #'qq-chat--cancel-open-message-request nil t)
@@ -6775,7 +6714,7 @@ Emacs integer arithmetic is arbitrary precision, so this never rounds them."
           (qq-chat--load-initial-history buffer session-key))
         (pop-to-buffer buffer)
         (with-current-buffer buffer
-          (qq-chat--on-window-size-change))))))
+          (appkit-view-refresh-responsive-geometry))))))
 
 (defun qq-chat--finish-open-message (target query)
   "Jump to loaded TARGET and highlight its actual text matching QUERY."
@@ -6843,7 +6782,7 @@ search-result jump cannot race a latest/read-position request."
       (setq qq-chat--pending-jump-id message-id))
     (pop-to-buffer buffer)
     (with-current-buffer buffer
-      (qq-chat--on-window-size-change)
+      (appkit-view-refresh-responsive-geometry)
       (unless (and (qq-chat--history-window-known-p)
                    (qq-chat--finish-open-message message-id query))
         (let* ((view (qq-chat--live-current-view))

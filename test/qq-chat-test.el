@@ -231,7 +231,7 @@
 
 (ert-deftest qq-chat-date-break-row-uses-telega-style-chrome ()
   (with-temp-buffer
-    (let ((qq-chat--fill-column 32))
+    (let ((fill-column 32))
       (qq-chat--insert-date-separator-row "11 August 2026 Tue"))
     (should (equal (buffer-string)
                    "──────(11 August 2026 Tue)──────\n"))
@@ -1756,7 +1756,8 @@
                   (lambda (_session-key) buffer))
                  ((symbol-function 'pop-to-buffer)
                   (lambda (&rest _args) buffer))
-                 ((symbol-function 'qq-chat--on-window-size-change) #'ignore)
+                 ((symbol-function 'appkit-view-refresh-responsive-geometry)
+                  #'ignore)
                  ((symbol-function 'qq-chat--goto-loaded-message)
                   (lambda (&rest _args) nil))
                  ((symbol-function 'qq-core-fetch-history-around)
@@ -1803,7 +1804,7 @@
                         (lambda (_session) buffer))
                        ((symbol-function 'qq-api-cancel-request)
                         (lambda (token) (push token canceled)))
-                       ((symbol-function 'qq-chat--on-window-size-change)
+                       ((symbol-function 'appkit-view-refresh-responsive-geometry)
                         #'ignore)
                        ((symbol-function 'qq-chat--goto-loaded-message)
                         (lambda (&rest _) nil))
@@ -1848,7 +1849,8 @@
                     (lambda (_session-key) buffer))
                    ((symbol-function 'pop-to-buffer)
                     (lambda (&rest _args) buffer))
-                   ((symbol-function 'qq-chat--on-window-size-change) #'ignore)
+                   ((symbol-function 'appkit-view-refresh-responsive-geometry)
+                    #'ignore)
                    ((symbol-function 'qq-chat--finish-open-message)
                     (lambda (&rest _args)
                       (setq fast-path-called t)
@@ -5411,23 +5413,26 @@ client, never as a doubled display name."
     (should (plist-get properties 'read-only))
     (should-not (plist-member properties 'mouse-face))))
 
-(ert-deftest qq-chat-window-resize-refreshes-layout-only-when-width-changes ()
+(ert-deftest qq-chat-appkit-responsive-geometry-refreshes-layout ()
   (qq-chat-test-with-reset
    (with-temp-buffer
      (qq-chat-mode)
+     (should (= line-spacing 0))
      (setq qq-chat--session-key "private:10001"
-           qq-chat--fill-column 70)
-     (let ((view (qq-chat--ensure-view))
-           (win (selected-window))
+           fill-column 70)
+     (let ((qq-chat-auto-fill-margin-columns 0)
+           (width 70)
            (real-request-sync (symbol-function 'appkit-request-sync))
-           calls
+           view calls
            (timeline-syncs 0)
            (frame-syncs 0))
-       (cl-letf (((symbol-function 'qq-chat--render-window) (lambda () win))
-                 ((symbol-function 'qq-chat--compute-fill-column)
-                  (lambda (&optional candidate)
-                    (should (eq candidate win))
-                    90))
+       (cl-letf (((symbol-function 'appkit-view-display-window)
+                  (lambda (&optional _buffer) (selected-window)))
+                 ((symbol-function 'appkit-view-window-fill-column)
+                  (lambda (candidate &optional margin)
+                    (should (eq candidate (selected-window)))
+                    (should-not margin)
+                    width))
                  ((symbol-function 'appkit-request-sync)
                   (lambda (candidate &rest options)
                     (push (cons candidate options) calls)
@@ -5437,73 +5442,29 @@ client, never as a doubled display name."
                   (lambda (&rest _) (cl-incf timeline-syncs)))
                  ((symbol-function 'qq-chat--update-frame)
                   (lambda () (cl-incf frame-syncs))))
-         (qq-chat--on-window-size-change)
-         ;; Hooks only request work; geometry state belongs to the view sync.
-         (should (= qq-chat--fill-column 70))
+         (setq view (qq-chat--ensure-view))
+         (should
+          (memq #'appkit-view--on-window-geometry-change
+                window-size-change-functions))
+         (setq width 90)
+         (run-hook-with-args
+          'window-size-change-functions (selected-window))
          (should
           (equal calls (list (list view :part 'geometry :position t))))
          (qq-chat-test-sync-invalidations)
-         (should (= qq-chat--fill-column 90))
          (should (= fill-column 90))
          (should (= timeline-syncs 1))
          (should (= frame-syncs 1))
          (setq calls nil)
-         (qq-chat--on-window-size-change)
-         (should-not calls))))))
-
-(ert-deftest qq-chat-text-scale-refreshes-pixel-alignment-at-same-width ()
-  (qq-chat-test-with-reset
-   (with-temp-buffer
-     (qq-chat-mode)
-     (should (= line-spacing 0))
-     (setq qq-chat--session-key "private:10001"
-           qq-chat--fill-column 90)
-     (let ((view (qq-chat--ensure-view))
-           (win (selected-window))
-           (real-request-sync (symbol-function 'appkit-request-sync))
-           calls
-           (timeline-syncs 0))
-       (cl-letf (((symbol-function 'qq-chat--render-window) (lambda () win))
-                 ((symbol-function 'qq-chat--compute-fill-column)
-                  (lambda (&optional candidate)
-                    (should (eq candidate win))
-                    90))
-                 ((symbol-function 'appkit-request-sync)
-                  (lambda (candidate &rest options)
-                    (push (cons candidate options) calls)
-                    (apply real-request-sync candidate
-                           (append options '(:delay 60)))))
-                 ((symbol-function 'qq-chat--sync-timeline)
-                  (lambda (&rest _) (cl-incf timeline-syncs)))
-                 ((symbol-function 'qq-chat--update-frame) #'ignore))
-         (qq-chat--on-text-scale-change)
+         (run-hook-with-args
+          'window-size-change-functions (selected-window))
+         (should-not calls)
+         (run-hooks 'text-scale-mode-hook)
          (should
           (equal calls (list (list view :part 'geometry :position t))))
-         (should (= timeline-syncs 0))
          (qq-chat-test-sync-invalidations)
-         (should (= qq-chat--fill-column 90))
-         (should (= timeline-syncs 1)))))))
-
-(ert-deftest qq-chat-geometry-hooks-ignore-detached-orphan-buffer ()
-  (qq-chat-test-with-reset
-   (with-temp-buffer
-     (qq-chat-mode)
-     (setq qq-chat--session-key "private:10001")
-     (appkit-kill-view (qq-chat--ensure-view))
-     (let ((measurements 0))
-       (cl-letf (((symbol-function 'qq-chat--render-window)
-                  (lambda () (cl-incf measurements)))
-                 ((symbol-function 'qq-chat--compute-fill-column)
-                  (lambda (&optional _window) (cl-incf measurements)))
-                 ((symbol-function 'appkit-request-sync)
-                  (lambda (&rest _)
-                    (ert-fail "detached chat requested geometry sync")))
-                 ((symbol-function 'qq-chat--sync-timeline)
-                  (lambda (&rest _)
-                    (ert-fail "detached chat projected geometry"))))
-         (qq-chat--on-window-size-change)
-         (qq-chat--on-text-scale-change))
-       (should (= measurements 0))))))
+         (should (= timeline-syncs 2))
+         (should (= frame-syncs 2)))))))
 
 (ert-deftest qq-chat-history-window-slice-honors-exact-first-and-last ()
   (with-temp-buffer
@@ -5531,7 +5492,7 @@ client, never as a doubled display name."
   (with-temp-buffer
     (qq-chat-mode)
     (setq qq-chat--session-key "group:20001")
-    (setq qq-chat--fill-column 24)
+    (setq fill-column 24)
     (qq-chat--set-history-window "m10" "m20")
     (let ((footer (qq-chat--footer-text)))
       (should (string-match-p "····" footer))

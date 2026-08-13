@@ -28,6 +28,7 @@
 (require 'appkit-invalidation)
 (require 'appkit-chat-timeline)
 (require 'appkit-ui)
+(require 'appkit-view)
 
 (declare-function qq-core-get-forward
                   "qq-core" (resource-id scene callback &optional errback))
@@ -53,8 +54,6 @@
                   "qq-chat" (message &rest keys))
 (declare-function qq-chat-insert-message-heading
                   "qq-chat" (message properties layout &rest keys))
-(declare-function qq-chat--compute-fill-column
-                  "qq-chat" (&optional window))
 (declare-function qq-message--segment-to-internal
                   "qq-message" (segment))
 
@@ -881,30 +880,33 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
           (qq-runtime-account-sync-function
            owner #'qq-forward--sync-invalidations))
          (id (qq-forward--view-id qq-forward--buffer-key))
-         (current (appkit-current-view)))
-    (cond
-     ((and (appkit-view-live-p current)
-           (eq app (appkit-view-app current))
-           (equal id (appkit-view-id current)))
-      (setf (appkit-view-state current) qq-forward--buffer-key
-            (appkit-view-sync-function current)
-            sync-function
-            (appkit-view-parts current) '(timeline geometry))
-      current)
-     ((appkit-view-live-p current)
-      (error "qq: forward buffer belongs to a different appkit view"))
-     (t
-      (let ((view
-             (appkit-attach-view
-              :app app
-              :id id
-              :state qq-forward--buffer-key
-              :mode 'qq-forward-mode
-              :sync-function sync-function
-              :parts '(timeline geometry))))
-        (qq-runtime-bind-account owner)
-        (qq-forward--setup-view view)
-        view)))))
+         (current (appkit-current-view))
+         (view
+          (cond
+           ((and (appkit-view-live-p current)
+                 (eq app (appkit-view-app current))
+                 (equal id (appkit-view-id current)))
+            (setf (appkit-view-state current) qq-forward--buffer-key
+                  (appkit-view-sync-function current)
+                  sync-function
+                  (appkit-view-parts current) '(timeline geometry))
+            current)
+           ((appkit-view-live-p current)
+            (error "qq: forward buffer belongs to a different appkit view"))
+           (t
+            (let ((attached
+                   (appkit-attach-view
+                    :app app
+                    :id id
+                    :state qq-forward--buffer-key
+                    :mode 'qq-forward-mode
+                    :sync-function sync-function
+                    :parts '(timeline geometry))))
+              (qq-runtime-bind-account owner)
+              (qq-forward--setup-view attached)
+              attached)))))
+    (appkit-view-enable-responsive-geometry view)
+    view))
 
 (defun qq-forward--ensure-timeline ()
   "Ensure the current forward view owns one projected appkit timeline."
@@ -932,10 +934,10 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
          (entries (appkit-invalidations-entry-keys invalidations)))
     (when (appkit-view-live-p view)
       (when geometry-p
-        (when-let* ((next (qq-chat--compute-fill-column))
-                    (_ (and (integerp next) (> next 15))))
-          (setq-local qq-chat--fill-column next
-                      fill-column next)))
+        (when-let* ((next
+                     (appkit-view-responsive-width
+                      qq-chat-auto-fill-margin-columns)))
+          (setq-local fill-column next)))
       (when (or resources
                 entries
                 (appkit-invalidations-structure-p invalidations)
@@ -1132,38 +1134,10 @@ records issue a fresh `emacs_get_forward' request."
     map)
   "Keymap for `qq-forward-mode'.")
 
-(defun qq-forward--request-geometry-sync (&optional force)
-  "Request a position-preserving geometry sync for the live forward view.
-
-When FORCE is non-nil, request projection even if the measured character
-width is unchanged so pixel-aligned media follows text scaling."
-  (when-let* ((view (qq-forward--live-current-view)))
-    (let ((next (qq-chat--compute-fill-column)))
-      (when (or force
-                (and (integerp next)
-                     (> next 15)
-                     (not (equal next qq-chat--fill-column))))
-        (appkit-request-sync view :part 'geometry :position t)
-        view))))
-
-(defun qq-forward--on-window-size-change (&optional _frame)
-  "Queue shared chat row geometry after this forward window resizes."
-  (qq-forward--request-geometry-sync))
-
-(defun qq-forward--on-text-scale-change ()
-  "Queue shared chat row geometry after text scaling changes."
-  (qq-forward--request-geometry-sync t))
-
 (define-derived-mode qq-forward-mode special-mode "QQ-Forward"
   "Major mode for one QQ merged-forward message tree."
   (setq-local truncate-lines nil
-              line-spacing 0
-              qq-chat--fill-column nil)
-  (add-hook 'window-size-change-functions
-            #'qq-forward--on-window-size-change nil t)
-  (add-hook 'display-line-numbers-mode-hook
-            #'qq-forward--on-window-size-change nil t)
-  (add-hook 'text-scale-mode-hook #'qq-forward--on-text-scale-change nil t)
+              line-spacing 0)
   (add-hook 'kill-buffer-hook #'qq-forward--cancel-request nil t)
   (add-hook 'change-major-mode-hook #'qq-forward--cancel-request nil t)
   (setq-local header-line-format
@@ -1245,7 +1219,7 @@ width is unchanged so pixel-aligned media follows text scaling."
       (appkit-sync-invalidations view))
     (pop-to-buffer buffer)
     (with-current-buffer buffer
-      (qq-forward--on-window-size-change))
+      (appkit-view-refresh-responsive-geometry))
     (unless existing
       ;; Consume geometry measured only after the buffer has a real window.
       ;; The earlier sync guarantees that replacement data was removed before
