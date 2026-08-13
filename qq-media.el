@@ -1926,6 +1926,58 @@ lifecycle-own an external video player."
      ((qq-media--absolute-local-file-present-p preview-file) preview-file)
      (t nil))))
 
+(defun qq-media--segment-media-id (segment)
+  "Return SEGMENT's opaque native media ID, or nil."
+  (or (qq-media--native-record-media-id segment)
+      (qq-media--native-image-media-id segment)
+      (qq-media--native-video-media-id segment)
+      (qq-media--native-file-media-id segment)))
+
+(defun qq-media-segment-cancel-transfer (segment)
+  "Cancel SEGMENT's in-flight download or native materialization."
+  (let* ((state (qq-media-segment-download-state segment))
+         (transfer (plist-get state :transfer))
+         (media-id (qq-media--segment-media-id segment)))
+    (cond
+     ((appkit-media-transfer-p transfer)
+      (appkit-media-cancel-transfer transfer))
+     (media-id
+      (qq-remote-media-cancel media-id))
+     (t
+      (user-error "qq: no media transfer is in progress")))))
+
+(defun qq-media-segment-transfer (segment)
+  "Return Appkit transfer control spec for SEGMENT, or nil.
+
+Native materialization exposes `bytes_done' and `bytes_total'.  HTTP
+downloads are shown without a byte count until the transport reports one."
+  (let* ((download (qq-media-segment-download-state segment))
+         (download-status (plist-get download :status))
+         (media-id (qq-media--segment-media-id segment))
+         (content (and media-id
+                       (qq-remote-media-part
+                        (qq-remote-media media-id) 'content)))
+         (phase (alist-get 'phase content))
+         (cancel (lambda ()
+                   (qq-media-segment-cancel-transfer segment))))
+    (cond
+     ((eq download-status 'downloading)
+      (list :direction 'download
+            :state 'active
+            :action cancel
+            :action-label "Cancel"
+            :help-echo "Cancel this download"))
+     ((equal phase "materializing")
+      (list :direction 'download
+            :state 'active
+            :bytes-done (alist-get 'bytes_done content)
+            :bytes-total (or (alist-get 'bytes_total content)
+                             (alist-get 'expected_size content))
+            :action cancel
+            :action-label "Cancel"
+            :help-echo "Cancel this transfer"))
+     (t nil))))
+
 (cl-defun qq-media-segment-start-download
     (segment &optional open-after &key owner)
   "Download SEGMENT into `qq-media-download-directory'.

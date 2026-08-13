@@ -3859,7 +3859,8 @@ a replacement app instance."
                      (appkit-view-app view)))
          (capabilities (or capabilities
                            (qq-media-segment-capabilities segment)))
-         (url (plist-get capabilities :remote-url)))
+         (url (plist-get capabilities :remote-url))
+         (transfer (qq-media-segment-transfer segment)))
     (appkit-media-card-context-create
      :payload segment
      :kind (qq-chat--segment-media-card-kind segment)
@@ -3871,6 +3872,7 @@ a replacement app instance."
                         (lambda ()
                           (qq-media-segment-start-download
                            segment nil :owner owner)))
+     :cancel-action (plist-get transfer :action)
      :save-as-action (when (plist-get capabilities :save)
                        (lambda ()
                          (qq-media-segment-save-as segment)))
@@ -3908,6 +3910,7 @@ a replacement app instance."
   (let* ((kind-label (qq-chat--segment-media-kind-label segment))
          (meta (qq-chat--segment-media-meta-line segment))
          (capabilities (qq-media-segment-capabilities segment))
+         (transfer (qq-media-segment-transfer segment))
          (context (qq-chat--segment-media-card-context
                    segment capabilities))
          (native-record-p (and (qq-media--native-record-media-id segment) t))
@@ -3918,8 +3921,9 @@ a replacement app instance."
      :title (qq-chat--segment-media-summary segment)
      :details (unless (or native-record-p (string-empty-p meta))
                 (list meta))
-     :status (unless native-record-p
+     :status (unless (or native-record-p transfer)
                (plist-get capabilities :status))
+     :transfer (unless native-record-p transfer)
      :prefix prefix-state
      :title-face 'bold
      :meta-face 'shadow
@@ -3937,11 +3941,17 @@ a replacement app instance."
             :state (plist-get control :state)
             :duration-seconds (plist-get control :duration-seconds)
             :played-seconds (plist-get control :played-seconds)
-            :status-text (plist-get control :status-text)
+            :status-text (unless transfer
+                           (plist-get control :status-text))
             :prefix card-prefix-state
             :face 'shadow
             :action (plist-get context :open-action)
-            :help-echo "Play, pause, or replay this voice note")))
+            :help-echo "Play, pause, or replay this voice note")
+           (when transfer
+             (apply #'appkit-chat-ins-insert-transfer
+                    :prefix card-prefix-state
+                    :face 'shadow
+                    transfer))))
         ((qq-media-segment-preview-capable-p segment)
          (let ((preview-start (point))
                (preview (qq-media-segment-preview-image segment))
