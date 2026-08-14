@@ -4386,17 +4386,21 @@ content."
       (qq-chat--message-sender-name message)))
 
 (defun qq-chat--message-title-face (message)
-  "Return sender title face for MESSAGE.
+  "Return the identity-colored sender title face for MESSAGE.
 
-The current account retains its QQ-specific face.  Other senders combine the
-QQ base face with Appkit's deterministic identity-keyed color."
-  (if (alist-get 'self-p message)
-      'qq-msg-self-title
-    (if-let* ((color-face
-               (appkit-name-color-face
-                (qq-chat--message-sender-color-key message))))
-        (list color-face 'qq-msg-user-title)
-      'qq-msg-user-title)))
+Every ordinary sender uses Appkit's deterministic identity color.  The current
+account additionally keeps QQ's self-title emphasis."
+  (let ((color-face
+         (appkit-name-color-face
+          (qq-chat--message-sender-color-key message))))
+    (cond
+     ((alist-get 'self-p message)
+      (if color-face
+          (list color-face 'qq-msg-self-title)
+        'qq-msg-self-title))
+     (color-face
+      (list color-face 'qq-msg-user-title))
+     (t 'qq-msg-user-title))))
 
 (defun qq-chat--message-avatar-prefixes (message)
   "Return shared telega-style two-line avatar prefixes for MESSAGE."

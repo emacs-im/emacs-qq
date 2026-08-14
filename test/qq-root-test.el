@@ -325,9 +325,10 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                     (last-message-preview . "hello"))))
     (should (equal "hello" (qq-root--session-preview-text incoming)))
     (should (equal "Me: hello" (qq-root--session-preview-text outgoing)))
-    (should (eq 'qq-msg-self-title
-                (appkit-ui-one-line-preview-label-face
-                 (qq-root--session-preview-model outgoing))))))
+    (should
+     (equal (list (appkit-name-color-face "Me") 'qq-msg-self-title)
+            (appkit-ui-one-line-preview-label-face
+             (qq-root--session-preview-model outgoing))))))
 
 (ert-deftest qq-root-service-and-dataline-previews-omit-sender ()
   (dolist (type '(service dataline))
