@@ -782,7 +782,14 @@ command owns presentation."
     (alist-get 'id (alist-get 'data segment))))
 
 (defun qq-completion-read-reaction ()
-  "Read and return one normalized QQ face or Unicode reaction."
+  "Read and return one normalized QQ face or Unicode reaction.
+
+Use a static completion collection with explicit substring matching.  The
+generic Appkit candidate table supports aliases, but some minibuffer frontends
+retain that table's entire candidate stream while merely moving point to the
+first textual match.  A reaction picker has self-searchable labels, so letting
+Emacs filter the static labels guarantees that typed input actually narrows the
+visible set."
   (let* ((unicode-candidates
           (seq-filter
            (lambda (candidate)
@@ -791,23 +798,46 @@ command owns presentation."
                     (emoji (plist-get value :emoji)))
                (and (stringp emoji) (= (length emoji) 1))))
            (appkit-chat-emoji-candidates)))
-         (candidate
-          (appkit-chat-completion-read
-           "Reaction: "
-           (append (qq-completion--base-face-candidates)
-                   unicode-candidates)
-           :history 'qq-completion--reaction-history))
-         (value (appkit-chat-completion-candidate-value candidate)))
-    (pcase (plist-get value :kind)
-      ('base-face
-       (let* ((segment (plist-get value :segment))
-              (id (alist-get 'id (alist-get 'data segment))))
-         `((emoji-id . ,id) (emoji-type . "1"))))
-      ('unicode-emoji
-       (let ((emoji (plist-get value :emoji)))
-         `((emoji-id . ,(number-to-string (aref emoji 0)))
-           (emoji-type . "2"))))
-      (_ (error "qq: reaction picker returned an unsupported candidate")))))
+         (candidates
+          (append (qq-completion--base-face-candidates)
+                  unicode-candidates))
+         (candidate-map (make-hash-table :test #'equal))
+         labels)
+    (dolist (candidate candidates)
+      (let ((label
+             (appkit-chat-completion-candidate-label candidate)))
+        (when (gethash label candidate-map)
+          (error "qq: duplicate reaction completion label: %s" label))
+        (puthash label candidate candidate-map)
+        (push label labels)))
+    (setq labels (nreverse labels))
+    (let* ((completion-ignore-case t)
+           (completion-styles '(substring basic))
+           (completion-extra-properties
+            `(:affixation-function
+              ,(lambda (visible-labels)
+                 (appkit-chat-completion-affixation
+                  visible-labels candidate-map))))
+           (choice
+            (completing-read
+             "Reaction: " labels nil t nil
+             'qq-completion--reaction-history))
+           (candidate (gethash choice candidate-map))
+           (value
+            (and candidate
+                 (appkit-chat-completion-candidate-value candidate))))
+      (unless candidate
+        (user-error "Unknown reaction completion candidate: %s" choice))
+      (pcase (plist-get value :kind)
+        ('base-face
+         (let* ((segment (plist-get value :segment))
+                (id (alist-get 'id (alist-get 'data segment))))
+           `((emoji-id . ,id) (emoji-type . "1"))))
+        ('unicode-emoji
+         (let ((emoji (plist-get value :emoji)))
+           `((emoji-id . ,(number-to-string (aref emoji 0)))
+             (emoji-type . "2"))))
+        (_ (error "qq: reaction picker returned an unsupported candidate"))))))
 
 (defun qq-completion-read-custom-face (faces)
   "Read and return one favorite face from FACES."
