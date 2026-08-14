@@ -838,6 +838,34 @@
     (should-not (equal (qq-media-segment-preview-key first)
                        (qq-media-segment-preview-key second)))))
 
+(ert-deftest qq-media-message-one-line-preview-projects-primary-segment ()
+  (let* ((segment
+          '((type . "image")
+            (data . ((file . "cached-image.png")))))
+         (message `((segments . (,segment))))
+         (image '(image :type png :data "bytes")))
+    (cl-letf (((symbol-function
+                'qq-media-segment-one-line-preview-image)
+               (lambda (candidate)
+                 (should (equal candidate segment))
+                 image)))
+      (let ((preview
+             (qq-media-message-one-line-preview message "[image]")))
+        (should (equal "[image]"
+                       (appkit-ui-one-line-preview-text preview)))
+        (should (= qq-media-one-line-preview-columns
+                   (appkit-ui-one-line-preview-visual-columns preview)))
+        (let ((display
+               (get-text-property
+                0 'display (appkit-ui-one-line-preview-visual preview))))
+          (should (eq 'slice (caar display)))
+          (should
+           (equal "bytes"
+                  (plist-get (cdr (cadr display)) :data))))
+        (should
+         (equal (list (qq-media-segment-preview-key segment))
+                (qq-media-message-one-line-preview-keys message)))))))
+
 (ert-deftest qq-media-segment-preview-image-uses-local-file-without-api ()
   (qq-media-test-with-reset
    (let* ((local-file (make-temp-file "qq-preview" nil ".png"))
@@ -1032,21 +1060,21 @@
                       (setq captured arguments)
                       (funcall (plist-get arguments :callback)
                                image "/tmp/preview.gif")))
-                     ((symbol-function 'qq-media--note-cache-updated)
-                      (lambda (media-key) (setq updated media-key)))
-                     ((symbol-function 'appkit-media-video-preview-display-image)
-                      (lambda (candidate &optional _namespace) candidate))
-                     ((symbol-function 'image-size)
-                      (lambda (&rest _args) '(16 . 16))))
-             (qq-media-segment-preview-image segment)
-             (should (equal (plist-get captured :key) (concat "qq:" key)))
-             (should (equal (plist-get captured :source) source))
-             (should (equal (plist-get captured :source-size) "2048"))
-             (should (= (plist-get captured :duration) 4.5))
-             (should (eq image (gethash key qq-media--image-cache)))
-             (should-not (gethash key qq-media--fetching-cache))
-             (should (eq image (qq-media-segment-preview-image segment)))
-             (should (equal updated key)))
+                   ((symbol-function 'qq-media--note-cache-updated)
+                    (lambda (media-key) (setq updated media-key)))
+                   ((symbol-function 'appkit-media-video-preview-display-image)
+                    (lambda (candidate &optional _namespace) candidate))
+                   ((symbol-function 'image-size)
+                    (lambda (&rest _args) '(16 . 16))))
+           (qq-media-segment-preview-image segment)
+           (should (equal (plist-get captured :key) (concat "qq:" key)))
+           (should (equal (plist-get captured :source) source))
+           (should (equal (plist-get captured :source-size) "2048"))
+           (should (= (plist-get captured :duration) 4.5))
+           (should (eq image (gethash key qq-media--image-cache)))
+           (should-not (gethash key qq-media--fetching-cache))
+           (should (eq image (qq-media-segment-preview-image segment)))
+           (should (equal updated key)))
        (when (file-exists-p source) (delete-file source))
        (when (file-directory-p qq-media-cache-directory)
          (delete-directory qq-media-cache-directory t))))))
@@ -1554,7 +1582,7 @@
                               (name . "report.pdf")))))
           (capabilities
            `(:download t
-             :download-state (:status not-downloaded :path ,path))))
+		       :download-state (:status not-downloaded :path ,path))))
      (cl-letf (((symbol-function 'qq-media-segment-capabilities)
                 (lambda (_segment) capabilities))
                ((symbol-function 'qq-media-resolve-segment-resource)
@@ -1580,7 +1608,7 @@
                               (name . "report.pdf")))))
           (capabilities
            `(:download t
-             :download-state (:status not-downloaded :path ,path))))
+		       :download-state (:status not-downloaded :path ,path))))
      (cl-letf (((symbol-function 'qq-media-segment-capabilities)
                 (lambda (_segment) capabilities))
                ((symbol-function 'qq-media-resolve-segment-resource)
@@ -1636,7 +1664,7 @@
         (should (equal (plist-get caps :status)
                        "Preparing 4096/8192 bytes"))
         (dolist (key '(:download :save :copy-url :local-file
-                       :resolve-remote :remote-url))
+				 :resolve-remote :remote-url))
           (should-not (plist-get caps key)))
         (should (equal (qq-media--segment-resource-key segment)
                        (concat "record:" media-id))))
@@ -1956,10 +1984,10 @@
                   ((symbol-function 'qq-remote-media-prepare-record-playback)
                    (lambda (called-media-id _callback &optional _errback)
                      (setq operation
-                            (qq-remote-media-operation-create
-                             :active-p t
-                             :media-id called-media-id
-                             :account-id account-id))))
+                           (qq-remote-media-operation-create
+                            :active-p t
+                            :media-id called-media-id
+                            :account-id account-id))))
                   ((symbol-function 'qq-media--notify-native-record-state)
                    #'ignore))
           (qq-media-play-native-record segment :owner owner)

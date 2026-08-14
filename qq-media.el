@@ -14,6 +14,8 @@
 (require 'seq)
 (require 'subr-x)
 (require 'appkit-media)
+(require 'appkit-media-image)
+(require 'appkit-ui)
 (require 'qq-account)
 (require 'qq-api)
 (require 'qq-customize)
@@ -922,26 +924,26 @@ only a client-owned stable file.  ERRBACK receives failures."
                            (closed nil))
                       (cl-labels
                           ((close-access
-                            ()
-                            (unless closed
-                              (setq closed t)
-                              (qq-media--close-local-access access-id)))
+                             ()
+                             (unless closed
+                               (setq closed t)
+                               (qq-media--close-local-access access-id)))
                            (finish
-                            (file)
-                            (close-access)
-                            (let ((resource
-                                   `((file . ,file)
-                                     (name . ,(file-name-nondirectory file))
-                                     ,@(when animated-p
-                                         '((animated . t))))))
-                              (if animated-p
-                                  (qq-media--prepare-animated-face-resource
-                                   resource callback)
-                                (funcall callback resource))))
+                             (file)
+                             (close-access)
+                             (let ((resource
+                                    `((file . ,file)
+                                      (name . ,(file-name-nondirectory file))
+                                      ,@(when animated-p
+                                          '((animated . t))))))
+                               (if animated-p
+                                   (qq-media--prepare-animated-face-resource
+                                    resource callback)
+                                 (funcall callback resource))))
                            (fail-copy
-                            (reason)
-                            (close-access)
-                            (funcall error-fn nil reason)))
+                             (reason)
+                             (close-access)
+                             (funcall error-fn nil reason)))
                         (condition-case copy-error
                             (appkit-media-cache-image-resource-async
                              `((file . ,path))
@@ -964,7 +966,7 @@ only a client-owned stable file.  ERRBACK receives failures."
          nil)))))
 
 (defun qq-media--fetch-native-image-resource
-  (segment key callback errback)
+    (segment key callback errback)
   "Materialize native image SEGMENT into KEY.
 
 Call CALLBACK with the persistent resource; call ERRBACK on failure."
@@ -973,7 +975,7 @@ Call CALLBACK with the persistent resource; call ERRBACK on failure."
    key callback errback))
 
 (defun qq-media--fetch-native-video-thumbnail-resource
-  (segment key callback errback)
+    (segment key callback errback)
   "Materialize native video SEGMENT thumbnail into KEY.
 
 Call CALLBACK with the persistent resource; call ERRBACK on failure."
@@ -996,23 +998,23 @@ Call CALLBACK with the persistent resource; call ERRBACK on failure."
                          (closed nil))
                     (cl-labels
                         ((close-access
-                          ()
-                          (unless closed
-                            (setq closed t)
-                            (qq-media--close-local-access access-id)))
+                           ()
+                           (unless closed
+                             (setq closed t)
+                             (qq-media--close-local-access access-id)))
                          (finish
-                          (file)
-                          (close-access)
-                          (funcall
-                           callback
-                           `((file . ,file)
-                             (name . ,(file-name-nondirectory file))
-                             ,@(when mime-type
-                                 `((mime-type . ,mime-type))))))
+                           (file)
+                           (close-access)
+                           (funcall
+                            callback
+                            `((file . ,file)
+                              (name . ,(file-name-nondirectory file))
+                              ,@(when mime-type
+                                  `((mime-type . ,mime-type))))))
                          (fail-copy
-                          (reason)
-                          (close-access)
-                          (funcall error-fn nil reason)))
+                           (reason)
+                           (close-access)
+                           (funcall error-fn nil reason)))
                       (condition-case copy-error
                           (appkit-media-copy-or-download-resource-async
                            `((file . ,path)) target #'finish #'fail-copy)
@@ -1030,7 +1032,7 @@ Call CALLBACK with the persistent resource; call ERRBACK on failure."
        nil))))
 
 (defun qq-media--fetch-native-video-resource
-  (segment key callback errback)
+    (segment key callback errback)
   "Materialize native video SEGMENT content into KEY."
   (if-let* ((media-id (qq-media--native-video-media-id segment)))
       (qq-media--materialize-native-content-to-cache
@@ -1593,8 +1595,8 @@ retired."
          (emoji-id (alist-get 'id data)))
     (pcase type
       ("image" (or (and image-media-id
-                         (qq-media--native-image-key image-media-id))
-                    (and file-key (format "image:%s" file-key))
+                        (qq-media--native-image-key image-media-id))
+                   (and file-key (format "image:%s" file-key))
                    (and (appkit-media-url-present-p url) (format "image-url:%s" url))))
       ("video"
        (or (and video-media-id
@@ -1609,7 +1611,7 @@ retired."
            (and file-key (format "%s:%s" type file-key))
            (and (appkit-media-url-present-p url) (format "%s-url:%s" type url))))
       ("record" (or (and record-media-id
-                          (qq-media--native-record-key record-media-id))
+                         (qq-media--native-record-key record-media-id))
                     (and file-key (format "record:%s" file-key))))
       ("face" (and emoji-id (format "face:%s" emoji-id)))
       ("mface" (or (and file-key (format "mface:%s" file-key))
@@ -2201,11 +2203,11 @@ an owned media resource alist; ERRBACK follows the native RPC convention."
      :callback
      (lambda (resource)
        (qq-runtime-with-account owner
-         (qq-account--invoke callback resource)))
+				(qq-account--invoke callback resource)))
      :errback
      (lambda (body reason)
        (qq-runtime-with-account owner
-         (qq-account--invoke errback body reason))))))
+				(qq-account--invoke errback body reason))))))
 
 (defun qq-media--fetch-native-user-avatar-locator
     (user-id callback &optional errback)
@@ -3001,9 +3003,9 @@ Preview failures are soft (no NapCat error spam)."
           (or (appkit-media-video-preview-display-image image 'qq)
               image)))
        ((qq-media-videoish-segment-p segment)
-          (when-let* ((image (qq-media--video-segment-preview-image segment key)))
-            (or (appkit-media-video-preview-display-image image 'qq)
-                image)))
+        (when-let* ((image (qq-media--video-segment-preview-image segment key)))
+          (or (appkit-media-video-preview-display-image image 'qq)
+              image)))
        (t
         (when (or local (appkit-media-url-present-p url))
           (qq-media--cache-resource
@@ -3020,25 +3022,80 @@ Preview failures are soft (no NapCat error spam)."
                   segment key done error)))
              #'qq-media--preview-image-from-file)
           (qq-media--ensure-resource-image
-             key
-             (lambda (done error)
-               (if (qq-media-segment-preview-capable-p segment)
-                   (qq-media--resolve-fileish-segment
-                    segment
-                    "get_image"
-                    done
-                    ;; Soft-fail: clear fetching without user-error / NapCat spam.
-                    (lambda (_response _reason)
-                      (funcall error nil "preview image not found"))
-                    "preview image not found")
-                 (funcall done nil)))
-             nil
-             #'qq-media--preview-image-from-file)))))))
+           key
+           (lambda (done error)
+             (if (qq-media-segment-preview-capable-p segment)
+                 (qq-media--resolve-fileish-segment
+                  segment
+                  "get_image"
+                  done
+                  ;; Soft-fail: clear fetching without user-error / NapCat spam.
+                  (lambda (_response _reason)
+                    (funcall error nil "preview image not found"))
+                  "preview image not found")
+               (funcall done nil)))
+           nil
+           #'qq-media--preview-image-from-file)))))))
 
 (defun qq-media-segment-preview-fetching-p (segment)
   "Return non-nil when preview fetch for SEGMENT is currently active."
   (when-let* ((key (qq-media-segment-preview-key segment)))
     (qq-media--resource-fetching-p key)))
+
+(defun qq-media-message-primary-preview-segment (message)
+  "Return MESSAGE's first segment capable of a visual preview."
+  (let ((segments (and (listp message) (alist-get 'segments message))))
+    (seq-find
+     #'qq-media-segment-preview-capable-p
+     (if (vectorp segments) (append segments nil) segments))))
+
+(defun qq-media--preview-image-source-file (image)
+  "Return local source file carried by IMAGE, or nil."
+  (when (and (consp image) (eq (car image) 'image))
+    (let ((file (plist-get (cdr image) :file)))
+      (and (appkit-media-file-present-p file) file))))
+
+(defun qq-media-segment-one-line-preview-image (segment)
+  "Return a one-line image for SEGMENT, scheduling acquisition when cold."
+  (when-let* ((key (qq-media-segment-preview-key segment)))
+    (let* ((preview-image (qq-media-segment-preview-image segment))
+           (resource (qq-media--cached-resource key))
+           (file
+            (or (qq-media--segment-existing-path segment)
+                (and resource
+                     (qq-media--resource-image-file key resource))
+                (qq-media--remote-image-cache-existing-file key resource)
+                (qq-media--preview-image-source-file preview-image))))
+      (when file
+        (appkit-media-one-line-preview-image-from-file
+         file
+         (* (max 1 qq-media-one-line-preview-columns)
+            (max 1 (frame-char-width))))))))
+
+(cl-defun qq-media-message-one-line-preview
+    (message text &key label separator label-face)
+  "Return an Appkit one-line preview for MESSAGE and visible TEXT."
+  (let* ((segment (qq-media-message-primary-preview-segment message))
+         (image
+          (and segment
+               (qq-media-segment-one-line-preview-image segment)))
+         (visual
+          (and image
+               (appkit-media-one-line-image-display-string image "▧"))))
+    (appkit-ui-one-line-preview-create
+     :text text
+     :label label
+     :separator separator
+     :visual visual
+     :visual-columns
+     (and visual (max 1 qq-media-one-line-preview-columns))
+     :label-face label-face)))
+
+(defun qq-media-message-one-line-preview-keys (message)
+  "Return media keys that can change MESSAGE's one-line preview."
+  (when-let* ((segment (qq-media-message-primary-preview-segment message))
+              (key (qq-media-segment-preview-key segment)))
+    (list key)))
 
 (provide 'qq-media)
 

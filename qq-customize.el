@@ -503,6 +503,11 @@ fallbacks and previews when the face image is not yet available."
   :type 'integer
   :group 'qq)
 
+(defcustom qq-media-one-line-preview-columns 2
+  "Columns reserved for compact message media previews."
+  :type 'integer
+  :group 'qq)
+
 (defcustom qq-media-download-directory
   (locate-user-emacs-file "qq-downloads/")
   "Directory used for QQ media downloads copied from NapCat resources."

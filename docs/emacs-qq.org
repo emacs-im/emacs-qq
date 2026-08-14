@@ -225,6 +225,11 @@ WebSocket 端口可访问、认证文件权限正确且 token 完全一致。进
 主界面显示最近会话、最后活动摘要、时间、未读数、提及及输入状态。最近会话顺序以
 Linux QQ 返回的结果为准，不在客户端中重新按名称排序。
 
+最后消息含图片、mface、图片文件或视频缩略图时，主界面会在文本摘要前显示一行高的
+缓存预览。媒体仍由 QQ 客户端缓存和失效机制管理；缓存尚未就绪、图形显示不可用或
+消息对象不在本地时继续显示 segment-first 文本摘要，不会显示 CQ、~raw-message~ 或
+内部消息 ID。
+
 ** 主界面按键（Emacs state）
 
 - Key: ~RET~ (~qq-root-open-at-point~) :: 打开光标处会话。
@@ -349,6 +354,9 @@ Linux QQ 返回的结果为准，不在客户端中重新按名称排序。
 回复预览和搜索结果使用服务器消息 ID 定位。跳到尚未载入的回复目标时，客户端会向
 fork 请求目标附近的一页历史，而不是从当前最旧消息盲目逐页扫描。每次跳转都把原
 位置压入消息 pop ring；按 ~x~ 或 ~M-g x~ 返回。
+
+回复输入区上方使用同一套单行媒体预览。图片缓存完成后只刷新对应回复卡片；关闭按钮
+仍是独立 action，图片本身不会获得取消回复动作。
 
 ~qq-auto-mark-read~ 默认为非空。光标在时间线上时，读位置跟随确切消息；光标在输入区
 时，读位置采用当前最新已载入消息。若希望只手动标记，可以把该选项设为 ~nil~，再用
@@ -621,6 +629,7 @@ state 和输入区边界共同决定。
 - ~qq-media-animated-face-image-height~：动画表情显示高度；
 - ~qq-media-preview-image-height~：媒体预览最大高度；
 - ~qq-media-preview-image-max-width~：媒体预览最大宽度；
+- ~qq-media-one-line-preview-columns~：主界面和回复卡片媒体前缀预留列数；
 - ~qq-media-download-directory~：用户主动下载的默认目录；
 - ~qq-media-cache-directory~：临时媒体缓存目录；
 - ~qq-media-default-emoji-directory~：QQ 内置表情资源目录；

@@ -57,13 +57,13 @@
 
 (defface qq-contacts-navigation-button
   '((t :inherit mode-line-inactive :weight semi-bold
-       :box (:line-width -1 :style released-button)))
+     :box (:line-width -1 :style released-button)))
   "Face for inactive directory navigation buttons."
   :group 'qq-contacts)
 
 (defface qq-contacts-navigation-button-selected
   '((t :inherit mode-line-emphasis :weight bold
-       :box (:line-width -1 :style pressed-button)))
+     :box (:line-width -1 :style pressed-button)))
   "Face for the selected directory navigation button."
   :group 'qq-contacts)
 
@@ -488,9 +488,7 @@
       :icon-inserter (lambda ()
                        (insert
                         (qq-media-avatar-cached-display-string user-id)))
-      :context (qq-contacts--friend-name friend)
-      :preview (qq-contacts--friend-preview friend)
-      :line-properties
+      :context (qq-contacts--friend-name friend) :preview (appkit-ui-one-line-preview-create :text (qq-contacts--friend-preview friend)) :line-properties
       (list 'qq-contacts-key (qq-contacts--entry-key entry)
             'qq-contacts-row-type 'friend
             'qq-contacts-object friend
@@ -591,9 +589,7 @@
       :context (qq-contacts--group-name group)
       :context-trail (qq-contacts--permission-label
                       (alist-get 'self_permission group))
-      :context-trail-face 'shadow
-      :preview (qq-contacts--group-preview group)
-      :line-properties
+      :context-trail-face 'shadow :preview (appkit-ui-one-line-preview-create :text (qq-contacts--group-preview group)) :line-properties
       (list 'qq-contacts-key (qq-contacts--entry-key entry)
             'qq-contacts-row-type 'group
             'qq-contacts-object group
@@ -643,9 +639,7 @@
       :context (qq-contacts--member-name member)
       :context-trail (qq-contacts--present-string
                       (alist-get 'group_name member))
-      :context-trail-face 'shadow
-      :preview (qq-contacts--member-preview member)
-      :line-properties
+      :context-trail-face 'shadow :preview (appkit-ui-one-line-preview-create :text (qq-contacts--member-preview member)) :line-properties
       (list 'qq-contacts-key (qq-contacts--entry-key entry)
             'qq-contacts-row-type 'member
             'qq-contacts-object member
@@ -677,9 +671,7 @@
                         (qq-media-avatar-cached-display-string user-id)))
       :context (qq-contacts--stranger-name stranger)
       :context-trail "全网用户"
-      :context-trail-face 'shadow
-      :preview (format "QQ %s · 打开资料页后可添加好友" user-id)
-      :line-properties
+      :context-trail-face 'shadow :preview (appkit-ui-one-line-preview-create :text (format "QQ %s · 打开资料页后可添加好友" user-id)) :line-properties
       (list 'qq-contacts-key (qq-contacts--entry-key entry)
             'qq-contacts-row-type 'stranger
             'qq-contacts-object stranger
@@ -1331,35 +1323,35 @@ APPEND-P controls whether the resulting page extends existing entries."
       (error "QQ: directory search lost its dispatch view"))
     (condition-case error-data
         (let ((request
-               (pcase kind
-                 ('friends
-                  (if cursor
-                      (qq-api-search-contacts-next
-                       'friends cursor query success failure nil 50)
-                    (qq-api-search-contacts-start
-                     'friends query success failure nil 50)))
-                 ('groups
-                  (if cursor
-                      (qq-api-search-group-chats-next
-                       cursor query success failure 'default 50 nil)
-                    (qq-api-search-group-chats-start
-                     query success failure 'default 50 nil)))
-                 ('strangers
-                  (if cursor
-                      (qq-api-search-strangers-next
-                       cursor query success failure 50)
-                    (qq-api-search-strangers-start
-                     query success failure 50)))
-                 ('members
-                  (when cursor
-                    (error "qq: v2 group-member search has no continuation"))
-                  (qq-core-search-group-members
-                   qq-contacts--member-group-id query
-                   (lambda (members)
-                     (funcall success
-                              `((results . ,members) (next_cursor))))
-                   failure))
-                 (_ (error "qq: unknown native directory search kind %S" kind)))))
+                (pcase kind
+                  ('friends
+                   (if cursor
+                       (qq-api-search-contacts-next
+                        'friends cursor query success failure nil 50)
+                     (qq-api-search-contacts-start
+                      'friends query success failure nil 50)))
+                  ('groups
+                   (if cursor
+                       (qq-api-search-group-chats-next
+                        cursor query success failure 'default 50 nil)
+                     (qq-api-search-group-chats-start
+                      query success failure 'default 50 nil)))
+                  ('strangers
+                   (if cursor
+                       (qq-api-search-strangers-next
+                        cursor query success failure 50)
+                     (qq-api-search-strangers-start
+                      query success failure 50)))
+                  ('members
+                   (when cursor
+                     (error "qq: v2 group-member search has no continuation"))
+                   (qq-core-search-group-members
+                    qq-contacts--member-group-id query
+                    (lambda (members)
+                      (funcall success
+                               `((results . ,members) (next_cursor))))
+                    failure))
+                  (_ (error "qq: unknown native directory search kind %S" kind)))))
           (when (qq-contacts--search-current-p view buffer owner kind)
             (pcase kind
               ('friends (setq qq-contacts--search-friend-request request))
@@ -1811,13 +1803,13 @@ user as part of the same backend operation."
       (qq-contacts--queue-view-sync view)
       (condition-case error-data
           (let ((request
-                 (qq-core-refresh-friend-categories
-                  (lambda (_categories)
-                    (qq-contacts--finish-refresh-part
-                     view buffer owner 'friends))
-                  (lambda (_response reason)
-                    (qq-contacts--finish-refresh-part
-                     view buffer owner 'friends reason)))))
+                  (qq-core-refresh-friend-categories
+                   (lambda (_categories)
+                     (qq-contacts--finish-refresh-part
+                      view buffer owner 'friends))
+                   (lambda (_response reason)
+                     (qq-contacts--finish-refresh-part
+                      view buffer owner 'friends reason)))))
             (when (qq-contacts--refresh-part-current-p
                    view buffer owner 'friends)
               (setq qq-contacts--friend-request request)))
@@ -1826,13 +1818,13 @@ user as part of the same backend operation."
           view buffer owner 'friends (error-message-string error-data))))
       (condition-case error-data
           (let ((request
-                 (qq-core-refresh-joined-groups
-                  (lambda (_groups)
-                    (qq-contacts--finish-refresh-part
-                     view buffer owner 'groups))
-                  (lambda (_response reason)
-                    (qq-contacts--finish-refresh-part
-                     view buffer owner 'groups reason)))))
+                  (qq-core-refresh-joined-groups
+                   (lambda (_groups)
+                     (qq-contacts--finish-refresh-part
+                      view buffer owner 'groups))
+                   (lambda (_response reason)
+                     (qq-contacts--finish-refresh-part
+                      view buffer owner 'groups reason)))))
             (when (qq-contacts--refresh-part-current-p
                    view buffer owner 'groups)
               (setq qq-contacts--group-request request)))
@@ -1858,7 +1850,7 @@ user as part of the same backend operation."
         (setq keys (list (cons 'friend (match-string 1 media-key))
                          (cons 'member (match-string 1 media-key))
                          (cons 'stranger (match-string 1 media-key)))))
-      ((string-match "\\`group-avatar:\\([1-9][0-9]*\\)\\'" media-key)
+       ((string-match "\\`group-avatar:\\([1-9][0-9]*\\)\\'" media-key)
         (setq keys (list (cons 'group (match-string 1 media-key))))))
       (when keys
         (dolist (view (qq-contacts--live-views))
