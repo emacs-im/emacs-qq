@@ -123,19 +123,18 @@
 
 (ert-deftest qq-core-events-project-the-owned-account-slot ()
   (qq-core-test-with-managed-account
-    (let (
-        (qq-message--peer-uin-by-uid
-         (make-hash-table :test #'equal))
-        (qq-message--pending-recalls
-         (make-hash-table :test #'equal))
-        (qq-message--pending-reactions
-         (make-hash-table :test #'equal))
-        (qq-message--pending-sends
-         (make-hash-table :test #'equal))
-        (qq-message--live-frontiers
-         (make-hash-table :test #'equal))
-        (qq-account-registry-changed-hook nil)
-        observed)
+    (let ((qq-message--peer-uin-by-uid
+           (make-hash-table :test #'equal))
+          (qq-message--pending-recalls
+           (make-hash-table :test #'equal))
+          (qq-message--pending-reactions
+           (make-hash-table :test #'equal))
+          (qq-message--pending-sends
+           (make-hash-table :test #'equal))
+          (qq-message--live-frontiers
+           (make-hash-table :test #'equal))
+          (qq-account-registry-changed-hook nil)
+          observed)
       (let ((qq-message-event-hook
              (list (lambda (event _data) (setq observed event)))))
         (qq-message--handle-event
@@ -152,93 +151,93 @@
 
 (ert-deftest qq-core-recent-projects-uid-only-private-and-skips-temporary ()
   (qq-core-test-with-managed-account
-   (let* ((raw-message (alist-get 'message (qq-core-test-message-event)))
-         (message (qq-server-wire-domain-copy raw-message))
-         (temporary-message (copy-tree message))
-         (page
-         `((account_id . "slot-a")
-            (conversations
-             . (((conversation . ((kind . "private") (peer_uid . "u_peer")))
-                 (pinned . t)
-                 (activity_revision . "2")
-                 (latest_message . ((kind . "native")
-                                    (row_key . "2")
-                                    (timeline_class . "authored")
-                                    (recalled . :false)
-                                    (message . ,message))))
-                ((conversation
-                  . ((kind . "temporary")
-                     (peer_uid . "u_peer")
-                     (from_tiny_id . "10")))
-                 (activity_revision . "1")
-                 (latest_message
-                  . ((kind . "native")
-                     (row_key . "1")
-                     (timeline_class . "authored")
-                     (recalled . :false)
-                     (message . ,temporary-message))))))
-            (truncated . :false))))
-    (setf (alist-get 'conversation temporary-message nil nil #'eq)
-          '((kind . "temp") (name . "Temporary")
-            (from_tiny_id . "10")))
-    (progn
-          (let ((entry
-                 (qq-core--recent-row-state-entry
-                  page
-                  (car (alist-get 'conversations page))
-                  (qq-core-test-account))))
-            (should-not (plist-member entry :read-cursor-known-p))
-            (should-not (plist-member entry :read-cursor)))
-          (qq-core--apply-recent-page
-           page (qq-state-session-summary-observation-start))
-          (should (equal (qq-state-recent-session-keys)
-                         '("private:10001")))
-          (let ((session (qq-state-session "private:10001")))
-            (should (eq (alist-get 'pinned session) t))
-            (should (equal
-                     (alist-get 'last-message-gateway-account-id session)
-                     "slot-a"))
-            (should-not (qq-state-session-messages "private:10001")))))))
+    (let* ((raw-message (alist-get 'message (qq-core-test-message-event)))
+           (message (qq-server-wire-domain-copy raw-message))
+           (temporary-message (copy-tree message))
+           (page
+            `((account_id . "slot-a")
+              (conversations
+               . (((conversation . ((kind . "private") (peer_uid . "u_peer")))
+                   (pinned . t)
+                   (activity_revision . "2")
+                   (latest_message . ((kind . "native")
+                                      (row_key . "2")
+                                      (timeline_class . "authored")
+                                      (recalled . :false)
+                                      (message . ,message))))
+                  ((conversation
+                    . ((kind . "temporary")
+                       (peer_uid . "u_peer")
+                       (from_tiny_id . "10")))
+                   (activity_revision . "1")
+                   (latest_message
+                    . ((kind . "native")
+                       (row_key . "1")
+                       (timeline_class . "authored")
+                       (recalled . :false)
+                       (message . ,temporary-message))))))
+              (truncated . :false))))
+      (setf (alist-get 'conversation temporary-message nil nil #'eq)
+            '((kind . "temp") (name . "Temporary")
+              (from_tiny_id . "10")))
+      (progn
+        (let ((entry
+               (qq-core--recent-row-state-entry
+                page
+                (car (alist-get 'conversations page))
+                (qq-core-test-account))))
+          (should-not (plist-member entry :read-cursor-known-p))
+          (should-not (plist-member entry :read-cursor)))
+        (qq-core--apply-recent-page
+         page (qq-state-session-summary-observation-start))
+        (should (equal (qq-state-recent-session-keys)
+                       '("private:10001")))
+        (let ((session (qq-state-session "private:10001")))
+          (should (eq (alist-get 'pinned session) t))
+          (should (equal
+                   (alist-get 'last-message-gateway-account-id session)
+                   "slot-a"))
+          (should-not (qq-state-session-messages "private:10001")))))))
 
 (ert-deftest qq-core-recent-projects-dataline-through-unified-head ()
   (qq-core-test-with-managed-account
-   (let* ((peer-uid "u_Wcc5rknRRqRO8y5gxMD6sA")
-          (message-id "7348923749823749824")
-          (page
-           `((account_id . "slot-a")
-             (conversations
-              . (((conversation . ((kind . "dataline")
-                                   (peer_uid . ,peer-uid)
-                                   (variant . "desktop")))
-                  (activity_revision . "5")
-                  (latest_message
-                   . ((kind . "dataline")
-                      (message
-                       . ((message_id . ,message-id)
-                          (chat . ((peer_uid . ,peer-uid)
-                                   (variant . "desktop")))
-                          (direction . "received")
-                          (sent_at . 1784700001)
-                          (segments
-                           . (((kind . "text")
-                               (payload
-                                . ((text . "hello from phone")))))))))))))
-             (truncated . :false))))
-     (qq-message--recent-check-page page)
-     (qq-core--apply-recent-page
-      page (qq-state-session-summary-observation-start))
-     (should (equal (qq-state-recent-session-keys)
-                    (list (format "dataline:desktop:%s" peer-uid))))
-     (let ((session
-            (qq-state-session
-             (format "dataline:desktop:%s" peer-uid))))
-       (should (equal (alist-get 'title session) "My phone"))
-       (should (equal (alist-get 'variant session) "desktop"))
-       (should (equal (alist-get 'last-message-id session) message-id))
-       (should (equal (alist-get 'last-message-preview session)
-                      "hello from phone"))
-       (should-not (assq 'pinned session))
-       (should-not (alist-get 'last-message-seq session))))))
+    (let* ((peer-uid "u_Wcc5rknRRqRO8y5gxMD6sA")
+           (message-id "7348923749823749824")
+           (page
+            `((account_id . "slot-a")
+              (conversations
+               . (((conversation . ((kind . "dataline")
+                                    (peer_uid . ,peer-uid)
+                                    (variant . "desktop")))
+                   (activity_revision . "5")
+                   (latest_message
+                    . ((kind . "dataline")
+                       (message
+                        . ((message_id . ,message-id)
+                           (chat . ((peer_uid . ,peer-uid)
+                                    (variant . "desktop")))
+                           (direction . "received")
+                           (sent_at . 1784700001)
+                           (segments
+                            . (((kind . "text")
+                                (payload
+                                 . ((text . "hello from phone")))))))))))))
+              (truncated . :false))))
+      (qq-message--recent-check-page page)
+      (qq-core--apply-recent-page
+       page (qq-state-session-summary-observation-start))
+      (should (equal (qq-state-recent-session-keys)
+                     (list (format "dataline:desktop:%s" peer-uid))))
+      (let ((session
+             (qq-state-session
+              (format "dataline:desktop:%s" peer-uid))))
+        (should (equal (alist-get 'title session) "My phone"))
+        (should (equal (alist-get 'variant session) "desktop"))
+        (should (equal (alist-get 'last-message-id session) message-id))
+        (should (equal (alist-get 'last-message-preview session)
+                       "hello from phone"))
+        (should-not (assq 'pinned session))
+        (should-not (alist-get 'last-message-seq session))))))
 
 (ert-deftest qq-core-recent-accepts-idless-gray-tip-with-canonical-row-key ()
   (qq-core-test-with-managed-account
@@ -348,8 +347,8 @@
               ((symbol-function 'qq-server-cancel)
                (lambda (token) (setq cancelled token))))
       (let ((request
-             (qq-core-refresh-friend-categories
-              (lambda (value) (setq delivered value)) #'ignore t)))
+              (qq-core-refresh-friend-categories
+               (lambda (value) (setq delivered value)) #'ignore t)))
         (should (qq-request-p request))
         (should (equal (qq-request-token request) "gateway-request"))
         (should (functionp (nth 0 sent)))
@@ -364,61 +363,61 @@
 
 (ert-deftest qq-core-recent-request-owns-the-only-lifecycle ()
   (qq-core-test-with-managed-account
-   (let ((qq-core--recent-requests (make-hash-table :test #'equal))
-         cancelled)
-    (cl-letf (((symbol-function 'qq-account-current-id)
-               (lambda () "slot-a"))
-              ((symbol-function 'qq-state-session-summary-observation-start)
-               (lambda () '(recent-observation)))
-              ((symbol-function 'qq-message-list-recent)
-               (lambda (_account-id &rest _arguments) "recent-request"))
-              ((symbol-function 'qq-server-cancel)
-               (lambda (token) (setq cancelled token) t)))
-      (let ((request (qq-core-refresh-recent-conversations)))
-        (should (qq-request-active-p request))
-        (should (equal (qq-request-token request) "recent-request"))
-        (should (eq request
-                    (gethash "slot-a" qq-core--recent-requests)))
-        (should (qq-request-cancel request))
-        (should (equal cancelled "recent-request"))
-        (should (eq (qq-request-state request) 'cancelled)))))))
+    (let ((qq-core--recent-requests (make-hash-table :test #'equal))
+          cancelled)
+      (cl-letf (((symbol-function 'qq-account-current-id)
+                 (lambda () "slot-a"))
+                ((symbol-function 'qq-state-session-summary-observation-start)
+                 (lambda () '(recent-observation)))
+                ((symbol-function 'qq-message-list-recent)
+                 (lambda (_account-id &rest _arguments) "recent-request"))
+                ((symbol-function 'qq-server-cancel)
+                 (lambda (token) (setq cancelled token) t)))
+        (let ((request (qq-core-refresh-recent-conversations)))
+          (should (qq-request-active-p request))
+          (should (equal (qq-request-token request) "recent-request"))
+          (should (eq request
+                      (gethash "slot-a" qq-core--recent-requests)))
+          (should (qq-request-cancel request))
+          (should (equal cancelled "recent-request"))
+          (should (eq (qq-request-state request) 'cancelled)))))))
 
 (ert-deftest qq-core-recent-replacement-revokes-old-projector ()
   (qq-core-test-with-managed-account
-   (let ((qq-request--active (make-hash-table :test #'eq))
-         (qq-core--recent-requests (make-hash-table :test #'equal))
-         callbacks cancelled projected delivered (request-count 0))
-    (cl-letf (((symbol-function 'qq-account-current-id)
-               (lambda () "slot-a"))
-              ((symbol-function 'qq-state-session-summary-observation-start)
-               (lambda () (list 'observation (1+ request-count))))
-              ((symbol-function 'qq-message-list-recent)
-               (lambda (account-id &rest arguments)
-                 (cl-incf request-count)
-                 (push (list account-id (plist-get arguments :callback))
-                       callbacks)
-                 (format "recent-%d" request-count)))
-              ((symbol-function 'qq-core--apply-recent-page)
-               (lambda (page observation)
-                 (push (list page observation) projected)
-                 page))
-              ((symbol-function 'qq-server-cancel)
-               (lambda (token) (push token cancelled) t)))
-      (qq-core-refresh-recent-conversations
-       (lambda (value) (push value delivered)) #'ignore)
-      (qq-core-refresh-recent-conversations
-       (lambda (value) (push value delivered)) #'ignore)
-      (should (equal cancelled '("recent-1")))
-      ;; Adapter callbacks can race transport cancellation.  The old product
-      ;; request must reject the callback before state projection begins.
-      (funcall (cadr (cadr callbacks)) 'old-page)
-      (should-not projected)
-      (funcall (cadr (car callbacks)) 'new-page)
-      (should (equal projected
-                     '((new-page (observation 2)))))
-      (should (equal delivered '(new-page)))
-      (should-not (gethash "slot-a" qq-core--recent-requests)))
-     (should (= (hash-table-count qq-request--active) 0)))))
+    (let ((qq-request--active (make-hash-table :test #'eq))
+          (qq-core--recent-requests (make-hash-table :test #'equal))
+          callbacks cancelled projected delivered (request-count 0))
+      (cl-letf (((symbol-function 'qq-account-current-id)
+                 (lambda () "slot-a"))
+                ((symbol-function 'qq-state-session-summary-observation-start)
+                 (lambda () (list 'observation (1+ request-count))))
+                ((symbol-function 'qq-message-list-recent)
+                 (lambda (account-id &rest arguments)
+                   (cl-incf request-count)
+                   (push (list account-id (plist-get arguments :callback))
+                         callbacks)
+                   (format "recent-%d" request-count)))
+                ((symbol-function 'qq-core--apply-recent-page)
+                 (lambda (page observation)
+                   (push (list page observation) projected)
+                   page))
+                ((symbol-function 'qq-server-cancel)
+                 (lambda (token) (push token cancelled) t)))
+        (qq-core-refresh-recent-conversations
+         (lambda (value) (push value delivered)) #'ignore)
+        (qq-core-refresh-recent-conversations
+         (lambda (value) (push value delivered)) #'ignore)
+        (should (equal cancelled '("recent-1")))
+        ;; Adapter callbacks can race transport cancellation.  The old product
+        ;; request must reject the callback before state projection begins.
+        (funcall (cadr (cadr callbacks)) 'old-page)
+        (should-not projected)
+        (funcall (cadr (car callbacks)) 'new-page)
+        (should (equal projected
+                       '((new-page (observation 2)))))
+        (should (equal delivered '(new-page)))
+        (should-not (gethash "slot-a" qq-core--recent-requests)))
+      (should (= (hash-table-count qq-request--active) 0)))))
 
 (ert-deftest qq-request-starter-nonlocal-exit-revokes-ownership ()
   (let ((qq-request--active (make-hash-table :test #'eq))
@@ -453,50 +452,50 @@
 
 (ert-deftest qq-request-slot-scope-survives-selection-until-removal ()
   (qq-core-test-with-managed-account
-   (let ((qq-request--active (make-hash-table :test #'eq))
-         success delivered cancelled)
-    (cl-letf (((symbol-function 'qq-server-cancel)
-               (lambda (token) (push token cancelled))))
-      (let ((request
-             (qq-request-start
-              (lambda (callback _failure)
-                (setq success callback)
-                "slot-request")
-              :callback (lambda (value) (setq delivered value)))))
-        (should (equal (qq-request-owner request) "slot-a"))
-        ;; The stable slot remains the request's callback observation context.
-        (funcall success 'current-page)
-        (should (eq delivered 'current-page))
-        (should (eq (qq-request-state request) 'settled)))
-      (setq delivered nil)
-      (let ((request
-             (qq-request-start
-              (lambda (callback _failure)
-                (setq success callback)
-                "switched-slot-request")
-              :owner "slot-a"
-              :callback (lambda (value) (setq delivered value)))))
-        (qq-account--upsert-account
-         '((account_id . "slot-b") (label . "Other") (phase . "online")
-           (uin . "10003") (uid . "u_other") (challenge) (problem))
-         'changed)
-        (qq-account-select "slot-b")
-        (funcall success 'owned-page)
-        (should (eq delivered 'owned-page))
-        (should (eq (qq-request-state request) 'settled)))
-      (setq delivered nil)
-      (let ((request
-             (qq-request-start
-              (lambda (callback _failure)
-                (setq success callback)
-                "removed-slot-request")
-              :owner "slot-a"
-              :callback (lambda (value) (setq delivered value)))))
-        (qq-account--remove-account "slot-a" 'removed)
-        (funcall success 'stale-page)
-        (should-not delivered)
-        (should (eq (qq-request-state request) 'cancelled))
-        (should (equal cancelled '("removed-slot-request"))))))))
+    (let ((qq-request--active (make-hash-table :test #'eq))
+          success delivered cancelled)
+      (cl-letf (((symbol-function 'qq-server-cancel)
+                 (lambda (token) (push token cancelled))))
+        (let ((request
+                (qq-request-start
+                 (lambda (callback _failure)
+                   (setq success callback)
+                   "slot-request")
+                 :callback (lambda (value) (setq delivered value)))))
+          (should (equal (qq-request-owner request) "slot-a"))
+          ;; The stable slot remains the request's callback observation context.
+          (funcall success 'current-page)
+          (should (eq delivered 'current-page))
+          (should (eq (qq-request-state request) 'settled)))
+        (setq delivered nil)
+        (let ((request
+                (qq-request-start
+                 (lambda (callback _failure)
+                   (setq success callback)
+                   "switched-slot-request")
+                 :owner "slot-a"
+                 :callback (lambda (value) (setq delivered value)))))
+          (qq-account--upsert-account
+           '((account_id . "slot-b") (label . "Other") (phase . "online")
+             (uin . "10003") (uid . "u_other") (challenge) (problem))
+           'changed)
+          (qq-account-select "slot-b")
+          (funcall success 'owned-page)
+          (should (eq delivered 'owned-page))
+          (should (eq (qq-request-state request) 'settled)))
+        (setq delivered nil)
+        (let ((request
+                (qq-request-start
+                 (lambda (callback _failure)
+                   (setq success callback)
+                   "removed-slot-request")
+                 :owner "slot-a"
+                 :callback (lambda (value) (setq delivered value)))))
+          (qq-account--remove-account "slot-a" 'removed)
+          (funcall success 'stale-page)
+          (should-not delivered)
+          (should (eq (qq-request-state request) 'cancelled))
+          (should (equal cancelled '("removed-slot-request"))))))))
 
 (ert-deftest qq-core-start-request-distinguishes-omitted-and-global-scope ()
   (let ((qq-request--active (make-hash-table :test #'eq)))
@@ -562,168 +561,168 @@
 
 (ert-deftest qq-core-group-settings-update-shared-directory-after-receipt ()
   (qq-core-test-with-managed-account
-  (let ((qq-account--current-account-id "slot-a") calls callbacks)
-    (unwind-protect
-        (progn
-          (qq-state-reset)
-          (qq-state-apply-groups
-           '(((group_id . "8209413637")
-              (group_name . "Old")
-              (group_remark . "Old Remark")
-              (member_count . 3)
-              (max_member_count . 500))))
-          (cl-letf
-              (((symbol-function 'qq-directory-set-group-name)
-                (lambda (group-id value callback &optional _errback)
-                  (push (list 'name group-id value) calls)
-                  (funcall callback '((name . "New")))
-                  "name-request"))
-               ((symbol-function 'qq-directory-set-group-remark)
-                (lambda (group-id value callback &optional _errback)
-                  (push (list 'remark group-id value) calls)
-                  (funcall callback '((remark . "")))
-                  "remark-request"))
-               ((symbol-function 'qq-directory-set-group-whole-mute)
-                (lambda (group-id value callback &optional _errback)
-                  (push (list 'mute group-id value) calls)
-                  (funcall callback '((enabled . t)))
-                  "mute-request"))
-               ((symbol-function 'qq-directory-set-group-pinned)
-                (lambda (group-id value callback &optional _errback)
-                  (push (list 'pinned group-id value) calls)
-                  (funcall callback '((pinned . :false)))
-                  "pinned-request"))
-               ((symbol-function 'qq-directory-clock-in-group)
-                (lambda (group-id callback &optional _errback)
-                  (push (list 'clock-in group-id) calls)
-                  (funcall callback '((title . "今日已打卡")))
-                  "clock-in-request")))
-            (let ((name-request
-                   (qq-core-set-group-name
-                    "8209413637" "New"
-                    (lambda (_receipt) (push 'name callbacks))))
-                  (remark-request
-                   (qq-core-set-group-remark
-                    "8209413637" ""
-                    (lambda (_receipt) (push 'remark callbacks))))
-                  (mute-request
-                   (qq-core-set-group-whole-mute
-                    "8209413637" t
-                    (lambda (_receipt) (push 'mute callbacks))))
-                  (pinned-request
-                   (qq-core-set-group-pinned
-                    "8209413637" nil
-                    (lambda (_receipt) (push 'pinned callbacks))))
-                  (clock-in-request
-                   (qq-core-clock-in-group
-                    "8209413637"
-                    (lambda (_receipt) (push 'clock-in callbacks)))))
-              (dolist (request (list name-request remark-request mute-request
-                                     pinned-request clock-in-request))
-                (should (qq-request-p request))
-                (should (eq (qq-request-state request) 'settled))
-                (should-not (qq-request-token request)))))
-          (let ((group (qq-state-group "8209413637")))
-            (should (equal (alist-get 'group_name group) "New"))
-            (should-not (alist-get 'group_remark group))
-            (should (eq (alist-get 'pinned group) :false)))
-          (should (equal (sort callbacks
-                               (lambda (left right)
-                                 (string< (symbol-name left)
-                                          (symbol-name right))))
-                         '(clock-in mute name pinned remark)))
-          (should
-           (equal (nreverse calls)
-                  '((name "8209413637" "New")
-                    (remark "8209413637" "")
-                    (mute "8209413637" t)
-                    (pinned "8209413637" nil)
-                    (clock-in "8209413637")))))
-      (qq-state-reset))) ))
+    (let ((qq-account--current-account-id "slot-a") calls callbacks)
+      (unwind-protect
+          (progn
+            (qq-state-reset)
+            (qq-state-apply-groups
+             '(((group_id . "8209413637")
+                (group_name . "Old")
+                (group_remark . "Old Remark")
+                (member_count . 3)
+                (max_member_count . 500))))
+            (cl-letf
+                (((symbol-function 'qq-directory-set-group-name)
+                  (lambda (group-id value callback &optional _errback)
+                    (push (list 'name group-id value) calls)
+                    (funcall callback '((name . "New")))
+                    "name-request"))
+                 ((symbol-function 'qq-directory-set-group-remark)
+                  (lambda (group-id value callback &optional _errback)
+                    (push (list 'remark group-id value) calls)
+                    (funcall callback '((remark . "")))
+                    "remark-request"))
+                 ((symbol-function 'qq-directory-set-group-whole-mute)
+                  (lambda (group-id value callback &optional _errback)
+                    (push (list 'mute group-id value) calls)
+                    (funcall callback '((enabled . t)))
+                    "mute-request"))
+                 ((symbol-function 'qq-directory-set-group-pinned)
+                  (lambda (group-id value callback &optional _errback)
+                    (push (list 'pinned group-id value) calls)
+                    (funcall callback '((pinned . :false)))
+                    "pinned-request"))
+                 ((symbol-function 'qq-directory-clock-in-group)
+                  (lambda (group-id callback &optional _errback)
+                    (push (list 'clock-in group-id) calls)
+                    (funcall callback '((title . "今日已打卡")))
+                    "clock-in-request")))
+              (let ((name-request
+                     (qq-core-set-group-name
+                      "8209413637" "New"
+                      (lambda (_receipt) (push 'name callbacks))))
+                    (remark-request
+                     (qq-core-set-group-remark
+                      "8209413637" ""
+                      (lambda (_receipt) (push 'remark callbacks))))
+                    (mute-request
+                     (qq-core-set-group-whole-mute
+                      "8209413637" t
+                      (lambda (_receipt) (push 'mute callbacks))))
+                    (pinned-request
+                     (qq-core-set-group-pinned
+                      "8209413637" nil
+                      (lambda (_receipt) (push 'pinned callbacks))))
+                    (clock-in-request
+                     (qq-core-clock-in-group
+                      "8209413637"
+                      (lambda (_receipt) (push 'clock-in callbacks)))))
+                (dolist (request (list name-request remark-request mute-request
+                                       pinned-request clock-in-request))
+                  (should (qq-request-p request))
+                  (should (eq (qq-request-state request) 'settled))
+                  (should-not (qq-request-token request)))))
+            (let ((group (qq-state-group "8209413637")))
+              (should (equal (alist-get 'group_name group) "New"))
+              (should-not (alist-get 'group_remark group))
+              (should (eq (alist-get 'pinned group) :false)))
+            (should (equal (sort callbacks
+                                 (lambda (left right)
+                                   (string< (symbol-name left)
+                                            (symbol-name right))))
+                           '(clock-in mute name pinned remark)))
+            (should
+             (equal (nreverse calls)
+                    '((name "8209413637" "New")
+                      (remark "8209413637" "")
+                      (mute "8209413637" t)
+                      (pinned "8209413637" nil)
+                      (clock-in "8209413637")))))
+        (qq-state-reset)))))
 
 (ert-deftest qq-core-friend-pinned-routes-exact-uin ()
   (qq-core-test-with-managed-account
-  (let ((qq-account--current-account-id "slot-a") called callback-value)
-    (cl-letf (((symbol-function 'qq-directory-set-friend-pinned)
-               (lambda (user-id pinned callback &optional _errback)
-                 (setq called (list user-id pinned))
-                 (funcall callback `((friend_uin . ,user-id) (pinned . t)))
-                 "friend-pin")))
-      (let ((request
-             (qq-core-set-friend-pinned
-              "9007199254740999" t
-              (lambda (receipt) (setq callback-value receipt)))))
-        (should (eq (qq-request-state request) 'settled))))
-    (should (equal called '("9007199254740999" t)))
-    (should (eq (alist-get 'pinned callback-value) t))) ))
+    (let ((qq-account--current-account-id "slot-a") called callback-value)
+      (cl-letf (((symbol-function 'qq-directory-set-friend-pinned)
+                 (lambda (user-id pinned callback &optional _errback)
+                   (setq called (list user-id pinned))
+                   (funcall callback `((friend_uin . ,user-id) (pinned . t)))
+                   "friend-pin")))
+        (let ((request
+                (qq-core-set-friend-pinned
+                 "9007199254740999" t
+                 (lambda (receipt) (setq callback-value receipt)))))
+          (should (eq (qq-request-state request) 'settled))))
+      (should (equal called '("9007199254740999" t)))
+      (should (eq (alist-get 'pinned callback-value) t)))))
 
 (ert-deftest qq-core-presence-targets-selected-account ()
   (qq-core-test-with-managed-account
-  (let (called callback-value)
-    (cl-letf (((symbol-function 'qq-account-current-id)
-               (lambda () "slot-a"))
-              ((symbol-function 'qq-account-set-presence)
-               (lambda (account-id presence callback &optional _errback)
-                 (setq called (list account-id presence))
-                 (funcall callback
-                          `((account_id . ,account-id)
-                            (presence . ,presence)))
-                 "presence")))
-      (let* ((presence '((kind . "away")))
-             (request
-              (qq-core-set-presence
-               presence (lambda (receipt) (setq callback-value receipt)))))
-        (should (eq (qq-request-state request) 'settled))
-        (should (equal called (list "slot-a" presence)))
-        (should (equal (alist-get 'presence callback-value) presence))))) ))
+    (let (called callback-value)
+      (cl-letf (((symbol-function 'qq-account-current-id)
+                 (lambda () "slot-a"))
+                ((symbol-function 'qq-account-set-presence)
+                 (lambda (account-id presence callback &optional _errback)
+                   (setq called (list account-id presence))
+                   (funcall callback
+                            `((account_id . ,account-id)
+                              (presence . ,presence)))
+                   "presence")))
+        (let* ((presence '((kind . "away")))
+               (request
+                 (qq-core-set-presence
+                  presence (lambda (receipt) (setq callback-value receipt)))))
+          (should (eq (qq-request-state request) 'settled))
+          (should (equal called (list "slot-a" presence)))
+          (should (equal (alist-get 'presence callback-value) presence)))))))
 
 (ert-deftest qq-core-group-leave-converges-loaded-state ()
   (qq-core-test-with-managed-account
-  (let ((qq-account--current-account-id "slot-a")
-        (group-id "8209413637") called callback-value)
-    (unwind-protect
-        (progn
-          (qq-state-reset)
-          (qq-state-apply-groups
-           `(((group_id . ,group-id) (group_name . "Leave"))
-             ((group_id . "20002") (group_name . "Keep"))))
-          (cl-letf (((symbol-function 'qq-directory-leave-group)
-                     (lambda (candidate callback &optional _errback)
-                       (setq called candidate)
-                       (funcall callback `((group_uin . ,candidate)))
-                       "leave")))
-            (let ((request
-                   (qq-core-leave-group
-                    group-id
-                    (lambda (receipt) (setq callback-value receipt)))))
-              (should (eq (qq-request-state request) 'settled))))
-          (should (equal called group-id))
-          (should callback-value)
-          (should-not (qq-state-group group-id))
-          (should (qq-state-group "20002")))
-      (qq-state-reset))) ))
+    (let ((qq-account--current-account-id "slot-a")
+          (group-id "8209413637") called callback-value)
+      (unwind-protect
+          (progn
+            (qq-state-reset)
+            (qq-state-apply-groups
+             `(((group_id . ,group-id) (group_name . "Leave"))
+               ((group_id . "20002") (group_name . "Keep"))))
+            (cl-letf (((symbol-function 'qq-directory-leave-group)
+                       (lambda (candidate callback &optional _errback)
+                         (setq called candidate)
+                         (funcall callback `((group_uin . ,candidate)))
+                         "leave")))
+              (let ((request
+                      (qq-core-leave-group
+                       group-id
+                       (lambda (receipt) (setq callback-value receipt)))))
+                (should (eq (qq-request-state request) 'settled))))
+            (should (equal called group-id))
+            (should callback-value)
+            (should-not (qq-state-group group-id))
+            (should (qq-state-group "20002")))
+        (qq-state-reset)))))
 
 (ert-deftest qq-core-group-at-all-query-routes-wide-group-uin ()
   (qq-core-test-with-managed-account
-  (let ((qq-account--current-account-id "slot-a") called callback-value)
-    (cl-letf (((symbol-function
-               'qq-directory-get-group-at-all-remaining)
-               (lambda (candidate callback &optional _errback)
-                 (setq called candidate)
-                 (funcall callback
-                          `((group_uin . ,candidate)
-                            (can_at_all . t)
-                            (remain_at_all_count_for_uin . 3)
-                            (remain_at_all_count_for_group . 9)))
-                 "at-all")))
-      (let ((request
-             (qq-core-get-group-at-all-remaining
-              "8209413637"
-              (lambda (receipt) (setq callback-value receipt)))))
-        (should (eq (qq-request-state request) 'settled))))
-    (should (equal called "8209413637"))
-    (should (= (alist-get 'remain_at_all_count_for_uin callback-value) 3))
-    (should (= (alist-get 'remain_at_all_count_for_group callback-value) 9))) ))
+    (let ((qq-account--current-account-id "slot-a") called callback-value)
+      (cl-letf (((symbol-function
+                  'qq-directory-get-group-at-all-remaining)
+                 (lambda (candidate callback &optional _errback)
+                   (setq called candidate)
+                   (funcall callback
+                            `((group_uin . ,candidate)
+                              (can_at_all . t)
+                              (remain_at_all_count_for_uin . 3)
+                              (remain_at_all_count_for_group . 9)))
+                   "at-all")))
+        (let ((request
+                (qq-core-get-group-at-all-remaining
+                 "8209413637"
+                 (lambda (receipt) (setq callback-value receipt)))))
+          (should (eq (qq-request-state request) 'settled))))
+      (should (equal called "8209413637"))
+      (should (= (alist-get 'remain_at_all_count_for_uin callback-value) 3))
+      (should (= (alist-get 'remain_at_all_count_for_group callback-value) 9)))))
 
 (ert-deftest qq-core-group-leave-does-not-invent-unloaded-directory ()
   (unwind-protect
@@ -741,49 +740,49 @@
 
 (ert-deftest qq-core-group-member-settings-route-wide-native-identities ()
   (qq-core-test-with-managed-account
-  (let ((qq-account--current-account-id "slot-a") calls callbacks)
-    (cl-letf
-        (((symbol-function 'qq-directory-set-group-member-card)
-          (lambda (group-id user-id value callback &optional _errback)
-            (push (list 'card group-id user-id value) calls)
-            (funcall callback '((card . "Ferris")))
-            "card-request"))
-         ((symbol-function
-           'qq-directory-set-group-member-special-title)
-          (lambda (group-id user-id value callback &optional _errback)
-            (push (list 'title group-id user-id value) calls)
-            (funcall callback '((special_title . "Maintainer")))
-            "title-request"))
-         ((symbol-function 'qq-directory-kick-group-member)
-          (lambda (group-id user-id reject callback &optional _errback)
-            (push (list 'kick group-id user-id reject) calls)
-            (funcall callback '((reject_add_request . t)))
-            "kick-request")))
-      (let ((card-request
-             (qq-core-set-group-member-card
-              "8209413637" "9007199254741001" "Ferris"
-              (lambda (_receipt) (push 'card callbacks))))
-            (title-request
-             (qq-core-set-group-member-special-title
-              "8209413637" "9007199254741001" "Maintainer"
-              (lambda (_receipt) (push 'title callbacks))))
-            (kick-request
-             (qq-core-kick-group-member
-              "8209413637" "9007199254741001" t
-              (lambda (_receipt) (push 'kick callbacks)))))
-        (dolist (request (list card-request title-request kick-request))
-          (should (eq (qq-request-state request) 'settled)))))
-    (should (equal (nreverse calls)
-                   '((card "8209413637" "9007199254741001" "Ferris")
-                     (title "8209413637" "9007199254741001"
-                            "Maintainer")
-                     (kick "8209413637" "9007199254741001" t))))
-    (should (equal (sort callbacks
-                         (lambda (left right)
-                           (string< (symbol-name left) (symbol-name right))))
-                   '(card kick title)))
-    (should (qq-core-group-id-p "8209413637"))
-    (should (qq-core-user-id-p "9007199254741001"))) ))
+    (let ((qq-account--current-account-id "slot-a") calls callbacks)
+      (cl-letf
+          (((symbol-function 'qq-directory-set-group-member-card)
+            (lambda (group-id user-id value callback &optional _errback)
+              (push (list 'card group-id user-id value) calls)
+              (funcall callback '((card . "Ferris")))
+              "card-request"))
+           ((symbol-function
+             'qq-directory-set-group-member-special-title)
+            (lambda (group-id user-id value callback &optional _errback)
+              (push (list 'title group-id user-id value) calls)
+              (funcall callback '((special_title . "Maintainer")))
+              "title-request"))
+           ((symbol-function 'qq-directory-kick-group-member)
+            (lambda (group-id user-id reject callback &optional _errback)
+              (push (list 'kick group-id user-id reject) calls)
+              (funcall callback '((reject_add_request . t)))
+              "kick-request")))
+        (let ((card-request
+               (qq-core-set-group-member-card
+                "8209413637" "9007199254741001" "Ferris"
+                (lambda (_receipt) (push 'card callbacks))))
+              (title-request
+               (qq-core-set-group-member-special-title
+                "8209413637" "9007199254741001" "Maintainer"
+                (lambda (_receipt) (push 'title callbacks))))
+              (kick-request
+               (qq-core-kick-group-member
+                "8209413637" "9007199254741001" t
+                (lambda (_receipt) (push 'kick callbacks)))))
+          (dolist (request (list card-request title-request kick-request))
+            (should (eq (qq-request-state request) 'settled)))))
+      (should (equal (nreverse calls)
+                     '((card "8209413637" "9007199254741001" "Ferris")
+                       (title "8209413637" "9007199254741001"
+                              "Maintainer")
+                       (kick "8209413637" "9007199254741001" t))))
+      (should (equal (sort callbacks
+                           (lambda (left right)
+                             (string< (symbol-name left) (symbol-name right))))
+                     '(card kick title)))
+      (should (qq-core-group-id-p "8209413637"))
+      (should (qq-core-user-id-p "9007199254741001")))))
 
 (ert-deftest qq-core-member-search-filters-cached-exact-ids ()
   (let (result fetched)
@@ -803,21 +802,21 @@
 
 (ert-deftest qq-core-member-search-fetches-on-cache-miss ()
   (qq-core-test-with-managed-account
-  (let ((qq-account--current-account-id "slot-a") callback result)
-    (cl-letf (((symbol-function 'qq-directory-group-member-page)
-               (lambda (_group-id) nil))
-              ((symbol-function 'qq-directory-list-group-members)
-               (lambda (_group-id success _errback &optional _refresh)
-                 (setq callback success)
-                 "member-request")))
-      (let ((request
-             (qq-core-search-group-members
-              "8209413637" "friend"
-              (lambda (members) (setq result members)) nil 200)))
-        (should (equal (qq-request-token request) "member-request"))
-        (funcall callback (copy-tree qq-core-test-members))
-        (should (= (length result) 1))
-        (should (equal (alist-get 'user_id (car result)) "10003"))))) ))
+    (let ((qq-account--current-account-id "slot-a") callback result)
+      (cl-letf (((symbol-function 'qq-directory-group-member-page)
+                 (lambda (_group-id) nil))
+                ((symbol-function 'qq-directory-list-group-members)
+                 (lambda (_group-id success _errback &optional _refresh)
+                   (setq callback success)
+                   "member-request")))
+        (let ((request
+                (qq-core-search-group-members
+                 "8209413637" "friend"
+                 (lambda (members) (setq result members)) nil 200)))
+          (should (equal (qq-request-token request) "member-request"))
+          (funcall callback (copy-tree qq-core-test-members))
+          (should (= (length result) 1))
+          (should (equal (alist-get 'user_id (car result)) "10003")))))))
 
 (ert-deftest qq-core-send-routes-closed-segments ()
   (let ((qq-account--current-account-id "slot-a") sent)
@@ -833,8 +832,8 @@
                ((type . "face") (data . ((id . "178"))))
                ((type . "text") (data . ((text . "hello")))))))
         (let ((request
-               (qq-core-send-message
-                "group:8209413637" segments "optimistic")))
+                (qq-core-send-message
+                 "group:8209413637" segments "optimistic")))
           (should (qq-request-p request))
           (should (equal (qq-request-token request) "send-request")))
         (should (equal (nth 0 sent) "group:8209413637"))
@@ -869,13 +868,13 @@
                 (lambda (resource-id)
                   (push resource-id released))))
             (let ((request
-                   (qq-core-send-message
-                    "group:8209413637"
-                    `(((type . "file")
-                       (data . ((file . ,path)
-                                (name . "notes.txt")))))
-                    nil
-                    (lambda (receipt) (setq success receipt)))))
+                    (qq-core-send-message
+                     "group:8209413637"
+                     `(((type . "file")
+                        (data . ((file . ,path)
+                                 (name . "notes.txt")))))
+                     nil
+                     (lambda (receipt) (setq success receipt)))))
               (should (eq (qq-request-state request) 'settled))
               (should (equal staged (list path "notes.txt")))
               (should
@@ -913,10 +912,10 @@
                     `((type . "image")
                       (data . ((file . ,path) (name . "photo.png")))))
                    (request
-                    (qq-core-send-message
-                     "dataline:mobile:u_Wcc5rknRRqRO8y5gxMD6sA"
-                     (list segment) nil
-                     (lambda (receipt) (setq success receipt)))))
+                     (qq-core-send-message
+                      "dataline:mobile:u_Wcc5rknRRqRO8y5gxMD6sA"
+                      (list segment) nil
+                      (lambda (receipt) (setq success receipt)))))
               (should (eq (qq-request-state request) 'settled))
               (should (equal staged (list path "photo.png")))
               (should (equal (nth 0 sent)
@@ -958,10 +957,10 @@
                     `((type . "image")
                       (data . ((file . ,path) (name . "photo.png")))))
                    (request
-                    (qq-core-send-message
-                     "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA"
-                     (list segment) nil
-                     (lambda (receipt) (setq success receipt)))))
+                     (qq-core-send-message
+                      "dataline:desktop:u_Wcc5rknRRqRO8y5gxMD6sA"
+                      (list segment) nil
+                      (lambda (receipt) (setq success receipt)))))
               (should (eq (qq-request-state request) 'active))
               (should ready-callback)
               (should-not sent)
@@ -999,10 +998,10 @@
                ((symbol-function 'qq-core--release-send-resource)
                 (lambda (resource-id) (push resource-id released))))
             (let ((request
-                   (qq-core-send-message
-                    "private:10001"
-                    `(((type . "file")
-                       (data . ((file . ,path) (name . "notes.txt"))))))))
+                    (qq-core-send-message
+                     "private:10001"
+                     `(((type . "file")
+                        (data . ((file . ,path) (name . "notes.txt"))))))))
               (should (eq (qq-request-state request) 'settled))
               (should (equal staged (list path "notes.txt")))
               (should (equal sent '("private:10001" "res-private-file")))
@@ -1034,11 +1033,11 @@
                ((symbol-function 'qq-core--release-send-resource)
                 (lambda (resource-id) (push resource-id released))))
             (let ((request
-                   (qq-core-send-message
-                    "private:10001"
-                    `(((type . "file")
-                       (data . ((file . ,path) (name . "notes.txt")))))
-                    nil (lambda (receipt) (setq delivered receipt)))))
+                    (qq-core-send-message
+                     "private:10001"
+                     `(((type . "file")
+                        (data . ((file . ,path) (name . "notes.txt")))))
+                     nil (lambda (receipt) (setq delivered receipt)))))
               (should (qq-request-active-p request))
               (should publication-success)
               (should-not released)
@@ -1052,249 +1051,249 @@
 
 (ert-deftest qq-core-local-images-finish-concurrently-but-send-in-draft-order ()
   (qq-core-test-with-managed-account
-  (let ((path-a (make-temp-file "qq-core-image-a-" nil ".png" "aaa"))
-        (path-b (make-temp-file "qq-core-image-b-" nil ".png" "bbb"))
-        (owner "slot-a")
-        staged sent released-resources)
-    (unwind-protect
-        (let ((segments
-               `(((type . "text") (data . ((text . "before"))))
-                 ((type . "image")
-                  (data . ((file . ,path-a)
-                           (summary . "first")
-                           (sub_type . 0))))
-                 ((type . "text") (data . ((text . "between"))))
-                 ((type . "image")
-                  (data . ((file . ,path-b)
-                           (summary . "second")
-                           (sub_type . 1)))))))
-          (cl-letf
-              (((symbol-function 'qq-account-current-id)
-                (lambda () owner))
-               ((symbol-function
-                 'qq-attachment-stage-and-prepare-image)
-                (lambda (session path summary sub-type callback errback)
-                  (let ((operation
-                         (qq-attachment-operation-create
-                          :active-p t)))
-                    (push (list session path summary sub-type callback
-                                errback operation)
-                          staged)
-                    operation)))
-               ((symbol-function 'qq-core--release-send-resource)
-                (lambda (resource-id)
-                  (push resource-id released-resources)))
-               ((symbol-function 'qq-message-send)
-                (lambda (session ready-segments
-                                 &optional raw callback errback optimistic)
-                  (setq sent (list session ready-segments raw callback
-                                   errback optimistic))
-                  "send-request")))
-            (let ((request
-                   (qq-core-send-message
-                    "group:8209413637" segments "optimistic")))
-              (should (qq-request-p request))
-              (should (= (length staged) 2))
-              (let* ((entry-b (seq-find (lambda (entry)
-                                          (equal (nth 1 entry) path-b))
-                                        staged))
-                     (operation-b (nth 6 entry-b)))
-                (setf (qq-attachment-operation-active-p operation-b)
-                      nil)
-                (funcall
-                 (nth 4 entry-b)
-                 (qq-core-test-prepared-image
-                  "att-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-                  "res-image-b")))
-              (should-not sent)
-              (let* ((entry-a (seq-find (lambda (entry)
-                                          (equal (nth 1 entry) path-a))
-                                        staged))
-                     (operation-a (nth 6 entry-a)))
-                (setf (qq-attachment-operation-active-p operation-a)
-                      nil)
-                (funcall
-                 (nth 4 entry-a)
-                 (qq-core-test-prepared-image
-                  "att-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-                  "res-image-a")))
-              (should (equal (qq-request-token request) "send-request"))
-              (should (equal (car sent) "group:8209413637"))
-              (should
-               (equal
-                (nth 1 sent)
-                '(((type . "text") (data . ((text . "before"))))
-                  ((type . "image")
-                   (data
-                    . ((attachment_id
-                        . "att-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"))))
-                  ((type . "text") (data . ((text . "between"))))
-                  ((type . "image")
-                   (data
-                    . ((attachment_id
-                        . "att-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")))))))
-              (should (equal (nth 2 sent) "optimistic"))
-              (should (equal (nth 5 sent) segments))
-              (should-not
-               (string-match-p "qq-core-image-"
-                               (prin1-to-string (nth 1 sent))))
-              (should
-               (equal (sort released-resources #'string<)
-                      '("res-image-a" "res-image-b"))))))
-      (delete-file path-a)
-      (delete-file path-b))) ))
+    (let ((path-a (make-temp-file "qq-core-image-a-" nil ".png" "aaa"))
+          (path-b (make-temp-file "qq-core-image-b-" nil ".png" "bbb"))
+          (owner "slot-a")
+          staged sent released-resources)
+      (unwind-protect
+          (let ((segments
+                 `(((type . "text") (data . ((text . "before"))))
+                   ((type . "image")
+                    (data . ((file . ,path-a)
+                             (summary . "first")
+                             (sub_type . 0))))
+                   ((type . "text") (data . ((text . "between"))))
+                   ((type . "image")
+                    (data . ((file . ,path-b)
+                             (summary . "second")
+                             (sub_type . 1)))))))
+            (cl-letf
+                (((symbol-function 'qq-account-current-id)
+                  (lambda () owner))
+                 ((symbol-function
+                   'qq-attachment-stage-and-prepare-image)
+                  (lambda (session path summary sub-type callback errback)
+                    (let ((operation
+                           (qq-attachment-operation-create
+                            :active-p t)))
+                      (push (list session path summary sub-type callback
+                                  errback operation)
+                            staged)
+                      operation)))
+                 ((symbol-function 'qq-core--release-send-resource)
+                  (lambda (resource-id)
+                    (push resource-id released-resources)))
+                 ((symbol-function 'qq-message-send)
+                  (lambda (session ready-segments
+                                   &optional raw callback errback optimistic)
+                    (setq sent (list session ready-segments raw callback
+                                     errback optimistic))
+                    "send-request")))
+              (let ((request
+                      (qq-core-send-message
+                       "group:8209413637" segments "optimistic")))
+                (should (qq-request-p request))
+                (should (= (length staged) 2))
+                (let* ((entry-b (seq-find (lambda (entry)
+                                            (equal (nth 1 entry) path-b))
+                                          staged))
+                       (operation-b (nth 6 entry-b)))
+                  (setf (qq-attachment-operation-active-p operation-b)
+                        nil)
+                  (funcall
+                   (nth 4 entry-b)
+                   (qq-core-test-prepared-image
+                    "att-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+                    "res-image-b")))
+                (should-not sent)
+                (let* ((entry-a (seq-find (lambda (entry)
+                                            (equal (nth 1 entry) path-a))
+                                          staged))
+                       (operation-a (nth 6 entry-a)))
+                  (setf (qq-attachment-operation-active-p operation-a)
+                        nil)
+                  (funcall
+                   (nth 4 entry-a)
+                   (qq-core-test-prepared-image
+                    "att-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+                    "res-image-a")))
+                (should (equal (qq-request-token request) "send-request"))
+                (should (equal (car sent) "group:8209413637"))
+                (should
+                 (equal
+                  (nth 1 sent)
+                  '(((type . "text") (data . ((text . "before"))))
+                    ((type . "image")
+                     (data
+                      . ((attachment_id
+                          . "att-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"))))
+                    ((type . "text") (data . ((text . "between"))))
+                    ((type . "image")
+                     (data
+                      . ((attachment_id
+                          . "att-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")))))))
+                (should (equal (nth 2 sent) "optimistic"))
+                (should (equal (nth 5 sent) segments))
+                (should-not
+                 (string-match-p "qq-core-image-"
+                                 (prin1-to-string (nth 1 sent))))
+                (should
+                 (equal (sort released-resources #'string<)
+                        '("res-image-a" "res-image-b"))))))
+        (delete-file path-a)
+        (delete-file path-b)))))
 
 (ert-deftest qq-core-local-media-starter-signal-retires-and-releases ()
   (qq-core-test-with-managed-account
-  (let ((path-a (make-temp-file "qq-core-image-ready-" nil ".png" "aaa"))
-        (path-b (make-temp-file "qq-core-image-signal-" nil ".png" "bbb"))
-        (qq-request--active (make-hash-table :test #'eq))
-        (real-create (symbol-function 'qq-request-create))
-        request caught sent failure
-        released-resources released-attachments)
-    (unwind-protect
-        (cl-letf
-            (((symbol-function 'qq-account-current-id)
-              (lambda () "slot-a"))
-             ((symbol-function 'qq-request-create)
-              (lambda (&optional owner cancel-function)
-                (setq request
-                      (funcall real-create owner cancel-function))))
-             ((symbol-function
-               'qq-attachment-stage-and-prepare-image)
-              (lambda (_session path _summary _sub-type callback _errback)
-                (if (equal path path-a)
-                    (progn
-                      ;; The first starter completes before returning.  Its
-                      ;; attachment is consequently owned by the composite
-                      ;; request when the next starter signals.
-                      (funcall
-                       callback
-                       (qq-core-test-prepared-image
-                        "att-aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
-                        "res-ready-before-signal"))
-                      (qq-attachment-operation-create
-                       :active-p nil))
-                  (signal 'file-error
-                          (list "staging exploded" path-b)))))
-             ((symbol-function 'qq-core--release-send-resource)
-              (lambda (resource-id) (push resource-id released-resources)))
-             ((symbol-function 'qq-core--release-send-attachment)
-              (lambda (attachment-id)
-                (push attachment-id released-attachments)))
-             ((symbol-function 'qq-message-send)
-              (lambda (&rest _arguments) (setq sent t))))
-          (condition-case error-data
-              (qq-core-send-message
-               "private:10001"
-               `(((type . "image") (data . ((file . ,path-a))))
-                 ((type . "image") (data . ((file . ,path-b)))))
-               nil nil
-               (lambda (body reason) (setq failure (list body reason))))
-            (file-error (setq caught error-data)))
-          (should (equal caught
-                         (list 'file-error "staging exploded" path-b)))
-          (should (qq-request-p request))
-          (should (eq (qq-request-state request) 'failed))
-          (should-not (qq-request-active-p request))
-          (should (= (hash-table-count qq-request--active) 0))
-          (should-not sent)
-          ;; A synchronous Lisp signal is not translated into the async
-          ;; ERRBACK contract.
-          (should-not failure)
-          (should (equal released-resources
-                         '("res-ready-before-signal")))
-          (should
-           (equal released-attachments
-                  '("att-aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"))))
-      (delete-file path-a)
-      (delete-file path-b))) ))
+    (let ((path-a (make-temp-file "qq-core-image-ready-" nil ".png" "aaa"))
+          (path-b (make-temp-file "qq-core-image-signal-" nil ".png" "bbb"))
+          (qq-request--active (make-hash-table :test #'eq))
+          (real-create (symbol-function 'qq-request-create))
+          request caught sent failure
+          released-resources released-attachments)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'qq-account-current-id)
+                (lambda () "slot-a"))
+               ((symbol-function 'qq-request-create)
+                (lambda (&optional owner cancel-function)
+                  (setq request
+                        (funcall real-create owner cancel-function))))
+               ((symbol-function
+                 'qq-attachment-stage-and-prepare-image)
+                (lambda (_session path _summary _sub-type callback _errback)
+                  (if (equal path path-a)
+                      (progn
+                        ;; The first starter completes before returning.  Its
+                        ;; attachment is consequently owned by the composite
+                        ;; request when the next starter signals.
+                        (funcall
+                         callback
+                         (qq-core-test-prepared-image
+                          "att-aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+                          "res-ready-before-signal"))
+                        (qq-attachment-operation-create
+                         :active-p nil))
+                    (signal 'file-error
+                            (list "staging exploded" path-b)))))
+               ((symbol-function 'qq-core--release-send-resource)
+                (lambda (resource-id) (push resource-id released-resources)))
+               ((symbol-function 'qq-core--release-send-attachment)
+                (lambda (attachment-id)
+                  (push attachment-id released-attachments)))
+               ((symbol-function 'qq-message-send)
+                (lambda (&rest _arguments) (setq sent t))))
+            (condition-case error-data
+                (qq-core-send-message
+                 "private:10001"
+                 `(((type . "image") (data . ((file . ,path-a))))
+                   ((type . "image") (data . ((file . ,path-b)))))
+                 nil nil
+                 (lambda (body reason) (setq failure (list body reason))))
+              (file-error (setq caught error-data)))
+            (should (equal caught
+                           (list 'file-error "staging exploded" path-b)))
+            (should (qq-request-p request))
+            (should (eq (qq-request-state request) 'failed))
+            (should-not (qq-request-active-p request))
+            (should (= (hash-table-count qq-request--active) 0))
+            (should-not sent)
+            ;; A synchronous Lisp signal is not translated into the async
+            ;; ERRBACK contract.
+            (should-not failure)
+            (should (equal released-resources
+                           '("res-ready-before-signal")))
+            (should
+             (equal released-attachments
+                    '("att-aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"))))
+        (delete-file path-a)
+        (delete-file path-b)))))
 
 (ert-deftest qq-core-local-media-starter-quit-cleans-composite-ownership ()
   (qq-core-test-with-managed-account
-  (let ((path-a (make-temp-file "qq-core-image-ready-" nil ".png" "aaa"))
-        (path-b (make-temp-file "qq-core-image-ready-" nil ".png" "bbb"))
-        (path-c (make-temp-file "qq-core-image-quit-" nil ".png" "ccc"))
-        (qq-request--active (make-hash-table :test #'eq))
-        (real-create (symbol-function 'qq-request-create))
-        request operations late-ready caught sent failure
-        released-resources released-attachments)
-    (unwind-protect
-        (cl-letf
-            (((symbol-function 'qq-account-current-id)
-              (lambda () "slot-a"))
-             ((symbol-function 'qq-request-create)
-              (lambda (&optional owner cancel-function)
-                (setq request
-                      (funcall real-create owner cancel-function))))
-             ((symbol-function
-              'qq-attachment-stage-and-prepare-image)
-              (lambda (_session path _summary _sub-type callback _errback)
-                (cond
-                 ((equal path path-c)
-                  (setq late-ready callback)
-                  (signal 'quit nil))
-                 (t
-                  (funcall
-                   callback
-                   (if (equal path path-a)
+    (let ((path-a (make-temp-file "qq-core-image-ready-" nil ".png" "aaa"))
+          (path-b (make-temp-file "qq-core-image-ready-" nil ".png" "bbb"))
+          (path-c (make-temp-file "qq-core-image-quit-" nil ".png" "ccc"))
+          (qq-request--active (make-hash-table :test #'eq))
+          (real-create (symbol-function 'qq-request-create))
+          request operations late-ready caught sent failure
+          released-resources released-attachments)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'qq-account-current-id)
+                (lambda () "slot-a"))
+               ((symbol-function 'qq-request-create)
+                (lambda (&optional owner cancel-function)
+                  (setq request
+                        (funcall real-create owner cancel-function))))
+               ((symbol-function
+                 'qq-attachment-stage-and-prepare-image)
+                (lambda (_session path _summary _sub-type callback _errback)
+                  (cond
+                   ((equal path path-c)
+                    (setq late-ready callback)
+                    (signal 'quit nil))
+                   (t
+                    (funcall
+                     callback
+                     (if (equal path path-a)
+                         (qq-core-test-prepared-image
+                          "att-aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+                          "res-ready-a")
                        (qq-core-test-prepared-image
-                        "att-aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
-                        "res-ready-a")
-                     (qq-core-test-prepared-image
-                      "att-bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb"
-                      "res-ready-b")))
-                  (let ((operation
-                         (qq-attachment-operation-create
-                          :active-p t)))
-                    (push operation operations)
-                    operation)))))
-             ((symbol-function 'qq-core--release-send-resource)
-              (lambda (resource-id) (push resource-id released-resources)))
-             ((symbol-function 'qq-core--release-send-attachment)
-              (lambda (attachment-id)
-                (push attachment-id released-attachments)))
-             ((symbol-function 'qq-message-send)
-              (lambda (&rest _arguments) (setq sent t))))
-          (condition-case error-data
-              (qq-core-send-message
-               "private:10001"
-               `(((type . "image") (data . ((file . ,path-a))))
-                 ((type . "image") (data . ((file . ,path-b))))
-                 ((type . "image") (data . ((file . ,path-c)))))
-               nil nil
-               (lambda (body reason) (setq failure (list body reason))))
-            (quit (setq caught error-data)))
-          (should (equal caught '(quit)))
-          (should (qq-request-p request))
-          (should (eq (qq-request-state request) 'failed))
-          (should-not (qq-request-active-p request))
-          (should (= (hash-table-count qq-request--active) 0))
-          (should (= (length operations) 2))
-          (dolist (operation operations)
-            (should-not
-             (qq-attachment-operation-active-p operation)))
-          (should-not sent)
-          (should-not failure)
-          ;; A late completion is inert and releases the objects it produced.
-          (funcall
-           late-ready
-           (qq-core-test-prepared-image
-            "att-cccccccc-1111-4111-8111-cccccccccccc"
-            "res-ready-c"))
-          (should-not sent)
-          (should
-           (equal (sort released-resources #'string<)
-                  '("res-ready-a" "res-ready-b" "res-ready-c")))
-          (should
-           (equal
-            (sort released-attachments #'string<)
-            '("att-aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
-              "att-bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb"
-              "att-cccccccc-1111-4111-8111-cccccccccccc"))))
-      (delete-file path-a)
-      (delete-file path-b)
-      (delete-file path-c))) ))
+                        "att-bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb"
+                        "res-ready-b")))
+                    (let ((operation
+                           (qq-attachment-operation-create
+                            :active-p t)))
+                      (push operation operations)
+                      operation)))))
+               ((symbol-function 'qq-core--release-send-resource)
+                (lambda (resource-id) (push resource-id released-resources)))
+               ((symbol-function 'qq-core--release-send-attachment)
+                (lambda (attachment-id)
+                  (push attachment-id released-attachments)))
+               ((symbol-function 'qq-message-send)
+                (lambda (&rest _arguments) (setq sent t))))
+            (condition-case error-data
+                (qq-core-send-message
+                 "private:10001"
+                 `(((type . "image") (data . ((file . ,path-a))))
+                   ((type . "image") (data . ((file . ,path-b))))
+                   ((type . "image") (data . ((file . ,path-c)))))
+                 nil nil
+                 (lambda (body reason) (setq failure (list body reason))))
+              (quit (setq caught error-data)))
+            (should (equal caught '(quit)))
+            (should (qq-request-p request))
+            (should (eq (qq-request-state request) 'failed))
+            (should-not (qq-request-active-p request))
+            (should (= (hash-table-count qq-request--active) 0))
+            (should (= (length operations) 2))
+            (dolist (operation operations)
+              (should-not
+               (qq-attachment-operation-active-p operation)))
+            (should-not sent)
+            (should-not failure)
+            ;; A late completion is inert and releases the objects it produced.
+            (funcall
+             late-ready
+             (qq-core-test-prepared-image
+              "att-cccccccc-1111-4111-8111-cccccccccccc"
+              "res-ready-c"))
+            (should-not sent)
+            (should
+             (equal (sort released-resources #'string<)
+                    '("res-ready-a" "res-ready-b" "res-ready-c")))
+            (should
+             (equal
+              (sort released-attachments #'string<)
+              '("att-aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+                "att-bbbbbbbb-1111-4111-8111-bbbbbbbbbbbb"
+                "att-cccccccc-1111-4111-8111-cccccccccccc"))))
+        (delete-file path-a)
+        (delete-file path-b)
+        (delete-file path-c)))))
 
 (ert-deftest qq-core-favorite-materializes-through-image-attachment-in-order ()
   (qq-core-test-with-managed-account
@@ -1323,8 +1322,8 @@
                                errback optimistic))
               "send-favorite-request")))
         (let ((request
-               (qq-core-send-message
-                "group:8209413637" segments "optimistic")))
+                (qq-core-send-message
+                 "group:8209413637" segments "optimistic")))
           (should (qq-request-p request))
           (should (equal (seq-take prepared 2)
                          (list "group:8209413637" favorite-id)))
@@ -1350,67 +1349,67 @@
 
 (ert-deftest qq-core-local-record-is-prepared-before-message-send ()
   (qq-core-test-with-managed-account
-  (let ((path (make-temp-file "qq-core-record-" nil ".wav" "pcm"))
-        (owner "slot-a")
-        operation prepared sent released-resources released-attachments)
-    (unwind-protect
-        (let ((segments
-               `(((type . "text") (data . ((text . "voice:"))))
-                 ((type . "record")
-                  (data . ((file . ,path) (name . "voice.wav")))))))
-          (cl-letf
-              (((symbol-function 'qq-account-current-id)
-                (lambda () owner))
-               ((symbol-function
-                 'qq-attachment-stage-and-prepare-record)
-                (lambda (session record-path callback errback)
-                  (setq prepared
-                        (list session record-path callback errback)
-                        operation
-                        (qq-attachment-operation-create :active-p t))
-                  operation))
-               ((symbol-function 'qq-core--release-send-resource)
-                (lambda (resource-id) (push resource-id released-resources)))
-               ((symbol-function 'qq-core--release-send-attachment)
-                (lambda (attachment-id)
-                  (push attachment-id released-attachments)))
-               ((symbol-function 'qq-message-send)
-                (lambda (session ready-segments
-                                 &optional raw callback errback optimistic)
-                  (setq sent (list session ready-segments raw callback
-                                   errback optimistic))
-                  "send-record-request")))
-            (let ((request
-                   (qq-core-send-message
-                    "private:10001" segments "optimistic")))
-              (should (qq-request-p request))
-              (should (equal (car prepared) "private:10001"))
-              (should (equal (cadr prepared) path))
-              (setf (qq-attachment-operation-active-p operation) nil)
-              (funcall
-               (nth 2 prepared)
-               (qq-core-test-prepared-image
-                "att-dddddddd-dddd-4ddd-8ddd-dddddddddddd"
-                "res-record-ready"))
-              (should (equal (qq-request-token request)
-                             "send-record-request"))
-              (should
-               (equal
-                (nth 1 sent)
-                '(((type . "text") (data . ((text . "voice:"))))
-                  ((type . "record")
-                   (data
-                    . ((attachment_id
-                        . "att-dddddddd-dddd-4ddd-8ddd-dddddddddddd")))))))
-              (should (equal (nth 5 sent) segments))
-              (should-not
-               (string-match-p "qq-core-record-"
-                               (prin1-to-string (nth 1 sent))))
-              (should (equal released-resources '("res-record-ready")))
-              (funcall (nth 3 sent) '((sent . t)))
-              (should (eq (qq-request-state request) 'settled))
-              (should-not released-attachments))))
-      (delete-file path))) ))
+    (let ((path (make-temp-file "qq-core-record-" nil ".wav" "pcm"))
+          (owner "slot-a")
+          operation prepared sent released-resources released-attachments)
+      (unwind-protect
+          (let ((segments
+                 `(((type . "text") (data . ((text . "voice:"))))
+                   ((type . "record")
+                    (data . ((file . ,path) (name . "voice.wav")))))))
+            (cl-letf
+                (((symbol-function 'qq-account-current-id)
+                  (lambda () owner))
+                 ((symbol-function
+                   'qq-attachment-stage-and-prepare-record)
+                  (lambda (session record-path callback errback)
+                    (setq prepared
+                          (list session record-path callback errback)
+                          operation
+                          (qq-attachment-operation-create :active-p t))
+                    operation))
+                 ((symbol-function 'qq-core--release-send-resource)
+                  (lambda (resource-id) (push resource-id released-resources)))
+                 ((symbol-function 'qq-core--release-send-attachment)
+                  (lambda (attachment-id)
+                    (push attachment-id released-attachments)))
+                 ((symbol-function 'qq-message-send)
+                  (lambda (session ready-segments
+                                   &optional raw callback errback optimistic)
+                    (setq sent (list session ready-segments raw callback
+                                     errback optimistic))
+                    "send-record-request")))
+              (let ((request
+                      (qq-core-send-message
+                       "private:10001" segments "optimistic")))
+                (should (qq-request-p request))
+                (should (equal (car prepared) "private:10001"))
+                (should (equal (cadr prepared) path))
+                (setf (qq-attachment-operation-active-p operation) nil)
+                (funcall
+                 (nth 2 prepared)
+                 (qq-core-test-prepared-image
+                  "att-dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+                  "res-record-ready"))
+                (should (equal (qq-request-token request)
+                               "send-record-request"))
+                (should
+                 (equal
+                  (nth 1 sent)
+                  '(((type . "text") (data . ((text . "voice:"))))
+                    ((type . "record")
+                     (data
+                      . ((attachment_id
+                          . "att-dddddddd-dddd-4ddd-8ddd-dddddddddddd")))))))
+                (should (equal (nth 5 sent) segments))
+                (should-not
+                 (string-match-p "qq-core-record-"
+                                 (prin1-to-string (nth 1 sent))))
+                (should (equal released-resources '("res-record-ready")))
+                (funcall (nth 3 sent) '((sent . t)))
+                (should (eq (qq-request-state request) 'settled))
+                (should-not released-attachments))))
+        (delete-file path)))))
 
 (ert-deftest qq-core-local-video-is-prepared-with-thumbnail-before-send ()
   (qq-core-test-with-managed-account
@@ -1442,8 +1441,8 @@
                                      errback optimistic))
                     "send-video-request")))
               (let ((request
-                     (qq-core-send-message
-                      "group:8209413637" segments "optimistic")))
+                      (qq-core-send-message
+                       "group:8209413637" segments "optimistic")))
                 (should (qq-request-p request))
                 (should (equal (car prepared) "group:8209413637"))
                 (should (equal (cadr prepared) path))
@@ -1491,9 +1490,9 @@
              ((symbol-function 'qq-message-send)
               (lambda (&rest _arguments) (setq sent t))))
           (let ((request
-                 (qq-core-send-message
-                  "private:10001"
-                  `(((type . "image") (data . ((file . ,path))))))))
+                  (qq-core-send-message
+                   "private:10001"
+                   `(((type . "image") (data . ((file . ,path))))))))
             (should (qq-attachment-operation-active-p operation))
             (qq-request-cancel request)
             (should-not
@@ -1525,11 +1524,11 @@
              ((symbol-function 'qq-message-send)
               (lambda (&rest _arguments) (setq sent t))))
           (let ((request
-                 (qq-core-send-message
-                  "private:10001"
-                  `(((type . "image") (data . ((file . ,path)))))
-                  nil nil
-                  (lambda (body reason) (setq failure (list body reason))))))
+                  (qq-core-send-message
+                   "private:10001"
+                   `(((type . "image") (data . ((file . ,path)))))
+                   nil nil
+                   (lambda (body reason) (setq failure (list body reason))))))
             (setq owner "slot-b")
             (setf (qq-attachment-operation-active-p operation) nil)
             (funcall
@@ -1548,113 +1547,113 @@
 
 (ert-deftest qq-core-local-image-preflight-failure-releases-prepared-object ()
   (qq-core-test-with-managed-account
-  (let ((path (make-temp-file "qq-core-image-preflight-" nil ".png" "abc"))
-        ready-callback operation failure
-        released-resources released-attachments)
-    (unwind-protect
-        (cl-letf
-            (((symbol-function 'qq-account-current-id)
-              (lambda () "slot-a"))
-             ((symbol-function
-               'qq-attachment-stage-and-prepare-image)
-              (lambda (_session _path _summary _sub-type callback _errback)
-                (setq ready-callback callback
-                      operation
-                      (qq-attachment-operation-create :active-p t))
-                operation))
-             ((symbol-function 'qq-core--release-send-resource)
-              (lambda (resource-id) (push resource-id released-resources)))
-             ((symbol-function 'qq-core--release-send-attachment)
-              (lambda (attachment-id)
-                (push attachment-id released-attachments)))
-             ((symbol-function 'qq-message-send)
-              (lambda (_session _segments &optional _raw _callback errback
-                       _optimistic)
-                (funcall errback
-                         '((code . "capability_unavailable"))
-                         "message.send unavailable")
-                nil)))
-          (let ((request
-                 (qq-core-send-message
-                  "private:10001"
-                  `(((type . "image") (data . ((file . ,path)))))
-                  nil nil
-                  (lambda (body reason) (setq failure (list body reason))))))
-            (setf (qq-attachment-operation-active-p operation) nil)
-            (funcall
-             ready-callback
-             (qq-core-test-prepared-image
-              "att-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
-              "res-image-preflight"))
-            (should (eq (qq-request-state request) 'failed))))
-      (delete-file path))
-    (should (equal released-resources '("res-image-preflight")))
-    (should
-     (equal released-attachments
-            '("att-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")))
-    (should (equal (cadr failure) "message.send unavailable"))) ))
+    (let ((path (make-temp-file "qq-core-image-preflight-" nil ".png" "abc"))
+          ready-callback operation failure
+          released-resources released-attachments)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'qq-account-current-id)
+                (lambda () "slot-a"))
+               ((symbol-function
+                 'qq-attachment-stage-and-prepare-image)
+                (lambda (_session _path _summary _sub-type callback _errback)
+                  (setq ready-callback callback
+                        operation
+                        (qq-attachment-operation-create :active-p t))
+                  operation))
+               ((symbol-function 'qq-core--release-send-resource)
+                (lambda (resource-id) (push resource-id released-resources)))
+               ((symbol-function 'qq-core--release-send-attachment)
+                (lambda (attachment-id)
+                  (push attachment-id released-attachments)))
+               ((symbol-function 'qq-message-send)
+                (lambda (_session _segments &optional _raw _callback errback
+                                  _optimistic)
+                  (funcall errback
+                           '((code . "capability_unavailable"))
+                           "message.send unavailable")
+                  nil)))
+            (let ((request
+                    (qq-core-send-message
+                     "private:10001"
+                     `(((type . "image") (data . ((file . ,path)))))
+                     nil nil
+                     (lambda (body reason) (setq failure (list body reason))))))
+              (setf (qq-attachment-operation-active-p operation) nil)
+              (funcall
+               ready-callback
+               (qq-core-test-prepared-image
+                "att-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+                "res-image-preflight"))
+              (should (eq (qq-request-state request) 'failed))))
+        (delete-file path))
+      (should (equal released-resources '("res-image-preflight")))
+      (should
+       (equal released-attachments
+              '("att-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")))
+      (should (equal (cadr failure) "message.send unavailable")))))
 
 (ert-deftest qq-core-local-image-async-send-failure-releases-submitted-object ()
   (qq-core-test-with-managed-account
-  (let ((path (make-temp-file "qq-core-image-async-failure-" nil ".png" "abc"))
-        ready-callback operation send-errback failure
-        released-resources released-attachments)
-    (unwind-protect
-        (cl-letf
-            (((symbol-function 'qq-account-current-id)
-              (lambda () "slot-a"))
-             ((symbol-function
-               'qq-attachment-stage-and-prepare-image)
-              (lambda (_session _path _summary _sub-type callback _errback)
-                (setq ready-callback callback
-                      operation
-                      (qq-attachment-operation-create :active-p t))
-                operation))
-             ((symbol-function 'qq-core--release-send-resource)
-              (lambda (resource-id) (push resource-id released-resources)))
-             ((symbol-function 'qq-core--release-send-attachment)
-              (lambda (attachment-id)
-                (push attachment-id released-attachments)))
-             ((symbol-function 'qq-message-send)
-              (lambda (_session _segments &optional _raw _callback errback
-                       _optimistic)
-                (setq send-errback errback)
-                "send-async-failure")))
-          (let ((request
-                 (qq-core-send-message
-                  "private:10001"
-                  `(((type . "reply")
-                     (data . ((id . "7348923749823749823"))))
-                    ((type . "image") (data . ((file . ,path)))))
-                  nil nil
-                  (lambda (body reason) (setq failure (list body reason))))))
-            (setf (qq-attachment-operation-active-p operation) nil)
-            (funcall
-             ready-callback
-             (qq-core-test-prepared-image
-              "att-ffffffff-eeee-4eee-8eee-ffffffffffff"
-              "res-image-async-failure"))
-            (should (equal (qq-request-token request)
-                           "send-async-failure"))
-            (should (equal released-resources
-                           '("res-image-async-failure")))
-            (should-not released-attachments)
-            (funcall send-errback
-                     '((code . "message_reference_unknown"))
-                     "reply target is unknown")
-            (should (eq (qq-request-state request) 'failed))
-            (should
-             (equal released-attachments
-                    '("att-ffffffff-eeee-4eee-8eee-ffffffffffff")))
-            (should (equal (cadr failure) "reply target is unknown"))
-            ;; A duplicate terminal callback cannot release the ID twice.
-            (funcall send-errback
-                     '((code . "message_reference_unknown"))
-                     "reply target is unknown")
-            (should
-             (equal released-attachments
-                    '("att-ffffffff-eeee-4eee-8eee-ffffffffffff")))))
-      (delete-file path))) ))
+    (let ((path (make-temp-file "qq-core-image-async-failure-" nil ".png" "abc"))
+          ready-callback operation send-errback failure
+          released-resources released-attachments)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'qq-account-current-id)
+                (lambda () "slot-a"))
+               ((symbol-function
+                 'qq-attachment-stage-and-prepare-image)
+                (lambda (_session _path _summary _sub-type callback _errback)
+                  (setq ready-callback callback
+                        operation
+                        (qq-attachment-operation-create :active-p t))
+                  operation))
+               ((symbol-function 'qq-core--release-send-resource)
+                (lambda (resource-id) (push resource-id released-resources)))
+               ((symbol-function 'qq-core--release-send-attachment)
+                (lambda (attachment-id)
+                  (push attachment-id released-attachments)))
+               ((symbol-function 'qq-message-send)
+                (lambda (_session _segments &optional _raw _callback errback
+                                  _optimistic)
+                  (setq send-errback errback)
+                  "send-async-failure")))
+            (let ((request
+                    (qq-core-send-message
+                     "private:10001"
+                     `(((type . "reply")
+                        (data . ((id . "7348923749823749823"))))
+                       ((type . "image") (data . ((file . ,path)))))
+                     nil nil
+                     (lambda (body reason) (setq failure (list body reason))))))
+              (setf (qq-attachment-operation-active-p operation) nil)
+              (funcall
+               ready-callback
+               (qq-core-test-prepared-image
+                "att-ffffffff-eeee-4eee-8eee-ffffffffffff"
+                "res-image-async-failure"))
+              (should (equal (qq-request-token request)
+                             "send-async-failure"))
+              (should (equal released-resources
+                             '("res-image-async-failure")))
+              (should-not released-attachments)
+              (funcall send-errback
+                       '((code . "message_reference_unknown"))
+                       "reply target is unknown")
+              (should (eq (qq-request-state request) 'failed))
+              (should
+               (equal released-attachments
+                      '("att-ffffffff-eeee-4eee-8eee-ffffffffffff")))
+              (should (equal (cadr failure) "reply target is unknown"))
+              ;; A duplicate terminal callback cannot release the ID twice.
+              (funcall send-errback
+                       '((code . "message_reference_unknown"))
+                       "reply target is unknown")
+              (should
+               (equal released-attachments
+                      '("att-ffffffff-eeee-4eee-8eee-ffffffffffff")))))
+        (delete-file path)))))
 
 (ert-deftest qq-core-url-only-image-fails-before-staging ()
   (let (staged sent)
@@ -1679,7 +1678,7 @@
                  (setq call (list session-key target-id callback errback))
                  "poke-request")))
       (let ((request
-             (qq-core-send-poke "group:8209413637" "10002")))
+              (qq-core-send-poke "group:8209413637" "10002")))
         (should (qq-request-p request))
         (should (equal (qq-request-token request) "poke-request")))
       (should (equal (nth 0 call) "group:8209413637"))
@@ -1697,8 +1696,8 @@
                (server-id . "7348923749823749823")
                (message-seq . "9007199254740999"))))
         (let ((request
-               (qq-core-set-message-reaction
-                message '((emoji-id . "178") (emoji-type . "1")) t)))
+                (qq-core-set-message-reaction
+                 message '((emoji-id . "178") (emoji-type . "1")) t)))
           (should (qq-request-p request))
           (should (equal (qq-request-token request)
                          "reaction-request")))
@@ -1710,144 +1709,144 @@
 
 (ert-deftest qq-core-read-reports-coalesce-to-newest-timeline-message ()
   (qq-core-test-with-managed-account
-  (let ((qq-core--read-operations (make-hash-table :test #'equal))
-        (qq-request--active (make-hash-table :test #'eq))
-        calls completed timeline)
-    (cl-letf (((symbol-function 'qq-account-current-id)
-               (lambda () "slot-a"))
-              ((symbol-function 'qq-core-message-read-capable-p)
-               (lambda (message)
-                 (equal (qq-account-current-id)
-                        (alist-get 'gateway-account-id message))))
-              ((symbol-function 'qq-state-session-messages)
-               (lambda (_session-key) timeline))
-              ((symbol-function 'qq-message-mark-read)
-               (lambda (message &optional callback errback)
-                 (setq calls
-                       (append calls
-                               (list (list message callback errback))))
-                 (format "read-%d" (length calls)))))
-      (let* ((base
-              '((session-key . "group:8209413637")
-                (server-id . "7348923749823749823")
-                (canonical-row-key . "101")
-                (group-id . "8209413637")
-                (gateway-account-id . "slot-a")))
-             (newest (copy-tree base))
-             (middle (copy-tree base)))
-        (setf (alist-get 'server-id newest) nil
-              (alist-get 'canonical-row-key newest) "103"
-              (alist-get 'server-id middle) "7348923749823749824"
-              (alist-get 'canonical-row-key middle) "102")
-        (setq timeline (list base middle newest))
-        (let ((request
-               (qq-core-mark-message-read
-                base (lambda (_receipt) (push 'base completed)))))
-          (should (qq-request-p request))
-          (should
-           (eq
-            (qq-core-mark-message-read
-             newest (lambda (_receipt) (push 'newest completed)))
-            request))
-          ;; A later-but-not-newest intent cannot replace the queued frontier.
-          (should
-           (eq
-            (qq-core-mark-message-read
-             middle (lambda (_receipt) (push 'middle completed)))
-            request)))
-        (let ((other-account (copy-tree newest)))
-          (setf (alist-get 'canonical-row-key other-account) "104"
-                (alist-get 'gateway-account-id other-account) "slot-b")
-          (should-error
-           (qq-core-mark-message-read other-account #'ignore)
-           :type 'user-error))
-        (should (= (length calls) 1))
-        (funcall
-         (nth 1 (car calls))
-         '((account_id . "slot-a")
-           (row_key . "101")))
-        (should (= (length calls) 2))
-        (should (eq (car (cadr calls)) newest))
-        (funcall
-         (nth 1 (cadr calls))
-         '((account_id . "slot-a")
-           (row_key . "103")))
-        ;; MIDDLE never reached the wire and therefore owns no callback result.
-        (should (equal (nreverse completed) '(base newest)))
-        (should (= (hash-table-count qq-core--read-operations) 0))))) ))
+    (let ((qq-core--read-operations (make-hash-table :test #'equal))
+          (qq-request--active (make-hash-table :test #'eq))
+          calls completed timeline)
+      (cl-letf (((symbol-function 'qq-account-current-id)
+                 (lambda () "slot-a"))
+                ((symbol-function 'qq-core-message-read-capable-p)
+                 (lambda (message)
+                   (equal (qq-account-current-id)
+                          (alist-get 'gateway-account-id message))))
+                ((symbol-function 'qq-state-session-messages)
+                 (lambda (_session-key) timeline))
+                ((symbol-function 'qq-message-mark-read)
+                 (lambda (message &optional callback errback)
+                   (setq calls
+                         (append calls
+                                 (list (list message callback errback))))
+                   (format "read-%d" (length calls)))))
+        (let* ((base
+                '((session-key . "group:8209413637")
+                  (server-id . "7348923749823749823")
+                  (canonical-row-key . "101")
+                  (group-id . "8209413637")
+                  (gateway-account-id . "slot-a")))
+               (newest (copy-tree base))
+               (middle (copy-tree base)))
+          (setf (alist-get 'server-id newest) nil
+                (alist-get 'canonical-row-key newest) "103"
+                (alist-get 'server-id middle) "7348923749823749824"
+                (alist-get 'canonical-row-key middle) "102")
+          (setq timeline (list base middle newest))
+          (let ((request
+                  (qq-core-mark-message-read
+                   base (lambda (_receipt) (push 'base completed)))))
+            (should (qq-request-p request))
+            (should
+             (eq
+              (qq-core-mark-message-read
+               newest (lambda (_receipt) (push 'newest completed)))
+              request))
+            ;; A later-but-not-newest intent cannot replace the queued frontier.
+            (should
+             (eq
+              (qq-core-mark-message-read
+               middle (lambda (_receipt) (push 'middle completed)))
+              request)))
+          (let ((other-account (copy-tree newest)))
+            (setf (alist-get 'canonical-row-key other-account) "104"
+                  (alist-get 'gateway-account-id other-account) "slot-b")
+            (should-error
+             (qq-core-mark-message-read other-account #'ignore)
+             :type 'user-error))
+          (should (= (length calls) 1))
+          (funcall
+           (nth 1 (car calls))
+           '((account_id . "slot-a")
+             (row_key . "101")))
+          (should (= (length calls) 2))
+          (should (eq (car (cadr calls)) newest))
+          (funcall
+           (nth 1 (cadr calls))
+           '((account_id . "slot-a")
+             (row_key . "103")))
+          ;; MIDDLE never reached the wire and therefore owns no callback result.
+          (should (equal (nreverse completed) '(base newest)))
+          (should (= (hash-table-count qq-core--read-operations) 0)))))))
 
 (ert-deftest qq-core-read-callback-reentry-sees-live-stable-successor ()
   (qq-core-test-with-managed-account
-  (let ((qq-core--read-operations (make-hash-table :test #'equal))
-        (qq-request--active (make-hash-table :test #'eq))
-        calls cancelled reentered live-successor queued-callback
-        reentered-active-p reentered-is-successor-p timeline)
-    (cl-letf (((symbol-function 'qq-account-current-id)
-               (lambda () "slot-a"))
-              ((symbol-function 'qq-core-message-read-capable-p)
-               (lambda (_message) t))
-              ((symbol-function 'qq-server-cancel)
-               (lambda (token) (push token cancelled)))
-              ((symbol-function 'qq-state-session-messages)
-               (lambda (_session-key) timeline))
-              ((symbol-function 'qq-message-mark-read)
-               (lambda (message &optional callback errback)
-                 (setq calls
-                       (append calls
-                               (list (list message callback errback))))
-                 (format "read-%d" (length calls)))))
-      (let* ((base
-              '((session-key . "group:8209413637")
-                (server-id . "7348923749823749823")
-                (canonical-row-key . "201")
-                (group-id . "8209413637")
-                (gateway-account-id . "slot-a")))
-             (newest (copy-tree base))
-             request)
-        (setf (alist-get 'server-id newest) nil
-              (alist-get 'canonical-row-key newest) "202")
-        (setq timeline (list base newest))
-        (setq request
-              (qq-core-mark-message-read
-               base
-               (lambda (_receipt)
-                 (setq live-successor
-                       (gethash
-                        (qq-core--read-operation-key
-                         "slot-a" "group:8209413637")
-                                qq-core--read-operations)
-                       reentered
-                       (qq-core-mark-message-read newest))
-                 (setq reentered-is-successor-p
-                       (and
-                        (eq reentered request)
-                        (eq reentered
-                            (qq-core--read-operation-request
-                             live-successor)))
-                       reentered-active-p
-                       (qq-request-active-p reentered))
-                 (qq-request-cancel reentered))))
-        (should
-         (eq (qq-core-mark-message-read
-              newest (lambda (_receipt) (setq queued-callback t)))
-             request))
-        (funcall (nth 1 (car calls))
-                 '((account_id . "slot-a")
-                   (row_key . "201")))
-        (should (= (length calls) 2))
-        (should (eq reentered request))
-        (should reentered-is-successor-p)
-        (should reentered-active-p)
-        (should (equal cancelled '("read-2")))
-        (should (eq (qq-request-state request) 'cancelled))
-        (should-not queued-callback)
-        (should (= (hash-table-count qq-core--read-operations) 0))
-        ;; The canceled successor's late completion is inert and cannot
-        ;; dispatch a hidden third request.
-        (funcall (nth 1 (cadr calls))
-                 '((account_id . "slot-a")
-                   (row_key . "202")))
-        (should (= (length calls) 2))))) ))
+    (let ((qq-core--read-operations (make-hash-table :test #'equal))
+          (qq-request--active (make-hash-table :test #'eq))
+          calls cancelled reentered live-successor queued-callback
+          reentered-active-p reentered-is-successor-p timeline)
+      (cl-letf (((symbol-function 'qq-account-current-id)
+                 (lambda () "slot-a"))
+                ((symbol-function 'qq-core-message-read-capable-p)
+                 (lambda (_message) t))
+                ((symbol-function 'qq-server-cancel)
+                 (lambda (token) (push token cancelled)))
+                ((symbol-function 'qq-state-session-messages)
+                 (lambda (_session-key) timeline))
+                ((symbol-function 'qq-message-mark-read)
+                 (lambda (message &optional callback errback)
+                   (setq calls
+                         (append calls
+                                 (list (list message callback errback))))
+                   (format "read-%d" (length calls)))))
+        (let* ((base
+                '((session-key . "group:8209413637")
+                  (server-id . "7348923749823749823")
+                  (canonical-row-key . "201")
+                  (group-id . "8209413637")
+                  (gateway-account-id . "slot-a")))
+               (newest (copy-tree base))
+               request)
+          (setf (alist-get 'server-id newest) nil
+                (alist-get 'canonical-row-key newest) "202")
+          (setq timeline (list base newest))
+          (setq request
+                (qq-core-mark-message-read
+                 base
+                 (lambda (_receipt)
+                   (setq live-successor
+                         (gethash
+                          (qq-core--read-operation-key
+                           "slot-a" "group:8209413637")
+                          qq-core--read-operations)
+                         reentered
+                         (qq-core-mark-message-read newest))
+                   (setq reentered-is-successor-p
+                         (and
+                          (eq reentered request)
+                          (eq reentered
+                              (qq-core--read-operation-request
+                               live-successor)))
+                         reentered-active-p
+                         (qq-request-active-p reentered))
+                   (qq-request-cancel reentered))))
+          (should
+           (eq (qq-core-mark-message-read
+                newest (lambda (_receipt) (setq queued-callback t)))
+               request))
+          (funcall (nth 1 (car calls))
+                   '((account_id . "slot-a")
+                     (row_key . "201")))
+          (should (= (length calls) 2))
+          (should (eq reentered request))
+          (should reentered-is-successor-p)
+          (should reentered-active-p)
+          (should (equal cancelled '("read-2")))
+          (should (eq (qq-request-state request) 'cancelled))
+          (should-not queued-callback)
+          (should (= (hash-table-count qq-core--read-operations) 0))
+          ;; The canceled successor's late completion is inert and cannot
+          ;; dispatch a hidden third request.
+          (funcall (nth 1 (cadr calls))
+                   '((account_id . "slot-a")
+                     (row_key . "202")))
+          (should (= (length calls) 2)))))))
 
 (ert-deftest qq-core-account-selection-preserves-both-read-operations ()
   (qq-core-test-with-managed-account
@@ -1903,84 +1902,84 @@
 
 (ert-deftest qq-core-read-coalescer-survives-same-slot-runtime-restart ()
   (qq-core-test-with-managed-account
-  (let ((qq-core--read-operations (make-hash-table :test #'equal))
-        (qq-request--active (make-hash-table :test #'eq))
-        (current-account-id "slot-a")
-        calls cancelled failures completed timeline)
-    (cl-letf (((symbol-function 'qq-account-current-id)
-               (lambda () current-account-id))
-              ((symbol-function 'qq-core-message-read-capable-p)
-               (lambda (message)
-                 (equal current-account-id
-                        (alist-get 'gateway-account-id message))))
-              ((symbol-function 'qq-server-cancel)
-               (lambda (token) (push token cancelled)))
-              ((symbol-function 'qq-state-session-messages)
-               (lambda (_session-key) timeline))
-              ((symbol-function 'qq-message-mark-read)
-               (lambda (message &optional callback errback)
-                 (setq calls
-                       (append calls (list (list message callback errback))))
-                 (format "read-%d" (length calls)))))
-      (let* ((old
-              '((session-key . "group:8209413637")
-                (server-id . "7348923749823749823")
-                (canonical-row-key . "401")
-                (group-id . "8209413637")
-                (gateway-account-id . "slot-a")))
-             (new (copy-tree old))
-             (request
-              (qq-core-mark-message-read
-               old #'ignore
-               (lambda (_body reason) (push reason failures)))))
-        (setf (alist-get 'server-id new) nil
-              (alist-get 'canonical-row-key new) "402")
-        (setq timeline (list old new))
-        ;; A registry update for the same stable slot must not revoke the
-        ;; coalescer's outer request.
-        (qq-core--revoke-stale-read-operations)
-        (should (qq-request-active-p request))
-        (should-not cancelled)
-        (should (eq (qq-core-mark-message-read
-                     new (lambda (_receipt) (push 'new completed)))
-                    request))
-        ;; An in-flight adapter failure reports through the stable outer
-        ;; operation and advances its queued cursor.
-        (funcall (nth 2 (car calls))
-                 '((code . "stale_request")) "runtime changed")
-        (should (equal failures '("runtime changed")))
-        (should (= (length calls) 2))
-        (should (eq (car (cadr calls)) new))
-        (funcall (nth 1 (cadr calls))
-                 '((account_id . "slot-a")
-                   (row_key . "402")))
-        (should (equal completed '(new)))
-        (should (= (hash-table-count qq-core--read-operations) 0))))) ))
+    (let ((qq-core--read-operations (make-hash-table :test #'equal))
+          (qq-request--active (make-hash-table :test #'eq))
+          (current-account-id "slot-a")
+          calls cancelled failures completed timeline)
+      (cl-letf (((symbol-function 'qq-account-current-id)
+                 (lambda () current-account-id))
+                ((symbol-function 'qq-core-message-read-capable-p)
+                 (lambda (message)
+                   (equal current-account-id
+                          (alist-get 'gateway-account-id message))))
+                ((symbol-function 'qq-server-cancel)
+                 (lambda (token) (push token cancelled)))
+                ((symbol-function 'qq-state-session-messages)
+                 (lambda (_session-key) timeline))
+                ((symbol-function 'qq-message-mark-read)
+                 (lambda (message &optional callback errback)
+                   (setq calls
+                         (append calls (list (list message callback errback))))
+                   (format "read-%d" (length calls)))))
+        (let* ((old
+                '((session-key . "group:8209413637")
+                  (server-id . "7348923749823749823")
+                  (canonical-row-key . "401")
+                  (group-id . "8209413637")
+                  (gateway-account-id . "slot-a")))
+               (new (copy-tree old))
+               (request
+                 (qq-core-mark-message-read
+                  old #'ignore
+                  (lambda (_body reason) (push reason failures)))))
+          (setf (alist-get 'server-id new) nil
+                (alist-get 'canonical-row-key new) "402")
+          (setq timeline (list old new))
+          ;; A registry update for the same stable slot must not revoke the
+          ;; coalescer's outer request.
+          (qq-core--revoke-stale-read-operations)
+          (should (qq-request-active-p request))
+          (should-not cancelled)
+          (should (eq (qq-core-mark-message-read
+                       new (lambda (_receipt) (push 'new completed)))
+                      request))
+          ;; An in-flight adapter failure reports through the stable outer
+          ;; operation and advances its queued cursor.
+          (funcall (nth 2 (car calls))
+                   '((code . "stale_request")) "runtime changed")
+          (should (equal failures '("runtime changed")))
+          (should (= (length calls) 2))
+          (should (eq (car (cadr calls)) new))
+          (funcall (nth 1 (cadr calls))
+                   '((account_id . "slot-a")
+                     (row_key . "402")))
+          (should (equal completed '(new)))
+          (should (= (hash-table-count qq-core--read-operations) 0)))))))
 
 (ert-deftest qq-core-read-capability-requires-current-account-slot ()
   (qq-core-test-with-managed-account
-  (let ((message
-         '((session-key . "private:10001")
-           (server-id . "7348923749823749823")
-           (canonical-row-key . "501")
-           (gateway-account-id . "slot-a"))))
-    (cl-letf (((symbol-function 'qq-core-ready-p) (lambda () t))
-              ((symbol-function 'qq-server-capabilities)
-               (lambda () '("message.mark_read")))
-              ((symbol-function 'qq-account-current-id)
-               (lambda () "slot-a"))
-              ((symbol-function 'qq-account-current)
-               (lambda () '((phase . "online")))))
-      (should (qq-core-message-read-capable-p message))
-      (let ((other-account (copy-tree message)))
-        (setf (alist-get 'gateway-account-id other-account) "slot-b")
-        (should-not (qq-core-message-read-capable-p other-account)))
-      (let ((missing-row (copy-tree message)))
-        (setf (alist-get 'canonical-row-key missing-row) nil)
-        (should-not (qq-core-message-read-capable-p missing-row)))
-      (let ((service (copy-tree message)))
-        (setf (alist-get 'session-key service) "service:u_peer")
-        (should-not (qq-core-message-read-capable-p service))))) ))
+    (let ((message
+           '((session-key . "private:10001")
+             (server-id . "7348923749823749823")
+             (canonical-row-key . "501")
+             (gateway-account-id . "slot-a"))))
+      (cl-letf (((symbol-function 'qq-core-ready-p) (lambda () t))
+                ((symbol-function 'qq-server-capabilities)
+                 (lambda () '("message.mark_read")))
+                ((symbol-function 'qq-account-current-id)
+                 (lambda () "slot-a"))
+                ((symbol-function 'qq-account-current)
+                 (lambda () '((phase . "online")))))
+        (should (qq-core-message-read-capable-p message))
+        (let ((other-account (copy-tree message)))
+          (setf (alist-get 'gateway-account-id other-account) "slot-b")
+          (should-not (qq-core-message-read-capable-p other-account)))
+        (let ((missing-row (copy-tree message)))
+          (setf (alist-get 'canonical-row-key missing-row) nil)
+          (should-not (qq-core-message-read-capable-p missing-row)))
+        (let ((service (copy-tree message)))
+          (setf (alist-get 'session-key service) "service:u_peer")
+          (should-not (qq-core-message-read-capable-p service)))))))
 
 (ert-deftest qq-core-capabilities-follow-negotiated-methods ()
   (cl-letf (((symbol-function 'qq-server-capabilities)
@@ -2033,12 +2032,12 @@
         (dolist (call calls)
           (should (eq (nth 0 call) message))
           (should (functionp (nth 3 call)))))
-    (should-error
-     (qq-core-set-message-todo
-      '((session-key . "group:8209413637")
-        (server-id . "7348923749823749823"))
-     'finish)
-     :type 'user-error))))
+      (should-error
+       (qq-core-set-message-todo
+        '((session-key . "group:8209413637")
+          (server-id . "7348923749823749823"))
+        'finish)
+       :type 'user-error))))
 
 (ert-deftest qq-core-poke-recall-routes-whole-message ()
   (let ((qq-account--current-account-id "slot-a") call)
@@ -2111,9 +2110,9 @@
                           :message-count 0))
                    "history-page")))
         (let ((request
-               (qq-core-fetch-history-page
-                "group:8209413637" nil 'older
-                (lambda (meta) (setq callback-meta meta)) nil 20)))
+                (qq-core-fetch-history-page
+                 "group:8209413637" nil 'older
+                 (lambda (meta) (setq callback-meta meta)) nil 20)))
           (should (qq-request-p request))
           (should
            (equal call '("group:8209413637" nil older 20)))
@@ -2164,10 +2163,10 @@
                           :message-count 0))
                    "history-page")))
         (let ((request
-               (qq-core-fetch-history-page
-                "private:10001" nil 'older
-                (lambda (meta) (setq callback-meta meta))
-                nil 20)))
+                (qq-core-fetch-history-page
+                 "private:10001" nil 'older
+                 (lambda (meta) (setq callback-meta meta))
+                 nil 20)))
           (should (qq-request-p request)))
         (should
          (equal call
@@ -2276,8 +2275,8 @@
                    (setq call (list session center count))
                    "history-around")))
         (let ((request
-               (qq-core-fetch-history-around
-                "private:10001" "7348923749823749823" #'ignore nil 20)))
+                (qq-core-fetch-history-around
+                 "private:10001" "7348923749823749823" #'ignore nil 20)))
           (should (qq-request-p request)))
         (should
          (equal call
@@ -2294,9 +2293,9 @@
                    (setq call (list session center count))
                    "history-around")))
         (let ((request
-               (qq-core-fetch-history-around
-                "group:8209413637" nil #'ignore nil 20
-                "9007199254740999")))
+                (qq-core-fetch-history-around
+                 "group:8209413637" nil #'ignore nil 20
+                 "9007199254740999")))
           (should (qq-request-p request)))
         (should
          (equal call
@@ -2329,33 +2328,33 @@
 
 (ert-deftest qq-core-recent-bootstrap-waits-for-current-directory-bootstrap ()
   (qq-core-test-with-managed-account
-   (let* ((token (list 'directory-bootstrap))
-          (qq-core--bootstraps (make-hash-table :test #'equal))
-          (qq-core--recent-bootstrap-instances
-           (make-hash-table :test #'equal))
-          (bootstrap
-           (qq-core--bootstrap-create
-            :owner "slot-a"
-            :instance-id "gateway-a"
-            :token token
-            :pending 1))
-          (recent-calls 0))
-     (puthash "slot-a" bootstrap qq-core--bootstraps)
-     (cl-letf
-         (((symbol-function 'qq-server-ready-p) (lambda () t))
-          ((symbol-function 'qq-server-gateway-instance-id)
-           (lambda () "gateway-a"))
-          ((symbol-function 'qq-core-supports-p)
-           (lambda (_capability) t))
-          ((symbol-function 'qq-core-refresh-recent-conversations)
-           (lambda (&rest _arguments) (cl-incf recent-calls))))
-       (qq-core--bootstrap-managed-recents)
-       (should (= recent-calls 0))
-       (qq-core--bootstrap-success "slot-a" token nil)
-       (should (= recent-calls 1))
-       (should (equal (gethash "slot-a"
-                               qq-core--recent-bootstrap-instances)
-                      "gateway-a"))))))
+    (let* ((token (list 'directory-bootstrap))
+           (qq-core--bootstraps (make-hash-table :test #'equal))
+           (qq-core--recent-bootstrap-instances
+            (make-hash-table :test #'equal))
+           (bootstrap
+            (qq-core--bootstrap-create
+             :owner "slot-a"
+             :instance-id "gateway-a"
+             :token token
+             :pending 1))
+           (recent-calls 0))
+      (puthash "slot-a" bootstrap qq-core--bootstraps)
+      (cl-letf
+          (((symbol-function 'qq-server-ready-p) (lambda () t))
+           ((symbol-function 'qq-server-gateway-instance-id)
+            (lambda () "gateway-a"))
+           ((symbol-function 'qq-core-supports-p)
+            (lambda (_capability) t))
+           ((symbol-function 'qq-core-refresh-recent-conversations)
+            (lambda (&rest _arguments) (cl-incf recent-calls))))
+        (qq-core--bootstrap-managed-recents)
+        (should (= recent-calls 0))
+        (qq-core--bootstrap-success "slot-a" token nil)
+        (should (= recent-calls 1))
+        (should (equal (gethash "slot-a"
+                                qq-core--recent-bootstrap-instances)
+                       "gateway-a"))))))
 
 (ert-deftest qq-core-bootstrap-coalesces-one-owner ()
   (qq-core-test-with-managed-account

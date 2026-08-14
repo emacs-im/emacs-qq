@@ -1368,96 +1368,96 @@ and the recently observed sender map before showing the bare UIN."
 EXPECTED-PRIVATE-PEER-UID constrains a private payload without supplying any
 missing wire identity."
   (let* ((chat-type (qq-state--normalize-id (qq-state--message-chat-type message)))
-           (peer-uid (qq-state--message-peer-uid message))
-           (peer-uin (qq-state--message-peer-uin message))
-           (session-key (qq-state--raw-message-session-key
-                         message expected-session-key))
-           (session-identity
-            (and session-key (qq-state-session-key-identity session-key)))
-           (sender (alist-get 'sender message))
-           (sender-id (qq-state--normalize-id
-                       (or (alist-get 'user_id sender)
-                           (alist-get 'user_id message))))
-           (sender-id (if (and (qq-state--dataline-chat-type-p chat-type)
-                               (equal sender-id "0"))
-                          nil
-                        sender-id))
-           (sender-fields (qq-state--sender-display-fields session-key sender sender-id))
-           ;; Learn non-friend display names from ordinary senders: QQ fills
-           ;; some GrayTip name parameters with the raw UIN, and this local
-           ;; map is the only presentation fallback for those senders.
-           (observed-sender-name (alist-get 'sender-name sender-fields))
-           (sender-name (and sender-id
-                             (stringp observed-sender-name)
-                             (not (string-empty-p observed-sender-name))
-                             (not (equal observed-sender-name sender-id))
-                             (not (equal observed-sender-name "unknown"))
-                             observed-sender-name))
-           (recalled-p (qq-state--raw-message-recalled-p message))
-           (segments (if recalled-p '() (or (alist-get 'message message) '())))
-           (mention-kinds (qq-state--mention-kinds-from-segments segments))
-           (raw-message (if recalled-p
-                            "[message recalled]"
-                          (or (alist-get 'raw_message message)
-                              (qq-state-message-preview-from-segments segments)
-                              "")))
-           ;; NapCat hard-cut: message_id is the NT snowflake string (never coerce
-           ;; with string-to-number — snowflakes exceed fixnum precision).
-           (server-id
-            (qq-protocol-optional-message-id
-             (or (alist-get 'message_id message)
-                 (alist-get 'id message))
-             "message event"))
-           (self-p (qq-state--message-self-p message))
-           (status (cond
-                    (recalled-p 'recalled)
-                    (self-p 'sent)
-                    (t 'received)))
-           (time (qq-state--normalize-time (alist-get 'time message)))
-           (target-id (alist-get 'target-id session-identity)))
-      (when (and expected-private-peer-uid
-                 (eq (alist-get 'type session-identity) 'private)
-                 peer-uid
-                 (not (equal peer-uid expected-private-peer-uid)))
-        (error "qq: private latest message contradicts its contact UID"))
-      (when sender-name
-        (puthash sender-id sender-name qq-state--known-user-names))
-      `((id . ,server-id)
-        (server-id . ,server-id)
-        (session-key . ,session-key)
-        (time . ,time)
-        (message-seq . ,(let ((sequence (alist-get 'message_seq message)))
-                          (and (qq-protocol--nonzero-decimal-string-p sequence)
-                               sequence)))
-        (sender-id . ,sender-id)
-        (sender-name . ,(alist-get 'sender-name sender-fields))
-        (sender-secondary-name . ,(alist-get 'sender-secondary-name sender-fields))
-        (sender-card . ,(alist-get 'sender-card sender-fields))
-        (sender-nickname . ,(alist-get 'sender-nickname sender-fields))
-        (sender-remark . ,(alist-get 'sender-remark sender-fields))
-        (self-p . ,self-p)
-        (status . ,status)
-        (timeline-class . authored)
-        (segments . ,segments)
-        (mention-kinds . ,mention-kinds)
-        (contains-mention-p . ,(and mention-kinds t))
-        (raw-message . ,raw-message)
-        (preview . ,(if recalled-p
-                        "[message recalled]"
-                      (qq-state-message-preview-from-segments segments)))
-        (message-type . ,(alist-get 'message_type message))
-        (chat-type . ,chat-type)
-        (peer-uid . ,peer-uid)
-        (peer-uin . ,peer-uin)
-        (peer-name . ,(qq-state--present-string (alist-get 'peer_name message)))
-        (group-id . ,(qq-state--normalize-id (alist-get 'group_id message)))
-        (user-id . ,(qq-state--normalize-id (alist-get 'user_id message)))
-        (target-id . ,target-id)
-        ,@(when (assq 'emoji_likes_list message)
-            `((reactions . ,(qq-state--normalize-reactions
-                             (alist-get 'emoji_likes_list message)))))
-        (order . ,(qq-state--next-message-order))
-        (raw-event . ,(copy-tree message)))))
+         (peer-uid (qq-state--message-peer-uid message))
+         (peer-uin (qq-state--message-peer-uin message))
+         (session-key (qq-state--raw-message-session-key
+                       message expected-session-key))
+         (session-identity
+          (and session-key (qq-state-session-key-identity session-key)))
+         (sender (alist-get 'sender message))
+         (sender-id (qq-state--normalize-id
+                     (or (alist-get 'user_id sender)
+                         (alist-get 'user_id message))))
+         (sender-id (if (and (qq-state--dataline-chat-type-p chat-type)
+                             (equal sender-id "0"))
+                        nil
+                      sender-id))
+         (sender-fields (qq-state--sender-display-fields session-key sender sender-id))
+         ;; Learn non-friend display names from ordinary senders: QQ fills
+         ;; some GrayTip name parameters with the raw UIN, and this local
+         ;; map is the only presentation fallback for those senders.
+         (observed-sender-name (alist-get 'sender-name sender-fields))
+         (sender-name (and sender-id
+                           (stringp observed-sender-name)
+                           (not (string-empty-p observed-sender-name))
+                           (not (equal observed-sender-name sender-id))
+                           (not (equal observed-sender-name "unknown"))
+                           observed-sender-name))
+         (recalled-p (qq-state--raw-message-recalled-p message))
+         (segments (if recalled-p '() (or (alist-get 'message message) '())))
+         (mention-kinds (qq-state--mention-kinds-from-segments segments))
+         (raw-message (if recalled-p
+                          "[message recalled]"
+                        (or (alist-get 'raw_message message)
+                            (qq-state-message-preview-from-segments segments)
+                            "")))
+         ;; NapCat hard-cut: message_id is the NT snowflake string (never coerce
+         ;; with string-to-number — snowflakes exceed fixnum precision).
+         (server-id
+          (qq-protocol-optional-message-id
+           (or (alist-get 'message_id message)
+               (alist-get 'id message))
+           "message event"))
+         (self-p (qq-state--message-self-p message))
+         (status (cond
+                  (recalled-p 'recalled)
+                  (self-p 'sent)
+                  (t 'received)))
+         (time (qq-state--normalize-time (alist-get 'time message)))
+         (target-id (alist-get 'target-id session-identity)))
+    (when (and expected-private-peer-uid
+               (eq (alist-get 'type session-identity) 'private)
+               peer-uid
+               (not (equal peer-uid expected-private-peer-uid)))
+      (error "qq: private latest message contradicts its contact UID"))
+    (when sender-name
+      (puthash sender-id sender-name qq-state--known-user-names))
+    `((id . ,server-id)
+      (server-id . ,server-id)
+      (session-key . ,session-key)
+      (time . ,time)
+      (message-seq . ,(let ((sequence (alist-get 'message_seq message)))
+                        (and (qq-protocol--nonzero-decimal-string-p sequence)
+                             sequence)))
+      (sender-id . ,sender-id)
+      (sender-name . ,(alist-get 'sender-name sender-fields))
+      (sender-secondary-name . ,(alist-get 'sender-secondary-name sender-fields))
+      (sender-card . ,(alist-get 'sender-card sender-fields))
+      (sender-nickname . ,(alist-get 'sender-nickname sender-fields))
+      (sender-remark . ,(alist-get 'sender-remark sender-fields))
+      (self-p . ,self-p)
+      (status . ,status)
+      (timeline-class . authored)
+      (segments . ,segments)
+      (mention-kinds . ,mention-kinds)
+      (contains-mention-p . ,(and mention-kinds t))
+      (raw-message . ,raw-message)
+      (preview . ,(if recalled-p
+                      "[message recalled]"
+                    (qq-state-message-preview-from-segments segments)))
+      (message-type . ,(alist-get 'message_type message))
+      (chat-type . ,chat-type)
+      (peer-uid . ,peer-uid)
+      (peer-uin . ,peer-uin)
+      (peer-name . ,(qq-state--present-string (alist-get 'peer_name message)))
+      (group-id . ,(qq-state--normalize-id (alist-get 'group_id message)))
+      (user-id . ,(qq-state--normalize-id (alist-get 'user_id message)))
+      (target-id . ,target-id)
+      ,@(when (assq 'emoji_likes_list message)
+          `((reactions . ,(qq-state--normalize-reactions
+                           (alist-get 'emoji_likes_list message)))))
+      (order . ,(qq-state--next-message-order))
+      (raw-event . ,(copy-tree message)))))
 
 (defun qq-state--emacs-search-chat-session-key (chat)
   "Return canonical group/private session key represented by closed CHAT."

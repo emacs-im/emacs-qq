@@ -43,7 +43,7 @@ BODY may refer to the lexical variable `view'."
   (let (action params result)
     (cl-letf (((symbol-function 'qq-api-call)
                (lambda (candidate-action candidate-params callback
-                        &optional _errback)
+                                         &optional _errback)
                  (setq action candidate-action
                        params candidate-params)
                  (funcall callback
@@ -66,16 +66,16 @@ BODY may refer to the lexical variable `view'."
                  (funcall callback
                           `((data . ((group_id . "20001")
                                      (notices .
-                                      (((notice_id . "notice-one")
-                                        (sender_id . 10001)
-                                        (published_at . 1)
-                                        (title)
-                                        (text . "Synthetic")
-                                        (images)
-                                        (read_count)
-                                        (read)
-                                        (confirmation_required)
-                                        (all_confirmed))))))))
+                                              (((notice_id . "notice-one")
+                                                (sender_id . 10001)
+                                                (published_at . 1)
+                                                (title)
+                                                (text . "Synthetic")
+                                                (images)
+                                                (read_count)
+                                                (read)
+                                                (confirmation_required)
+                                                (all_confirmed))))))))
                  'request)))
       (qq-api-get-group-notices
        "20001" #'ignore

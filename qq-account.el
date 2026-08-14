@@ -836,8 +836,8 @@ snapshot; ERRBACK receives a failure body and reason."
 CALLBACK receives the snapshot; ERRBACK receives a failure body and reason."
   (interactive
    (let ((account-id (qq-account--read-account-id "Stop Native Session: ")))
-      (unless (yes-or-no-p
-               (format "Stop Native Session %s and retain quick login? " account-id))
+     (unless (yes-or-no-p
+              (format "Stop Native Session %s and retain quick login? " account-id))
        (user-error "qq: Account stop cancelled"))
      (list account-id #'qq-account--interactive-success
            #'qq-account--interactive-error)))

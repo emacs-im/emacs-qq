@@ -5370,9 +5370,9 @@ client, never as a doubled display name."
         (should (equal (get-text-property (- (match-beginning 0) 1)
                                           'display)
                        `(space :align-to
-                               ,(- 50
-                                   (string-width
-                                    (qq-chat--format-time 1710000001))))))))))
+                         ,(- 50
+                             (string-width
+                              (qq-chat--format-time 1710000001))))))))))
 
 (ert-deftest qq-chat-avatar-spans-heading-and-first-body-line ()
   (with-temp-buffer
