@@ -162,9 +162,9 @@ used only when its QQ number agrees with ACCOUNT."
           (cond
            (gateway-p "account manager")
            (account
-              (format "%s — %s"
-                      (qq-root--account-title account self-info)
-                      (alist-get 'phase account)))
+            (format "%s — %s"
+                    (qq-root--account-title account self-info)
+                    (alist-get 'phase account)))
            (t "account no longer managed")))
          (registry-summary
           (and (> account-count 1)
@@ -320,24 +320,45 @@ prominent even when the badge is unavailable or the session muted."
                                   (alist-get 'key session)
                                   "session"))))))
 
-(defun qq-root--session-preview-model (session)
-  "Return the one-line preview model for SESSION.
+(defun qq-root--session-last-message (session)
+  "Return SESSION's cached latest message object, or nil."
+  (when-let* ((session-key (alist-get 'key session)))
+    (let ((identities
+           (delete-dups
+            (delq nil
+                  (list (alist-get 'last-message-id session)
+                        (alist-get 'last-message-local-id session))))))
+      (seq-find
+       (lambda (message)
+         (seq-some
+          (lambda (identity)
+            (member identity
+                    (delq nil
+                          (list (qq-state-message-anchor message)
+                                (alist-get 'server-id message)
+                                (alist-get 'id message)
+                                (alist-get 'local-id message)))))
+          identities))
+       (qq-state-session-messages session-key)))))
 
-Mirrors telega `telega-ins--chat-status': peer chat-actions (typing) take
-priority over the last-message preview.  Group previews identify an ordinary
-message's sender; private previews do so only for outgoing messages, since the
-session title already identifies an incoming peer.  The model keeps the sender
-prefix length and face separate so the shared row renderer can style it like a
-message title rather than like dimmed preview content."
+(defun qq-root--session-preview-model (session)
+  "Return the Appkit one-line preview for SESSION.
+
+Peer chat-actions take priority over the last message.  Group previews identify
+an ordinary message's sender; private previews do so only for outgoing
+messages, since the session title already identifies an incoming peer."
   (let* ((session-key (alist-get 'key session))
-         (action-text (and qq-chat-show-peer-actions
-                           session-key
-                           (qq-state-preview-one-line
-                            (qq-state-action-text session-key))))
-         (preview (qq-state-preview-one-line
-                   (alist-get 'last-message-preview session)))
-         (sender (qq-state-preview-one-line
-                  (alist-get 'last-message-sender-name session)))
+         (action-text
+          (and qq-chat-show-peer-actions
+               session-key
+               (qq-state-preview-one-line
+                (qq-state-action-text session-key))))
+         (preview
+          (qq-state-preview-one-line
+           (alist-get 'last-message-preview session)))
+         (sender
+          (qq-state-preview-one-line
+           (alist-get 'last-message-sender-name session)))
          (show-sender-p
           (and (not (string-empty-p sender))
                (pcase (alist-get 'type session)
@@ -345,19 +366,35 @@ message title rather than like dimmed preview content."
                  ('private (eq (alist-get 'last-message-self-p session) t))
                  (_ nil)))))
     (if (and (stringp action-text) (not (string-empty-p action-text)))
-        (list :text (concat (or qq-chat-action-prefix ".. ") action-text))
-      (if (and show-sender-p (not (string-empty-p preview)))
-          (let ((prefix (concat sender ": ")))
-            (list :text (concat prefix preview)
-                  :leading-length (length prefix)
-                  :leading-face (if (eq (alist-get 'last-message-self-p session) t)
-                                    'qq-msg-self-title
-                                  'qq-msg-user-title)))
-        (list :text preview)))))
+        (appkit-ui-one-line-preview-create
+         :text (concat (or qq-chat-action-prefix ".. ") action-text))
+      (let ((label
+             (and show-sender-p
+                  (not (string-empty-p preview))
+                  sender)))
+        (qq-media-message-one-line-preview
+         (qq-root--session-last-message session)
+         preview
+         :label label
+         :separator (and label ":")
+         :label-face
+         (and label
+              (if (eq (alist-get 'last-message-self-p session) t)
+                  'qq-msg-self-title
+                'qq-msg-user-title)))))))
 
 (defun qq-root--session-preview-text (session)
-  "Return SESSION's one-line preview text."
-  (plist-get (qq-root--session-preview-model session) :text))
+  "Return SESSION's flattened one-line preview text."
+  (let* ((preview (qq-root--session-preview-model session))
+         (label (or (appkit-ui-one-line-preview-label preview) ""))
+         (separator
+          (or (appkit-ui-one-line-preview-separator preview) ""))
+         (text (or (appkit-ui-one-line-preview-text preview) "")))
+    (appkit-ui-one-line-text
+     (if (string-empty-p label)
+         text
+       (concat label separator
+               (unless (string-empty-p text) (concat " " text)))))))
 
 (defun qq-root--session-one-line-row (session)
   "Return one-line row model for SESSION."
@@ -365,15 +402,13 @@ message title rather than like dimmed preview content."
          (unread (or (alist-get 'unread-badge-count session) 0))
          (muted (qq-root--session-muted-p session))
          (important (qq-root--session-important-unread-p session))
-         (preview-model (qq-root--session-preview-model session)))
+         (preview (qq-root--session-preview-model session)))
     (appkit-view-one-line-row-create
      :icon-inserter (lambda ()
                       (qq-root--insert-session-icon session))
      :context (qq-root--session-context-label session)
      :context-trail (qq-root--session-unread-trail session)
-     :preview (plist-get preview-model :text)
-     :preview-leading-length (plist-get preview-model :leading-length)
-     :preview-leading-face (plist-get preview-model :leading-face)
+     :preview preview
      ;; Unread activity lives in the title trail.  Keep a dedicated time-tail
      ;; face (meant for a trailing status glyph) off the plain timestamp.
      :time (qq-root--format-time (alist-get 'last-message-time session))
@@ -382,7 +417,7 @@ message title rather than like dimmed preview content."
      :line-properties
      (list 'qq-root-row-type 'session
            'qq-root-session-key session-key
-            'qq-root-badge-count unread
+           'qq-root-badge-count unread
            'qq-root-has-unread (and (> unread 0) t)
            'qq-root-muted-p muted
            'qq-root-has-important-unread (and important t))
@@ -701,7 +736,7 @@ candidate line.  When WRAP is non-nil, wrap to buffer edge once."
   (unless (qq-root--move-linewise
            1
            (lambda ()
-              (> (or (get-text-property (point) 'qq-root-badge-count) 0) 0))
+             (> (or (get-text-property (point) 'qq-root-badge-count) 0) 0))
            t)
     (message "qq: no unread sessions")))
 
@@ -820,10 +855,10 @@ an application session merely to discover that no root is open."
                 (and (appkit-app-live-p qq-runtime--app)
                      qq-runtime--app))))
     (when app
-    (when-let* ((view (appkit-view-for-id app 'root)))
-      (and (with-current-buffer (appkit-view-buffer view)
-             (derived-mode-p 'qq-root-mode))
-           view)))))
+      (when-let* ((view (appkit-view-for-id app 'root)))
+        (and (with-current-buffer (appkit-view-buffer view)
+               (derived-mode-p 'qq-root-mode))
+             view)))))
 
 (cl-defun qq-root--queue-invalidation
     (&key account-id structure part parts entry entries position)
@@ -857,30 +892,30 @@ ACCOUNT-ID may be `gateway' to open the multi-account manager."
     (if owner
         (qq-runtime-with-account owner
           (let* ((app (qq-runtime-app owner))
-             (existing (appkit-view-for-id app 'root))
-             (name (qq-runtime-account-display-name owner))
-             (view
-              (qq-runtime-open-account-view
-               :account-id owner
-               :id 'root
-               :mode 'qq-root-mode
-               :buffer-name (format "*qq-root:%s*" name)
-               :sync-function #'qq-root--sync-invalidations
-               :parts '(header entries geometry)
-               :setup (apply-partially #'qq-root--setup-scope owner)
-               :select t))
-             (buffer (appkit-view-buffer view)))
-        (with-current-buffer buffer
-          (setq-local qq-root--scope owner)
-          (unless existing
-            ;; A newly attached (including reattached) view gets one explicit
-            ;; initial projection after it has a real display window.
-            (appkit-invalidate view :structure t :part 'header)
-            (appkit-sync-invalidations view))
-          (qq-root--reflow-visible nil)
-          (unless (qq-root--session-key-at-point)
-            (goto-char (point-min))
-            (qq-root-button-forward)))
+                 (existing (appkit-view-for-id app 'root))
+                 (name (qq-runtime-account-display-name owner))
+                 (view
+                  (qq-runtime-open-account-view
+                   :account-id owner
+                   :id 'root
+                   :mode 'qq-root-mode
+                   :buffer-name (format "*qq-root:%s*" name)
+                   :sync-function #'qq-root--sync-invalidations
+                   :parts '(header entries geometry)
+                   :setup (apply-partially #'qq-root--setup-scope owner)
+                   :select t))
+                 (buffer (appkit-view-buffer view)))
+            (with-current-buffer buffer
+              (setq-local qq-root--scope owner)
+              (unless existing
+                ;; A newly attached (including reattached) view gets one explicit
+                ;; initial projection after it has a real display window.
+                (appkit-invalidate view :structure t :part 'header)
+                (appkit-sync-invalidations view))
+              (qq-root--reflow-visible nil)
+              (unless (qq-root--session-key-at-point)
+                (goto-char (point-min))
+                (qq-root-button-forward)))
             buffer))
       (let* ((app (qq-runtime-gateway-app))
              (existing (appkit-view-for-id app 'root))
@@ -946,8 +981,14 @@ pixel-valued alignment follows text scaling."
           (qq-runtime-with-account owner
             (let (keys)
               (dolist (session (qq-state-sessions))
-                (when (equal media-key
-                             (qq-root--session-avatar-media-key session))
+                (when
+                    (or
+                     (equal media-key
+                            (qq-root--session-avatar-media-key session))
+                     (member
+                      media-key
+                      (qq-media-message-one-line-preview-keys
+                       (qq-root--session-last-message session))))
                   (push
                    (qq-root--session-entry-key (alist-get 'key session))
                    keys)))

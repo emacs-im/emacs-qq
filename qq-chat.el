@@ -3025,9 +3025,12 @@ Never dump OneBot CQ or `raw-message' here.  The bounded preview comes from
                         (or (qq-state-message-preview message) ""))))
         (appkit-chatbuf-aux-render
          :title (concat "Reply to " (propertize name 'face title-face))
-         :preview (if (string-empty-p preview)
-                      "Message preview unavailable"
-                    preview)
+         :preview
+         (qq-media-message-one-line-preview
+          message
+          (if (string-empty-p preview)
+              "Message preview unavailable"
+            preview))
          :cancel-action #'qq-chat-cancel-dwim
          :cancel-help "Cancel reply (C-c C-k)"
          :accent-face title-face
@@ -6799,6 +6802,13 @@ search-result jump cannot race a latest/read-position request."
             (setq qq-chat--open-message-request request)))))
     buffer))
 
+(defun qq-chat--composer-preview-media-key-p (media-key)
+  "Return non-nil when MEDIA-KEY affects the active reply preview."
+  (and (stringp media-key)
+       (member media-key
+               (qq-media-message-one-line-preview-keys
+                (qq-chat--reply-message)))))
+
 (defun qq-chat--rerender-open-chats (&optional media-key)
   "Invalidate open chat rows and composer destinations affected by MEDIA-KEY."
   (dolist (buffer (buffer-list))
@@ -6811,7 +6821,10 @@ search-result jump cannot race a latest/read-position request."
           (if media-key
               (appkit-request-sync
                view
-               :part (and (equal media-key prompt-key) 'composer)
+               :part
+               (and (or (equal media-key prompt-key)
+                        (qq-chat--composer-preview-media-key-p media-key))
+                    'composer)
                :resource (list :media media-key))
             (when (or (appkit-chat-timeline-live-p)
                       (appkit-chatbuf-prompt-button-live-p))
