@@ -658,6 +658,14 @@ SPEC may be a numeric maximum height for compact decorative images."
      qq-media-preview-image-max-width
      (if (numberp spec) spec qq-media-preview-image-height))))
 
+(defun qq-media--one-line-preview-image-from-file (file _spec)
+  "Create a single-row thumbnail from FILE for compact preview surfaces."
+  (when (appkit-media-file-present-p file)
+    (appkit-media-one-line-preview-image-from-file
+     file
+     (* (max 1 qq-media-one-line-preview-columns)
+        (max 1 (frame-char-width))))))
+
 (defun qq-media--image-display-string (image fallback)
   "Return display string for IMAGE, or FALLBACK when IMAGE is nil."
   (appkit-media-image-display-string image fallback))
@@ -2449,6 +2457,24 @@ Use FALLBACK until the preview is available."
    (qq-media-url-preview-image key url max-height)
    fallback))
 
+(defun qq-media-url-one-line-preview-image (key url)
+  "Return KEY's one-line URL thumbnail, scheduling its shared resource load.
+
+KEY must name a resource used exclusively in compact one-line presentation."
+  (when (appkit-media-url-present-p url)
+    (qq-media--ensure-resource-image
+     key
+     (lambda (done _error)
+       (funcall done `((url . ,url))))
+     nil
+     #'qq-media--one-line-preview-image-from-file)))
+
+(defun qq-media-url-one-line-preview-display-string (key url fallback)
+  "Return URL as KEY's one-line thumbnail, or FALLBACK while it loads."
+  (appkit-media-one-line-image-display-string
+   (qq-media-url-one-line-preview-image key url)
+   fallback))
+
 (defun qq-media-poke-image-cache-key (url)
   "Return the cache key used for a decorative POKE image URL."
   (and (appkit-media-url-present-p url)
@@ -3067,10 +3093,7 @@ Preview failures are soft (no NapCat error spam)."
                 (qq-media--remote-image-cache-existing-file key resource)
                 (qq-media--preview-image-source-file preview-image))))
       (when file
-        (appkit-media-one-line-preview-image-from-file
-         file
-         (* (max 1 qq-media-one-line-preview-columns)
-            (max 1 (frame-char-width))))))))
+        (qq-media--one-line-preview-image-from-file file nil)))))
 
 (cl-defun qq-media-message-one-line-preview
     (message text &key label separator label-face)
