@@ -247,14 +247,33 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                    (appkit-ui-one-line-preview-label preview-model)))
     (should (equal ":"
                    (appkit-ui-one-line-preview-separator preview-model)))
-    (should (eq 'qq-msg-user-title
-                (appkit-ui-one-line-preview-label-face preview-model)))
+    (should
+     (equal (list (appkit-name-color-face "Alice") 'qq-msg-user-title)
+            (appkit-ui-one-line-preview-label-face preview-model)))
     (should (equal "Alice"
                    (appkit-ui-one-line-preview-label
                     (appkit-view-one-line-row-preview row))))
-    (should (eq 'qq-msg-user-title
-                (appkit-ui-one-line-preview-label-face
-                 (appkit-view-one-line-row-preview row))))))
+    (should
+     (equal (list (appkit-name-color-face "Alice") 'qq-msg-user-title)
+            (appkit-ui-one-line-preview-label-face
+             (appkit-view-one-line-row-preview row))))))
+
+(ert-deftest qq-root-preview-label-face-prefers-cached-sender-identity ()
+  (let ((session '((key . "group:42")
+                   (type . group)
+                   (last-message-id . "m1")
+                   (last-message-sender-name . "Alice")
+                   (last-message-preview . "hello")))
+        (message '((server-id . "m1")
+                   (sender-id . "42")
+                   (sender-name . "Alice")
+                   (self-p . nil))))
+    (cl-letf (((symbol-function 'qq-state-session-messages)
+               (lambda (_session-key) (list message))))
+      (should
+       (equal (qq-chat--message-title-face message)
+              (appkit-ui-one-line-preview-label-face
+               (qq-root--session-preview-model session)))))))
 
 (ert-deftest qq-root-session-preview-projects-cached-message-media ()
   (let* ((qq-chat-show-peer-actions nil)
