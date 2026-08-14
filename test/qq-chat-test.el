@@ -4115,8 +4115,8 @@
                   (lambda (callback &optional _errback _force)
                     (funcall callback (list face))))
                  ((symbol-function 'completing-read)
-                  (lambda (&rest _)
-                    (qq-media-custom-face-label face 0))))
+                  (lambda (_prompt table &rest _)
+                    (car (all-completions "" table)))))
          (qq-chat-attach-custom-face)
          ;; Media completion queues insertion on the captured view.
          (should-not (qq-chat--current-input-segments))

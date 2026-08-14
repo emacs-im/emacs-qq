@@ -819,14 +819,16 @@ projection."
   (pcase (alist-get 'kind emoji)
     ("qq_face"
      (let ((id (alist-get 'id emoji)))
-       (unless (and (qq-account--uint32-p id) (> id 0))
+       (unless (qq-account--uint32-p id)
          (error "qq: native qq_face reaction has an invalid id"))
        `((emoji-id . ,(number-to-string id))
          (emoji-type . "1"))))
     ("unicode"
      (let ((value (alist-get 'value emoji)))
-       (unless (and (stringp value) (= (length value) 1))
-         (error "qq: native Unicode reaction must contain one scalar"))
+       (unless (and (stringp value)
+                    (= (length value) 1)
+                    (> (aref value 0) 0))
+         (error "qq: native Unicode reaction must contain one non-NUL scalar"))
        `((emoji-id . ,(number-to-string (aref value 0)))
          (emoji-type . "2"))))
     (_ (error "qq: native reaction has an unsupported emoji kind"))))
@@ -853,15 +855,16 @@ projection."
     (let ((code (string-to-number emoji-id)))
       (pcase emoji-type
         ("1"
-         (unless (and (qq-account--uint32-p code) (> code 0))
+         (unless (qq-account--uint32-p code)
            (user-error "qq: QQ face reaction ID is outside uint32"))
          `((kind . "qq_face") (id . ,code)))
         ("2"
-         (let ((value (and (<= 0 code #x10ffff)
+         (let ((value (and (> code 0)
+                           (<= code #x10ffff)
                            (not (<= #xd800 code #xdfff))
                            (decode-char 'ucs code))))
            (unless value
-             (user-error "qq: Unicode reaction ID is not a scalar"))
+             (user-error "qq: Unicode reaction ID is not a non-NUL scalar"))
            `((kind . "unicode") (value . ,(char-to-string value)))))
         (_ (user-error "qq: Reaction has no closed emoji kind"))))))
 

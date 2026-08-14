@@ -533,6 +533,7 @@
   (let* ((rocket
           (appkit-chat-completion-candidate-create
            :label ":rocket:"
+           :prefix "🚀 "
            :value '(:kind unicode-emoji :emoji "🚀")))
          (family
           (appkit-chat-completion-candidate-create
@@ -544,36 +545,45 @@
               ((symbol-function 'appkit-chat-emoji-candidates)
                (lambda (&optional _) (list rocket family)))
               ((symbol-function 'completing-read)
-               (lambda (_prompt candidates &rest _)
-                 (setq seen candidates)
-                 (car candidates))))
+               (lambda (_prompt table &rest _)
+                 (setq seen (all-completions "" table))
+                 (car seen))))
       (should
        (equal (qq-completion-read-reaction)
               '((emoji-id . "128640") (emoji-type . "2"))))
-      (should (equal seen '(":rocket:"))))))
+      (should (equal seen '("🚀 :rocket:"))))))
 
-(ert-deftest qq-completion-reaction-picker-narrows-visible-candidates ()
+(ert-deftest qq-completion-reaction-picker-preserves-preview-while-narrowing ()
   (let ((white-flower
          (appkit-chat-completion-candidate-create
           :label ":white_flower:"
+          :prefix (concat (propertize " " 'display 'white-preview) " ")
           :value '(:kind unicode-emoji :emoji "💮")))
         (wind-chime
          (appkit-chat-completion-candidate-create
           :label ":wind_chime:"
+          :prefix (concat (propertize " " 'display 'wind-preview) " ")
           :value '(:kind unicode-emoji :emoji "🎐"))))
     (cl-letf (((symbol-function 'qq-completion--base-face-candidates)
                #'ignore)
               ((symbol-function 'appkit-chat-emoji-candidates)
                (lambda (&optional _) (list white-flower wind-chime)))
               ((symbol-function 'completing-read)
-               (lambda (_prompt candidates &rest _)
-                 (should (equal completion-styles '(substring basic)))
+               (lambda (_prompt table &rest _)
                  (should
-                  (equal
-                   (completion-all-completions
-                    "whi" candidates nil 3)
-                   '(":white_flower:" . 0)))
-                 ":white_flower:")))
+                  (eq (completion-metadata-get
+                       (completion-metadata "" table nil) 'category)
+                      'appkit-chat))
+                 (let* ((matches
+                         (completion-all-completions "whi" table nil 3))
+                        (title (car matches)))
+                   (should (equal (cdr matches) 0))
+                   (should
+                    (equal (substring-no-properties title)
+                           "  :white_flower:"))
+                   (should (eq (get-text-property 0 'display title)
+                               'white-preview))
+                   title))))
       (should
        (equal (qq-completion-read-reaction)
               '((emoji-id . "128174") (emoji-type . "2")))))))
