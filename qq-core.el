@@ -1156,13 +1156,15 @@ the later authoritative self event."
    callback errback))
 
 (defun qq-core-set-message-reaction
-    (message emoji-id set &optional callback errback)
-  "Add or remove EMOJI-ID on normalized native group MESSAGE.
+    (message reaction set &optional callback errback)
+  "Add or remove normalized REACTION on native group MESSAGE.
 
 SET non-nil adds the reaction.  CALLBACK receives the successful service
 receipt; ERRBACK receives failure details."
   (unless (listp message)
     (user-error "qq: Reaction requires a normalized message"))
+  (unless (listp reaction)
+    (user-error "qq: Reaction requires a normalized emoji identity"))
   (let ((session-key (alist-get 'session-key message))
         (message-id (alist-get 'server-id message)))
     (unless (and session-key (stringp message-id))
@@ -1170,7 +1172,7 @@ receipt; ERRBACK receives failure details."
     (qq-core--start-request
      (lambda (success failure)
        (qq-message-set-reaction
-        message emoji-id set success failure))
+        message reaction set success failure))
      callback errback)))
 
 (defun qq-core-set-message-essence

@@ -529,6 +529,29 @@
         (funcall exit ":rocket:" 'finished)
         (should (equal "🚀" (appkit-chatbuf-input-string)))))))
 
+(ert-deftest qq-completion-reaction-picker-supports-scalar-unicode ()
+  (let* ((rocket
+          (appkit-chat-completion-candidate-create
+           :label ":rocket:"
+           :value '(:kind unicode-emoji :emoji "🚀")))
+         (family
+          (appkit-chat-completion-candidate-create
+           :label ":family:"
+           :value '(:kind unicode-emoji :emoji "👨‍👩‍👧")))
+         seen)
+    (cl-letf (((symbol-function 'qq-completion--base-face-candidates)
+               #'ignore)
+              ((symbol-function 'appkit-chat-emoji-candidates)
+               (lambda (&optional _) (list rocket family)))
+              ((symbol-function 'appkit-chat-completion-read)
+               (lambda (_prompt candidates &rest _)
+                 (setq seen candidates)
+                 (car candidates))))
+      (should
+       (equal (qq-completion-read-reaction)
+              '((emoji-id . "128640") (emoji-type . "2"))))
+      (should (equal seen (list rocket))))))
+
 (ert-deftest qq-completion-cold-fav-tab-caches-without-async-presentation ()
   (qq-completion-test-with-group
     (insert "/fav")

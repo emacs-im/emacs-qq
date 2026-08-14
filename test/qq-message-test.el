@@ -219,16 +219,21 @@
      (operator-uid "u_member") (operator-uin "10001")
      (emoji-id "178") (emoji-type "1") (is-add t) (count 3))
   "Return one authoritative native Gateway group reaction event payload."
-  `((account_id . ,account-id)
-    (reaction
-     . ((conversation . ((kind . "group") (group_uin . ,group-uin)))
-        (sequence . ,sequence)
-        (operator_uid . ,operator-uid)
-        ,@(when operator-uin `((operator_uin . ,operator-uin)))
-        (emoji_id . ,emoji-id)
-        (emoji_type . ,emoji-type)
-        (is_add . ,is-add)
-        (count . ,count)))))
+  (let ((emoji
+         (pcase emoji-type
+           ("1" `((kind . "qq_face") (id . ,(string-to-number emoji-id))))
+           ("2" `((kind . "unicode")
+                  (value . ,(char-to-string (string-to-number emoji-id)))))
+           (_ (error "invalid test reaction emoji type")))))
+    `((account_id . ,account-id)
+      (reaction
+       . ((conversation . ((kind . "group") (group_uin . ,group-uin)))
+          (sequence . ,sequence)
+          (operator_uid . ,operator-uid)
+          ,@(when operator-uin `((operator_uin . ,operator-uin)))
+          (emoji . ,emoji)
+          (is_add . ,is-add)
+          (count . ,count))))))
 
 (cl-defun qq-message-test-essence
     (&key
@@ -1477,6 +1482,35 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
       (should (= (alist-get 'count reaction) 7))
       (should-not (alist-get 'chosen-p reaction)))))
 
+(ert-deftest qq-message-projects-structured-reaction-snapshot ()
+  (qq-message-test-with-state
+    (let* ((event
+            (qq-message-test-event
+             :conversation
+             '((kind . "group") (group_uin . "8209413637")
+               (group_name . "Protocol Lab") (sender_card . "Alice"))))
+           (message (alist-get 'message event)))
+      (setf
+       (alist-get 'message event)
+       (append
+        message
+        '((emoji_likes_list
+           . (((emoji . ((kind . "qq_face") (id . 424)))
+               (count . 2)
+               (is_clicked . :false))
+              ((emoji . ((kind . "unicode") (value . "👍")))
+               (count . 1)
+               (is_clicked . t)))))))
+      (qq-message--handle-event "message.received" event)
+      (should
+       (equal
+        (qq-state-message-reactions
+         (car (qq-state-session-messages "group:8209413637")))
+        '(((emoji-id . "424") (emoji-type . "1")
+           (count . 2) (chosen-p))
+          ((emoji-id . "128077") (emoji-type . "2")
+           (count . 1) (chosen-p . t))))))))
+
 (ert-deftest qq-message-sequence-reaction-waits-for-message ()
   (qq-message-test-with-state
     (qq-message--handle-event
@@ -2618,13 +2652,13 @@ push carries sequence=40909 and client_sequence=30202."
                             '((account_id . "slot-a")
                               (message_id . "7348923749823749823")
                               (sequence . "9007199254740999")
-                              (emoji_id . "128077")
+                              (emoji . ((kind . "unicode") (value . "👍")))
                               (set . t)))
                    "request-reaction")))
         (should
          (equal
           (qq-message-set-reaction
-           message "128077" t
+           message '((emoji-id . "128077") (emoji-type . "2")) t
            (lambda (result) (setq callback-result result)))
           "request-reaction"))
         (should (equal sent-method "message.set_reaction"))
@@ -2635,9 +2669,10 @@ push carries sequence=40909 and client_sequence=30202."
             (conversation . ((kind . "group")
                              (group_uin . "8209413637")))
             (message . ((message_id . "7348923749823749823")))
-            (emoji_id . "128077")
+            (emoji . ((kind . "unicode") (value . "👍")))
             (set . t))))
-        (should (equal (alist-get 'emoji_id callback-result) "128077"))
+        (should (equal (alist-get 'emoji callback-result)
+                       '((kind . "unicode") (value . "👍"))))
         (should-not
          (qq-state-message-reactions
           (car (qq-state-session-messages session-key))))
@@ -3451,6 +3486,7 @@ push carries sequence=40909 and client_sequence=30202."
             (alist-get
              'message
              (qq-message-test-event
+              :message-id nil
               :sequence "100"
               :conversation
               '((kind . "group")

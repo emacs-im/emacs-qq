@@ -676,6 +676,11 @@ order."
         (segments . ,segments)
         (mention-kinds . ,mention-kinds)
         (contains-mention-p . ,(and mention-kinds t))
+        ,@(when (assq 'emoji_likes_list message)
+            `((reactions
+               . ,(mapcar
+                   #'qq-message--reaction-snapshot-to-local
+                   (or (alist-get 'emoji_likes_list message) '())))))
         (raw-message . ,preview)
         (preview . ,preview)
         (message-type . ,kind)
@@ -809,10 +814,63 @@ projection."
     (remhash key qq-message--pending-recalls)
     (qq-message--apply-recall-target session-key target)))
 
+(defun qq-message--reaction-emoji-to-local (emoji)
+  "Project one closed native reaction EMOJI to local id/type fields."
+  (pcase (alist-get 'kind emoji)
+    ("qq_face"
+     (let ((id (alist-get 'id emoji)))
+       (unless (and (qq-account--uint32-p id) (> id 0))
+         (error "qq: native qq_face reaction has an invalid id"))
+       `((emoji-id . ,(number-to-string id))
+         (emoji-type . "1"))))
+    ("unicode"
+     (let ((value (alist-get 'value emoji)))
+       (unless (and (stringp value) (= (length value) 1))
+         (error "qq: native Unicode reaction must contain one scalar"))
+       `((emoji-id . ,(number-to-string (aref value 0)))
+         (emoji-type . "2"))))
+    (_ (error "qq: native reaction has an unsupported emoji kind"))))
+
+(defun qq-message--reaction-snapshot-to-local (reaction)
+  "Project one authoritative native REACTION snapshot to local state."
+  (let ((count (alist-get 'count reaction))
+        (chosen (alist-get 'is_clicked reaction)))
+    (unless (and (qq-account--uint32-p count)
+                 (memq chosen '(t :false)))
+      (error "qq: native reaction snapshot is malformed"))
+    (append
+     (qq-message--reaction-emoji-to-local (alist-get 'emoji reaction))
+     `((count . ,count)
+       (chosen-p . ,(eq chosen t))))))
+
+(defun qq-message--reaction-emoji-from-local (reaction)
+  "Return the closed native emoji union represented by local REACTION."
+  (let ((emoji-id (alist-get 'emoji-id reaction))
+        (emoji-type (alist-get 'emoji-type reaction)))
+    (unless (and (stringp emoji-id)
+                 (string-match-p "\\`[0-9]+\\'" emoji-id))
+      (user-error "qq: Reaction has no canonical decimal emoji identity"))
+    (let ((code (string-to-number emoji-id)))
+      (pcase emoji-type
+        ("1"
+         (unless (and (qq-account--uint32-p code) (> code 0))
+           (user-error "qq: QQ face reaction ID is outside uint32"))
+         `((kind . "qq_face") (id . ,code)))
+        ("2"
+         (let ((value (and (<= 0 code #x10ffff)
+                           (not (<= #xd800 code #xdfff))
+                           (decode-char 'ucs code))))
+           (unless value
+             (user-error "qq: Unicode reaction ID is not a scalar"))
+           `((kind . "unicode") (value . ,(char-to-string value)))))
+        (_ (user-error "qq: Reaction has no closed emoji kind"))))))
+
 (defun qq-message--reaction-notice (reaction message)
   "Return legacy state notice for authoritative REACTION on MESSAGE."
   (let* ((conversation (alist-get 'conversation reaction))
          (group-uin (alist-get 'group_uin conversation))
+         (emoji (qq-message--reaction-emoji-to-local
+                 (alist-get 'emoji reaction)))
          (account
           (qq-account-get (alist-get 'gateway-account-id message)))
          (operator-uin
@@ -825,15 +883,16 @@ projection."
       (message_id . ,(alist-get 'server-id message))
       ,@(when operator-uin `((user_id . ,operator-uin)))
       (is_add . ,(alist-get 'is_add reaction))
-      (likes . (((emoji_id . ,(alist-get 'emoji_id reaction))
-                 (emoji_type . ,(alist-get 'emoji_type reaction))
+      (likes . (((emoji_id . ,(alist-get 'emoji-id emoji))
+                 (emoji_type . ,(alist-get 'emoji-type emoji))
                  (count . ,(alist-get 'count reaction))))))))
 
 (defun qq-message--apply-reaction (reaction message)
-  "Apply authoritative REACTION to projected MESSAGE."
+  "Apply authoritative REACTION to its sequence-matched MESSAGE."
   (qq-state-apply-emoji-like-notice
    (alist-get 'session-key message)
-   (qq-message--reaction-notice reaction message)))
+   (qq-message--reaction-notice reaction message)
+   (qq-state-message-anchor message)))
 
 (defun qq-message--apply-pending-reactions (owner normalized merged)
   "Apply reactions awaiting OWNER's MERGED authored message."
@@ -2414,8 +2473,8 @@ replace it."
      :stale-message "QQ account or Gateway connection changed during poke")))
 
 (defun qq-message-set-reaction
-    (message emoji-id set &optional callback errback)
-  "Add or remove EMOJI-ID on native group MESSAGE.
+    (message reaction set &optional callback errback)
+  "Add or remove normalized REACTION on native group MESSAGE.
 
 SET non-nil adds the reaction.  CALLBACK receives the receipt.  Only the
 authoritative `message.reaction_changed' update changes local reaction state."
@@ -2427,6 +2486,7 @@ authoritative `message.reaction_changed' update changes local reaction state."
          (message-id (alist-get 'server-id message))
          (group-uin (and session-key
                          (qq-state-session-key-target-id session-key)))
+         (emoji (qq-message--reaction-emoji-from-local reaction))
          (set (and set t)))
     (unless (and session-key
                  (eq (qq-state-session-key-type session-key) 'group)
@@ -2435,13 +2495,11 @@ authoritative `message.reaction_changed' update changes local reaction state."
       (user-error "qq: Native reaction requires an exact group Message Reference"))
     (unless (equal (alist-get 'gateway-account-id message) owner)
       (user-error "qq: Reaction message belongs to another Gateway account"))
-    (setq emoji-id (format "%s" emoji-id))
-    (qq-message--validate-sequence emoji-id "Reaction emoji ID")
     (qq-message--call
      "message.set_reaction" owner
      `((conversation . ((kind . "group") (group_uin . ,group-uin)))
        (message . ((message_id . ,message-id)))
-       (emoji_id . ,emoji-id)
+       (emoji . ,emoji)
        (set . ,(if set t :false)))
      :callback callback
      :errback errback

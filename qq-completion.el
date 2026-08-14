@@ -51,6 +51,9 @@ nil means the authoritative catalog is empty.")
 (defvar qq-completion--face-history nil
   "History for shared QQ base-face completion readers.")
 
+(defvar qq-completion--reaction-history nil
+  "History for combined QQ and Unicode reaction readers.")
+
 (defvar qq-completion--custom-face-history nil
   "History for shared QQ favorite-face completion readers.")
 
@@ -777,6 +780,34 @@ command owns presentation."
          (value (appkit-chat-completion-candidate-value candidate))
          (segment (plist-get value :segment)))
     (alist-get 'id (alist-get 'data segment))))
+
+(defun qq-completion-read-reaction ()
+  "Read and return one normalized QQ face or Unicode reaction."
+  (let* ((unicode-candidates
+          (seq-filter
+           (lambda (candidate)
+             (let* ((value
+                     (appkit-chat-completion-candidate-value candidate))
+                    (emoji (plist-get value :emoji)))
+               (and (stringp emoji) (= (length emoji) 1))))
+           (appkit-chat-emoji-candidates)))
+         (candidate
+          (appkit-chat-completion-read
+           "Reaction: "
+           (append (qq-completion--base-face-candidates)
+                   unicode-candidates)
+           :history 'qq-completion--reaction-history))
+         (value (appkit-chat-completion-candidate-value candidate)))
+    (pcase (plist-get value :kind)
+      ('base-face
+       (let* ((segment (plist-get value :segment))
+              (id (alist-get 'id (alist-get 'data segment))))
+         `((emoji-id . ,id) (emoji-type . "1"))))
+      ('unicode-emoji
+       (let ((emoji (plist-get value :emoji)))
+         `((emoji-id . ,(number-to-string (aref emoji 0)))
+           (emoji-type . "2"))))
+      (_ (error "qq: reaction picker returned an unsupported candidate")))))
 
 (defun qq-completion-read-custom-face (faces)
   "Read and return one favorite face from FACES."
