@@ -1952,10 +1952,8 @@ a closed chat-action operation."
 (defun qq-chat--input-footer-context-text ()
   "Return dynamic footer text shown above the composer prompt.
 
-Order (telega-inspired):
-1. peer chat-action / typing indicator
-2. reply aux (keeps its own faces/button; do not blanket-propertize
-   or the cancel `[×]' loses its link face)."
+The typing indicator precedes the reply card.  The shared Appkit renderer owns
+the card chrome and cancel action; do not blanket-propertize it."
   (let ((action-text (qq-chat--action-indicator-text))
         (reply-context (qq-chat--reply-context-text)))
     (concat
@@ -3011,61 +3009,29 @@ is not swallowed into the image segment."
          segments)
       segments)))
 
-(defun qq-chat--composer-context-text (label message-id)
-  "Return one composer context line for LABEL and MESSAGE-ID."
-  (format "%s %s\n" label message-id))
-
-(defun qq-chat--cancel-reply-button-string ()
-  "Return telega-style close button for reply aux (`[×]').
-
-Matches `telega-symbol-button-close' + `telega-link' face."
-  (propertize
-   "[×]"
-   'face 'link
-   'mouse-face 'highlight
-   'help-echo "Cancel reply (C-c C-k)"
-   'follow-link t
-   'keymap (let ((map (make-sparse-keymap)))
-             (define-key map [mouse-1]
-                         (lambda ()
-                           (interactive)
-                           (qq-chat-cancel-dwim)))
-             (define-key map (kbd "RET")
-                         (lambda ()
-                           (interactive)
-                           (qq-chat-cancel-dwim)))
-             map)
-   'qq-chat-cancel-reply t))
-
 (defun qq-chat--reply-context-text ()
-  "Return extra context lines shown above the chat composer.
+  "Return the unified reply context card shown above the composer.
 
-Telega-like aux bar:
-  [×] Reply to Name
-      short human preview
-
-Never dump OneBot CQ / raw_message here — previews come from
-`qq-state-message-preview' (segment-first)."
+Never dump OneBot CQ or `raw-message' here.  The bounded preview comes from
+`qq-state-message-preview', which is segment-first."
   (let ((message (qq-chat--reply-message)))
     (if-let* ((reply-target
                (and message
                     (qq-message-reply-target qq-chat--session-key message)))
               (name (or (car (qq-chat--message-sender-display-parts message))
                         "message"))
-              (preview (string-trim (or (qq-state-message-preview message) "")))
-              (preview (if (string-empty-p preview) "…" preview))
-              (preview (truncate-string-to-width preview 64 nil nil t))
-              (title (propertize (format "Reply to %s" name)
-                                 'face 'qq-msg-title))
-              (body (propertize (format "  %s" preview)
-                                'face 'qq-msg-inline-reply)))
-        (concat
-         (qq-chat--cancel-reply-button-string)
-         " "
-         title
-         "\n"
-         body
-         "\n")
+              (title-face (qq-chat--message-title-face message))
+              (preview (string-trim
+                        (or (qq-state-message-preview message) ""))))
+        (appkit-chatbuf-aux-render
+         :title (concat "Reply to " (propertize name 'face title-face))
+         :preview (if (string-empty-p preview)
+                      "Message preview unavailable"
+                    preview)
+         :cancel-action #'qq-chat-cancel-dwim
+         :cancel-help "Cancel reply (C-c C-k)"
+         :accent-face title-face
+         :width (qq-chat--line-fill-column))
       "")))
 
 (defun qq-chat--insert-date-separator-row (day-label)

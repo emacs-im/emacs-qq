@@ -4621,8 +4621,13 @@
        (should (eq (plist-get (appkit-chatbuf-aux-state) :aux-type) 'reply))
        (should (eq (plist-get (appkit-chatbuf-aux-state) :aux-msg) message))
        (should-not (plist-get (appkit-chatbuf-aux-state) :message-id))
-       (should (string-match-p "Reply to Alice"
-                               (qq-chat--reply-context-text)))))))
+       (let ((card (qq-chat--reply-context-text)))
+         (should
+          (equal "× ▏ Reply to Alice\n  ▏ source\n"
+                 (substring-no-properties card)))
+         (should
+          (eq (get-text-property 0 appkit-ui-action-property card)
+              #'qq-chat-cancel-dwim)))))))
 
 (ert-deftest qq-chat-message-reply-id-from-segments ()
   (should

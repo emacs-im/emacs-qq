@@ -539,19 +539,28 @@
           (appkit-chat-completion-candidate-create
            :label ":family:"
            :value '(:kind unicode-emoji :emoji "👨‍👩‍👧")))
-         seen)
+         seen
+         seen-prefix)
     (cl-letf (((symbol-function 'qq-completion--base-face-candidates)
                #'ignore)
               ((symbol-function 'appkit-chat-emoji-candidates)
                (lambda (&optional _) (list rocket family)))
               ((symbol-function 'completing-read)
                (lambda (_prompt table &rest _)
-                 (setq seen (all-completions "" table))
-                 (car seen))))
+                 (let* ((metadata (completion-metadata "" table nil))
+                        (affixation-function
+                         (completion-metadata-get
+                          metadata 'affixation-function)))
+                   (setq seen (all-completions "" table)
+                         seen-prefix
+                         (cadr
+                          (car (funcall affixation-function seen)))))
+                   (car seen))))
       (should
        (equal (qq-completion-read-reaction)
               '((emoji-id . "128640") (emoji-type . "2"))))
-      (should (equal seen '("🚀 :rocket:"))))))
+      (should (equal seen '(":rocket:")))
+      (should (equal seen-prefix "🚀 ")))))
 
 (ert-deftest qq-completion-reaction-picker-preserves-preview-while-narrowing ()
   (let ((white-flower
@@ -570,20 +579,29 @@
                (lambda (&optional _) (list white-flower wind-chime)))
               ((symbol-function 'completing-read)
                (lambda (_prompt table &rest _)
-                 (should
-                  (eq (completion-metadata-get
-                       (completion-metadata "" table nil) 'category)
-                      'appkit-chat))
-                 (let* ((matches
+                 (let* ((metadata (completion-metadata "" table nil))
+                        (affixation-function
+                         (completion-metadata-get
+                          metadata 'affixation-function))
+                        (matches
                          (completion-all-completions "whi" table nil 3))
-                        (title (car matches)))
+                        (title (car matches))
+                        (row
+                         (car
+                          (funcall affixation-function
+                                   (list
+                                    (substring-no-properties title)))))
+                        (prefix (cadr row)))
+                   (should
+                    (eq (completion-metadata-get metadata 'category)
+                        'appkit-chat))
                    (should (equal (cdr matches) 0))
                    (should
                     (equal (substring-no-properties title)
-                           "  :white_flower:"))
-                   (should (eq (get-text-property 0 'display title)
+                           ":white_flower:"))
+                   (should (eq (get-text-property 0 'display prefix)
                                'white-preview))
-                   title))))
+                   (substring-no-properties title)))))
       (should
        (equal (qq-completion-read-reaction)
               '((emoji-id . "128174") (emoji-type . "2")))))))
