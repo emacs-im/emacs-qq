@@ -341,6 +341,21 @@ prominent even when the badge is unavailable or the session muted."
           identities))
        (qq-state-session-messages session-key)))))
 
+(defun qq-root--session-preview-label-face (session sender message)
+  "Return the sender-label face for SESSION's latest MESSAGE.
+
+Prefer MESSAGE's stable sender identity so the root and timeline agree.  A
+session-only preview has no message identity; its visible SENDER remains a
+deterministic fallback key."
+  (cond
+   ((eq (alist-get 'last-message-self-p session) t)
+    'qq-msg-self-title)
+   ((and (qq-chat--present-string (alist-get 'sender-name message))
+         (qq-chat--message-title-face message)))
+   ((when-let* ((color-face (appkit-name-color-face sender)))
+      (list color-face 'qq-msg-user-title)))
+   (t 'qq-msg-user-title)))
+
 (defun qq-root--session-preview-model (session)
   "Return the Appkit one-line preview for SESSION.
 
@@ -359,6 +374,7 @@ messages, since the session title already identifies an incoming peer."
          (sender
           (qq-state-preview-one-line
            (alist-get 'last-message-sender-name session)))
+         (message (qq-root--session-last-message session))
          (show-sender-p
           (and (not (string-empty-p sender))
                (pcase (alist-get 'type session)
@@ -373,15 +389,13 @@ messages, since the session title already identifies an incoming peer."
                   (not (string-empty-p preview))
                   sender)))
         (qq-media-message-one-line-preview
-         (qq-root--session-last-message session)
-         preview
+         message preview
          :label label
          :separator (and label ":")
          :label-face
          (and label
-              (if (eq (alist-get 'last-message-self-p session) t)
-                  'qq-msg-self-title
-                'qq-msg-user-title)))))))
+              (qq-root--session-preview-label-face
+               session sender message)))))))
 
 (defun qq-root--session-preview-text (session)
   "Return SESSION's flattened one-line preview text."
