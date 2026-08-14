@@ -5134,7 +5134,7 @@ attachment inherited `appkit-chatbuf-input-object' and was dropped on parse."
     (with-temp-buffer
       (let ((inhibit-read-only t)
             (fill-column 80))
-        (cl-letf (((symbol-function 'qq-media-url-preview-display-string)
+        (cl-letf (((symbol-function 'qq-media-url-one-line-preview-display-string)
                    (lambda (&rest _args) "✦")))
           (qq-chat--insert-poke-message message nil)
           (should (string-match-p
@@ -5178,7 +5178,7 @@ client, never as a doubled display name."
             (fill-column 80)
             (qq-state--self-info
              '((user_id . "90001") (nickname . "Self"))))
-        (cl-letf (((symbol-function 'qq-media-url-preview-display-string)
+        (cl-letf (((symbol-function 'qq-media-url-one-line-preview-display-string)
                    (lambda (&rest _args) "✦")))
           (qq-chat--insert-poke-message message nil)
           (should (string-match-p
@@ -5210,7 +5210,7 @@ client, never as a doubled display name."
             (fill-column 80)
             (qq-state--self-info
              '((user_id . "90001") (nickname . "Self"))))
-        (cl-letf (((symbol-function 'qq-media-url-preview-display-string)
+        (cl-letf (((symbol-function 'qq-media-url-one-line-preview-display-string)
                    (lambda (&rest _args) "✦")))
           (qq-chat--insert-poke-message message nil)
           (should (string-match-p

@@ -3519,11 +3519,8 @@ with the timestamp."
          (image-url (qq-chat--present-string (alist-get 'image-url data)))
          (image
           (if image-url
-              (qq-media-url-preview-display-string
-               (qq-media-poke-image-cache-key image-url)
-               image-url
-               "✦"
-               qq-media-poke-image-height)
+              (qq-media-url-one-line-preview-display-string
+               (qq-media-poke-image-cache-key image-url) image-url "✦")
             "✦"))
          (time (qq-chat--format-time-short (alist-get 'time message)))
          (time-width (string-width time))
