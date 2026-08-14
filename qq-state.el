@@ -47,14 +47,14 @@ resource identities let the shared timeline redraw only affected rows.")
   "Set form of `qq-state--recent-session-keys' for constant-time membership.")
 (defvar qq-state--messages-by-session (make-hash-table :test #'equal))
 (defvar qq-state--message-patch-journal (make-hash-table :test #'equal)
-  "Notice state keyed by (SESSION-KEY . MESSAGE-ID).
+  "Notice state keyed by (SESSION-KEY . MESSAGE-ANCHOR).
 
 Recall tombstones remain authoritative for the lifetime of the state store.
 Reaction patches are retained only while an older materialization request is
 active.  Such a request may replay patches observed after it started, but a
 future request must accept its own authoritative reaction snapshot unchanged.")
 (defvar qq-state--message-observation-clock 0
-  "Monotonic token for ID-scoped message patch observations.")
+  "Monotonic token for stable-anchor message patch observations.")
 (defvar qq-state--materialization-request-counter 0
   "Monotonic identity counter for materialization request owners.")
 (defvar qq-state--materialization-request-owners
@@ -2163,9 +2163,9 @@ Return the local message object."
   "Return MESSAGES with EXISTING replaced by REPLACEMENT."
   (mapcar (lambda (it) (if (eq it existing) replacement it)) messages))
 
-(defun qq-state--message-patch-journal-key (session-key message-id)
-  "Return the journal key for exact MESSAGE-ID in SESSION-KEY."
-  (cons session-key message-id))
+(defun qq-state--message-patch-journal-key (session-key message-anchor)
+  "Return the journal key for stable MESSAGE-ANCHOR in SESSION-KEY."
+  (cons session-key message-anchor))
 
 (defun qq-state-message-observation-token ()
   "Return the current ID-scoped message observation clock.
@@ -2259,12 +2259,13 @@ no older request in the same session can still consume them."
     t))
 
 (defun qq-state--journal-message-patch
-    (session-key message-id patch)
-  "Journal closed PATCH for MESSAGE-ID in SESSION-KEY when required.
+    (session-key message-anchor patch)
+  "Journal closed PATCH for MESSAGE-ANCHOR in SESSION-KEY when required.
 
 Recall is stored as a tombstone.  A reaction patch is retained only when an
 active request started before its observation token."
-  (let* ((key (qq-state--message-patch-journal-key session-key message-id))
+  (let* ((key (qq-state--message-patch-journal-key
+               session-key message-anchor))
          (entry (copy-tree (gethash key qq-state--message-patch-journal))))
     (pcase (plist-get patch :kind)
       ('recall
@@ -2308,10 +2309,10 @@ When REPLAY-RETAINED-REACTIONS-P is non-nil without an owner, catch a
 canonical row up through every retained delta before applying a newer live
 notice.  In both cases the row's reaction observation watermark prevents a
 delta from being applied twice."
-  (let* ((message-id (alist-get 'server-id message))
-         (key (and message-id
+  (let* ((message-anchor (qq-state-message-anchor message))
+         (key (and message-anchor
                    (qq-state--message-patch-journal-key
-                    session-key message-id)))
+                    session-key message-anchor)))
          (entry (and key
                      (copy-tree
                       (gethash key qq-state--message-patch-journal)))))
@@ -3235,18 +3236,34 @@ snapshots.  PATCH is a plist whose `:kind' is `recall' or `emoji-like'."
        (qq-state--message-with-emoji-like-notice message notice)))
     (kind (error "qq: unsupported message patch kind %S" kind))))
 
-(defun qq-state-apply-emoji-like-notice (session-key notice)
+(defun qq-state-apply-emoji-like-notice
+    (session-key notice &optional target-anchor)
   "Apply group emoji-like NOTICE in explicit SESSION-KEY.
 
 The notice `count' is treated as the authoritative aggregate when present;
 notices without an aggregate count are applied as a one-step delta.  The
 explicit session scopes filter-owned snapshots when the message is absent from
-canonical history."
+canonical history.
+
+TARGET-ANCHOR may identify an already matched canonical group row whose native
+history snapshot legitimately omitted `message_id'.  Without it, NOTICE must
+carry an exact message ID."
   (let* ((message-id
-          (or (qq-protocol-optional-message-id
-               (alist-get 'message_id notice)
-               "group_msg_emoji_like notice")
-              (error "qq: emoji-like notice requires an exact message_id")))
+          (qq-protocol-optional-message-id
+           (alist-get 'message_id notice)
+           "group_msg_emoji_like notice"))
+         (message-anchor
+          (cond
+           ((and message-id target-anchor
+                 (not (equal message-id target-anchor)))
+            (error "qq: emoji-like notice contradicts its target message"))
+           (message-id
+            (qq-state-validate-message-session session-key message-id))
+           ((and (stringp target-anchor)
+                 (not (string-empty-p target-anchor)))
+            target-anchor)
+           (t
+            (error "qq: emoji-like notice requires an exact message target"))))
          (group-id (qq-state--normalize-id (alist-get 'group_id notice)))
          (identity (qq-state-session-key-identity session-key))
          (_group-session
@@ -3256,18 +3273,20 @@ canonical history."
           (unless (and group-id
                        (equal group-id (alist-get 'target-id identity)))
             (error "qq: emoji-like notice requires the explicit session group")))
-         (message-id
-          (qq-state-validate-message-session session-key message-id))
          (messages (and session-key
                         (copy-tree
                          (or (gethash session-key qq-state--messages-by-session)
                              '()))))
          (existing
-          (and message-id messages
+          (and messages
                (qq-state--find-message
                 messages
                 (lambda (message)
-                  (equal (alist-get 'server-id message) message-id)))))
+                  (equal (qq-state-message-anchor message)
+                         message-anchor)))))
+         (_matched-target
+          (when (and (null message-id) (null existing))
+            (error "qq: emoji-like notice target is not materialized")))
          (observation-token (qq-state--next-message-observation-token))
          (patch (list :kind 'emoji-like
                       :observation-token observation-token
@@ -3283,7 +3302,7 @@ canonical history."
              (updated
               (qq-state--apply-observed-reaction-patch materialized patch)))
         (qq-state--journal-message-patch
-         session-key message-id patch)
+         session-key message-anchor patch)
         (setq messages (qq-state--replace-message messages existing updated))
         (puthash session-key messages qq-state--messages-by-session)
         (qq-state--index-message updated)
@@ -3291,7 +3310,7 @@ canonical history."
         (qq-state--emit 'message
                         :session-key session-key
                         :message (copy-tree updated)
-                        :message-anchor message-id
+                        :message-anchor message-anchor
                         :mutation 'update
                         :source 'notice
                         :observation-token observation-token
@@ -3299,10 +3318,10 @@ canonical history."
         updated))
      ((and session-key message-id)
       (qq-state--journal-message-patch
-       session-key message-id patch)
+       session-key message-anchor patch)
       (qq-state--emit 'message
                       :session-key session-key
-                      :message-anchor message-id
+                      :message-anchor message-anchor
                       :mutation 'update
                       :source 'notice
                       :observation-token observation-token

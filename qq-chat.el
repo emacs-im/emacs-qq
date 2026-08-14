@@ -4166,23 +4166,23 @@ buffer session with a detached message id after the fact."
        (chat . ,(qq-api-chat-locator session-key)))
      "selected message reference")))
 
-(defun qq-chat-toggle-message-reaction (message-id emoji-id)
-  "Toggle EMOJI-ID on cached MESSAGE-ID, telega reaction-button style."
+(defun qq-chat-toggle-message-reaction (message-id reaction)
+  "Toggle normalized REACTION on cached MESSAGE-ID."
   (interactive
    (let* ((message (or (qq-chat--message-at-point)
                        (user-error "qq: no message at point")))
           (reaction (or (car (qq-state-message-reactions message))
                         (user-error "qq: message has no reaction to toggle"))))
-     (list (alist-get 'server-id message)
-           (alist-get 'emoji-id reaction))))
+     (list (alist-get 'server-id message) reaction)))
   (let* ((message (or (qq-chat--message-by-server-id message-id)
                       (user-error "qq: reaction message is not loaded")))
          (_reactable (or (qq-chat--message-reactable-p message)
                          (user-error "qq: reactions require a live group message")))
-         (reaction (qq-chat--reaction-by-emoji-id message emoji-id))
-         (set (not (and reaction (alist-get 'chosen-p reaction)))))
+         (emoji-id (alist-get 'emoji-id reaction))
+         (current (qq-chat--reaction-by-emoji-id message emoji-id))
+         (set (not (and current (alist-get 'chosen-p current)))))
     (qq-core-set-message-reaction
-     message emoji-id set
+     message reaction set
      (lambda (_response)
        (message "qq: reaction %s (%s)"
                 (if set "added" "removed") emoji-id)))))
@@ -4263,7 +4263,7 @@ buffer session with a detached message id after the fact."
                     :action-function
                     (lambda (reaction)
                       (qq-chat-toggle-message-reaction
-                       message-id (alist-get 'emoji-id reaction)))
+                       message-id reaction))
                     :help-echo-function
                     (lambda (reaction)
                       (let ((emoji-id (alist-get 'emoji-id reaction)))
@@ -6028,22 +6028,36 @@ way to send literal token text."
    (or (qq-chat--message-at-point)
        (user-error "qq: no message at point"))))
 
-(defun qq-chat-react-to-message (&optional face-id message)
-  "Add QQ base FACE-ID as a reaction to MESSAGE at point.
+(defun qq-chat-react-to-message (&optional reaction message)
+  "Add REACTION to MESSAGE at point.
 
-Like telega's `!' action, interactive use opens the existing QQ face picker.
+REACTION is a normalized emoji identity.  For compatibility, a decimal string
+or integer is accepted as a QQ base face id.  Interactive use offers every
+reaction kind supported by Gateway: QQ base faces and scalar Unicode emoji.
 Clicking an existing reaction chip performs add/remove toggle instead."
-  (interactive)
+  (interactive (list (qq-completion-read-reaction)))
   (let* ((message (or message
                       (qq-chat--message-at-point)
                       (user-error "qq: no message at point")))
          (_reactable (or (qq-chat--message-reactable-p message)
                          (user-error "qq: reactions require a live group message")))
-         (emoji-id (format "%s" (or face-id
-                                    (qq-chat--read-base-face-id
-                                     "React with QQ face: ")))))
+         (reaction
+          (cond
+           ((and (listp reaction)
+                 (alist-get 'emoji-id reaction)
+                 (alist-get 'emoji-type reaction))
+            reaction)
+           ((or (integerp reaction)
+                (and (stringp reaction)
+                     (string-match-p "\\`[0-9]+\\'" reaction)))
+            `((emoji-id . ,(format "%s" reaction)) (emoji-type . "1")))
+           ((and (stringp reaction) (= (length reaction) 1))
+            `((emoji-id . ,(number-to-string (aref reaction 0)))
+              (emoji-type . "2")))
+           (t (user-error "qq: reaction requires a supported emoji identity"))))
+         (emoji-id (alist-get 'emoji-id reaction)))
     (qq-core-set-message-reaction
-     message emoji-id t
+     message reaction t
      (lambda (_response)
        (message "qq: reaction added (%s)" emoji-id)))))
 

@@ -1689,19 +1689,22 @@
 (ert-deftest qq-core-reaction-routes-whole-message ()
   (let ((qq-account--current-account-id "slot-a") call)
     (cl-letf (((symbol-function 'qq-message-set-reaction)
-               (lambda (message emoji-id set &optional callback errback)
-                 (setq call (list message emoji-id set callback errback))
+               (lambda (message reaction set &optional callback errback)
+                 (setq call (list message reaction set callback errback))
                  "reaction-request")))
       (let ((message
              '((session-key . "group:8209413637")
                (server-id . "7348923749823749823")
                (message-seq . "9007199254740999"))))
-        (let ((request (qq-core-set-message-reaction message "178" t)))
+        (let ((request
+               (qq-core-set-message-reaction
+                message '((emoji-id . "178") (emoji-type . "1")) t)))
           (should (qq-request-p request))
           (should (equal (qq-request-token request)
                          "reaction-request")))
         (should (eq (nth 0 call) message))
-        (should (equal (nth 1 call) "178"))
+        (should (equal (nth 1 call)
+                       '((emoji-id . "178") (emoji-type . "1"))))
         (should (eq (nth 2 call) t))
         (should (functionp (nth 4 call)))))))
 
