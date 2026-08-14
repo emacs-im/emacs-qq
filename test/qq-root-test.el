@@ -258,6 +258,16 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
             (appkit-ui-one-line-preview-label-face
              (appkit-view-one-line-row-preview row))))))
 
+(ert-deftest qq-root-preview-label-face-uses-summary-sender-identity ()
+  (let ((session '((type . group)
+                   (last-message-sender-id . "42")
+                   (last-message-sender-name . "Alice")
+                   (last-message-preview . "hello"))))
+    (should
+     (equal (list (appkit-name-color-face "42") 'qq-msg-user-title)
+            (appkit-ui-one-line-preview-label-face
+             (qq-root--session-preview-model session))))))
+
 (ert-deftest qq-root-preview-label-face-prefers-cached-sender-identity ()
   (let ((session '((key . "group:42")
                    (type . group)

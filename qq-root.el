@@ -341,20 +341,20 @@ prominent even when the badge is unavailable or the session muted."
           identities))
        (qq-state-session-messages session-key)))))
 
-(defun qq-root--session-preview-label-face (session sender message)
+(defun qq-root--session-preview-label-face (session identity message)
   "Return the sender-label face for SESSION's latest MESSAGE.
 
 Prefer MESSAGE's stable sender identity so the root and timeline agree.  A
-session-only preview has no message identity; its visible SENDER remains a
-deterministic fallback key."
+session-only preview uses summary IDENTITY; its visible SENDER is a last-resort
+fallback when the protocol supplied no identity."
   (cond
    ((qq-chat--present-string (alist-get 'sender-name message))
     (qq-chat--message-title-face message))
    ((eq (alist-get 'last-message-self-p session) t)
-    (if-let* ((color-face (appkit-name-color-face sender)))
+    (if-let* ((color-face (appkit-name-color-face identity)))
         (list color-face 'qq-msg-self-title)
       'qq-msg-self-title))
-   ((when-let* ((color-face (appkit-name-color-face sender)))
+   ((when-let* ((color-face (appkit-name-color-face identity)))
       (list color-face 'qq-msg-user-title)))
    (t 'qq-msg-user-title)))
 
@@ -376,6 +376,10 @@ messages, since the session title already identifies an incoming peer."
          (sender
           (qq-state-preview-one-line
            (alist-get 'last-message-sender-name session)))
+         (identity
+          (or (qq-chat--present-string
+               (alist-get 'last-message-sender-id session))
+              sender))
          (message (qq-root--session-last-message session))
          (show-sender-p
           (and (not (string-empty-p sender))
@@ -397,7 +401,7 @@ messages, since the session title already identifies an incoming peer."
          :label-face
          (and label
               (qq-root--session-preview-label-face
-               session sender message)))))))
+               session identity message)))))))
 
 (defun qq-root--session-preview-text (session)
   "Return SESSION's flattened one-line preview text."
