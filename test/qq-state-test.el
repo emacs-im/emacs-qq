@@ -2985,7 +2985,8 @@ it kept the element's visible text, the user should still see it."
 
 (ert-deftest qq-state-message-patches-reject-identity-contradictions ()
   (qq-test-with-reset
-   (let ((message-id "9007199254741004883"))
+   (let ((message-id "9007199254741004883")
+         (unindexed-message-id "9007199254741004884"))
      (qq-state-merge-live-message
       `((post_type . "message")
         (message_type . "private")
@@ -3009,7 +3010,7 @@ it kept the element's visible text, the user should still see it."
               `((notice_type . "group_msg_emoji_like")
                 (group_id . "20002")
                 (user_id . "10002")
-                (message_id . ,message-id)
+                (message_id . ,unindexed-message-id)
                 (is_add . t)
                 (likes . (((emoji_id . "178") (count . 1)))))))))
        (should (string-match-p "requires the explicit session group"
