@@ -773,7 +773,7 @@ command owns presentation."
 (defun qq-completion-read-base-face-id (&optional prompt)
   "Read a QQ base face and return its string id."
   (let* ((candidate
-          (appkit-chat-completion-read
+          (appkit-chat-completion-read-visual
            (or prompt "QQ face: ")
            (qq-completion--base-face-candidates)
            :history 'qq-completion--face-history))
@@ -782,14 +782,7 @@ command owns presentation."
     (alist-get 'id (alist-get 'data segment))))
 
 (defun qq-completion-read-reaction ()
-  "Read and return one normalized QQ face or Unicode reaction.
-
-Use a static completion collection with explicit substring matching.  The
-generic Appkit candidate table supports aliases, but some minibuffer frontends
-retain that table's entire candidate stream while merely moving point to the
-first textual match.  A reaction picker has self-searchable labels, so letting
-Emacs filter the static labels guarantees that typed input actually narrows the
-visible set."
+  "Read and return one normalized QQ face or Unicode reaction."
   (let* ((unicode-candidates
           (seq-filter
            (lambda (candidate)
@@ -798,51 +791,28 @@ visible set."
                     (emoji (plist-get value :emoji)))
                (and (stringp emoji) (= (length emoji) 1))))
            (appkit-chat-emoji-candidates)))
-         (candidates
-          (append (qq-completion--base-face-candidates)
-                  unicode-candidates))
-         (candidate-map (make-hash-table :test #'equal))
-         labels)
-    (dolist (candidate candidates)
-      (let ((label
-             (appkit-chat-completion-candidate-label candidate)))
-        (when (gethash label candidate-map)
-          (error "qq: duplicate reaction completion label: %s" label))
-        (puthash label candidate candidate-map)
-        (push label labels)))
-    (setq labels (nreverse labels))
-    (let* ((completion-ignore-case t)
-           (completion-styles '(substring basic))
-           (completion-extra-properties
-            `(:affixation-function
-              ,(lambda (visible-labels)
-                 (appkit-chat-completion-affixation
-                  visible-labels candidate-map))))
-           (choice
-            (completing-read
-             "Reaction: " labels nil t nil
-             'qq-completion--reaction-history))
-           (candidate (gethash choice candidate-map))
-           (value
-            (and candidate
-                 (appkit-chat-completion-candidate-value candidate))))
-      (unless candidate
-        (user-error "Unknown reaction completion candidate: %s" choice))
-      (pcase (plist-get value :kind)
-        ('base-face
-         (let* ((segment (plist-get value :segment))
-                (id (alist-get 'id (alist-get 'data segment))))
-           `((emoji-id . ,id) (emoji-type . "1"))))
-        ('unicode-emoji
-         (let ((emoji (plist-get value :emoji)))
-           `((emoji-id . ,(number-to-string (aref emoji 0)))
-             (emoji-type . "2"))))
-        (_ (error "qq: reaction picker returned an unsupported candidate"))))))
+         (candidate
+          (appkit-chat-completion-read-visual
+           "Reaction: "
+           (append (qq-completion--base-face-candidates)
+                   unicode-candidates)
+           :history 'qq-completion--reaction-history))
+         (value (appkit-chat-completion-candidate-value candidate)))
+    (pcase (plist-get value :kind)
+      ('base-face
+       (let* ((segment (plist-get value :segment))
+              (id (alist-get 'id (alist-get 'data segment))))
+         `((emoji-id . ,id) (emoji-type . "1"))))
+      ('unicode-emoji
+       (let ((emoji (plist-get value :emoji)))
+         `((emoji-id . ,(number-to-string (aref emoji 0)))
+           (emoji-type . "2"))))
+      (_ (error "qq: reaction picker returned an unsupported candidate")))))
 
 (defun qq-completion-read-custom-face (faces)
   "Read and return one favorite face from FACES."
   (let* ((candidate
-          (appkit-chat-completion-read
+          (appkit-chat-completion-read-visual
            "Favorite face: "
            (qq-completion--custom-face-candidates faces)
            :history 'qq-completion--custom-face-history))
