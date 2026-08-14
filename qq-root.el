@@ -348,10 +348,12 @@ Prefer MESSAGE's stable sender identity so the root and timeline agree.  A
 session-only preview has no message identity; its visible SENDER remains a
 deterministic fallback key."
   (cond
+   ((qq-chat--present-string (alist-get 'sender-name message))
+    (qq-chat--message-title-face message))
    ((eq (alist-get 'last-message-self-p session) t)
-    'qq-msg-self-title)
-   ((and (qq-chat--present-string (alist-get 'sender-name message))
-         (qq-chat--message-title-face message)))
+    (if-let* ((color-face (appkit-name-color-face sender)))
+        (list color-face 'qq-msg-self-title)
+      'qq-msg-self-title))
    ((when-let* ((color-face (appkit-name-color-face sender)))
       (list color-face 'qq-msg-user-title)))
    (t 'qq-msg-user-title)))

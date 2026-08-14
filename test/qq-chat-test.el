@@ -2210,9 +2210,9 @@
      (equal (qq-chat--message-title-face original)
             (qq-chat--message-title-face renamed)))
     (should
-     (eq 'qq-msg-self-title
-         (qq-chat--message-title-face
-          '((sender-id . "10001") (self-p . t)))))))
+     (equal (list (appkit-name-color-face "10001") 'qq-msg-self-title)
+            (qq-chat--message-title-face
+             '((sender-id . "10001") (self-p . t)))))))
 
 (ert-deftest qq-chat-render-shows-group-card-and-nickname-like-telega ()
   (qq-chat-test-with-reset
