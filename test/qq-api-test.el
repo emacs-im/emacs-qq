@@ -43,20 +43,20 @@
   "Return one strict synthetic QQ channel message event."
   (copy-tree
    '((post_type . "emacs_guild_message")
-    (chat . ((kind . "guild-channel")
-             (guild_id . "9007199254740993")
-             (channel_id . "9007199254741999")))
-    (message_id . "9007199254742999")
-    (message_sequence . "17")
-    (sent_at . 1784000000)
-    (channel_name . "Synthetic channel")
-    (sender . ((native_id . "u_synthetic_sender")
-               (user_id . nil)
-               (nickname . "Synthetic member")
-               (member_name . "")
-               (display_name . "Synthetic member")))
-    (outgoing . :false)
-    (state . "live")
+     (chat . ((kind . "guild-channel")
+              (guild_id . "9007199254740993")
+              (channel_id . "9007199254741999")))
+     (message_id . "9007199254742999")
+     (message_sequence . "17")
+     (sent_at . 1784000000)
+     (channel_name . "Synthetic channel")
+     (sender . ((native_id . "u_synthetic_sender")
+                (user_id . nil)
+                (nickname . "Synthetic member")
+                (member_name . "")
+                (display_name . "Synthetic member")))
+     (outgoing . :false)
+     (state . "live")
      (segments . (((kind . "text")
                    (payload . ((text . "hello")))))))))
 
@@ -111,27 +111,27 @@
   "Return one strict native group-chat search result for GROUP-ID."
   (copy-tree
    `((group
-     . ((group_id . ,(or group-id "20001"))
-        (name . "Search Group")
-        (remark . "")
-        (member_count . 42)
-        (is_conf . :false)
-        (has_modify_conf_group_face . :false)
-        (has_modify_conf_group_name . t)
-        (no_code_finger_open_flag . :false)
-        (self_permission . "member")
-        (hits
-         . ((group_id)
-            (name . (((start . 0) (end . 6) (text . "Search"))))
-            (remark)))))
-    (discussions)
-    (member_profiles
-     . (((uid . "u_native_alice")
-         (user_id . "10001")
-         (nickname . "Alice")
+      . ((group_id . ,(or group-id "20001"))
+         (name . "Search Group")
          (remark . "")
-         (card . "Alice Card")
-         (hits . ((user_id) (nickname) (remark) (card))))))
+         (member_count . 42)
+         (is_conf . :false)
+         (has_modify_conf_group_face . :false)
+         (has_modify_conf_group_name . t)
+         (no_code_finger_open_flag . :false)
+         (self_permission . "member")
+         (hits
+          . ((group_id)
+             (name . (((start . 0) (end . 6) (text . "Search"))))
+             (remark)))))
+     (discussions)
+     (member_profiles
+      . (((uid . "u_native_alice")
+          (user_id . "10001")
+          (nickname . "Alice")
+          (remark . "")
+          (card . "Alice Card")
+          (hits . ((user_id) (nickname) (remark) (card))))))
      (member_cards)
      (recall_reason . ""))))
 
@@ -196,7 +196,7 @@
   (dolist (group-id '("0" "4294967296" 4294967295))
     (should-error
      (qq-api-validate-chat-locator
-     `((kind . "group") (group_id . ,group-id)))
+      `((kind . "group") (group_id . ,group-id)))
      :type 'user-error)))
 
 (ert-deftest qq-api-chat-locator-private-id-is-canonical-nonzero-decimal ()
@@ -379,7 +379,7 @@
                      '(((type . "reply")
                         (data . ((id . "42"))))
                        ((type . "text")
-                         (data . ((text . "hello"))))))))))
+                        (data . ((text . "hello"))))))))))
 
 (ert-deftest qq-api-send-message-calls-owner-after-pending-success ()
   (let (success-fn events promotion-args)
@@ -566,7 +566,7 @@
       session-key '((type . guild-channel) (channel-kind . "forum")) nil)
      (cl-letf (((symbol-function 'qq-api-call)
                 (lambda (candidate-action candidate-params callback
-                         &optional _errback)
+                                          &optional _errback)
                   (setq action candidate-action
                         params candidate-params)
                   (funcall callback
@@ -820,7 +820,7 @@
       (should (qq-protocol-emacs-message-search-result-p candidate 'message)))
 
     (dolist (key '(chat message_id message_seq sent_at sender outgoing state
-                       segments reactions))
+                   segments reactions))
       (let ((candidate (copy-tree result)))
         (setq candidate (assq-delete-all key candidate))
         (should-not
@@ -882,7 +882,7 @@
     (setf (alist-get 'message_seq result) "900719925474099312346")
     (cl-letf (((symbol-function 'qq-api-call)
                (lambda (candidate-action candidate-params callback
-                        &optional _errback)
+                                         &optional _errback)
                  (setq action candidate-action
                        params candidate-params)
                  (funcall callback
@@ -916,8 +916,8 @@
                  (setq params candidate-params)
                  (funcall callback
                           '((data . ((projection . "summary")
-                                    (results)
-                                    (next_cursor)))))
+                                     (results)
+                                     (next_cursor)))))
                  'request-2)))
       (qq-api-search-messages-next
        "group:20001" "opaque:cursor" 'summary
@@ -936,7 +936,7 @@
   (let (action params page)
     (cl-letf (((symbol-function 'qq-api-call)
                (lambda (candidate-action candidate-params callback
-                        &optional _errback)
+                                         &optional _errback)
                  (setq action candidate-action
                        params candidate-params)
                  (funcall
@@ -1023,20 +1023,20 @@
   (let ((result
          (copy-tree
           '((group
-            . ((group_id . "4294967295")
-               (name . "Synthetic Group")
-               (remark . "")
-               (member_count . 4294967295)
-               (is_conf . :false)
-               (has_modify_conf_group_face . :false)
-               (has_modify_conf_group_name . :false)
-               (no_code_finger_open_flag . :false)
-               (self_permission . "member")
-               (hits . ((group_id) (name) (remark)))))
-           (discussions)
-           (member_profiles)
-           (member_cards)
-           (recall_reason . "synthetic")))))
+             . ((group_id . "4294967295")
+                (name . "Synthetic Group")
+                (remark . "")
+                (member_count . 4294967295)
+                (is_conf . :false)
+                (has_modify_conf_group_face . :false)
+                (has_modify_conf_group_name . :false)
+                (no_code_finger_open_flag . :false)
+                (self_permission . "member")
+                (hits . ((group_id) (name) (remark)))))
+            (discussions)
+            (member_profiles)
+            (member_cards)
+            (recall_reason . "synthetic")))))
     (should
      (qq-api--validate-group-chat-search-page
       `((results . (,result)) (multi_user_keywords) (next_cursor))))
@@ -1066,7 +1066,7 @@
   (let (action params page)
     (cl-letf (((symbol-function 'qq-api-call)
                (lambda (candidate-action candidate-params callback
-                        &optional _errback)
+                                         &optional _errback)
                  (setq action candidate-action
                        params candidate-params)
                  (funcall
@@ -1099,7 +1099,7 @@
   (dolist
       (case
        `((group-members "group_members"
-                        (,(qq-api-test--contact-search-group-member-result)))
+          (,(qq-api-test--contact-search-group-member-result)))
          (friends-and-group-members
           "friends_and_group_members"
           (,(qq-api-test--contact-search-friend-result)
@@ -1311,7 +1311,7 @@
         `((results) (next_cursor . "123E4567-E89B-42D3-A456-426614174000"))
         `((results) (next_cursor . ,(qq-api-test--uuid-v4)) (extra . t))
         `((results . (,(qq-api-test--contact-search-friend-result)
-                       . malformed-tail))
+                      . malformed-tail))
           (next_cursor))))
     (should-error (qq-api--validate-contact-search-page page)))
   (should
@@ -1380,8 +1380,8 @@
      (qq-api--group-chat-search-callback
       consumer errback
       `((data . ((results . (,synthetic-group))
-                  (multi_user_keywords)
-                  (next_cursor))))))
+                 (multi_user_keywords)
+                 (next_cursor))))))
     (should-error
      (qq-api--contact-search-callback
       '((scope . "friends") (query . "Synthetic") (limit . 50))
@@ -1421,7 +1421,7 @@
     (unwind-protect
         (cl-letf (((symbol-function 'qq-api-call)
                    (lambda (candidate-action candidate-params callback
-                            &optional _errback)
+                                             &optional _errback)
                      (setq action candidate-action
                            params candidate-params)
                      (funcall
@@ -1454,8 +1454,8 @@
                  (setq params candidate-params)
                  (funcall callback
                           '((data . ((projection . "message")
-                                    (results)
-                                    (next_cursor)))))
+                                     (results)
+                                     (next_cursor)))))
                  'filter-next-request)))
       (qq-api-filter-messages-next
        "private:10001" "opaque:filter" (lambda (page) (setq value page)))
@@ -1557,18 +1557,18 @@
       (qq-api-refresh-recent-contacts)
       (funcall (nth 1 callbacks)
                '((data . (((chatType . 2) (peerUid . "20001")
-                            (peerUin . "20001") (unreadCount . 2)
-                            (msgTime . "1710000002")
-                            (msgId . "9007199254741004646")
-                            (msgSeq . "10002")
-                            (lastMessagePreview . "newer"))))))
+                           (peerUin . "20001") (unreadCount . 2)
+                           (msgTime . "1710000002")
+                           (msgId . "9007199254741004646")
+                           (msgSeq . "10002")
+                           (lastMessagePreview . "newer"))))))
       (funcall (nth 0 callbacks)
                '((data . (((chatType . 2) (peerUid . "20001")
-                            (peerUin . "20001") (unreadCount . 9)
-                            (msgTime . "1710000001")
-                            (msgId . "9007199254741004645")
-                            (msgSeq . "10001")
-                            (lastMessagePreview . "older"))))))
+                           (peerUin . "20001") (unreadCount . 9)
+                           (msgTime . "1710000001")
+                           (msgId . "9007199254741004645")
+                           (msgSeq . "10001")
+                           (lastMessagePreview . "older"))))))
       (should (= 2 (alist-get 'unread-badge-count
                               (qq-state-session "group:20001"))))
       (should (equal "9007199254741004646"
@@ -1585,7 +1585,7 @@
     (unwind-protect
         (cl-letf (((symbol-function 'qq-api-call)
                    (lambda (candidate-action candidate-params callback
-                            &optional _errback)
+                                             &optional _errback)
                      (setq action candidate-action
                            params candidate-params)
                      (funcall
@@ -1647,9 +1647,9 @@
        '((data
           . ((categories
               . (((category_id . 1) (sort_id . 1) (name . "旧")
-                   (online_count . 0)
-                   (friends . (((user_id . "10001")
-                                (nickname . "Old") (remark)))))))))))
+                  (online_count . 0)
+                  (friends . (((user_id . "10001")
+                               (nickname . "Old") (remark)))))))))))
       (should (= (length calls) 2))
       (should (equal (mapcar #'car callbacks) '(first)))
       (should (equal (alist-get 'nickname (qq-state-friend "10001"))
@@ -1659,9 +1659,9 @@
        '((data
           . ((categories
               . (((category_id . 1) (sort_id . 1) (name . "新")
-                   (online_count . 1)
-                   (friends . (((user_id . "10001")
-                                (nickname . "New") (remark)))))))))))
+                  (online_count . 1)
+                  (friends . (((user_id . "10001")
+                               (nickname . "New") (remark)))))))))))
       (should (equal (sort (mapcar #'car callbacks)
                            (lambda (left right)
                              (string< (symbol-name left) (symbol-name right))))
@@ -1692,15 +1692,15 @@
       (funcall
        (caar calls)
        '((data . ((categories . (((category_id . 1) (sort_id . 1)
-                                   (name . "A") (online_count . 0)
-                                   (friends))))))))
+                                  (name . "A") (online_count . 0)
+                                  (friends))))))))
       (should first-called)
       (should (= (length calls) 2))
       (funcall
        (car (nth 1 calls))
        '((data . ((categories . (((category_id . 1) (sort_id . 1)
-                                   (name . "B") (online_count . 0)
-                                   (friends))))))))
+                                  (name . "B") (online_count . 0)
+                                  (friends))))))))
       (should-not second-called)
       (should third-called))))
 
@@ -1748,14 +1748,14 @@
       (funcall
        (caar calls)
        '((data . ((categories . (((category_id . 1) (sort_id . 1)
-                                   (name . "First") (online_count . 0)
-                                   (friends))))))))
+                                  (name . "First") (online_count . 0)
+                                  (friends))))))))
       (should (= (length calls) 2))
       (funcall
        (car (nth 1 calls))
        '((data . ((categories . (((category_id . 2) (sort_id . 2)
-                                   (name . "Second") (online_count . 0)
-                                   (friends))))))))
+                                  (name . "Second") (online_count . 0)
+                                  (friends))))))))
       (should second-called)
       (should-not (gethash 'friend-categories qq-api--snapshot-active)))))
 
@@ -1765,7 +1765,7 @@
        '((((category_id . 1) (sort_id . 1) (name . "A")
            (online_count . 0)
            (friends . (((user_id . 90071992547409931)
-                        (nickname . "Alice") (remark))))) )
+                        (nickname . "Alice") (remark))))))
          (((category_id . 1) (sort_id . 1) (name . "A")
            (online_count . 0)
            (friends . (((user_id . "10001")
@@ -1823,7 +1823,7 @@
     (unwind-protect
         (cl-letf (((symbol-function 'qq-api-call)
                    (lambda (candidate-action candidate-params callback
-                            &optional _errback)
+                                             &optional _errback)
                      (setq action candidate-action
                            params candidate-params)
                      (funcall
@@ -1882,14 +1882,14 @@
     (unwind-protect
         (cl-letf (((symbol-function 'qq-api-call)
                    (lambda (candidate-action candidate-params callback
-                            &optional _errback)
+                                             &optional _errback)
                      (setq action candidate-action
                            params candidate-params)
                      (funcall
                       callback
                       '((data
                          . ((guilds
-                            . (((guild_id . "9007199254740993")
+                             . (((guild_id . "9007199254740993")
                                  (name . "Synthetic guild")
                                  (avatar_seq . "3")
                                  (pinned_at))))
@@ -1933,7 +1933,7 @@
   (let (action params delivered)
     (cl-letf (((symbol-function 'qq-api-call)
                (lambda (candidate-action candidate-params callback
-                        &optional _errback)
+                                         &optional _errback)
                  (setq action candidate-action
                        params candidate-params)
                  (funcall callback
@@ -2525,7 +2525,7 @@
       (should-error
        (qq-api-delete-message
         (qq-api-test--message-reference 'private "10001" 77))
-                    :type 'user-error))))
+       :type 'user-error))))
 
 (ert-deftest qq-api-message-mutations-reject-invalid-reference-before-transport ()
   (let (transport-called)
@@ -2842,7 +2842,7 @@
           '(((kind . "forward-card")
              (payload
               . ((reference . ((kind . "resource")
-                                (resource_id . "resource-a")))
+                               (resource_id . "resource-a")))
                  (presentation . nil))))))))
     (should (qq-api-validate-native-forward-messages (list message)))
     (setf (alist-get 'presentation
@@ -3015,10 +3015,10 @@
 
 (ert-deftest qq-api-native-forward-rejects-dataline-destination ()
   (let ((request
-         '((kind . "individual")
-           (messages
-            . (((message_id . "9007199254742007089")
-                (chat . ((kind . "private") (user_id . "10001"))))))))
+          '((kind . "individual")
+            (messages
+             . (((message_id . "9007199254742007089")
+                 (chat . ((kind . "private") (user_id . "10001"))))))))
         transport-called)
     (cl-letf (((symbol-function 'qq-api-call)
                (lambda (&rest _arguments) (setq transport-called t))))
@@ -3052,12 +3052,12 @@
                (variant (nth 1 case))
                (allowed-p (nth 2 case))
                (request
-                `((kind . ,kind)
-                  (messages
-                   . (((message_id . "9007199254742007089")
-                       (chat . ((kind . "dataline")
-                                (peer_uid . "dev:a")
-                                (variant . ,variant)))))))))
+                 `((kind . ,kind)
+                   (messages
+                    . (((message_id . "9007199254742007089")
+                        (chat . ((kind . "dataline")
+                                 (peer_uid . "dev:a")
+                                 (variant . ,variant)))))))))
           (if allowed-p
               (should
                (eq
@@ -3204,7 +3204,7 @@
     '((kind . "single")
       (message . ((message_id . "9007199254742007001")
                   (chat . ((kind . "group") (group_id . "20001"))))))
-   #'ignore)
+    #'ignore)
    :type 'user-error)
   (should-error
    (qq-api-send-forward
@@ -3269,23 +3269,23 @@
                        params actual-params)
                  (funcall callback
                           '((data . (((user_id . "10001")
-                                     (uid . "uid-alice")
-                                     (nickname . "Alice")
-                                     (card . "Alice Card")
-                                     (remark . nil)
-                                     (qid . "alice")
-                                     (title . "管理员")
-                                     (role . "admin")
-                                     (robot . :false))
-                                    ((user_id . "10002")
-                                     (uid . "u-alice")
-                                     (nickname . "Alice")
-                                     (card . nil)
-                                     (remark . nil)
-                                     (qid . nil)
-                                     (title . nil)
-                                     (role . "member")
-                                     (robot . :false)))))))))
+                                      (uid . "uid-alice")
+                                      (nickname . "Alice")
+                                      (card . "Alice Card")
+                                      (remark . nil)
+                                      (qid . "alice")
+                                      (title . "管理员")
+                                      (role . "admin")
+                                      (robot . :false))
+                                     ((user_id . "10002")
+                                      (uid . "u-alice")
+                                      (nickname . "Alice")
+                                      (card . nil)
+                                      (remark . nil)
+                                      (qid . nil)
+                                      (title . nil)
+                                      (role . "member")
+                                      (robot . :false)))))))))
       (qq-api-search-group-members
        "20001" "Alice" (lambda (members) (setq delivered members)) nil 80))
     (should (equal "emacs_search_group_members" action))
@@ -3303,14 +3303,14 @@
                (lambda (_action _params callback &optional _errback)
                  (funcall callback
                           '((data . (((user_id . 10001)
-                                     (uid . "uid-alice")
-                                     (nickname . "Alice")
-                                     (card . nil)
-                                     (remark . nil)
-                                     (qid . nil)
-                                     (title . nil)
-                                     (role . "member")
-                                     (robot . :false)))))))))
+                                      (uid . "uid-alice")
+                                      (nickname . "Alice")
+                                      (card . nil)
+                                      (remark . nil)
+                                      (qid . nil)
+                                      (title . nil)
+                                      (role . "member")
+                                      (robot . :false)))))))))
       (qq-api-search-group-members
        "20001" "" (lambda (_) (setq delivered t))
        (lambda (_response reason) (setq failure reason))))
