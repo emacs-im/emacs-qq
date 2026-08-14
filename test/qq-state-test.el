@@ -597,20 +597,18 @@
        (qq-state--bump-recent-session "group:20003")
        (should (= emitted 0))))))
 
-(ert-deftest qq-state-bump-recent-inserts-unknown-session-and-skips-empty ()
+(ert-deftest qq-state-bump-recent-starts-projection-and-inserts-unknown-session ()
   (qq-test-with-reset
-   ;; An empty projection has no baseline until a native snapshot arrives.
-   (let ((emitted 0))
-     (cl-letf (((symbol-function 'qq-state--emit)
-                (lambda (&rest _) (cl-incf emitted))))
-       (qq-state--bump-recent-session "group:20002")
-       (should (= emitted 0))))
+   ;; A live message may arrive before the first native recent snapshot.
+   (qq-state-upsert-session "group:20002" nil nil)
+   (qq-state--bump-recent-session "group:20002")
+   (should (equal (qq-state-recent-session-keys) '("group:20002")))
    (qq-state-apply-recent-conversations
     (list (qq-state-test--native-recent-entry
            :message (qq-state-test--native-recent-message
                      :session-key "group:20001")))
     1)
-   ;; A session absent from the recent projection still enters at the head.
+   ;; A session absent from the latest snapshot enters at the activity head.
    (qq-state--bump-recent-session "group:20002")
    (should (equal (qq-state-recent-session-keys)
                   '("group:20002" "group:20001")))))

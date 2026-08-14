@@ -1605,6 +1605,12 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
   (qq-message-test-with-state
     (let ((now (floor (float-time))) sent-method sent-params callback-result
           local-id)
+      (let ((key-set (make-hash-table :test #'equal)))
+        (dolist (key '("group:20001" "private:10001"))
+          (puthash key t key-set))
+        (setq qq-state--recent-session-keys
+              '("group:20001" "private:10001")
+              qq-state--recent-session-key-set key-set))
       (cl-letf (((symbol-function 'qq-server-ready-p)
                  (lambda () t))
                 ((symbol-function 'qq-server-capabilities)
@@ -1648,6 +1654,9 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                        (payload . ((text . "hello")))))))))
         (should (equal (alist-get 'client_sequence callback-result) "42001"))
         (should (= (hash-table-count qq-message--pending-sends) 1))
+        ;; A confirmed local send promotes its session before any self-echo.
+        (should (equal (qq-state-recent-session-keys)
+                       '("private:10001" "group:20001")))
         (qq-message--handle-event
          "message.received"
          (qq-message-test-event

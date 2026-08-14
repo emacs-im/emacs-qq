@@ -2251,6 +2251,9 @@ device's independently assigned inbound DataLine Message ID."
                         (format "%s" (alist-get 'client_sequence receipt))
                         :random (alist-get 'random receipt))
                   qq-message--pending-sends)))
+             ;; A successful send is recent activity even when its self-echo
+             ;; is delayed or never delivered by the native client.
+             (qq-state--bump-recent-session session-key)
              receipt)
            :callback
            (lambda (receipt)
