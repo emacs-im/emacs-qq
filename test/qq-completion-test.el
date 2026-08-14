@@ -543,14 +543,40 @@
                #'ignore)
               ((symbol-function 'appkit-chat-emoji-candidates)
                (lambda (&optional _) (list rocket family)))
-              ((symbol-function 'appkit-chat-completion-read)
+              ((symbol-function 'completing-read)
                (lambda (_prompt candidates &rest _)
                  (setq seen candidates)
                  (car candidates))))
       (should
        (equal (qq-completion-read-reaction)
               '((emoji-id . "128640") (emoji-type . "2"))))
-      (should (equal seen (list rocket))))))
+      (should (equal seen '(":rocket:"))))))
+
+(ert-deftest qq-completion-reaction-picker-narrows-visible-candidates ()
+  (let ((white-flower
+         (appkit-chat-completion-candidate-create
+          :label ":white_flower:"
+          :value '(:kind unicode-emoji :emoji "💮")))
+        (wind-chime
+         (appkit-chat-completion-candidate-create
+          :label ":wind_chime:"
+          :value '(:kind unicode-emoji :emoji "🎐"))))
+    (cl-letf (((symbol-function 'qq-completion--base-face-candidates)
+               #'ignore)
+              ((symbol-function 'appkit-chat-emoji-candidates)
+               (lambda (&optional _) (list white-flower wind-chime)))
+              ((symbol-function 'completing-read)
+               (lambda (_prompt candidates &rest _)
+                 (should (equal completion-styles '(substring basic)))
+                 (should
+                  (equal
+                   (completion-all-completions
+                    "whi" candidates nil 3)
+                   '(":white_flower:" . 0)))
+                 ":white_flower:")))
+      (should
+       (equal (qq-completion-read-reaction)
+              '((emoji-id . "128174") (emoji-type . "2")))))))
 
 (ert-deftest qq-completion-cold-fav-tab-caches-without-async-presentation ()
   (qq-completion-test-with-group
