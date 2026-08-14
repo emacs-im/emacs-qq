@@ -776,6 +776,7 @@ they are never split, normalized, escaped, or reconstructed from metadata."
       (read-latest-message-id . nil)
       (last-message-time . 0)
       (last-message-preview . "")
+      (last-message-sender-id . nil)
       (last-message-sender-name . nil)
       (last-message-self-p . nil)
       (last-message-summary-token . 0)
@@ -1969,8 +1970,11 @@ fallback describes the already accepted exact message."
                 'last-message-order
                 (assq-delete-all
                  'last-message-self-p
-                 (assq-delete-all 'last-message-sender-name
-                                  (copy-tree fields)))))))
+                 (assq-delete-all
+                  'last-message-sender-name
+                  (assq-delete-all
+                   'last-message-sender-id
+                   (copy-tree fields))))))))
       (qq-state-upsert-session
        session-key
        (append (copy-tree fields)
@@ -1990,6 +1994,10 @@ fallback describes the already accepted exact message."
       (last-message-local-id . ,(alist-get 'local-id message))
       (last-message-order . ,(alist-get 'order message))
       (last-message-preview . ,(qq-state-message-preview message))
+      (last-message-sender-id
+       . ,(unless special-p
+            (or (alist-get 'sender-id message)
+                (alist-get 'sender-native-id message))))
       (last-message-sender-name
        . ,(unless special-p (alist-get 'sender-name message)))
       (last-message-self-p
@@ -2057,6 +2065,7 @@ asynchronous materialization request; nil denotes a live/local observation."
          (token (qq-state-session-summary-observation-start))
          (cleared '((last-message-time . 0)
                     (last-message-preview . "")
+                    (last-message-sender-id . nil)
                     (last-message-sender-name . nil)
                     (last-message-self-p . nil)
                     (last-message-local-id . nil)
@@ -3603,6 +3612,7 @@ its session metadata can be committed."
               (or (alist-get 'lastMessagePreview contact)
                   (alist-get 'last_message_preview contact)
                   "")))
+         (last-message-sender-id . nil)
          (last-message-sender-name . nil)
          (last-message-self-p . nil))
        :normalized-message

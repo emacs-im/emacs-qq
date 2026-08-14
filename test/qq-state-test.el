@@ -1915,6 +1915,7 @@ buffer instead of doubling the display name."
      (should (equal (alist-get 'sender-name message) "Alice"))
      (should-not (alist-get 'sender-secondary-name message))
      (let ((session (qq-state-session "group:20001")))
+       (should (equal (alist-get 'last-message-sender-id session) "10001"))
        (should (equal (alist-get 'last-message-sender-name session) "Alice"))
        (should-not (alist-get 'last-message-self-p session))))))
 
@@ -2159,6 +2160,7 @@ it kept the element's visible text, the user should still see it."
     "group:20002"
     '((last-message-id . "9007199254741004990")
       (last-message-preview . "old")
+      (last-message-sender-id . "10001")
       (last-message-sender-name . "Alice")
       (last-message-self-p . t))
     nil)
@@ -2174,6 +2176,7 @@ it kept the element's visible text, the user should still see it."
    (let ((session (qq-state-session "group:20002")))
      (should (equal (alist-get 'last-message-preview session)
                     "new fallback"))
+     (should-not (alist-get 'last-message-sender-id session))
      (should-not (alist-get 'last-message-sender-name session))
      (should-not (alist-get 'last-message-self-p session)))))
 
