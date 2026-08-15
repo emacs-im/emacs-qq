@@ -189,7 +189,7 @@ contact cache."
      errback)))
 
 (defun qq-core--recent-private-row-projectable-p (row account)
-  "Return non-nil when private recent ROW can derive a UIN using ACCOUNT."
+  "Return non-nil when C2C recent ROW can derive a UIN using ACCOUNT."
   (let* ((message (alist-get 'message (alist-get 'latest_message row)))
          (sender (alist-get 'sender message))
          (recipient (alist-get 'recipient message))
@@ -209,13 +209,11 @@ contact cache."
   (let ((identity (alist-get 'conversation row)))
     (pcase (alist-get 'kind identity)
       ("group" t)
-      ;; The identity may legitimately be UID-only.  The latest message
-      ;; can still provide the peer UIN needed by the product session key.
-      ("private" (qq-core--recent-private-row-projectable-p row account))
-      ("dataline" t)
-      ;; Temporary conversations are valid protocol rows but have no product
-      ;; session-key/routing model yet.
-      ("temporary" nil))))
+      ;; C2C identities may legitimately be UID-only.  The latest message
+      ;; can still provide the peer UIN needed by the private product session.
+      ((or "private" "temporary")
+       (qq-core--recent-private-row-projectable-p row account))
+      ("dataline" t))))
 
 (defun qq-core--recent-row-state-entry (page row account)
   "Return one state-domain entry for PAGE ROW and ACCOUNT."
@@ -240,7 +238,7 @@ contact cache."
          (session-key (alist-get 'session-key normalized))
          (session-identity (qq-state-session-key-identity session-key)))
     (pcase identity-kind
-      ("private"
+      ((or "private" "temporary")
        (unless (and (eq (alist-get 'type session-identity) 'private)
                     (or (not (assq 'peer_uin identity))
                         (equal (alist-get 'peer_uin identity)
@@ -248,7 +246,7 @@ contact cache."
                     (or (not (assq 'peer_uid identity))
                         (equal (alist-get 'peer_uid identity)
                                (alist-get 'peer-uid normalized))))
-         (error "qq: recent private identity contradicts latest message")))
+         (error "qq: recent C2C identity contradicts latest message")))
       ("group"
        (unless (and (eq (alist-get 'type session-identity) 'group)
                     (equal (alist-get 'group_uin identity)

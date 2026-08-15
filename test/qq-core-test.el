@@ -149,7 +149,7 @@
       (should (qq-core-activate))
       (should bootstrapped))))
 
-(ert-deftest qq-core-recent-projects-uid-only-private-and-skips-temporary ()
+(ert-deftest qq-core-recent-projects-private-and-temporary-c2c-rows ()
   (qq-core-test-with-managed-account
     (let* ((raw-message (alist-get 'message (qq-core-test-message-event)))
            (message (qq-server-wire-domain-copy raw-message))
@@ -167,8 +167,10 @@
                                       (message . ,message))))
                   ((conversation
                     . ((kind . "temporary")
+                       (c2c_type . 100)
                        (peer_uid . "u_peer")
                        (from_tiny_id . "10")))
+                   (pinned . t)
                    (activity_revision . "1")
                    (latest_message
                     . ((kind . "native")
@@ -179,7 +181,8 @@
               (truncated . :false))))
       (setf (alist-get 'conversation temporary-message nil nil #'eq)
             '((kind . "temp") (name . "Temporary")
-              (from_tiny_id . "10")))
+              (from_tiny_id . "10"))
+            (alist-get 'sub_type temporary-message nil nil #'eq) 100)
       (progn
         (let ((entry
                (qq-core--recent-row-state-entry
@@ -188,6 +191,18 @@
                 (qq-core-test-account))))
           (should-not (plist-member entry :read-cursor-known-p))
           (should-not (plist-member entry :read-cursor)))
+        (let ((temporary-entry
+               (qq-core--recent-row-state-entry
+                page
+                (cadr (alist-get 'conversations page))
+                (qq-core-test-account))))
+          (should (equal (plist-get temporary-entry :session-key)
+                         "private:10001"))
+          (should (equal (alist-get 'message-type
+                                    (plist-get temporary-entry :message))
+                         "temp")))
+        (setf (alist-get 'conversations page nil nil #'eq)
+              (list (cadr (alist-get 'conversations page))))
         (qq-core--apply-recent-page
          page (qq-state-session-summary-observation-start))
         (should (equal (qq-state-recent-session-keys)

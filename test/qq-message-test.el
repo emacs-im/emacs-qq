@@ -1429,7 +1429,7 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                            (car (qq-state-session-messages "private:10001")))
                 "slot-b"))))))
 
-(ert-deftest qq-message-temp-is-valid-but-not-projected ()
+(ert-deftest qq-message-temp-projects-on-the-private-product-session ()
   (qq-message-test-with-state
     (let (reason)
       (add-hook 'qq-message-projection-error-hook
@@ -1442,8 +1442,11 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           (name . "Temporary")
           (from_tiny_id . "1")
           (to_tiny_id . "2"))))
-      (should (string-match-p "Temp conversations" reason))
-      (should-not (qq-state-sessions)))))
+      (should-not reason)
+      (let ((message
+             (car (qq-state-session-messages "private:10001"))))
+        (should (equal (alist-get 'message-type message) "temp"))
+        (should (equal (alist-get 'peer-uid message) "u_peer"))))))
 
 (ert-deftest qq-message-sequence-recall-waits-for-group-message ()
   (qq-message-test-with-state

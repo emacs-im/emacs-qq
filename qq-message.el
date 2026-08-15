@@ -562,7 +562,7 @@ order."
                        (alist-get 'uid sender)))))
          session-key peer peer-name outgoing group-id)
     (pcase kind
-      ("private"
+      ((or "private" "temp")
        (let ((context (qq-message--private-context message account)))
          (setq outgoing
                (cond
@@ -604,8 +604,7 @@ order."
                     (alist-get 'group_name conversation))
                    (qq-message--present-string
                     (alist-get 'group_name group))
-                   group-id))))
-      ("temp" (error "qq: Temp conversations are not projected yet")))
+                   group-id)))))
     (let* ((server-id
             (qq-protocol-optional-message-id
              (alist-get 'message_id message) "Native message snapshot"))
@@ -2852,7 +2851,10 @@ observations resolve sequence, timestamp, and GrayTip tips-sequence evidence."
          (error "qq: recent %s group identity contradicts latest message"
                 context)))
       ("temporary"
-       (unless (equal (alist-get 'kind conversation) "temp")
+       (unless (and (equal (alist-get 'kind conversation) "temp")
+                    (integerp (alist-get 'c2c_type identity))
+                    (= (alist-get 'c2c_type identity)
+                       (alist-get 'sub_type message)))
          (error "qq: recent %s temporary identity contradicts latest message"
                 context))
        (dolist (key '(from_tiny_id to_tiny_id))
@@ -2877,8 +2879,8 @@ observations resolve sequence, timestamp, and GrayTip tips-sequence evidence."
                 context))))
   message)
 
-(defun qq-message--recent-identity-key (identity message)
-  "Return a projection duplicate key for IDENTITY and latest MESSAGE."
+(defun qq-message--recent-identity-key (identity)
+  "Return a projection duplicate key for recent IDENTITY."
   (pcase (alist-get 'kind identity)
     ("private"
      (list "private" (alist-get 'peer_uid identity)
@@ -2886,11 +2888,11 @@ observations resolve sequence, timestamp, and GrayTip tips-sequence evidence."
     ("group" (list "group" (alist-get 'group_uin identity)))
     ("temporary"
      (list "temporary"
+           (alist-get 'c2c_type identity)
            (alist-get 'peer_uid identity)
            (alist-get 'peer_uin identity)
            (alist-get 'from_tiny_id identity)
-           (alist-get 'to_tiny_id identity)
-           (alist-get 'sub_type message)))
+           (alist-get 'to_tiny_id identity)))
     ("dataline"
      (list "dataline"
            (alist-get 'variant identity)
@@ -2908,8 +2910,7 @@ SEEN-IDENTITIES rejects two rows that would own the same local session."
                         "dataline"
                       "native"))
          (message (qq-message--history-item head head-kind context))
-         (identity-key
-          (qq-message--recent-identity-key identity message)))
+         (identity-key (qq-message--recent-identity-key identity)))
     (qq-message--recent-assert-identity-message identity message context)
     (when (gethash identity-key seen-identities)
       (error "qq: recent page duplicates conversation identity"))
