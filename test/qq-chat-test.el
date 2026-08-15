@@ -4451,6 +4451,52 @@
        (should (equal "9007199254742007095"
                       (alist-get 'server-id (qq-chat--reply-message))))))))
 
+(ert-deftest qq-chat-send-success-settles-late-error-callback ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001" '((title . "Alice") (target-id . "10001")) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (qq-chat-edit-draft)
+     (insert "sent draft")
+     (let (success-fn error-fn)
+       (cl-letf (((symbol-function 'qq-core-send-message)
+                  (lambda (_session _segments &optional _raw success errback)
+                    (setq success-fn success
+                          error-fn errback)))
+                 ((symbol-function 'qq-api--default-error) #'ignore))
+         (qq-chat-send-message)
+         (funcall success-fn nil)
+         (funcall error-fn nil "late failure"))
+       (should (equal "" (qq-chat--current-draft-string)))
+       (should-not (appkit-chatbuf-aux-state))))))
+
+(ert-deftest qq-chat-failed-send-revision-prevents-empty-state-aba ()
+  (qq-chat-test-with-reset
+   (qq-state-upsert-session
+    "private:10001" '((title . "Alice") (target-id . "10001")) nil)
+   (with-temp-buffer
+     (qq-chat-mode)
+     (setq qq-chat--session-key "private:10001")
+     (qq-chat-render)
+     (qq-chat-edit-draft)
+     (insert "old draft")
+     (let (error-fn cleared-revision)
+       (cl-letf (((symbol-function 'qq-core-send-message)
+                  (lambda (_session _segments &optional _raw _success errback)
+                    (setq error-fn errback)))
+                 ((symbol-function 'qq-api--default-error) #'ignore))
+         (qq-chat-send-message)
+         (setq cleared-revision (appkit-chatbuf-composer-revision))
+         (insert "new")
+         (delete-region (appkit-chatbuf-input-start-position) (point-max))
+         (should (> (appkit-chatbuf-composer-revision) cleared-revision))
+         (funcall error-fn nil "late failure"))
+       (should (equal "" (qq-chat--current-draft-string)))
+       (should-not (appkit-chatbuf-aux-state))))))
+
 
 (ert-deftest qq-api-history-exhausted-error-p ()
   (require 'qq-api)
