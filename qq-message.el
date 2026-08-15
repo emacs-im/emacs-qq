@@ -1936,9 +1936,9 @@ DIRECTION closes which operation may consume its private position."
       (qq-message--exact-history-object-keys-p
        result
        '(history_version account_id conversation direction messages
-                         unsupported_message_count requested_cursor
-                         older_cursor newer_cursor has_older
-                         has_newer_materialized))
+         unsupported_message_count requested_cursor
+         older_cursor newer_cursor has_older
+         has_newer_materialized))
     (error "qq: Gateway returned a non-closed history page"))
   (let ((wire-direction (symbol-name direction))
         (response-cursor (alist-get 'requested_cursor result)))
@@ -1997,8 +1997,8 @@ DIRECTION closes which operation may consume its private position."
        (qq-message--exact-history-object-keys-p
         result
         '(history_version account_id conversation center messages
-                          unsupported_message_count older_cursor newer_cursor
-                          has_older has_newer_materialized))
+          unsupported_message_count older_cursor newer_cursor
+          has_older has_newer_materialized))
        (qq-message--history-center-equal-p
         (alist-get 'center result) center))
     (error "qq: Gateway returned a non-closed history around page"))
@@ -2309,8 +2309,8 @@ forwarding, face projection, or multipart capabilities."
                                           "u_l7jpPIZxQo0mzJwoEt-SKw"))
                        (qq-account--non-empty-string-p text)
                        (<= (string-bytes text) 160))
-             (user-error
-              "qq: current dataline.send_text requires one 1–160 byte text segment for a pinned phone/pad class"))
+            (user-error
+             "qq: current dataline.send_text requires one 1–160 byte text segment for a pinned phone/pad class"))
           (qq-message--send-request
            session-key (or optimistic-segments segments) raw-message
            "dataline.send_text"
