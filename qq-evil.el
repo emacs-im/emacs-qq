@@ -2,10 +2,9 @@
 
 ;;; Commentary:
 
-;; emacs-qq keeps its ordinary maps as the Emacs-state interface and defines a
-;; separate modal vocabulary here.  In particular, application refresh and
-;; navigation use `gr' and `gj'/`gk', leaving native Evil prefixes such as `gg'
-;; intact.  This integration is optional and does not depend on evil-collection.
+;; emacs-qq keeps its ordinary maps as the Emacs-state interface.  This
+;; optional integration keeps native Evil motions and defines only deliberate
+;; application actions.  It does not depend on evil-collection.
 
 ;;; Code:
 
@@ -115,8 +114,6 @@
 (declare-function qq-user-photo-open-at-point "qq-user-photo" ())
 (declare-function qq-user-photo-refresh "qq-user-photo" ())
 (declare-function qq-user-refresh "qq-user" ())
-(declare-function turn-off-evil-snipe-mode "evil-snipe" ())
-(declare-function turn-off-evil-snipe-override-mode "evil-snipe" ())
 
 (eval-when-compile
   (unless (require 'evil nil t)
@@ -204,7 +201,6 @@ When nil, leave Evil's initial-state selection untouched."
     (kbd "I") #'qq-root-open-self-user
     (kbd "TAB") #'qq-root-tab-dwim
     (kbd "<backtab>") #'qq-root-button-backward
-    (kbd "g u") #'qq-root-next-unread
     (kbd "?") #'qq-root-transient)
 
   (appkit-evil-define-keys qq-evil--application-states 'qq-contacts-mode-map
@@ -221,16 +217,12 @@ When nil, leave Evil's initial-state selection untouched."
     (kbd "a") #'qq-contacts-open-avatar-at-point
     (kbd "Y") #'qq-contacts-copy-id-at-point
     (kbd "t") #'qq-contacts-toggle-category
-    (kbd "g j") #'qq-contacts-next-item
-    (kbd "g k") #'qq-contacts-previous-item
     (kbd "TAB") #'forward-button
     (kbd "<backtab>") #'qq-contacts-button-backward
     (kbd "g b") #'qq-contacts-open-root)
 
   (appkit-evil-define-keys qq-evil--application-states 'qq-forward-mode-map
-    (kbd "g r") #'qq-forward-refresh
-    (kbd "g j") #'qq-forward-next-message
-    (kbd "g k") #'qq-forward-previous-message)
+    (kbd "g r") #'qq-forward-refresh)
 
   (appkit-evil-define-keys qq-evil--application-states 'qq-group-mode-map
     (kbd "g r") #'qq-group-refresh
@@ -257,17 +249,13 @@ When nil, leave Evil's initial-state selection untouched."
       'qq-guild-forum-mode-map
     (kbd "RET") #'qq-guild-forum-open-post
     (kbd "<return>") #'qq-guild-forum-open-post
-    (kbd "g r") #'qq-guild-forum-refresh
-    (kbd "g j") #'qq-guild-forum-next-post
-    (kbd "g k") #'qq-guild-forum-previous-post)
+    (kbd "g r") #'qq-guild-forum-refresh)
 
   (appkit-evil-define-keys qq-evil--application-states
       'qq-guild-forum-post-mode-map
     (kbd "RET") #'qq-guild-forum-post-open-at-point
     (kbd "<return>") #'qq-guild-forum-post-open-at-point
-    (kbd "g r") #'qq-guild-forum-post-refresh
-    (kbd "g j") #'appkit-discussion-next-entry
-    (kbd "g k") #'appkit-discussion-previous-entry)
+    (kbd "g r") #'qq-guild-forum-post-refresh)
 
   (appkit-evil-define-keys qq-evil--application-states
       'qq-guild-user-mode-map
@@ -283,10 +271,7 @@ When nil, leave Evil's initial-state selection untouched."
     (kbd "g r") #'qq-guilds-refresh
     (kbd "s") #'qq-guilds-filter
     (kbd "TAB") #'appkit-directory-tab-dwim
-    (kbd "<backtab>") #'appkit-directory-previous-item
-    (kbd "g j") #'appkit-directory-next-item
-    (kbd "g k") #'appkit-directory-previous-item
-    (kbd "g u") #'appkit-directory-next-unread)
+    (kbd "<backtab>") #'appkit-directory-previous-item)
 
   (appkit-evil-define-keys qq-evil--application-states
       'qq-red-packet-mode-map
@@ -298,8 +283,6 @@ When nil, leave Evil's initial-state selection untouched."
     (kbd "RET") #'qq-search-open-result
     (kbd "<return>") #'qq-search-open-result
     (kbd "g r") #'qq-search-refresh
-    (kbd "g j") #'qq-search-next-result
-    (kbd "g k") #'qq-search-previous-result
     (kbd "m") #'qq-search-load-more
     (kbd "s") #'qq-search-search)
 
@@ -308,7 +291,6 @@ When nil, leave Evil's initial-state selection untouched."
     (kbd "<return>") #'qq-user-open-photo-at-point
     (kbd "g r") #'qq-user-refresh
     (kbd "m") #'qq-user-open-chat
-    (kbd "l") #'qq-user-like
     (kbd "+") #'qq-user-add-friend
     (kbd "a") #'qq-user-open-avatar
     (kbd "P") #'qq-user-open-photo-wall
@@ -335,17 +317,14 @@ When nil, leave Evil's initial-state selection untouched."
     (kbd "g x") #'qq-chat-goto-pop-message)
 
   ;; The timeline mode is inactive in the composer, so these bindings never
-  ;; steal typed input.  `dd' follows telega's modal message-delete convention.
+  ;; steal typed input.  Evil operators and motions retain their native meanings.
   (appkit-evil-define-keys qq-evil--application-states
       'qq-chat-timeline-mode-map
     (kbd "q") #'quit-window
     (kbd "r") #'qq-chat-reply-to-message
-    (kbd "d d") #'qq-chat-delete-message
-    (kbd "d r") #'qq-chat-recall-message
     (kbd "R") #'qq-chat-forward-transient
     (kbd "m") #'qq-chat-toggle-message-selection
     (kbd "U") #'qq-chat-clear-message-selection
-    (kbd "o") #'qq-chat-open-resource-at-point
     (kbd "a") #'qq-chat-open-avatar-at-point
     (kbd "i") #'qq-chat-open-user-at-point
     (kbd "K") #'qq-chat-open-peer-info
@@ -353,23 +332,8 @@ When nil, leave Evil's initial-state selection untouched."
     (kbd "g x") #'qq-chat-goto-pop-message
     (kbd "P") #'qq-chat-poke-sender
     (kbd "!") #'qq-chat-react-to-message
-    (kbd "?") #'qq-chat-transient)
-  (add-hook 'qq-chat-timeline-mode-hook
-            #'appkit-evil-normalize-keymaps))
+    (kbd "?") #'qq-chat-transient))
 
-(defun qq-evil--disable-snipe ()
-  "Disable Evil Snipe in a read-only QQ application buffer."
-  (when (fboundp 'turn-off-evil-snipe-mode)
-    (turn-off-evil-snipe-mode))
-  (when (fboundp 'turn-off-evil-snipe-override-mode)
-    (turn-off-evil-snipe-override-mode)))
-
-(defun qq-evil--install-snipe-hooks ()
-  "Keep read-only QQ bindings above Evil Snipe's local overrides."
-  (when qq-evil-enable-integration
-    (dolist (mode (delq 'qq-chat-mode
-                        (copy-sequence qq-evil--application-modes)))
-      (add-hook (intern (format "%s-hook" mode)) #'qq-evil--disable-snipe))))
 
 (defun qq-evil--refresh-live-buffers ()
   "Refresh Evil projections in existing QQ application buffers."
@@ -377,9 +341,6 @@ When nil, leave Evil's initial-state selection untouched."
     (when (buffer-live-p buffer)
       (with-current-buffer buffer
         (when (memq major-mode qq-evil--application-modes)
-          (when (and (featurep 'evil-snipe)
-                     (not (eq major-mode 'qq-chat-mode)))
-            (qq-evil--disable-snipe))
           (appkit-evil-normalize-keymaps))))))
 
 ;;;###autoload
@@ -391,15 +352,11 @@ Safe to call multiple times."
     (qq-evil--set-initial-states)
     (qq-evil--define-readonly-keys)
     (qq-evil--define-chat-keys)
-    (when (featurep 'evil-snipe)
-      (qq-evil--install-snipe-hooks))
     (qq-evil--refresh-live-buffers)))
 
 (with-eval-after-load 'evil
   (qq-evil-setup))
 
-(with-eval-after-load 'evil-snipe
-  (qq-evil--install-snipe-hooks))
 
 (provide 'qq-evil)
 

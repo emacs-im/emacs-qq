@@ -376,6 +376,8 @@ remove this membership only while the same OWNER still belongs to ANCHOR."
     (define-key map (kbd "q") #'quit-window)
     ;; Message actions at point (telega-style single keys; never steal input).
     (define-key map (kbd "r") #'qq-chat-reply-to-message)
+    (define-key map (kbd "n") #'qq-chat-next-message)
+    (define-key map (kbd "p") #'qq-chat-previous-message)
     (define-key map (kbd "d") #'qq-chat-delete-transient)
     (define-key map (kbd "f") #'qq-chat-forward-transient)
     (define-key map (kbd "m") #'qq-chat-toggle-message-selection)
@@ -392,11 +394,11 @@ remove this membership only while the same OWNER still belongs to ANCHOR."
     map)
   "Timeline-only keymap active when point is outside the draft region.
 
-Single-key message actions (`r' reply, `d' delete menu, `f' forward,
-`!' react, `P' poke sender, `m' select/unselect, `U' clear selection,
-`o' open media, `a' avatar, `i' user,
-`g' goto replied-to, `x' pop jump) and the `?' menu apply on the timeline.
-They are inactive in the composer so typing is never stolen.")
+Single-key message actions (`r' reply, `n'/`p' message navigation, `d'
+delete menu, `f' forward, `!' react, `P' poke sender, `m' select/unselect,
+`U' clear selection, `o' open media, `a' avatar, `i' user, `g' goto
+replied-to, `x' pop jump) and the `?' menu apply on the timeline.  They are
+inactive in the composer so typing is never stolen.")
 
 (define-minor-mode qq-chat-timeline-mode
   "Buffer-local navigation bindings active outside the draft region."

@@ -14,8 +14,7 @@
                 #'evil-goto-first-line))
     (should (eq (key-binding (kbd "g r"))
                 #'qq-root-refresh))
-    (should (eq (key-binding (kbd "g u"))
-                #'qq-root-next-unread))
+    (should (eq (key-binding (kbd "g u")) #'evil-downcase))
     (should (eq (key-binding (kbd "n"))
                 #'evil-search-next))
     (evil-motion-state)
@@ -36,14 +35,9 @@
 (ert-deftest qq-evil-read-only-surfaces-use-modal-action-keys ()
   (dolist (case
            '((qq-contacts-mode-map "RET" qq-contacts-open-at-point)
-             (qq-contacts-mode-map "g j" qq-contacts-next-item)
              (qq-forward-mode-map "g r" qq-forward-refresh)
-             (qq-forward-mode-map "g k" qq-forward-previous-message)
              (qq-guilds-mode-map "RET" appkit-directory-activate)
-             (qq-guilds-mode-map "g j" appkit-directory-next-item)
              (qq-guild-forum-mode-map "RET" qq-guild-forum-open-post)
-             (qq-guild-forum-post-mode-map
-              "g k" appkit-discussion-previous-entry)
              (qq-user-mode-map "P" qq-user-open-photo-wall)
              (qq-group-mode-map "g n" qq-group-open-notices)
              (qq-red-packet-mode-map "c" qq-red-packet-grab)))
@@ -53,7 +47,13 @@
         (evil-normal-state)
         (should (eq (key-binding (kbd key)) command))
         (should (eq (key-binding (kbd "g g"))
-                    #'evil-goto-first-line))))))
+                    #'evil-goto-first-line))
+        (dolist (binding
+                 '(("g j" . evil-next-visual-line)
+                   ("g k" . evil-previous-visual-line)
+                   ("g u" . evil-downcase)))
+          (should (eq (key-binding (kbd (car binding)))
+                      (cdr binding))))))))
 
 (ert-deftest qq-evil-chat-keeps-prefixes-and-the-composer-boundary ()
   (with-temp-buffer
@@ -63,14 +63,24 @@
     (should (eq (key-binding (kbd "g g"))
                 #'evil-goto-first-line))
     (should (eq (key-binding (kbd "g r")) #'qq-chat-refresh))
-    (qq-chat-timeline-mode 1)
+    (appkit-chatbuf-use-timeline-mode #'qq-chat-timeline-mode)
     (should (eq (key-binding (kbd "r")) #'qq-chat-reply-to-message))
-    (should (eq (key-binding (kbd "d d")) #'qq-chat-delete-message))
-    (should (eq (key-binding (kbd "d r")) #'qq-chat-recall-message))
     (should (eq (key-binding (kbd "R")) #'qq-chat-forward-transient))
+    (should (eq (key-binding (kbd "i")) #'qq-chat-open-user-at-point))
     (should (eq (key-binding (kbd "g q")) #'qq-chat-goto-reply))
+    (dolist (binding
+             '(("e" . evil-forward-word-end)
+               ("l" . evil-forward-char)
+               ("n" . evil-search-next)
+               ("p" . evil-paste-after)
+               ("d" . evil-delete)
+               ("g j" . evil-next-visual-line)
+               ("g k" . evil-previous-visual-line)
+               ("g u" . evil-downcase)
+               ("g i" . evil-insert-resume)))
+      (should (eq (key-binding (kbd (car binding))) (cdr binding))))
     (should (eq (key-binding (kbd "g g")) #'evil-goto-first-line))
-    (qq-chat-timeline-mode -1)
+    (appkit-chatbuf-use-timeline-mode nil)
     (should-not (eq (key-binding (kbd "r"))
                     #'qq-chat-reply-to-message))))
 
@@ -82,6 +92,8 @@
     (should (eq (key-binding (kbd "g")) #'qq-chat-goto-reply))
     (should (eq (key-binding (kbd "d")) #'qq-chat-delete-transient))
     (should (eq (key-binding (kbd "f")) #'qq-chat-forward-transient))
+    (should (eq (key-binding (kbd "n")) #'qq-chat-next-message))
+    (should (eq (key-binding (kbd "p")) #'qq-chat-previous-message))
     (should-not (lookup-key qq-chat-timeline-mode-map (kbd "R")))))
 
 (ert-deftest qq-evil-applies-bindings-to-a-lazily-loaded-surface ()
@@ -99,6 +111,7 @@
                 #'qq-group-notices-refresh))
     (should (eq (key-binding (kbd "g g"))
                 #'evil-goto-first-line))))
+
 
 (provide 'qq-evil-test)
 
