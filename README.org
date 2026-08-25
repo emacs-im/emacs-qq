@@ -173,21 +173,25 @@ eask emacs -Q -L . -l qq.el
 其中：
 
 - ~test-concise~ 会先编译，再在成功时只打印 ERT 摘要；失败时保留有用的日志尾部。
-- ~test-local~ 会强制刷新相邻目录中的 ~appkit.el~，然后运行测试。
+- ~test-local~ 会强制刷新相邻目录中的 ~appkit.el~，然后运行测试；
+  ~browser-session~ 通过工作区的 ~../browser-session~ 本地链接解析。
 
-同时开发两个仓库时，可以让 Eask 直接链接 Appkit 源码包：
+同时开发依赖仓库时，可以让 Eask 直接链接源码包：
 
 #+begin_src sh
 eask link add appkit ../appkit.el
+eask link add browser-session ../browser-session
 #+end_src
 
-使用 ~eask link list~ 查看当前链接；使用
-~eask link delete appkit-0.1.0~ 恢复为快照安装。
+使用 ~eask link list~ 查看当前链接；使用对应的 ~eask link delete~ 命令恢复为快照
+安装。
 
 * 架构边界
 
 - QQ 运行时依赖 Appkit 0.2.2 或更高版本的 view、presentation、media、
   chat-buffer、completion 和 chat-timeline 基础设施，不依赖 ~disco.el~。
+- ~browser-session~ 只承载 captcha 人机交互并产出私密页面结果；Native Session、
+  ~challenge_id~、Password #2 和协议 cookie 始终由 Rust/Gateway 拥有。
 - ~qq-server.el~ 独占 WebSocket、JSON wire value 和连接生命周期；~qq-rpc.el~
   在其上提供带所有权的请求与事件分派。
 - ~qq-account.el~、~qq-message.el~、~qq-directory.el~、~qq-resource.el~、

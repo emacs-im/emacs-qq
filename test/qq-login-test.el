@@ -27,8 +27,7 @@
          (qq-account--gateway-instance-id nil)
          (qq-account-registry-changed-hook nil)
          (qq-account-selection-changed-hook nil)
-         (qq-login-change-hook nil)
-         (qq-login-open-verification-url nil))
+         (qq-login-change-hook nil))
      (unwind-protect
          (progn ,@body)
        (when (qq-login-active-p)
@@ -56,6 +55,25 @@
   `((uin . ,uin)
     (uid . ,uid)
     (generated_at_unix . ,generated-at)))
+
+(defun qq-login-test-captcha-challenge (&optional challenge-id sid)
+  "Return one closed captcha challenge with CHALLENGE-ID and SID."
+  (let ((sid (or sid "123456789")))
+    `((kind . "captcha")
+      (challenge_id . ,(or challenge-id "captcha-challenge"))
+      (url . ,(format
+               (concat
+                "https://ti.qq.com/safe/tools/captcha/sms-verify-login"
+                "?aid=2086582797&sid=%s&uin=10001")
+               sid))
+      (sid . ,sid))))
+
+(defun qq-login-test-captcha-document (url proof)
+  "Return a browser-session document for URL containing PROOF."
+  `((schema . 1)
+    (source . ((browser . "chrome") (url . ,url)))
+    (cookies)
+    (page . ,proof)))
 
 (ert-deftest qq-login-chooser-lists-quick-identities-and-new-account ()
   (qq-login-test-with-state
@@ -496,6 +514,207 @@
       (should (seq-every-p (lambda (character) (= character 0)) password))
       (should-not (qq-login--session-in-flight-p session)))))
 
+(ert-deftest qq-login-captcha-captures-and-submits-closed-proof ()
+  (qq-login-test-with-state
+    (let* ((challenge (qq-login-test-captcha-challenge))
+           (url (alist-get 'url challenge))
+           (account
+            (qq-login-test-account
+             "slot-a" "logging_in" "10001" challenge))
+           (session (qq-login-test-session "slot-a"))
+           (request (browser-session--request-create))
+           (ticket (copy-sequence "synthetic-ticket"))
+           capture-arguments
+           sent)
+      (qq-account--upsert-account account 'test)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-login--schedule) #'ignore)
+                ((symbol-function 'read-passwd)
+                 (lambda (&rest _arguments)
+                   (ert-fail "captcha requested manual secret input")))
+                ((symbol-function 'browser-session-capture)
+                 (lambda (&rest arguments)
+                   (setq capture-arguments arguments)
+                   request))
+                ((symbol-function 'browser-session-read)
+                 (lambda (file)
+                   (should (equal file
+                                  (plist-get capture-arguments :output-file)))
+                   (qq-login-test-captcha-document
+                    url
+                    `((ticket . ,ticket)
+                      (randstr . "@test")
+                      (sid . "123456789")))))
+                ((symbol-function 'qq-account-login-captcha)
+                 (lambda
+                     (account-id challenge-id proof rand-str sid
+                                 success _failure)
+                   (setq sent
+                         (list account-id challenge-id
+                               (copy-sequence proof) rand-str sid))
+                   (funcall success account))))
+        (qq-login--drive session)
+        (should (eq request
+                    (qq-login--captcha-capture-request
+                     (qq-login--session-captcha-capture session))))
+        (should (equal (plist-get capture-arguments :url) url))
+        (should (equal (plist-get capture-arguments :script)
+                       qq-login--captcha-script))
+        (should-not (plist-member capture-arguments :script-file))
+        (should (string-suffix-p
+                 "/profile"
+                 (plist-get capture-arguments :profile-directory)))
+        (should-not (plist-member capture-arguments :cookies))
+        (should-not sent)
+        (funcall (plist-get capture-arguments :callback) 'metadata)
+        (should
+         (equal sent
+                '("slot-a" "captcha-challenge"
+                  "synthetic-ticket" "@test" "123456789")))
+        (should-not (qq-login--session-captcha-capture session))
+        (should-not (qq-login--session-in-flight-p session))
+        (should (seq-every-p (lambda (character) (= character 0))
+                             ticket))))))
+
+(ert-deftest qq-login-captcha-rejects-sid-conflict-before-opening-browser ()
+  (qq-login-test-with-state
+    (let* ((challenge (qq-login-test-captcha-challenge))
+           (session (qq-login-test-session "slot-a"))
+           (account
+            (qq-login-test-account
+             "slot-a" "logging_in" "10001" challenge)))
+      (setf (alist-get 'sid challenge) "conflicting-sid")
+      (cl-letf (((symbol-function 'browser-session-capture)
+                 (lambda (&rest _arguments)
+                   (ert-fail "conflicting captcha opened a browser"))))
+        (should-error
+         (qq-login--captcha session account challenge)
+         :type 'user-error)
+        (should-not (qq-login--session-captcha-capture session))))))
+
+(ert-deftest qq-login-captcha-rejects-malformed-proof-without-diagnosing-it ()
+  (qq-login-test-with-state
+    (let* ((challenge (qq-login-test-captcha-challenge))
+           (url (alist-get 'url challenge))
+           (account
+            (qq-login-test-account
+             "slot-a" "logging_in" "10001" challenge))
+           (session (qq-login-test-session "slot-a"))
+           capture-arguments
+           messages
+           directory)
+      (qq-account--upsert-account account 'test)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-login--schedule) #'ignore)
+                ((symbol-function 'browser-session-capture)
+                 (lambda (&rest arguments)
+                   (setq capture-arguments arguments)
+                   (browser-session--request-create)))
+                ((symbol-function 'browser-session-read)
+                 (lambda (_file)
+                   (qq-login-test-captcha-document
+                    url
+                    '((ticket . "SECRET-PROOF")
+                      (randstr . "@test")
+                      (sid . "wrong-sid")))))
+                ((symbol-function 'message)
+                 (lambda (format-string &rest arguments)
+                   (push (apply #'format format-string arguments)
+                         messages))))
+        (qq-login--drive session)
+        (setq directory
+              (qq-login--captcha-capture-directory
+               (qq-login--session-captcha-capture session)))
+        (funcall (plist-get capture-arguments :callback) 'metadata)
+        (should-not (qq-login--session-captcha-capture session))
+        (should-not (file-exists-p directory))
+        (should
+         (equal (qq-login--session-error session)
+                "qq: browser returned an invalid captcha proof"))
+        (should-not
+         (seq-some
+          (lambda (text) (string-match-p "SECRET-PROOF" text))
+          messages))))))
+
+(ert-deftest qq-login-captcha-cancel-waits-for-helper-cleanup ()
+  (qq-login-test-with-state
+    (let* ((challenge (qq-login-test-captcha-challenge))
+           (account
+            (qq-login-test-account
+             "slot-a" "logging_in" "10001" challenge))
+           (session (qq-login-test-session "slot-a"))
+           capture-arguments
+           cancelled
+           directory)
+      (qq-account--upsert-account account 'test)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-login--schedule) #'ignore)
+                ((symbol-function 'browser-session-capture)
+                 (lambda (&rest arguments)
+                   (setq capture-arguments arguments)
+                   (browser-session--request-create)))
+                ((symbol-function 'browser-session-cancel)
+                 (lambda (request)
+                   (setq cancelled request)
+                   t)))
+        (qq-login--drive session)
+        (let ((capture (qq-login--session-captcha-capture session)))
+          (setq directory
+                (qq-login--captcha-capture-directory capture))
+          (should (file-directory-p directory))
+          (qq-login-cancel)
+          (should cancelled)
+          (should (file-directory-p directory))
+          (funcall
+           (plist-get capture-arguments :errorback)
+           '((code . "cancelled")
+             (message . "browser session capture was cancelled")))
+          (should-not (file-exists-p directory)))))))
+
+(ert-deftest qq-login-captcha-stale-callback-never-submits-proof ()
+  (qq-login-test-with-state
+    (let* ((challenge (qq-login-test-captcha-challenge "old-challenge"))
+           (url (alist-get 'url challenge))
+           (account
+            (qq-login-test-account
+             "slot-a" "logging_in" "10001" challenge))
+           (session (qq-login-test-session "slot-a"))
+           capture-arguments
+           cancelled
+           submitted)
+      (qq-account--upsert-account account 'test)
+      (cl-letf (((symbol-function 'qq-server-ready-p) (lambda () t))
+                ((symbol-function 'qq-login--schedule) #'ignore)
+                ((symbol-function 'browser-session-capture)
+                 (lambda (&rest arguments)
+                   (setq capture-arguments arguments)
+                   (browser-session--request-create)))
+                ((symbol-function 'browser-session-cancel)
+                 (lambda (_request) (setq cancelled t)))
+                ((symbol-function 'qq-login--prepare-qr) #'ignore)
+                ((symbol-function 'browser-session-read)
+                 (lambda (_file)
+                   (qq-login-test-captcha-document
+                    url
+                    '((ticket . "stale-ticket")
+                      (randstr . "@old")
+                      (sid . "123456789")))))
+                ((symbol-function 'qq-account-login-captcha)
+                 (lambda (&rest _arguments) (setq submitted t))))
+        (qq-login--drive session)
+        (let* ((replacement
+                '((kind . "new_device")
+                  (challenge_id . "new-challenge")
+                  (qr_url . "https://example.invalid/scan")))
+               (replacement-account
+                (qq-login-test-account
+                 "slot-a" "logging_in" "10001" replacement)))
+          (qq-account--upsert-account replacement-account 'test)
+          (qq-login--drive session))
+        (should cancelled)
+        (funcall (plist-get capture-arguments :callback) 'metadata)
+        (should-not submitted)))))
+
 (ert-deftest qq-login-new-device-only-projects-the-rust-owned-qr ()
   (qq-login-test-with-state
     (let* ((challenge
@@ -508,17 +727,16 @@
            (session (qq-login-test-session "slot-a"))
            rendered)
       (qq-account--upsert-account account 'test)
-      (let ((qq-login-open-verification-url t))
-        (cl-letf (((symbol-function 'qq-server-ready-p)
-                   (lambda () t))
-                  ((symbol-function 'qq-login--schedule)
-                   #'ignore)
-                  ((symbol-function 'qq-login--prepare-qr)
-                   (lambda (_session url) (setq rendered url)))
-                  ((symbol-function 'qq-rpc-call)
-                   (lambda (&rest _arguments)
-                     (ert-fail "QR projection sent an RPC"))))
-          (qq-login--drive session)))
+      (cl-letf (((symbol-function 'qq-server-ready-p)
+                 (lambda () t))
+                ((symbol-function 'qq-login--schedule)
+                 #'ignore)
+                ((symbol-function 'qq-login--prepare-qr)
+                 (lambda (_session url) (setq rendered url)))
+                ((symbol-function 'qq-rpc-call)
+                 (lambda (&rest _arguments)
+                   (ert-fail "QR projection sent an RPC"))))
+        (qq-login--drive session))
       (should (equal rendered "https://example.invalid/scan"))
       (should-not (qq-login--session-in-flight-p session)))))
 
@@ -545,7 +763,7 @@
   (qq-login-test-with-state
     (let ((session (qq-login-test-session "slot-a")))
       (setf (qq-login--session-in-flight-p session) t
-            (qq-login--session-submitted-challenge-id session) "challenge-7"
+            (qq-login--session-handled-challenge-id session) "challenge-7"
             (qq-login--session-qr-display session) "[QR]\n"
             (qq-login--session-status session)
             "Waiting for mobile QQ confirmation…")
@@ -553,7 +771,7 @@
       (should (eq qq-login--current session))
       (should (qq-login--session-in-flight-p session))
       (should
-       (equal (qq-login--session-submitted-challenge-id session)
+       (equal (qq-login--session-handled-challenge-id session)
               "challenge-7"))
       (should (equal (plist-get (qq-login-view-model) :display) "[QR]\n")))))
 

@@ -69,11 +69,14 @@ authenticated ready snapshot, not merely when the socket opens."
   :type '(choice (const :tag "Unlimited" nil) integer)
   :group 'qq)
 
-(defcustom qq-login-open-verification-url t
-  "Whether `qq-login' opens the projected captcha URL.
+(defcustom qq-login-captcha-timeout 300
+  "Seconds allowed for completing one interactive QQ captcha.
 
-When nil, the URL is still shown in the echo area and can be opened manually."
-  :type 'boolean
+The isolated browser is closed when this timeout expires."
+  :type '(restricted-sexp
+          :match-alternatives
+          ((lambda (value)
+             (and (integerp value) (> value 0)))))
   :group 'qq)
 
 (defcustom qq-login-qrencode-program "qrencode"
