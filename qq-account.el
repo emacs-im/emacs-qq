@@ -806,19 +806,9 @@ Gateway protocol."
     (account-id challenge-id ticket rand-str sid &optional callback errback)
   "Continue ACCOUNT-ID's captcha CHALLENGE-ID.
 
-TICKET, RAND-STR, and SID carry the proof.  CALLBACK receives the account
-snapshot; ERRBACK receives a failure body and reason."
-  (interactive
-   (let* ((account-id (qq-account--read-account-id "Captcha account: "))
-          (challenge (alist-get 'challenge (qq-account-get account-id))))
-     (unless (equal (alist-get 'kind challenge) "captcha")
-       (user-error "qq: Selected account has no captcha challenge"))
-     (list account-id (alist-get 'challenge_id challenge)
-           (read-passwd "Captcha ticket: ")
-           (read-string "Captcha randStr: ")
-           (read-string "Captcha sid: " (alist-get 'sid challenge))
-           #'qq-account--interactive-success
-           #'qq-account--interactive-error)))
+TICKET, RAND-STR, and SID carry proof captured by the foreground browser
+adapter.  CALLBACK receives the account snapshot; ERRBACK receives a failure
+body and reason."
   (dolist (value (list challenge-id ticket rand-str sid))
     (unless (qq-account--non-empty-string-p value)
       (user-error "qq: Captcha proof fields must be non-empty strings")))

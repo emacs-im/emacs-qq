@@ -10,13 +10,17 @@
 
 (package-file "qq.el")
 
+(files "*.el"
+       "qq-face-names.json")
+
 (source "gnu")
 (source 'melpa)
 
-(depends-on "emacs" "27.1")
+(depends-on "emacs" "29.1")
 (depends-on "websocket" "1.16")
 (depends-on "transient" "0.7")
 (depends-on "appkit" :file "../appkit.el")
+(depends-on "browser-session" :file "../browser-session")
 
 (development
  (depends-on "evil"))

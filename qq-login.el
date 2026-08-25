@@ -14,12 +14,25 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'subr-x)
-(require 'browse-url)
+(require 'url-parse)
+(require 'url-util)
+(require 'browser-session)
 (require 'qq-customize)
 (require 'qq-account)
 (require 'qq-rpc)
 (require 'qq-server)
 (require 'qq-core)
+
+(cl-defstruct (qq-login--captcha-capture
+               (:constructor qq-login--captcha-capture-create))
+  "One browser-owned QQ captcha interaction."
+  challenge-id
+  account-id
+  url
+  sid
+  directory
+  output-file
+  request)
 
 (cl-defstruct (qq-login--session
                (:constructor qq-login--session-create))
@@ -37,7 +50,8 @@
   in-flight-p
   prompting-p
   retry-failed-p
-  submitted-challenge-id
+  handled-challenge-id
+  captcha-capture
   status
   error
   qr-url
@@ -60,6 +74,24 @@
   "Return non-nil when SESSION still owns foreground authorization."
   (and (eq session qq-login--current)
        (qq-login--session-active-p session)))
+
+(defun qq-login--delete-captcha-directory (capture)
+  "Delete private files owned by CAPTCHA CAPTURE."
+  (when-let* ((directory (qq-login--captcha-capture-directory capture)))
+    (setf (qq-login--captcha-capture-directory capture) nil)
+    (when (file-directory-p directory)
+      (ignore-errors (delete-directory directory t)))))
+
+(defun qq-login--cancel-captcha-capture (session)
+  "Cancel and detach SESSION's active browser captcha capture."
+  (when-let* ((capture (qq-login--session-captcha-capture session)))
+    (setf (qq-login--session-captcha-capture session) nil)
+    (if-let* ((request (qq-login--captcha-capture-request capture)))
+        (condition-case nil
+            (browser-session-cancel request)
+          (error
+           (message "qq: could not cancel the captcha browser")))
+      (qq-login--delete-captcha-directory capture))))
 
 (defun qq-login--cancel-timer (session)
   "Cancel SESSION's pending progression timer."
@@ -97,6 +129,7 @@
   "Finish SESSION and optionally report MESSAGE-TEXT."
   (when (qq-login--current-p session)
     (qq-login--cancel-timer session)
+    (qq-login--cancel-captcha-capture session)
     (qq-login--clear-qr session)
     (setf (qq-login--session-active-p session) nil
           (qq-login--session-in-flight-p session) nil
@@ -506,12 +539,148 @@ Return its current snapshot, or nil while account creation is in flight."
         (qq-account--set-current-account selected)
         (qq-account-get selected))))))
 
-(defun qq-login--open-captcha-url (url)
-  "Offer the CAPTCHA URL to the user."
-  (when (qq-account--non-empty-string-p url)
-    (message "qq: complete QQ captcha verification: %s" url)
-    (when qq-login-open-verification-url
-      (browse-url url))))
+(defconst qq-login--captcha-path
+  "/safe/tools/captcha/sms-verify-login"
+  "Only evidenced QQ ProofWater page path accepted by the browser adapter.")
+
+(defconst qq-login--captcha-script
+  (mapconcat
+   #'identity
+   '("(() => {"
+     "  'use strict';"
+     "  const stateKey = '__EMACS_QQ_CAPTCHA_CAPTURE_V1__';"
+     "  let state = window[stateKey];"
+     "  if (!state) {"
+     "    state = { installed: false, proof: null };"
+     "    Object.defineProperty(window, stateKey, {"
+     "      value: state,"
+     "      enumerable: false,"
+     "      configurable: false,"
+     "      writable: false"
+     "    });"
+     "  }"
+     "  if (state.proof !== null) return state.proof;"
+     "  if (state.installed) return null;"
+     "  const original = window.captchaCallback;"
+     "  if (typeof original !== 'function') return null;"
+     "  window.captchaCallback = function (result) {"
+     "    if (result !== null && typeof result === 'object' &&"
+     "        result.ret === 0 &&"
+     "        typeof result.ticket === 'string' &&"
+     "        result.ticket.trim().length > 0 &&"
+     "        !result.ticket.startsWith('terror_') &&"
+     "        typeof result.randstr === 'string' &&"
+     "        result.randstr.trim().length > 0) {"
+     "      const sid = new URL(window.location.href).searchParams.get('sid');"
+     "      if (sid) {"
+     "        state.proof = {"
+     "          ticket: result.ticket,"
+     "          randstr: result.randstr,"
+     "          sid: sid"
+     "        };"
+     "      }"
+     "    }"
+     "    return Reflect.apply(original, this, arguments);"
+     "  };"
+     "  state.installed = true;"
+     "  return null;"
+     "})();")
+   "\n")
+  "Exact provider expression for the evidenced QQ ProofWater callback.")
+
+(defun qq-login--captcha-url-sid (url)
+  "Validate QQ captcha URL and return its non-empty sid query value."
+  (let ((sid
+         (condition-case nil
+             (when (qq-account--non-empty-string-p url)
+               (let* ((parsed (url-generic-parse-url url))
+                      (filename (url-filename parsed))
+                      (query-index (and filename (string-match "\\?" filename)))
+                      (path (and filename
+                                 (if query-index
+                                     (substring filename 0 query-index)
+                                   filename)))
+                      (query (and query-index
+                                  (substring filename (1+ query-index)))))
+                 (when (and (equal (url-type parsed) "https")
+                            (equal (downcase (or (url-host parsed) ""))
+                                   "ti.qq.com")
+                            (null (url-user parsed))
+                            (memq (url-port parsed) '(nil 443))
+                            (equal path qq-login--captcha-path)
+                            query)
+                   (cadr (assoc "sid" (url-parse-query-string query))))))
+           (error nil))))
+    (unless (qq-account--non-empty-string-p sid)
+      (user-error "qq: unsupported or incomplete captcha URL"))
+    sid))
+
+(defun qq-login--captcha-capture-current-p (session capture)
+  "Return non-nil when SESSION still owns CAPTCHA CAPTURE."
+  (and (qq-login--current-p session)
+       (eq capture (qq-login--session-captcha-capture session))))
+
+(defun qq-login--captcha-proof (capture)
+  "Read and validate the private proof owned by CAPTCHA CAPTURE."
+  (let* ((document
+          (browser-session-read
+           (qq-login--captcha-capture-output-file capture)))
+         (source (alist-get 'source document))
+         (proof (browser-session-page document))
+         (ticket (alist-get 'ticket proof))
+         (rand-str (alist-get 'randstr proof))
+         (sid (alist-get 'sid proof)))
+    (unless (and (equal (alist-get 'url source)
+                        (qq-login--captcha-capture-url capture))
+                 (null (browser-session-cookies document))
+                 (qq-account--exact-object-keys-p
+                  proof '(ticket randstr sid))
+                 (qq-account--non-empty-string-p ticket)
+                 (not (string-prefix-p "terror_" ticket))
+                 (qq-account--non-empty-string-p rand-str)
+                 (qq-account--non-empty-string-p sid)
+                 (equal sid (qq-login--captcha-capture-sid capture)))
+      (user-error "qq: browser returned an invalid captcha proof"))
+    (list ticket rand-str sid)))
+
+(defun qq-login--captcha-error (session capture error)
+  "Pause SESSION after CAPTCHA CAPTURE failed with structured ERROR."
+  (unwind-protect
+      (when (qq-login--captcha-capture-current-p session capture)
+        (setf (qq-login--session-captcha-capture session) nil)
+        (let ((reason (browser-session-error-message error)))
+          (qq-login--present session "CAPTCHA verification paused." reason)
+          (message "qq: CAPTCHA verification paused: %s" reason)))
+    (qq-login--delete-captcha-directory capture)))
+
+(defun qq-login--captcha-success (session capture _metadata)
+  "Submit the private proof produced for SESSION CAPTCHA CAPTURE."
+  (if (not (qq-login--captcha-capture-current-p session capture))
+      (qq-login--delete-captcha-directory capture)
+    (condition-case error-data
+        (pcase-let ((`(,ticket ,rand-str ,sid)
+                     (qq-login--captcha-proof capture)))
+          (setf (qq-login--session-captcha-capture session) nil
+                (qq-login--session-retry-failed-p session) nil)
+          (qq-login--delete-captcha-directory capture)
+          (qq-login--present session "Submitting CAPTCHA proof…" nil)
+          (unwind-protect
+              (condition-case request-error
+                  (qq-login--request
+                   session
+                   (lambda (success failure)
+                     (qq-account-login-captcha
+                      (qq-login--captcha-capture-account-id capture)
+                      (qq-login--captcha-capture-challenge-id capture)
+                      ticket rand-str sid success failure)))
+                (error
+                 (qq-login--request-error
+                  session nil (error-message-string request-error))))
+            (clear-string ticket)))
+      (error
+       (qq-login--captcha-error
+        session capture
+        `((message . ,(error-message-string error-data))))))))
 
 (defun qq-login--password (session account)
   "Read credentials and begin password login for SESSION ACCOUNT."
@@ -558,30 +727,55 @@ Return its current snapshot, or nil while account creation is in flight."
      #'qq-login--quick-error)))
 
 (defun qq-login--captcha (session account challenge)
-  "Read CAPTCHA proof for SESSION ACCOUNT and CHALLENGE."
-  (setf (qq-login--session-prompting-p session) t)
-  (unwind-protect
-      (let* ((account-id (alist-get 'account_id account))
-             (challenge-id (alist-get 'challenge_id challenge))
-             (_opened
-              (qq-login--open-captcha-url (alist-get 'url challenge)))
-             (ticket (read-passwd "Captcha ticket: "))
-             (rand-str (read-string "Captcha randStr: "))
-             (sid (read-string "Captcha sid: " (alist-get 'sid challenge))))
-        (unwind-protect
-            (progn
-              (setf (qq-login--session-retry-failed-p session) nil
-                    (qq-login--session-submitted-challenge-id session)
-                    (copy-sequence challenge-id))
-              (qq-login--present session "Submitting CAPTCHA proof…" nil)
-              (qq-login--request
-               session
-               (lambda (success failure)
-                 (qq-account-login-captcha
-                  account-id challenge-id ticket rand-str sid success failure))))
-          (clear-string ticket)))
-    (when (qq-login--session-p session)
-      (setf (qq-login--session-prompting-p session) nil))))
+  "Start isolated browser verification for SESSION ACCOUNT and CHALLENGE."
+  (let* ((account-id (alist-get 'account_id account))
+         (challenge-id (alist-get 'challenge_id challenge))
+         (url (alist-get 'url challenge))
+         (sid (alist-get 'sid challenge))
+         (url-sid (qq-login--captcha-url-sid url)))
+    (dolist (value (list account-id challenge-id sid))
+      (unless (qq-account--non-empty-string-p value)
+        (user-error "qq: captcha challenge is incomplete")))
+    (unless (equal sid url-sid)
+      (user-error "qq: captcha challenge sid conflicts with its URL"))
+    (qq-login--cancel-captcha-capture session)
+    (let* ((directory (make-temp-file "emacs-qq-captcha-" t))
+           (output-file (expand-file-name "capture.json" directory))
+           (profile-directory (expand-file-name "profile" directory))
+           (capture
+            (qq-login--captcha-capture-create
+             :challenge-id (copy-sequence challenge-id)
+             :account-id (copy-sequence account-id)
+             :url (copy-sequence url)
+             :sid (copy-sequence sid)
+             :directory directory
+             :output-file output-file)))
+      (setf (qq-login--session-retry-failed-p session) nil
+            (qq-login--session-handled-challenge-id session)
+            (copy-sequence challenge-id)
+            (qq-login--session-captcha-capture session) capture)
+      (qq-login--present
+       session "Complete the QQ verification in the opened browser…" nil)
+      (condition-case error-data
+          (setf
+           (qq-login--captcha-capture-request capture)
+           (let ((browser-session-timeout qq-login-captcha-timeout))
+             (browser-session-capture
+              :url url
+              :output-file output-file
+              :profile-directory profile-directory
+              :script qq-login--captcha-script
+              :callback
+              (lambda (metadata)
+                (qq-login--captcha-success session capture metadata))
+              :errorback
+              (lambda (error)
+                (qq-login--captcha-error session capture error)))))
+        (error
+         (when (eq capture (qq-login--session-captcha-capture session))
+           (setf (qq-login--session-captcha-capture session) nil))
+         (qq-login--delete-captcha-directory capture)
+         (signal (car error-data) (cdr error-data)))))))
 
 (defun qq-login--qrencode ()
   "Return the executable used for QR rendering, or signal a user error."
@@ -697,10 +891,25 @@ an optional public QR URL."
     ("unusual_device" (qq-login--unusual-device session account challenge))
     ("captcha"
      (if (equal (alist-get 'challenge_id challenge)
-                (qq-login--session-submitted-challenge-id session))
-         (qq-login--present session "Waiting for QQ login to continue…" nil)
+                (qq-login--session-handled-challenge-id session))
+         (unless (qq-login--session-error session)
+           (qq-login--present
+            session
+            (if (qq-login--session-captcha-capture session)
+                "Complete the QQ verification in the opened browser…"
+              "Waiting for QQ login to continue…")
+            nil))
        (qq-login--captcha session account challenge)))
     (kind (error "qq: unsupported login challenge kind %S" kind))))
+
+(defun qq-login--reconcile-captcha-capture (session phase challenge)
+  "Cancel SESSION's capture unless PHASE and CHALLENGE still own it."
+  (when-let* ((capture (qq-login--session-captcha-capture session)))
+    (unless (and (equal phase "logging_in")
+                 (equal (alist-get 'kind challenge) "captcha")
+                 (equal (alist-get 'challenge_id challenge)
+                        (qq-login--captcha-capture-challenge-id capture)))
+      (qq-login--cancel-captcha-capture session))))
 
 (defun qq-login--start-account (session account)
   "Start native runtime for SESSION ACCOUNT."
@@ -718,6 +927,7 @@ an optional public QR URL."
     (when-let* ((account (qq-login--ensure-account session)))
       (let ((phase (alist-get 'phase account))
             (challenge (alist-get 'challenge account)))
+        (qq-login--reconcile-captcha-capture session phase challenge)
         (when (and (qq-login--session-qr-display session)
                    (not (and (equal phase "logging_in")
                              (member (alist-get 'kind challenge)
@@ -797,12 +1007,13 @@ the caller has already made the optional label choice, including choosing nil."
                (equal account-id
                       (qq-login--session-account-id qq-login--current))))
       (let ((session qq-login--current))
-        (if (qq-login--session-in-flight-p session)
+        (if (or (qq-login--session-in-flight-p session)
+                (qq-login--session-captcha-capture session))
             (message "qq: %s"
                      (or (qq-login--session-status session)
                          "login request is still running"))
           (setf (qq-login--session-retry-failed-p session) t
-                (qq-login--session-submitted-challenge-id session) nil)
+                (qq-login--session-handled-challenge-id session) nil)
           (qq-login--present session "Continuing QQ login…" nil)
           (qq-login--schedule session))
         session)
