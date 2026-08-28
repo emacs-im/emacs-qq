@@ -727,7 +727,9 @@
                       #x00 #x00 #x03 #x00 #x01 #x00 #x05 #xfe
                       #xd4 #xef #x00 #x00 #x00 #x00 #x49 #x45
                       #x4e #x44 #xae #x42 #x60 #x82)))
-           (cl-letf (((symbol-function 'qq-api-call)
+           (cl-letf (((symbol-function 'qq-media--system-emoji-cache-roots)
+                      (lambda () nil))
+                     ((symbol-function 'qq-api-call)
                       (lambda (&rest _args)
                         (setq api-called t)
                         (ert-fail "base-face rendering must not use OneBot"))))
@@ -748,7 +750,9 @@
          (make-temp-file "qq-empty-default-emojis" t))
         (api-called nil))
     (unwind-protect
-        (cl-letf (((symbol-function 'qq-api-call)
+        (cl-letf (((symbol-function 'qq-media--system-emoji-cache-roots)
+                   (lambda () nil))
+                  ((symbol-function 'qq-api-call)
                    (lambda (&rest _args)
                      (setq api-called t)
                      (ert-fail "base-face rendering must not use OneBot"))))
@@ -756,6 +760,66 @@
           (should (equal (qq-media-face-display-string "178") "/斜眼笑"))
           (should-not api-called))
       (delete-directory qq-media-default-emoji-directory t))))
+
+(ert-deftest qq-media-dynamic-system-face-cache-exposes-image-and-lottie ()
+  (qq-media-test-with-reset
+   (let* ((root (make-temp-file "qq-system-emoji" t))
+          (png-dir (expand-file-name "493/png" root))
+          (lottie-dir (expand-file-name "493/lottie" root))
+          (png (expand-file-name "493.png" png-dir))
+          (lottie (expand-file-name "493.json" lottie-dir))
+          (qq-media-default-emoji-directory
+           (make-temp-file "qq-empty-default-emojis" t)))
+     (unwind-protect
+         (progn
+           (make-directory png-dir t)
+           (make-directory lottie-dir t)
+           (with-temp-file png
+             (set-buffer-multibyte nil)
+             (insert (unibyte-string
+                      #x89 #x50 #x4e #x47 #x0d #x0a #x1a #x0a
+                      #x00 #x00 #x00 #x0d #x49 #x48 #x44 #x52
+                      #x00 #x00 #x00 #x01 #x00 #x00 #x00 #x01
+                      #x08 #x02 #x00 #x00 #x00 #x90 #x77 #x53
+                      #xde #x00 #x00 #x00 #x0c #x49 #x44 #x41
+                      #x54 #x08 #xd7 #x63 #xf8 #xcf #xc0 #x00
+                      #x00 #x00 #x03 #x00 #x01 #x00 #x05 #xfe
+                      #xd4 #xef #x00 #x00 #x00 #x00 #x49 #x45
+                      #x4e #x44 #xae #x42 #x60 #x82)))
+           (with-temp-file lottie
+             (insert "{\"v\":\"5.12.1\",\"fr\":60,\"ip\":0,\"op\":1,"
+                     "\"w\":1,\"h\":1,\"layers\":[]}"))
+           (cl-letf (((symbol-function 'qq-media--system-emoji-cache-roots)
+                      (lambda () (list root))))
+             (should (equal (qq-media--local-base-emoji-file "493") png))
+             (should
+              (equal (qq-media--local-base-emoji-lottie-file "493") lottie))
+             (let ((display (qq-media-face-display-string "493" "/睡觉")))
+               (should (get-text-property 0 'display display))
+               (should (equal
+                        (get-text-property 0 'qq-system-face-id display)
+                        "493")))))
+       (delete-directory root t)
+       (delete-directory qq-media-default-emoji-directory t)))))
+
+(ert-deftest qq-media-face-segment-retains-animated-catalog-metadata ()
+  (let ((qq-media--system-emoji-tables (make-hash-table :test #'equal))
+        (table (make-hash-table :test #'equal)))
+    (puthash
+     "493"
+     '((id . "493") (description . "/睡觉") (emoji_type . 1)
+       (animated_pack_id . 1) (animated_sticker_id . 77))
+     table)
+    (puthash "slot-a" table qq-media--system-emoji-tables)
+    (cl-letf (((symbol-function 'qq-runtime-current-account-id)
+               (lambda () "slot-a")))
+      (should
+       (equal
+        (qq-media-face-to-segment "493")
+        '((type . "face")
+          (data . ((id . "493") (face_type . "animated")
+                   (pack_id . 1) (sticker_id . 77)
+                   (description . "/睡觉")))))))))
 
 (ert-deftest qq-media-resolve-fileish-prefers-existing-local-path ()
   "Outbound attach paths must not hit NapCat get_image."
@@ -1684,8 +1748,12 @@
           (should-not (plist-get caps key)))
         (should (equal (qq-media--segment-resource-key segment)
                        (concat "record:" media-id))))
-      (puthash media-id '(:status paused :process player)
-               qq-media--native-record-playbacks)
+      (puthash
+       media-id
+       (list :session
+             (appkit-media-player-session--create
+              :status 'paused :played-seconds 3.0))
+       qq-media--native-record-playbacks)
       (let ((caps (qq-media-segment-capabilities segment)))
         (should (plist-get caps :open))
         (should (equal (plist-get caps :status) "Paused"))))))
@@ -1949,38 +2017,40 @@
       (should (eq called-segment segment))
       (should (eq called-owner owner)))))
 
-(ert-deftest qq-media-native-record-click-pauses-and-resumes-live-player ()
+(ert-deftest qq-media-native-record-click-toggles-appkit-player-session ()
   (let* ((media-id "media-22334455-6677-8899-aabb-ccddeeff0011")
          (segment `((type . "record")
                     (data . ((duration_seconds . 15)
                              (media_id . ,media-id)))))
-         (process (make-pipe-process :name "qq-record-pause-test"
-                                     :noquery t))
-         (qq-media--native-record-playbacks (make-hash-table :test #'equal))
+         (session
+          (appkit-media-player-session--create
+           :status 'playing :played-seconds 2.0))
+         (qq-media--native-record-playbacks
+          (make-hash-table :test #'equal))
          (qq-media--native-record-current-id media-id)
-         signals)
-    (puthash media-id `(:status playing :process ,process)
+         toggles)
+    (puthash media-id (list :status 'playing :session session)
              qq-media--native-record-playbacks)
-    (unwind-protect
-        (cl-letf (((symbol-function 'signal-process)
-                   (lambda (called-process signal &optional _remote)
-                     (push (list called-process signal) signals)))
-                  ((symbol-function 'qq-media--notify-native-record-state)
-                   #'ignore))
-          (qq-media-play-native-record segment)
-          (should (eq (plist-get (qq-media-native-record-playback-state media-id)
-                                 :status)
-                      'paused))
-          (qq-media-play-native-record segment)
-          (should (eq (plist-get (qq-media-native-record-playback-state media-id)
-                                 :status)
-                      'playing))
-          (should (equal (nreverse signals)
-                         (list (list process 'SIGSTOP)
-                               (list process 'SIGCONT)))))
-      (set-process-sentinel process nil)
-      (when (process-live-p process)
-        (delete-process process)))))
+    (cl-letf (((symbol-function 'appkit-media-player-toggle)
+               (lambda (current)
+                 (push current toggles)
+                 (setf (appkit-media-player-session-status current)
+                       (if (eq (appkit-media-player-session-status current)
+                               'playing)
+                           'paused
+                         'playing))
+                 current)))
+      (qq-media-play-native-record segment)
+      (should (eq (plist-get
+                   (qq-media-native-record-playback-state media-id)
+                   :status)
+                  'paused))
+      (qq-media-play-native-record segment)
+      (should (eq (plist-get
+                   (qq-media-native-record-playback-state media-id)
+                   :status)
+                  'playing))
+      (should (equal (list session session) toggles)))))
 
 (ert-deftest qq-media-native-record-preparation-follows-exact-app-owner ()
   (let* ((media-id "media-33445566-7788-99aa-bbcc-ddeeff001122")
@@ -2020,46 +2090,53 @@
       (when (appkit-app-live-p owner)
         (appkit-stop-app owner)))))
 
-(ert-deftest qq-media-native-record-player-exit-revokes-local-access ()
+(ert-deftest qq-media-native-record-appkit-exit-revokes-local-access ()
   (let* ((media-id "media-11223344-5566-7788-99aa-bbccddeeff00")
          (file (make-temp-file "qq-record-player" nil ".wav"))
          (access-id "access-11223344-5566-7788-99aa-bbccddeeff00")
-         (qq-media--native-record-playbacks (make-hash-table :test #'equal))
+         (appkit-media-audio-player-command '("sh" "-c" "exit 0"))
+         (qq-media--native-record-playbacks
+          (make-hash-table :test #'equal))
          (qq-media--native-record-current-id media-id)
-         closed process)
-    (puthash media-id '(:status preparing) qq-media--native-record-playbacks)
+         closed session)
+    (puthash media-id
+             '(:status preparing
+               :account-id "10001"
+               :duration-seconds 1)
+             qq-media--native-record-playbacks)
     (unwind-protect
-        (cl-letf (((symbol-function 'qq-media--record-player-command)
-                   (lambda () '("sh" "-c" "exit 0")))
-                  ((symbol-function 'qq-media-native-record-playback-available-p)
-                   (lambda () t))
+        (cl-letf (((symbol-function 'qq-account-get)
+                   (lambda (_account-id) t))
                   ((symbol-function 'qq-media--close-local-access)
-                   (lambda (called-access-id) (push called-access-id closed)))
+                   (lambda (called-access-id)
+                     (push called-access-id closed)))
                   ((symbol-function 'qq-media--notify-native-record-state)
                    #'ignore))
-          (setq process
+          (setq session
                 (qq-media--start-native-record-player
                  media-id
                  `((access . ((access_id . ,access-id)
                               (path . ,file))))))
-          (while (process-live-p process)
+          (let ((process
+                 (appkit-media-player-session-process session)))
+            (while (process-live-p process)
+              (accept-process-output process 0.1))
             (accept-process-output process 0.1))
-          (accept-process-output process 0.1)
           (let ((public-state
                  (qq-media-native-record-playback-state media-id))
                 (private-state
                  (gethash media-id qq-media--native-record-playbacks)))
             (should (eq (plist-get public-state :status) 'finished))
-            (dolist (key '(:process :operation :access-id :path))
+            (dolist (key '(:session :operation :access-id :path))
               (should-not (plist-member public-state key)))
-            (should-not (plist-get private-state :process))
+            (should (appkit-media-player-session-p
+                     (plist-get private-state :session)))
             (should-not (plist-get private-state :access-id)))
           (should (equal closed (list access-id)))
           (should-not qq-media--native-record-current-id))
-      (when (processp process)
-        (set-process-sentinel process nil)
-        (when (process-live-p process)
-          (delete-process process)))
+      (when (and (appkit-media-player-session-p session)
+                 (not (appkit-media-player-session-finalized-p session)))
+        (appkit-media-player-stop session))
       (when (file-exists-p file)
         (delete-file file)))))
 

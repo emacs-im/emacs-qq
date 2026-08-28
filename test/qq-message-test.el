@@ -1307,7 +1307,8 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
                . ((target
                    . ((kind . "native")
                       (sequence . "4000000001"))))))
-            '((kind . "face") (payload . ((id . "178"))))
+            '((kind . "face")
+              (payload . ((type . "basic") (id . "178"))))
             '((kind . "record") (payload . ((duration_seconds . 17))))
             '((kind . "unsupported")
               (payload
@@ -1352,6 +1353,9 @@ START-SEQUENCE and END-SEQUENCE are echoed as the requested range."
           "4000000001"))
         (should (equal (alist-get 'id (alist-get 'data (nth 3 internal)))
                        "178"))
+        (should (equal (alist-get 'face_type
+                                  (alist-get 'data (nth 3 internal)))
+                       "basic"))
         (should (= (alist-get 'duration_seconds
                               (alist-get 'data (nth 4 internal)))
                    17))
@@ -1965,7 +1969,8 @@ push carries sequence=40909 and client_sequence=30202."
               (qq-message-test-reply-segment "7348923749823749823")
               '((type . "at")
                 (data . ((qq . "10001") (name . "Alice"))))
-              '((type . "face") (data . ((id . "178"))))
+              '((type . "face")
+                (data . ((id . "178") (face_type . "basic"))))
               '((type . "text") (data . ((text . " hello")))))))
         (cl-letf (((symbol-function 'qq-server-ready-p)
                    (lambda () t))
@@ -2007,7 +2012,8 @@ push carries sequence=40909 and client_sequence=30202."
                    (payload
                     . ((target . ((kind . "user") (uin . "10001")))
                        (display . "Alice"))))
-                  ((kind . "face") (payload . ((id . "178"))))
+                  ((kind . "face")
+                   (payload . ((type . "basic") (id . "178"))))
                   ((kind . "text")
                    (payload . ((text . " hello")))))))))
           (let ((pending

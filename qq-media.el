@@ -59,8 +59,18 @@ Redisplay therefore observes operation state but never schedules a retry.")
 (defvar qq-media--native-record-current-id nil
   "Media ID of the one preparing, playing, or paused native record.")
 
-(defvar qq-media--native-record-progress-timer nil
-  "Timer refreshing the one active native record progress row.")
+
+(defvar qq-media--system-emoji-tables (make-hash-table :test #'equal)
+  "Managed account id to validated system-emoji catalog table.")
+
+(defvar qq-media--system-emoji-requests (make-hash-table :test #'equal)
+  "Managed account ids with an in-flight system-emoji catalog request.")
+
+(defvar qq-media--lottie-players (make-hash-table :test #'equal)
+  "System face id to exact live Lottie playback owner.")
+
+(defvar qq-media--lottie-current-frames (make-hash-table :test #'equal)
+  "System face id to the current unpublished PNG playback frame.")
 
 (defun qq-media--json-truthy-p (value)
   "Return non-nil when JSON VALUE is a true-ish flag."
@@ -114,6 +124,16 @@ Redisplay therefore observes operation state but never schedules a retry.")
   (clrhash qq-media--native-preview-attempts)
   (clrhash qq-media--fetching-cache)
   (clrhash qq-media--download-state-table)
+  (clrhash qq-media--system-emoji-tables)
+  (clrhash qq-media--system-emoji-requests)
+  (maphash
+   (lambda (_id owner)
+     (when-let* ((process (plist-get owner :process)))
+       (when (process-live-p process)
+         (delete-process process))))
+   qq-media--lottie-players)
+  (clrhash qq-media--lottie-players)
+  (clrhash qq-media--lottie-current-frames)
   (when (file-directory-p qq-media-cache-directory)
     (ignore-errors (delete-directory qq-media-cache-directory t)))
   (message "qq: media cache cleared"))
@@ -216,78 +236,46 @@ transfer callbacks can run outside a safe redisplay context; immediate
   "Return logical thumbnail cache key for native video MEDIA-ID."
   (format "video-thumbnail:%s" media-id))
 
-(defun qq-media-native-record-playback-state (segment-or-media-id)
-  "Return public playback state for SEGMENT-OR-MEDIA-ID, or nil.
+(defun qq-media--native-record-played-seconds (entry)
+  "Return Appkit playback position represented by native record ENTRY."
+  (let ((session (plist-get entry :session)))
+    (if (appkit-media-player-session-p session)
+        (appkit-media-player-played-seconds session)
+      (max 0.0 (float (or (plist-get entry :played-seconds) 0.0))))))
 
-The result intentionally excludes the process, operation, local-access ID,
-and ephemeral filesystem path retained by the private player state."
+(defun qq-media-native-record-playback-state (segment-or-media-id)
+  "Return public Appkit playback state for SEGMENT-OR-MEDIA-ID, or nil.
+
+The result excludes the session, preparation operation, local-access ID, and
+ephemeral filesystem path retained by the private QQ adapter."
   (let ((media-id (if (stringp segment-or-media-id)
                       segment-or-media-id
                     (qq-media--native-record-media-id segment-or-media-id))))
     (when-let* ((entry
                  (and media-id
                       (gethash media-id qq-media--native-record-playbacks))))
-      ;; Emacs does not guarantee that a process exit sentinel has run before
-      ;; the next state read.  Finalize an exited process synchronously so UI
-      ;; state and local-access lease ownership cannot remain stuck at
-      ;; `playing'.  The sentinel checks exact process ownership and is
-      ;; idempotent if an exit event was already queued.
-      (when-let* ((process (plist-get entry :process))
-                  ((processp process))
-                  ((not (process-live-p process))))
-        (qq-media--native-record-player-sentinel process "state poll\n")
-        (setq entry (gethash media-id qq-media--native-record-playbacks)))
-      (list :media-id media-id
-            :status (plist-get entry :status)
-            :duration-seconds (plist-get entry :duration-seconds)
-            :played-seconds (qq-media--native-record-played-seconds entry)
-            :error (plist-get entry :error)))))
-
-(defun qq-media--native-record-played-seconds (entry)
-  "Return current playback position represented by native record ENTRY."
-  (let* ((played (or (plist-get entry :played-seconds) 0.0))
-         (started-at (plist-get entry :started-at))
-         (duration (plist-get entry :duration-seconds))
-         (position
-          (if (and (eq (plist-get entry :status) 'playing)
-                   (numberp started-at))
-              (+ played (max 0.0 (- (float-time) started-at)))
-            played)))
-    (if (and (numberp duration) (> duration 0))
-        (min (float duration) position)
-      position)))
-
-(defun qq-media--cancel-native-record-progress-timer ()
-  "Cancel the native record progress redisplay timer."
-  (when (timerp qq-media--native-record-progress-timer)
-    (cancel-timer qq-media--native-record-progress-timer))
-  (setq qq-media--native-record-progress-timer nil))
-
-(defun qq-media--native-record-progress-tick ()
-  "Redisplay the active native record while its player is running."
-  (let* ((media-id qq-media--native-record-current-id)
-         (entry (and media-id
-                     (gethash media-id qq-media--native-record-playbacks)))
-         (process (and entry (plist-get entry :process))))
-    (if (and (eq (plist-get entry :status) 'playing)
-             (processp process)
-             (process-live-p process))
-        (qq-media--notify-native-record-state media-id)
-      (qq-media--cancel-native-record-progress-timer))))
-
-(defun qq-media--ensure-native-record-progress-timer ()
-  "Start one shared native record progress redisplay timer."
-  (unless (timerp qq-media--native-record-progress-timer)
-    (setq qq-media--native-record-progress-timer
-          (run-at-time 1 1 #'qq-media--native-record-progress-tick))))
-
-(defun qq-media--record-player-command ()
-  "Return normalized native-record player arguments, or nil."
-  (appkit-media-command-arguments qq-media-record-player-command))
+      (let* ((session (plist-get entry :session))
+             (session-status
+              (and (appkit-media-player-session-p session)
+                   (appkit-media-player-status session)))
+             (status
+              (pcase session-status
+                ('starting 'preparing)
+                ((or 'playing 'paused 'finished 'failed) session-status)
+                (_ (plist-get entry :status)))))
+        (list :media-id media-id
+              :status status
+              :duration-seconds
+              (or (and (appkit-media-player-session-p session)
+                       (appkit-media-player-session-duration-seconds session))
+                  (plist-get entry :duration-seconds))
+              :played-seconds
+              (qq-media--native-record-played-seconds entry)
+              :error (plist-get entry :error))))))
 
 (defun qq-media-native-record-playback-available-p ()
-  "Return non-nil when the configured native-record player is runnable."
-  (appkit-media-command-runnable-p qq-media-record-player-command))
+  "Return non-nil when Appkit can play a local native record."
+  (appkit-media-player-available-p nil 'audio))
 
 (defun qq-media--notify-native-record-state (media-id)
   "Notify open chats that native record MEDIA-ID changed playback state."
@@ -308,19 +296,17 @@ and ephemeral filesystem path retained by the private player state."
        (message "qq: could not request resource lease closure: %s"
                 (error-message-string error-data))))))
 
-(defun qq-media--dispose-native-record-entry (media-id &optional status error-text)
+(defun qq-media--dispose-native-record-entry
+    (media-id &optional status error-text)
   "Stop and clean native record MEDIA-ID, recording STATUS and ERROR-TEXT."
   (when-let* ((entry (gethash media-id qq-media--native-record-playbacks)))
     (let ((operation (plist-get entry :operation))
-          (process (plist-get entry :process))
-          (buffer (plist-get entry :buffer))
+          (session (plist-get entry :session))
           (access-id (plist-get entry :access-id))
           (owner-handle (plist-get entry :owner-handle)))
-      ;; Revoke callback ownership before cancellation; transport cancellation
-      ;; may synchronously run an errback.
+      ;; Revoke exact callback ownership before any cancellation can reenter.
       (setq entry (plist-put entry :operation nil))
-      (setq entry (plist-put entry :process nil))
-      (setq entry (plist-put entry :buffer nil))
+      (setq entry (plist-put entry :session nil))
       (setq entry (plist-put entry :access-id nil))
       (setq entry (plist-put entry :owner-handle nil))
       (setq entry (plist-put entry :status (or status 'stopped)))
@@ -329,27 +315,19 @@ and ephemeral filesystem path retained by the private player state."
       (when (and (qq-remote-media-operation-p operation)
                  (qq-remote-media-operation-active-p operation))
         (qq-remote-media-cancel-operation operation))
-      (when (processp process)
-        (set-process-filter process nil)
-        (set-process-sentinel process nil)
-        (when (process-live-p process)
-          (delete-process process))
-        (set-process-plist process nil))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer))
+      (when (appkit-media-player-session-p session)
+        (appkit-media-player-stop session))
       (when (and (appkit-handle-p owner-handle)
                  (appkit-handle-alive-p owner-handle))
         (appkit-retire-handle owner-handle))
       (qq-media--close-local-access access-id)
       (when (equal qq-media--native-record-current-id media-id)
-        (setq qq-media--native-record-current-id nil)
-        (qq-media--cancel-native-record-progress-timer))
+        (setq qq-media--native-record-current-id nil))
       (qq-media--notify-native-record-state media-id)
       entry)))
 
 (defun qq-media--stop-all-native-record-playback ()
-  "Cancel every native-record preparation/player and revoke its lease."
-  (qq-media--cancel-native-record-progress-timer)
+  "Cancel every native-record preparation/session and revoke its lease."
   (let (media-ids)
     (maphash (lambda (media-id _entry) (push media-id media-ids))
              qq-media--native-record-playbacks)
@@ -358,125 +336,93 @@ and ephemeral filesystem path retained by the private player state."
     (clrhash qq-media--native-record-playbacks)
     (setq qq-media--native-record-current-id nil)))
 
-(defun qq-media--native-record-player-sentinel (process _event)
-  "Finalize exact native record player PROCESS after exit."
-  (unless (process-live-p process)
-    (let* ((media-id (plist-get (process-plist process) :qq-media-id))
-           (entry (and media-id
-                       (gethash media-id qq-media--native-record-playbacks))))
-      (when (and entry (eq process (plist-get entry :process)))
-        (let ((buffer (plist-get entry :buffer))
-              (access-id (plist-get entry :access-id))
-              (owner-handle (plist-get entry :owner-handle))
-              (successful (= (process-exit-status process) 0))
-              (played-seconds
-               (qq-media--native-record-played-seconds entry)))
-          (setq entry (plist-put entry :process nil))
-          (setq entry (plist-put entry :buffer nil))
-          (setq entry (plist-put entry :access-id nil))
-          (setq entry (plist-put entry :owner-handle nil))
-          (setq entry (plist-put entry :status
-                                 (if successful 'finished 'failed)))
-          (setq entry (plist-put entry :played-seconds
-                                 (if successful
-                                     (or (plist-get entry :duration-seconds)
-                                         played-seconds)
-                                   played-seconds)))
-          (setq entry (plist-put entry :started-at nil))
-          (setq entry (plist-put entry :error
-                                 (unless successful "record player exited abnormally")))
-          (puthash media-id entry qq-media--native-record-playbacks)
-          (set-process-plist process nil)
-          (when (buffer-live-p buffer)
-            (kill-buffer buffer))
-          (when (and (appkit-handle-p owner-handle)
-                     (appkit-handle-alive-p owner-handle))
-            (appkit-retire-handle owner-handle))
-          (qq-media--close-local-access access-id)
-          (when (equal qq-media--native-record-current-id media-id)
-            (setq qq-media--native-record-current-id nil)
-            (qq-media--cancel-native-record-progress-timer))
-          (qq-media--notify-native-record-state media-id))))))
+(defun qq-media--native-record-session-current-p (media-id session)
+  "Return non-nil when SESSION exactly owns native record MEDIA-ID."
+  (eq session
+      (plist-get
+       (gethash media-id qq-media--native-record-playbacks)
+       :session)))
+
+(defun qq-media--native-record-session-changed (media-id session)
+  "Project exact Appkit SESSION state for native record MEDIA-ID."
+  (when (qq-media--native-record-session-current-p media-id session)
+    (let* ((entry (gethash media-id qq-media--native-record-playbacks))
+           (status (appkit-media-player-status session))
+           (terminal-p (memq status '(finished failed stopped)))
+           (access-id (and terminal-p (plist-get entry :access-id))))
+      (setq entry (plist-put entry :status status))
+      (setq entry
+            (plist-put entry :played-seconds
+                       (appkit-media-player-played-seconds session)))
+      (setq entry
+            (plist-put entry :error
+                       (and (eq status 'failed)
+                            "record player exited abnormally")))
+      (when terminal-p
+        (setq entry (plist-put entry :access-id nil))
+        (when (equal qq-media--native-record-current-id media-id)
+          (setq qq-media--native-record-current-id nil)))
+      (puthash media-id entry qq-media--native-record-playbacks)
+      (when access-id
+        (qq-media--close-local-access access-id))
+      (qq-media--notify-native-record-state media-id))))
 
 (defun qq-media--start-native-record-player (media-id result)
-  "Start configured player for prepared native record MEDIA-ID using RESULT."
+  "Start Appkit playback for prepared native record MEDIA-ID using RESULT."
   (let* ((access (alist-get 'access result))
          (access-id (alist-get 'access_id access))
          (path (alist-get 'path access))
-         (argv (qq-media--record-player-command))
-         (program (car argv))
-         (entry (gethash media-id qq-media--native-record-playbacks))
-         (buffer (generate-new-buffer " *qq-record-player*"))
-         process)
+         (entry (gethash media-id qq-media--native-record-playbacks)))
     (if (not (and entry
-                  program
                   (qq-media-native-record-playback-available-p)
                   (stringp path)
                   (file-regular-p path)))
         (progn
-          (when (buffer-live-p buffer)
-            (kill-buffer buffer))
           (qq-media--close-local-access access-id)
           (qq-media--dispose-native-record-entry
            media-id 'failed "record playback input or player is unavailable")
           (message "qq: Native record playback input or player is unavailable")
           nil)
       (setq entry (plist-put entry :access-id access-id))
-      (setq entry (plist-put entry :buffer buffer))
       (puthash media-id entry qq-media--native-record-playbacks)
       (condition-case error-data
-          (progn
-            (setq process
-                  (make-process
-                   :name "qq-record-player"
-                   :buffer buffer
-                   :command (append argv (list path))
-                   :noquery t
-                   ;; Install the real sentinel only after PROCESS owns a
-                   ;; playback entry.  A short-lived player can otherwise exit
-                   ;; between `make-process' and `set-process-plist', leaking
-                   ;; both its buffer and the local-access lease.
-                   :sentinel #'ignore))
-            (set-process-query-on-exit-flag process nil)
-            (set-process-plist process (list :qq-media-id media-id))
-            (setq entry (gethash media-id qq-media--native-record-playbacks))
-            ;; Starting a process may admit process/timer callbacks.  Do not
-            ;; resurrect playback if its exact Appkit owner stopped while the
-            ;; constructor was returning.
-            (if (not
-                 (and entry
-                      (eq (plist-get entry :status) 'preparing)
-                      (let ((owner-handle (plist-get entry :owner-handle)))
-                        (or (null owner-handle)
-                            (and (appkit-handle-p owner-handle)
-                                 (appkit-handle-alive-p owner-handle))))))
+          (let* ((owner (plist-get entry :owner))
+                 (duration (plist-get entry :duration-seconds))
+                 (session
+                  (appkit-media-player-start-file
+                   path
+                   :kind 'audio
+                   :owner owner
+                   :duration-seconds duration
+                   :on-change
+                   (apply-partially
+                    #'qq-media--native-record-session-changed media-id)))
+                 (current
+                  (gethash media-id qq-media--native-record-playbacks)))
+            (if (not (and current
+                          (eq (plist-get current :status) 'preparing)
+                          (qq-account-get (plist-get current :account-id))))
                 (progn
-                  (set-process-filter process nil)
-                  (set-process-sentinel process nil)
-                  (when (process-live-p process)
-                    (delete-process process))
-                  (set-process-plist process nil)
-                  (when (buffer-live-p buffer)
-                    (kill-buffer buffer))
+                  (appkit-media-player-stop session)
                   (qq-media--close-local-access access-id)
                   nil)
-              (setq entry (plist-put entry :operation nil))
-              (setq entry (plist-put entry :process process))
-              (setq entry (plist-put entry :status 'playing))
-              (setq entry (plist-put entry :started-at (float-time)))
-              (setq entry (plist-put entry :error nil))
-              (puthash media-id entry qq-media--native-record-playbacks)
+              (when-let* ((handle (plist-get current :owner-handle)))
+                (when (appkit-handle-alive-p handle)
+                  (appkit-retire-handle handle)))
+              (setq current (plist-put current :operation nil))
+              (setq current (plist-put current :owner-handle nil))
+              (setq current (plist-put current :session session))
+              (setq current
+                    (plist-put
+                     current :status
+                     (appkit-media-player-status session)))
+              (setq current (plist-put current :error nil))
+              (puthash media-id current qq-media--native-record-playbacks)
               (setq qq-media--native-record-current-id media-id)
-              (set-process-sentinel
-               process #'qq-media--native-record-player-sentinel)
-              (qq-media--ensure-native-record-progress-timer)
-              ;; Emacs does not promise to replay an exit event which arrived
-              ;; while the sentinel was `ignore'.  Finalization is idempotent
-              ;; because it checks exact process ownership.
-              (unless (process-live-p process)
-                (qq-media--native-record-player-sentinel process "finished\n"))
               (qq-media--notify-native-record-state media-id)
-              process))
+              (when (appkit-media-player-session-finalized-p session)
+                (qq-media--native-record-session-changed media-id session))
+              session))
         (error
          (qq-media--dispose-native-record-entry
           media-id 'failed (error-message-string error-data))
@@ -505,55 +451,33 @@ and ephemeral filesystem path retained by the private player state."
 (cl-defun qq-media-play-native-record (segment &key owner)
   "Prepare, play, pause, or resume native record SEGMENT.
 
-OWNER is the Appkit owner captured by the rendering card.  As with Telega
-voice notes, clicking a playing record pauses it and clicking again resumes."
+OWNER owns preparation until the local file is handed to an Appkit playback
+session.  Playing records pause by stopping ffplay; paused records resume with
+a fresh process at Appkit's retained Telega-style progress."
   (let* ((media-id (qq-media--native-record-media-id segment))
          (entry (and media-id
                      (gethash media-id qq-media--native-record-playbacks)))
-         (process (and entry (plist-get entry :process)))
-         (status (and entry (plist-get entry :status))))
+         (session (and entry (plist-get entry :session)))
+         (status
+          (or (and (appkit-media-player-session-p session)
+                   (appkit-media-player-status session))
+              (and entry (plist-get entry :status)))))
     (unless media-id
       (user-error "qq: Native record has no materializable media ID"))
     (pcase status
       ('preparing
        (qq-media--dispose-native-record-entry media-id 'stopped)
        (message "qq: canceled record playback preparation"))
-      ('playing
-       (if (process-live-p process)
-           (condition-case error-data
-               (progn
-                 (signal-process process 'SIGSTOP)
-                 (setq entry
-                       (plist-put
-                        entry :played-seconds
-                        (qq-media--native-record-played-seconds entry)))
-                 (setq entry (plist-put entry :started-at nil))
-                 (setq entry (plist-put entry :status 'paused))
-                 (puthash media-id entry qq-media--native-record-playbacks)
-                 (qq-media--cancel-native-record-progress-timer)
-                 (qq-media--notify-native-record-state media-id))
-             (error
-              (qq-media--dispose-native-record-entry
-               media-id 'failed (error-message-string error-data))))
-         (qq-media--dispose-native-record-entry media-id 'stopped)))
-      ('paused
-       (if (process-live-p process)
-           (condition-case error-data
-               (progn
-                 (signal-process process 'SIGCONT)
-                 (setq entry (plist-put entry :started-at (float-time)))
-                 (setq entry (plist-put entry :status 'playing))
-                 (puthash media-id entry qq-media--native-record-playbacks)
-                 (qq-media--ensure-native-record-progress-timer)
-                 (qq-media--notify-native-record-state media-id))
-             (error
-              (qq-media--dispose-native-record-entry
-               media-id 'failed (error-message-string error-data))))
-         (qq-media--dispose-native-record-entry media-id 'stopped)))
+      ((or 'playing 'paused)
+       (condition-case error-data
+           (appkit-media-player-toggle session)
+         (error
+          (qq-media--dispose-native-record-entry
+           media-id 'failed (error-message-string error-data)))))
       (_
        (unless (qq-media-native-record-playback-available-p)
          (user-error
-          "qq: Record player unavailable; customize `qq-media-record-player-command'"))
+          "qq: Record player unavailable; customize `appkit-media-audio-player-command'"))
        (when (and qq-media--native-record-current-id
                   (not (equal qq-media--native-record-current-id media-id)))
          (qq-media--dispose-native-record-entry
@@ -566,18 +490,19 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
                      (apply-partially
                       #'qq-media--dispose-native-record-entry
                       media-id 'stopped))))
-              (next (list :status 'preparing
-                          :account-id account-id
-                          :duration-seconds
-                          (alist-get 'duration_seconds
-                                     (alist-get 'data segment))
-                          :played-seconds 0.0
-                          :started-at nil
-                          :owner-handle owner-handle
-                          :operation nil
-                          :process nil
-                          :access-id nil
-                          :error nil)))
+              (next
+               (list :status 'preparing
+                     :account-id account-id
+                     :owner owner
+                     :duration-seconds
+                     (alist-get 'duration_seconds
+                                (alist-get 'data segment))
+                     :played-seconds 0.0
+                     :owner-handle owner-handle
+                     :operation nil
+                     :session nil
+                     :access-id nil
+                     :error nil)))
          (unless account-id
            (user-error "qq: Select an online account before playing a record"))
          (puthash media-id next qq-media--native-record-playbacks)
@@ -587,12 +512,14 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
              (let ((operation
                     (qq-remote-media-prepare-record-playback
                      media-id
-                     (apply-partially #'qq-media--native-record-prepared media-id)
+                     (apply-partially
+                      #'qq-media--native-record-prepared media-id)
                      (apply-partially
                       #'qq-media--native-record-prepare-failed media-id))))
-               ;; Synchronous test transports may already have handed off.
+               ;; Synchronous transports may already have handed off to Appkit.
                (when-let* ((current
-                            (gethash media-id qq-media--native-record-playbacks)))
+                            (gethash media-id
+                                     qq-media--native-record-playbacks)))
                  (when (eq (plist-get current :status) 'preparing)
                    (setq current (plist-put current :operation operation))
                    (puthash media-id current
@@ -602,7 +529,6 @@ voice notes, clicking a playing record pauses it and clicking again resumes."
              media-id 'failed (error-message-string error-data))
             (signal (car error-data) (cdr error-data)))))))
     (qq-media-native-record-playback-state media-id)))
-
 (defun qq-media--native-remote-media-changed (_reason media-id)
   "Redisplay cards affected by remote MEDIA-ID state changes."
   (if media-id
@@ -1426,7 +1352,8 @@ states never probe a second interface such as get_file."
 
 (defun qq-media--native-record-capabilities (media-id)
   "Return the action/status model for native record MEDIA-ID."
-  (let* ((playback (gethash media-id qq-media--native-record-playbacks))
+  (let* ((playback
+          (qq-media-native-record-playback-state media-id))
          (playback-status (plist-get playback :status))
          (playback-error (plist-get playback :error))
          (remote (qq-remote-media media-id))
@@ -2554,6 +2481,136 @@ resolution and is safe while the account has no managed backend runtime."
       ('service "◇")
       (_ "?"))))
 
+(defun qq-media--system-emoji-download-info-p (value)
+  "Return non-nil when VALUE is one closed system-emoji download locator."
+  (and (qq-account--exact-object-keys-p
+        value '(base_resource_url advanced_resource_url))
+       (cl-every
+        (lambda (key)
+          (let ((url (alist-get key value)))
+            (or (null url)
+                (and (qq-account--non-empty-string-p url)
+                     (string-prefix-p "https://" url)))))
+        '(base_resource_url advanced_resource_url))))
+
+(defun qq-media--system-emoji-entry-p (entry)
+  "Return non-nil when ENTRY is one exact Gateway system emoji."
+  (and
+   (qq-account--exact-object-keys-p
+    entry
+    '(id description qzone_code qcid emoji_type animated_pack_id
+         animated_sticker_id download associate_words hidden start_time
+         end_time animation_width animation_height interact_pack_id
+         interact_sticker_id))
+   (qq-account--non-empty-string-p (alist-get 'id entry))
+   (stringp (alist-get 'description entry))
+   (stringp (alist-get 'qzone_code entry))
+   (cl-every
+    (lambda (key)
+      (let ((value (alist-get key entry)))
+        (and (integerp value) (<= 0 value #xffffffff))))
+    '(qcid emoji_type animation_width animation_height))
+   (< (alist-get 'emoji_type entry) 6)
+   (cl-every
+    (lambda (key)
+      (let ((value (alist-get key entry)))
+        (or (null value)
+            (and (integerp value) (< 0 value #xffffffff)))))
+    '(animated_pack_id animated_sticker_id interact_pack_id interact_sticker_id))
+   (qq-media--system-emoji-download-info-p (alist-get 'download entry))
+   (let ((words (alist-get 'associate_words entry)))
+     (and (proper-list-p words)
+          (<= (length words) 64)
+          (cl-every #'stringp words)))
+   (memq (alist-get 'hidden entry) '(t nil :false))
+   (cl-every
+    (lambda (key)
+      (let ((value (alist-get key entry)))
+        (or (null value) (and (integerp value) (< 0 value)))))
+    '(start_time end_time))))
+
+(defun qq-media--project-system-emoji-catalog (result)
+  "Validate and return Gateway system-emoji catalog RESULT."
+  (unless (qq-account--exact-object-keys-p result '(panels))
+    (error "qq: Gateway returned malformed system-emoji catalog"))
+  (let ((panels (alist-get 'panels result))
+        (count 0))
+    (unless
+        (and
+         (proper-list-p panels)
+         (<= (length panels) 3)
+         (cl-every
+          (lambda (panel)
+            (and
+             (qq-account--exact-object-keys-p panel '(kind groups download))
+             (member (alist-get 'kind panel) '("normal" "super" "red_heart"))
+             (qq-media--system-emoji-download-info-p
+              (alist-get 'download panel))
+             (let ((groups (alist-get 'groups panel)))
+               (and
+                (proper-list-p groups)
+                (<= (length groups) 256)
+                (cl-every
+                 (lambda (group)
+                   (let ((emojis (alist-get 'emojis group)))
+                     (and
+                      (qq-account--exact-object-keys-p
+                       group '(name emojis start_time end_time group_type))
+                      (stringp (alist-get 'name group))
+                      (integerp (alist-get 'group_type group))
+                      (proper-list-p emojis)
+                      (<= (+ count (length emojis)) 4096)
+                      (progn (setq count (+ count (length emojis))) t)
+                      (cl-every #'qq-media--system-emoji-entry-p emojis))))
+                 groups)))))
+          panels))
+      (error "qq: Gateway returned invalid system-emoji catalog panels"))
+    (copy-tree result)))
+
+(defun qq-media--system-emoji-table-from-catalog (catalog)
+  "Build a numeric face-id table from validated CATALOG."
+  (let ((table (make-hash-table :test #'equal)))
+    (dolist (panel (alist-get 'panels catalog))
+      (dolist (group (alist-get 'groups panel))
+        (dolist (entry (alist-get 'emojis group))
+          (let ((id (alist-get 'id entry)))
+            (when (and (stringp id)
+                       (string-match-p "\\`[0-9]+\\'" id))
+              (puthash id entry table))))))
+    table))
+
+(defun qq-media--ensure-system-emoji-catalog ()
+  "Start at most one system-emoji catalog request for the current account."
+  (when-let* ((owner (qq-runtime-current-account-id))
+              ((qq-account-get owner))
+              ((member "system_emoji.list" (qq-server-capabilities)))
+              ((not (gethash owner qq-media--system-emoji-tables)))
+              ((not (gethash owner qq-media--system-emoji-requests))))
+    (puthash owner t qq-media--system-emoji-requests)
+    (qq-rpc-call
+     "system_emoji.list" `((account_id . ,owner))
+     :current-p (lambda () (and (qq-account-get owner) t))
+     :stale-code "account_removed"
+     :stale-message "QQ account was removed during system-emoji catalog fetch"
+     :projector #'qq-media--project-system-emoji-catalog
+     :callback
+     (lambda (catalog)
+       (remhash owner qq-media--system-emoji-requests)
+       (puthash owner
+                (qq-media--system-emoji-table-from-catalog catalog)
+                qq-media--system-emoji-tables)
+       (qq-media--note-cache-updated "system-emoji-catalog"))
+     :errback
+     (lambda (_body _reason)
+       (remhash owner qq-media--system-emoji-requests)))))
+
+(defun qq-media-system-emoji-entry (emoji-id)
+  "Return current account catalog entry for numeric EMOJI-ID, or nil."
+  (qq-media--ensure-system-emoji-catalog)
+  (when-let* ((owner (qq-runtime-current-account-id))
+              (table (gethash owner qq-media--system-emoji-tables)))
+    (gethash (format "%s" emoji-id) table)))
+
 (defvar qq-media--face-names-table nil
   "Lazy hash table: face id string → QDes name (e.g. \"/斜眼笑\").")
 
@@ -2597,11 +2654,11 @@ resolution and is safe while the account has no managed backend runtime."
 (defun qq-media-face-name (emoji-id)
   "Return human-readable QQ face name for EMOJI-ID, or nil."
   (let* ((id (format "%s" emoji-id))
+         (entry (qq-media-system-emoji-entry id))
+         (catalog-name (and entry (alist-get 'description entry)))
          (table (qq-media--load-face-names-table)))
-    (or (gethash id table)
-        ;; Also accept numeric keys that json may have stored differently.
-        (and (string-match-p "\\`[0-9]+\\'" id)
-             (gethash id table)))))
+    (or (and (qq-account--non-empty-string-p catalog-name) catalog-name)
+        (gethash id table))))
 
 (defun qq-media--face-id-number (id)
   "Return numeric value of face ID string, or nil."
@@ -2618,8 +2675,16 @@ or numeric id.  Use `qq-media-face-id-from-completion'.
 Order is by face id (0, 1, 2, …) — the same order as QQ's default
 emoji panel.  Pair with `qq-media-face-completion-table' so Vertico
 does not re-sort by string length/history."
-  (let ((table (qq-media--load-face-names-table))
+  (let ((table (copy-hash-table (qq-media--load-face-names-table)))
         (candidates nil))
+    (when-let* ((owner (qq-runtime-current-account-id))
+                (catalog (gethash owner qq-media--system-emoji-tables)))
+      (maphash
+       (lambda (id entry)
+         (let ((name (alist-get 'description entry)))
+           (when (qq-account--non-empty-string-p name)
+             (puthash id name table))))
+       catalog))
     (maphash
      (lambda (id name)
        (push (cons id (format "%s  (%s)"
@@ -2777,25 +2842,89 @@ Those shorter-lived capabilities are acquired only when the draft is sent."
   (or (qq-media-face-name emoji-id)
       (format "[face:%s]" emoji-id)))
 
-(defun qq-media--local-base-emoji-file (emoji-id)
-  "Return path to LinuxQQ default face image for EMOJI-ID, or nil."
+(defun qq-media--system-emoji-cache-roots ()
+  "Return configured and discovered LinuxQQ dynamic emoji cache roots."
+  (delete-dups
+   (seq-filter
+    #'file-directory-p
+    (append
+     (mapcar #'expand-file-name qq-media-system-emoji-cache-directories)
+     (file-expand-wildcards
+      (expand-file-name
+       ".config/QQ/nt_qq_*/nt_data/Emoji/BaseEmojiSyastems/EmojiSystermResource"
+       "~")
+      t)))))
+
+(defun qq-media--local-base-emoji-lottie-file (emoji-id)
+  "Return LinuxQQ's cached Lottie JSON for EMOJI-ID, or nil."
+  (let ((id (format "%s" emoji-id)))
+    (seq-some
+     (lambda (root)
+       (let ((file (expand-file-name
+                    (format "%s/lottie/%s.json" id id) root)))
+         (and (file-readable-p file) file)))
+     (qq-media--system-emoji-cache-roots))))
+
+(defun qq-media-face-to-segment (emoji-id)
+  "Build one closed composer segment for system EMOJI-ID."
   (let* ((id (format "%s" emoji-id))
+         (number (qq-media--face-id-number id))
+         (entry (qq-media-system-emoji-entry id))
+         (emoji-type (and entry (alist-get 'emoji_type entry)))
+         (pack-id (and entry (alist-get 'animated_pack_id entry)))
+         (sticker-id (and entry (alist-get 'animated_sticker_id entry)))
+         (description (and entry (alist-get 'description entry))))
+    (unless (and number (<= 0 number #xffffffff))
+      (user-error "qq: system face id is not a uint32"))
+    (cond
+     ((< number 260)
+      `((type . "face")
+        (data . ((id . ,id) (face_type . "basic")
+                 ,@(when description `((description . ,description)))))))
+     ((and (memq emoji-type '(1 2)) pack-id sticker-id)
+      `((type . "face")
+        (data . ((id . ,id) (face_type . "animated")
+                 (pack_id . ,pack-id) (sticker_id . ,sticker-id)
+                 ,@(when description `((description . ,description)))))))
+     ((and entry (= (or emoji-type 0) 0))
+      `((type . "face")
+        (data . ((id . ,id) (face_type . "small")
+                 ,@(when description `((description . ,description)))))))
+     (t
+      (qq-media--ensure-system-emoji-catalog)
+      (user-error "qq: system face %s needs its native catalog metadata" id)))))
+
+(defun qq-media--local-base-emoji-file (emoji-id)
+  "Return the best LinuxQQ image resource for EMOJI-ID, or nil."
+  (let* ((id (format "%s" emoji-id))
+         (dynamic
+          (seq-some
+           (lambda (root)
+             (seq-find
+              #'file-readable-p
+              (list
+               (expand-file-name (format "%s/apng/%s.png" id id) root)
+               (expand-file-name (format "%s/png/%s.png" id id) root)
+               (expand-file-name (format "%s/png/%s_0.png" id id) root))))
+           (qq-media--system-emoji-cache-roots)))
          (dir qq-media-default-emoji-directory))
-    (when (and (stringp dir)
-               (not (string-empty-p id))
-               (file-directory-p dir))
-      (seq-find
-       #'file-exists-p
-       (mapcar (lambda (ext)
-                 (expand-file-name (concat id "." ext) dir))
-               '("png" "gif" "webp" "jpg" "jpeg"))))))
+    (or dynamic
+        (when (and (stringp dir)
+                   (not (string-empty-p id))
+                   (file-directory-p dir))
+          (seq-find
+           #'file-readable-p
+           (mapcar (lambda (ext)
+                     (expand-file-name (concat id "." ext) dir))
+                   '("png" "gif" "webp" "jpg" "jpeg")))))))
 
 (defun qq-media--face-resource-from-local (emoji-id)
   "Return resource alist for local face EMOJI-ID, or nil."
   (when-let* ((file (qq-media--local-base-emoji-file emoji-id)))
     `((file . ,file)
       (emoji_id . ,(format "%s" emoji-id))
-      (description . ,(qq-media-face-name emoji-id)))))
+      (description . ,(qq-media-face-name emoji-id))
+      (animated . ,(and (string-match-p "/apng/" file) t)))))
 
 (defun qq-media--prepare-animated-face-resource (resource callback)
   "Pass RESOURCE to CALLBACK, converting native APNG to animated GIF.
@@ -2851,36 +2980,171 @@ cache; GIF is then handled by appkit's bounded inline-animation machinery."
       image)))
 
 (defun qq-media-face-image (emoji-id)
-  "Return inline QQ base face image for EMOJI-ID.
+  "Return inline QQ system-face image for EMOJI-ID.
 
-Resolve only from LinuxQQ `default-emojis/<id>.png'.  A missing native
-resource returns nil so the caller can render the face description; it must
-not make a removed OneBot request from the timeline renderer."
+Dynamic LinuxQQ account caches take precedence over the packaged static
+fallback.  APNG resources are converted once through the bounded GIF path."
   (let* ((id (format "%s" emoji-id))
+         (frame (gethash id qq-media--lottie-current-frames))
          (key (format "face:%s" id))
          (local (qq-media--face-resource-from-local id)))
-    (when local
-      (qq-media--cache-resource key local))
-    (when local
+    (cond
+     ((and frame (file-readable-p frame))
+      (qq-media--image-from-file frame qq-media-animated-face-image-height))
+     (local
+      (qq-media--cache-resource key local)
       (qq-media--ensure-resource-image
        key
        (lambda (done _error)
-         (funcall done local))
+         (if (alist-get 'animated local)
+             (qq-media--prepare-animated-face-resource local done)
+           (funcall done local)))
        qq-media-face-image-height
-       #'qq-media--face-image-from-file))))
+       #'qq-media--face-image-from-file)))))
 
 (defun qq-media-face-display-string (emoji-id &optional description)
   "Return inline display string for QQ face EMOJI-ID.
 
-Prefer the face image (local default-emojis first).  When the image is
-not ready yet, show DESCRIPTION or the known human face name
-(`/斜眼笑') rather than CQ."
-  (qq-media--image-display-string
-   (qq-media-face-image emoji-id)
-   (or (and (stringp description)
-            (not (string-empty-p description))
-            description)
-       (qq-media-face-text-fallback emoji-id))))
+Prefer a dynamic/static image, then DESCRIPTION or the catalog/static name.
+When native Lottie JSON exists, attach playback identity to the projection."
+  (let* ((id (format "%s" emoji-id))
+         (lottie (qq-media--local-base-emoji-lottie-file id))
+         (text
+          (qq-media--image-display-string
+           (qq-media-face-image id)
+           (or (and (stringp description)
+                    (not (string-empty-p description))
+                    description)
+               (qq-media-face-text-fallback id)))))
+    (when (and lottie (> (length text) 0))
+      (add-text-properties
+       0 (length text)
+       `(qq-system-face-id ,id
+         help-echo "RET: play native Lottie system face")
+       text))
+    text))
+
+(defun qq-media--lottie-player-current-p (id owner)
+  "Return non-nil when OWNER still owns system face ID playback."
+  (eq (gethash id qq-media--lottie-players) owner))
+
+(defun qq-media--publish-lottie-frame (id owner bytes)
+  "Publish complete PNG BYTES for system face ID still owned by OWNER."
+  (when (qq-media--lottie-player-current-p id owner)
+    (let* ((directory (expand-file-name "face-lottie-playing/"
+                                        qq-media-cache-directory))
+           (file (progn
+                   (make-directory directory t)
+                   (make-temp-file
+                    (expand-file-name (format "%s-" id) directory)
+                    nil ".png"))))
+      (condition-case err
+          (progn
+            (let ((coding-system-for-write 'no-conversion))
+              (write-region bytes nil file nil 'silent))
+            (push file (plist-get owner :frame-files))
+            (puthash id file qq-media--lottie-current-frames)
+            (remhash (format "face:%s" id) qq-media--image-cache)
+            (qq-media--note-cache-updated (format "face:%s" id)))
+        (error
+         (message "qq: could not project Lottie frame: %s"
+                  (error-message-string err))
+         (ignore-errors (delete-file file))
+         (when-let* ((process (plist-get owner :process)))
+           (when (process-live-p process)
+             (delete-process process))))))))
+
+(defun qq-media--finish-lottie-player (id owner output)
+  "Retire system face ID playback OWNER and process OUTPUT buffer."
+  (when (qq-media--lottie-player-current-p id owner)
+    (remhash id qq-media--lottie-players)
+    (remhash id qq-media--lottie-current-frames)
+    (remhash (format "face:%s" id) qq-media--image-cache)
+    (qq-media--note-cache-updated (format "face:%s" id)))
+  (when-let* ((files (plist-get owner :frame-files)))
+    (run-at-time
+     0.5 nil
+     (lambda (retired-files)
+       (dolist (file retired-files)
+         (ignore-errors (delete-file file))))
+     files))
+  (when (buffer-live-p output)
+    (kill-buffer output)))
+
+(defun qq-media-play-system-face (emoji-id)
+  "Stream native Lottie frames for system EMOJI-ID."
+  (interactive "sSystem face id: ")
+  (let* ((id (format "%s" emoji-id))
+         (source (qq-media--local-base-emoji-lottie-file id))
+         (renderer qq-media-lottie-renderer-command))
+    (unless source
+      (user-error "qq: system face %s has no local Lottie resource" id))
+    (unless (and renderer (file-executable-p renderer))
+      (user-error "qq: Lottie playback requires tgs2png"))
+    (when-let* ((previous (gethash id qq-media--lottie-players))
+                (process (plist-get previous :process)))
+      (when (process-live-p process)
+        (delete-process process)))
+    (let* ((owner (list :process nil :frame-files nil))
+           (output (generate-new-buffer " *qq-system-face-lottie*"))
+           process)
+      (puthash id owner qq-media--lottie-players)
+      (with-current-buffer output
+        (set-buffer-multibyte nil))
+      (condition-case err
+          (progn
+            (setq process
+                  (make-process
+                   :name (format "qq-system-face-%s" id)
+                   :command
+                   (list renderer
+                         "-s" (format "0x%d" qq-media-animated-face-image-height)
+                         source)
+                   :buffer output
+                   :stderr nil
+                   :coding 'no-conversion
+                   :noquery t
+                   :connection-type 'pipe
+                   :filter
+                   (lambda (proc bytes)
+                     (when (and (process-live-p proc)
+                                (qq-media--lottie-player-current-p id owner)
+                                (buffer-live-p output))
+                       (condition-case filter-error
+                           (with-current-buffer output
+                             (goto-char (point-max))
+                             (insert bytes)
+                             (when-let*
+                                 ((frame
+                                   (appkit-media-png-stream-pop-latest output)))
+                               (qq-media--publish-lottie-frame
+                                id owner frame)))
+                         (error
+                          (message "qq: invalid Lottie frame stream: %s"
+                                   (error-message-string filter-error))
+                          (delete-process proc)))))
+                   :sentinel
+                   (lambda (proc _event)
+                     (when (memq (process-status proc) '(exit signal))
+                       (qq-media--finish-lottie-player id owner output)))))
+            (setf (plist-get owner :process) process)
+            t)
+        (error
+         (remhash id qq-media--lottie-players)
+         (when (buffer-live-p output)
+           (kill-buffer output))
+         (user-error "qq: could not start Lottie playback: %s"
+                     (error-message-string err)))))))
+
+(defun qq-media-play-system-face-at-point ()
+  "Play the native Lottie system face projected at point."
+  (interactive)
+  (let ((id (or (get-text-property (point) 'qq-system-face-id)
+                (and (> (point) (point-min))
+                     (get-text-property (1- (point)) 'qq-system-face-id)))))
+    (if id
+        (qq-media-play-system-face id)
+      (user-error "qq: no Lottie system face at point"))))
 
 (defun qq-media-segment-preview-key (segment)
   "Return preview cache key for SEGMENT, or nil when unsupported."
