@@ -225,6 +225,18 @@ pushes left optimistic sends stuck without a snowflake."
                     (source . ,source)
                     (summary . ,(alist-get 'summary payload))
                     (prompt . ,prompt))))))
+      ("face"
+       `((type . "face")
+         (data . ((id . ,(alist-get 'id payload))
+                  (face_type . ,(alist-get 'type payload))
+                  ,@(when (alist-get 'pack_id payload)
+                      `((pack_id . ,(alist-get 'pack_id payload))))
+                  ,@(when (alist-get 'sticker_id payload)
+                      `((sticker_id . ,(alist-get 'sticker_id payload))))
+                  ,@(when (alist-get 'result_id payload)
+                      `((result_id . ,(alist-get 'result_id payload))))
+                  ,@(when (alist-get 'preview payload)
+                      `((description . ,(alist-get 'preview payload))))))))
       ("market_face"
        `((type . "mface")
          (data . ((emoji_package_id . ,(alist-get 'package_id payload))
@@ -2055,8 +2067,37 @@ domain schema, observed source metadata, and segment limits."
                  `((kind . "text")
                    (payload . ((text . ,(alist-get 'text data))))))
                 ("face"
-                 `((kind . "face")
-                   (payload . ((id . ,(alist-get 'id data))))))
+                 (let* ((id (alist-get 'id data))
+                        (face-type
+                         (or (alist-get 'face_type data)
+                             (and (stringp id)
+                                  (string-match-p "\\`[0-9]+\\'" id)
+                                  (< (string-to-number id) 260)
+                                  "basic")))
+                        (payload `((type . ,face-type) (id . ,id)))
+                        (preview (alist-get 'description data)))
+                   (unless (member face-type '("basic" "small" "animated"))
+                     (user-error "qq: System face lacks native type metadata"))
+                   (when (and (member face-type '("small" "animated"))
+                              (qq-account--non-empty-string-p preview))
+                     (setq payload
+                           (append payload `((preview . ,preview)))))
+                   (when (equal face-type "animated")
+                     (let ((pack-id (alist-get 'pack_id data))
+                           (sticker-id (alist-get 'sticker_id data))
+                           (result-id (alist-get 'result_id data)))
+                       (unless (and (integerp pack-id) (> pack-id 0)
+                                    (integerp sticker-id) (> sticker-id 0))
+                         (user-error
+                          "qq: Animated face lacks native pack/sticker metadata"))
+                       (setq payload
+                             (append
+                              payload
+                              `((pack_id . ,pack-id)
+                                (sticker_id . ,sticker-id))
+                              (when result-id
+                                `((result_id . ,result-id)))))))
+                   `((kind . "face") (payload . ,payload))))
                 ("at"
                  (unless group-p
                    (user-error "qq: Mentions require a group chat"))

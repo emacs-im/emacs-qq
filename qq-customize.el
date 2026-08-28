@@ -480,6 +480,23 @@ the textual face description."
   :type 'directory
   :group 'qq)
 
+(defcustom qq-media-system-emoji-cache-directories nil
+  "Additional LinuxQQ dynamic system-emoji cache roots.
+
+Each root contains `<id>/png', `<id>/apng', and `<id>/lottie'.  When nil,
+emacs-qq discovers account caches below `~/.config/QQ/nt_qq_*'."
+  :type '(repeat directory)
+  :group 'qq)
+
+(defcustom qq-media-lottie-renderer-command
+  (executable-find "tgs2png")
+  "Renderer used for system-face Lottie previews and playback.
+
+The command must implement the `tgs2png' interface used by disco.el.  Nil
+keeps APNG/static rendering and the textual fallback."
+  :type '(choice (const :tag "Unavailable" nil) file)
+  :group 'qq)
+
 (defcustom qq-media-face-names-file
   (let* ((lib (or (locate-library "qq-customize.el")
                   (locate-library "qq-media.el")
@@ -523,22 +540,6 @@ fallbacks and previews when the face image is not yet available."
   :type 'directory
   :group 'qq)
 
-(defcustom qq-media-record-player-command
-  (cond
-   ((executable-find "ffplay") '("ffplay" "-nodisp" "-autoexit"))
-   ((executable-find "mpv") '("mpv" "--no-video"))
-   ((executable-find "vlc") '("vlc" "--intf" "dummy" "--play-and-exit"))
-   (t nil))
-  "Command used to play native QQ voice records.
-
-The decoded PCM WAV path is supplied as the final argument.  Playback never
-uses this command to select or perform a protocol transformation; Rust has
-already materialized and decoded the immutable resource before launch."
-  :type '(choice
-          (const :tag "No record player" nil)
-          (string :tag "Command line")
-          (repeat :tag "Argument vector" string))
-  :group 'qq)
 
 (defcustom qq-self-message-dedupe-window 10
   "Seconds used to weakly dedupe self-message event echoes."

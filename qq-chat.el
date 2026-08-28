@@ -2776,8 +2776,7 @@ Bound via `qq-chat-attach-emoji' (`C-c C-e'); attach transient `e'."
    (list (qq-chat--read-base-face-id)))
   (let* ((id (format "%s" (or face-id
                               (user-error "qq: face id required"))))
-         (segment `((type . "face")
-                    (data . ((id . ,id))))))
+         (segment (qq-media-face-to-segment id)))
     (qq-chat--insert-input-segment-object segment)
     (qq-chat--sync-draft-from-buffer)
     (message "qq: face %s (%s)"
@@ -3345,7 +3344,8 @@ an exact Message ID center or an authored conversation-sequence center."
            (sticker-id (or (alist-get 'sticker_id data)
                            (alist-get 'stickerId data)
                            (and (listp raw) (alist-get 'stickerId raw)))))
-      (or (equal face-type 3)
+      (or (equal face-type "animated")
+          (equal face-type 3)
           (and sticker-id
                (not (equal (format "%s" sticker-id) "0")))))))
 
@@ -5904,7 +5904,14 @@ way to send literal token text."
   (interactive "P")
   (qq-chat--ensure-composer-visible)
   (if (not (appkit-chatbuf-point-in-input-p))
-      (appkit-chatbuf-focus-input)
+      (let ((face-id
+             (or (get-text-property (point) 'qq-system-face-id)
+                 (and (> (point) (point-min))
+                      (get-text-property
+                       (1- (point)) 'qq-system-face-id)))))
+        (if face-id
+            (qq-media-play-system-face face-id)
+          (appkit-chatbuf-focus-input)))
     (cond
      (arg
       (insert "\n"))

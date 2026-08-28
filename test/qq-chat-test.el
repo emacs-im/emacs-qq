@@ -4124,7 +4124,10 @@
          (should (= 1 (length segments)))
          (should (equal "face" (alist-get 'type (car segments))))
          (should (equal "178"
-                        (alist-get 'id (alist-get 'data (car segments))))))))))
+                        (alist-get 'id (alist-get 'data (car segments)))))
+         (should (equal "basic"
+                        (alist-get 'face_type
+                                   (alist-get 'data (car segments))))))))))
 
 (ert-deftest qq-chat-attach-custom-face-inserts-durable-favorite-segment ()
   (qq-chat-test-with-reset
