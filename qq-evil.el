@@ -184,13 +184,13 @@ When nil, leave Evil's initial-state selection untouched."
      "RET" #'qq-root-open-at-point
      "<return>" #'qq-root-open-at-point
      "g r" #'qq-root-refresh
-     "g s" #'qq-root-search
-     "g c" #'qq-contacts-open
+     "s" #'qq-root-search
+     "c" #'qq-contacts-open
      "g G" #'qq-guilds-open
-     "g o" #'qq-root-open-session
-     "g a" #'qq-root-open-avatar-at-point
-     "g i" #'qq-root-open-info-at-point
-     "g I" #'qq-root-open-self-user
+     "o" #'qq-root-open-session
+     "a" #'qq-root-open-avatar-at-point
+     "i" #'qq-root-open-info-at-point
+     "I" #'qq-root-open-self-user
      "TAB" #'qq-root-tab-dwim
      "<backtab>" #'qq-root-button-backward
      "?" #'qq-root-transient)
@@ -199,15 +199,16 @@ When nil, leave Evil's initial-state selection untouched."
      "RET" #'qq-contacts-open-at-point
      "<return>" #'qq-contacts-open-at-point
      "g r" #'qq-contacts-refresh
-     "g s" #'qq-contacts-search
-     "g f" #'qq-contacts-show-friends
+     "s" #'qq-contacts-search
+     "f" #'qq-contacts-show-friends
      "g G" #'qq-contacts-show-groups
      "g I" #'qq-contacts-show-not-recent-groups
-     "g i" #'qq-contacts-open-info-at-point
+     "m" #'qq-contacts-open-at-point
+     "i" #'qq-contacts-open-info-at-point
      "+" #'qq-contacts-add-friend-at-point
-     "g a" #'qq-contacts-open-avatar-at-point
+     "a" #'qq-contacts-open-avatar-at-point
      "Y" #'qq-contacts-copy-id-at-point
-     "g t" #'qq-contacts-toggle-category
+     "t" #'qq-contacts-toggle-category
      "TAB" #'forward-button
      "<backtab>" #'qq-contacts-button-backward
      "g b" #'qq-contacts-open-root)
@@ -217,11 +218,11 @@ When nil, leave Evil's initial-state selection untouched."
     (:map qq-group-mode-map
      :nm
      "g r" #'qq-group-refresh
-     "g m" #'qq-group-open-chat
-     "g a" #'qq-group-open-avatar
-     "g s" #'qq-group-search-members
+     "m" #'qq-group-open-chat
+     "a" #'qq-group-open-avatar
+     "s" #'qq-group-search-members
      "g n" #'qq-group-open-notices
-     "g o" #'qq-group-open-owner
+     "o" #'qq-group-open-owner
      "Y" #'qq-group-copy-id
      "TAB" #'forward-button
      "<backtab>" #'qq-group-button-backward)
@@ -246,7 +247,7 @@ When nil, leave Evil's initial-state selection untouched."
     (:map qq-guild-user-mode-map
      :nm
      "g r" #'qq-guild-user-refresh
-     "g a" #'qq-guild-user-open-avatar
+     "a" #'qq-guild-user-open-avatar
      "Y" #'qq-guild-user-copy-id
      "TAB" #'forward-button
      "<backtab>" #'qq-guild-user-button-backward)
@@ -255,29 +256,29 @@ When nil, leave Evil's initial-state selection untouched."
      "RET" #'appkit-directory-activate
      "<return>" #'appkit-directory-activate
      "g r" #'qq-guilds-refresh
-     "g s" #'qq-guilds-filter
+     "s" #'qq-guilds-filter
      "TAB" #'appkit-directory-tab-dwim
      "<backtab>" #'appkit-directory-previous-item)
     (:map qq-red-packet-mode-map
      :nm
      "g r" #'qq-red-packet-refresh
-     "g c" #'qq-red-packet-grab
+     "c" #'qq-red-packet-grab
      "TAB" #'forward-button)
     (:map qq-search-mode-map
      :nm
      "RET" #'qq-search-open-result
      "<return>" #'qq-search-open-result
      "g r" #'qq-search-refresh
-     "g m" #'qq-search-load-more
-     "g s" #'qq-search-search)
+     "m" #'qq-search-load-more
+     "s" #'qq-search-search)
     (:map qq-user-mode-map
      :nm
      "RET" #'qq-user-open-photo-at-point
      "<return>" #'qq-user-open-photo-at-point
      "g r" #'qq-user-refresh
-     "g m" #'qq-user-open-chat
+     "m" #'qq-user-open-chat
      "+" #'qq-user-add-friend
-     "g a" #'qq-user-open-avatar
+     "a" #'qq-user-open-avatar
      "P" #'qq-user-open-photo-wall
      "Y" #'qq-user-copy-id
      "TAB" #'forward-button
@@ -292,8 +293,8 @@ When nil, leave Evil's initial-state selection untouched."
 
 (defun qq-evil--define-chat-keys ()
   "Install chat-wide and timeline-only modal bindings."
-  ;; The timeline map is inactive in the composer.  `i' is the one deliberate
-  ;; lowercase override: it focuses that composer and enters insert state.
+  ;; Follow Telega's message vocabulary on generated timeline content.  The
+  ;; timeline map is inactive in the composer, so these keys never steal input.
   (appkit-evil-map
     (:map qq-chat-mode-map
      :nm
@@ -306,13 +307,12 @@ When nil, leave Evil's initial-state selection untouched."
     (:map qq-chat-timeline-mode-map
      :nm
      "q" #'quit-window
-     "R" #'qq-chat-reply-to-message
-     "g f" #'qq-chat-forward-transient
-     "M" #'qq-chat-toggle-message-selection
+     "r" #'qq-chat-reply-to-message
+     "R" #'qq-chat-forward-transient
+     "m" #'qq-chat-toggle-message-selection
      "U" #'qq-chat-clear-message-selection
-     "g a" #'qq-chat-open-avatar-at-point
-     "i" #'appkit-evil-chatbuf-enter-input
-     "g u" #'qq-chat-open-user-at-point
+     "a" #'qq-chat-open-avatar-at-point
+     "i" #'qq-chat-open-user-at-point
      "K" #'qq-chat-open-peer-info
      "g q" #'qq-chat-goto-reply
      "g x" #'qq-chat-goto-pop-message
