@@ -18,8 +18,6 @@
 (declare-function appkit-directory-tab-dwim "appkit-directory" ())
 (declare-function appkit-discussion-next-entry "appkit-discussion" ())
 (declare-function appkit-discussion-previous-entry "appkit-discussion" ())
-(declare-function appkit-evil-normalize-keymaps "appkit-evil" ())
-(declare-function evil-set-initial-state "evil-core" (mode state))
 (declare-function qq-chat-clear-message-selection "qq-chat" (&optional quiet))
 (declare-function qq-chat-delete-message "qq-chat" ())
 (declare-function qq-chat-recall-message "qq-chat" ())
@@ -115,10 +113,6 @@
 (declare-function qq-user-photo-refresh "qq-user-photo" ())
 (declare-function qq-user-refresh "qq-user" ())
 
-(eval-when-compile
-  (unless (require 'evil nil t)
-    (defun evil-set-initial-state (&rest _args) nil)))
-
 (defgroup qq-evil nil
   "Optional native Evil integration for emacs-qq."
   :group 'qq
@@ -174,174 +168,161 @@ When nil, leave Evil's initial-state selection untouched."
     qq-user-photo-mode-map)
   "Read-only emacs-qq keymaps with standard modal quit semantics.")
 
-(defconst qq-evil--application-states '(normal motion)
-  "Evil states used by emacs-qq application bindings.")
-
 (defun qq-evil--set-initial-states ()
   "Register `qq-evil-initial-state' for all QQ application modes."
-  (when qq-evil-initial-state
-    (dolist (mode qq-evil--application-modes)
-      (evil-set-initial-state mode qq-evil-initial-state))))
+  (appkit-evil-set-initial-states
+   qq-evil--application-modes qq-evil-initial-state))
 
 (defun qq-evil--define-readonly-keys ()
   "Install shared and surface-specific read-only bindings."
   (dolist (map qq-evil--readonly-maps)
     (appkit-evil-define-readonly-keys map))
 
-  (appkit-evil-define-keys qq-evil--application-states 'qq-root-mode-map
-    (kbd "RET") #'qq-root-open-at-point
-    (kbd "<return>") #'qq-root-open-at-point
-    (kbd "g r") #'qq-root-refresh
-    (kbd "s") #'qq-root-search
-    (kbd "c") #'qq-contacts-open
-    (kbd "g G") #'qq-guilds-open
-    (kbd "o") #'qq-root-open-session
-    (kbd "a") #'qq-root-open-avatar-at-point
-    (kbd "i") #'qq-root-open-info-at-point
-    (kbd "I") #'qq-root-open-self-user
-    (kbd "TAB") #'qq-root-tab-dwim
-    (kbd "<backtab>") #'qq-root-button-backward
-    (kbd "?") #'qq-root-transient)
-
-  (appkit-evil-define-keys qq-evil--application-states 'qq-contacts-mode-map
-    (kbd "RET") #'qq-contacts-open-at-point
-    (kbd "<return>") #'qq-contacts-open-at-point
-    (kbd "g r") #'qq-contacts-refresh
-    (kbd "s") #'qq-contacts-search
-    (kbd "f") #'qq-contacts-show-friends
-    (kbd "g G") #'qq-contacts-show-groups
-    (kbd "g I") #'qq-contacts-show-not-recent-groups
-    (kbd "m") #'qq-contacts-open-at-point
-    (kbd "i") #'qq-contacts-open-info-at-point
-    (kbd "+") #'qq-contacts-add-friend-at-point
-    (kbd "a") #'qq-contacts-open-avatar-at-point
-    (kbd "Y") #'qq-contacts-copy-id-at-point
-    (kbd "t") #'qq-contacts-toggle-category
-    (kbd "TAB") #'forward-button
-    (kbd "<backtab>") #'qq-contacts-button-backward
-    (kbd "g b") #'qq-contacts-open-root)
-
-  (appkit-evil-define-keys qq-evil--application-states 'qq-forward-mode-map
-    (kbd "g r") #'qq-forward-refresh)
-
-  (appkit-evil-define-keys qq-evil--application-states 'qq-group-mode-map
-    (kbd "g r") #'qq-group-refresh
-    (kbd "m") #'qq-group-open-chat
-    (kbd "a") #'qq-group-open-avatar
-    (kbd "s") #'qq-group-search-members
-    (kbd "g n") #'qq-group-open-notices
-    (kbd "o") #'qq-group-open-owner
-    (kbd "Y") #'qq-group-copy-id
-    (kbd "TAB") #'forward-button
-    (kbd "<backtab>") #'qq-group-button-backward)
-
-  (appkit-evil-define-keys qq-evil--application-states
-      'qq-group-notices-mode-map
-    (kbd "g r") #'qq-group-notices-refresh
-    (kbd "TAB") #'forward-button
-    (kbd "<backtab>") #'qq-group-notices-button-backward)
-
-  (appkit-evil-define-keys qq-evil--application-states
-      'qq-guild-channel-mode-map
-    (kbd "g r") #'qq-guild-channel-refresh)
-
-  (appkit-evil-define-keys qq-evil--application-states
-      'qq-guild-forum-mode-map
-    (kbd "RET") #'qq-guild-forum-open-post
-    (kbd "<return>") #'qq-guild-forum-open-post
-    (kbd "g r") #'qq-guild-forum-refresh)
-
-  (appkit-evil-define-keys qq-evil--application-states
-      'qq-guild-forum-post-mode-map
-    (kbd "RET") #'qq-guild-forum-post-open-at-point
-    (kbd "<return>") #'qq-guild-forum-post-open-at-point
-    (kbd "g r") #'qq-guild-forum-post-refresh)
-
-  (appkit-evil-define-keys qq-evil--application-states
-      'qq-guild-user-mode-map
-    (kbd "g r") #'qq-guild-user-refresh
-    (kbd "a") #'qq-guild-user-open-avatar
-    (kbd "Y") #'qq-guild-user-copy-id
-    (kbd "TAB") #'forward-button
-    (kbd "<backtab>") #'qq-guild-user-button-backward)
-
-  (appkit-evil-define-keys qq-evil--application-states 'qq-guilds-mode-map
-    (kbd "RET") #'appkit-directory-activate
-    (kbd "<return>") #'appkit-directory-activate
-    (kbd "g r") #'qq-guilds-refresh
-    (kbd "s") #'qq-guilds-filter
-    (kbd "TAB") #'appkit-directory-tab-dwim
-    (kbd "<backtab>") #'appkit-directory-previous-item)
-
-  (appkit-evil-define-keys qq-evil--application-states
-      'qq-red-packet-mode-map
-    (kbd "g r") #'qq-red-packet-refresh
-    (kbd "c") #'qq-red-packet-grab
-    (kbd "TAB") #'forward-button)
-
-  (appkit-evil-define-keys qq-evil--application-states 'qq-search-mode-map
-    (kbd "RET") #'qq-search-open-result
-    (kbd "<return>") #'qq-search-open-result
-    (kbd "g r") #'qq-search-refresh
-    (kbd "m") #'qq-search-load-more
-    (kbd "s") #'qq-search-search)
-
-  (appkit-evil-define-keys qq-evil--application-states 'qq-user-mode-map
-    (kbd "RET") #'qq-user-open-photo-at-point
-    (kbd "<return>") #'qq-user-open-photo-at-point
-    (kbd "g r") #'qq-user-refresh
-    (kbd "m") #'qq-user-open-chat
-    (kbd "+") #'qq-user-add-friend
-    (kbd "a") #'qq-user-open-avatar
-    (kbd "P") #'qq-user-open-photo-wall
-    (kbd "Y") #'qq-user-copy-id
-    (kbd "TAB") #'forward-button
-    (kbd "<backtab>") #'qq-user-button-backward)
-
-  (appkit-evil-define-keys qq-evil--application-states
-      'qq-user-photo-mode-map
-    (kbd "RET") #'qq-user-photo-open-at-point
-    (kbd "<return>") #'qq-user-photo-open-at-point
-    (kbd "g r") #'qq-user-photo-refresh
-    (kbd "TAB") #'forward-button
-    (kbd "<backtab>") #'qq-user-photo-button-backward))
+  (appkit-evil-map
+    (:map qq-root-mode-map
+     :nm
+     "RET" #'qq-root-open-at-point
+     "<return>" #'qq-root-open-at-point
+     "g r" #'qq-root-refresh
+     "g s" #'qq-root-search
+     "g c" #'qq-contacts-open
+     "g G" #'qq-guilds-open
+     "g o" #'qq-root-open-session
+     "g a" #'qq-root-open-avatar-at-point
+     "g i" #'qq-root-open-info-at-point
+     "g I" #'qq-root-open-self-user
+     "TAB" #'qq-root-tab-dwim
+     "<backtab>" #'qq-root-button-backward
+     "?" #'qq-root-transient)
+    (:map qq-contacts-mode-map
+     :nm
+     "RET" #'qq-contacts-open-at-point
+     "<return>" #'qq-contacts-open-at-point
+     "g r" #'qq-contacts-refresh
+     "g s" #'qq-contacts-search
+     "g f" #'qq-contacts-show-friends
+     "g G" #'qq-contacts-show-groups
+     "g I" #'qq-contacts-show-not-recent-groups
+     "g i" #'qq-contacts-open-info-at-point
+     "+" #'qq-contacts-add-friend-at-point
+     "g a" #'qq-contacts-open-avatar-at-point
+     "Y" #'qq-contacts-copy-id-at-point
+     "g t" #'qq-contacts-toggle-category
+     "TAB" #'forward-button
+     "<backtab>" #'qq-contacts-button-backward
+     "g b" #'qq-contacts-open-root)
+    (:map qq-forward-mode-map
+     :nm
+     "g r" #'qq-forward-refresh)
+    (:map qq-group-mode-map
+     :nm
+     "g r" #'qq-group-refresh
+     "g m" #'qq-group-open-chat
+     "g a" #'qq-group-open-avatar
+     "g s" #'qq-group-search-members
+     "g n" #'qq-group-open-notices
+     "g o" #'qq-group-open-owner
+     "Y" #'qq-group-copy-id
+     "TAB" #'forward-button
+     "<backtab>" #'qq-group-button-backward)
+    (:map qq-group-notices-mode-map
+     :nm
+     "g r" #'qq-group-notices-refresh
+     "TAB" #'forward-button
+     "<backtab>" #'qq-group-notices-button-backward)
+    (:map qq-guild-channel-mode-map
+     :nm
+     "g r" #'qq-guild-channel-refresh)
+    (:map qq-guild-forum-mode-map
+     :nm
+     "RET" #'qq-guild-forum-open-post
+     "<return>" #'qq-guild-forum-open-post
+     "g r" #'qq-guild-forum-refresh)
+    (:map qq-guild-forum-post-mode-map
+     :nm
+     "RET" #'qq-guild-forum-post-open-at-point
+     "<return>" #'qq-guild-forum-post-open-at-point
+     "g r" #'qq-guild-forum-post-refresh)
+    (:map qq-guild-user-mode-map
+     :nm
+     "g r" #'qq-guild-user-refresh
+     "g a" #'qq-guild-user-open-avatar
+     "Y" #'qq-guild-user-copy-id
+     "TAB" #'forward-button
+     "<backtab>" #'qq-guild-user-button-backward)
+    (:map qq-guilds-mode-map
+     :nm
+     "RET" #'appkit-directory-activate
+     "<return>" #'appkit-directory-activate
+     "g r" #'qq-guilds-refresh
+     "g s" #'qq-guilds-filter
+     "TAB" #'appkit-directory-tab-dwim
+     "<backtab>" #'appkit-directory-previous-item)
+    (:map qq-red-packet-mode-map
+     :nm
+     "g r" #'qq-red-packet-refresh
+     "g c" #'qq-red-packet-grab
+     "TAB" #'forward-button)
+    (:map qq-search-mode-map
+     :nm
+     "RET" #'qq-search-open-result
+     "<return>" #'qq-search-open-result
+     "g r" #'qq-search-refresh
+     "g m" #'qq-search-load-more
+     "g s" #'qq-search-search)
+    (:map qq-user-mode-map
+     :nm
+     "RET" #'qq-user-open-photo-at-point
+     "<return>" #'qq-user-open-photo-at-point
+     "g r" #'qq-user-refresh
+     "g m" #'qq-user-open-chat
+     "+" #'qq-user-add-friend
+     "g a" #'qq-user-open-avatar
+     "P" #'qq-user-open-photo-wall
+     "Y" #'qq-user-copy-id
+     "TAB" #'forward-button
+     "<backtab>" #'qq-user-button-backward)
+    (:map qq-user-photo-mode-map
+     :nm
+     "RET" #'qq-user-photo-open-at-point
+     "<return>" #'qq-user-photo-open-at-point
+     "g r" #'qq-user-photo-refresh
+     "TAB" #'forward-button
+     "<backtab>" #'qq-user-photo-button-backward)))
 
 (defun qq-evil--define-chat-keys ()
   "Install chat-wide and timeline-only modal bindings."
-  (appkit-evil-define-keys qq-evil--application-states 'qq-chat-mode-map
-    (kbd "g r") #'qq-chat-refresh
-    (kbd "g s") #'qq-chat-inplace-search
-    (kbd "g n") #'qq-chat-search-next
-    (kbd "g p") #'qq-chat-search-prev
-    (kbd "g >") #'qq-chat-read-all
-    (kbd "g x") #'qq-chat-goto-pop-message)
-
-  ;; The timeline mode is inactive in the composer, so these bindings never
-  ;; steal typed input.  Evil operators and motions retain their native meanings.
-  (appkit-evil-define-keys qq-evil--application-states
-      'qq-chat-timeline-mode-map
-    (kbd "q") #'quit-window
-    (kbd "r") #'qq-chat-reply-to-message
-    (kbd "R") #'qq-chat-forward-transient
-    (kbd "m") #'qq-chat-toggle-message-selection
-    (kbd "U") #'qq-chat-clear-message-selection
-    (kbd "a") #'qq-chat-open-avatar-at-point
-    (kbd "i") #'qq-chat-open-user-at-point
-    (kbd "K") #'qq-chat-open-peer-info
-    (kbd "g q") #'qq-chat-goto-reply
-    (kbd "g x") #'qq-chat-goto-pop-message
-    (kbd "P") #'qq-chat-poke-sender
-    (kbd "!") #'qq-chat-react-to-message
-    (kbd "?") #'qq-chat-transient))
-
+  ;; The timeline map is inactive in the composer.  `i' is the one deliberate
+  ;; lowercase override: it focuses that composer and enters insert state.
+  (appkit-evil-map
+    (:map qq-chat-mode-map
+     :nm
+     "g r" #'qq-chat-refresh
+     "g s" #'qq-chat-inplace-search
+     "g n" #'qq-chat-search-next
+     "g p" #'qq-chat-search-prev
+     "g >" #'qq-chat-read-all
+     "g x" #'qq-chat-goto-pop-message)
+    (:map qq-chat-timeline-mode-map
+     :nm
+     "q" #'quit-window
+     "R" #'qq-chat-reply-to-message
+     "g f" #'qq-chat-forward-transient
+     "M" #'qq-chat-toggle-message-selection
+     "U" #'qq-chat-clear-message-selection
+     "g a" #'qq-chat-open-avatar-at-point
+     "i" #'appkit-evil-chatbuf-enter-input
+     "g u" #'qq-chat-open-user-at-point
+     "K" #'qq-chat-open-peer-info
+     "g q" #'qq-chat-goto-reply
+     "g x" #'qq-chat-goto-pop-message
+     "P" #'qq-chat-poke-sender
+     "!" #'qq-chat-react-to-message
+     "?" #'qq-chat-transient)))
 
 (defun qq-evil--refresh-live-buffers ()
   "Refresh Evil projections in existing QQ application buffers."
-  (dolist (buffer (buffer-list))
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (when (memq major-mode qq-evil--application-modes)
-          (appkit-evil-normalize-keymaps))))))
+  (appkit-evil-normalize-buffers qq-evil--application-modes))
 
 ;;;###autoload
 (defun qq-evil-setup ()
@@ -356,7 +337,6 @@ Safe to call multiple times."
 
 (with-eval-after-load 'evil
   (qq-evil-setup))
-
 
 (provide 'qq-evil)
 
