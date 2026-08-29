@@ -65,10 +65,10 @@ Appkit 视图。多个账号的根页、聊天、联系人和资料页可以同�
 Emacs state 的接口。默认使用 normal state，可以通过 ~qq-evil-initial-state~ 或
 ~qq-evil-enable-integration~ 调整。
 
-只读界面保留原生 Evil motion、operator 和编辑键；应用动作集中到 ~g~ 前缀，
-例如 ~gr~ 刷新、~gj~ / ~gk~ 移动、~gs~ 搜索。聊天时间线用 ~i~ 进入输入区，
-~R~ 回复、~gf~ 转发、~gq~ 跳到被回复消息。切换到 Emacs state 后，原有单键
-~g~、~n~、~p~ 等绑定仍保持不变。
+只读界面的消息动作沿用 Telega 和 evil-collection-telega 的交互词汇：
+~r~ 回复、~R~ 转发、~m~ 选择、~a~ 查看头像、~i~ 查看用户。聊天时间线在
+输入区内自动失效，因此这些单键不会偷走输入。切换到 Emacs state 后，原有
+单键 ~g~、~n~、~p~ 等绑定仍保持不变。
 
 * 联系人与资料
 
