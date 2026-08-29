@@ -88,13 +88,13 @@
   "Register exact directory-state ownership for inspect VIEW."
   (let* ((owner qq-runtime--account-id)
          (handler
-         (lambda (event)
-           (when (and (appkit-view-live-p view)
-                      (equal (plist-get event :account-id) owner)
-                      (memq (plist-get event :type)
-                            '(reset guild-directory-refreshed)))
-             (appkit-with-live-view view
-               (appkit-request-sync view :structure t :part 'channel))))))
+          (lambda (event)
+            (when (and (appkit-view-live-p view)
+                       (equal (plist-get event :account-id) owner)
+                       (memq (plist-get event :type)
+                             '(reset guild-directory-refreshed)))
+              (appkit-with-live-view view
+                (appkit-request-sync view :structure t :part 'channel))))))
     (add-hook 'qq-state-change-hook handler)
     (appkit-register-handle
      view 'hook (list 'qq-state-change-hook handler nil (current-buffer)))))
