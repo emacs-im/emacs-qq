@@ -1904,7 +1904,9 @@ an asynchronous callback never resolves a replacement runtime app."
                (appkit-media-play-video-source
                 resolved-file "qq" :owner owner))
               ((appkit-media-url-present-p url)
-               (appkit-media-play-video-source url "qq" :owner owner))
+               (appkit-media-play-video-source
+                url "qq" :owner owner
+                :cache-key (qq-media--segment-resource-key segment)))
               (t
                (error "video segment has no playable source"))))
          ((error quit)
