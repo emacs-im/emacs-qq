@@ -597,10 +597,8 @@ SPEC may be a numeric maximum height for compact decorative images."
   (appkit-media-image-display-string image fallback))
 
 (defun qq-media-composer-image-preview (file)
-  "Return a telega-style one-line composer preview for local image FILE."
-  (when (appkit-media-file-present-p file)
-    (appkit-media-one-line-preview-image-from-file
-     file qq-media-preview-image-max-width)))
+  "Return a Telega-style one-line composer preview for local image FILE."
+  (qq-media--one-line-preview-image-from-file file nil))
 
 (defun qq-media--prefer-remote-image-resource-p (key resource)
   "Return non-nil when RESOURCE at KEY should prefer its remote image.
