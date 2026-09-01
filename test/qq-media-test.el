@@ -110,6 +110,18 @@
         (list key nil #'qq-media--one-line-preview-image-from-file)
         captured)))))
 
+(ert-deftest qq-media-composer-preview-reuses-one-line-builder ()
+  "Composer images should use the existing compact one-line builder."
+  (let (captured)
+    (cl-letf (((symbol-function 'qq-media--one-line-preview-image-from-file)
+               (lambda (file spec)
+                 (setq captured (list file spec))
+                 'composer-image)))
+      (should
+       (eq 'composer-image
+           (qq-media-composer-image-preview "/tmp/photo.png")))
+      (should (equal captured '("/tmp/photo.png" nil))))))
+
 (ert-deftest qq-media-ensure-resource-image-uses-existing-disk-cache ()
   (qq-media-test-with-reset
    (let* ((qq-media-cache-directory (make-temp-file "qq-media-cache" t))

@@ -2643,8 +2643,9 @@ Favorite drafts remain durable identity objects until send-time materialization.
                          (file-exists-p file)
                          (file-size-human-readable
                           (file-attribute-size (file-attributes file)))))
-              (preview (and image
-                            (qq-media--image-display-string image "▧"))))
+              (preview
+               (and image
+                    (appkit-media-one-line-image-display-string image "▧"))))
          (cond
           (sticker-p
            (qq-media--image-display-string
