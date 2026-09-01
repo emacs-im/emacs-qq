@@ -52,22 +52,6 @@ BODY may refer to the lexical variables `buffer' and `view'."
              ,@body))
        (qq-runtime-stop))))
 
-(ert-deftest qq-api-get-group-preserves-string-identity ()
-  (let (action params value)
-    (cl-letf (((symbol-function 'qq-api-call)
-               (lambda (candidate-action candidate-params callback
-                        &optional _errback)
-                 (setq action candidate-action
-                       params candidate-params)
-                 (funcall callback `((data . ,qq-group-test--profile)))
-                 'request)))
-      (should (eq (qq-api-get-group "20001" (lambda (profile)
-                                                (setq value profile)))
-                  'request))
-      (should (equal action "emacs_get_group"))
-      (should (equal params '((group_id . "20001"))))
-      (should (equal (alist-get 'group_id value) "20001"))
-      (should-error (qq-api-get-group 20001 #'ignore) :type 'user-error))))
 
 (ert-deftest qq-group-render-shows-telega-style-card ()
   (with-temp-buffer
@@ -96,8 +80,6 @@ BODY may refer to the lexical variables `buffer' and `view'."
       (search-forward "打开群聊")
       (should (button-at (1- (point))))
       (search-forward "搜索成员")
-      (should (button-at (1- (point))))
-      (search-forward "群公告")
       (should (button-at (1- (point))))
       (search-forward "取消置顶")
       (should (button-at (1- (point))))
@@ -412,8 +394,6 @@ BODY may refer to the lexical variables `buffer' and `view'."
               #'qq-group-open-chat))
   (should (eq (lookup-key qq-group-mode-map (kbd "s"))
               #'qq-group-search-members))
-  (should (eq (lookup-key qq-group-mode-map (kbd "n"))
-              #'qq-group-open-notices))
   (should (eq (lookup-key qq-group-mode-map (kbd "N"))
               #'qq-group-set-name))
   (should (eq (lookup-key qq-group-mode-map (kbd "R"))

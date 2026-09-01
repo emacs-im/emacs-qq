@@ -26,17 +26,14 @@
 (require 'qq-login)
 (require 'qq-runtime)
 (require 'qq-state)
+(require 'qq-protocol)
 
 (autoload 'qq-user-open "qq-user" nil t)
 (autoload 'qq-group-open "qq-group" nil t)
-(autoload 'qq-search-open "qq-search" nil t)
 (autoload 'qq-contacts-open "qq-contacts" nil t)
-(autoload 'qq-guilds-open "qq-guilds" nil t)
 (declare-function qq-user-open "qq-user" (user-id))
 (declare-function qq-group-open "qq-group" (group-id))
-(declare-function qq-search-open "qq-search" (session-key &optional query))
 (declare-function qq-contacts-open "qq-contacts" ())
-(declare-function qq-guilds-open "qq-guilds" ())
 (declare-function qq-root-transient "qq-transient" ())
 
 (defconst qq-root-buffer-name "*qq-root*"
@@ -281,8 +278,9 @@ Render `?' instead of a partial number when COUNT is nil."
   "Return SESSION's propertized unread trail for the title brackets.
 
 Like telega's chat unread trail, the active adapter's complete named Badge
-Count follows the title and uses a muted or unmuted face. Mention kinds remain independently
-prominent even when the badge is unavailable or the session muted."
+Count follows the title and uses a muted or unmuted face.  Mention kinds
+remain independently prominent even when the badge is unavailable or the
+session muted."
   (let* ((badge (alist-get 'unread-badge-count session))
          (unread (and (integerp badge) (> badge 0) badge))
          (mentions (qq-root--session-mention-kinds session))
@@ -403,18 +401,6 @@ messages, since the session title already identifies an incoming peer."
               (qq-root--session-preview-label-face
                session identity message)))))))
 
-(defun qq-root--session-preview-text (session)
-  "Return SESSION's flattened one-line preview text."
-  (let* ((preview (qq-root--session-preview-model session))
-         (label (or (appkit-ui-one-line-preview-label preview) ""))
-         (separator
-          (or (appkit-ui-one-line-preview-separator preview) ""))
-         (text (or (appkit-ui-one-line-preview-text preview) "")))
-    (appkit-ui-one-line-text
-     (if (string-empty-p label)
-         text
-       (concat label separator
-               (unless (string-empty-p text) (concat " " text)))))))
 
 (defun qq-root--session-one-line-row (session)
   "Return one-line row model for SESSION."
@@ -660,7 +646,7 @@ When POS is nil, use point."
          (user-id (or (alist-get 'peer-uin session)
                       (alist-get 'target-id session))))
     (unless (and (eq (alist-get 'type session) 'private)
-                 (qq-core-user-id-p user-id))
+                 (qq-protocol-user-uin-p user-id))
       (user-error "qq: session has no user profile"))
     (qq-user-open user-id)))
 
@@ -674,11 +660,11 @@ When POS is nil, use point."
                         (alist-get 'target-id session))))
     (pcase type
       ('private
-       (unless (qq-core-user-id-p target-id)
+       (unless (qq-protocol-user-uin-p target-id)
          (user-error "qq: session has no user profile"))
        (qq-user-open target-id))
       ('group
-       (unless (qq-core-group-id-p target-id)
+       (unless (qq-protocol-group-uin-p target-id)
          (user-error "qq: session has no group profile"))
        (qq-group-open target-id))
       (_ (user-error "qq: session has no profile page")))))
@@ -687,7 +673,7 @@ When POS is nil, use point."
   "Open the logged-in user's profile."
   (interactive)
   (let ((user-id (alist-get 'user_id (qq-state-self-info))))
-    (unless (qq-core-user-id-p user-id)
+    (unless (qq-protocol-user-uin-p user-id)
       (user-error "qq: self user profile is unavailable"))
     (qq-user-open user-id)))
 
@@ -800,15 +786,6 @@ Views belonging to other accounts remain live and visible."
     (user-error "qq: QQ account does not exist: %s" account-id))
   (qq-root-open account-id))
 
-(defun qq-root-search (&optional query)
-  "Choose a searchable session and open message results for optional QUERY."
-  (interactive)
-  (qq-search-open
-   (qq-root--read-session-key
-    "Search messages in: "
-    (lambda (session)
-      (memq (alist-get 'type session) '(group private))))
-   query))
 
 (defun qq-root-refresh ()
   "Request fresh native recent and directory snapshots."
@@ -818,9 +795,7 @@ Views belonging to other accounts remain live and visible."
 (defvar qq-root-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "g") #'qq-root-refresh)
-    (define-key map (kbd "s") #'qq-root-search)
     (define-key map (kbd "c") #'qq-contacts-open)
-    (define-key map (kbd "G") #'qq-guilds-open)
     (define-key map (kbd "/") #'qq-root-open-session)
     (define-key map (kbd "RET") #'qq-root-open-at-point)
     (define-key map (kbd "a") #'qq-root-open-avatar-at-point)

@@ -39,18 +39,18 @@ ERRBACK follow the native RPC adapter convention."
      :callback
      (lambda (value)
        (qq-runtime-with-account owner
-         (qq-account--invoke callback value)))
+         (qq-rpc-invoke callback value)))
      :errback
      (lambda (body reason)
        (qq-runtime-with-account owner
-         (qq-account--invoke errback body reason))))))
+         (qq-rpc-invoke errback body reason))))))
 
 (defun qq-profile--project (result owner user-uin)
   "Return USER-UIN's profile from owned Gateway RESULT."
   (let ((profile (alist-get 'profile result)))
     (unless
         (and
-         (qq-account--exact-object-keys-p result '(account_id profile))
+         (qq-server-wire-exact-object-keys-p result '(account_id profile))
          (equal (alist-get 'account_id result) owner)
          (listp profile)
          (equal (alist-get 'user_uin profile) user-uin))
@@ -59,7 +59,7 @@ ERRBACK follow the native RPC adapter convention."
 
 (defun qq-profile-get (user-uin callback &optional errback)
   "Fetch USER-UIN's sparse native profile and call CALLBACK."
-  (unless (qq-account--canonical-decimal-p user-uin)
+  (unless (qq-protocol-uint64-decimal-p user-uin)
     (user-error "qq: User profile requires an exact decimal UIN"))
   (qq-profile--request
    "profile.get"
@@ -73,9 +73,9 @@ ERRBACK follow the native RPC adapter convention."
   (let ((summary (alist-get 'summary result)))
     (unless
         (and
-         (qq-account--exact-object-keys-p result '(account_id summary))
+         (qq-server-wire-exact-object-keys-p result '(account_id summary))
          (equal (alist-get 'account_id result) owner)
-         (qq-account--exact-object-keys-p summary '(user_uin total_count))
+         (qq-server-wire-exact-object-keys-p summary '(user_uin total_count))
          (equal (alist-get 'user_uin summary) user-uin)
          (natnump (alist-get 'total_count summary)))
       (error "qq: Gateway returned an invalid profile-like summary"))
@@ -84,7 +84,7 @@ ERRBACK follow the native RPC adapter convention."
 (defun qq-profile-get-like-summary
     (user-uin callback &optional errback)
   "Fetch USER-UIN's native profile-like summary and call CALLBACK."
-  (unless (qq-account--canonical-decimal-p user-uin)
+  (unless (qq-protocol-uint64-decimal-p user-uin)
     (user-error "qq: Profile likes require an exact decimal UIN"))
   (qq-profile--request
    "profile.get_like_summary"
@@ -98,7 +98,7 @@ ERRBACK follow the native RPC adapter convention."
   (let ((outcome (alist-get 'outcome result)))
     (unless
         (and
-         (qq-account--exact-object-keys-p
+         (qq-server-wire-exact-object-keys-p
           result '(account_id user_uin outcome))
          (equal (alist-get 'account_id result) owner)
          (equal (alist-get 'user_uin result) user-uin)
@@ -108,11 +108,11 @@ ERRBACK follow the native RPC adapter convention."
       ("liked"
        (unless
            (and
-            (qq-account--exact-object-keys-p outcome '(kind added_count))
+            (qq-server-wire-exact-object-keys-p outcome '(kind added_count))
             (equal (alist-get 'added_count outcome) 1))
          (error "qq: Gateway returned an invalid liked outcome")))
       ("daily_limit"
-       (unless (qq-account--exact-object-keys-p outcome '(kind))
+       (unless (qq-server-wire-exact-object-keys-p outcome '(kind))
          (error "qq: Gateway returned an invalid daily-limit outcome")))
       (_
        (error "qq: Gateway returned an unknown profile-like outcome")))
@@ -121,7 +121,7 @@ ERRBACK follow the native RPC adapter convention."
 (defun qq-profile-send-like
     (user-uin callback &optional errback)
   "Give USER-UIN one native profile-card like and call CALLBACK."
-  (unless (qq-account--canonical-decimal-p user-uin)
+  (unless (qq-protocol-uint64-decimal-p user-uin)
     (user-error "qq: Profile likes require an exact decimal UIN"))
   (qq-profile--request
    "profile.send_like"

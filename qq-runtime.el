@@ -182,6 +182,44 @@ ACCOUNT-ID defaults to the exact current account context."
   "Return an Appkit sync wrapper for ACCOUNT-ID and FUNCTION."
   (apply-partially #'qq-runtime--account-sync account-id function))
 
+(cl-defun qq-runtime-ensure-account-view
+    (&key id mode state sync-function parts setup)
+  "Return the account Appkit view owning the current buffer.
+
+ID, MODE, STATE, SYNC-FUNCTION, and PARTS describe the required view.  Reuse
+and refresh a matching live view, reject a foreign live view, or attach a new
+one.  SETUP runs only after a new view is attached."
+  (let* ((account-id
+          (or qq-runtime--account-id
+              (user-error "qq: buffer has no account owner")))
+         (app (qq-runtime-app account-id))
+         (wrapped-sync
+          (qq-runtime-account-sync-function account-id sync-function))
+         (current (appkit-current-view)))
+    (cond
+     ((and (appkit-view-live-p current)
+           (eq app (appkit-view-app current))
+           (equal id (appkit-view-id current)))
+      (setf (appkit-view-state current) state
+            (appkit-view-sync-function current) wrapped-sync
+            (appkit-view-parts current) parts)
+      current)
+     ((appkit-view-live-p current)
+      (error "QQ: buffer belongs to another Appkit view"))
+     (t
+      (let ((view
+             (appkit-attach-view
+              :app app
+              :id id
+              :mode mode
+              :state state
+              :sync-function wrapped-sync
+              :parts parts)))
+        (qq-runtime-bind-account account-id)
+        (when setup
+          (funcall setup view))
+        view)))))
+
 (cl-defun qq-runtime-open-account-view
     (&key account-id id mode buffer-name state sync-function parts
           position-policy setup select)

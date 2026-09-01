@@ -135,217 +135,12 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
               (qq-contacts--project-groups t))
              '(navigation (group . "20002")))))))
 
-(ert-deftest qq-contacts-projects-native-search-pages-and-pagination ()
-  (qq-contacts-test-with-state
-   (with-temp-buffer
-     (qq-contacts-test-mode)
-     (setq qq-contacts--view 'search
-           qq-contacts--query "Emacs"
-           qq-contacts--search-friends
-           '(((kind . "friend") (user_id . "10001") (uid . "uid-a")
-              (qid . "alice") (nickname . "Alice") (remark . "A姐")
-              (category_name . "工作") (hits) (recall_reason . "")))
-           qq-contacts--search-groups
-           '(((group_id . "20002") (group_name . "Emacs Group")
-              (group_remark . "Lisp") (member_count . 20)
-              (self_permission . "member") (matched_members)))
-           qq-contacts--search-friend-cursor "friend-cursor"
-           qq-contacts--search-group-cursor "group-cursor")
-     (should
-      (equal (qq-contacts-test--entry-keys
-              (qq-contacts--project-search))
-             '(navigation
-               (section . friends) (friend . "10001")
-               (load-more . friends)
-               (section . groups) (group . "20002")
-               (load-more . groups)))))))
 
-(ert-deftest qq-contacts-group-search-preview-keeps-native-match-evidence ()
-  (let* ((result
-          '((group
-             . ((group_id . "20001") (name . "Emacs") (remark . "")
-                (member_count . 42) (self_permission . "member")
-                (hits . ((group_id) (name . (((start . 0)))) (remark)))))
-            (discussions . (((discussion_id . "d1") (name . "Lisp 讨论"))))
-            (member_profiles
-             . (((user_id . "10001") (card . "Alice Card")
-                 (remark . "") (nickname . "Alice"))))
-            (member_cards . (((uid . "u2") (card . "Bob Card"))))
-            (recall_reason . "native recall")))
-         (group (qq-contacts--search-group-object result))
-         (preview (qq-contacts--group-preview group)))
-    (should (string-match-p "命中群名" preview))
-    (should (string-match-p "命中讨论组 Lisp 讨论" preview))
-    (should (string-match-p "命中成员 Alice Card" preview))
-    (should (string-match-p "命中群名片 Bob Card" preview))
-    (should (string-match-p "匹配原因 native recall" preview))))
 
-(ert-deftest qq-contacts-empty-native-page-with-cursor-only-offers-pagination ()
-  (with-temp-buffer
-    (qq-contacts-test-mode)
-    (setq qq-contacts--view 'search
-          qq-contacts--query "Emacs"
-          qq-contacts--search-friend-cursor "friend-cursor")
-    (should
-     (equal (qq-contacts-test--entry-keys (qq-contacts--project-search))
-            '(navigation (load-more . friends))))
-    (setq qq-contacts--view 'members
-          qq-contacts--member-group-id "20001"
-          qq-contacts--search-friend-cursor nil
-          qq-contacts--search-member-cursor "member-cursor")
-    (should
-     (equal (qq-contacts-test--entry-keys (qq-contacts--project-members))
-            '(navigation (load-more . members))))))
 
-(ert-deftest qq-contacts-empty-search-and-clear-outside-search-preserve-view ()
-  (with-temp-buffer
-    (qq-contacts-test-mode)
-    (qq-contacts--ensure-view)
-    (setq qq-contacts--view 'groups
-          qq-contacts--previous-view 'friends)
-    (qq-contacts-search "   ")
-    (should (eq qq-contacts--view 'groups))
-    (qq-contacts-clear-search)
-    (should (eq qq-contacts--view 'groups))))
 
-(ert-deftest qq-contacts-native-search-survives-synchronous-callbacks ()
-  (with-temp-buffer
-    (qq-contacts-test-mode)
-    (let (contact-call group-call stranger-call)
-      (cl-letf
-          (((symbol-function 'qq-contacts--queue-view-sync) #'ignore)
-           ((symbol-function 'qq-api-search-contacts-start)
-            (lambda (scope query callback &optional _errback group-id limit)
-              (setq contact-call (list scope query group-id limit))
-              (funcall callback
-                       '((results
-                          . (((kind . "friend") (user_id . "10001")
-                              (uid . "uid-a") (qid . "alice")
-                              (nickname . "Alice") (remark . "A姐")
-                              (category_name . "工作") (hits)
-                              (recall_reason . ""))))
-                         (next_cursor . "friend-next")))
-              'finished-contact))
-           ((symbol-function 'qq-api-search-group-chats-start)
-            (lambda (query callback &optional _errback sort limit filters)
-              (setq group-call (list query sort limit filters))
-              (funcall callback
-                       '((results
-                          . (((group
-                               . ((group_id . "20002") (name . "Emacs Group")
-                                  (remark . "Lisp") (member_count . 20)
-                                  (self_permission . "member") (hits)))
-                              (discussions) (member_profiles) (member_cards)
-                              (recall_reason . ""))))
-                         (multi_user_keywords)
-                         (next_cursor)))
-              'finished-group))
-           ((symbol-function 'qq-api-search-strangers-start)
-            (lambda (query callback &optional _errback limit)
-              (setq stranger-call (list query limit))
-              (funcall
-               callback
-               `((results
-                  . (((user_id . "9007199254740993")
-                      (uid . "u_synthetic_stranger")
-                      (nickname . "Synthetic Stranger")
-                      (avatar_url . "https://example.invalid/avatar")
-                      (candidate . ,(make-string 43 ?S)))))
-                 (next_cursor)))
-              'finished-stranger)))
-        (qq-contacts-search " Emacs ")
-        (should (equal contact-call '(friends "Emacs" nil 50)))
-        (should (equal group-call '("Emacs" default 50 nil)))
-        (should (equal stranger-call '("Emacs" 50)))
-        (should-not qq-contacts--search-pending)
-        (should-not qq-contacts--search-friend-request)
-        (should-not qq-contacts--search-group-request)
-        (should-not qq-contacts--search-stranger-request)
-        (should (equal (alist-get 'user_id
-                                  (car qq-contacts--search-friends))
-                       "10001"))
-        (should (equal (alist-get 'group_id
-                                  (car qq-contacts--search-groups))
-                       "20002"))
-        (should (equal (alist-get 'user_id
-                                  (car qq-contacts--search-strangers))
-                       "9007199254740993"))
-        (should (equal qq-contacts--search-friend-cursor "friend-next"))))))
 
-(ert-deftest qq-contacts-load-more-repeats-native-search-owner ()
-  (with-temp-buffer
-    (qq-contacts-test-mode)
-    (qq-contacts--ensure-view)
-    (setq qq-contacts--view 'search
-          qq-contacts--query "Emacs"
-          qq-contacts--search-owner '(owner)
-          qq-contacts--search-friends
-          '(((kind . "friend") (user_id . "10001") (uid . "uid-a")))
-          qq-contacts--search-friend-cursor
-          "00000000-0000-4000-8000-000000000000")
-    (let (call)
-      (cl-letf (((symbol-function 'qq-contacts--queue-view-sync) #'ignore)
-                ((symbol-function 'qq-api-search-contacts-next)
-                 (lambda (scope cursor query callback
-                          &optional _errback group-id limit)
-                   (setq call (list cursor scope query group-id limit))
-                   (funcall callback
-                            '((results
-                               . (((kind . "friend") (user_id . "10002")
-                                   (uid . "uid-b"))))
-                              (next_cursor)))
-                   'finished)))
-        (qq-contacts-load-more-friends)
-        (should
-         (equal call
-                '("00000000-0000-4000-8000-000000000000"
-                  friends "Emacs" nil 50)))
-        (should
-         (equal (mapcar (lambda (friend) (alist-get 'user_id friend))
-                        qq-contacts--search-friends)
-                '("10001" "10002")))
-        (should-not qq-contacts--search-friend-cursor)
-        (should-not qq-contacts--search-pending)))))
 
-(ert-deftest qq-contacts-load-more-strangers-consumes-exact-capability ()
-  (with-temp-buffer
-    (qq-contacts-test-mode)
-    (qq-contacts--ensure-view)
-    (let ((cursor (make-string 43 ?Q)))
-      (setq qq-contacts--view 'search
-            qq-contacts--query "Synthetic"
-            qq-contacts--search-owner '(synthetic-owner)
-            qq-contacts--search-strangers
-            `(((user_id . "9007199254740993")
-               (uid . "u_synthetic_first")
-               (nickname . "Synthetic First")
-               (avatar_url . "https://example.invalid/first")
-               (candidate . ,(make-string 43 ?A))))
-            qq-contacts--search-stranger-cursor cursor)
-      (let (call)
-        (cl-letf (((symbol-function 'qq-contacts--queue-view-sync) #'ignore)
-                  ((symbol-function 'qq-api-search-strangers-next)
-                   (lambda (token query callback &optional _errback limit)
-                     (setq call (list token query limit))
-                     (funcall
-                      callback
-                      `((results
-                         . (((user_id . "9007199254740994")
-                             (uid . "u_synthetic_second")
-                             (nickname . "Synthetic Second")
-                             (avatar_url . "https://example.invalid/second")
-                             (candidate . ,(make-string 43 ?B)))))
-                        (next_cursor)))
-                     'already-finished)))
-          (qq-contacts-load-more-strangers))
-        (should (equal call (list cursor "Synthetic" 50)))
-        (should
-         (equal (mapcar (lambda (result) (alist-get 'user_id result))
-                        qq-contacts--search-strangers)
-                '("9007199254740993" "9007199254740994")))
-        (should-not qq-contacts--search-stranger-cursor)
-        (should-not qq-contacts--search-stranger-request)
-        (should-not qq-contacts--search-pending)))))
 
 (ert-deftest qq-contacts-navigation-buttons-are-real-and-switch-view ()
   (qq-contacts-test-with-state
@@ -431,8 +226,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                      (lambda (_view &optional keys) (setq forced keys))))
             (qq-contacts--handle-media-cache-update "avatar:10001")
             (should (equal forced '((friend . "10001")
-                                    (member . "10001")
-                                    (stranger . "10001"))))
+                                    (member . "10001"))))
             (setq forced nil)
             (qq-contacts--handle-media-cache-update "forward-image:x")
             (should-not forced)))
@@ -460,8 +254,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
       (should-not (nth 1 (nth 0 calls)))
       (should
        (equal '((friend . "10001")
-                (member . "10001")
-                (stranger . "10001"))
+                (member . "10001"))
               (nth 1 (nth 1 calls))))
       (should (equal renamed (buffer-name buffer)))
       (should-not (get-buffer qq-contacts-buffer-name)))))
@@ -507,57 +300,6 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
               (list (list view :entries forced)
                     (list view :structure t :part 'directory)))))))
 
-(ert-deftest qq-contacts-search-callback-requires-its-dispatch-view ()
-  (qq-contacts-test-with-runtime-view
-    (let (success failure syncs)
-      (cl-letf (((symbol-function 'qq-api-search-contacts-start)
-                 (lambda (_scope _query callback &optional errback _group _limit)
-                   (setq success callback
-                         failure errback)
-                   'friend-search-request))
-                ((symbol-function 'appkit-request-sync)
-                 (lambda (candidate &rest arguments)
-                   (push (cons candidate arguments) syncs)
-                   'owned-timer)))
-        (qq-contacts-search "Alice" 'friends)
-        (let ((owner qq-contacts--search-owner))
-          (should success)
-          (should failure)
-          (with-temp-buffer
-            (qq-contacts-test-mode)
-            (should-not
-             (qq-contacts--search-current-p
-              view (current-buffer) owner 'friends)))
-          (setq syncs nil)
-          (unwind-protect
-              (progn
-                ;; `appkit-view-live-p' alone remains true here.  The callback
-                ;; must additionally require that VIEW is still current in its
-                ;; exact owning buffer.
-                (setq-local appkit--current-view nil)
-                (funcall success
-                         '((results
-                            . (((kind . "friend") (user_id . "10001")
-                                (uid . "native-10001"))))
-                           (next_cursor)))
-                (funcall failure nil "stale failure"))
-            (setq-local appkit--current-view view))
-          (should (eq owner qq-contacts--search-owner))
-          (should (equal qq-contacts--search-pending '(friends)))
-          (should-not qq-contacts--search-friends)
-          (should-not qq-contacts--search-errors)
-          (should-not syncs)
-          (funcall success
-                   '((results
-                      . (((kind . "friend") (user_id . "10001")
-                          (uid . "native-10001"))))
-                     (next_cursor)))
-          (should-not qq-contacts--search-pending)
-          (should (equal (alist-get 'user_id
-                                    (car qq-contacts--search-friends))
-                         "10001"))
-          (should (= (length syncs) 1))
-          (should (eq view (caar syncs))))))))
 
 (ert-deftest qq-contacts-refresh-callback-rejects-replacement-view ()
   (qq-contacts-test-with-runtime-view
@@ -673,42 +415,6 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
-(ert-deftest qq-contacts-dead-view-rejects-state-media-and-search-callbacks ()
-  (let ((buffer (get-buffer-create qq-contacts-buffer-name)) queued)
-    (unwind-protect
-        (with-current-buffer buffer
-          (qq-contacts-test-mode)
-          (let ((view (qq-contacts--ensure-view))
-                (refresh-owner (list 'dead-refresh))
-                (search-owner (list 'dead-search)))
-            (setq qq-contacts--refresh-owner refresh-owner
-                  qq-contacts--refresh-parts '(friends)
-                  qq-contacts--refresh-pending 1
-                  qq-contacts--loading t
-                  qq-contacts--search-owner search-owner
-                  qq-contacts--search-pending '(friends))
-            (appkit-kill-view view)
-            (cl-letf (((symbol-function 'qq-contacts--queue-view-sync)
-                       (lambda (&rest _args) (setq queued t))))
-              (qq-contacts--handle-state-change '(:type friends-refreshed))
-              (qq-contacts--handle-media-cache-update "avatar:10001")
-              (qq-contacts--finish-refresh-part
-               view buffer refresh-owner 'friends)
-              (qq-contacts--finish-search-page
-               view buffer search-owner 'friends nil
-               '((results . (((kind . "friend")
-                              (user_id . "10001")
-                              (uid . "native-10001"))))
-                 (next_cursor)))
-              (should-not queued)
-              (should-not qq-contacts--loading)
-              (should-not qq-contacts--refresh-owner)
-              (should-not qq-contacts--refresh-parts)
-              (should-not qq-contacts--search-owner)
-              (should-not qq-contacts--search-pending)
-              (should-not qq-contacts--search-friends))))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
 
 (ert-deftest qq-contacts-dead-view-makes-window-callbacks-inert ()
   (with-temp-buffer
@@ -795,90 +501,9 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
     (should (equal qq-contacts--pending-force-keys
                    '((friend . "10001"))))))
 
-(ert-deftest qq-contacts-search-append-rejects-cross-page-identities ()
-  (should-error
-   (qq-contacts--append-search-items
-    '(((group_id . "synthetic-group")))
-    '(((group_id . "synthetic-group")))
-    '((group_id))))
-  (should-error
-   (qq-contacts--append-search-items
-    '(((kind . "friend") (user_id . "synthetic-user-a")
-       (uid . "synthetic-native-a")))
-    '(((kind . "friend") (user_id . "synthetic-user-a")
-       (uid . "synthetic-native-b")))
-    qq-contacts--contact-search-identities))
-  ;; A native UID changing its public UIN across cursor pages is independently
-  ;; invalid even though `(kind,user_id)' remains unique.
-  (should-error
-   (qq-contacts--append-search-items
-    '(((kind . "friend") (user_id . "synthetic-user-a")
-       (uid . "synthetic-native-shared")))
-    '(((kind . "friend") (user_id . "synthetic-user-b")
-        (uid . "synthetic-native-shared")))
-    qq-contacts--contact-search-identities)))
 
-(ert-deftest qq-contacts-stranger-append-validates-nonnull-uid-identity ()
-  (should-error
-   (qq-contacts--append-search-items
-    '(((user_id . "synthetic-user-a") (uid . "native-shared")))
-    '(((user_id . "synthetic-user-b") (uid . "native-shared")))
-    '((user_id) (uid)) '((uid))))
-  (should
-   (= (length
-       (qq-contacts--append-search-items
-        '(((user_id . "synthetic-user-a") (uid)))
-        '(((user_id . "synthetic-user-b") (uid)))
-        '((user_id) (uid)) '((uid))))
-      2)))
 
-(ert-deftest qq-contacts-stranger-query-prevalidates-utf-16-before-state-change ()
-  (with-temp-buffer
-    (qq-contacts-test-mode)
-    (let ((owner '(existing-owner)) cancelled)
-      (setq qq-contacts--view 'search
-            qq-contacts--search-owner owner)
-      (cl-letf (((symbol-function 'qq-contacts--cancel-search)
-                 (lambda () (setq cancelled t))))
-        (should-error
-         (qq-contacts-search (make-string 65 #x1f600) 'strangers)
-         :type 'user-error))
-      (should-not cancelled)
-      (should (eq qq-contacts--search-owner owner)))))
 
-(ert-deftest qq-contacts-duplicate-continuation-settles-pending-section ()
-  (with-temp-buffer
-    (qq-contacts-test-mode)
-    (let* ((view (qq-contacts--ensure-view))
-           (owner (list 'synthetic-search-owner))
-           (existing
-            '(((kind . "friend")
-               (user_id . "synthetic-user")
-               (uid . "synthetic-native-user")
-               (nickname . "Synthetic Friend")))))
-      (setq qq-contacts--view 'search
-            qq-contacts--query "Synthetic"
-            qq-contacts--search-owner owner
-            qq-contacts--search-pending '(friends)
-            qq-contacts--search-friends (copy-tree existing)
-            qq-contacts--search-friend-request 'synthetic-request)
-      (cl-letf (((symbol-function 'qq-contacts--queue-view-sync) #'ignore))
-        (qq-contacts--finish-search-page
-         view (current-buffer) owner 'friends t
-         '((results
-            . (((kind . "friend")
-                (user_id . "synthetic-user")
-                (uid . "synthetic-native-user")
-                (nickname . "Repeated Synthetic Friend"))))
-           (next_cursor . "synthetic-next"))))
-      (should (equal qq-contacts--search-friends existing))
-      (should-not qq-contacts--search-pending)
-      (should-not qq-contacts--search-friend-request)
-      (should-not qq-contacts--search-friend-cursor)
-      (should
-       (string-match-p
-        "repeated.*across pages"
-        (or (alist-get 'friends qq-contacts--search-errors) ""))))))
 
 (ert-deftest qq-contacts-layout-uses-narrowest-visible-window ()
   (with-temp-buffer
@@ -913,92 +538,6 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
     (should (memq #'qq-contacts--cancel-refresh change-major-mode-hook))
     (should (memq #'qq-contacts--cancel-search change-major-mode-hook))))
 
-(ert-deftest qq-contacts-app-replacement-clears-view-owned-search-state ()
-  ;; Replacing one account Appkit keeps the stable slot identity while
-  ;; invalidating every view-owned request and search projection.
-  (let* ((qq-runtime--accounts (make-hash-table :test #'equal))
-         (qq-state--partitions (make-hash-table :test #'equal))
-         (qq-state--active-account-id nil)
-         (runtime-one (qq-runtime-ensure-account "slot-a"))
-         (app-one (qq-runtime-account-app runtime-one))
-         (app-two nil)
-         (buffer (generate-new-buffer " *qq-contacts-runtime-replace*"))
-         cancelled)
-    (unwind-protect
-        (with-current-buffer buffer
-          (qq-contacts-test-mode)
-          (let ((view-one (qq-contacts--ensure-view)))
-            (setq qq-contacts--view 'members
-                  qq-contacts--previous-view 'groups
-                  qq-contacts--query "OLD GLOBAL QUERY"
-                  qq-contacts--search-scope 'strangers
-                  qq-contacts--search-owner '(old-search-owner)
-                  qq-contacts--search-pending
-                  '(friends groups strangers members)
-                  qq-contacts--search-errors
-                  '((strangers . "old account error"))
-                  qq-contacts--search-friends '(((user_id . "10001")))
-                  qq-contacts--search-groups '(((group_id . "20001")))
-                  qq-contacts--search-strangers
-                  '(((user_id . "10002") (uid . "old-native-uid")))
-                  qq-contacts--search-members '(((user_id . "10003")))
-                  qq-contacts--member-group-id "20001"
-                  qq-contacts--search-friend-cursor "friend-cursor"
-                  qq-contacts--search-group-cursor "group-cursor"
-                  qq-contacts--search-stranger-cursor (make-string 43 ?O)
-                  qq-contacts--search-member-cursor "member-cursor"
-                  qq-contacts--search-friend-request 'friend-request
-                  qq-contacts--search-group-request 'group-request
-                  qq-contacts--search-stranger-request 'stranger-request
-                  qq-contacts--search-member-request 'member-request)
-            ;; Looking up the current live view is not a lifecycle boundary.
-            (should (eq view-one (qq-contacts--ensure-view)))
-            (should (equal qq-contacts--query "OLD GLOBAL QUERY"))
-            (should qq-contacts--search-strangers)
-            (should qq-contacts--search-stranger-cursor)
-            (cl-letf (((symbol-function 'qq-api-cancel-request)
-                       (lambda (request) (push request cancelled)))
-                      ((symbol-function 'qq-request-cancel)
-                       (lambda (request) (push request cancelled))))
-              (appkit-stop-app app-one))
-            (should-not (appkit-view-live-p view-one))
-            (should-not qq-contacts--query)
-            (should (eq qq-contacts--search-scope 'all))
-            (should (eq qq-contacts--view 'friends))
-            (should (eq qq-contacts--previous-view 'friends))
-            (should-not qq-contacts--search-owner)
-            (should-not qq-contacts--search-pending)
-            (should-not qq-contacts--search-errors)
-            (should-not qq-contacts--search-friends)
-            (should-not qq-contacts--search-groups)
-            (should-not qq-contacts--search-strangers)
-            (should-not qq-contacts--search-members)
-            (should-not qq-contacts--member-group-id)
-            (should-not qq-contacts--search-friend-cursor)
-            (should-not qq-contacts--search-group-cursor)
-            (should-not qq-contacts--search-stranger-cursor)
-            (should-not qq-contacts--search-member-cursor)
-            (should-not qq-contacts--search-friend-request)
-            (should-not qq-contacts--search-group-request)
-            (should-not qq-contacts--search-stranger-request)
-            (should-not qq-contacts--search-member-request)
-            (should (= 4 (length cancelled)))
-            (setq app-two
-                  (qq-runtime-account-app
-                   (qq-runtime-ensure-account "slot-a")))
-            (let ((view-two (qq-contacts--ensure-view)))
-              (should (appkit-view-live-p view-two))
-              (should-not (eq view-one view-two))
-              (should-not qq-contacts--query)
-              (should-not qq-contacts--search-strangers)
-              (should-not qq-contacts--search-stranger-cursor))))
-      (when (appkit-app-live-p app-one)
-        (appkit-stop-app app-one))
-      (when (appkit-app-live-p app-two)
-        (appkit-stop-app app-two))
-      (qq-runtime-stop-account "slot-a" t)
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
 
 (ert-deftest qq-contacts-group-member-search-reuses-a-renamed-owning-buffer ()
   (qq-contacts-test-with-runtime-view
@@ -1204,8 +743,6 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
   (should (eq (lookup-key qq-root-mode-map (kbd "c")) #'qq-contacts-open))
   (should (eq (lookup-key qq-contacts-mode-map (kbd "g"))
               #'qq-contacts-refresh))
-  (should (eq (lookup-key qq-contacts-mode-map (kbd "/"))
-              #'qq-contacts-search))
   (should (eq (lookup-key qq-contacts-mode-map (kbd "RET"))
               #'qq-contacts-open-at-point))
   (should (eq (lookup-key qq-contacts-mode-map (kbd "i"))

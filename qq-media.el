@@ -4,8 +4,7 @@
 
 ;;; Commentary:
 
-;; Resource helpers specialized for NapCat/QQ
-;; resource types such as avatars, base emojis, and OneBot file/image segments.
+;; Resource helpers for QQ avatars, emoji, and structured message media.
 
 ;;; Code:
 
@@ -17,12 +16,12 @@
 (require 'appkit-media-image)
 (require 'appkit-ui)
 (require 'qq-account)
-(require 'qq-api)
 (require 'qq-customize)
 (require 'qq-favorite-emoji)
 (require 'qq-remote-media)
 (require 'qq-rpc)
 (require 'qq-server)
+(require 'qq-protocol)
 (require 'qq-runtime)
 (require 'qq-state)
 
@@ -71,6 +70,11 @@ Redisplay therefore observes operation state but never schedules a retry.")
 
 (defvar qq-media--lottie-current-frames (make-hash-table :test #'equal)
   "System face id to the current unpublished PNG playback frame.")
+
+
+(defun qq-media--default-error (_response reason)
+  "Display a media operation failure REASON."
+  (message "qq: %s" (or reason "media operation failed")))
 
 (defun qq-media--json-truthy-p (value)
   "Return non-nil when JSON VALUE is a true-ish flag."
@@ -603,8 +607,8 @@ SPEC may be a numeric maximum height for compact decorative images."
 (defun qq-media--prefer-remote-image-resource-p (key resource)
   "Return non-nil when RESOURCE at KEY should prefer its remote image.
 
-User-avatar local files may be stale NapCat fallbacks.  A remote avatar copy
-is reusable only when its disk identity includes the URL that supplied it."
+User-avatar local files may be stale cache entries.  A remote avatar copy is
+reusable only when its disk identity includes the URL that supplied it."
   (and (stringp key)
        (string-prefix-p "avatar:" key)
        resource
@@ -839,7 +843,7 @@ ordinary segment operations directly and can therefore retry."
 The Gateway grants only a short-lived local access path.  Copy it through
 Appkit's atomic image cache before closing the lease; CALLBACK therefore sees
 only a client-owned stable file.  ERRBACK receives failures."
-  (let ((error-fn (or errback #'qq-api--default-error))
+  (let ((error-fn (or errback #'qq-media--default-error))
         (animated-p
          (and (eq part 'content)
               (qq-media--native-image-animated-p segment))))
@@ -918,7 +922,7 @@ Call CALLBACK with the persistent resource; call ERRBACK on failure."
 (defun qq-media--materialize-native-content-to-cache
     (media-id key target callback errback &optional mime-type)
   "Materialize native MEDIA-ID content into client-owned TARGET under KEY."
-  (let ((error-fn (or errback #'qq-api--default-error)))
+  (let ((error-fn (or errback #'qq-media--default-error)))
     (condition-case error-data
         (let ((operation
                (qq-remote-media-prepare-part-local-access
@@ -973,7 +977,7 @@ Call CALLBACK with the persistent resource; call ERRBACK on failure."
         (format "native-video-%s.mp4" (secure-hash 'sha256 key))
         qq-media-cache-directory)
        callback errback "video/mp4")
-    (funcall (or errback #'qq-api--default-error)
+    (funcall (or errback #'qq-media--default-error)
              nil "video segment has no native media handle")))
 
 (defun qq-media--fetch-native-file-resource
@@ -989,7 +993,7 @@ Call CALLBACK with the persistent resource; call ERRBACK on failure."
                   safe-name)
           qq-media-cache-directory)
          callback errback))
-    (funcall (or errback #'qq-api--default-error)
+    (funcall (or errback #'qq-media--default-error)
              nil "file segment has no native media handle")))
 
 (defun qq-media--resource-fetching-p (key)
@@ -1000,7 +1004,7 @@ Call CALLBACK with the persistent resource; call ERRBACK on failure."
   "Resolve resource by KEY using FETCHER, then run CALLBACK.
 
 FETCHER is called with a one-argument callback that receives the resource
-alist returned by NapCat."
+alist returned by the resource fetcher."
   (if-let* ((cached (qq-media--cached-resource key)))
       (funcall callback cached)
     (funcall fetcher
@@ -1027,34 +1031,6 @@ alist returned by NapCat."
   "Return best file key from SEGMENT."
   (car (qq-media--segment-file-keys segment)))
 
-(defun qq-media--video-resolver-cache-identity (segment)
-  "Return a stable cache identity derived from SEGMENT's complete resolver.
-
-The native resolver, rather than a display filename or opaque `data.file',
-is the authoritative identity of a resolvable video.  Hash the complete
-  validated object so cache, download, and preview state cannot collide merely
-  because two messages use the same filename."
-  (when-let* ((resolver (qq-media--video-resolver segment))
-              (peer (alist-get 'peer resolver)))
-    ;; Build an explicit field-order-independent tuple.  JSON object member
-    ;; order is not semantic and must not split one native resource identity.
-    (let ((identity
-           (pcase (alist-get 'kind resolver)
-             ("message"
-              (list "message"
-                    (alist-get 'chat_type peer)
-                    (alist-get 'peer_uid peer)
-                    (alist-get 'guild_id peer)
-                    (alist-get 'message_id resolver)
-                    (alist-get 'element_id resolver)))
-             ("snapshot"
-              (list "snapshot"
-                    (alist-get 'chat_type peer)
-                    (alist-get 'peer_uid peer)
-                    (alist-get 'guild_id peer)
-                    (alist-get 'file_uuid resolver))))))
-      (format "resolver:%s"
-              (secure-hash 'sha256 (prin1-to-string identity))))))
 
 (defun qq-media--absolute-local-file-present-p (file)
   "Return non-nil when FILE is an existing absolute local path.
@@ -1081,8 +1057,8 @@ bounded GIF previews and must never be promoted to the playable video source."
   "Return an existing local filesystem path from SEGMENT, or nil.
 
 Outbound attach/pending segments carry absolute paths in `file' or `path'.
-Those must never be sent to NapCat `get_image'/`get_file' (Telega-style
-local-first rendering)."
+Those must never be treated as remote media handles (Telega-style local-first
+rendering)."
   (let* ((data (alist-get 'data segment))
          (candidates (list (alist-get 'path data)
                            (alist-get 'file data))))
@@ -1092,15 +1068,6 @@ local-first rendering)."
           (throw 'found candidate)))
       nil)))
 
-(defun qq-media--segment-remote-file-keys (segment)
-  "Return SEGMENT file keys that are not existing local paths.
-
-Only these keys are safe to pass to NapCat `get_image'/`get_file'."
-  (let (remote)
-    (dolist (key (qq-media--segment-file-keys segment))
-      (unless (qq-media--absolute-local-file-present-p key)
-        (push key remote)))
-    (nreverse remote)))
 
 (defun qq-media--resource-from-local+url (local url)
   "Build a resource alist from LOCAL path and optional URL."
@@ -1111,36 +1078,17 @@ Only these keys are safe to pass to NapCat `get_image'/`get_file'."
      `((url . ,url)))))
 
 (defun qq-media--resolve-fileish-segment
-    (segment action callback errback &optional final-error)
-  "Resolve file-like SEGMENT with Telega-style priority.
-
-Order:
-1. Existing local path on the segment (outbound attach / pending)
-2. Dormant v1 ACTION resolver for any remaining legacy keys
-3. Direct `url' from the segment
-4. ERRBACK
-
-The native service owns FTN identity and signed URL negotiation; the client
-never treats a local absolute path or display filename as a download token."
+    (segment callback errback &optional final-error)
+  "Resolve file-like SEGMENT from an existing local path or direct URL."
   (let* ((capabilities (qq-media-segment-capabilities segment))
          (url (plist-get capabilities :remote-url))
          (local (qq-media--segment-existing-path segment))
-         (remote-keys (qq-media--segment-remote-file-keys segment))
-         (error-fn (or errback #'qq-api--default-error))
-         (fail-msg (or final-error
-                       "media segment has neither local file, file id, nor URL")))
+         (error-fn (or errback #'qq-media--default-error))
+         (fail-msg
+          (or final-error "media segment has neither local file nor URL")))
     (cond
      (local
       (funcall callback (qq-media--resource-from-local+url local url)))
-     (remote-keys
-      (qq-media--call-fileish-action
-       action remote-keys
-       callback
-       (lambda (response reason)
-         (if (appkit-media-url-present-p url)
-             (funcall callback `((url . ,url)))
-           (funcall error-fn response (or reason fail-msg))))
-       fail-msg))
      ((appkit-media-url-present-p url)
       (funcall callback `((url . ,url))))
      (t
@@ -1187,23 +1135,6 @@ only the fallback for older/general file producers that do not provide one."
       (qq-media-imageish-file-segment-p segment)
       (qq-media-videoish-segment-p segment)))
 
-(defun qq-media--call-fileish-action (action file-keys callback errback &optional final-error)
-  "Call ACTION with FILE-KEYS until one succeeds.
-
-On success pass decoded data to CALLBACK.  When all candidates fail, call
-ERRBACK with FINAL-ERROR or the last backend reason."
-  (letrec ((try-next
-            (lambda (keys last-reason last-response)
-              (if (null keys)
-                  (funcall errback last-response (or final-error last-reason "file not found"))
-                (qq-api-call
-                 action
-                 `((file . ,(car keys)))
-                 (lambda (response)
-                   (funcall callback (qq-api--response-data response)))
-                 (lambda (response reason)
-                   (funcall try-next (cdr keys) reason response)))))))
-    (funcall try-next file-keys nil nil)))
 
 (defun qq-media--segment-url (segment)
   "Return best direct URL from SEGMENT, or nil."
@@ -1224,15 +1155,6 @@ state and must not enable a remote operation."
      ((equal value "unresolved") 'unresolved)
      (t 'invalid))))
 
-(defun qq-media--video-resolver (segment)
-  "Return validated exact resolver carried by video SEGMENT, or nil."
-  (when (and (equal (alist-get 'type segment) "video")
-             (eq (qq-media--video-remote-status segment) 'resolvable))
-    (condition-case nil
-        (qq-api-validate-video-resolver
-         (alist-get 'resolver (alist-get 'data segment))
-         "video segment resolver" t)
-      (error nil))))
 
 (defun qq-media--transfer-status-text (state)
   "Return compact user-visible transfer status for download STATE."
@@ -1253,42 +1175,19 @@ state and must not enable a remote operation."
       (_ nil))))
 
 (defun qq-media--legacy-segment-capabilities (segment)
-  "Return the centralized action/status model for media SEGMENT.
-
-The result is a plist with `:open', `:download', `:save', `:copy-url',
-`:status', `:local-file', `:remote-status', `:resolve-remote', `:remote-url',
-and `:remote-error'.  Video remote state comes exclusively from
-`remote_status'; a real local file remains usable independently of that
-state.  `available' uses its non-empty URL, while `resolvable' invokes only
-its explicit fork-native resolver on user demand.  Terminal and invalid
-states never probe a second interface such as get_file."
+  "Return actions available from local files and direct native URLs."
   (let* ((type (alist-get 'type segment))
-         (data (alist-get 'data segment))
          (supported (member type
                             '("image" "file" "record" "video" "face" "mface")))
          (video-p (equal type "video"))
-         (remote-status (if video-p
-                            (qq-media--video-remote-status segment)
-                          'not-applicable))
-         (video-resolver (and video-p (qq-media--video-resolver segment)))
+         (remote-status
+          (if video-p (qq-media--video-remote-status segment) 'not-applicable))
          (local-file (qq-media-segment-local-file segment))
          (url (qq-media--segment-url segment))
-         (url-p (appkit-media-url-present-p url))
-         (usable-url-p (and url-p
-                            (or (not video-p)
-                                (eq remote-status 'available))))
-         (remote-keys (qq-media--segment-remote-file-keys segment))
-         (face-id (and (equal type "face") (alist-get 'id data)))
-         (remote-source-p (if video-p
-                              (or usable-url-p video-resolver)
-                            (or remote-keys usable-url-p face-id)))
-         (resolve-remote
-          (and supported remote-source-p
-               (or (not video-p)
-                   (memq remote-status '(available resolvable)))))
-         (remote-url
-          (and usable-url-p
-               url))
+         (usable-url-p
+          (and (appkit-media-url-present-p url)
+               (or (not video-p) (eq remote-status 'available))))
+         (resolve-remote (and supported usable-url-p))
          (download-state (qq-media-segment-download-state segment))
          (download-status (plist-get download-state :status))
          (open (and supported (or local-file resolve-remote)))
@@ -1296,7 +1195,6 @@ states never probe a second interface such as get_file."
                         (not (memq download-status
                                    '(downloading downloaded)))))
          (save (and supported (or local-file resolve-remote)))
-         (copy-url (and remote-url t))
          (remote-error
           (and video-p
                (pcase remote-status
@@ -1305,8 +1203,7 @@ states never probe a second interface such as get_file."
                  ('invalid "video resource has invalid remote_status")
                  ('unresolved "video resource is unresolved")
                  ('resolvable
-                  (unless video-resolver
-                    "video resource has an invalid resolver"))
+                  "video resource requires an unavailable legacy resolver")
                  ('available
                   (unless usable-url-p
                     "available video resource has no URL")))))
@@ -1316,20 +1213,19 @@ states never probe a second interface such as get_file."
                 ('expired "Expired")
                 ('unavailable "Unavailable")
                 ('unresolved "Unresolved")
-                ('resolvable
-                 (qq-media--transfer-status-text download-state))
+                ('resolvable "Unavailable")
                 ('invalid "Invalid remote status")
                 (_ (qq-media--transfer-status-text download-state)))
             (qq-media--transfer-status-text download-state))))
     (list :open open
           :download download
           :save save
-          :copy-url copy-url
+          :copy-url (and usable-url-p t)
           :status status
           :local-file local-file
           :remote-status remote-status
           :resolve-remote resolve-remote
-          :remote-url remote-url
+          :remote-url (and usable-url-p url)
           :remote-error remote-error
           :download-state download-state)))
 
@@ -1515,9 +1411,6 @@ retired."
 (defun qq-media--segment-resource-key (segment)
   "Return logical resource cache key for SEGMENT, or nil."
   (let* ((type (alist-get 'type segment))
-         (resolver-identity (and (equal type "video")
-                                 (qq-media--video-resolver-cache-identity
-                                  segment)))
          (file-key (qq-media--segment-file-key segment))
          (url (qq-media--segment-url segment))
          (data (alist-get 'data segment))
@@ -1530,37 +1423,37 @@ retired."
       ("image" (or (and image-media-id
                         (qq-media--native-image-key image-media-id))
                    (and file-key (format "image:%s" file-key))
-                   (and (appkit-media-url-present-p url) (format "image-url:%s" url))))
+                   (and (appkit-media-url-present-p url)
+                        (format "image-url:%s" url))))
       ("video"
        (or (and video-media-id
                 (qq-media--native-video-key video-media-id))
-           (and resolver-identity
-                (format "video:%s" resolver-identity))
            (and file-key (format "video:%s" file-key))
            (and (appkit-media-url-present-p url)
                 (format "video-url:%s" url))))
       ((or "file" "group_file")
        (or (and file-media-id (qq-media--native-file-key file-media-id))
            (and file-key (format "%s:%s" type file-key))
-           (and (appkit-media-url-present-p url) (format "%s-url:%s" type url))))
+           (and (appkit-media-url-present-p url)
+                (format "%s-url:%s" type url))))
       ("record" (or (and record-media-id
                          (qq-media--native-record-key record-media-id))
                     (and file-key (format "record:%s" file-key))))
       ("face" (and emoji-id (format "face:%s" emoji-id)))
       ("mface" (or (and file-key (format "mface:%s" file-key))
-                   (and (appkit-media-url-present-p url) (format "mface-url:%s" url))))
+                   (and (appkit-media-url-present-p url)
+                        (format "mface-url:%s" url))))
       (_ nil))))
 
 (defun qq-media--fetch-segment-resource (segment callback &optional errback)
   "Fetch media resource for SEGMENT and pass it to CALLBACK.
 
-Native segments materialize their opaque `media_id'.  Remaining transitional
-segments use local path → dormant action resolver → URL; see
-`qq-media--resolve-fileish-segment'."
+Native segments materialize their opaque `media_id'.  Other segments may use
+only an existing local path or a direct URL."
   (let* ((type (alist-get 'type segment))
          (data (alist-get 'data segment))
          (emoji-id (alist-get 'id data))
-         (error-fn (or errback #'qq-api--default-error)))
+         (error-fn (or errback #'qq-media--default-error)))
     (pcase type
       ("image"
        (if-let* ((media-id (qq-media--native-image-media-id segment)))
@@ -1568,51 +1461,28 @@ segments use local path → dormant action resolver → URL; see
             segment (qq-media--native-image-key media-id)
             callback error-fn)
          (qq-media--resolve-fileish-segment
-          segment "get_image" callback error-fn
-          "image segment has neither local file, file id, nor URL")))
+          segment callback error-fn
+          "image segment has neither local file nor URL")))
       ("video"
        (if-let* ((media-id (qq-media--native-video-media-id segment)))
            (qq-media--fetch-native-video-resource
             segment (qq-media--native-video-key media-id)
             callback error-fn)
          (qq-media--resolve-fileish-segment
-          segment "get_file" callback error-fn
-          "video segment has neither local file, file id, nor URL")))
+          segment callback error-fn
+          "video segment has neither local file nor URL")))
       ((or "file" "group_file")
        (if-let* ((media-id (qq-media--native-file-media-id segment)))
            (qq-media--fetch-native-file-resource
             segment (qq-media--native-file-key media-id)
             callback error-fn)
          (qq-media--resolve-fileish-segment
-          segment
-          (if (qq-media-imageish-file-segment-p segment)
-              "get_image"
-            "get_file")
-          callback error-fn
-          (format "%s segment has neither local file, file id, nor URL" type))))
+          segment callback error-fn
+          (format "%s segment has neither local file nor URL" type))))
       ("record"
-       (let ((remote-keys (qq-media--segment-remote-file-keys segment))
-             (local (qq-media--segment-existing-path segment)))
-         (cond
-          (local
-           (funcall callback `((file . ,local))))
-          (remote-keys
-           (letrec ((try-next
-                     (lambda (keys last-reason last-response)
-                       (if (null keys)
-                           (funcall error-fn last-response
-                                    (or last-reason "record segment has no usable file id"))
-                         (qq-api-call
-                          "get_record"
-                          `((file . ,(car keys))
-                            (out_format . "mp3"))
-                          (lambda (response)
-                            (funcall callback (qq-api--response-data response)))
-                          (lambda (response reason)
-                            (funcall try-next (cdr keys) reason response)))))))
-             (funcall try-next remote-keys nil nil)))
-          (t
-           (funcall error-fn nil "record segment has no file id")))))
+       (if-let* ((local (qq-media--segment-existing-path segment)))
+           (funcall callback `((file . ,local)))
+         (funcall error-fn nil "record segment has no local file")))
       ("face"
        (cond
         ((not emoji-id)
@@ -1624,16 +1494,15 @@ segments use local path → dormant action resolver → URL; see
                   "base face has no local resource in the native backend"))))
       ("mface"
        (qq-media--resolve-fileish-segment
-        segment "get_image" callback error-fn
-        "mface segment has neither local file, file id, nor URL"))
+        segment callback error-fn
+        "mface segment has neither local file nor URL"))
       (_
        (funcall error-fn nil (format "unsupported segment type for resource fetch: %s" type))))))
 
 (defun qq-media-resolve-segment-resource (segment callback &optional errback)
   "Resolve media resource for SEGMENT and pass it to CALLBACK."
   (let ((cache-key (qq-media--segment-resource-key segment))
-        (capabilities (qq-media-segment-capabilities segment))
-        (video-resolver (qq-media--video-resolver segment)))
+        (capabilities (qq-media-segment-capabilities segment)))
     (let ((url (plist-get capabilities :remote-url))
           (local (plist-get capabilities :local-file))
           (remote-error (plist-get capabilities :remote-error)))
@@ -1656,29 +1525,6 @@ segments use local path → dormant action resolver → URL; see
             (qq-media--cache-resource cache-key resource)
             (qq-media--note-cache-updated cache-key))
           (funcall callback resource)))
-       ;; A live-message or forward-snapshot resolver is a complete native
-       ;; capability, not a fallback.  Resolve it afresh for each operation so
-       ;; an old signed URL is never treated as permanently valid.
-       ((and (equal (alist-get 'type segment) "video") video-resolver)
-        (qq-api-resolve-video
-         video-resolver
-         (lambda (remote)
-           (pcase (alist-get 'state remote)
-             ("available"
-              (funcall callback `((url . ,(alist-get 'url remote)))))
-             ("expired"
-              (if errback
-                  (funcall errback nil "video resource has expired")
-                (user-error "qq: video resource has expired")))
-             ("unavailable"
-              (if errback
-                  (funcall errback nil "video resource is unavailable")
-                (user-error "qq: video resource is unavailable")))
-             ("unresolved"
-              (if errback
-                  (funcall errback nil "video resource is unresolved")
-                (user-error "qq: video resource is unresolved")))))
-         errback))
        ((and cache-key (qq-media--cached-resource cache-key))
         (funcall callback (qq-media--cached-resource cache-key)))
        (cache-key
@@ -1697,7 +1543,7 @@ segments use local path → dormant action resolver → URL; see
         (user-error "qq: segment has neither local file nor URL"))))))
 
 (cl-defun qq-media-segment-open (segment &key owner)
-  "Open OneBot message SEGMENT using QQ-aware resource resolution.
+  "Open normalized message SEGMENT using QQ-aware resource resolution.
 
 OWNER is the exact Appkit app generation that owns any external media player."
   (if (qq-media--native-record-media-id segment)
@@ -2105,11 +1951,11 @@ OWNER is the requesting account.  IDENTITY-KEY and IDENTITY identify the
 exact user or group whose avatar was requested."
   (unless
       (and
-       (qq-account--exact-object-keys-p
+       (qq-server-wire-exact-object-keys-p
         result (list 'account_id identity-key 'url))
        (equal (alist-get 'account_id result) owner)
        (equal (alist-get identity-key result) identity)
-       (qq-account--non-empty-string-p (alist-get 'url result))
+       (qq-protocol-non-empty-string-p (alist-get 'url result))
        (string-prefix-p "https://" (alist-get 'url result)))
     (error "qq: Gateway returned an invalid avatar locator"))
   `((url . ,(alist-get 'url result))))
@@ -2120,7 +1966,7 @@ exact user or group whose avatar was requested."
 
 IDENTITY-KEY names the exact decimal IDENTITY parameter.  CALLBACK receives
 an owned media resource alist; ERRBACK follows the native RPC convention."
-  (unless (qq-account--canonical-decimal-p identity)
+  (unless (qq-protocol-uint64-decimal-p identity)
     (user-error "qq: avatar resolution requires an exact decimal identity"))
   (let ((owner (qq-media--avatar-owner)))
     (qq-rpc-call
@@ -2136,11 +1982,11 @@ an owned media resource alist; ERRBACK follows the native RPC convention."
      :callback
      (lambda (resource)
        (qq-runtime-with-account owner
-				(qq-account--invoke callback resource)))
+				(qq-rpc-invoke callback resource)))
      :errback
      (lambda (body reason)
        (qq-runtime-with-account owner
-				(qq-account--invoke errback body reason))))))
+				(qq-rpc-invoke errback body reason))))))
 
 (defun qq-media--fetch-native-user-avatar-locator
     (user-id callback &optional errback)
@@ -2194,7 +2040,7 @@ fallback for identities observed outside that directory."
      key
      (lambda (done)
        (qq-media--fetch-native-user-avatar
-        user-id done #'qq-api--default-error))
+        user-id done #'qq-media--default-error))
      (lambda (resource)
        (qq-media-open-resource resource 'image key)))))
 
@@ -2206,7 +2052,7 @@ fallback for identities observed outside that directory."
    (format "group-avatar:%s" group-id)
    (lambda (done)
      (qq-media--fetch-native-group-avatar
-      group-id done #'qq-api--default-error))
+      group-id done #'qq-media--default-error))
    (lambda (resource)
      (qq-media-open-resource
       resource 'image (format "group-avatar:%s" group-id)))))
@@ -2220,39 +2066,18 @@ fallback for identities observed outside that directory."
       ('dataline (user-error "qq: dataline sessions have no QQ avatar"))
       (type (user-error "qq: %s sessions have no QQ avatar" type)))))
 
-(defun qq-media--guild-member-avatar-key (guild-id native-id)
-  "Return the cache key for GUILD-ID member NATIVE-ID."
-  (format "guild-member-avatar:%s:%s" guild-id native-id))
 
 (defun qq-media--message-avatar-identity (message)
-  "Return the native avatar identity represented by MESSAGE.
-
-The result is either `(:guild-member GUILD-ID NATIVE-ID)' or
-`(:user USER-ID)'.  Guild member ids and ordinary QQ user ids deliberately
-remain disjoint: a Guild tiny id is not a QQ account id."
-  (if-let* ((session-key (alist-get 'session-key message))
-            ((eq (qq-state-session-key-type session-key) 'guild-channel))
-            (guild-id
-             (alist-get 'guild-id
-                        (qq-state-session-key-identity session-key)))
-            (native-id (alist-get 'sender-native-id message)))
-      (list :guild-member guild-id native-id)
-    (when-let* ((sender-id (or (alist-get 'sender-id message)
-                               (alist-get 'user-id message)))
-                ((not (equal (format "%s" sender-id) "0"))))
-      (list :user sender-id))))
+  "Return MESSAGE sender's canonical QQ user identity, or nil."
+  (when-let* ((sender-id (or (alist-get 'sender-id message)
+                             (alist-get 'user-id message)))
+              ((qq-protocol-user-uin-p sender-id)))
+    (list :user sender-id)))
 
 (defun qq-media--message-snapshot-avatar-url (message)
-  "Return MESSAGE's authoritative non-Guild snapshot avatar URL, or nil.
-
-Merged-forward nodes carry per-entry avatar URLs because their projected QQ
-UIN can be a repeated fallback shared by unrelated authors.  Guild messages
-retain their native member cache identity and its existing URL handling."
-  (let ((identity (qq-media--message-avatar-identity message))
-        (url (alist-get 'sender-avatar-url message)))
-    (and (not (eq (car-safe identity) :guild-member))
-         (appkit-media-url-present-p url)
-         url)))
+  "Return MESSAGE's authoritative snapshot avatar URL, or nil."
+  (let ((url (alist-get 'sender-avatar-url message)))
+    (and (appkit-media-url-present-p url) url)))
 
 (defun qq-media--message-snapshot-avatar-key (message)
   "Return the URL-scoped avatar cache key for MESSAGE, or nil."
@@ -2263,10 +2088,7 @@ retain their native member cache identity and its existing URL handling."
   "Return the logical avatar cache key affecting MESSAGE, or nil."
   (or (qq-media--message-snapshot-avatar-key message)
       (pcase (qq-media--message-avatar-identity message)
-        (`(:guild-member ,guild-id ,native-id)
-         (qq-media--guild-member-avatar-key guild-id native-id))
-        (`(:user ,user-id)
-         (format "avatar:%s" user-id)))))
+        (`(:user ,user-id) (format "avatar:%s" user-id)))))
 
 (defun qq-media-open-message-avatar (message)
   "Open sender avatar for MESSAGE."
@@ -2274,69 +2096,24 @@ retain their native member cache identity and its existing URL handling."
             (key (qq-media--message-snapshot-avatar-key message)))
       (qq-media-open-image-url key url)
     (pcase (qq-media--message-avatar-identity message)
-      (`(:guild-member ,guild-id ,native-id)
-       (qq-media-open-guild-member-avatar guild-id native-id))
-      (`(:user ,user-id)
-       (qq-media-open-user-avatar user-id))
-      (_
-       (user-error "qq: message sender has no native avatar identity")))))
+      (`(:user ,user-id) (qq-media-open-user-avatar user-id))
+      (_ (user-error "qq: message sender has no native avatar identity")))))
 
-(defun qq-media--guild-member-avatar-resource (profile)
-  "Return the avatar resource projected from Guild member PROFILE."
-  `((url . ,(alist-get 'avatar_url profile))))
 
-(defun qq-media-open-guild-member-avatar (guild-id native-id)
-  "Open the native channel avatar for GUILD-ID member NATIVE-ID."
-  (let ((key (qq-media--guild-member-avatar-key guild-id native-id)))
-    (qq-media--resolve-resource
-     key
-     (lambda (done)
-       (qq-api-get-guild-member-profile
-        guild-id native-id
-        (lambda (profile)
-          (funcall done (qq-media--guild-member-avatar-resource profile)))))
-     (lambda (resource)
-       (qq-media-open-resource resource 'image key)))))
 
-(defun qq-media-guild-member-avatar-image (guild-id native-id)
-  "Return the inline native avatar for GUILD-ID member NATIVE-ID."
-  (qq-media--ensure-resource-image
-   (qq-media--guild-member-avatar-key guild-id native-id)
-   (lambda (done error)
-     (qq-api-get-guild-member-profile
-      guild-id native-id
-      (lambda (profile)
-        (funcall done (qq-media--guild-member-avatar-resource profile)))
-      error))
-   qq-media-avatar-image-height
-   #'qq-media--avatar-image-from-file))
 
 (defun qq-media-message-avatar-image (message)
   "Return the identity-correct inline sender avatar for MESSAGE."
-  (let ((identity (qq-media--message-avatar-identity message))
-        (avatar-url (alist-get 'sender-avatar-url message))
-        (snapshot-url (qq-media--message-snapshot-avatar-url message)))
-    (cond
-     (snapshot-url
-      (qq-media--ensure-resource-image
-       (qq-media--message-snapshot-avatar-key message)
-       (lambda (done _error)
-         (funcall done `((url . ,snapshot-url))))
-       qq-media-avatar-image-height
-       #'qq-media--avatar-image-from-file))
-     (t
-      (pcase identity
-        (`(:guild-member ,guild-id ,native-id)
-         (if (appkit-media-url-present-p avatar-url)
-             (qq-media--ensure-resource-image
-              (qq-media--guild-member-avatar-key guild-id native-id)
-              (lambda (done _error)
-                (funcall done `((url . ,avatar-url))))
-              qq-media-avatar-image-height
-              #'qq-media--avatar-image-from-file)
-           (qq-media-guild-member-avatar-image guild-id native-id)))
-        (`(:user ,user-id)
-         (qq-media-avatar-image user-id)))))))
+  (let ((snapshot-url (qq-media--message-snapshot-avatar-url message)))
+    (if snapshot-url
+        (qq-media--ensure-resource-image
+         (qq-media--message-snapshot-avatar-key message)
+         (lambda (done _error)
+           (funcall done `((url . ,snapshot-url))))
+         qq-media-avatar-image-height
+         #'qq-media--avatar-image-from-file)
+      (pcase (qq-media--message-avatar-identity message)
+        (`(:user ,user-id) (qq-media-avatar-image user-id))))))
 
 (defun qq-media-avatar-image (user-id)
   "Return inline avatar image for USER-ID, triggering fetch when needed."
@@ -2481,26 +2258,26 @@ resolution and is safe while the account has no managed backend runtime."
 
 (defun qq-media--system-emoji-download-info-p (value)
   "Return non-nil when VALUE is one closed system-emoji download locator."
-  (and (qq-account--exact-object-keys-p
+  (and (qq-server-wire-exact-object-keys-p
         value '(base_resource_url advanced_resource_url))
        (cl-every
         (lambda (key)
           (let ((url (alist-get key value)))
             (or (null url)
-                (and (qq-account--non-empty-string-p url)
+                (and (qq-protocol-non-empty-string-p url)
                      (string-prefix-p "https://" url)))))
         '(base_resource_url advanced_resource_url))))
 
 (defun qq-media--system-emoji-entry-p (entry)
   "Return non-nil when ENTRY is one exact Gateway system emoji."
   (and
-   (qq-account--exact-object-keys-p
+   (qq-server-wire-exact-object-keys-p
     entry
     '(id description qzone_code qcid emoji_type animated_pack_id
          animated_sticker_id download associate_words hidden start_time
          end_time animation_width animation_height interact_pack_id
          interact_sticker_id))
-   (qq-account--non-empty-string-p (alist-get 'id entry))
+   (qq-protocol-non-empty-string-p (alist-get 'id entry))
    (stringp (alist-get 'description entry))
    (stringp (alist-get 'qzone_code entry))
    (cl-every
@@ -2529,7 +2306,7 @@ resolution and is safe while the account has no managed backend runtime."
 
 (defun qq-media--project-system-emoji-catalog (result)
   "Validate and return Gateway system-emoji catalog RESULT."
-  (unless (qq-account--exact-object-keys-p result '(panels))
+  (unless (qq-server-wire-exact-object-keys-p result '(panels))
     (error "qq: Gateway returned malformed system-emoji catalog"))
   (let ((panels (alist-get 'panels result))
         (count 0))
@@ -2540,7 +2317,7 @@ resolution and is safe while the account has no managed backend runtime."
          (cl-every
           (lambda (panel)
             (and
-             (qq-account--exact-object-keys-p panel '(kind groups download))
+             (qq-server-wire-exact-object-keys-p panel '(kind groups download))
              (member (alist-get 'kind panel) '("normal" "super" "red_heart"))
              (qq-media--system-emoji-download-info-p
               (alist-get 'download panel))
@@ -2552,7 +2329,7 @@ resolution and is safe while the account has no managed backend runtime."
                  (lambda (group)
                    (let ((emojis (alist-get 'emojis group)))
                      (and
-                      (qq-account--exact-object-keys-p
+                      (qq-server-wire-exact-object-keys-p
                        group '(name emojis start_time end_time group_type))
                       (stringp (alist-get 'name group))
                       (integerp (alist-get 'group_type group))
@@ -2655,7 +2432,7 @@ resolution and is safe while the account has no managed backend runtime."
          (entry (qq-media-system-emoji-entry id))
          (catalog-name (and entry (alist-get 'description entry)))
          (table (qq-media--load-face-names-table)))
-    (or (and (qq-account--non-empty-string-p catalog-name) catalog-name)
+    (or (and (qq-protocol-non-empty-string-p catalog-name) catalog-name)
         (gethash id table))))
 
 (defun qq-media--face-id-number (id)
@@ -2680,7 +2457,7 @@ does not re-sort by string length/history."
       (maphash
        (lambda (id entry)
          (let ((name (alist-get 'description entry)))
-           (when (qq-account--non-empty-string-p name)
+           (when (qq-protocol-non-empty-string-p name)
              (puthash id name table))))
        catalog))
     (maphash
@@ -3151,28 +2928,20 @@ When native Lottie JSON exists, attach playback identity to the projection."
            (native-video-id (qq-media--native-video-media-id segment))
            (native-file-id (qq-media--native-file-media-id segment))
            (type (alist-get 'type segment))
-           (resolver-identity
-            (and (equal type "video")
-                 (qq-media--video-resolver-cache-identity segment)))
-           (preview-type (cond
-                          ((qq-media-imageish-file-segment-p segment)
-                           "file-image")
-                          ((qq-media-videoish-segment-p segment)
-                           (appkit-media-video-preview-policy-key))
-                          (t type)))
+           (preview-type
+            (cond
+             ((qq-media-imageish-file-segment-p segment) "file-image")
+             ((qq-media-videoish-segment-p segment)
+              (appkit-media-video-preview-policy-key))
+             (t type)))
            (file-key (qq-media--segment-file-key segment))
            (url (qq-media--segment-url segment)))
       (cond
-       (native-image-id
-        (qq-media--native-image-key native-image-id))
+       (native-image-id (qq-media--native-image-key native-image-id))
        (native-video-id
         (qq-media--native-video-thumbnail-key native-video-id))
-       (native-file-id
-        (qq-media--native-file-key native-file-id))
-       (resolver-identity
-        (format "preview:%s:%s" preview-type resolver-identity))
-       (file-key
-        (format "preview:%s:%s" preview-type file-key))
+       (native-file-id (qq-media--native-file-key native-file-id))
+       (file-key (format "preview:%s:%s" preview-type file-key))
        ((appkit-media-url-present-p url)
         (format "preview:%s-url:%s" preview-type url))
        (t nil)))))
@@ -3268,10 +3037,10 @@ Live evidence (emacsclient, forward image
 
 So when the wire segment already carries a URL (or local path), seed that
 into the preview resource cache *before* `ensure', so we take the URL
-download branch instead of blocking forever on `get_image'.  Only fall back
-to NapCat `get_image' when there is no usable URL/local path.
+download branch instead of blocking forever.  Only fall back to the direct
+resource fetcher when there is no usable URL/local path.
 
-Preview failures are soft (no NapCat error spam)."
+Preview failures are soft and do not surface an operation error."
   (let ((key (qq-media-segment-preview-key segment))
         (native-image-id (qq-media--native-image-media-id segment))
         (native-video-id (qq-media--native-video-media-id segment))
@@ -3315,9 +3084,7 @@ Preview failures are soft (no NapCat error spam)."
              (if (qq-media-segment-preview-capable-p segment)
                  (qq-media--resolve-fileish-segment
                   segment
-                  "get_image"
                   done
-                  ;; Soft-fail: clear fetching without user-error / NapCat spam.
                   (lambda (_response _reason)
                     (funcall error nil "preview image not found"))
                   "preview image not found")

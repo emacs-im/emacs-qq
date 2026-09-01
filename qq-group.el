@@ -4,9 +4,8 @@
 
 ;;; Commentary:
 
-;; Telega-style group profile page backed by the selected OneBot or native
-;; native service.  Unknown native enum values remain visible as numeric
-;; codes.
+;; Telega-style group profile page backed by the native Gateway.  Unknown
+;; native enum values remain visible as numeric codes.
 
 ;;; Code:
 
@@ -16,11 +15,11 @@
 (require 'appkit-core)
 (require 'appkit-invalidation)
 (require 'appkit-transaction)
-(require 'qq-api)
 (require 'qq-core)
 (require 'qq-media)
 (require 'qq-runtime)
 (require 'qq-state)
+(require 'qq-protocol)
 (require 'appkit-ui)
 (require 'appkit-view)
 (require 'appkit-position)
@@ -29,8 +28,6 @@
 (declare-function qq-contacts-search-group-members
                   "qq-contacts" (group-id query))
 (declare-function qq-user-open "qq-user" (user-id))
-(declare-function qq-group-notices-open
-                  "qq-group-notices" (group-id &optional group-name))
 (defconst qq-group--view-id 'group-profile
   "Stable Appkit identity of the singleton group-profile view.")
 
@@ -155,7 +152,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
   "Open the current group owner's user page."
   (interactive)
   (let ((owner-id (alist-get 'owner_id qq-group--profile)))
-    (unless (qq-api-user-id-p owner-id)
+    (unless (qq-protocol-user-uin-p owner-id)
       (user-error "qq: group owner identity is unavailable"))
     (require 'qq-user)
     (qq-user-open owner-id)))
@@ -177,13 +174,6 @@ GROUP-ID defaults to the identity selected in the current buffer."
   (require 'qq-contacts)
   (qq-contacts-search-group-members qq-group--group-id query))
 
-(defun qq-group-open-notices ()
-  "Open the current group's read-only announcement list."
-  (interactive)
-  (unless qq-group--group-id
-    (user-error "qq: this buffer has no group identity"))
-  (require 'qq-group-notices)
-  (qq-group-notices-open qq-group--group-id (qq-group--display-name)))
 
 (defun qq-group--setting-current-p (buffer group-id)
   "Return non-nil when BUFFER still displays GROUP-ID."
@@ -354,11 +344,7 @@ GROUP-ID defaults to the identity selected in the current buffer."
   (appkit-ui-insert-action-button
    " 搜索成员 " #'qq-group-search-members
    :face 'qq-group-action-button :help-echo "原生搜索群成员 (s)")
-  (insert "  ")
-  (appkit-ui-insert-action-button
-   " 群公告 " #'qq-group-open-notices
-   :face 'qq-group-action-button :help-echo "查看群公告列表 (n)")
-  (when (qq-api-user-id-p (alist-get 'owner_id qq-group--profile))
+  (when (qq-protocol-user-uin-p (alist-get 'owner_id qq-group--profile))
     (insert "  ")
     (appkit-ui-insert-action-button
      " 群主资料 " #'qq-group-open-owner
@@ -589,7 +575,7 @@ RESOURCE identifies a presentation-only media dependency update."
                                qq-group--request nil
                                qq-group--request-owner nil)
                          (qq-group--request-sync view))))
-                   (lambda (response reason)
+                   (lambda (_response reason)
                      (when (qq-group--request-current-p
                             view buffer group-id owner)
                        (with-current-buffer buffer
@@ -600,7 +586,7 @@ RESOURCE identifies a presentation-only media dependency update."
                                qq-group--request nil
                                qq-group--request-owner nil)
                          (qq-group--request-sync view)
-                         (qq-api--default-error response reason)))))))
+                         (message "qq: %s" (or reason "native request failed"))))))))
             (when (eq qq-group--request-owner owner)
               (setq qq-group--request request)))
         (error
@@ -665,36 +651,13 @@ RESOURCE identifies a presentation-only media dependency update."
 (defun qq-group--ensure-view ()
   "Return the live Appkit view owning the current group buffer."
   (unless qq-group--group-id
-    (error "QQ: cannot attach a group view without an opaque group identity"))
-  (let* ((owner
-          (or qq-runtime--account-id
-              (user-error "qq: group buffer has no account owner")))
-         (app (qq-runtime-app owner))
-         (sync-function
-          (qq-runtime-account-sync-function
-           owner #'qq-group--sync-invalidations))
-         (current (appkit-current-view)))
-    (cond
-     ((and (appkit-view-live-p current)
-           (eq app (appkit-view-app current))
-           (equal qq-group--view-id (appkit-view-id current)))
-      (setf (appkit-view-sync-function current)
-            sync-function
-            (appkit-view-parts current) '(profile))
-      current)
-     ((appkit-view-live-p current)
-      (error "QQ: group buffer belongs to another Appkit view"))
-     (t
-      (let ((view
-             (appkit-attach-view
-              :app app
-              :id qq-group--view-id
-              :mode 'qq-group-mode
-              :sync-function sync-function
-              :parts '(profile))))
-        (qq-runtime-bind-account owner)
-        (qq-group--setup-view view)
-        view)))))
+    (error "QQ: cannot attach a group view without a group identity"))
+  (qq-runtime-ensure-account-view
+   :id qq-group--view-id
+   :mode 'qq-group-mode
+   :sync-function #'qq-group--sync-invalidations
+   :parts '(profile)
+   :setup #'qq-group--setup-view))
 
 (defun qq-group--select-group (group-id)
   "Prepare the shared group buffer to display GROUP-ID."
@@ -714,7 +677,6 @@ RESOURCE identifies a presentation-only media dependency update."
     (define-key map (kbd "m") #'qq-group-open-chat)
     (define-key map (kbd "a") #'qq-group-open-avatar)
     (define-key map (kbd "s") #'qq-group-search-members)
-    (define-key map (kbd "n") #'qq-group-open-notices)
     (define-key map (kbd "o") #'qq-group-open-owner)
     (define-key map (kbd "w") #'qq-group-copy-id)
     (define-key map (kbd "N") #'qq-group-set-name)
@@ -742,7 +704,7 @@ RESOURCE identifies a presentation-only media dependency update."
 (defun qq-group-open (group-id)
   "Open the native group profile for exact native string GROUP-ID."
   (interactive "sQQ group number: ")
-  (unless (qq-core-group-id-p group-id)
+  (unless (qq-protocol-group-uin-p group-id)
     (user-error "qq: group profile requires an exact native group id"))
   (let* ((owner (qq-runtime-require-account-id "opening a group profile"))
          (view

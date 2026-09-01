@@ -47,16 +47,16 @@
 
 (defun qq-read--cursor-p (value)
   "Return non-nil when VALUE is a canonical uint64 cursor string."
-  (qq-account--uint64-decimal-p value t))
+  (qq-protocol-uint64-decimal-p value t))
 
 (defun qq-read--message-id-p (value)
   "Return non-nil when VALUE is an exact nonzero uint64 message ID."
-  (qq-account--uint64-decimal-p value))
+  (qq-protocol-uint64-decimal-p value))
 
 (defun qq-read--position-p (value)
   "Return non-nil when VALUE is a closed unread message position."
   (and (qq-read--closed-object-p value '(sequence message_id))
-       (qq-account--uint64-decimal-p (alist-get 'sequence value))
+       (qq-protocol-uint64-decimal-p (alist-get 'sequence value))
        (let ((message-id (alist-get 'message_id value)))
          (or (null message-id) (qq-read--message-id-p message-id)))))
 
@@ -66,13 +66,13 @@
        (pcase (alist-get 'kind value)
          ("group"
           (and (qq-read--closed-object-p value '(kind group_uin))
-               (qq-account--uint64-decimal-p (alist-get 'group_uin value))))
+               (qq-protocol-uint64-decimal-p (alist-get 'group_uin value))))
          ("private"
           (and (qq-read--closed-object-p
                 value '(kind peer_uid) '(peer_uin))
-               (qq-account--non-empty-string-p (alist-get 'peer_uid value))
+               (qq-protocol-non-empty-string-p (alist-get 'peer_uid value))
                (let ((uin (alist-get 'peer_uin value)))
-                 (or (null uin) (qq-account--uint64-decimal-p uin)))))
+                 (or (null uin) (qq-protocol-uint64-decimal-p uin)))))
          (_ nil))))
 
 (defun qq-read--message-count-p (value)
@@ -144,7 +144,7 @@
    (qq-read--conversation-p (alist-get 'conversation value))
    (qq-read--cursor-p (alist-get 'read_sequence value))
    (qq-read--cursor-p (alist-get 'latest_sequence value))
-   (not (qq-account--decimal-less-p
+   (not (qq-protocol-decimal-less-p
          (alist-get 'latest_sequence value)
          (alist-get 'read_sequence value)))
    (qq-read--unread-p (alist-get 'unread value))
@@ -173,11 +173,11 @@
           (cl-every
            (lambda (position)
              (let ((sequence (alist-get 'sequence position)))
-               (and (qq-account--decimal-less-p read sequence)
-                    (not (qq-account--decimal-less-p latest sequence))
+               (and (qq-protocol-decimal-less-p read sequence)
+                    (not (qq-protocol-decimal-less-p latest sequence))
                     (or (null first-sequence)
                         (equal sequence first-sequence)
-                        (qq-account--decimal-less-p first-sequence sequence)))))
+                        (qq-protocol-decimal-less-p first-sequence sequence)))))
            positions)))))
 
 (defun qq-read--state-key (state)
@@ -192,7 +192,7 @@
 
 When EXPECTED-ACCOUNT-ID is non-nil, reject a contradictory owner."
   (unless (and (qq-read--closed-object-p value '(account_id states))
-               (qq-account--non-empty-string-p (alist-get 'account_id value))
+               (qq-protocol-non-empty-string-p (alist-get 'account_id value))
                (or (null expected-account-id)
                    (equal expected-account-id (alist-get 'account_id value)))
                (proper-list-p (alist-get 'states value)))
@@ -282,7 +282,7 @@ When EXPECTED-ACCOUNT-ID is non-nil, reject a contradictory owner."
 
 (defun qq-read--request-states (method account-id callback errback)
   "Request ACCOUNT-ID's read states through METHOD."
-  (unless (qq-account--non-empty-string-p account-id)
+  (unless (qq-protocol-non-empty-string-p account-id)
     (user-error "qq: conversation read states require an account slot"))
   (qq-rpc-call
    method `((account_id . ,account-id))
@@ -361,7 +361,7 @@ When EXPECTED-ACCOUNT-ID is non-nil, reject a contradictory owner."
       (progn
         (unless (and (equal event "conversation.read_state_changed")
                      (qq-read--closed-object-p data '(account_id state))
-                     (qq-account--non-empty-string-p
+                     (qq-protocol-non-empty-string-p
                       (alist-get 'account_id data))
                      (qq-read--state-p (alist-get 'state data)))
           (error "qq: malformed conversation read-state event"))
@@ -373,7 +373,7 @@ When EXPECTED-ACCOUNT-ID is non-nil, reject a contradictory owner."
            (qq-read--next-observation-token))))
     (error
      (let ((reason (error-message-string error-data)))
-       (qq-account--run-hook
+       (qq-rpc-run-hook
         'qq-read-projection-error-hook event (copy-tree data) reason)
        (message "qq: Gateway %s projection skipped: %s" event reason)))))
 

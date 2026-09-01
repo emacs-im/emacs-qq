@@ -64,15 +64,15 @@
       (should (eq delivered t)))))
 
 (ert-deftest qq-account-uint64-wire-predicate-is-exact-and-bounded ()
-  (should (qq-account--uint64-decimal-p "1"))
+  (should (qq-protocol-uint64-decimal-p "1"))
   (should
-   (qq-account--uint64-decimal-p qq-account--max-uint64-decimal))
-  (should (qq-account--uint64-decimal-p "0" t))
+   (qq-protocol-uint64-decimal-p qq-protocol--max-uint64-decimal))
+  (should (qq-protocol-uint64-decimal-p "0" t))
   (dolist (value
            '(nil 0 "0" "00" "01" "-1" "18446744073709551616"))
-    (should-not (qq-account--uint64-decimal-p value)))
+    (should-not (qq-protocol-uint64-decimal-p value)))
   (dolist (value '("00" "01" "18446744073709551616"))
-    (should-not (qq-account--uint64-decimal-p value t))))
+    (should-not (qq-protocol-uint64-decimal-p value t))))
 
 (ert-deftest qq-account-online-devices-preserve-independent-source-rosters ()
   (qq-account-test-with-state

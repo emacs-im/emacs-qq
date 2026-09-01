@@ -117,9 +117,6 @@
       (qq-core-disconnect))
     (should (equal (nreverse calls) '(activate native-start native-stop)))))
 
-(ert-deftest qq-core-unported-actions-fail-closed ()
-  (should-error
-   (qq-api-call "get_login_info" nil #'ignore) :type 'user-error))
 
 (ert-deftest qq-core-events-project-the-owned-account-slot ()
   (qq-core-test-with-managed-account
@@ -796,8 +793,8 @@
                            (lambda (left right)
                              (string< (symbol-name left) (symbol-name right))))
                      '(card kick title)))
-      (should (qq-core-group-id-p "8209413637"))
-      (should (qq-core-user-id-p "9007199254741001")))))
+      (should (qq-protocol-group-uin-p "8209413637"))
+      (should (qq-protocol-user-uin-p "9007199254741001")))))
 
 (ert-deftest qq-core-member-search-filters-cached-exact-ids ()
   (let (result fetched)

@@ -30,12 +30,12 @@
   (pcase (alist-get 'kind identity)
     ("uin"
      (let ((uin (alist-get 'uin identity)))
-       (unless (qq-account--uint64-decimal-p uin)
+       (unless (qq-protocol-uint64-decimal-p uin)
          (error "qq: Gateway returned an invalid GrayTip UIN identity"))
        `((kind . "uin") (uin . ,uin))))
     ("uid"
      (let ((uid (alist-get 'uid identity)))
-       (unless (qq-account--non-empty-string-p uid)
+       (unless (qq-protocol-non-empty-string-p uid)
          (error "qq: Gateway returned an invalid GrayTip UID identity"))
        `((kind . "uid") (uid . ,uid))))
     (_ (error "qq: Gateway returned an unsupported GrayTip identity"))))
@@ -183,7 +183,7 @@
           (and (alist-get 'operator payload)
                (qq-gray-tip--identity (alist-get 'operator payload))))
          (duration (alist-get 'duration_seconds payload)))
-    (unless (qq-account--uint32-p duration)
+    (unless (qq-protocol-uint32-p duration)
       (error "qq: Gateway returned an invalid group-mute duration"))
     (let* ((operator (and operator-identity
                           (qq-gray-tip--user-part

@@ -89,7 +89,7 @@ PART is one of the symbols `content' and `thumbnail'."
           qq-remote-media--order nil
           qq-remote-media--playable-resources (make-hash-table :test #'equal))
     (when changed
-      (qq-account--run-hook 'qq-remote-media-changed-hook reason nil))))
+      (qq-rpc-run-hook 'qq-remote-media-changed-hook reason nil))))
 
 (defun qq-remote-media-reset ()
   "Forget client remote-media projection without mutating service state."
@@ -131,7 +131,7 @@ PART is one of the symbols `content' and `thumbnail'."
             (append qq-remote-media--order (list media-id))))
     (unless (equal snapshot existing)
       (puthash media-id snapshot qq-remote-media--media)
-      (qq-account--run-hook 'qq-remote-media-changed-hook reason media-id))
+      (qq-rpc-run-hook 'qq-remote-media-changed-hook reason media-id))
     (qq-server-value-copy snapshot)))
 
 (defun qq-remote-media--replace (snapshots reason)
@@ -146,7 +146,7 @@ PART is one of the symbols `content' and `thumbnail'."
         (push media-id order)))
     (setq qq-remote-media--media next
           qq-remote-media--order (nreverse order))
-    (qq-account--run-hook 'qq-remote-media-changed-hook reason nil)
+    (qq-rpc-run-hook 'qq-remote-media-changed-hook reason nil)
     (qq-remote-media-list)))
 
 (defun qq-remote-media--remove (media-id reason)
@@ -155,7 +155,7 @@ PART is one of the symbols `content' and `thumbnail'."
     (remhash media-id qq-remote-media--media)
     (remhash media-id qq-remote-media--playable-resources)
     (setq qq-remote-media--order (delete media-id qq-remote-media--order))
-    (qq-account--run-hook 'qq-remote-media-changed-hook reason media-id)
+    (qq-rpc-run-hook 'qq-remote-media-changed-hook reason media-id)
     t))
 
 (defun qq-remote-media-refresh (&optional callback errback reason)
@@ -260,18 +260,18 @@ receives the materialized media snapshot; ERRBACK receives terminal failure."
                 (cond
                  ((null media)
                   (qq-request-watch-cancel watch)
-                  (qq-account--client-error
+                  (qq-rpc-client-error
                    errback "media_disappeared" "Remote media disappeared"))
                  ((null (qq-remote-media-part media part))
                   (qq-request-watch-cancel watch)
-                  (qq-account--client-error
+                  (qq-rpc-client-error
                    errback "media_part_unavailable"
                    "Remote media part is unavailable"))
                  ((equal
                    (alist-get 'phase (qq-remote-media-part media part))
                    "materialized")
                   (qq-request-watch-cancel watch)
-                  (qq-account--invoke callback media))
+                  (qq-rpc-invoke callback media))
                  ((equal
                    (alist-get 'phase (qq-remote-media-part media part))
                    "failed")
@@ -279,7 +279,7 @@ receives the materialized media snapshot; ERRBACK receives terminal failure."
                   (let ((problem
                          (alist-get
                           'error (qq-remote-media-part media part))))
-                    (qq-account--client-error
+                    (qq-rpc-client-error
                      errback
                      (or (alist-get 'code problem) "media_materialize_failed")
                      "%s"
@@ -289,7 +289,7 @@ receives the materialized media snapshot; ERRBACK receives terminal failure."
                    (alist-get 'phase (qq-remote-media-part media part))
                    "available")
                   (qq-request-watch-cancel watch)
-                  (qq-account--client-error
+                  (qq-rpc-client-error
                    errback "media_materialize_canceled"
                    "Remote media materialization was canceled")))))))
     (add-hook 'qq-remote-media-changed-hook observer)
@@ -371,7 +371,7 @@ convention.  Return a cancellable `qq-remote-media-operation'."
           (when (qq-remote-media-operation-active-p operation)
             (setf (qq-remote-media-operation-active-p operation) nil)
             (qq-remote-media--cancel-operation-local operation)
-            (qq-account--invoke errback body reason)))
+            (qq-rpc-invoke errback body reason)))
          (ensure-account
           ()
           (if (qq-remote-media--account-current-p operation)
@@ -506,7 +506,7 @@ Return a cancellable `qq-remote-media-operation'."
           (when (qq-remote-media-operation-active-p operation)
             (setf (qq-remote-media-operation-active-p operation) nil)
             (qq-remote-media--cancel-operation-local operation)
-            (qq-account--invoke errback body reason)))
+            (qq-rpc-invoke errback body reason)))
          (ensure-account
           ()
           (if (qq-remote-media--account-current-p operation)
@@ -688,7 +688,7 @@ Return a cancellable `qq-remote-media-operation'."
 (defun qq-remote-media--handle-projection-resync (projection body)
   "Resynchronize after runtime PROJECTION events were lost with BODY."
   (when (equal projection "remote_media")
-    (qq-account--run-hook 'qq-remote-media-desync-hook body)
+    (qq-rpc-run-hook 'qq-remote-media-desync-hook body)
     (qq-remote-media--request-resync 'resync)))
 
 (add-hook 'qq-resource-changed-hook

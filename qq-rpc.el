@@ -27,6 +27,21 @@ Ordinary callback errors are isolated from Gateway request machinery."
        (message "qq: Gateway RPC callback failed: %s"
                 (error-message-string error-data))))))
 
+(defun qq-rpc-run-hook (hook &rest arguments)
+  "Run each function on HOOK with owned copies of ARGUMENTS.
+
+Consumer errors are isolated from Gateway event and projection machinery."
+  (apply
+   #'run-hook-wrapped hook
+   (lambda (function &rest hook-arguments)
+     (condition-case error-data
+         (apply function (mapcar #'qq-server-value-copy hook-arguments))
+       (error
+        (message "qq: Gateway client hook %s failed in %S: %s"
+                 hook function (error-message-string error-data))))
+     nil)
+   arguments))
+
 (defun qq-rpc-client-error
     (errback code format-string &rest arguments)
   "Synchronously invoke ERRBACK with client CODE and formatted reason.

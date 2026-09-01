@@ -69,7 +69,7 @@
 
 (defun qq-resource--safe-name-p (value)
   "Return non-nil when VALUE is one safe staged-resource display basename."
-  (and (qq-account--non-empty-string-p value)
+  (and (qq-protocol-non-empty-string-p value)
        (<= (string-bytes value) 255)
        (not (member value '("." "..")))
        (not (string-match-p "[/\\[:cntrl:]]" value))))
@@ -97,7 +97,7 @@
     (setq qq-resource--resources (make-hash-table :test #'equal)
           qq-resource--order nil)
     (when changed
-      (qq-account--run-hook 'qq-resource-changed-hook reason nil))))
+      (qq-rpc-run-hook 'qq-resource-changed-hook reason nil))))
 
 (defun qq-resource-reset ()
   "Forget the client resource projection without mutating service state."
@@ -116,7 +116,7 @@
         (push resource-id order)))
     (setq qq-resource--resources next
           qq-resource--order (nreverse order))
-    (qq-account--run-hook 'qq-resource-changed-hook reason nil)
+    (qq-rpc-run-hook 'qq-resource-changed-hook reason nil)
     (qq-resources)))
 
 (defun qq-resource--phase-rank (phase)
@@ -170,7 +170,7 @@
         (error "qq: Gateway resource lifecycle transition is invalid")))
       (unless (equal snapshot existing)
         (puthash resource-id snapshot qq-resource--resources)
-        (qq-account--run-hook
+        (qq-rpc-run-hook
          'qq-resource-changed-hook reason resource-id))
       (qq-server-value-copy snapshot))))
 
@@ -180,7 +180,7 @@
     (remhash resource-id qq-resource--resources)
     (setq qq-resource--order
           (delete resource-id qq-resource--order))
-    (qq-account--run-hook
+    (qq-rpc-run-hook
      'qq-resource-changed-hook reason resource-id)
     t))
 
@@ -347,16 +347,16 @@ service state.  CALLBACK receives the ready snapshot."
                 (cond
                  ((null resource)
                   (qq-request-watch-cancel watch)
-                  (qq-account--client-error
+                  (qq-rpc-client-error
                    errback "resource_disappeared"
                    "Staged resource disappeared"))
                  ((equal (alist-get 'phase resource) "ready")
                   (qq-request-watch-cancel watch)
-                  (qq-account--invoke callback resource))
+                  (qq-rpc-invoke callback resource))
                  ((member (alist-get 'phase resource) '("failed" "released"))
                   (qq-request-watch-cancel watch)
                   (let ((problem (alist-get 'error resource)))
-                    (qq-account--client-error
+                    (qq-rpc-client-error
                      errback
                      (or (alist-get 'code problem) "resource_released")
                      "%s"
@@ -465,7 +465,7 @@ AFTER is an opaque cursor returned by the previous page.  LIMIT defaults to
 
 (defun qq-resource--handle-ready (instance-id)
   "Synchronize resources after Gateway ready INSTANCE-ID."
-  (unless (qq-account--non-empty-string-p instance-id)
+  (unless (qq-protocol-non-empty-string-p instance-id)
     (error "qq: Gateway ready instance identity is malformed"))
   (unless (equal instance-id qq-resource--gateway-instance-id)
     (qq-resource--clear 'gateway-changed))
@@ -489,7 +489,7 @@ AFTER is an opaque cursor returned by the previous page.  LIMIT defaults to
 (defun qq-resource--handle-projection-resync (projection body)
   "Resynchronize after runtime PROJECTION events were lost with BODY."
   (when (equal projection "resources")
-    (qq-account--run-hook
+    (qq-rpc-run-hook
      'qq-resource-desync-hook
      body)
     (qq-resource--request-resync 'resync)))

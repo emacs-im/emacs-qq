@@ -29,6 +29,18 @@
   (dolist (session-key session-keys)
     (puthash session-key t qq-state--recent-session-key-set)))
 
+(defun qq-root-test-session-preview-text (session)
+  "Flatten SESSION's projected one-line preview for assertions."
+  (let* ((preview (qq-root--session-preview-model session))
+         (label (or (appkit-ui-one-line-preview-label preview) ""))
+         (separator (or (appkit-ui-one-line-preview-separator preview) ""))
+         (text (or (appkit-ui-one-line-preview-text preview) "")))
+    (appkit-ui-one-line-text
+     (if (string-empty-p label)
+         text
+       (concat label separator
+               (unless (string-empty-p text) (concat " " text)))))))
+
 (defmacro qq-root-test-with-live-view (&rest body)
   "Run BODY in a uniquely named live Appkit root view.
 
@@ -228,11 +240,11 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
 (ert-deftest qq-root-muted-session-without-unread-has-no-activity-trail ()
   (let ((session '((muted-p . t) (unread-badge-count . 0))))
     (should (equal "" (qq-root--session-unread-trail session)))
-    (should (equal "" (qq-root--session-preview-text session)))))
+    (should (equal "" (qq-root-test-session-preview-text session)))))
 
 (ert-deftest qq-root-session-preview-is-always-one-line ()
   (should (equal "first second third"
-                 (qq-root--session-preview-text
+                 (qq-root-test-session-preview-text
                   '((last-message-preview . " first\nsecond\r\n  third "))))))
 
 (ert-deftest qq-root-group-preview-shows-latest-sender ()
@@ -322,7 +334,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                 (appkit-ui-one-line-preview-text preview)))
         (should
          (equal "Alice: [image]"
-                (qq-root--session-preview-text session)))))))
+                (qq-root-test-session-preview-text session)))))))
 
 (ert-deftest qq-root-private-preview-shows-sender-only-when-outgoing ()
   (let ((incoming '((type . private)
@@ -333,8 +345,8 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                     (last-message-sender-name . "Me")
                     (last-message-self-p . t)
                     (last-message-preview . "hello"))))
-    (should (equal "hello" (qq-root--session-preview-text incoming)))
-    (should (equal "Me: hello" (qq-root--session-preview-text outgoing)))
+    (should (equal "hello" (qq-root-test-session-preview-text incoming)))
+    (should (equal "Me: hello" (qq-root-test-session-preview-text outgoing)))
     (should
      (equal (list (appkit-name-color-face "Me") 'qq-msg-self-title)
             (appkit-ui-one-line-preview-label-face
@@ -344,7 +356,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
   (dolist (type '(service dataline))
     (should
      (equal "Henrik: subject"
-            (qq-root--session-preview-text
+            (qq-root-test-session-preview-text
              `((type . ,type)
                (last-message-sender-name . "QQ Mail")
                (last-message-self-p . t)
@@ -352,7 +364,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
 
 (ert-deftest qq-root-does-not-invent-a-missing-message-preview ()
   (should (equal ""
-                 (qq-root--session-preview-text
+                 (qq-root-test-session-preview-text
                   '((type . group)
                     (last-message-id . "9007199254741004991")
                     (last-message-sender-name . "Alice"))))))
@@ -442,33 +454,7 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
     (should (equal "first" (qq-root--session-key-at-point 4)))
     (should (equal "second" (qq-root--session-key-at-point)))))
 
-(ert-deftest qq-root-search-chooses-session-before-message-search ()
-  (qq-root-test-with-reset
-   (qq-state-upsert-session
-    "private:10001"
-    '((type . private) (title . "Alice") (target-id . "10001"))
-    nil)
-   (qq-state-upsert-session
-    "service:mail"
-    '((type . service) (title . "QQ Mail"))
-    nil)
-   (let (call offered)
-     (cl-letf (((symbol-function 'completing-read)
-                (lambda (_prompt collection &rest _args)
-                  (setq offered collection)
-                  (caar collection)))
-               ((symbol-function 'qq-search-open)
-                (lambda (&rest args) (setq call args))))
-       (qq-root-search "needle"))
-     (should (= (length offered) 1))
-     (should (string-match-p "Alice" (caar offered)))
-     (should (equal call '("private:10001" "needle"))))))
 
-(ert-deftest qq-root-search-bindings-separate-session-find-and-message-search ()
-  (should (eq (lookup-key qq-root-mode-map (kbd "/"))
-              #'qq-root-open-session))
-  (should (eq (lookup-key qq-root-mode-map (kbd "s"))
-              #'qq-root-search)))
 
 (ert-deftest qq-root-projects-navigation-without-a-key-cheat-sheet ()
   (qq-root-test-with-reset

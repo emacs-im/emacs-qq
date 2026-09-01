@@ -90,7 +90,7 @@ behalf of one caller."
     (setq qq-attachment--attachments (make-hash-table :test #'equal)
           qq-attachment--order nil)
     (when changed
-      (qq-account--run-hook
+      (qq-rpc-run-hook
        'qq-attachment-changed-hook reason nil))))
 
 (defun qq-attachment-reset ()
@@ -110,7 +110,7 @@ behalf of one caller."
         (push attachment-id order)))
     (setq qq-attachment--attachments next
           qq-attachment--order (nreverse order))
-    (qq-account--run-hook 'qq-attachment-changed-hook reason nil)
+    (qq-rpc-run-hook 'qq-attachment-changed-hook reason nil)
     (qq-attachments)))
 
 (defun qq-attachment--phase-rank (phase)
@@ -173,7 +173,7 @@ immutable."
       (setq snapshot existing))
      ((and (equal (alist-get 'phase existing) "uploading")
            (equal (alist-get 'phase snapshot) "uploading")
-           (qq-account--decimal-less-p
+           (qq-protocol-decimal-less-p
             (alist-get 'bytes_done snapshot) (alist-get 'bytes_done existing)))
       (setq snapshot existing))
      ((and (member (alist-get 'phase existing)
@@ -182,7 +182,7 @@ immutable."
       (error "qq: Gateway attachment terminal snapshot changed")))
     (unless (equal snapshot existing)
       (puthash attachment-id snapshot qq-attachment--attachments)
-      (qq-account--run-hook
+      (qq-rpc-run-hook
        'qq-attachment-changed-hook reason attachment-id))
     (qq-server-value-copy snapshot)))
 
@@ -339,17 +339,17 @@ service state."
                 (cond
                  ((null snapshot)
                   (qq-request-watch-cancel watch)
-                  (qq-account--client-error
+                  (qq-rpc-client-error
                    errback "attachment_disappeared"
                    "Prepared attachment disappeared during upload"))
                  ((equal (alist-get 'phase snapshot) "ready")
                   (qq-request-watch-cancel watch)
-                  (qq-account--invoke callback snapshot))
+                  (qq-rpc-invoke callback snapshot))
                  ((member (alist-get 'phase snapshot)
                           '("failed" "consumed" "canceled"))
                   (qq-request-watch-cancel watch)
                   (let ((problem (alist-get 'error snapshot)))
-                    (qq-account--client-error
+                    (qq-rpc-client-error
                      errback
                      (or (alist-get 'code problem) "attachment_canceled")
                      "%s"
@@ -436,7 +436,7 @@ never stops an account or the long-lived service."
     (setf (qq-attachment-operation-active-p operation) nil)
     (qq-attachment--cancel-local-work operation)
     (qq-attachment--release-created operation)
-    (qq-account--invoke errback body reason)))
+    (qq-rpc-invoke errback body reason)))
 
 (defun qq-attachment--acquire-transform-and-prepare
     (media-name transform-phase acquire transform prepare callback errback)
@@ -514,7 +514,7 @@ local operation that owns every service object created before that handoff."
                              (qq-attachment-operation-attachment-watch
                               operation)
                              nil)
-                            (qq-account--invoke callback ready))))
+                            (qq-rpc-invoke callback ready))))
                       #'fail)))
                 (when (qq-request-watch-active-p watch)
                   (setf
@@ -814,7 +814,7 @@ Return a cancellable `qq-attachment-operation'."
                            (qq-attachment-operation-active-p operation) nil
                            (qq-attachment-operation-attachment-watch operation)
                            nil)
-                          (qq-account--invoke callback ready)))
+                          (qq-rpc-invoke callback ready)))
                       #'fail)))
                 (when (qq-request-watch-active-p watch)
                   (setf
@@ -908,7 +908,7 @@ ACCOUNT-ID is a stable account-slot identity.  EXPECTED-USE defaults to image
 and may be \"record\" or \"video\"."
   (unless (qq-attachment--id-p attachment-id)
     (user-error "qq: Media segment lacks an opaque attachment ID"))
-  (unless (qq-account--non-empty-string-p account-id)
+  (unless (qq-protocol-non-empty-string-p account-id)
     (user-error "qq: Prepared attachment requires a stable account ID"))
   (let ((expected-use (or expected-use "image"))
         (snapshot (qq-attachment attachment-id))
@@ -939,7 +939,7 @@ and may be \"record\" or \"video\"."
 
 (defun qq-attachment--handle-ready (instance-id)
   "Synchronize attachments after Gateway ready INSTANCE-ID."
-  (unless (qq-account--non-empty-string-p instance-id)
+  (unless (qq-protocol-non-empty-string-p instance-id)
     (error "qq: Gateway ready instance identity is malformed"))
   (unless (equal instance-id qq-attachment--gateway-instance-id)
     (qq-attachment--clear 'gateway-changed))
@@ -960,7 +960,7 @@ and may be \"record\" or \"video\"."
 (defun qq-attachment--handle-projection-resync (projection body)
   "Resynchronize after runtime PROJECTION events were lost with BODY."
   (when (equal projection "attachments")
-    (qq-account--run-hook
+    (qq-rpc-run-hook
      'qq-attachment-desync-hook
      body)
     (qq-attachment--request-resync 'resync)))
