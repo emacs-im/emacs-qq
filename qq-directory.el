@@ -78,7 +78,7 @@
     (dolist (friend friends)
       (unless (gethash (alist-get 'category_id friend) category-ids)
         (error "qq: Gateway friend belongs to an unknown category"))
-      (unless (and (qq-account--non-empty-string-p
+      (unless (and (qq-protocol-non-empty-string-p
                     (alist-get 'avatar_url friend))
                    (string-prefix-p "https://"
                                     (alist-get 'avatar_url friend)))
@@ -484,13 +484,13 @@ Gateway error conventions."
                     (when (qq-directory--finish-request
                            request 'settled)
                       (qq-runtime-with-account owner
-                        (qq-account--invoke callback value))))
+                        (qq-rpc-invoke callback value))))
                   :errback
                   (lambda (body reason)
                     (when (qq-directory--finish-request
                            request 'failed)
                       (qq-runtime-with-account owner
-                        (qq-account--invoke errback body reason)))))))
+                        (qq-rpc-invoke errback body reason)))))))
             (when (and token
                        (qq-directory--request-current-p request))
               (setf
@@ -541,7 +541,7 @@ force the Native Session to replace its contact cache."
 (defun qq-directory-set-friend-pinned
     (friend-uin pinned &optional callback errback)
   "Set FRIEND-UIN's conversation PINNED state through the native service."
-  (unless (qq-account--canonical-decimal-p friend-uin)
+  (unless (qq-protocol-uint64-decimal-p friend-uin)
     (user-error "qq: Friend pinned state requires an exact decimal UIN"))
   (setq pinned (if pinned t :false))
   (let ((owner (qq-directory--current-owner)))
@@ -559,7 +559,7 @@ force the Native Session to replace its contact cache."
 (defun qq-directory--set-group-setting
     (method group-uin field value callback errback)
   "Send group setting METHOD with FIELD and VALUE for GROUP-UIN."
-  (unless (qq-account--canonical-decimal-p group-uin)
+  (unless (qq-protocol-uint64-decimal-p group-uin)
     (user-error "qq: Group setting requires an exact decimal group UIN"))
   (let ((owner (qq-directory--current-owner)))
     (qq-rpc-call
@@ -608,7 +608,7 @@ force the Native Session to replace its contact cache."
 (defun qq-directory-clock-in-group
     (group-uin &optional callback errback)
   "Clock the current buffer's QQ account into exact GROUP-UIN."
-  (unless (qq-account--canonical-decimal-p group-uin)
+  (unless (qq-protocol-uint64-decimal-p group-uin)
     (user-error "qq: Group clock-in requires an exact group UIN"))
   (let ((owner (qq-directory--current-owner)))
     (qq-rpc-call
@@ -624,7 +624,7 @@ force the Native Session to replace its contact cache."
 (defun qq-directory-get-group-at-all-remaining
     (group-uin &optional callback errback)
   "Fetch live @all availability and quotas for exact GROUP-UIN."
-  (unless (qq-account--canonical-decimal-p group-uin)
+  (unless (qq-protocol-uint64-decimal-p group-uin)
     (user-error "qq: Group @all quota requires an exact group UIN"))
   (let ((owner (qq-directory--current-owner)))
     (qq-rpc-call
@@ -644,7 +644,7 @@ force the Native Session to replace its contact cache."
 This method cannot dismiss a group.  A successful receipt revokes cached
 member data and any older group or member request that could reintroduce the
 departed group."
-  (unless (qq-account--canonical-decimal-p group-uin)
+  (unless (qq-protocol-uint64-decimal-p group-uin)
     (user-error "qq: Group leave requires an exact group UIN"))
   (let ((owner (qq-directory--current-owner)))
     (qq-rpc-call
@@ -691,9 +691,9 @@ receipt."
 (defun qq-directory--set-group-member-setting
     (method group-uin target-uin field cache-field value callback errback)
   "Send group-member setting METHOD and update its projected CACHE-FIELD."
-  (unless (qq-account--canonical-decimal-p group-uin)
+  (unless (qq-protocol-uint64-decimal-p group-uin)
     (user-error "qq: Group-member setting requires an exact group UIN"))
-  (unless (qq-account--canonical-decimal-p target-uin)
+  (unless (qq-protocol-uint64-decimal-p target-uin)
     (user-error "qq: Group-member setting requires an exact target UIN"))
   (unless (stringp value)
     (user-error "qq: Group-member setting value must be a string"))
@@ -754,9 +754,9 @@ member is left untouched, and no incomplete directory state is invented."
 (defun qq-directory-kick-group-member
     (group-uin target-uin reject-add-request &optional callback errback)
   "Remove TARGET-UIN from GROUP-UIN through the native service."
-  (unless (qq-account--canonical-decimal-p group-uin)
+  (unless (qq-protocol-uint64-decimal-p group-uin)
     (user-error "qq: Group kick requires an exact group UIN"))
-  (unless (qq-account--canonical-decimal-p target-uin)
+  (unless (qq-protocol-uint64-decimal-p target-uin)
     (user-error "qq: Group kick requires an exact target UIN"))
   (let* ((owner (qq-directory--current-owner))
          (wire-reject (if reject-add-request t :false)))
@@ -783,7 +783,7 @@ member is left untouched, and no incomplete directory state is invented."
 
 ERRBACK receives a Gateway error body and reason.  When REFRESH is non-nil,
 force the Native Session to replace its member cache."
-  (unless (qq-account--canonical-decimal-p group-uin)
+  (unless (qq-protocol-uint64-decimal-p group-uin)
     (user-error "qq: Group UIN must be an exact decimal string"))
   (qq-directory--request
    (cons 'group-members group-uin) "contact.list_group_members"

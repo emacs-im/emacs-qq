@@ -37,18 +37,11 @@
 (require 'qq-core)
 (require 'qq-login)
 (require 'qq-chat)
-(require 'qq-search)
 (require 'qq-media)
 (require 'qq-forward)
-(require 'qq-red-packet)
-(require 'qq-user-photo)
 (require 'qq-user)
-(require 'qq-guild-user)
-(require 'qq-guild-channel)
-(require 'qq-guild-forum)
 (require 'qq-group)
 (require 'qq-contacts)
-(require 'qq-guilds)
 (require 'qq-root)
 (require 'qq-presence)
 (require 'qq-transient)
@@ -61,16 +54,8 @@
     qq-contacts-mode
     qq-forward-mode
     qq-group-mode
-    qq-group-notices-mode
-    qq-guild-channel-mode
-    qq-guild-forum-mode
-    qq-guild-user-mode
-    qq-guilds-mode
-    qq-red-packet-mode
     qq-root-mode
-    qq-search-mode
-    qq-user-mode
-    qq-user-photo-mode)
+    qq-user-mode)
   "Major modes whose buffers contain account-scoped QQ client data.")
 
 (defconst qq--reset-drain-limit 128

@@ -67,72 +67,6 @@ Gateway-owned registry from an authoritative snapshot.")
 (defvar qq-account--resync-request-id nil
   "Identity of the in-flight automatic account registry resync.")
 
-(defun qq-account--run-hook (hook &rest arguments)
-  "Run each function on HOOK with ARGUMENTS, isolating consumer errors."
-  (apply
-   #'run-hook-wrapped hook
-   (lambda (function &rest hook-arguments)
-     (condition-case error-data
-         (apply function (mapcar #'qq-server-value-copy hook-arguments))
-       (error
-        (message "qq: Gateway client hook %s failed in %S: %s"
-                 hook function (error-message-string error-data))))
-     nil)
-   arguments))
-
-(defun qq-account--invoke (callback &rest arguments)
-  "Invoke CALLBACK with owned copies of ARGUMENTS."
-  (apply #'qq-rpc-invoke callback arguments))
-
-(defun qq-account--client-error (errback code format-string &rest arguments)
-  "Invoke ERRBACK with client CODE.
-
-FORMAT-STRING and ARGUMENTS produce the human-readable failure text."
-  (apply #'qq-rpc-client-error
-         errback code format-string arguments))
-
-(defun qq-account--exact-object-keys-p (object keys)
-  "Return non-nil when alist OBJECT has exactly symbol KEYS."
-  (qq-server-wire-exact-object-keys-p object keys))
-
-(defun qq-account--non-empty-string-p (value)
-  "Return non-nil when VALUE is a non-empty string."
-  (and (stringp value) (not (string-empty-p value))))
-
-(defun qq-account--canonical-decimal-p (value &optional allow-zero)
-  "Return non-nil when VALUE is a canonical decimal string.
-
-When ALLOW-ZERO is non-nil, the exact string `0' is accepted."
-  (and (stringp value)
-       (if allow-zero
-           (string-match-p "\\`\\(?:0\\|[1-9][0-9]*\\)\\'" value)
-         (string-match-p "\\`[1-9][0-9]*\\'" value))))
-
-(defconst qq-account--max-uint64-decimal
-  "18446744073709551615"
-  "Largest exact unsigned 64-bit integer accepted on the Gateway wire.")
-
-(defun qq-account--decimal-less-p (left right)
-  "Return non-nil when canonical decimal LEFT is less than RIGHT.
-
-The comparison never coerces either protocol value to an Emacs number."
-  (or (< (length left) (length right))
-      (and (= (length left) (length right))
-           (string-lessp left right))))
-
-(defun qq-account--uint64-decimal-p (value &optional allow-zero)
-  "Return non-nil when VALUE is a canonical uint64 decimal string.
-
-VALUE is compared as decimal text and is never coerced to an Emacs number.
-By default zero is rejected; when ALLOW-ZERO is non-nil, only the exact
-canonical string `0' additionally qualifies."
-  (and (qq-account--canonical-decimal-p value allow-zero)
-       (not (qq-account--decimal-less-p
-             qq-account--max-uint64-decimal value))))
-
-(defun qq-account--uint32-p (value)
-  "Return non-nil when VALUE is an exact unsigned 32-bit integer."
-  (and (integerp value) (<= 0 value #xffffffff)))
 
 (defun qq-account-get (account-id)
   "Return a copy of managed ACCOUNT-ID's snapshot, or nil."
@@ -164,7 +98,7 @@ canonical string `0' additionally qualifies."
     (let ((old qq-account--current-account-id))
       (setq qq-account--current-account-id
             (and account-id (copy-sequence account-id)))
-      (qq-account--run-hook
+      (qq-rpc-run-hook
        'qq-account-selection-changed-hook old account-id)))
   account-id)
 
@@ -229,7 +163,7 @@ canonical string `0' additionally qualifies."
           qq-account--gateway-instance-id
           (and instance-id (copy-sequence instance-id)))
     (qq-account--maybe-select-single-account)
-    (qq-account--run-hook 'qq-account-registry-changed-hook reason nil)
+    (qq-rpc-run-hook 'qq-account-registry-changed-hook reason nil)
     (qq-account-list)))
 
 (defun qq-account--upsert-account (raw-snapshot reason)
@@ -243,7 +177,7 @@ canonical string `0' additionally qualifies."
     (unless (equal existing snapshot)
       (puthash account-id snapshot qq-account--accounts)
       (qq-account--maybe-select-single-account)
-      (qq-account--run-hook
+      (qq-rpc-run-hook
        'qq-account-registry-changed-hook reason account-id))
     snapshot))
 
@@ -255,7 +189,7 @@ canonical string `0' additionally qualifies."
       (setq qq-account--account-order
             (delete account-id qq-account--account-order))
       (qq-account--maybe-select-single-account)
-      (qq-account--run-hook
+      (qq-rpc-run-hook
        'qq-account-registry-changed-hook reason account-id))
     old))
 
@@ -282,7 +216,7 @@ CALLBACK receives the domain account snapshot and ERRBACK receives a protocol
 error body plus reason.
 
 When REMOVE-P is non-nil, remove the returned snapshot instead of merging it."
-  (unless (qq-account--non-empty-string-p account-id)
+  (unless (qq-protocol-non-empty-string-p account-id)
     (user-error "qq: Account ID must be a non-empty opaque string"))
   (qq-rpc-call
    method `((account_id . ,account-id))
@@ -336,7 +270,7 @@ CALLBACK receives t; ERRBACK receives a failure body and reason."
    "device.reset" nil
    :projector
    (lambda (result)
-     (unless (qq-account--exact-object-keys-p result nil)
+     (unless (qq-server-wire-exact-object-keys-p result nil)
        (error "qq: Gateway returned an invalid Device Reset receipt"))
      t)
    :callback callback
@@ -353,7 +287,7 @@ CALLBACK receives its snapshot; ERRBACK receives a failure body and reason."
          #'qq-account--interactive-success
          #'qq-account--interactive-error))
   (when label
-    (unless (and (qq-account--non-empty-string-p label)
+    (unless (and (qq-protocol-non-empty-string-p label)
                  (equal label (string-trim label))
                  (<= (length label) 128))
       (user-error "qq: Account label must be trimmed and at most 128 characters")))
@@ -389,7 +323,7 @@ CALLBACK receives the snapshot; ERRBACK receives a failure body and reason."
 CALLBACK receives an acknowledgement carrying the account ID and
 requested presence.  This command does not change the account lifecycle phase
 or store presence in the local account snapshot."
-  (unless (qq-account--non-empty-string-p account-id)
+  (unless (qq-protocol-non-empty-string-p account-id)
     (user-error "qq: Account ID must be a non-empty opaque string"))
   (setq presence
         (qq-protocol-validate-account-presence
@@ -404,47 +338,47 @@ or store presence in the local account snapshot."
 
 (defun qq-account--device-common-fields-p (device)
   "Return non-nil when DEVICE has valid common roster fields."
-  (and (qq-account--uint32-p (alist-get 'instance_id device))
+  (and (qq-protocol-uint32-p (alist-get 'instance_id device))
        (> (alist-get 'instance_id device) 0)
        (let ((client-type (alist-get 'client_type device)))
-         (or (null client-type) (qq-account--uint32-p client-type)))
+         (or (null client-type) (qq-protocol-uint32-p client-type)))
        (member (alist-get 'kind device)
                '("computer" "phone" "pad" "unknown"))
        (let ((platform-id (alist-get 'platform_id device)))
-         (or (null platform-id) (qq-account--uint32-p platform-id)))
+         (or (null platform-id) (qq-protocol-uint32-p platform-id)))
        (let ((name (alist-get 'device_name device)))
          (or (null name) (stringp name)))))
 
 (defun qq-account--online-client-p (device)
   "Return non-nil when DEVICE is a closed PushParams client row."
   (and
-   (qq-account--exact-object-keys-p
+   (qq-server-wire-exact-object-keys-p
     device '(instance_id client_type kind state platform_id platform_type
              new_client_type device_name))
    (qq-account--device-common-fields-p device)
    (let ((state (alist-get 'state device)))
-     (or (null state) (qq-account--uint32-p state)))
+     (or (null state) (qq-protocol-uint32-p state)))
    (let ((platform-type (alist-get 'platform_type device)))
      (or (null platform-type) (stringp platform-type)))
    (let ((client-type (alist-get 'new_client_type device)))
-     (or (null client-type) (qq-account--uint32-p client-type)))))
+     (or (null client-type) (qq-protocol-uint32-p client-type)))))
 
 (defun qq-account--dataline-candidate-p (device)
   "Return non-nil when DEVICE is a closed 528/349 candidate row."
   (and
-   (qq-account--exact-object-keys-p
+   (qq-server-wire-exact-object-keys-p
     device '(app_id instance_id client_type kind platform_id device_name
              field_11))
    (qq-account--device-common-fields-p device)
    (let ((app-id (alist-get 'app_id device)))
-     (or (null app-id) (qq-account--uint32-p app-id)))
+     (or (null app-id) (qq-protocol-uint32-p app-id)))
    (let ((field-11 (alist-get 'field_11 device)))
-     (or (null field-11) (qq-account--uint32-p field-11)))))
+     (or (null field-11) (qq-protocol-uint32-p field-11)))))
 
 (defun qq-account--dataline-peer-p (peer)
   "Return non-nil when PEER is a pinned DataLine class route."
   (and
-   (qq-account--exact-object-keys-p
+   (qq-server-wire-exact-object-keys-p
     peer '(class peer_uid route_profile candidate_instance_ids))
    (let ((class (alist-get 'class peer))
          (uid (alist-get 'peer_uid peer)))
@@ -458,7 +392,7 @@ or store presence in the local account snapshot."
          valid)
      (setq valid (and (listp instances) instances))
      (dolist (instance instances)
-       (unless (and (qq-account--uint32-p instance)
+       (unless (and (qq-protocol-uint32-p instance)
                     (> instance 0)
                     (not (gethash instance seen)))
          (setq valid nil))
@@ -470,11 +404,11 @@ or store presence in the local account snapshot."
   (let ((state (alist-get 'state roster)))
     (cond
      ((equal state "unknown")
-      (unless (qq-account--exact-object-keys-p roster '(state))
+      (unless (qq-server-wire-exact-object-keys-p roster '(state))
         (error "qq: Gateway returned an open %s roster" context))
       '((state . "unknown")))
      ((equal state "observed")
-      (unless (and (qq-account--exact-object-keys-p roster '(state devices))
+      (unless (and (qq-server-wire-exact-object-keys-p roster '(state devices))
                    (listp (alist-get 'devices roster)))
         (error "qq: Gateway returned an invalid %s roster" context))
       (let ((seen-instances (make-hash-table :test #'eql))
@@ -496,11 +430,11 @@ or store presence in the local account snapshot."
   (let ((state (alist-get 'state roster)))
     (cond
      ((equal state "unknown")
-      (unless (qq-account--exact-object-keys-p roster '(state))
+      (unless (qq-server-wire-exact-object-keys-p roster '(state))
         (error "qq: Gateway returned an open DataLine-peer roster"))
       '((state . "unknown")))
      ((equal state "observed")
-      (unless (and (qq-account--exact-object-keys-p roster '(state devices))
+      (unless (and (qq-server-wire-exact-object-keys-p roster '(state devices))
                    (listp (alist-get 'devices roster)))
         (error "qq: Gateway returned an invalid DataLine-peer roster"))
       (let ((seen-classes (make-hash-table :test #'equal))
@@ -521,7 +455,7 @@ or store presence in the local account snapshot."
 (defun qq-account--project-online-devices (result expected-account-id)
   "Validate independent device RESULT rosters for EXPECTED-ACCOUNT-ID."
   (unless (and
-           (qq-account--exact-object-keys-p
+           (qq-server-wire-exact-object-keys-p
             result '(account_id online_clients data_line_candidates
                      data_line_peers))
            (equal (alist-get 'account_id result) expected-account-id))
@@ -586,7 +520,7 @@ or store presence in the local account snapshot."
             (insert
              (format "  %s — kind: %s; client type: %s; instance: %s\n"
                      (let ((name (alist-get 'device_name device)))
-                       (if (qq-account--non-empty-string-p name)
+                       (if (qq-protocol-non-empty-string-p name)
                            name
                          (capitalize (alist-get 'kind device))))
                      (alist-get 'kind device)
@@ -603,7 +537,7 @@ or store presence in the local account snapshot."
             (insert
              (format "  %s — kind: %s; client type: %s; instance: %s\n"
                      (let ((name (alist-get 'device_name device)))
-                       (if (qq-account--non-empty-string-p name)
+                       (if (qq-protocol-non-empty-string-p name)
                            name
                          (capitalize (alist-get 'kind device))))
                      (alist-get 'kind device)
@@ -660,7 +594,7 @@ the Gateway transport convention."
    (list (qq-account--read-account-id "List devices for account: ")
          #'qq-account--display-online-devices
          #'qq-account--interactive-error))
-  (unless (qq-account--non-empty-string-p account-id)
+  (unless (qq-protocol-non-empty-string-p account-id)
     (user-error "qq: Account ID must be a non-empty opaque string"))
   (unless (qq-account-get account-id)
     (user-error "qq: QQ account does not exist: %s" account-id))
@@ -690,7 +624,7 @@ CALLBACK receives the snapshot; ERRBACK receives a failure body and reason."
 
 PARAMS is called with the copied secret.  CALLBACK receives the account
 snapshot; ERRBACK receives a failure body and reason."
-  (unless (qq-account--non-empty-string-p account-id)
+  (unless (qq-protocol-non-empty-string-p account-id)
     (user-error "qq: Account ID must be a non-empty opaque string"))
   (let ((secret-copy (copy-sequence secret)))
     (unwind-protect
@@ -706,7 +640,7 @@ snapshot; ERRBACK receives a failure body and reason."
 
 (defun qq-account--project-quick-login-accounts (result)
   "Validate RESULT and return its ordered EasyLogin account metadata."
-  (unless (and (qq-account--exact-object-keys-p result '(accounts))
+  (unless (and (qq-server-wire-exact-object-keys-p result '(accounts))
                (listp (alist-get 'accounts result)))
     (error "qq: Gateway returned an invalid quick-login account list"))
   (let ((seen-uins (make-hash-table :test #'equal))
@@ -714,10 +648,10 @@ snapshot; ERRBACK receives a failure body and reason."
     (dolist (account (alist-get 'accounts result))
       (unless
           (and
-           (qq-account--exact-object-keys-p
+           (qq-server-wire-exact-object-keys-p
             account '(uin uid generated_at_unix))
-           (qq-account--uint64-decimal-p (alist-get 'uin account))
-           (qq-account--non-empty-string-p (alist-get 'uid account))
+           (qq-protocol-uint64-decimal-p (alist-get 'uin account))
+           (qq-protocol-non-empty-string-p (alist-get 'uid account))
            (integerp (alist-get 'generated_at_unix account))
            (>= (alist-get 'generated_at_unix account) 0))
         (error "qq: Gateway returned invalid quick-login account metadata"))
@@ -763,11 +697,11 @@ reason."
            (read-passwd "QQ password: ") nil
            #'qq-account--interactive-success
            #'qq-account--interactive-error)))
-  (unless (qq-account--uint64-decimal-p uin)
+  (unless (qq-protocol-uint64-decimal-p uin)
     (user-error "qq: UIN must be a canonical nonzero uint64 string"))
-  (unless (qq-account--non-empty-string-p password)
+  (unless (qq-protocol-non-empty-string-p password)
     (user-error "qq: Password must not be empty"))
-  (unless (or (null qimei) (qq-account--non-empty-string-p qimei))
+  (unless (or (null qimei) (qq-protocol-non-empty-string-p qimei))
     (user-error "qq: QIMEI must be a non-empty string or nil"))
   (qq-account--login-command
    "account.login.password" account-id
@@ -784,11 +718,11 @@ reason."
 QIMEI is optional.  CALLBACK receives the account snapshot; ERRBACK receives
 a failure body and reason.  No reusable credential material crosses the
 Gateway protocol."
-  (unless (qq-account--uint64-decimal-p uin)
+  (unless (qq-protocol-uint64-decimal-p uin)
     (user-error "qq: UIN must be a canonical nonzero uint64 string"))
-  (unless (or (null qimei) (qq-account--non-empty-string-p qimei))
+  (unless (or (null qimei) (qq-protocol-non-empty-string-p qimei))
     (user-error "qq: QIMEI must be a non-empty string or nil"))
-  (unless (qq-account--non-empty-string-p account-id)
+  (unless (qq-protocol-non-empty-string-p account-id)
     (user-error "qq: Account ID must be a non-empty opaque string"))
   (qq-rpc-call
    "account.login.quick"
@@ -810,7 +744,7 @@ TICKET, RAND-STR, and SID carry proof captured by the foreground browser
 adapter.  CALLBACK receives the account snapshot; ERRBACK receives a failure
 body and reason."
   (dolist (value (list challenge-id ticket rand-str sid))
-    (unless (qq-account--non-empty-string-p value)
+    (unless (qq-protocol-non-empty-string-p value)
       (user-error "qq: Captcha proof fields must be non-empty strings")))
   (qq-account--login-command
    "account.login.captcha" account-id
@@ -879,7 +813,7 @@ reason."
            (setq qq-account--resync-request-id nil)))
        (let ((projected
               (qq-account--replace-accounts accounts 'ready instance-id)))
-         (qq-account--run-hook 'qq-account-registry-ready-hook instance-id)
+         (qq-rpc-run-hook 'qq-account-registry-ready-hook instance-id)
          projected)))
     ("account.changed"
      (qq-account--upsert-account data 'changed))
@@ -890,7 +824,7 @@ reason."
 
 (defun qq-account--resync-accounts (body)
   "Resynchronize the account registry after transient event loss BODY."
-  (qq-account--run-hook 'qq-account-desync-hook body)
+  (qq-rpc-run-hook 'qq-account-desync-hook body)
   (qq-rpc-request-single-flight
    'qq-account--resync-request-id 'account-resync
    (lambda (success failure)
@@ -905,21 +839,21 @@ projection, so all projection owners resynchronize."
   (when (equal (alist-get 'code body) "event_stream_lagged")
     (qq-account--resync-accounts body)
     (dolist (projection qq-account--foreign-projections)
-      (qq-account--run-hook
+      (qq-rpc-run-hook
        'qq-account-projection-resync-hook projection body))))
 
 (defun qq-account--handle-resync-required (_event data)
   "Resynchronize one runtime projection after lossy DATA."
   (let ((projection (alist-get 'projection data)))
-    (unless (and (qq-account--exact-object-keys-p data '(projection skipped))
-                 (qq-account--non-empty-string-p projection)
-                 (qq-account--non-empty-string-p (alist-get 'skipped data)))
+    (unless (and (qq-server-wire-exact-object-keys-p data '(projection skipped))
+                 (qq-protocol-non-empty-string-p projection)
+                 (qq-protocol-non-empty-string-p (alist-get 'skipped data)))
       (error "qq: Malformed runtime.resync_required event"))
     (cond
      ((equal projection "accounts")
       (qq-account--resync-accounts data))
      ((member projection qq-account--foreign-projections)
-      (qq-account--run-hook
+      (qq-rpc-run-hook
        'qq-account-projection-resync-hook projection data))
      (t
       (error "qq: Unowned runtime projection %s requires resync"

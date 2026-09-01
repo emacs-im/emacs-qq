@@ -16,7 +16,6 @@
 
 (require 'transient)
 (require 'appkit-media)
-(require 'qq-api)
 (require 'qq-core)
 (require 'qq-chat)
 (require 'qq-media)
@@ -26,7 +25,6 @@
 (require 'qq-state)
 (require 'qq-user)
 (require 'qq-group)
-(require 'qq-guilds)
 
 (declare-function qq-connect "qq")
 (declare-function qq-disconnect "qq")
@@ -153,7 +151,7 @@
   "Return non-nil when the message sender has no user page."
   (let* ((message (qq-transient--message-at-point))
          (user-id (and message (alist-get 'sender-id message))))
-    (not (and (qq-api-user-id-p user-id) (not (equal user-id "0"))))))
+    (not (and (qq-protocol-user-uin-p user-id) (not (equal user-id "0"))))))
 
 (defun qq-transient--peer-user-inapt-p ()
   "Return non-nil when the current chat has no private peer user page."
@@ -163,7 +161,7 @@
                        (or (alist-get 'peer-uin session)
                            (alist-get 'target-id session)))))
     (not (and (eq (alist-get 'type session) 'private)
-              (qq-api-user-id-p user-id)))))
+              (qq-protocol-user-uin-p user-id)))))
 
 (defun qq-transient--friend-pin-inapt-p ()
   "Return non-nil when the current chat is not an authoritative friend chat."
@@ -183,8 +181,8 @@
                                   (alist-get 'peer-uin session))
                              (alist-get 'target-id session)))))
     (pcase type
-      ('private (not (qq-api-user-id-p target-id)))
-      ('group (not (qq-api-group-id-p target-id)))
+      ('private (not (qq-protocol-user-uin-p target-id)))
+      ('group (not (qq-protocol-group-uin-p target-id)))
       (_ t))))
 
 (defun qq-transient--no-reply-context-p ()
@@ -201,14 +199,6 @@
   "Return non-nil when root point is not on a session row."
   (null (ignore-errors (qq-root--session-key-at-point))))
 
-(defun qq-transient--root-user-inapt-p ()
-  "Return non-nil when the root session has no user page."
-  (let* ((session (ignore-errors (qq-root--session-at-point)))
-         (user-id (and session
-                       (or (alist-get 'peer-uin session)
-                           (alist-get 'target-id session)))))
-    (not (and (eq (alist-get 'type session) 'private)
-              (qq-api-user-id-p user-id)))))
 
 (defun qq-transient--root-info-inapt-p ()
   "Return non-nil when the root session has no profile page."
@@ -219,8 +209,8 @@
                                   (alist-get 'peer-uin session))
                              (alist-get 'target-id session)))))
     (pcase type
-      ('private (not (qq-api-user-id-p target-id)))
-      ('group (not (qq-api-group-id-p target-id)))
+      ('private (not (qq-protocol-user-uin-p target-id)))
+      ('group (not (qq-protocol-group-uin-p target-id)))
       (_ t))))
 
 
@@ -323,11 +313,6 @@ Prefer this over inline button rows."
           'merged (qq-chat-forward-plan-session-key plan))))
     (error t)))
 
-(transient-define-suffix qq-transient-forward-individually (plan)
-  "Forward PLAN as separate native messages."
-  :transient nil
-  (interactive (list (qq-transient--forward-plan-scope)))
-  (qq-chat-forward-individually plan))
 
 (transient-define-suffix qq-transient-forward-merged (plan)
   "Forward PLAN as one native merged-forward card."
@@ -346,7 +331,6 @@ Prefer this over inline button rows."
               (qq-chat-forward-plan-anchors
                (oref (transient-prefix-object) scope)))))]
   [["发送方式"
-    ("i" "逐条转发…" qq-transient-forward-individually)
     ("m" "合并转发…" qq-transient-forward-merged)]]
   (interactive (list (qq-chat--current-forward-plan)))
   (unless (qq-chat-forward-plan-p plan)
@@ -363,14 +347,6 @@ Prefer this over inline button rows."
   [["Timeline"
     ("g" "Refresh" qq-chat-refresh)
     (">" "Latest / mark read" qq-chat-read-all)
-    ("/" "Filter messages" qq-chat-filter)
-    ("M-/" "Search results" qq-chat-search-results)
-    ("x" "Cancel filter" qq-chat-filter-cancel)
-    ("X" "Cancel search" qq-chat-search-cancel)
-    ("s" "Search older" qq-chat-search)
-    ("S" "Search newer" qq-chat-search-forward)
-    ("n" "Search next" qq-chat-search-next)
-    ("p" "Search prev" qq-chat-search-prev)
     ("P" "Poke user…" qq-chat-send-poke
      :inapt-if qq-transient--poke-session-inapt-p)
     ("f" "Forward selected / at point…" qq-chat-forward-transient
@@ -436,9 +412,7 @@ Prefer this over inline button rows."
      :inapt-if qq-transient--root-info-inapt-p)
     ("I" "My profile" qq-root-open-self-user)
     ("d" "Contacts" qq-contacts-open)
-    ("G" "QQ Guilds" qq-guilds-open)
     ("/" "Find session…" qq-root-open-session)
-    ("s" "Search messages…" qq-root-search)
     ("u" "Next unread" qq-root-next-unread)]
    ["Connection"
     ("l" "Login / continue" qq-login)

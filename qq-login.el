@@ -172,7 +172,7 @@
     (let* ((code (alist-get 'code body))
            (error-text
             (format "Login failed%s: %s"
-                    (if (qq-account--non-empty-string-p code)
+                    (if (qq-protocol-non-empty-string-p code)
                         (format " [%s]" code)
                       "")
                     (or reason "native request failed"))))
@@ -274,7 +274,7 @@ that candidate source; managed accounts and new-account login remain usable."
             (qq-login--session-login-accounts-loaded-p session) t
             (qq-login--session-login-accounts session) nil)
       (message "qq: EasyLogin accounts unavailable%s: %s"
-               (if (qq-account--non-empty-string-p code)
+               (if (qq-protocol-non-empty-string-p code)
                    (format " [%s]" code)
                  "")
                (or reason "native request failed"))
@@ -592,7 +592,7 @@ Return its current snapshot, or nil while account creation is in flight."
   "Validate QQ captcha URL and return its non-empty sid query value."
   (let ((sid
          (condition-case nil
-             (when (qq-account--non-empty-string-p url)
+             (when (qq-protocol-non-empty-string-p url)
                (let* ((parsed (url-generic-parse-url url))
                       (filename (url-filename parsed))
                       (query-index (and filename (string-match "\\?" filename)))
@@ -611,7 +611,7 @@ Return its current snapshot, or nil while account creation is in flight."
                             query)
                    (cadr (assoc "sid" (url-parse-query-string query))))))
            (error nil))))
-    (unless (qq-account--non-empty-string-p sid)
+    (unless (qq-protocol-non-empty-string-p sid)
       (user-error "qq: unsupported or incomplete captcha URL"))
     sid))
 
@@ -633,12 +633,12 @@ Return its current snapshot, or nil while account creation is in flight."
     (unless (and (equal (alist-get 'url source)
                         (qq-login--captcha-capture-url capture))
                  (null (browser-session-cookies document))
-                 (qq-account--exact-object-keys-p
+                 (qq-server-wire-exact-object-keys-p
                   proof '(ticket randstr sid))
-                 (qq-account--non-empty-string-p ticket)
+                 (qq-protocol-non-empty-string-p ticket)
                  (not (string-prefix-p "terror_" ticket))
-                 (qq-account--non-empty-string-p rand-str)
-                 (qq-account--non-empty-string-p sid)
+                 (qq-protocol-non-empty-string-p rand-str)
+                 (qq-protocol-non-empty-string-p sid)
                  (equal sid (qq-login--captcha-capture-sid capture)))
       (user-error "qq: browser returned an invalid captcha proof"))
     (list ticket rand-str sid)))
@@ -734,7 +734,7 @@ Return its current snapshot, or nil while account creation is in flight."
          (sid (alist-get 'sid challenge))
          (url-sid (qq-login--captcha-url-sid url)))
     (dolist (value (list account-id challenge-id sid))
-      (unless (qq-account--non-empty-string-p value)
+      (unless (qq-protocol-non-empty-string-p value)
         (user-error "qq: captcha challenge is incomplete")))
     (unless (equal sid url-sid)
       (user-error "qq: captcha challenge sid conflicts with its URL"))
@@ -862,7 +862,7 @@ Return its current snapshot, or nil while account creation is in flight."
   "Display Rust-owned new-device verification for SESSION ACCOUNT CHALLENGE."
   (ignore account)
   (let ((qr-url (alist-get 'qr_url challenge)))
-    (unless (qq-account--non-empty-string-p qr-url)
+    (unless (qq-protocol-non-empty-string-p qr-url)
       (error "qq: new-device challenge has no scannable qr_url"))
     (qq-login--prepare-qr session qr-url)
     (setf (qq-login--session-retry-failed-p session) nil)
@@ -876,7 +876,7 @@ PasswordLogin UnusualDevice automatically.  Emacs only shows wait status and
 an optional public QR URL."
   (ignore account)
   (let ((qr-url (alist-get 'qr_url challenge)))
-    (when (qq-account--non-empty-string-p qr-url)
+    (when (qq-protocol-non-empty-string-p qr-url)
       (qq-login--prepare-qr session qr-url))
     (setf (qq-login--session-retry-failed-p session) nil)
     (qq-login--present

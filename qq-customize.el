@@ -168,9 +168,9 @@ corresponds to telega's `telega-chat-messages-pop-ring-size'."
 (defcustom qq-chat-jump-history-count nil
   "History page size when seeking a jump target (reply goto).
 
-Nil means use `qq-history-fetch-count'.  NapCat `get_*_msg_history' with
-`message_seq' set to the target snowflake loads one page from that cursor
-(not iterative load-older from the buffer's oldest id)."
+Nil means use `qq-history-fetch-count'.  The Gateway requests one bounded
+history page around the target snowflake instead of iterating from the
+buffer's oldest message."
   :type '(choice (const :tag "Same as qq-history-fetch-count" nil)
                  (integer :tag "Count"))
   :group 'qq)
@@ -205,9 +205,9 @@ displaying a chat buffer does not mark the whole session as read."
 (defcustom qq-input-status-ttl 6
   "Seconds to keep a friend's chat-action (typing) after the last push.
 
-Modeled after telega's ephemeral chat actions.  NapCat's
-`notify/input_status' has no guaranteed stop packet, so the client
-auto-clears unless a newer push refreshes it."
+Modeled after telega's ephemeral chat actions.  The Gateway may omit an
+explicit stop event, so the client auto-clears unless a newer push refreshes
+the action."
   :type 'integer
   :group 'qq)
 
@@ -239,7 +239,7 @@ Default nil matches telega (`telega-chat-show-deleted-messages-for' defaults
 to nil): recalled rows stay in `qq-state' but are omitted from the EWOC.
 When non-nil, render a \"[message recalled]\" placeholder (no action buttons).
 
-Requires NapCat fork to mark messages with `recalled' / `recall_time'."
+Requires the Gateway to project authoritative recall state."
   :type 'boolean
   :group 'qq)
 
@@ -508,7 +508,7 @@ keeps APNG/static rendering and the textual fallback."
     (expand-file-name "qq-face-names.json" (or here default-directory)))
   "JSON map of QQ face id → display name (e.g. \"178\" → \"/斜眼笑\").
 
-Bundled with emacs-qq from NapCat `face_config.json'.  Used for plain-text
+Bundled with emacs-qq from Linux QQ's face catalog.  Used for plain-text
 fallbacks and previews when the face image is not yet available."
   :type 'file
   :group 'qq)
@@ -530,7 +530,7 @@ fallbacks and previews when the face image is not yet available."
 
 (defcustom qq-media-download-directory
   (locate-user-emacs-file "qq-downloads/")
-  "Directory used for QQ media downloads copied from NapCat resources."
+  "Directory used for QQ media downloads materialized by the Gateway."
   :type 'directory
   :group 'qq)
 

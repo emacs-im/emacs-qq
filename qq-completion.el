@@ -5,8 +5,8 @@
 ;;; Commentary:
 
 ;; QQ-specific providers and protocol insertion built on appkit's generic chat
-;; completion substrate.  Group members come from the strict fork-native
-;; `emacs_search_group_members' action; faces remain structured send segments.
+;; completion substrate.  Group members come from `qq-core-search-group-members';
+;; faces remain structured send segments.
 
 ;;; Code:
 
@@ -329,7 +329,7 @@ member model; a later explicit completion command owns presentation."
 
 (defun qq-completion--poke-user-id-p (value)
   "Return non-nil when VALUE is a canonical nonzero poke user id."
-  (and (qq-api-user-id-p value)
+  (and (qq-protocol-user-uin-p value)
        (not (equal value "0"))))
 
 (defun qq-completion--poke-session-current-p
@@ -497,7 +497,7 @@ member model; a later explicit completion command owns presentation."
           (string-trim
            (read-string "Search group member: " initial-user-id
                         'qq-completion--poke-search-history))))
-    (unless (qq-core-group-id-p group-id)
+    (unless (qq-protocol-group-uin-p group-id)
       (user-error "qq: group poke requires a canonical group id"))
     (when (string-empty-p query)
       (user-error "qq: group poke requires a non-empty member search"))

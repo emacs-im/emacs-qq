@@ -67,7 +67,7 @@
   "Native source kind: `message', `resource', `context', or nil inline.")
 
 (defvar-local qq-forward--source nil
-  "Validated fork-native remote source for this viewer, or nil inline.")
+  "Validated native remote source for this viewer, or nil inline.")
 
 (defvar-local qq-forward--messages nil
   "Viewer-local normalized messages rendered in the current buffer.")
@@ -313,27 +313,6 @@ snapshot is remote-only."
            (string-match "\\([0-9]+\\)\\s-*forwarded" summary))
       (string-to-number (match-string 1 summary)))
      (t nil))))
-(defun qq-forward--unsupported-segment (payload)
-  "Return safe internal placeholder for unsupported native PAYLOAD.
-
-Mirrors `qq-state--unsupported-preview': when the gateway retained the
-element's visible text, show it with a marker instead of replacing it with a
-diagnostic, so the forward view and the chat buffer agree."
-  (let* ((raw (and (listp payload) (alist-get 'raw payload)))
-         (fallback (qq-forward--present-string
-                    (and (listp raw) (alist-get 'fallback_text raw))))
-         (summary (qq-forward--present-string
-                   (and (listp payload) (alist-get 'summary payload))))
-         (summary (or summary "unknown element"))
-         (summary (replace-regexp-in-string "[\n\r\t ]+" " " summary)))
-    `((type . "text")
-      (data
-       . ((text
-           . ,(if fallback
-                  (concat (replace-regexp-in-string "[\n\r\t ]+" " " fallback)
-                          " ⁇")
-                (format "[unsupported QQ element: %s]"
-                        (truncate-string-to-width summary 80 nil nil t)))))))))
 
 (defconst qq-forward--gateway-segment-kinds
   '("text" "face" "at" "reply" "record" "video" "image"
@@ -370,7 +349,7 @@ diagnostic, so the forward view and the chat buffer agree."
   (when (assq 'message_id message)
     (qq-api-validate-message-id
      (alist-get 'message_id message) context t))
-  (unless (qq-account--uint64-decimal-p (alist-get 'sequence message))
+  (unless (qq-protocol-uint64-decimal-p (alist-get 'sequence message))
     (error "qq: %s sequence must be canonical uint64 text" context))
   (unless (and (integerp (alist-get 'sent_at message))
                (>= (alist-get 'sent_at message) 0))
@@ -385,9 +364,9 @@ diagnostic, so the forward view and the chat buffer agree."
            (and
             (qq-api--exact-object-keys-p
              sender '(kind user_id name avatar_url))
-            (qq-api-user-id-p (alist-get 'user_id sender))
+            (qq-protocol-user-uin-p (alist-get 'user_id sender))
             (stringp (alist-get 'name sender))
-            (qq-api-non-empty-string-p (alist-get 'avatar_url sender)))
+            (qq-protocol-non-empty-string-p (alist-get 'avatar_url sender)))
          (error "qq: %s user sender is invalid" context)))
       ("anonymous"
        (unless
@@ -401,13 +380,13 @@ diagnostic, so the forward view and the chat buffer agree."
       ("private"
        (unless
            (and (qq-api--exact-object-keys-p origin '(kind peer_uin))
-                (qq-account--uint64-decimal-p
+                (qq-protocol-uint64-decimal-p
                  (alist-get 'peer_uin origin)))
          (error "qq: %s private origin is invalid" context)))
       ("group"
        (unless
            (and (qq-api--exact-object-keys-p origin '(kind group_uin))
-                (qq-account--uint64-decimal-p
+                (qq-protocol-uint64-decimal-p
                  (alist-get 'group_uin origin)))
          (error "qq: %s group origin is invalid" context)))
       ("unknown"
@@ -512,7 +491,7 @@ diagnostic, so the forward view and the chat buffer agree."
 
 Canonical native-derived internal segments pass through unchanged.  Legacy
 inline content is deliberately ignored: native snapshots are loaded through
-the fork-native forward action using an explicit locator-qualified reference."
+the native forward action using an explicit locator-qualified reference."
   (cond
    ((qq-forward-segment-p segment)
     (copy-tree segment))
@@ -869,42 +848,17 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
     (qq-forward--reset-buffer-work buffer)))
 
 (defun qq-forward--ensure-view ()
-  "Return the live appkit view owning the current forward buffer."
+  "Return the live Appkit view owning the current forward buffer."
   (unless qq-forward--buffer-key
     (error "qq: forward buffer has no canonical identity"))
-  (let* ((owner
-          (or qq-runtime--account-id
-              (user-error "qq: forward buffer has no account owner")))
-         (app (qq-runtime-app owner))
-         (sync-function
-          (qq-runtime-account-sync-function
-           owner #'qq-forward--sync-invalidations))
-         (id (qq-forward--view-id qq-forward--buffer-key))
-         (current (appkit-current-view))
-         (view
-          (cond
-           ((and (appkit-view-live-p current)
-                 (eq app (appkit-view-app current))
-                 (equal id (appkit-view-id current)))
-            (setf (appkit-view-state current) qq-forward--buffer-key
-                  (appkit-view-sync-function current)
-                  sync-function
-                  (appkit-view-parts current) '(timeline geometry))
-            current)
-           ((appkit-view-live-p current)
-            (error "qq: forward buffer belongs to a different appkit view"))
-           (t
-            (let ((attached
-                   (appkit-attach-view
-                    :app app
-                    :id id
-                    :state qq-forward--buffer-key
-                    :mode 'qq-forward-mode
-                    :sync-function sync-function
-                    :parts '(timeline geometry))))
-              (qq-runtime-bind-account owner)
-              (qq-forward--setup-view attached)
-              attached)))))
+  (let ((view
+         (qq-runtime-ensure-account-view
+          :id (qq-forward--view-id qq-forward--buffer-key)
+          :mode 'qq-forward-mode
+          :state qq-forward--buffer-key
+          :sync-function #'qq-forward--sync-invalidations
+          :parts '(timeline geometry)
+          :setup #'qq-forward--setup-view)))
     (appkit-view-enable-responsive-geometry view)
     view))
 

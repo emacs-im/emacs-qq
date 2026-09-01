@@ -22,19 +22,19 @@
 
 The native service owns the exact wire grammar.  This client checks only the
 transport-safe properties it needs before returning an identity to Gateway."
-  (and (qq-account--non-empty-string-p value)
+  (and (qq-protocol-non-empty-string-p value)
        (not (string-match-p "[/[:space:][:cntrl:]]" value))))
 
 (defun qq-favorite-emoji--entry-p (entry)
   "Return non-nil when ENTRY has the exact native catalog shape."
-  (and (qq-account--exact-object-keys-p
+  (and (qq-server-wire-exact-object-keys-p
         entry '(favorite_emoji_id md5 url))
        (qq-favorite-emoji-id-p (alist-get 'favorite_emoji_id entry))
        (let ((md5 (alist-get 'md5 entry)))
          (and (stringp md5)
               (string-match-p "\\`[0-9a-f]\\{32\\}\\'" md5)))
        (let ((url (alist-get 'url entry)))
-         (and (qq-account--non-empty-string-p url)
+         (and (qq-protocol-non-empty-string-p url)
               (string-prefix-p "https://" url)))))
 
 (defun qq-favorite-emoji--entries-p (entries max-entries)
@@ -77,11 +77,11 @@ ERRBACK follow the native RPC adapter convention."
      :callback
      (lambda (value)
        (qq-runtime-with-account owner
-         (qq-account--invoke callback value)))
+         (qq-rpc-invoke callback value)))
      :errback
      (lambda (body reason)
        (qq-runtime-with-account owner
-         (qq-account--invoke errback body reason))))))
+         (qq-rpc-invoke errback body reason))))))
 
 (defun qq-favorite-emoji--project-catalog (result owner)
   "Return exact favorite catalog RESULT belonging to OWNER."
@@ -90,12 +90,12 @@ ERRBACK follow the native RPC adapter convention."
          (entries (alist-get 'entries result)))
     (unless
         (and
-         (qq-account--exact-object-keys-p
+         (qq-server-wire-exact-object-keys-p
           result
           '(account_id owner max_entries entries source refreshed_at))
          (equal (alist-get 'account_id result) owner)
          (equal (alist-get 'owner result) (alist-get 'uin account))
-         (qq-account--uint32-p max-entries)
+         (qq-protocol-uint32-p max-entries)
          (qq-favorite-emoji--entries-p entries max-entries)
          (member (alist-get 'source result) '("network" "cache"))
          (integerp (alist-get 'refreshed_at result)))
@@ -122,7 +122,7 @@ receives the validated catalog; ERRBACK follows the Gateway convention."
          (digests (and (listp resource) (alist-get 'digests resource))))
     (unless
         (and
-         (qq-account--exact-object-keys-p result '(account_id entry resource))
+         (qq-server-wire-exact-object-keys-p result '(account_id entry resource))
          (equal (alist-get 'account_id result) owner)
          (qq-favorite-emoji--entry-p entry)
          (equal (alist-get 'favorite_emoji_id entry) expected-id)

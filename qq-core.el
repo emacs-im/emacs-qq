@@ -111,13 +111,6 @@ cancellation cannot reenter the old operation."
   "Return non-nil when the native service accepts business requests."
   (qq-server-ready-p))
 
-(defun qq-core-group-id-p (value)
-  "Return non-nil when VALUE is an exact native group UIN."
-  (qq-account--canonical-decimal-p value))
-
-(defun qq-core-user-id-p (value)
-  "Return non-nil when VALUE is an exact native user UIN."
-  (qq-account--canonical-decimal-p value))
 
 (defun qq-core-connect ()
   "Connect to the native service without changing account lifecycle."
@@ -202,7 +195,7 @@ contact cache."
             (`(nil t) sender)
             (`(t t) recipient)
             (_ (error "qq: recent private endpoints do not identify account")))))
-    (and (qq-account--canonical-decimal-p (alist-get 'uin peer)) t)))
+    (and (qq-protocol-uint64-decimal-p (alist-get 'uin peer)) t)))
 
 (defun qq-core--recent-row-projectable-p (row account)
   "Return non-nil when recent ROW has a product session key for ACCOUNT."
@@ -314,12 +307,12 @@ adapter boundary.  ACCOUNT-ID defaults to the current UI account."
                (remhash account-id qq-core--recent-requests))
              (qq-runtime-with-account account-id
                (condition-case error-data
-                   (qq-account--invoke
+                   (qq-rpc-invoke
                     callback
                     (qq-core--apply-recent-page page observation-token))
                  (error
                   (let ((reason (error-message-string error-data)))
-                    (qq-account--invoke
+                    (qq-rpc-invoke
                      error-fn
                      `((code . "client_projection_failed")
                        (message . ,reason))
@@ -329,7 +322,7 @@ adapter boundary.  ACCOUNT-ID defaults to the current UI account."
                        (gethash account-id qq-core--recent-requests))
                (remhash account-id qq-core--recent-requests))
              (qq-runtime-with-account account-id
-               (qq-account--invoke error-fn body reason)))
+               (qq-rpc-invoke error-fn body reason)))
            :owner account-id))
     (when (qq-request-active-p request)
       (puthash (copy-sequence account-id) request
@@ -363,7 +356,7 @@ adapter boundary.  ACCOUNT-ID defaults to the current UI account."
 
 (defun qq-core-get-user-profile (user-id callback &optional errback)
   "Fetch USER-ID's sparse native profile and call CALLBACK."
-  (unless (qq-protocol--nonzero-decimal-string-p user-id)
+  (unless (qq-protocol-uint64-decimal-p user-id)
     (user-error "qq: user profile requires an exact decimal UIN"))
   (qq-core--start-request
    (lambda (success failure)
@@ -373,7 +366,7 @@ adapter boundary.  ACCOUNT-ID defaults to the current UI account."
 (defun qq-core-get-profile-like-summary
     (user-id callback &optional errback)
   "Fetch USER-ID's native profile-like summary and call CALLBACK."
-  (unless (qq-protocol--nonzero-decimal-string-p user-id)
+  (unless (qq-protocol-uint64-decimal-p user-id)
     (user-error "qq: profile likes require an exact decimal UIN"))
   (qq-core--start-request
    (lambda (success failure)
@@ -383,7 +376,7 @@ adapter boundary.  ACCOUNT-ID defaults to the current UI account."
 (defun qq-core-send-profile-like
     (user-id callback &optional errback)
   "Give USER-ID one native profile-card like and call CALLBACK."
-  (unless (qq-protocol--nonzero-decimal-string-p user-id)
+  (unless (qq-protocol-uint64-decimal-p user-id)
     (user-error "qq: profile likes require an exact decimal UIN"))
   (qq-core--start-request
    (lambda (success failure)
@@ -395,7 +388,7 @@ adapter boundary.  ACCOUNT-ID defaults to the current UI account."
 
 The projection is derived from its selected-slot joined-group cache; when
 absent, one authoritative group refresh is performed first."
-  (unless (qq-core-group-id-p group-id)
+  (unless (qq-protocol-group-uin-p group-id)
     (user-error "qq: group profile requires an exact group UIN"))
   (if-let* ((profile (qq-core--group-profile-from-state group-id)))
       (progn
@@ -462,11 +455,11 @@ after its first fetch.  ERRBACK receives the service response and reason."
   (setq limit (or limit 200))
   (unless (and (integerp limit) (<= 1 limit 200))
     (user-error "qq: Group member search limit must be between 1 and 200"))
-  (unless (qq-account--canonical-decimal-p group-id)
+  (unless (qq-protocol-uint64-decimal-p group-id)
     (user-error "qq: Group member search requires an exact group UIN"))
   (if-let* ((page (qq-directory-group-member-page group-id)))
       (progn
-        (qq-account--invoke
+        (qq-rpc-invoke
          callback
          (qq-core--filter-members
           (alist-get 'members page) query limit))
@@ -506,7 +499,7 @@ after its first fetch.  ERRBACK receives the service response and reason."
 (defun qq-core-set-group-name
     (group-id name &optional callback errback)
   "Set GROUP-ID's public NAME."
-  (unless (qq-core-group-id-p group-id)
+  (unless (qq-protocol-group-uin-p group-id)
     (user-error "qq: Group name requires an exact group UIN"))
   (unless (and (stringp name) (not (string-empty-p name)))
     (user-error "qq: Group name must be a non-empty string"))
@@ -522,7 +515,7 @@ after its first fetch.  ERRBACK receives the service response and reason."
 (defun qq-core-set-friend-pinned
     (user-id pinned &optional callback errback)
   "Set USER-ID's friend conversation PINNED state."
-  (unless (qq-core-user-id-p user-id)
+  (unless (qq-protocol-user-uin-p user-id)
     (user-error "qq: Friend pinned state requires an exact user UIN"))
   (setq pinned (and pinned t))
   (qq-core--start-request
@@ -551,7 +544,7 @@ locally selected managed account without changing its lifecycle phase."
 (defun qq-core-set-group-remark
     (group-id remark &optional callback errback)
   "Set or clear GROUP-ID's account-local REMARK."
-  (unless (qq-core-group-id-p group-id)
+  (unless (qq-protocol-group-uin-p group-id)
     (user-error "qq: Group remark requires an exact group UIN"))
   (unless (stringp remark)
     (user-error "qq: Group remark must be a string"))
@@ -570,7 +563,7 @@ locally selected managed account without changing its lifecycle phase."
 (defun qq-core-set-group-whole-mute
     (group-id enabled &optional callback errback)
   "Set GROUP-ID's whole-group mute state."
-  (unless (qq-core-group-id-p group-id)
+  (unless (qq-protocol-group-uin-p group-id)
     (user-error "qq: Group whole mute requires an exact group UIN"))
   (setq enabled (and enabled t))
   (qq-core--start-request
@@ -582,7 +575,7 @@ locally selected managed account without changing its lifecycle phase."
 (defun qq-core-set-group-pinned
     (group-id pinned &optional callback errback)
   "Set GROUP-ID's conversation PINNED state."
-  (unless (qq-core-group-id-p group-id)
+  (unless (qq-protocol-group-uin-p group-id)
     (user-error "qq: Group pinned state requires an exact group UIN"))
   (setq pinned (and pinned t))
   (qq-core--start-request
@@ -597,7 +590,7 @@ locally selected managed account without changing its lifecycle phase."
 (defun qq-core-clock-in-group
     (group-id &optional callback errback)
   "Clock the selected account into GROUP-ID."
-  (unless (qq-core-group-id-p group-id)
+  (unless (qq-protocol-group-uin-p group-id)
     (user-error "qq: Group clock-in requires an exact group UIN"))
   (qq-core--start-request
    (lambda (success failure)
@@ -607,7 +600,7 @@ locally selected managed account without changing its lifecycle phase."
 (defun qq-core-get-group-at-all-remaining
     (group-id callback &optional errback)
   "Fetch GROUP-ID's live @all availability."
-  (unless (qq-core-group-id-p group-id)
+  (unless (qq-protocol-group-uin-p group-id)
     (user-error "qq: Group @all quota requires an exact group UIN"))
   (qq-core--start-request
    (lambda (success failure)
@@ -628,7 +621,7 @@ locally selected managed account without changing its lifecycle phase."
 (defun qq-core-leave-group
     (group-id &optional callback errback)
   "Leave GROUP-ID without dismissing it."
-  (unless (qq-core-group-id-p group-id)
+  (unless (qq-protocol-group-uin-p group-id)
     (user-error "qq: Group leave requires an exact group UIN"))
   (qq-core--start-request
    (lambda (success failure)
@@ -641,9 +634,9 @@ locally selected managed account without changing its lifecycle phase."
 (defun qq-core-set-group-member-card
     (group-id user-id card &optional callback errback)
   "Set or clear USER-ID's CARD in GROUP-ID."
-  (unless (qq-core-group-id-p group-id)
+  (unless (qq-protocol-group-uin-p group-id)
     (user-error "qq: Group member card requires an exact group UIN"))
-  (unless (qq-core-user-id-p user-id)
+  (unless (qq-protocol-user-uin-p user-id)
     (user-error "qq: Group member card requires an exact user UIN"))
   (unless (stringp card)
     (user-error "qq: Group member card must be a string"))
@@ -656,9 +649,9 @@ locally selected managed account without changing its lifecycle phase."
 (defun qq-core-set-group-member-special-title
     (group-id user-id special-title &optional callback errback)
   "Set or clear USER-ID's SPECIAL-TITLE in GROUP-ID."
-  (unless (qq-core-group-id-p group-id)
+  (unless (qq-protocol-group-uin-p group-id)
     (user-error "qq: Special title requires an exact group UIN"))
-  (unless (qq-core-user-id-p user-id)
+  (unless (qq-protocol-user-uin-p user-id)
     (user-error "qq: Special title requires an exact user UIN"))
   (unless (stringp special-title)
     (user-error "qq: Special title must be a string"))
@@ -671,9 +664,9 @@ locally selected managed account without changing its lifecycle phase."
 (defun qq-core-kick-group-member
     (group-id user-id reject-add-request &optional callback errback)
   "Remove USER-ID from GROUP-ID."
-  (unless (qq-core-group-id-p group-id)
+  (unless (qq-protocol-group-uin-p group-id)
     (user-error "qq: Group kick requires an exact group UIN"))
-  (unless (qq-core-user-id-p user-id)
+  (unless (qq-protocol-user-uin-p user-id)
     (user-error "qq: Group kick requires an exact user UIN"))
   (setq reject-add-request (and reject-add-request t))
   (qq-core--start-request
@@ -694,7 +687,7 @@ same Resource and Prepared Attachment pipeline at that point."
      ((equal kind "favorite_emoji")
       (let ((favorite-id (and (listp data)
                               (alist-get 'favorite_emoji_id data))))
-        (unless (and (qq-account--exact-object-keys-p
+        (unless (and (qq-server-wire-exact-object-keys-p
                       data '(favorite_emoji_id))
                      (qq-favorite-emoji-id-p favorite-id))
           (user-error "qq: Favorite segment requires one durable identity"))
@@ -718,7 +711,7 @@ same Resource and Prepared Attachment pipeline at that point."
             (if (equal kind "image")
                 (let ((summary (or summary "[图片]"))
                       (sub-type (or sub-type 0)))
-                  (unless (and (qq-account--non-empty-string-p summary)
+                  (unless (and (qq-protocol-non-empty-string-p summary)
                                (<= (length (string-to-list summary)) 128)
                                (not (string-match-p "[[:cntrl:]]" summary)))
                     (user-error
@@ -1270,8 +1263,8 @@ Message ID metadata."
         (reference-row (alist-get 'canonical-row-key reference)))
     (when (and candidate-session
                (equal candidate-session reference-session)
-               (qq-account--uint64-decimal-p candidate-row)
-               (qq-account--uint64-decimal-p reference-row))
+               (qq-protocol-uint64-decimal-p candidate-row)
+               (qq-protocol-uint64-decimal-p reference-row))
       (let* ((messages (qq-state-session-messages candidate-session))
              (row-key (lambda (message)
                         (alist-get 'canonical-row-key message)))
@@ -1470,13 +1463,13 @@ explains a result without a sequence."
               (directory-sequence (alist-get 'latest_sequence group))
               sequence source)
          (when (and directory-sequence
-                    (not (qq-account--canonical-decimal-p
+                    (not (qq-protocol-uint64-decimal-p
                           directory-sequence t)))
            (error "qq: Native group latest_sequence is not exact"))
          (cond
           ((and live-sequence
                 (or (null directory-sequence)
-                    (qq-account--decimal-less-p
+                    (qq-protocol-decimal-less-p
                      directory-sequence live-sequence)))
            (setq sequence live-sequence source 'live-event))
           (directory-sequence
