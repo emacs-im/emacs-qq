@@ -21,6 +21,7 @@
 (require 'appkit-chat-history)
 (require 'appkit-chat-completion)
 (require 'appkit-chat-timeline)
+(require 'appkit-scroll)
 (require 'appkit-chat-ins)
 (require 'appkit-name-color)
 (require 'appkit-media)
@@ -197,6 +198,7 @@ buffer-local continuous history controller.")
 
 (defvar-local qq-chat--last-tail-poll-at nil
   "Time of the latest automatic unified-history poll at the live edge.")
+(defvar-local qq-chat--scroll-observer nil)
 
 (defvar-local qq-chat--guild-forum-next-cursor nil
   "Opaque native cursor for the next older QQ Guild forum page.")
@@ -1052,21 +1054,6 @@ prompt behavior.  Point on the timeline represents that exact message."
            (qq-chat--latest-visible-read-target)
          (qq-chat--message-at-point position))))))
 
-(defun qq-chat--window-scroll (window _display-start)
-  "Advance reads and load newer history from WINDOW's visible timeline edge."
-  (when (window-live-p window)
-    (with-current-buffer (window-buffer window)
-      (when (derived-mode-p 'qq-chat-mode)
-        ;; The selected window's ordinary post-command path owns read state.
-        ;; Indirect scrolling can move an inactive window without running it.
-        (unless (eq window (selected-window))
-          (qq-chat--manage-read-position (window-point window)))
-        ;; Mouse-wheel and scroll-bar commands may move the viewport while
-        ;; leaving point far above the newer edge.  Use AppKit's clamped
-        ;; visible end for both selected and inactive windows.
-        (when-let* ((visible-end
-                     (appkit-chat-timeline-window-visible-end-position window)))
-          (qq-chat--maybe-auto-load-newer visible-end))))))
 
 (defun qq-chat--message-forwardable-p (message)
   "Return non-nil when MESSAGE can be forwarded by its server ID."
@@ -1751,23 +1738,24 @@ selection; success removes only the immutable selection snapshot in PLAN."
   (when (appkit-chat-timeline-live-p)
     (appkit-chat-timeline-flush-deferred)))
 
-(defun qq-chat--maybe-auto-load-older ()
-  "Load an older page when point approaches the timeline top."
-  (when (and qq-chat--session-key
-             (not (appkit-chatbuf-point-in-input-p)))
-    (if (qq-chat--msg-filter-active-p)
-        (when (and (numberp qq-chat-history-auto-load-threshold)
-                   (<= (point)
-                       (+ (point-min)
-                          (max 0 qq-chat-history-auto-load-threshold))))
+(defun qq-chat--maybe-auto-load-older (&optional position)
+  "Load an older page when POSITION approaches the timeline top."
+  (let ((position (or position (point))))
+    (when (and qq-chat--session-key
+               (not (appkit-chatbuf-point-in-input-p)))
+      (if (qq-chat--msg-filter-active-p)
+          (when (and (numberp qq-chat-history-auto-load-threshold)
+                     (<= position
+                         (+ (point-min)
+                            (max 0 qq-chat-history-auto-load-threshold))))
+            (when-let* ((view (qq-chat--live-current-view)))
+              (qq-chat--request-callback-sync
+               view (lambda () (qq-chat-filter-load-more t)))))
+        (when (appkit-chat-history-autoload-older-p
+               position (point-min) qq-chat-history-auto-load-threshold)
           (when-let* ((view (qq-chat--live-current-view)))
             (qq-chat--request-callback-sync
-             view (lambda () (qq-chat-filter-load-more t)))))
-      (when (appkit-chat-history-autoload-older-p
-             (point) (point-min) qq-chat-history-auto-load-threshold)
-        (when-let* ((view (qq-chat--live-current-view)))
-          (qq-chat--request-callback-sync
-           view (lambda () (qq-chat-load-older-messages t))))))))
+             view (lambda () (qq-chat-load-older-messages t)))))))))
 
 (defun qq-chat--history-tail-poll-due-p (position footer composer-idle-p)
   "Return non-nil when an attached unified-history edge should be polled."
@@ -1808,14 +1796,33 @@ selection; success removes only the immutable selection snapshot in PLAN."
         (qq-chat--request-callback-sync
          view (lambda () (qq-chat-load-newer-messages t)))))))
 
+(defun qq-chat--install-scroll-observer (view)
+  "Install VIEW's lifecycle-owned history edge observer."
+  (unless (and (appkit-scroll-observer-p qq-chat--scroll-observer)
+               (appkit-scroll-observer-active-p qq-chat--scroll-observer)
+               (eq view
+                   (appkit-scroll-observer-owner qq-chat--scroll-observer)))
+    (when (appkit-scroll-observer-p qq-chat--scroll-observer)
+      (appkit-scroll-observer-cancel qq-chat--scroll-observer))
+    (setq-local
+     qq-chat--scroll-observer
+     (appkit-scroll-observer-install
+      view
+      :end-boundary-function #'appkit-chat-timeline-footer-start-position
+      :start-function
+      (lambda (_window position _start)
+        (qq-chat--maybe-auto-load-older position))
+      :end-function
+      (lambda (window position _end)
+        ;; The selected window's post-command path owns its point-based read.
+        (unless (eq window (selected-window))
+          (qq-chat--manage-read-position (window-point window)))
+        (qq-chat--maybe-auto-load-newer position))))))
+
 (defun qq-chat--post-command ()
   "Maintain QQ-specific timeline behavior after each command."
   (unless (appkit-chatbuf-rendering-p)
     (qq-chat--flush-deferred-node-redisplay)
-    ;; A partial around-message window behaves like telega: approaching its
-    ;; lower edge extends the continuous slice without inserting a gap row.
-    (qq-chat--maybe-auto-load-newer)
-    (qq-chat--maybe-auto-load-older)
     (qq-chat--manage-read-position)))
 
 (defun qq-chat--prompt-text ()
@@ -2428,7 +2435,9 @@ projection.  A replacement or detached view is inert."
                    (qq-chat--msg-filter-active-p)
                    (not qq-chat--filter-owner)
                    (qq-chat--msg-filter-has-more-p))
-          (qq-chat-filter-load-more t))))))
+          (qq-chat-filter-load-more t))
+        (when (appkit-scroll-observer-p qq-chat--scroll-observer)
+          (appkit-scroll-observer-check qq-chat--scroll-observer))))))
 
 (defun qq-chat--ensure-view ()
   "Return the live appkit view owning the current QQ chat buffer."
@@ -2462,6 +2471,7 @@ projection.  A replacement or detached view is inert."
              :mode 'qq-chat-mode
              :sync-function sync-function
              :parts '(frame timeline composer geometry))))))
+    (qq-chat--install-scroll-observer view)
     (appkit-view-enable-responsive-geometry view)
     view))
 
@@ -6298,6 +6308,7 @@ Attach from clipboard with `C-c C-v' (telega-style)."
   (setq-local appkit-media-card-fallback-context-function
               #'qq-chat--media-card-fallback-context)
   (qq-chat--reset-history-state)
+  (setq-local qq-chat--scroll-observer nil)
   (setq-local qq-chat--pending-jump-id nil)
   (setq-local qq-chat--open-message-owner nil)
   (setq-local qq-chat--open-message-request nil)
@@ -6310,7 +6321,6 @@ Attach from clipboard with `C-c C-v' (telega-style)."
              (lambda (mime-type data)
                (qq-chat--yank-media mime-type data nil))))
   (add-hook 'post-command-hook #'qq-chat--post-command t t)
-  (add-hook 'window-scroll-functions #'qq-chat--window-scroll nil t)
   (add-hook 'kill-buffer-hook #'qq-chat--cancel-search-request nil t)
   (add-hook 'kill-buffer-hook #'qq-chat--cancel-filter-request nil t)
   (add-hook 'kill-buffer-hook #'qq-chat--cancel-open-message-request nil t)
@@ -6669,6 +6679,7 @@ Emacs integer arithmetic is arbitrary precision, so this never rounds them."
         (with-current-buffer buffer
           (let ((fresh-p (null qq-chat--session-key)))
             (setq qq-chat--session-key session-key)
+            (qq-chat--install-scroll-observer view)
             (qq-completion-preload-members)
             (if fresh-p
                 (progn
