@@ -954,7 +954,7 @@
                     (data . ((name . "movie.mp4")
                              (url . "https://example.com/movie.mp4")))))
          (owner (list 'exact-owner))
-         played-source played-owner)
+         played-source played-owner played-cache-key)
     (cl-letf (((symbol-function 'qq-media-segment-local-file)
                (lambda (_segment) nil))
               ((symbol-function 'qq-media-resolve-segment-resource)
@@ -964,10 +964,14 @@
               ((symbol-function 'appkit-media-play-video-source)
                (lambda (source &optional _client-label &rest keys)
                  (setq played-source source
-                       played-owner (plist-get keys :owner)))))
+                       played-owner (plist-get keys :owner)
+                       played-cache-key (plist-get keys :cache-key)))))
       (qq-media-segment-open segment :owner owner)
       (should (equal played-source "https://example.com/movie.mp4"))
-      (should (eq played-owner owner)))))
+      (should (eq played-owner owner))
+      (should
+       (equal played-cache-key
+              (qq-media--segment-resource-key segment))))))
 
 (ert-deftest qq-media-video-segments-are-inline-preview-capable ()
   (should
