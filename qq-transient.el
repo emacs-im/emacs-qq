@@ -412,6 +412,7 @@ Prefer this over inline button rows."
      :inapt-if qq-transient--root-info-inapt-p)
     ("I" "My profile" qq-root-open-self-user)
     ("d" "Contacts" qq-contacts-open)
+    ("r" "Group requests" qq-group-requests-open)
     ("/" "Find session…" qq-root-open-session)
     ("u" "Next unread" qq-root-next-unread)]
    ["Connection"

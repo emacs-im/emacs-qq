@@ -31,9 +31,11 @@
 (autoload 'qq-user-open "qq-user" nil t)
 (autoload 'qq-group-open "qq-group" nil t)
 (autoload 'qq-contacts-open "qq-contacts" nil t)
+(autoload 'qq-group-requests-open "qq-group-requests" nil t)
 (declare-function qq-user-open "qq-user" (user-id))
 (declare-function qq-group-open "qq-group" (group-id))
 (declare-function qq-contacts-open "qq-contacts" ())
+(declare-function qq-group-requests-open "qq-group-requests" ())
 (declare-function qq-root-transient "qq-transient" ())
 
 (defconst qq-root-buffer-name "*qq-root*"
@@ -796,6 +798,7 @@ Views belonging to other accounts remain live and visible."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "g") #'qq-root-refresh)
     (define-key map (kbd "c") #'qq-contacts-open)
+    (define-key map (kbd "N") #'qq-group-requests-open)
     (define-key map (kbd "/") #'qq-root-open-session)
     (define-key map (kbd "RET") #'qq-root-open-at-point)
     (define-key map (kbd "a") #'qq-root-open-avatar-at-point)
