@@ -9,6 +9,7 @@
 (defconst qq-directory-test-capabilities
   '("contact.list_friends" "contact.list_groups"
     "contact.list_group_members"
+    "group_request.list" "group_request.decide"
     "group.set_name" "group.set_remark"
     "friend.set_pinned" "group.set_whole_mute" "group.set_pinned" "group.set_member_card"
     "group.set_member_special_title" "group.kick_member" "group.clock_in"

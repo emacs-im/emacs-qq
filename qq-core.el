@@ -382,6 +382,23 @@ adapter boundary.  ACCOUNT-ID defaults to the current UI account."
    (lambda (success failure)
      (qq-profile-send-like user-id success failure))
    callback errback))
+(defun qq-core-list-group-requests
+    (mailbox callback &optional errback)
+  "List native group requests in MAILBOX and call CALLBACK."
+  (qq-core--start-request
+   (lambda (success failure)
+     (qq-directory-list-group-requests mailbox success failure))
+   callback errback))
+
+(defun qq-core-decide-group-request
+    (mailbox request decision refusal-message callback &optional errback)
+  "Apply DECISION to group REQUEST in MAILBOX and call CALLBACK."
+  (qq-core--start-request
+   (lambda (success failure)
+     (qq-directory-decide-group-request
+      mailbox request decision refusal-message success failure))
+   callback errback))
+
 
 (defun qq-core-get-group (group-id callback &optional errback)
   "Fetch native GROUP-ID profile and call CALLBACK.
@@ -1555,6 +1572,7 @@ CALLBACK receives a page plist with messages and the unsupported-entry count."
     (profile-like "profile.send_like")
     (avatar "contact.get_user_avatar" "contact.get_group_avatar")
     (group-members "contact.list_group_members")
+    (group-requests "group_request.list" "group_request.decide")
     (group-settings "group.set_name" "group.set_remark"
                     "group.set_whole_mute" "group.set_pinned")
     (group-member-settings "group.set_member_card"

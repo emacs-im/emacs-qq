@@ -47,7 +47,7 @@ v2 不提供 NapCat/OneBot 兼容选择；v1 保留在版本历史中。Lagrange
 - 搜索已加载或按需获取的群成员；
 - 合并转发一组真实历史消息；
 - 消息回应、撤回、戳一戳和原生已读状态；
-- 用户资料、群资料和群成员；
+- 用户资料、群资料、群成员，以及群申请的浏览、同意和拒绝；
 - 可选的桌面通知、通知历史和 mode line 状态。
 
 
@@ -267,6 +267,7 @@ Linux QQ 返回的结果为准，不在客户端中重新按名称排序。
 - Key: ~RET~ (~qq-root-open-at-point~) :: 打开光标处会话。
 - Key: ~g~ (~qq-root-refresh~) :: 刷新账号和最近会话。
 - Key: ~c~ (~qq-contacts-open~) :: 打开联系人目录。
+- Key: ~N~ (~qq-group-requests-open~) :: 打开当前账号的群申请主箱和过滤箱。
 - Key: ~/~ (~qq-root-open-session~) :: 按名称选择并打开会话。
 - Key: ~a~ (~qq-root-open-avatar-at-point~) :: 打开光标处头像。
 - Key: ~i~ (~qq-root-open-info-at-point~) :: 打开会话资料。
@@ -468,6 +469,19 @@ Linux QQ 返回的结果为准，不在客户端中重新按名称排序。
 - ~q~ 退出。
 
 群成员搜索使用服务端索引，不要求先把整个成员列表载入 Emacs。
+
+** 群申请
+
+从主界面按 ~N~ 打开当前账号独立的 ~*qq-group-requests*~。页面同时显示 QQ
+原生主箱和过滤箱，但保留两者各自的请求身份；不会把过滤申请并入主箱。
+
+- ~g~ :: 刷新两个申请箱；
+- ~TAB~ / ~<backtab>~ :: 在“同意”和“拒绝”按钮间移动；
+- ~q~ :: 退出窗口。
+
+处理申请时会原样回传列表返回的 mailbox、sequence、event 和 group UIN。
+sequence 是 uint64 十进制字符串，不会被转换成 Elisp 数值。未知事件和已处理记录
+仍可阅读，但不会获得操作按钮。
 
 * QQ 频道
 

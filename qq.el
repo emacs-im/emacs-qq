@@ -42,6 +42,7 @@
 (require 'qq-user)
 (require 'qq-group)
 (require 'qq-contacts)
+(require 'qq-group-requests)
 (require 'qq-root)
 (require 'qq-presence)
 (require 'qq-transient)
@@ -54,6 +55,7 @@
     qq-contacts-mode
     qq-forward-mode
     qq-group-mode
+    qq-group-requests-mode
     qq-root-mode
     qq-user-mode)
   "Major modes whose buffers contain account-scoped QQ client data.")

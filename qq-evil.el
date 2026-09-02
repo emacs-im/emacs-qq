@@ -104,6 +104,7 @@ When nil, leave Evil's initial-state selection untouched."
     qq-contacts-mode
     qq-forward-mode
     qq-group-mode
+    qq-group-requests-mode
     qq-root-mode
     qq-user-mode)
   "Major modes participating in emacs-qq's Evil integration.")
@@ -112,6 +113,7 @@ When nil, leave Evil's initial-state selection untouched."
   '(qq-contacts-mode-map
     qq-forward-mode-map
     qq-group-mode-map
+    qq-group-requests-mode-map
     qq-root-mode-map
     qq-user-mode-map)
   "Read-only emacs-qq keymaps with standard modal quit semantics.")
@@ -159,6 +161,11 @@ When nil, leave Evil's initial-state selection untouched."
     (:map qq-forward-mode-map
      :nm
      "g r" #'qq-forward-refresh)
+    (:map qq-group-requests-mode-map
+     :nm
+     "g r" #'qq-group-requests-refresh
+     "TAB" #'forward-button
+     "<backtab>" #'qq-group-requests-button-backward)
     (:map qq-group-mode-map
      :nm
      "g r" #'qq-group-refresh

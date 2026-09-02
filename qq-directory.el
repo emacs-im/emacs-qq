@@ -777,6 +777,128 @@ member is left untouched, and no incomplete directory state is invented."
      :callback callback
      :errback errback)))
 
+(defun qq-directory--group-request-tag-p (value kinds)
+  "Return non-nil when VALUE is a closed tagged union in KINDS."
+  (and (listp value)
+       (let ((kind (alist-get 'kind value)))
+         (if (member kind kinds)
+             (qq-server-wire-exact-object-keys-p value '(kind))
+           (and (equal kind "unknown")
+                (qq-server-wire-exact-object-keys-p value '(kind code))
+                (qq-protocol-uint32-p (alist-get 'code value)))))))
+
+(defun qq-directory--group-request-user-p (value)
+  "Return non-nil when VALUE is a closed group-request user."
+  (or (null value)
+      (and (qq-server-wire-exact-object-keys-p value '(uid name))
+           (qq-protocol-non-empty-string-p (alist-get 'uid value))
+           (stringp (alist-get 'name value)))))
+
+(defun qq-directory--group-request-p (request)
+  "Return non-nil when REQUEST is one closed native group request."
+  (and
+   (qq-server-wire-exact-object-keys-p
+    request
+    '(sequence event state group_uin group_name target inviter operator
+               comment actionable))
+   (qq-protocol-uint64-decimal-p (alist-get 'sequence request))
+   (qq-directory--group-request-tag-p
+    (alist-get 'event request)
+    '("user_join" "account_invited" "member_invited"))
+   (qq-directory--group-request-tag-p
+    (alist-get 'state request)
+    '("no_action" "pending" "processed"))
+   (qq-protocol-uint64-decimal-p (alist-get 'group_uin request))
+   (stringp (alist-get 'group_name request))
+   (qq-directory--group-request-user-p (alist-get 'target request))
+   (qq-directory--group-request-user-p (alist-get 'inviter request))
+   (qq-directory--group-request-user-p (alist-get 'operator request))
+   (stringp (alist-get 'comment request))
+   (memq (alist-get 'actionable request) '(t :false))))
+
+(defun qq-directory--project-group-requests (result owner mailbox)
+  "Project owned group-request RESULT for OWNER and MAILBOX."
+  (let ((wire-mailbox (symbol-name mailbox))
+        (requests (alist-get 'requests result))
+        (cursor (alist-get 'new_latest_sequence result)))
+    (unless
+        (and
+         (qq-server-wire-exact-object-keys-p
+          result '(account_id mailbox new_latest_sequence requests))
+         (equal (alist-get 'account_id result) owner)
+         (equal (alist-get 'mailbox result) wire-mailbox)
+         (or (null cursor) (qq-protocol-uint64-decimal-p cursor))
+         (listp requests)
+         (cl-every #'qq-directory--group-request-p requests))
+      (error "qq: Gateway returned an invalid %s group-request page" mailbox))
+    (copy-tree result)))
+
+(defun qq-directory-list-group-requests
+    (mailbox callback &optional errback)
+  "List native group requests in MAILBOX and call CALLBACK.
+
+MAILBOX is `main' or `filtered'."
+  (unless (memq mailbox '(main filtered))
+    (user-error "qq: unsupported group-request mailbox %S" mailbox))
+  (qq-directory--request
+   (cons 'group-requests mailbox) "group_request.list"
+   `((mailbox . ,(symbol-name mailbox)))
+   (lambda (result owner)
+     (qq-directory--project-group-requests result owner mailbox))
+   callback errback))
+
+(defun qq-directory-decide-group-request
+    (mailbox request decision refusal-message callback &optional errback)
+  "Apply DECISION to native group REQUEST in MAILBOX and call CALLBACK.
+
+MAILBOX is `main' or `filtered'.  DECISION is `accept' or `reject'.
+REFUSAL-MESSAGE is used only for rejection."
+  (unless (memq mailbox '(main filtered))
+    (user-error "qq: unsupported group-request mailbox %S" mailbox))
+  (unless (and (qq-directory--group-request-p request)
+               (eq (alist-get 'actionable request) t))
+    (user-error "qq: group request is not actionable"))
+  (unless (memq decision '(accept reject))
+    (user-error "qq: unsupported group-request decision %S" decision))
+  (when (and (eq decision 'accept)
+             (not (string-empty-p (or refusal-message ""))))
+    (user-error "qq: accepted group request cannot carry a refusal message"))
+  (let* ((owner (qq-directory--current-owner))
+         (mailbox (symbol-name mailbox))
+         (sequence (alist-get 'sequence request))
+         (event (alist-get 'event request))
+         (group-uin (alist-get 'group_uin request))
+         (wire-decision (symbol-name decision))
+         (refusal-message (or refusal-message "")))
+    (qq-rpc-call
+     "group_request.decide"
+     `((account_id . ,owner)
+       (mailbox . ,mailbox)
+       (sequence . ,sequence)
+       (event . ,(copy-tree event))
+       (group_uin . ,group-uin)
+       (decision . ,wire-decision)
+       (refusal_message . ,refusal-message))
+     :current-p (lambda () (qq-account-get owner))
+     :stale-code "invalid_gateway_result"
+     :stale-message "QQ account was removed during group-request decision"
+     :projector
+     (lambda (receipt)
+       (unless
+           (and
+            (qq-server-wire-exact-object-keys-p
+             receipt '(account_id mailbox sequence event group_uin decision))
+            (equal (alist-get 'account_id receipt) owner)
+            (equal (alist-get 'mailbox receipt) mailbox)
+            (equal (alist-get 'sequence receipt) sequence)
+            (equal (alist-get 'event receipt) event)
+            (equal (alist-get 'group_uin receipt) group-uin)
+            (equal (alist-get 'decision receipt) wire-decision))
+         (error "qq: Gateway returned an invalid group-request receipt"))
+       (copy-tree receipt))
+     :callback callback
+     :errback errback)))
+
 (defun qq-directory-list-group-members
     (group-uin callback &optional errback refresh)
   "List exact GROUP-UIN members and call CALLBACK with mapped members.
