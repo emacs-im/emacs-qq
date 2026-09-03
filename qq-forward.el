@@ -880,30 +880,28 @@ The heading and two-line avatar geometry use the shared QQ presentation API."
    :force-keys force-keys
    :changed-resources changed-resources))
 
-(defun qq-forward--sync-invalidations (view invalidations)
-  "Consume coalesced appkit INVALIDATIONS for forward VIEW."
-  (let* ((parts (appkit-invalidations-parts invalidations))
-         (geometry-p (memq 'geometry parts))
-         (resources (appkit-invalidations-resource-keys invalidations))
-         (entries (appkit-invalidations-entry-keys invalidations)))
+(defun qq-forward--sync-invalidations (view invalidations _events)
+  "Consume coalesced Appkit INVALIDATIONS for forward VIEW."
+  (let* ((geometry-p
+          (memq 'geometry (appkit-invalidations-parts invalidations)))
+         (diff
+          (appkit-projection-diff-derive
+           invalidations
+           :existing-keys
+           (and (appkit-chat-timeline-live-p)
+                (appkit-chat-timeline-keys))
+           :reconcile-parts '(timeline))))
     (when (appkit-view-live-p view)
       (when geometry-p
         (when-let* ((next
                      (appkit-view-responsive-width
                       qq-chat-auto-fill-margin-columns)))
           (setq-local fill-column next)))
-      (when (or resources
-                entries
-                (appkit-invalidations-structure-p invalidations)
-                parts
-                (appkit-invalidations-position-p invalidations))
+      (when (appkit-projection-diff-reconcile-p diff)
         (qq-forward--sync-timeline
-         :force-keys
-         (if geometry-p
-             (delete-dups
-              (append entries (appkit-chat-timeline-keys)))
-           entries)
-         :changed-resources resources)))))
+         :force-keys (appkit-projection-diff-force-keys diff)
+         :changed-resources
+         (appkit-projection-diff-changed-dependencies diff))))))
 
 (defun qq-forward--request-timeline-sync (view)
   "Request one coalesced structural timeline sync for live VIEW."

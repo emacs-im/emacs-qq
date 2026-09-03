@@ -173,10 +173,10 @@ ACCOUNT-ID defaults to the exact current account context."
   (declare (indent 1) (debug t))
   `(qq-runtime-call-with-account ,account-id (lambda () ,@body)))
 
-(defun qq-runtime--account-sync (account-id function view invalidations)
-  "Run account view sync FUNCTION for VIEW/INVALIDATIONS under ACCOUNT-ID."
+(defun qq-runtime--account-sync (account-id function view invalidations events)
+  "Run account sync FUNCTION for VIEW, INVALIDATIONS, and EVENTS under ACCOUNT-ID."
   (qq-runtime-with-account account-id
-    (funcall function view invalidations)))
+    (funcall function view invalidations events)))
 
 (defun qq-runtime-account-sync-function (account-id function)
   "Return an Appkit sync wrapper for ACCOUNT-ID and FUNCTION."

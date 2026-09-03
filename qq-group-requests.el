@@ -192,7 +192,7 @@
        (goto-char (point-min))))
    :preserve-window-start t))
 
-(defun qq-group-requests--sync-invalidations (view invalidations)
+(defun qq-group-requests--sync-invalidations (view invalidations _events)
   "Render VIEW after coalesced INVALIDATIONS."
   (when (and (appkit-view-live-p view)
              (or (appkit-invalidations-structure-p invalidations)

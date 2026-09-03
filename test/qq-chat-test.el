@@ -3870,10 +3870,10 @@ client, never as a doubled display name."
          (setq view (qq-chat--ensure-view))
          (should
           (memq #'appkit-view-refresh-responsive-geometry
-                window-size-change-functions))
+                window-state-change-functions))
          (setq width 90)
          (run-hook-with-args
-          'window-size-change-functions (selected-window))
+          'window-state-change-functions (selected-window))
          (should
           (equal calls (list (list view :part 'geometry :position t))))
          (qq-chat-test-sync-invalidations)
@@ -3882,7 +3882,7 @@ client, never as a doubled display name."
          (should (= frame-syncs 1))
          (setq calls nil)
          (run-hook-with-args
-          'window-size-change-functions (selected-window))
+          'window-state-change-functions (selected-window))
          (should-not calls)
          (run-hooks 'text-scale-mode-hook)
          (should
@@ -5042,7 +5042,7 @@ client, never as a doubled display name."
            (cl-letf (((symbol-function 'qq-chat-render)
                       (lambda ()
                         (ert-fail "forward sync widened to full render"))))
-             (qq-chat--sync-invalidations view snapshot))
+             (qq-chat--sync-invalidations view snapshot nil))
            (should-not
             (get-text-property
              (appkit-chat-timeline-key-position message-id)

@@ -528,7 +528,7 @@ RESOURCE identifies a presentation-only media dependency update."
   (when (qq-group--view-current-p view)
     (appkit-sync-invalidations view)))
 
-(defun qq-group--sync-invalidations (view invalidations)
+(defun qq-group--sync-invalidations (view invalidations _events)
   "Render group profile VIEW from coalesced INVALIDATIONS."
   (when (and (qq-group--view-current-p view)
              (appkit-invalidations-any-p invalidations))

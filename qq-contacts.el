@@ -820,7 +820,7 @@ FORCE-KEYS identifies existing rows whose presentation resources changed."
   "Request a coalesced directory sync, forcing FORCE-KEYS when non-nil."
   (qq-contacts--queue-view-sync (qq-contacts--ensure-view) force-keys))
 
-(defun qq-contacts--sync-invalidations (view invalidations)
+(defun qq-contacts--sync-invalidations (view invalidations _events)
   "Consume coalesced Appkit INVALIDATIONS for contacts VIEW."
   (when (appkit-view-live-p view)
     (let ((force-keys (appkit-invalidations-entry-keys invalidations))
