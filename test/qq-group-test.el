@@ -35,6 +35,14 @@
     (has_custom_avatar . t))
   "One complete native group profile fixture.")
 
+(ert-deftest qq-group-frame-only-skips-profile-render ()
+  (let ((invalidations (appkit-invalidations-create)))
+    (setf (appkit-invalidations-parts invalidations) '(frame))
+    (cl-letf (((symbol-function 'qq-group-render)
+               (lambda ()
+                 (ert-fail "frame-only sync rendered group profile"))))
+      (qq-group--sync-invalidations 'unused invalidations nil))))
+
 (defmacro qq-group-test-with-profile-view (&rest body)
   "Evaluate BODY in a live Appkit group-profile view.
 

@@ -194,10 +194,8 @@
 
 (defun qq-group-requests--sync-invalidations (view invalidations _events)
   "Render VIEW after coalesced INVALIDATIONS."
-  (when (and (appkit-view-live-p view)
-             (or (appkit-invalidations-structure-p invalidations)
-                 (appkit-invalidations-parts invalidations)
-                 (appkit-invalidations-position-p invalidations)))
+  (when (and (appkit-invalidations-affect-p invalidations '(requests))
+             (appkit-view-live-p view))
     (with-current-buffer (appkit-view-buffer view)
       (qq-group-requests-render))))
 

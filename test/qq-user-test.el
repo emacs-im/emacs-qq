@@ -36,6 +36,14 @@
                      (category_name . "Friends"))))
   "One complete native profile fixture.")
 
+(ert-deftest qq-user-frame-only-skips-profile-render ()
+  (let ((invalidations (appkit-invalidations-create)))
+    (setf (appkit-invalidations-parts invalidations) '(frame))
+    (cl-letf (((symbol-function 'qq-user-render)
+               (lambda ()
+                 (ert-fail "frame-only sync rendered user profile"))))
+      (qq-user--sync-invalidations 'unused invalidations nil))))
+
 (defmacro qq-user-test-with-profile-view (&rest body)
   "Evaluate BODY in a live Appkit user-profile view.
 
