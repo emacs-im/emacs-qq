@@ -3915,29 +3915,42 @@ client, never as a doubled display name."
       (should-not (qq-chat--timeline-messages messages)))))
 
 (ert-deftest qq-chat-partial-window-footer-has-delimiter-not-gap-controls ()
-  (with-temp-buffer
-    (qq-chat-mode)
-    (setq qq-chat--session-key "group:20001")
-    (setq fill-column 24)
-    (qq-chat--set-history-window "m10" "m20")
-    (let ((footer (qq-chat--footer-text)))
-      (should (string-match-p "····" footer))
-      (should-not
-       (string-match-p
-        "\\(?:newer messages are not loaded\\|Load newer\\|Latest\\)"
-        footer))
-      (with-temp-buffer
-        (let ((inhibit-read-only t))
-          (insert footer))
-        (should-not (next-button (point-min)))))
-    (appkit-chat-history-request-begin 'newer)
-    (let ((footer (qq-chat--footer-text)))
-      (should (string-match-p "加载中…" footer))
-      (should-not (string-match-p "loading" footer))
-      (with-temp-buffer
-        (let ((inhibit-read-only t))
-          (insert footer))
-        (should-not (next-button (point-min)))))))
+  (let ((app
+         (appkit-start-app
+          'qq :id (make-symbol "history-footer") :shutdown #'ignore)))
+    (unwind-protect
+        (with-temp-buffer
+          (qq-chat-mode)
+          (setq qq-chat--session-key "group:20001"
+                fill-column 24)
+          (qq-chat--set-history-window "m10" "m20")
+          (let ((footer (qq-chat--footer-text)))
+            (should (string-match-p "····" footer))
+            (should-not
+             (string-match-p
+              "\\(?:newer messages are not loaded\\|Load newer\\|Latest\\)"
+              footer))
+            (with-temp-buffer
+              (let ((inhibit-read-only t))
+                (insert footer))
+              (should-not (next-button (point-min)))))
+          (let* ((view
+                  (appkit-attach-view
+                   :app app :id '(chat "group:20001")
+                   :state "group:20001" :mode major-mode))
+                 (owner
+                  (appkit-chat-history-request-start view 'newer)))
+            (unwind-protect
+                (let ((footer (qq-chat--footer-text)))
+                  (should (string-match-p "加载中…" footer))
+                  (should-not (string-match-p "loading" footer))
+                  (with-temp-buffer
+                    (let ((inhibit-read-only t))
+                      (insert footer))
+                    (should-not (next-button (point-min)))))
+              (appkit-chat-history-request-end owner))))
+      (when (appkit-app-live-p app)
+        (appkit-stop-app app)))))
 
 (ert-deftest qq-chat-history-batch-bounds-require-canonical-batch-members ()
   (qq-chat-test-with-reset
