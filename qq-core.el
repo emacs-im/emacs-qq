@@ -129,13 +129,14 @@ This never stops or logs out a managed QQ account."
 
 (cl-defun qq-core--start-request
     (starter callback errback
-             &key (owner nil owner-supplied-p))
+             &key (owner nil owner-supplied-p) lifecycle-owner)
   "Start asynchronous product work through STARTER.
 
 CALLBACK and ERRBACK are product-facing leaf callbacks.  When omitted, OWNER
-defaults to the current UI account; an explicitly supplied nil marks
-global work.  Omitting OWNER without a selected slot is a user error.
-Return one uniform `qq-request'."
+defaults to the current UI account; an explicitly supplied nil marks global
+work.  Omitting OWNER without a selected slot is a user error.  LIFECYCLE-OWNER
+optionally attaches the request to an Appkit lifecycle owner.  Return one
+uniform `qq-request'."
   (qq-request-start
    starter
    :callback callback
@@ -143,7 +144,8 @@ Return one uniform `qq-request'."
    :owner (if owner-supplied-p
               owner
             (or (qq-runtime-current-account-id)
-                (user-error "qq: Select a QQ account first")))))
+                (user-error "qq: Select a QQ account first")))
+   :lifecycle-owner lifecycle-owner))
 
 (defun qq-core--directory-refresh-success
     (_kind _owner callback value)
@@ -1509,13 +1511,16 @@ explains a result without a sequence."
   "Version of the conversation-neutral Gateway history contract.")
 
 (defun qq-core-fetch-history-page
-    (session-key cursor direction callback &optional errback count)
-  "Fetch one conversation-neutral history page.
+    (session-key cursor direction callback
+                 &optional errback count lifecycle-owner)
+  "Fetch one conversation-neutral history page for SESSION-KEY.
 
 CURSOR is nil for the authoritative latest page or an opaque cursor returned
 in earlier metadata.  DIRECTION is `older' or `newer'.  CALLBACK always
 receives versioned metadata with opaque older/newer cursors and explicit edge
-flags; callers must not inspect the selected storage/native driver."
+flags; callers must not inspect the selected storage/native driver.  ERRBACK
+receives failure details and COUNT limits rows.  LIFECYCLE-OWNER optionally
+owns cancellation of the returned request."
   (unless (memq direction '(older newer))
     (user-error "qq: History direction must be older or newer"))
   (setq count (min 100 (max 1 (or count qq-history-fetch-count))))
@@ -1523,16 +1528,19 @@ flags; callers must not inspect the selected storage/native driver."
    (lambda (success failure)
      (qq-message--request-history-page
       session-key cursor direction success failure count))
-   callback errback))
+   callback errback
+   :lifecycle-owner lifecycle-owner))
 
 (defun qq-core-fetch-history-around
-    (session-key message-id callback &optional errback count sequence)
-  "Fetch a conversation-neutral history window around one exact locator.
+    (session-key message-id callback
+                 &optional errback count sequence lifecycle-owner)
+  "Fetch SESSION-KEY history around one exact locator.
 
 MESSAGE-ID takes precedence.  When it is absent, SEQUENCE names an authored
 native row; ambiguous sequence resolution fails in the Message Store.  DataLine
 requires MESSAGE-ID.  No cached frontier or adapter hint participates in the
-request."
+request.  CALLBACK and ERRBACK receive settlement, COUNT limits rows, and
+LIFECYCLE-OWNER optionally owns cancellation of the returned request."
   (setq count (min 100 (max 1 (or count qq-history-fetch-count))))
   (let ((center
          (cond
@@ -1548,7 +1556,8 @@ request."
      (lambda (success failure)
        (qq-message--request-history-around
         session-key center success failure count))
-     callback errback)))
+     callback errback
+     :lifecycle-owner lifecycle-owner)))
 
 (defun qq-core-get-forward
     (resource-id scene callback &optional errback)

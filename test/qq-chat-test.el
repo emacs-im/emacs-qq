@@ -47,9 +47,9 @@
                 (appkit-view-invalidations view)))
       (ert-fail "chat invalidations did not settle"))))
 
-(defun qq-chat-test-native-request (token)
-  "Return an active native request fixture carrying opaque TOKEN."
-  (let ((request (qq-request-create)))
+(defun qq-chat-test-native-request (token &optional lifecycle-owner)
+  "Return an active native TOKEN request owned by optional LIFECYCLE-OWNER."
+  (let ((request (qq-request-create nil nil lifecycle-owner)))
     (setf (qq-request-token request) token)
     request))
 
@@ -3165,7 +3165,8 @@
            failure)
        (cl-letf (((symbol-function 'qq-core-fetch-history-around)
                   (lambda (_session _target callback
-                                    &optional _errback _count _sequence)
+                                    &optional _errback _count _sequence
+                                    _lifecycle-owner)
                     (cl-incf requests)
                     (funcall callback
                              (qq-chat-test--history-meta
@@ -3992,7 +3993,8 @@ client, never as a doubled display name."
      (let (loading-during-request)
        (cl-letf (((symbol-function 'qq-core-fetch-history-around)
                   (lambda (session-key target callback
-                                       &optional _errback _count _sequence)
+                                       &optional _errback _count _sequence
+                                       _lifecycle-owner)
                     (should (equal session-key "group:20001"))
                     (should (equal target "m20"))
                     (should (appkit-chat-history-request-owner))
@@ -4032,7 +4034,8 @@ client, never as a doubled display name."
      (let (loading-during-request failure)
        (cl-letf (((symbol-function 'qq-core-fetch-history-around)
                   (lambda (session-key target _callback
-                                       &optional errback _count _sequence)
+                                       &optional errback _count _sequence
+                                       _lifecycle-owner)
                     (should (equal session-key "group:20001"))
                     (should (equal target "m20"))
                     (should (appkit-chat-history-request-owner))
@@ -4070,7 +4073,7 @@ client, never as a doubled display name."
      (with-temp-buffer
        (qq-chat-mode)
        (setq qq-chat--session-key "group:20001")
-       (qq-chat--begin-around-history-window captured-latest)
+       (qq-chat--prepare-around-history-window captured-latest)
        (cl-letf (((symbol-function 'qq-chat--update-frame) #'ignore)
                  ((symbol-function 'qq-chat--sync-timeline) #'ignore))
          ;; Wire order and fallback newest are deliberately misleading;
@@ -4108,7 +4111,7 @@ client, never as a doubled display name."
      (with-temp-buffer
        (qq-chat-mode)
        (setq qq-chat--session-key "group:20001")
-       (qq-chat--begin-around-history-window stale-frontier)
+       (qq-chat--prepare-around-history-window stale-frontier)
        (cl-letf (((symbol-function 'qq-chat--update-frame) #'ignore)
                  ((symbol-function 'qq-chat--sync-timeline) #'ignore))
          (qq-chat--note-history-window
@@ -4411,7 +4414,8 @@ client, never as a doubled display name."
        (setq qq-chat--session-key session-key)
        (cl-letf (((symbol-function 'qq-core-fetch-history-page)
                   (lambda (_session-key cursor direction callback
-                                        &optional _errback _count)
+                                        &optional _errback _count
+                                        lifecycle-owner)
                     (should-not cursor)
                     (should (eq direction 'older))
                     (funcall
@@ -4424,8 +4428,7 @@ client, never as a doubled display name."
                       :history-has-newer-materialized-p nil
                       :batch-message-ids (list oldest latest)
                       :message-count 2 :added-count 2))
-                    (qq-chat-test-native-request "latest-native")))
-                 ((symbol-function 'qq-chat--ensure-view) #'ignore)
+                    nil))
                  ((symbol-function 'qq-chat--sync-timeline) #'ignore)
                  ((symbol-function 'qq-chat--update-frame) #'ignore))
          (qq-chat--load-initial-history (current-buffer) session-key)
@@ -4450,7 +4453,8 @@ client, never as a doubled display name."
          (setq qq-chat--session-key session-key)
          (cl-letf (((symbol-function 'qq-core-fetch-history-page)
                     (lambda (session cursor direction callback
-                                     &optional _errback count)
+                                     &optional _errback count
+                                     lifecycle-owner)
                       (setq history-call
                             (list session cursor direction count))
                       (puthash
@@ -4468,9 +4472,9 @@ client, never as a doubled display name."
                         :history-has-newer-materialized-p nil
                         :batch-message-ids (list message-id)
                         :message-count 1 :added-count 1))
-                      (qq-chat-test-native-request "dataline-history")))
-                   ((symbol-function 'qq-chat--sync-timeline) #'ignore)
-                   ((symbol-function 'qq-chat--update-frame) #'ignore))
+                      nil))
+                   ((symbol-function 'qq-chat--update-frame) #'ignore)
+                   ((symbol-function 'qq-chat-render) #'ignore))
            (qq-chat--load-initial-history (current-buffer) session-key)
            (qq-chat-test-sync-until-idle)
            (should
@@ -4499,7 +4503,7 @@ client, never as a doubled display name."
        (setq qq-chat--session-key session-key)
        (cl-letf (((symbol-function 'qq-core-fetch-history-page)
                   (lambda (_session cursor direction callback
-                                    &optional _errback count)
+                                    &optional _errback count lifecycle-owner)
                     (should (eq direction 'older))
                     (if cursor
                         (progn
@@ -4533,9 +4537,7 @@ client, never as a doubled display name."
                         :history-has-newer-materialized-p nil
                         :batch-message-ids (list latest-id)
                         :message-count 1 :added-count 1)))
-                    (qq-chat-test-native-request
-                     (if cursor "older-private" "latest-private"))))
-                 ((symbol-function 'qq-chat--ensure-view) #'ignore)
+                    nil))
                  ((symbol-function 'qq-chat--sync-timeline) #'ignore)
                  ((symbol-function 'qq-chat--update-frame) #'ignore))
          (qq-chat--load-initial-history (current-buffer) session-key)
@@ -4589,7 +4591,8 @@ client, never as a doubled display name."
        (appkit-chat-history-older-loaded-set nil)
        (cl-letf (((symbol-function 'qq-core-fetch-history-page)
                   (lambda (_session cursor direction callback
-                                    &optional _errback _count)
+                                    &optional _errback _count
+                                    _lifecycle-owner)
                     (setq call (list cursor direction))
                     (puthash
                      session-key
@@ -4606,8 +4609,7 @@ client, never as a doubled display name."
                       :history-has-older-p t
                       :batch-message-ids (list older-id)
                       :message-count 1 :added-count 1))
-                    nil))
-                 ((symbol-function 'qq-chat--ensure-view) #'ignore))
+                    nil)))
          (qq-chat-load-older-messages t)
          (should (equal call (list older-cursor 'older)))
          (should
@@ -4653,7 +4655,7 @@ client, never as a doubled display name."
        (qq-chat--set-history-window current-id nil)
        (cl-letf (((symbol-function 'qq-core-fetch-history-page)
                   (lambda (_session cursor direction callback
-                                    &optional _errback count)
+                                    &optional _errback count _lifecycle-owner)
                     (setq call (list cursor direction count))
                     (puthash
                      session-key
@@ -4670,8 +4672,7 @@ client, never as a doubled display name."
                       :history-has-newer-materialized-p nil
                       :batch-message-ids (list latest-id)
                       :message-count 1 :added-count 1))
-                    nil))
-                 ((symbol-function 'qq-chat--ensure-view) #'ignore))
+                    nil)))
          (qq-chat-load-newer-messages t)
          (should
           (equal call
@@ -4718,7 +4719,8 @@ client, never as a doubled display name."
        (qq-chat--set-history-window current-id current-id)
        (cl-letf (((symbol-function 'qq-core-fetch-history-page)
                   (lambda (_session cursor direction callback
-                                    &optional _errback _count)
+                                    &optional _errback _count
+                                    _lifecycle-owner)
                     (setq call (list cursor direction))
                     (puthash
                      session-key
@@ -4735,8 +4737,7 @@ client, never as a doubled display name."
                       :history-has-newer-materialized-p nil
                       :batch-message-ids (list latest-id)
                       :message-count 1 :added-count 1))
-                    nil))
-                 ((symbol-function 'qq-chat--ensure-view) #'ignore))
+                    nil)))
          (qq-chat-load-newer-messages t)
          (should (equal call (list newer-cursor 'newer)))
          (should (equal qq-chat--gateway-history-older-cursor older-cursor))
@@ -5383,7 +5384,7 @@ client, never as a doubled display name."
           (equal (qq-chat--message-selection-anchors)
                  '("9007199254743009336"))))))))
 
-(ert-deftest qq-chat-replacement-view-settles-older-history-owner ()
+(ert-deftest qq-chat-replacement-view-rejects-older-history-owner ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "private:10001"
@@ -5401,21 +5402,24 @@ client, never as a doubled display name."
             "private:10001" 'older
             '((kind . "timeline_row") (row_key . "200"))))
      (qq-chat--set-history-window "200" "300")
-     (let (callback old-view replacement-view projection-calls)
+     (let (callback request old-view replacement-view projection-calls)
        (cl-letf (((symbol-function 'qq-core-fetch-history-page)
                   (lambda (_session _cursor direction success
-                                    &optional _failure _count)
+                                    &optional _failure _count lifecycle-owner)
                     (should (eq direction 'older))
-                    (setq callback success)
-                    (qq-chat-test-native-request "older-private"))))
+                    (setq callback success
+                          request
+                          (qq-chat-test-native-request
+                           "older-private" lifecycle-owner))
+                    request)))
          (qq-chat-load-older-messages t))
-       (should (appkit-chat-history-loading-p))
        (setq old-view (appkit-current-view))
        (appkit-kill-view old-view)
+       (should (eq (qq-request-state request) 'cancelled))
        (setq replacement-view (qq-chat--ensure-view))
        (should-not (eq old-view replacement-view))
-       ;; The transport has already merged its canonical batch before this
-       ;; metadata callback, matching the real API boundary.
+       ;; The transport may merge canonical data before metadata publication.
+       ;; The retired View owner must not move the replacement View's window.
        (puthash
         "private:10001"
         '(((server-id . "150") (time . 150))
@@ -5438,11 +5442,11 @@ client, never as a doubled display name."
        (should-not projection-calls)
        (should-not (appkit-chat-history-loading-p))
        (should-not (appkit-chat-history-request-owner))
-       (should (equal (appkit-chat-history-window-first-key) "150"))
+       (should (equal (appkit-chat-history-window-first-key) "200"))
        (should (equal (appkit-chat-history-window-last-key) "300"))))))
 
 
-(ert-deftest qq-chat-replacement-view-settles-initial-history-chain ()
+(ert-deftest qq-chat-replacement-view-rejects-initial-history-owner ()
   (qq-chat-test-with-reset
    (qq-state-upsert-session
     "group:20001"
@@ -5450,20 +5454,26 @@ client, never as a doubled display name."
    (with-temp-buffer
      (qq-chat-mode)
      (setq qq-chat--session-key "group:20001")
-     (let (latest-callback old-view replacement-view projection-calls)
+     (let (latest-callback initial-request old-view replacement-view
+                           projection-calls)
        (cl-letf (((symbol-function 'qq-core-fetch-history-page)
                   (lambda (_session cursor direction success
-                                    &optional _failure _count)
+                                    &optional _failure _count lifecycle-owner)
                     (should-not cursor)
                     (should (eq direction 'older))
                     (setq latest-callback success)
-                    (qq-chat-test-native-request "latest-token"))))
+                    (qq-chat-test-native-request
+                     "latest-token" lifecycle-owner))))
          (qq-chat--load-initial-history (current-buffer) "group:20001")
-         (should (equal
-                  (qq-request-token qq-chat--initial-history-request)
-                  "latest-token"))
+         (setq initial-request
+               (appkit-handle-object
+                (car
+                 (appkit-view-operation-handles
+                  qq-chat--initial-history-owner))))
+         (should (equal (qq-request-token initial-request) "latest-token"))
          (setq old-view (appkit-current-view))
          (appkit-kill-view old-view)
+         (should (eq (qq-request-state initial-request) 'cancelled))
          (setq replacement-view (qq-chat--ensure-view))
          (cl-letf (((symbol-function 'appkit-request-sync)
                     (lambda (&rest arguments)
@@ -5480,10 +5490,9 @@ client, never as a doubled display name."
                      :message-count 1
                      :batch-message-ids '("300")))))
        (should-not projection-calls)
-       (should-not qq-chat--initial-history-request)
        (should-not qq-chat--initial-history-owner)
        (should-not (appkit-chat-history-loading-p))
-       (should (equal (appkit-chat-history-window-first-key) "300"))
+       (should-not (appkit-chat-history-window-first-key))
        (should (eq replacement-view (appkit-current-view)))))))
 
 (ert-deftest qq-chat-replacement-view-settles-forward-owner ()

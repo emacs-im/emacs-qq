@@ -442,6 +442,57 @@
     (should (equal caught '(quit)))
     (should (= (hash-table-count qq-request--active) 0))))
 
+(ert-deftest qq-request-appkit-lifecycle-owns-cancellation-and-retirement ()
+  (appkit-register-app-kind 'qq-request-test nil)
+  (let ((app (appkit-start-app 'qq-request-test :id 'lifecycle))
+        (qq-request--active (make-hash-table :test #'eq))
+        canceled)
+    (unwind-protect
+        (with-temp-buffer
+          (let* ((view
+                  (appkit-attach-view
+                   :app app
+                   :id '(request-test)
+                   :state 'request-test
+                   :mode major-mode
+                   :sync-function #'ignore
+                   :parts nil))
+                 (cancel-owner
+                  (appkit-view-operation-begin view 'cancel))
+                 cancel-request)
+            (cl-letf (((symbol-function 'qq-server-cancel)
+                       (lambda (token) (setq canceled token))))
+              (setq cancel-request
+                    (qq-request-start
+                     (lambda (_success _failure) "cancel-token")
+                     :owner "slot-a"
+                     :lifecycle-owner cancel-owner))
+              (should (equal (qq-request-owner cancel-request) "slot-a"))
+              (should (= 1 (length
+                            (appkit-view-operation-handles cancel-owner))))
+              (appkit-view-operation-cancel view 'cancel)
+              (should (eq (qq-request-state cancel-request) 'cancelled))
+              (should (equal canceled "cancel-token")))
+            (let ((settle-owner
+                   (appkit-view-operation-begin view 'settle))
+                  success delivered settle-request)
+              (setq settle-request
+                    (qq-request-start
+                     (lambda (callback _failure)
+                       (setq success callback)
+                       "settle-token")
+                     :owner nil
+                     :lifecycle-owner settle-owner
+                     :callback (lambda (value) (setq delivered value))))
+              (funcall success 'done)
+              (should (eq (qq-request-state settle-request) 'settled))
+              (should (eq delivered 'done))
+              (should (equal canceled "cancel-token"))
+              (should-not
+               (appkit-view-operation-handles settle-owner)))))
+      (when (appkit-app-live-p app)
+        (appkit-stop-app app)))))
+
 (ert-deftest qq-request-revoke-all-cancels-active-requests ()
   (let ((qq-request--active (make-hash-table :test #'eq))
         cleaned requests)
