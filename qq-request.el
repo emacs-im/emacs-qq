@@ -15,9 +15,12 @@
 ;; account slot across Native Session replacement.  Exact session identity is
 ;; deliberately kept behind the Gateway boundary; product callers never
 ;; coordinate it.
+;; Appkit lifecycle ownership is stored separately and may cancel the logical
+;; request without changing that account observation context.
 
 ;;; Code:
 
+(require 'appkit-core)
 (require 'cl-lib)
 (require 'qq-account)
 (require 'qq-server)
@@ -46,7 +49,8 @@
   owner
   (state 'active)
   token
-  cancel-function)
+  cancel-function
+  lifecycle-handle)
 
 (defvar qq-request--active (make-hash-table :test #'eq)
   "Active native requests, keyed by request identity.")
@@ -58,21 +62,33 @@
    ((and (stringp owner) (> (length owner) 0)) (copy-sequence owner))
    (t (error "qq: invalid native request owner context %S" owner))))
 
-(defun qq-request-create (&optional owner cancel-function)
+(defun qq-request-create (&optional owner cancel-function lifecycle-owner)
   "Create and register an active request for OWNER context.
 
 Nil denotes global work and a non-empty string denotes a stable managed
 account slot.  These scopes only control callback delivery; they do not
 authorize a request or add fields to its wire parameters.
 
-CANCEL-FUNCTION revokes adapter work and is called at most once.  Callers that
-only own a Gateway transport token should use `qq-request-start'."
+CANCEL-FUNCTION revokes adapter work and is called at most once.
+LIFECYCLE-OWNER, when non-nil, owns cancellation through an Appkit handle.
+Callers that only own a Gateway transport token should use `qq-request-start'."
   (let ((request
-          (qq-request--create
-           :owner (qq-request--copy-owner owner)
-           :cancel-function cancel-function)))
+         (qq-request--create
+          :owner (qq-request--copy-owner owner)
+          :cancel-function cancel-function)))
     (puthash request t qq-request--active)
-    request))
+    (condition-case error-data
+        (progn
+          (when lifecycle-owner
+            (setf (qq-request-lifecycle-handle request)
+                  (appkit-register-handle
+                   lifecycle-owner 'qq-request request
+                   #'qq-request--cancel-from-lifecycle-owner)))
+          request)
+      ((error quit)
+       (setf (qq-request-state request) 'cancelled)
+       (remhash request qq-request--active)
+       (signal (car error-data) (cdr error-data))))))
 
 (defun qq-request-active-p (request)
   "Return non-nil when REQUEST still owns asynchronous work."
@@ -82,10 +98,15 @@ only own a Gateway transport token should use `qq-request-start'."
 (defun qq-request--retire (request state)
   "Move active REQUEST to terminal STATE exactly once."
   (when (qq-request-active-p request)
-    (setf (qq-request-state request) state
-          (qq-request-token request) nil
-          (qq-request-cancel-function request) nil)
-    (remhash request qq-request--active)
+    (let ((handle (qq-request-lifecycle-handle request)))
+      (setf (qq-request-state request) state
+            (qq-request-token request) nil
+            (qq-request-cancel-function request) nil
+            (qq-request-lifecycle-handle request) nil)
+      (remhash request qq-request--active)
+      (when (and (appkit-handle-p handle)
+                 (appkit-handle-alive-p handle))
+        (appkit-retire-handle handle)))
     t))
 
 (defun qq-request-finish (request)
@@ -121,8 +142,8 @@ Native Session replacement."
         (apply #'qq-request--invoke callback arguments))
     (apply #'qq-request--invoke callback arguments)))
 
-(defun qq-request-cancel (request)
-  "Cancel REQUEST locally and revoke its adapter work exactly once."
+(defun qq-request--cancel-direct (request)
+  "Cancel active REQUEST after its lifecycle handle has been revoked."
   (when (qq-request-active-p request)
     (let ((cancel (qq-request-cancel-function request))
           (token (qq-request-token request)))
@@ -137,26 +158,42 @@ Native Session replacement."
                   (error-message-string error-data))))
       t)))
 
+(defun qq-request--cancel-from-lifecycle-owner (request)
+  "Cancel REQUEST after its Appkit lifecycle owner revoked the child handle."
+  (qq-request--cancel-direct request))
+
+(defun qq-request-cancel (request)
+  "Cancel REQUEST locally and revoke its adapter work exactly once."
+  (when (qq-request-active-p request)
+    (if-let* ((handle (qq-request-lifecycle-handle request))
+              ((appkit-handle-alive-p handle)))
+        (progn
+          (appkit-cancel-handle handle)
+          t)
+      (qq-request--cancel-direct request))))
+
 (cl-defun qq-request-start
-    (starter &key callback errback (owner nil owner-supplied-p))
+    (starter
+     &key callback errback (owner nil owner-supplied-p) lifecycle-owner)
   "Start one callback-scoped request through STARTER.
 
 STARTER is called with success and error continuations and returns its opaque
 adapter token.  CALLBACK receives one successful value; ERRBACK receives an
 error body and human-readable reason.  OWNER uses the scope vocabulary of
-`qq-request-create' and defaults to the current UI account.
+`qq-request-create' and defaults to the current UI account.  LIFECYCLE-OWNER,
+when non-nil, owns the request's Appkit cancellation handle.
 
 The request retires before invoking either leaf callback.  Late callbacks and
 callbacks for a removed OWNER are inert.  Native Session replacement does not
 change the stable account slot.  Product-specific replacement and projection
 policy belongs to the product operation, not this lifecycle type.
 
-A nil token must be paired with a synchronous failure callback.  A non-nil
-token is accepted work and its callback runs later on the event loop."
+A nil token is valid only when a callback settles the request synchronously.
+A non-nil token is accepted work whose callback runs later on the event loop."
   (let* ((owner (if owner-supplied-p
                     owner
                   (qq-runtime-current-account-id)))
-         (request (qq-request-create owner)))
+         (request (qq-request-create owner nil lifecycle-owner)))
     (condition-case error-data
         (cl-labels
             ((success
