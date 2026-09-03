@@ -515,9 +515,9 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
                    (should (eq window 'root-window))
                    104))
                 ((symbol-function 'qq-root--sync-invalidations)
-                 (lambda (candidate invalidations)
+                 (lambda (candidate invalidations events)
                    (cl-incf syncs)
-                   (funcall original-sync candidate invalidations))))
+                   (funcall original-sync candidate invalidations events))))
         (should (qq-root--reflow-visible))
         (should (= syncs 0))
         (should (= qq-root--fill-column 88))
@@ -584,9 +584,9 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
     (let ((syncs 0)
           (original-sync (symbol-function 'qq-root--sync-invalidations)))
       (cl-letf (((symbol-function 'qq-root--sync-invalidations)
-                 (lambda (candidate invalidations)
+                 (lambda (candidate invalidations events)
                    (cl-incf syncs)
-                   (funcall original-sync candidate invalidations))))
+                   (funcall original-sync candidate invalidations events))))
         (qq-root--handle-state-change
          '(:type connection :account-id "slot-a"))
         (qq-root--handle-state-change

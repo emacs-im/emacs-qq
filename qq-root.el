@@ -550,7 +550,7 @@ messages, since the session title already identifies an incoming peer."
               (qq-root--session-entry-key (alist-get 'key session)))
             (qq-root--recent-sessions))))
 
-(defun qq-root--sync-invalidations (view invalidations)
+(defun qq-root--sync-invalidations (view invalidations _events)
   "Synchronize VIEW from coalesced Appkit INVALIDATIONS.
 
 Structural, whole-entries, and geometry changes reconcile the stable-key
@@ -567,7 +567,10 @@ generated-content mutation is owned by one Appkit content transaction."
          (reconcile-p
           (or (appkit-invalidations-structure-p invalidations)
               entries-part-p
-              geometry-p)))
+              geometry-p))
+         (diff
+          (appkit-projection-diff-derive
+           invalidations :existing-keys (qq-root--session-entry-keys))))
     (when (or reconcile-p entries position-p)
       (appkit-with-content-update view
         (let ((snapshot
@@ -584,10 +587,7 @@ generated-content mutation is owned by one Appkit content transaction."
                        (qq-root--project-entries)
                        #'qq-root--entry-key
                        :force-keys
-                       (if geometry-p
-                           (delete-dups
-                            (append entries (qq-root--session-entry-keys)))
-                         entries)))
+                       (appkit-projection-diff-force-keys diff)))
               (dolist (key entries)
                 (appkit-ewoc-invalidate-key
                  qq-root--ewoc qq-root--node-table key))))

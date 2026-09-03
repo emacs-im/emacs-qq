@@ -1926,15 +1926,22 @@ projection.  A replacement or detached view is inert."
        (qq-chat--header-line-update)
        (qq-chat--refresh-prompt)))))
 
-(defun qq-chat--sync-invalidations (view invalidations)
-  "Synchronize VIEW's current chat from coalesced Appkit INVALIDATIONS."
-  (let* ((events (appkit-view-pending-events-snapshot view))
-         (parts (appkit-invalidations-parts invalidations))
+(defun qq-chat--sync-invalidations (view invalidations events)
+  "Synchronize VIEW's chat from Appkit INVALIDATIONS and EVENTS."
+  (let* ((parts (appkit-invalidations-parts invalidations))
          (geometry-p (memq 'geometry parts))
          (composer-p (memq 'composer parts))
          (non-composer-parts (delq 'composer (copy-sequence parts)))
-         (resources (appkit-invalidations-resource-keys invalidations))
-         (entries (appkit-invalidations-entry-keys invalidations))
+         (diff
+          (appkit-projection-diff-derive
+           invalidations
+           :existing-keys
+           (and (appkit-chat-timeline-live-p)
+                (appkit-chat-timeline-keys))
+           :reconcile-parts '(timeline)))
+         (force-keys (appkit-projection-diff-force-keys diff))
+         (changed-resources
+          (appkit-projection-diff-changed-dependencies diff))
          (raw-forward-sync-request qq-chat--forward-sync-request)
          (forward-sync-request
           (and (or (null (plist-get raw-forward-sync-request :view))
@@ -1964,16 +1971,14 @@ projection.  A replacement or detached view is inert."
           (setq rendered-p t))
          (geometry-p
           (qq-chat--sync-timeline
-           :force-keys
-           (and (appkit-chat-timeline-live-p)
-                (appkit-chat-timeline-keys))
-           :changed-resources resources)
+           :force-keys force-keys
+           :changed-resources changed-resources)
           (qq-chat--update-frame))
          (forward-sync-request
-          (when (or resources entries)
+          (when (or force-keys changed-resources)
             (qq-chat--sync-timeline
-             :force-keys entries
-             :changed-resources resources))
+             :force-keys force-keys
+             :changed-resources changed-resources))
           (qq-chat--update-frame))
          (send-sync-request
           (qq-chat--update-frame))
@@ -1983,18 +1988,14 @@ projection.  A replacement or detached view is inert."
                    (appkit-invalidations-position-p invalidations)))
           (qq-chat-render)
           (setq rendered-p t))
-         ((or resources entries)
+         ((or force-keys changed-resources)
           (qq-chat--sync-timeline
-           :force-keys entries
-           :changed-resources resources)))
-        (when (and rendered-p (or geometry-p resources entries))
+           :force-keys force-keys
+           :changed-resources changed-resources)))
+        (when (and rendered-p (or force-keys changed-resources))
           (qq-chat--sync-timeline
-           :force-keys
-           (if geometry-p
-               (delete-dups
-                (append entries (appkit-chat-timeline-keys)))
-             entries)
-           :changed-resources resources))
+           :force-keys force-keys
+           :changed-resources changed-resources))
         (when composer-p
           (qq-chat--refresh-prompt))
         (when send-sync-request
@@ -2007,7 +2008,6 @@ projection.  A replacement or detached view is inert."
           (setq qq-chat--callback-sync-request nil))
         (when (eq raw-send-sync-request qq-chat--send-sync-request)
           (setq qq-chat--send-sync-request nil))
-        (appkit-view-acknowledge-events view (length events))
         (when send-sync-request
           (appkit-chatbuf-focus-input))
         (dolist (action callback-actions)
