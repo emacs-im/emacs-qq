@@ -3869,7 +3869,7 @@ client, never as a doubled display name."
                   (lambda () (cl-incf frame-syncs))))
          (setq view (qq-chat--ensure-view))
          (should
-          (memq #'appkit-view--on-window-geometry-change
+          (memq #'appkit-view-refresh-responsive-geometry
                 window-size-change-functions))
          (setq width 90)
          (run-hook-with-args
