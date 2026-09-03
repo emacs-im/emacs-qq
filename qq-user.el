@@ -430,8 +430,8 @@ RESOURCE identifies a presentation-only media dependency update."
 
 (defun qq-user--sync-invalidations (view invalidations _events)
   "Render user profile VIEW from coalesced INVALIDATIONS."
-  (when (and (qq-user--view-current-p view)
-             (appkit-invalidations-any-p invalidations))
+  (when (and (appkit-invalidations-affect-p invalidations '(profile))
+             (qq-user--view-current-p view))
     (appkit-with-content-update view
       (qq-user-render))))
 

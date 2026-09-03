@@ -19,6 +19,7 @@
 (require 'appkit-core)
 (require 'appkit-ewoc)
 (require 'appkit-invalidation)
+(require 'appkit-projection)
 (require 'appkit-position)
 (require 'appkit-transaction)
 (require 'appkit-ui)
@@ -823,11 +824,16 @@ FORCE-KEYS identifies existing rows whose presentation resources changed."
 (defun qq-contacts--sync-invalidations (view invalidations _events)
   "Consume coalesced Appkit INVALIDATIONS for contacts VIEW."
   (when (appkit-view-live-p view)
-    (let ((force-keys (appkit-invalidations-entry-keys invalidations))
-          (full-p (or (appkit-invalidations-structure-p invalidations)
-                      (appkit-invalidations-parts invalidations)
-                      (appkit-invalidations-position-p invalidations))))
-      (when (or full-p force-keys)
+    (let* ((parts (appkit-invalidations-parts invalidations))
+           (full-p
+            (or (appkit-invalidations-structure-p invalidations)
+                parts))
+           (diff
+            (appkit-projection-diff-derive
+             invalidations
+             :reconcile-parts '(directory)))
+           (force-keys (appkit-projection-diff-force-keys diff)))
+      (when (appkit-projection-diff-reconcile-p diff)
         (if (qq-contacts--displayed-p)
             (appkit-with-content-update view
               (let ((width (qq-contacts--usable-width)))

@@ -342,6 +342,17 @@ BODY may refer to the lexical variables `app', `buffer', and `view'."
           (should (equal qq-contacts--error "replacement state"))
           (should-not syncs))))))
 
+(ert-deftest qq-contacts-position-only-does-not-reconcile ()
+  (with-temp-buffer
+    (qq-contacts-test-mode)
+    (let ((view (qq-contacts--ensure-view))
+          (invalidations (appkit-invalidations-create)))
+      (setf (appkit-invalidations-position-p invalidations) t)
+      (cl-letf (((symbol-function 'qq-contacts--project-entries)
+                 (lambda ()
+                   (ert-fail "position-only sync rebuilt contacts"))))
+        (qq-contacts--sync-invalidations view invalidations nil)))))
+
 (ert-deftest qq-contacts-visible-avatar-update-invalidates-only-target-rows ()
   (with-temp-buffer
     (qq-contacts-test-mode)
